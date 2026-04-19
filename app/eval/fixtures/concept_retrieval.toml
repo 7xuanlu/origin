@@ -1,0 +1,135 @@
+# Concept retrieval — tests that compiled concepts surface for knowledge-level queries.
+# These memories should cluster during distillation, producing concepts that
+# answer broad "how does X work?" queries better than individual memories.
+
+[[cases]]
+query = "libSQL database architecture"
+domain = "origin"
+
+[[cases.seeds]]
+id = "mem_libsql_vector"
+content = "Origin stores 768-dimensional vectors in libSQL F32_BLOB columns with DiskANN indexing for approximate nearest neighbor search"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_libsql_fts"
+content = "Full-text search uses FTS5 virtual tables with auto-sync triggers on insert, update, and delete operations"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_libsql_conn"
+content = "libSQL Connection is Send but not Sync so Origin wraps it in tokio::sync::Mutex for safe concurrent access"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_libsql_single_db"
+content = "Origin uses a single libSQL database for memories, knowledge graph entities, relations, observations, and full-text search indexes"
+memory_type = "decision"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "neg_postgres_sharding"
+content = "PostgreSQL horizontal sharding distributes rows across multiple nodes using consistent hashing"
+memory_type = "fact"
+domain = "infrastructure"
+
+[[cases.negative_seeds]]
+id = "neg_redis_caching"
+content = "Redis provides in-memory key-value caching with TTL-based expiration and pub/sub messaging"
+memory_type = "fact"
+domain = "infrastructure"
+
+
+[[cases]]
+query = "memory retrieval pipeline"
+domain = "origin"
+
+[[cases.seeds]]
+id = "mem_hybrid_search"
+content = "Origin combines vector similarity search with FTS5 keyword matching using Reciprocal Rank Fusion with RRF_K parameter of 60"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_confirmation_boost"
+content = "Human-confirmed memories receive a 1.5x score boost during retrieval to prioritize curated knowledge"
+memory_type = "decision"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_recap_penalty"
+content = "Recap memories receive a 0.3x score penalty to prevent activity summaries from drowning out primary memories"
+memory_type = "decision"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_domain_prefix"
+content = "Embedding vectors are prefixed with [domain] tag to improve cross-domain retrieval separation"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "neg_elastic_bm25"
+content = "Elasticsearch uses BM25 scoring algorithm for relevance ranking in full-text search queries"
+memory_type = "fact"
+domain = "infrastructure"
+
+[[cases.negative_seeds]]
+id = "neg_pinecone_metadata"
+content = "Pinecone supports metadata filtering with namespace isolation for multi-tenant vector search"
+memory_type = "fact"
+domain = "infrastructure"
+
+
+[[cases]]
+query = "how does knowledge compilation work"
+domain = "origin"
+
+[[cases.seeds]]
+id = "mem_concept_compile"
+content = "Knowledge compilation clusters related memories by entity and domain then uses LLM to generate structured wiki-style concept pages"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_concept_fts"
+content = "Compiled concepts are indexed in FTS5 for fast full-text search on title, summary, and content fields"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_concept_source_ids"
+content = "Each concept tracks source_memory_ids linking back to the atomic memories that were compiled into it"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "neg_rag_chunking"
+content = "Retrieval augmented generation splits documents into fixed-size chunks with overlap for embedding"
+memory_type = "fact"
+domain = "ai"

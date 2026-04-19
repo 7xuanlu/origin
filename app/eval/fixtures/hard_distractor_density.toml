@@ -1,0 +1,617 @@
+# Hard: Distractor density — 50 memories in one domain, find the 2-3 relevant ones.
+# Simulates a mature memory store. Target: NDCG@10 < 0.80 to differentiate model quality.
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# Query: chunking strategy for code blocks
+# 3 relevant seeds + 47 distractors, all domain="origin"
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "how does the chunking strategy handle code blocks"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "hd_chunking_code"
+content = "The code-aware chunker detects fenced code blocks and never splits them mid-block; the entire block is kept as a single chunk so embedding captures the full syntax context."
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "hd_chunking_lang"
+content = "Chunker inspects the language tag on fenced code fences (e.g. ```rust, ```ts) and stores it as chunk metadata so downstream retrieval can filter by programming language."
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+[[cases.seeds]]
+id = "hd_chunking_overlap"
+content = "Fixed-size chunking uses a 64-token overlap between adjacent chunks to preserve context across boundaries, but code blocks opt out of overlap to avoid duplicating import sections."
+memory_type = "fact"
+domain = "origin"
+relevance = 1
+
+# Distractors (relevance = 0)
+
+[[cases.seeds]]
+id = "hd_d01"
+content = "Vector search uses DiskANN indexing over F32_BLOB(768) columns in libSQL; approximate nearest-neighbour queries return top-k candidates before RRF re-ranking."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d02"
+content = "Full-text search is backed by an FTS5 virtual table (memories_fts) that is kept in sync with the memories table via SQLite triggers on insert, update, and delete."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d03"
+content = "Hybrid search combines vector similarity with FTS scores using Reciprocal Rank Fusion with a tunable rrf_k parameter; default is 60."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d04"
+content = "PII redaction runs before storage and replaces credit card numbers, SSNs, API keys, and email addresses with [REDACTED] placeholders."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d05"
+content = "The refinery runs background enrichment sweeps every 30 minutes: entity extraction, dedup proposals, and recap triggering are the three active phases."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d06"
+content = "Database migrations use PRAGMA user_version; each migration function checks the current version and applies changes incrementally up to the target version."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d07"
+content = "The toast window is a non-activating transparent overlay panel; it receives capture-event Tauri events and auto-dismisses after 4 seconds."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d08"
+content = "Quick-capture is a popup window triggered by the global hotkey; it lets users type a thought that is immediately stored as a memory without leaving their current app."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d09"
+content = "The Spotlight search window activates on Cmd+K and supports source filters, semantic search, and a working-memory panel showing the most recent captures."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d10"
+content = "Frontend server state is managed by TanStack React Query 5; all Tauri command responses are cached and invalidated on capture-event to keep the UI fresh."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d11"
+content = "MemoryCard components render summary as the primary text, falling back to content when summary is null; cards show memory_type as a badge and domain as a subtitle."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d12"
+content = "The Axum HTTP server listens on 127.0.0.1:7878 and also binds a Unix socket for same-machine tool integration; both surfaces share the same router."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d13"
+content = "Agent trust levels are enforced at write time: untrusted agents cannot set confirmed=true or relevance above 1 without human review."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d14"
+content = "The smart router deduplicates incoming trigger events using bigram Jaccard similarity with a 0.85 threshold before forwarding context bundles downstream."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d15"
+content = "AFK detection uses CGEventSource to poll idle time; captures are suppressed if the user has been idle for more than 60 seconds."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d16"
+content = "The focus sensor runs on a dedicated std::thread at 10 Hz, tracking cursor position with a 50-pixel radius and 2-second dwell threshold to determine the focused window."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d17"
+content = "The LLM formatter thread runs Qwen3-4B-Instruct-2507 via llama-cpp-2 on the Metal GPU; it captures a Tokio runtime Handle at spawn time for async DB write-back."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d18"
+content = "Persistent config is stored as JSON at ~/Library/Application Support/origin/config.json and is loaded at startup; hot-reload is not currently supported."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d19"
+content = "The file watcher uses the notify crate with a 2-second debounce; changed files are queued as RawDocuments for the two-pass capture pipeline."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d20"
+content = "WebSocket updates are served at /ws/updates on the Axum server; clients subscribe to receive real-time memory store and refinery phase completion events."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d21"
+content = "The /api/profile endpoint returns the user's identity fields including name, occupation observation, and preferred domains stored in the knowledge graph."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d22"
+content = "Spaces (projects) partition memories so that querying one project does not surface memories from another; domain acts as the partition key in hybrid search."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d23"
+content = "Stability tiers classify memories into ephemeral, working, and long-term based on confirmation status and recency; tiers influence retrieval weighting."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d24"
+content = "Confidence scores range from 0.0 to 1.0 and are assigned by the LLM classifier at store time; agent-written memories start at 0.7 unless explicitly overridden."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d25"
+content = "The quality gate rejects memories whose content fails minimum length, language detection, or information-density checks before they reach the embedding step."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d26"
+content = "Contradiction detection compares new memories against existing ones for the same entity; detected conflicts are flagged for human review rather than silently overwritten."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d27"
+content = "Distillation periodically collapses clusters of related memories into a single high-quality recap memory, reducing retrieval noise from redundant observations."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d28"
+content = "The supersede field records the ID of the earlier memory that a newer memory replaces; superseded memories are excluded from default search results."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d29"
+content = "Session tracking records the active session ID on each memory at write time so memories can be filtered or grouped by the conversation that produced them."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d30"
+content = "Tags are stored in a separate tag store and linked to memories by ID; the tag index enables fast filtering without adding columns to the memories table."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d31"
+content = "Apple Vision OCR is invoked per captured frame; results are passed through the OCR text cleanup pipeline before being assembled into a ContextBundle."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d32"
+content = "Frame comparison uses a 3-tier strategy: downscale to 64x64, perceptual hash, then Hellinger distance; frames below the similarity threshold are dropped without OCR."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d33"
+content = "Tauri commands are registered in lib.rs using the invoke_handler macro; there are approximately 92 commands covering search, memory CRUD, config, and capture control."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d34"
+content = "Frontend routing is hash-based: #/ loads the main window, #/toast loads the overlay, #/snip loads the selection overlay, and #/quick-capture loads the popup."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d35"
+content = "The memory detail page is the sole owner of edit actions; MemoryCard only shows fast hover toggles (confirm dot, delete) and delegates all other actions to the detail view."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d36"
+content = "Collapsed sidebar section state is persisted to localStorage with a 7-day TTL; stale entries are pruned on next load to avoid unbounded storage growth."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d37"
+content = "The processingStore uses the useSyncExternalStore pattern so capture progress state survives React component unmounts between navigation events."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d38"
+content = "Domain boost multiplies the base retrieval score by 1.5x when the search query explicitly mentions the memory's domain name, improving precision for project-scoped queries."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d39"
+content = "Recency decay reduces the effective score of memories older than 90 days by applying an exponential decay factor so stale information ranks below fresh observations."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d40"
+content = "FastEmbed caches model weights in .fastembed_cache/ at the repo root; on first run the 140 MB GTE-Base-EN-v1.5-Q model is downloaded and stored there."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d41"
+content = "Multi-row insert and delete loops are wrapped in explicit BEGIN/COMMIT transactions to ensure atomicity and improve write throughput on the libSQL connection."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d42"
+content = "WAL mode and foreign-key enforcement are set via PRAGMA at connection open time; FK cascades propagate deletes from entities to linked observations and relations."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d43"
+content = "Markdown-aware chunking preserves heading hierarchy so that each chunk inherits its parent headings as metadata, enabling section-level filtering during retrieval."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d44"
+content = "The knowledge graph stores entities, relations, and observations in separate tables with foreign-key cascades; 2-hop traversal is used to augment retrieval results."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d45"
+content = "Embedding model was upgraded from BGE-Small (384-dim) to GTE-Base-EN-v1.5-Q (768-dim) in migration 24; the larger model delivers +125% NDCG on combined benchmarks."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d46"
+content = "Source deduplication during retrieval removes candidates that share a source_id, then a content Jaccard pass removes near-duplicate text before final ranking."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd_d47"
+content = "The snip window is a full-screen transparent overlay used for region selection; the selected region coordinates are sent back to the router as a TriggerEvent payload."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# Query: what triggers a memory to be archived
+# 2 relevant seeds + 2 hard negatives + 30 distractors, all domain="origin"
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what triggers a memory to be archived"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "hd2_archive_trigger"
+content = "A memory is automatically archived when its recency decay score drops below the archive threshold (default 0.05) and it has not been confirmed or accessed in the past 180 days."
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "hd2_archive_decay"
+content = "Human confirmation resets the decay clock on a memory, preventing archival; memories confirmed by the user are exempt from automatic archival regardless of age."
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+# Hard negatives — archive-adjacent but wrong concept
+
+[[cases.negative_seeds]]
+id = "hd2_neg_supersede"
+content = "When a memory is stored with replace mode, the previous memory with the same entity and attribute is marked superseded and hidden from default search results, but it is not archived — it remains queryable with include_superseded=true."
+memory_type = "fact"
+domain = "origin"
+
+[[cases.negative_seeds]]
+id = "hd2_neg_quality_gate"
+content = "The quality gate rejects low-density memories before they are ever stored; rejected candidates are written to a separate quality_rejects table for audit but never appear in the memories table."
+memory_type = "fact"
+domain = "origin"
+
+# Distractors (relevance = 0)
+
+[[cases.seeds]]
+id = "hd2_d01"
+content = "Vector search uses DiskANN indexing over F32_BLOB(768) columns; top-k candidates are retrieved before RRF re-ranking merges vector and FTS scores."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d02"
+content = "FTS5 virtual table memories_fts is kept in sync with the memories table via insert, update, and delete triggers registered at schema creation time."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d03"
+content = "Hybrid search blends vector and full-text scores using Reciprocal Rank Fusion; the rrf_k parameter is tunable via SearchScoringConfig without recompilation."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d04"
+content = "PII redaction applies regex patterns for credit cards, SSNs, API keys, and emails before any content reaches the embedding step or the database."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d05"
+content = "The refinery enrichment sweeps run every 30 minutes and cover entity extraction, dedup proposal generation, and recap triggering in a fixed phase sequence."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d06"
+content = "Database migrations use PRAGMA user_version for version tracking; each numbered migration function is idempotent and applied only when the current version is below target."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d07"
+content = "The toast window is a non-activating transparent overlay that displays capture notifications and auto-dismisses after 4 seconds without stealing window focus."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d08"
+content = "Quick-capture lets users store a thought via a popup without leaving their current app; the stored memory is immediately available in Spotlight search."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d09"
+content = "The smart router applies bigram Jaccard deduplication at a 0.85 threshold so near-identical OCR frames do not generate redundant memory candidates."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d10"
+content = "AFK detection suppresses captures when idle time exceeds 60 seconds, preventing empty or lock-screen frames from entering the pipeline."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d11"
+content = "The focus sensor polls cursor position at 10 Hz on a dedicated thread and records the front-most window after a 2-second dwell within a 50-pixel radius."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d12"
+content = "Qwen3-4B-Instruct-2507 runs on Metal GPU via llama-cpp-2 on a dedicated std::thread; the thread bridges back to Tokio for async memory write-back."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d13"
+content = "Config is persisted as JSON at ~/Library/Application Support/origin/config.json; feature toggles read from config are exposed as AtomicBool flags for lock-free reads."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d14"
+content = "The file watcher debounces filesystem events by 2 seconds using the notify crate before queuing changed files for the two-pass capture pipeline."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d15"
+content = "WebSocket /ws/updates broadcasts real-time events for memory stores, refinery phase completions, and quality gate rejections to connected clients."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d16"
+content = "Agent trust levels gate write permissions: untrusted agents cannot set confirmed=true or assign relevance above the trust-tier ceiling without human approval."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d17"
+content = "Stability tiers (ephemeral, working, long-term) are derived from confirmation status and recency; tier assignment influences retrieval weighting and display grouping."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d18"
+content = "Confidence scores are assigned by the LLM classifier at store time on a 0.0–1.0 scale; agent-written memories default to 0.7 unless explicitly overridden in the payload."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d19"
+content = "Contradiction detection flags semantic conflicts between new and existing memories for the same entity so humans can resolve them rather than silently overwrite."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d20"
+content = "Distillation collapses clusters of semantically similar memories into a single recap memory, reducing retrieval noise while preserving the most informative details."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d21"
+content = "Session tracking stamps each memory with the active session ID at write time so memories can later be filtered or grouped by the conversation that produced them."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d22"
+content = "Tags are stored in a side table and linked to memories by ID; the tag index supports fast multi-tag intersection queries without additional columns on the memories table."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d23"
+content = "Apple Vision OCR processes each captured frame and passes cleaned text through the OCR text cleanup pipeline before ContextBundle assembly."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d24"
+content = "Frame comparison applies a 3-tier strategy (downscale, perceptual hash, Hellinger distance) and drops frames below the similarity threshold before invoking OCR."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d25"
+content = "Domain boost applies a 1.5x multiplier to retrieval scores when the query explicitly names the memory domain, improving precision for project-scoped searches."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d26"
+content = "FastEmbed caches GTE-Base-EN-v1.5-Q model weights in .fastembed_cache/ at the repo root; the 140 MB weights are downloaded once on first startup."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d27"
+content = "Batch insert and delete operations are wrapped in explicit BEGIN/COMMIT transactions to ensure atomicity and avoid excessive per-row WAL entries."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d28"
+content = "The code-aware chunker preserves fenced code blocks as atomic units and stores the language tag from the fence as chunk metadata for language-filtered retrieval."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d29"
+content = "Markdown-aware chunking inherits parent heading hierarchy as metadata on each chunk, enabling section-level filtering without reprocessing the source document."
+memory_type = "fact"
+domain = "origin"
+relevance = 0
+
+[[cases.seeds]]
+id = "hd2_d30"
+content = "Source deduplication during retrieval removes candidates sharing a source_id, then a content Jaccard pass removes near-duplicate text before final RRF ranking."
+memory_type = "fact"
+domain = "origin"
+relevance = 0

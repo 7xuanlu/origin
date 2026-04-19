@@ -1,0 +1,50 @@
+# Quality gate novelty tests — verify semantic duplicates are caught
+# while genuinely different memories about related topics are admitted.
+
+[[cases]]
+query = "dark mode preferences"
+
+# First memory (should be admitted and present in results)
+[[cases.seeds]]
+id = "mem_dark_original"
+content = "User prefers dark mode for all IDEs and terminal applications"
+memory_type = "preference"
+relevance = 3
+confirmed = true
+
+# Semantic duplicate (should be caught by novelty gate, not in DB)
+[[cases.negative_seeds]]
+id = "mem_dark_duplicate"
+content = "The user likes dark theme in code editors and terminals"
+memory_type = "preference"
+
+# Genuinely different memory about a related topic (should be admitted)
+[[cases.seeds]]
+id = "mem_theme_config"
+content = "VS Code theme is set to One Dark Pro. Terminal uses Dracula theme. Vim uses gruvbox colorscheme."
+memory_type = "fact"
+relevance = 2
+
+
+[[cases]]
+query = "database technology choices"
+
+[[cases.seeds]]
+id = "mem_db_decision"
+content = "Decided to use libSQL for the embedded database because it supports vectors, FTS5, and knowledge graph in a single file"
+memory_type = "decision"
+relevance = 3
+confirmed = true
+
+# Semantic duplicate of the decision above
+[[cases.negative_seeds]]
+id = "mem_db_duplicate"
+content = "We chose libSQL as our database since it has native vector support and full-text search built in"
+memory_type = "decision"
+
+# Different but related fact (should be admitted)
+[[cases.seeds]]
+id = "mem_db_config"
+content = "Database file is located at ~/Library/Application Support/origin/memorydb/origin_memory.db with DiskANN vector indexing enabled"
+memory_type = "fact"
+relevance = 2

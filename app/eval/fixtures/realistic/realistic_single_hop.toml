@@ -1,0 +1,1184 @@
+# Realistic single-hop retrieval — direct questions where the answer lives in one memory
+# but is buried among 20-30 other plausible memories from the same user's life.
+# Vocabulary mismatch between queries and seeds is intentional.
+# Difficulty: varies from hard to easy across cases.
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# "what language is the backend written in"
+# Answer says "Rust" and "server-side" — never says "language" or "backend"
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what language is the backend written in"
+
+[[cases.seeds]]
+id = "rsh_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees and the ability to do zero-cost FFI with macOS CoreGraphics. The compiled binary is roughly 35 MB."
+memory_type = "decision"
+domain = "work"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "rsh_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state. Vite handles bundling and HMR during development."
+memory_type = "fact"
+domain = "work"
+relevance = 1
+
+[[cases.seeds]]
+id = "rsh_proj_tauri"
+content = "Desktop shell is built with Tauri 2 to avoid the Electron memory overhead. The webview communicates with the native layer through IPC commands."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_proj_db"
+content = "All data lives in a single libSQL instance — vectors, graph, documents, full-text index. No external database process to manage."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU acceleration. A dedicated thread handles the generation loop to avoid blocking the async runtime."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q, a quantized transformer model loaded through ONNX. Output vectors are 768-dimensional."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_pref_editor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback when Cursor's AI features are distracting during review work."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM. Secondary display is an LG UltraFine 5K."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_identity_role"
+content = "Solo indie developer working on a personal AI memory product. Previously spent four years at a mid-size SaaS company doing full-stack work."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM. Avoids caffeine entirely after 5 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score and adjusts workout intensity accordingly."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_health_allergy"
+content = "Has a mild tree nut allergy — walnuts and pecans specifically. Almonds and cashews are fine."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym membership, and a few smaller tools."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_travel_home"
+content = "Lives in a one-bedroom apartment in the Mission District, San Francisco. Has been there since mid-2023."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_pref_music"
+content = "Listens to lo-fi hip hop or ambient electronic while coding. Switches to podcasts during commute walks."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_food_diet"
+content = "Mostly plant-based diet but not strict. Eats fish once or twice a week. Cooks at home 4-5 nights."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_proj_testing"
+content = "Test suite covers both frontend (Vitest + React Testing Library) and Rust (cargo test). Pre-push hook enforces 90% coverage gate."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_proj_deploy"
+content = "App is distributed as a macOS .dmg built by Tauri's bundler. No CI/CD pipeline yet — builds are manual from the development machine."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_proj_license"
+content = "Main application is AGPL-3.0. The MCP client library is MIT-licensed in a separate repository to encourage adoption."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_pref_comms"
+content = "Prefers async communication. Checks email twice a day and Slack messages in batches. Keeps notifications off except for direct mentions."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock in the embedding migration, started the eval framework. No user testing yet."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_goal_launch"
+content = "Primary goal for April: get the product to three beta testers and collect qualitative feedback on the memory retrieval quality."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_pref_reading"
+content = "Reads mostly non-fiction — recently finished Thinking in Systems by Donella Meadows. Keeps a reading list in Notion."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh_identity_values"
+content = "Values craftsmanship over speed. Willing to spend extra time on architecture if it prevents accumulated tech debt."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# "does the user have any pets"
+# Empty-set case — no memory mentions pets. Noise includes animals in other contexts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "does the user have any pets"
+empty_set = true
+
+[[cases.seeds]]
+id = "rsh2_health_allergy"
+content = "Has a mild tree nut allergy — walnuts and pecans specifically. Almonds and cashews are fine."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_travel_home"
+content = "Lives in a one-bedroom apartment in the Mission District, San Francisco. Has been there since mid-2023."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_food_diet"
+content = "Mostly plant-based diet but not strict. Eats fish once or twice a week. Cooks at home 4-5 nights."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_pref_editor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees and CoreGraphics FFI."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_pref_music"
+content = "Listens to lo-fi hip hop or ambient electronic while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym membership."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_pref_comms"
+content = "Prefers async communication. Checks email twice a day and Slack messages in batches."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock in the embedding migration."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_pref_reading"
+content = "Reads mostly non-fiction. Recently finished Thinking in Systems by Donella Meadows."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_identity_values"
+content = "Values craftsmanship over speed. Willing to spend extra time on architecture."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+# Near-miss: mentions an animal but not as a pet
+[[cases.seeds]]
+id = "rsh2_travel_safari"
+content = "Took a trip to Tanzania in 2022 and did a safari in Serengeti. Saw elephants, lions, and a cheetah. Would love to go back."
+memory_type = "fact"
+domain = "travel"
+relevance = 0
+
+# Near-miss: mentions animal-related content
+[[cases.seeds]]
+id = "rsh2_food_recipe"
+content = "Favorite recipe right now is a Thai coconut curry with tofu. Uses red curry paste from Mae Ploy and tops with fresh basil from the farmers market."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh2_proj_license"
+content = "Main application is AGPL-3.0. The MCP client library is MIT-licensed in a separate repo."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 3 ──────────────────────────────────────────────────────────────────
+# "where did the user go to school"
+# Answer uses "studied" and "university" — query says "go to school"
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "where did the user go to school"
+
+[[cases.seeds]]
+id = "rsh3_edu"
+content = "Studied computer science at UC Berkeley, graduated in 2019. Did an internship at Stripe the summer before senior year."
+memory_type = "identity"
+domain = "personal"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "rsh3_identity_role"
+content = "Solo indie developer working on a personal AI memory product. Previously spent four years at a mid-size SaaS company."
+memory_type = "identity"
+domain = "personal"
+relevance = 1
+
+[[cases.seeds]]
+id = "rsh3_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees and CoreGraphics FFI."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_health_allergy"
+content = "Has a mild tree nut allergy — walnuts and pecans specifically."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_travel_home"
+content = "Lives in a one-bedroom apartment in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_pref_music"
+content = "Listens to lo-fi hip hop or ambient electronic while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_food_diet"
+content = "Mostly plant-based diet but not strict. Eats fish once or twice a week."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_proj_tauri"
+content = "Desktop shell is built with Tauri 2 to avoid the Electron memory overhead."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_proj_db"
+content = "All data lives in a single libSQL instance — vectors, graph, documents, full-text index."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU acceleration on a dedicated thread."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_pref_editor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_pref_comms"
+content = "Prefers async communication. Checks email twice a day and Slack messages in batches."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock in the embedding migration."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_pref_reading"
+content = "Reads mostly non-fiction. Recently finished Thinking in Systems by Donella Meadows."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+# Near-miss: mentions learning but not school
+[[cases.seeds]]
+id = "rsh3_learning"
+content = "Taking an online course on advanced Rust patterns through Jon Gjengset's Crust of Rust series. Plans to apply ownership patterns to the capture pipeline."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_identity_values"
+content = "Values craftsmanship over speed. Willing to spend extra time on architecture."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q, a quantized transformer model loaded through ONNX."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh3_proj_testing"
+content = "Test suite covers both frontend (Vitest + React Testing Library) and Rust (cargo test). Pre-push hook enforces 90% coverage."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 4 ──────────────────────────────────────────────────────────────────
+# "how much does the user exercise"
+# Answer says "gym four times a week" and "running" — query says "exercise"
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "how much does the user exercise"
+
+[[cases.seeds]]
+id = "rsh4_fitness"
+content = "Goes to the gym four mornings a week — two upper body sessions and two lower body. Runs 5K on Saturdays at Dolores Park when the weather is good."
+memory_type = "fact"
+domain = "health"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "rsh4_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score and adjusts workout intensity accordingly."
+memory_type = "fact"
+domain = "health"
+relevance = 2
+
+[[cases.seeds]]
+id = "rsh4_health_allergy"
+content = "Has a mild tree nut allergy — walnuts and pecans specifically. Almonds and cashews are fine."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_food_diet"
+content = "Mostly plant-based diet but not strict. Eats fish once or twice a week. Cooks at home 4-5 nights."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_travel_home"
+content = "Lives in a one-bedroom apartment in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_pref_editor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_pref_music"
+content = "Listens to lo-fi hip hop or ambient electronic while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym membership."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_pref_comms"
+content = "Prefers async communication. Checks email twice a day and Slack messages in batches."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock in the embedding migration."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_pref_reading"
+content = "Reads mostly non-fiction. Recently finished Thinking in Systems."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_proj_db"
+content = "All data lives in a single libSQL instance — vectors, graph, documents, full-text index."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU acceleration."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_proj_testing"
+content = "Test suite covers both frontend and Rust. Pre-push hook enforces 90% coverage."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_proj_license"
+content = "Main application is AGPL-3.0. The MCP client library is MIT-licensed."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_identity_values"
+content = "Values craftsmanship over speed. Willing to spend extra time on architecture."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh4_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q, a quantized transformer model."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 5 ──────────────────────────────────────────────────────────────────
+# "what does the user do for a living"
+# Answer says "indie developer" and "AI memory product" — query says "do for a living"
+# Hard because many work seeds exist but only one captures the occupation
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what does the user do for a living"
+
+[[cases.seeds]]
+id = "rsh5_identity_role"
+content = "Solo indie developer working on a personal AI memory product. Previously spent four years at a mid-size SaaS company doing full-stack work."
+memory_type = "identity"
+domain = "personal"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "rsh5_edu"
+content = "Studied computer science at UC Berkeley, graduated in 2019. Did an internship at Stripe the summer before senior year."
+memory_type = "identity"
+domain = "personal"
+relevance = 1
+
+[[cases.seeds]]
+id = "rsh5_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees and CoreGraphics FFI."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_proj_tauri"
+content = "Desktop shell is built with Tauri 2 to avoid the Electron memory overhead."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_proj_db"
+content = "All data lives in a single libSQL instance — vectors, graph, documents, full-text index."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU acceleration."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q, a quantized transformer model."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_pref_editor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_health_allergy"
+content = "Has a mild tree nut allergy — walnuts and pecans specifically."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_travel_home"
+content = "Lives in a one-bedroom apartment in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_pref_music"
+content = "Listens to lo-fi hip hop or ambient electronic while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_food_diet"
+content = "Mostly plant-based diet but not strict. Eats fish once or twice a week."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_pref_comms"
+content = "Prefers async communication. Checks email twice a day and Slack in batches."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock in the embedding migration."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_pref_reading"
+content = "Reads mostly non-fiction. Recently finished Thinking in Systems by Donella Meadows."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_identity_values"
+content = "Values craftsmanship over speed. Willing to spend extra time on architecture."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_proj_testing"
+content = "Test suite covers both frontend and Rust. Pre-push hook enforces 90% coverage."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh5_fitness"
+content = "Goes to the gym four mornings a week. Runs 5K on Saturdays at Dolores Park."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+
+# ─── CASE 6 ──────────────────────────────────────────────────────────────────
+# "what package manager does the project use"
+# Hard: answer says "pnpm" — but there are seeds mentioning npm, cargo, etc.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what package manager does the project use"
+
+[[cases.seeds]]
+id = "rsh6_pnpm"
+content = "Switched to pnpm early on for stricter dependency isolation and faster installs. Lockfile is committed to the repo."
+memory_type = "decision"
+domain = "work"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "rsh6_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees and CoreGraphics FFI. The compiled binary is roughly 35 MB."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state. Vite handles bundling and HMR during development."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_tauri"
+content = "Desktop shell is built with Tauri 2. The webview communicates with the native layer through IPC commands."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_db"
+content = "All data lives in a single libSQL instance — vectors, graph, documents, full-text index."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU acceleration on a dedicated thread."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q, a quantized transformer model."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_testing"
+content = "Test suite covers both frontend (Vitest + React Testing Library) and Rust (cargo test)."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+# Near-miss: mentions cargo which is also a package manager
+[[cases.seeds]]
+id = "rsh6_proj_cargo"
+content = "Cargo workspace is configured at the repo root with a single member crate. Build cache is shared across git worktrees."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_pref_editor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_travel_home"
+content = "Lives in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_pref_comms"
+content = "Prefers async communication. Checks email twice a day."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock in the embedding migration."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_license"
+content = "Main application is AGPL-3.0. The MCP client library is MIT-licensed."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_proj_deploy"
+content = "App is distributed as a macOS .dmg built by Tauri's bundler. No CI/CD pipeline yet."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh6_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 7 ──────────────────────────────────────────────────────────────────
+# "what's the user's email setup"
+# Hard: no memory directly says "email setup" — only communication preferences
+# mention email indirectly
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what's the user's email setup"
+
+[[cases.seeds]]
+id = "rsh7_comms"
+content = "Prefers async communication. Checks email twice a day — once after morning standup, once before end of day. Uses Apple Mail on the Mac and the Gmail app on iPhone."
+memory_type = "preference"
+domain = "work"
+relevance = 3
+
+[[cases.seeds]]
+id = "rsh7_notif"
+content = "Keeps notifications off except for direct mentions in Slack. Email notifications are batched, not real-time."
+memory_type = "preference"
+domain = "work"
+relevance = 2
+
+[[cases.seeds]]
+id = "rsh7_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_pref_editor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_health_allergy"
+content = "Has a mild tree nut allergy — walnuts and pecans specifically."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_travel_home"
+content = "Lives in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_pref_music"
+content = "Listens to lo-fi hip hop or ambient electronic while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_food_diet"
+content = "Mostly plant-based diet but not strict. Eats fish once or twice a week."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_proj_db"
+content = "All data lives in a single libSQL instance — vectors, graph, documents, full-text index."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU acceleration."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_pref_reading"
+content = "Reads mostly non-fiction. Recently finished Thinking in Systems."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_identity_values"
+content = "Values craftsmanship over speed. Willing to spend extra time on architecture."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_proj_testing"
+content = "Test suite covers both frontend and Rust. Pre-push hook enforces 90% coverage."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rsh7_fitness"
+content = "Goes to the gym four mornings a week. Runs 5K on Saturdays."
+memory_type = "fact"
+domain = "health"
+relevance = 0

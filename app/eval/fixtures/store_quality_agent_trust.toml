@@ -1,0 +1,56 @@
+# Agent trust levels — memories from high-trust agents should rank above untrusted.
+# Pattern from real DB: agent naming inconsistency ("claude-code" vs "Claude Code" vs "claude"),
+# and refinery-generated recaps (100 memories) ranking alongside human-curated content.
+
+[[cases]]
+query = "database connection pooling"
+
+# Human-confirmed memory from trusted agent
+[[cases.seeds]]
+id = "mem_db_confirmed"
+content = "libSQL Connection is Send but not Sync. Wrap in tokio::sync::Mutex for shared access from AppState. Single connection per app instance is sufficient for local-first usage."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+# Same topic from trusted agent, unconfirmed
+[[cases.seeds]]
+id = "mem_db_unconfirmed"
+content = "WAL mode enabled for concurrent reads during write operations. Foreign keys enforced via PRAGMA at connection time."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Auto-generated recap — lower trust, should rank below originals
+[[cases.negative_seeds]]
+id = "mem_db_recap_auto"
+content = "Session recap: investigated database connection issues, configured WAL mode, tested concurrent access patterns."
+memory_type = "recap"
+domain = "projectA"
+
+
+[[cases]]
+query = "configuration file format"
+
+[[cases.seeds]]
+id = "mem_config_toml"
+content = "Intelligence tuning parameters loaded from TOML at startup. File at ~/Library/Application Support/origin/intelligence.toml. Missing keys fall back to serde defaults — partial overrides work correctly."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_config_json"
+content = "User-facing config stored as JSON at ~/Library/Application Support/origin/config.json. Includes watch paths, feature toggles, skip list for privacy-sensitive apps."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Generic fact about config formats — not project-specific
+[[cases.negative_seeds]]
+id = "mem_config_generic"
+content = "TOML is preferred over YAML for configuration files due to explicit typing and no indentation sensitivity."
+memory_type = "fact"
+domain = "general"

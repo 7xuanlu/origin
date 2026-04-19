@@ -1,0 +1,212 @@
+# Quality gate realistic agent session tests — verify gate admits high-signal
+# memories from real agent workflows while rejecting low-value noise that agents
+# commonly write alongside genuine insights.
+
+# Session 1: Developer onboarding session
+# An agent walks a new developer through the Origin codebase architecture.
+
+[[cases]]
+query = "how does state management work in the Rust backend"
+
+# Useful memories the agent learned and stored
+[[cases.seeds]]
+id = "mem_onboard_state_arch"
+content = "AppState is wrapped in Arc<RwLock<AppState>> managed by Tauri; libsql::Connection is not Sync so it lives inside a tokio::sync::Mutex inside AppState"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_onboard_atomic_flags"
+content = "Feature toggle flags (capture_enabled, ambient_enabled) use Arc<AtomicBool> shared with sensor threads so hot-loop reads never need to acquire the AppState lock"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+
+[[cases.seeds]]
+id = "mem_onboard_setup_gotcha"
+content = "Calling tokio::runtime::Handle::current() inside Tauri's setup() closure panics — must use tauri::async_runtime::block_on(async { Handle::current() }) to capture the handle"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_onboard_llm_bridge"
+content = "The LLM formatter runs on a dedicated std::thread and uses a captured Tokio handle to call handle.block_on() for async DB writes from the GPU inference thread"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+# Junk the agent also stored — plausible-looking but zero retrieval value
+[[cases.negative_seeds]]
+id = "junk_onboard_greeting"
+content = "The developer said hello and asked where to start with the codebase"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_onboard_generic_rwlock"
+content = "RwLock allows multiple concurrent readers or a single exclusive writer, which is a common pattern for shared state in concurrent Rust programs"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_onboard_ack1"
+content = "Developer confirmed they understood the explanation of the thread model"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_onboard_sysprompt"
+content = "You are a helpful engineering assistant. Help the developer understand the codebase by explaining architecture decisions clearly and concisely."
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_onboard_obvious"
+content = "Rust is a systems programming language that emphasizes memory safety and performance without a garbage collector"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_onboard_restate"
+content = "The developer is new to the codebase and needs to understand how the backend is structured"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_onboard_generic_arc"
+content = "Arc enables shared ownership across threads by using atomic reference counting, which is thread-safe unlike Rc"
+memory_type = "fact"
+
+
+# Session 2: Debugging session
+# An agent helps debug a production issue where semantic search returns no results.
+
+[[cases]]
+query = "why did semantic search stop returning results"
+
+# Useful memories: root cause, fix, and lesson
+[[cases.seeds]]
+id = "mem_debug_root_cause"
+content = "libsql 0.9.29 broke vector_top_k result column naming — vt.distance no longer works; must use vector_distance_cos(chunks.embedding, ?) to compute similarity in the outer query"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_debug_fix"
+content = "Fixed semantic search by replacing vt.distance with vector_distance_cos() in the hybrid search query in memory_db.rs; all vector similarity scores now return correctly"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_debug_lesson"
+content = "When upgrading libsql, test vector_top_k result column aliases first — the crate does not guarantee stable internal column names across minor versions"
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+# Junk the agent stored during the debug session
+[[cases.negative_seeds]]
+id = "junk_debug_stacktrace"
+content = "thread 'tokio-runtime-worker' panicked at 'called Result::unwrap() on an Err value: LibsqlError { message: \"no such column: vt.distance\" }', app/src/memory_db.rs:412"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_debug_hypothesis1"
+content = "Initial hypothesis: the embedding dimension changed from 384 to 512 and stored vectors are incompatible with the new model — this turned out to be incorrect"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_debug_hypothesis2"
+content = "Considered that FTS5 triggers might be dropping rows during upsert, causing the chunks table to appear empty — ruled out after confirming row counts"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_debug_timestamp"
+content = "Issue first reported at 2026-03-24T09:15:00Z; root cause identified at 2026-03-24T11:42:00Z; fix deployed at 2026-03-24T12:08:00Z"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_debug_status_update"
+content = "Currently investigating the semantic search regression; narrowing down whether the issue is in the embedding pipeline or the vector similarity query"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_debug_generic_advice"
+content = "When debugging database query issues, it helps to isolate each clause of the query and verify intermediate results against known-good data"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_debug_restate"
+content = "The problem is that search_memory returns zero results even when the database contains chunks that should match the query"
+memory_type = "fact"
+
+
+# Session 3: Planning/design session
+# An agent helps design the ingest quality gate feature.
+
+[[cases]]
+query = "what is the quality gate and how should it filter memories"
+
+# Useful memories: requirements, architecture decisions, trade-off rationale
+[[cases.seeds]]
+id = "mem_plan_quality_gate_def"
+content = "The ingest quality gate is a pre-storage filter that rejects noise before it reaches MemoryDB — catches system prompt bleed, timestamp-only entries, semantic duplicates, and zero-information acknowledgments"
+memory_type = "decision"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_plan_two_stage"
+content = "Quality gate runs two stages: (1) rule-based fast rejection for structural noise patterns (regex, length, entropy), then (2) semantic novelty check via cosine similarity against recent embeddings to catch rephrased duplicates"
+memory_type = "decision"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_plan_novelty_threshold"
+content = "Novelty threshold set at 0.85 cosine similarity — memories scoring above this against any existing chunk in the same domain within 7 days are rejected as duplicates; threshold chosen to match the existing bigram Jaccard dedup in the router"
+memory_type = "decision"
+domain = "origin"
+relevance = 3
+
+[[cases.seeds]]
+id = "mem_plan_no_llm_gate"
+content = "Decided against using an LLM call in the quality gate critical path — adds 200-800ms latency per memory write; rule-based + embedding similarity catches 90%+ of noise without blocking the ingest pipeline"
+memory_type = "decision"
+domain = "origin"
+relevance = 2
+
+# Junk from the planning session
+[[cases.negative_seeds]]
+id = "junk_plan_rejected_idea1"
+content = "Brainstormed using a small classifier model fine-tuned on labeled noise/signal pairs — rejected because it requires training data we don't have and adds a model dependency"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_plan_rejected_idea2"
+content = "Considered adding a human review queue for low-confidence memories — set aside for v2 since it adds friction to the zero-config experience"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_plan_meta"
+content = "Let me think through the requirements carefully before proposing an architecture for the quality gate feature"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_plan_restate_req"
+content = "The goal is to make sure that only high-quality, useful memories are stored in the database and that low-quality or duplicate content is filtered out"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_plan_generic_best_practice"
+content = "In general, input validation and filtering should happen as early as possible in a pipeline to avoid wasting compute on low-quality data downstream"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "junk_plan_restate2"
+content = "The ingest quality gate should prevent junk memories from being stored so that search results stay relevant and the database does not grow unbounded with noise"
+memory_type = "fact"

@@ -1,0 +1,68 @@
+{
+  "name": "origin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "packageManager": "pnpm@10.28.2",
+  "scripts": {
+    "dev": "vite",
+    "dev:daemon": "cargo build -p origin-server && (lsof -ti :7878 | xargs kill -9 2>/dev/null; sleep 0.3; target/debug/origin-server &)",
+    "dev:all": "pnpm clean:dev && pnpm dev:daemon && pnpm tauri dev",
+    "build": "tsc -b && vite build",
+    "build:daemon": "cargo build -p origin-server",
+    "build:all": "pnpm build:daemon && pnpm build",
+    "release:daemon": "cargo build --release -p origin-server",
+    "release": "pnpm clean:release && TRIPLE=$(rustc -vV | grep host | awk '{print $2}') && pnpm release:daemon && cp target/release/origin-server app/binaries/origin-server-$TRIPLE && CXXFLAGS='-std=c++17' pnpm tauri build",
+    "release:dmg": "rm -f target/release/bundle/macos/rw.*.dmg && mkdir -p target/release/bundle/dmg && rm -f target/release/bundle/dmg/Origin_0.1.0_aarch64.dmg && hdiutil create -volname Origin -srcfolder target/release/bundle/macos -ov -format UDZO target/release/bundle/dmg/Origin_0.1.0_aarch64.dmg",
+    "clean:dev": "pkill -9 -f origin-server 2>/dev/null; pkill -9 -f 'target/debug/origin' 2>/dev/null; lsof -ti :7878 2>/dev/null | xargs kill -9 2>/dev/null; lsof -ti :1420 2>/dev/null | xargs kill -9 2>/dev/null; sleep 0.3; echo 'Dev processes cleaned'",
+    "clean:release": "rm -f target/release/bundle/macos/rw.*.dmg; rm -rf target/release/bundle/dmg/Origin_*.dmg; echo 'Release artifacts cleaned'",
+    "clean:all": "pnpm clean:dev && pnpm clean:release && echo 'All cleaned'",
+    "preview": "vite preview",
+    "tauri": "TAURI_DIR=app tauri",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:all": "pnpm test && cd app && cargo test",
+    "test:coverage:all": "pnpm test:coverage && cd app && cargo llvm-cov --html"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.0.0",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.0",
+    "@tauri-apps/plugin-fs": "^2.5.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.0.0",
+    "@tauri-apps/plugin-notification": "^2.3.3",
+    "@tauri-apps/plugin-shell": "^2.0.0",
+    "d3-force": "^3.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-force-graph-2d": "^1.29.1",
+    "react-markdown": "^10.1.0",
+    "react-masonry-css": "^1.0.16",
+    "remark-gfm": "^4.0.1",
+    "sonner": "^2.0.7",
+    "tauri-plugin-clipboard-x-api": "^2.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/d3-force": "^3.0.10",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "@vitest/coverage-v8": "^4.1.0",
+    "jsdom": "^28.1.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vitest": "^4.1.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

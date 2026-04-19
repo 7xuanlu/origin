@@ -1,0 +1,58 @@
+# Recap flooding — domains with high recap ratios dilute original content.
+# Pattern from real DB: "technology" domain is 95.5% recaps (21/22),
+# "homepage" is 88.9% recaps. Original content gets buried.
+
+[[cases]]
+query = "CSS grid layout patterns"
+
+# The one original memory in a recap-heavy domain
+[[cases.seeds]]
+id = "mem_css_original"
+content = "Use CSS Grid for 2D layouts and Flexbox for 1D. Grid template areas provide readable layout definitions. Auto-fit with minmax enables responsive grids without media queries."
+memory_type = "fact"
+domain = "frontend"
+relevance = 3
+confirmed = true
+
+# Recaps that mention CSS but are just session summaries
+[[cases.negative_seeds]]
+id = "mem_css_recap1"
+content = "Session recap: worked on responsive layout for the dashboard page, adjusted grid column widths, fixed mobile breakpoint issues."
+memory_type = "recap"
+domain = "frontend"
+
+[[cases.negative_seeds]]
+id = "mem_css_recap2"
+content = "Session recap: implemented dark mode theme, updated CSS variables, tested grid layout in both light and dark modes."
+memory_type = "recap"
+domain = "frontend"
+
+[[cases.negative_seeds]]
+id = "mem_css_recap3"
+content = "Session recap: refactored component styles to use Tailwind utility classes, removed custom CSS grid definitions in favor of Tailwind grid."
+memory_type = "recap"
+domain = "frontend"
+
+
+[[cases]]
+query = "image optimization strategy"
+
+[[cases.seeds]]
+id = "mem_img_decision"
+content = "Serve WebP with AVIF fallback for modern browsers. Lazy load below-fold images with loading=lazy. Use srcset for responsive sizes at 640w, 1024w, and 1920w breakpoints."
+memory_type = "decision"
+domain = "frontend"
+relevance = 3
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "mem_img_recap"
+content = "Session recap: optimized hero images, compressed PNG assets, added lazy loading to product gallery. Reduced page weight by 40%."
+memory_type = "recap"
+domain = "frontend"
+
+[[cases.negative_seeds]]
+id = "mem_img_recap2"
+content = "Session recap: migrated image pipeline to use sharp for server-side resizing. Generated WebP variants for all static assets."
+memory_type = "recap"
+domain = "frontend"

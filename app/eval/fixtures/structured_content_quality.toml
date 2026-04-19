@@ -1,0 +1,128 @@
+# Structured content quality — tests retrieval when structured_fields are present.
+# Content is natural language (as agents write it). Structured fields are the extracted sidecar.
+# The pipeline flattens structured_fields into content and keeps prose in source_text for embedding.
+
+[[cases]]
+query = "dark mode preference for editors"
+
+[[cases.seeds]]
+id = "mem_pref_dark"
+content = "I strongly prefer dark mode in all my editors and terminals"
+memory_type = "preference"
+domain = "tools"
+relevance = 3
+confirmed = true
+structured_fields = '{"preference":"dark mode","applies_when":"editors, terminals","strength":"strong"}'
+
+[[cases.seeds]]
+id = "mem_pref_vim"
+content = "I like using relative line numbers in vim for easier navigation"
+memory_type = "preference"
+domain = "tools"
+relevance = 1
+structured_fields = '{"preference":"relative line numbers","applies_when":"vim configuration"}'
+
+[[cases.negative_seeds]]
+id = "mem_pref_light"
+content = "I prefer light mode when reading long documents or articles"
+memory_type = "preference"
+domain = "tools"
+structured_fields = '{"preference":"light mode","applies_when":"reading documents","strength":"moderate"}'
+
+# Hard negative: mentions dark mode and editor preference but is about a specific theme, not the general preference
+[[cases.negative_seeds]]
+id = "mem_pref_theme"
+content = "Switched VS Code theme from One Dark Pro to Catppuccin Mocha because the contrast ratio is better for long coding sessions. Editor font is JetBrains Mono 14pt."
+memory_type = "preference"
+domain = "tools"
+
+# Hard negative: mentions editor terminal preference but is about keybindings, not visual mode
+[[cases.negative_seeds]]
+id = "mem_pref_keybindings"
+content = "I use vim keybindings in VS Code with the VSCodeVim extension. Terminal uses tmux with a custom prefix key set to Ctrl-A instead of the default Ctrl-B."
+memory_type = "preference"
+domain = "tools"
+
+
+[[cases]]
+query = "what decision was made about the database"
+
+[[cases.seeds]]
+id = "mem_dec_libsql"
+content = "I decided to use libSQL instead of SQLite because it supports vectors and FTS in a single database file"
+memory_type = "decision"
+domain = "origin"
+relevance = 3
+confirmed = true
+structured_fields = '{"decision":"use libSQL","context":"need unified DB with vector and FTS","alternatives_considered":"PostgreSQL, MongoDB, SQLite"}'
+
+[[cases.seeds]]
+id = "mem_dec_agpl"
+content = "Chose AGPL-3.0-only license for the origin app to protect the open source release"
+memory_type = "decision"
+domain = "origin"
+relevance = 2
+structured_fields = '{"decision":"AGPL-3.0-only for origin app","context":"licensing for open source release"}'
+
+[[cases.negative_seeds]]
+id = "mem_dec_unrelated"
+content = "Decided to use GraphQL for the mobile app API because it reduces over-fetching"
+memory_type = "decision"
+domain = "other_project"
+structured_fields = '{"decision":"use GraphQL","context":"API design for mobile app"}'
+
+# Hard negative: mentions database decision but is about the DB path, not which DB was chosen
+[[cases.negative_seeds]]
+id = "mem_dec_db_path"
+content = "Database file is stored at ~/Library/Application Support/origin/memorydb/origin_memory.db. This location was chosen because macOS sandboxing allows app-specific data under Application Support."
+memory_type = "decision"
+domain = "origin"
+
+# Hard negative: mentions database and decision but is about connection pooling, not DB selection
+[[cases.negative_seeds]]
+id = "mem_dec_conn_pool"
+content = "Decided against connection pooling because libSQL in WAL mode supports concurrent reads with a single writer. The tokio::sync::Mutex wrapper serializes writes without the overhead of a pool."
+memory_type = "decision"
+domain = "origin"
+
+
+[[cases]]
+query = "Lucian identity claims"
+
+[[cases.seeds]]
+id = "mem_id_rust"
+content = "I am a full-stack developer specializing in Rust and TypeScript"
+memory_type = "identity"
+domain = "personal"
+relevance = 3
+confirmed = true
+structured_fields = '{"claim":"full-stack developer specializing in Rust and TypeScript"}'
+
+[[cases.seeds]]
+id = "mem_id_founder"
+content = "I co-founded an S-Corp before joining Meta, with a US citizen co-founder holding majority ownership"
+memory_type = "identity"
+domain = "personal"
+relevance = 2
+structured_fields = '{"claim":"co-founded an S-Corp before joining Meta","evidence":"US citizen co-founder holds majority"}'
+
+[[cases.negative_seeds]]
+id = "mem_id_noise"
+content = "Experienced with cloud infrastructure and DevOps tooling across AWS and GCP"
+memory_type = "identity"
+domain = "personal"
+structured_fields = '{"claim":"experienced with cloud infrastructure and DevOps"}'
+
+# Hard negative: mentions identity and developer background but is about a team member, not the user
+[[cases.negative_seeds]]
+id = "mem_id_teammate"
+content = "Alice is a senior backend engineer on the team, specializing in distributed systems and database internals. She reviewed most of the memory pipeline PRs."
+memory_type = "fact"
+domain = "work"
+
+# Hard negative: mentions Lucian and developer claims but is about a conference talk, not identity
+[[cases.negative_seeds]]
+id = "mem_id_talk"
+content = "Submitted a talk proposal on building local-first AI memory systems with Rust and libSQL. Conference is in June 2026; acceptance notification pending."
+memory_type = "fact"
+domain = "personal"

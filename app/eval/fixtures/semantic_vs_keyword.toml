@@ -1,0 +1,83 @@
+# Semantic vs keyword match — queries using different words than the stored content.
+# Tests that vector similarity catches semantic matches, not just exact keyword overlap.
+# Pattern seen: FTS-heavy ranking missed conceptually related memories that used different terminology.
+
+[[cases]]
+query = "how to prevent storing duplicate information"
+
+# Uses "dedup" and "similarity threshold" — different words than "duplicate" and "prevent"
+[[cases.seeds]]
+id = "mem_dedup_semantic"
+content = "Post-ingest dedup check compares new content against existing memories using cosine similarity. Threshold of 0.85 catches near-duplicates while avoiding false merges."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+# Uses "supersede" — another synonym for handling duplicates
+[[cases.seeds]]
+id = "mem_supersede"
+content = "When a newer memory supersedes an older one, the supersede mode determines behavior: archive keeps the old version with a 0.5x score penalty, replace removes it entirely."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "mem_keyword_trap"
+content = "Prevent PII from being stored by running content through the privacy redaction pipeline. Credit cards, SSNs, API keys, and email addresses are detected and masked."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions dedup and preventing storage but is about quality gate rejection, not duplicate handling
+[[cases.negative_seeds]]
+id = "mem_prevent_low_quality"
+content = "The quality gate prevents low-quality information from being stored by checking minimum word count, language detection, and information density before the embedding step runs."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions duplicate and storage but is about recap dedup, not general dedup
+[[cases.negative_seeds]]
+id = "mem_recap_dedup"
+content = "Recap deduplication removes redundant session summaries from search results by comparing bigram Jaccard similarity between recap and original content with a 0.5 threshold."
+memory_type = "fact"
+domain = "projectA"
+
+
+[[cases]]
+query = "making search results more relevant"
+
+# Mentions "scoring", "ranking", "quality" — not "relevant" or "search results"
+[[cases.seeds]]
+id = "mem_scoring_tuning"
+content = "Tiered retrieval scoring multiplies RRF base by confidence, recency decay, quality assessment, and confirmation boost. Each factor is configurable via TuningConfig."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_reranking"
+content = "Optional LLM reranking as a second pass: on-device model rates each result 0-10 for query relevance, then results are re-sorted. 10 second timeout with graceful fallback."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "mem_unrelated_search"
+content = "The spotlight search UI supports keyboard navigation with Cmd+K activation. Source filters narrow results by memory type."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions search quality but is about the eval harness measuring quality, not improving it
+[[cases.negative_seeds]]
+id = "mem_eval_quality"
+content = "Search quality is measured via NDCG@10 and MAP@5 on curated fixture cases. The eval harness seeds an ephemeral database per case and runs queries against it to compute metrics."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions relevance and results but is about displaying results, not ranking them
+[[cases.negative_seeds]]
+id = "mem_result_display"
+content = "Search results are displayed with relevance badges showing memory type and domain. The MemoryCard component renders summary text first, falling back to raw content when no summary exists."
+memory_type = "fact"
+domain = "projectA"

@@ -1,0 +1,169 @@
+# Temporal decisions — multiple decisions on the same topic over time. The most recent decision
+# should rank highest, but older ones are still partially relevant. Tests that retrieval handles
+# temporal disambiguation.
+
+[[cases]]
+query = "which embedding model are we using"
+
+[[cases.seeds]]
+id = "htd_model_v1"
+content = "Chose BGE-Small-EN-v1.5 (384-dim) for embeddings. Fast inference, good quality for the initial version."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 1
+
+[[cases.seeds]]
+id = "htd_model_v2"
+content = "Upgraded embeddings from BGE-Small to GTE-Base-Q (768-dim). Doubles vector dimensions for better semantic capture. Migration 24 handles re-embedding."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 1
+
+[[cases.seeds]]
+id = "htd_model_v3"
+content = "Switched from GTE-Base-Q to BGE-Base-Q (768-dim, same dimensions). BGE-Base-Q scored +1.5% NDCG on LoCoMo and +75% on semantic disconnect. Same BAAI family as original."
+memory_type = "decision"
+domain = "origin"
+confirmed = true
+relevance = 3
+
+# Distractors — other technology decisions
+[[cases.seeds]]
+id = "htd_distractor_llm"
+content = "Chose Qwen3-4B-Instruct-2507 as the on-device LLM, running via llama-cpp-2 with Metal GPU acceleration."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_indexing"
+content = "Adopted DiskANN for approximate nearest-neighbor indexing over the memories table. Provides sub-millisecond retrieval at scale without a separate vector DB."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_rrf"
+content = "Using Reciprocal Rank Fusion (RRF) to combine vector similarity and FTS5 full-text search scores into a single hybrid ranking."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_libsql"
+content = "Selected libSQL (Turso's SQLite fork) as the single database for everything: vectors, knowledge graph, documents, and FTS."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_tauri"
+content = "Built the desktop shell with Tauri 2 targeting macOS-first. Avoids Electron's memory footprint while keeping a native system-tray experience."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_react"
+content = "Chose React 19 with TanStack React Query 5 for the frontend. Server state lives in React Query; cross-unmount state uses useSyncExternalStore module stores."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_pnpm"
+content = "Using pnpm as the package manager for the frontend monorepo. Faster installs and strict phantom-dependency prevention."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_prefix"
+content = "Settled on domain-only embedding prefix (e.g. '[origin]') rather than '[type | domain | agent]'. Autoresearch ablation showed +25% NDCG — type labels add noise."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+# Hard negative — different project's embedding decision
+[[cases.negative_seeds]]
+id = "htd_hard_neg_projectb"
+content = "Chose text-embedding-3-small from OpenAI for embeddings. Cost-effective at $0.02/million tokens; 1536-dim output truncated to 512 for storage efficiency."
+memory_type = "decision"
+domain = "projectB"
+
+[[cases]]
+query = "what is the current authentication approach"
+
+[[cases.seeds]]
+id = "htd_auth_v1"
+content = "No authentication initially — server binds to localhost only, so only local processes can reach it. Sufficient for single-user desktop use."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 1
+
+[[cases.seeds]]
+id = "htd_auth_v2"
+content = "Added bearer token authentication. Token generated on first launch and stored in config.json. Callers include it in the Authorization header."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 2
+
+[[cases.seeds]]
+id = "htd_auth_v3"
+content = "Now supports bearer tokens for MCP clients and session cookies for browser access. Tokens stored in config; cookies issued on first authenticated request and expire after 24 hours."
+memory_type = "decision"
+domain = "origin"
+confirmed = true
+relevance = 3
+
+# Distractors — auth-adjacent topics
+[[cases.seeds]]
+id = "htd_distractor_trust"
+content = "Agent trust levels (confirmed, inferred, speculative) gate which memory tiers are surfaced in context. Trust is per-source, not per-user."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_cors"
+content = "CORS is restricted to localhost origins on the Axum server. Remote browser extensions must proxy through a local relay to avoid cross-origin blocks."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_remote"
+content = "Remote access feature (PR #34) exposes the Axum HTTP API externally so ChatGPT and Claude can reach it. Integration testing underway."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+[[cases.seeds]]
+id = "htd_distractor_oauth"
+content = "OAuth gap: Claude.ai requires OAuth 2.0 for MCP connections, but origin-mcp only issues bearer tokens. Bridging this is a pending launch blocker."
+memory_type = "decision"
+domain = "origin"
+confirmed = false
+relevance = 0
+
+# Hard negative — different project's auth decision
+[[cases.negative_seeds]]
+id = "htd_hard_neg_projecta"
+content = "Implemented Google Sign-In for the mobile app using Firebase Auth. ID tokens are verified server-side; refresh tokens stored in the device keychain."
+memory_type = "decision"
+domain = "projectA"

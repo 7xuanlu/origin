@@ -1,0 +1,47 @@
+# Domain consistency — semantically equivalent domains should not fragment search.
+# Pattern from real DB: "technology" (22), "engineering" (11), "development" (5),
+# "software-engineering" (3) all contain similar technical facts that should share one domain.
+
+[[cases]]
+query = "async programming patterns"
+domain = "technology"
+
+[[cases.seeds]]
+id = "mem_async_tech"
+content = "Async/await in Rust requires pinning futures that borrow across yield points. Use Box::pin for heap allocation or pin! macro for stack pinning."
+memory_type = "fact"
+domain = "technology"
+relevance = 3
+confirmed = true
+
+# Same kind of content but fragmented across synonym domains
+[[cases.negative_seeds]]
+id = "mem_async_eng"
+content = "Error handling in async Rust uses the ? operator with Result types. Map errors at boundary layers using .map_err() to maintain type consistency."
+memory_type = "fact"
+domain = "engineering"
+
+[[cases.negative_seeds]]
+id = "mem_async_dev"
+content = "Structured concurrency patterns group related async tasks. Use JoinSet to spawn and await multiple tasks with automatic cancellation on drop."
+memory_type = "fact"
+domain = "development"
+
+
+[[cases]]
+query = "type system design decisions"
+domain = "software-engineering"
+
+[[cases.seeds]]
+id = "mem_types_se"
+content = "Prefer newtype pattern over type aliases for domain types. A UserId(String) prevents accidentally passing a SessionId where a UserId is expected."
+memory_type = "decision"
+domain = "software-engineering"
+relevance = 3
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "mem_types_tech"
+content = "Rust enums with associated data replace the visitor pattern. Match exhaustiveness guarantees all variants are handled at compile time."
+memory_type = "fact"
+domain = "technology"

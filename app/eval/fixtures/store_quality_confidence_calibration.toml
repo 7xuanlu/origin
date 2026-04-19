@@ -1,0 +1,65 @@
+# Confidence calibration — confirmed memories should outscore unconfirmed,
+# and high-quality should outscore low-quality.
+# Pattern from real DB: 7 confirmed memories have confidence < 0.5,
+# 247/276 memories have no quality assessment at all.
+
+[[cases]]
+query = "error handling best practices"
+
+# Confirmed, high-quality — should rank highest
+[[cases.seeds]]
+id = "mem_error_confirmed"
+content = "Use Result<T, OriginError> for all fallible operations. Map errors at module boundaries with .map_err(). Never use unwrap() in production code paths — only in tests and provably-safe contexts."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+quality = "high"
+
+# Unconfirmed but relevant — should rank second
+[[cases.seeds]]
+id = "mem_error_unconfirmed"
+content = "The OriginError enum has 13 variants covering VectorDb, Embedding, Indexer, Source, Io, Http, Json, Llm, Vision, Trigger, Router, AgentDisabled, and Generic."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Low-relevance tangential fact
+[[cases.seeds]]
+id = "mem_error_tangential"
+content = "Log filter defaults to warn level. Add modules explicitly for info-level logging with target filters."
+memory_type = "fact"
+domain = "projectA"
+relevance = 1
+
+# Different project's error handling — should not appear
+[[cases.negative_seeds]]
+id = "mem_error_other"
+content = "Express middleware catches unhandled promise rejections and returns a 500 status with a generic error message."
+memory_type = "fact"
+domain = "projectB"
+
+
+[[cases]]
+query = "window management and multi-window architecture"
+
+[[cases.seeds]]
+id = "mem_window_arch"
+content = "Four Tauri windows from a single webview, routed by URL hash: main for spotlight/memory/settings, toast for capture notifications, snip for region selection, quick-capture for thought input."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_window_toast"
+content = "Toast window is a transparent non-activating panel. It overlays without stealing focus from the user's current application."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "mem_window_generic"
+content = "Electron supports multiple BrowserWindow instances with separate renderer processes. Each window can load a different URL."
+memory_type = "fact"
+domain = "general"

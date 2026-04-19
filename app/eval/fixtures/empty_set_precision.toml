@@ -1,0 +1,102 @@
+# Empty-set precision — queries where the DB has nothing relevant.
+# All seeds are distractors. The system should express low confidence.
+
+[[cases]]
+query = "best Italian restaurants near downtown"
+empty_set = true
+
+[[cases.negative_seeds]]
+id = "neg_cooking_pref"
+content = "User prefers cooking at home with fresh ingredients over eating out"
+memory_type = "preference"
+domain = "personal"
+
+[[cases.negative_seeds]]
+id = "neg_rome_trip"
+content = "Visited Rome in 2024, loved the Colosseum and Vatican architecture"
+memory_type = "fact"
+domain = "travel"
+
+[[cases]]
+query = "Alice's phone number"
+empty_set = true
+
+[[cases.negative_seeds]]
+id = "neg_alice_project"
+content = "Alice reviewed the PR for the authentication module refactor"
+memory_type = "fact"
+domain = "work"
+
+[[cases.negative_seeds]]
+id = "neg_contacts_pref"
+content = "User prefers Signal over iMessage for group chats"
+memory_type = "preference"
+domain = "personal"
+
+[[cases]]
+query = "kubernetes cluster autoscaling configuration"
+empty_set = true
+
+[[cases.negative_seeds]]
+id = "neg_docker_compose"
+content = "Development environment uses docker-compose with PostgreSQL and Redis containers"
+memory_type = "fact"
+domain = "work"
+
+[[cases.negative_seeds]]
+id = "neg_deploy_script"
+content = "Deploy script runs cargo build --release then copies binary to /opt/origin/bin"
+memory_type = "fact"
+domain = "origin"
+
+[[cases.negative_seeds]]
+id = "neg_ci_pipeline"
+content = "GitHub Actions CI runs cargo test and cargo clippy on every PR"
+memory_type = "fact"
+domain = "origin"
+
+# Near-miss: mentions scaling and cluster but is about database, not k8s
+[[cases.negative_seeds]]
+id = "neg_db_cluster"
+content = "Considered clustering the libSQL database across multiple nodes for horizontal scaling but rejected it because the local-first architecture requires single-node operation."
+memory_type = "decision"
+domain = "origin"
+
+# Near-miss: mentions autoscaling and configuration but is about a load balancer, not k8s
+[[cases.negative_seeds]]
+id = "neg_autoscale_lb"
+content = "The Axum HTTP server auto-adjusts its connection pool size based on request load. Configuration caps the pool at 128 connections with a 30-second idle timeout."
+memory_type = "fact"
+domain = "origin"
+
+[[cases]]
+query = "what happened at the March board meeting"
+empty_set = true
+
+[[cases.negative_seeds]]
+id = "neg_standup"
+content = "Daily standup moved to 10am starting next week per team vote"
+memory_type = "decision"
+domain = "work"
+
+[[cases.negative_seeds]]
+id = "neg_quarterly"
+content = "Q1 revenue exceeded projections by 12%, driven by enterprise tier upgrades"
+memory_type = "fact"
+domain = "work"
+
+[[cases]]
+query = "how to make sourdough bread starter"
+empty_set = true
+
+[[cases.negative_seeds]]
+id = "neg_baking_none"
+content = "User tracks macros: 2200 calories, 180g protein target per day"
+memory_type = "preference"
+domain = "health"
+
+[[cases.negative_seeds]]
+id = "neg_grocery"
+content = "Switched to weekly grocery delivery from Instacart to save time"
+memory_type = "decision"
+domain = "personal"

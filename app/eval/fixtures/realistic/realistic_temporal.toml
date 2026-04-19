@@ -1,0 +1,1194 @@
+# Realistic temporal retrieval — time-sensitive questions where outdated memories compete
+# with current ones. Uses age_days and supersedes to create update chains.
+# Difficulty: varies — stale info tests are harder than clear recency cases.
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# "what project is the user currently working on"
+# Career progression: consulting gig (180d ago) -> SaaS company (90d ago) -> indie product (now)
+# Hard because all three are "projects the user works on"
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what project is the user currently working on"
+
+[[cases.seeds]]
+id = "rt_project_consulting"
+content = "Doing freelance consulting for a fintech startup — building their data pipeline in Python. Two-month contract through end of Q3."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+age_days = 180
+
+[[cases.seeds]]
+id = "rt_project_saas"
+content = "Joined a mid-size SaaS company as a senior full-stack engineer. Working on their billing system migration from Stripe to a custom solution."
+memory_type = "fact"
+domain = "work"
+relevance = 1
+age_days = 90
+supersedes = "rt_project_consulting"
+
+[[cases.seeds]]
+id = "rt_project_current"
+content = "Left the SaaS job to go indie. Building a personal AI memory product — a local-first desktop app where agents write what they learn and humans curate."
+memory_type = "fact"
+domain = "work"
+relevance = 3
+confirmed = true
+age_days = 5
+supersedes = "rt_project_saas"
+
+[[cases.seeds]]
+id = "rt_goal_launch"
+content = "Primary goal for April: get the product to three beta testers and collect qualitative feedback on memory retrieval quality."
+memory_type = "goal"
+domain = "work"
+relevance = 2
+age_days = 3
+
+[[cases.seeds]]
+id = "rt_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock in the embedding migration, started the eval framework."
+memory_type = "recap"
+domain = "work"
+relevance = 1
+age_days = 10
+
+[[cases.seeds]]
+id = "rt_identity_role"
+content = "Solo indie developer working on a personal AI memory product. Previously spent four years at a mid-size SaaS company doing full-stack work."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_proj_rust"
+content = "Chose Rust for the server-side code because of memory safety guarantees."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_proj_react"
+content = "The UI layer uses React 19 with TanStack Query for server state."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_proj_tauri"
+content = "Desktop shell is built with Tauri 2."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_proj_db"
+content = "All data lives in a single libSQL instance."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_pref_editor"
+content = "Primarily uses Cursor as the code editor."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max with 36 GB RAM."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_pref_coffee"
+content = "Drinks oat milk lattes in the morning and switches to green tea after 2 PM."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_health_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_health_allergy"
+content = "Has a mild tree nut allergy — walnuts and pecans specifically."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_finance_sub"
+content = "Monthly subscriptions total about $340."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_travel_home"
+content = "Lives in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_pref_music"
+content = "Listens to lo-fi hip hop or ambient electronic while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_food_diet"
+content = "Mostly plant-based diet but not strict."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_pref_comms"
+content = "Prefers async communication. Checks email twice a day."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_fitness"
+content = "Goes to the gym four mornings a week. Runs 5K on Saturdays."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_pref_reading"
+content = "Reads mostly non-fiction."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_identity_values"
+content = "Values craftsmanship over speed."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_proj_testing"
+content = "Test suite covers both frontend and Rust."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# "where does the user live"
+# Location progression: Portland (2y ago) -> Oakland (1y ago) -> SF Mission (now)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "where does the user live"
+
+[[cases.seeds]]
+id = "rt2_home_portland"
+content = "Renting a studio in the Pearl District in Portland. Walking distance to Powell's Books and a handful of good coffee shops."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+age_days = 730
+
+[[cases.seeds]]
+id = "rt2_home_oakland"
+content = "Moved to a one-bedroom in Oakland near Lake Merritt. Shorter commute to the city for meetings and the food scene is surprisingly good."
+memory_type = "fact"
+domain = "personal"
+relevance = 1
+age_days = 365
+supersedes = "rt2_home_portland"
+
+[[cases.seeds]]
+id = "rt2_home_sf"
+content = "Lives in a one-bedroom apartment in the Mission District, San Francisco. Has been there since mid-2023."
+memory_type = "fact"
+domain = "personal"
+relevance = 3
+confirmed = true
+age_days = 5
+supersedes = "rt2_home_oakland"
+
+[[cases.seeds]]
+id = "rt2_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_proj_rust"
+content = "Chose Rust for the server-side code."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_proj_react"
+content = "The UI layer uses React 19."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_proj_tauri"
+content = "Desktop shell is built with Tauri 2."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_proj_db"
+content = "All data lives in a single libSQL instance."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_pref_editor"
+content = "Primarily uses Cursor as the code editor."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_pref_coffee"
+content = "Drinks oat milk lattes in the morning."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_health_sleep"
+content = "Targets 7.5 hours of sleep."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_health_allergy"
+content = "Has a mild tree nut allergy."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_finance_sub"
+content = "Monthly subscriptions total about $340."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_pref_music"
+content = "Listens to lo-fi hip hop while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_food_diet"
+content = "Mostly plant-based diet."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_pref_comms"
+content = "Prefers async communication."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_recap_week"
+content = "Week of March 24: shipped context composition PR."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_fitness"
+content = "Goes to the gym four mornings a week."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_pref_reading"
+content = "Reads mostly non-fiction."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_identity_values"
+content = "Values craftsmanship over speed."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+# Near-miss: mentions a place but not where they live
+[[cases.seeds]]
+id = "rt2_travel_safari"
+content = "Took a trip to Tanzania in 2022 and did a safari in Serengeti."
+memory_type = "fact"
+domain = "travel"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt2_proj_testing"
+content = "Test suite covers frontend and Rust."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 3 ──────────────────────────────────────────────────────────────────
+# "what embedding model does the project use"
+# Tech progression: BGE-Small (60d) -> GTE-Base-Q (30d) -> BGE-Base-Q (5d)
+# Very hard: all three are embedding models with similar vocabulary
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what embedding model does the project use"
+
+[[cases.seeds]]
+id = "rt3_embed_v1"
+content = "Adopted BGE-Small-EN-v1.5 for initial embeddings. Produces 384-dimensional vectors with fast inference. Adequate for the early prototype stage."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+age_days = 60
+
+[[cases.seeds]]
+id = "rt3_embed_v2"
+content = "Upgraded from BGE-Small to GTE-Base-EN-v1.5-Q (768-dim). The quantized model doubles the vector dimensions for better semantic resolution. Migration 24 handles re-embedding existing rows."
+memory_type = "decision"
+domain = "work"
+relevance = 1
+age_days = 30
+supersedes = "rt3_embed_v1"
+
+[[cases.seeds]]
+id = "rt3_embed_v3"
+content = "Switched to BGE-Base-Q (768-dim, same dimensionality as GTE). Benchmark showed improvement on retrieval quality and semantic disconnect tests. Same BAAI model family as the original BGE-Small."
+memory_type = "decision"
+domain = "work"
+relevance = 3
+confirmed = true
+age_days = 5
+supersedes = "rt3_embed_v2"
+
+[[cases.seeds]]
+id = "rt3_embed_prefix"
+content = "Domain prefix such as [conversation] or [origin] is prepended before encoding. Ablation showed prefix-only embedding outperforms bare content."
+memory_type = "fact"
+domain = "work"
+relevance = 1
+
+[[cases.seeds]]
+id = "rt3_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_proj_rust"
+content = "Chose Rust for the server-side code."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_proj_react"
+content = "The UI layer uses React 19."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_proj_tauri"
+content = "Desktop shell is built with Tauri 2."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_proj_db"
+content = "All data lives in a single libSQL instance."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU acceleration."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_pref_editor"
+content = "Primarily uses Cursor as the code editor."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_pref_coffee"
+content = "Drinks oat milk lattes in the morning."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_health_sleep"
+content = "Targets 7.5 hours of sleep."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_health_allergy"
+content = "Has a mild tree nut allergy."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_finance_sub"
+content = "Monthly subscriptions total about $340."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_travel_home"
+content = "Lives in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_pref_music"
+content = "Listens to lo-fi hip hop while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_food_diet"
+content = "Mostly plant-based diet."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_pref_comms"
+content = "Prefers async communication."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_recap_week"
+content = "Week of March 24: shipped context composition PR, fixed a deadlock."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_fitness"
+content = "Goes to the gym four mornings a week."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_pref_reading"
+content = "Reads mostly non-fiction."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_identity_values"
+content = "Values craftsmanship over speed."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_proj_testing"
+content = "Test suite covers frontend and Rust."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt3_proj_license"
+content = "Main application is AGPL-3.0."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 4 ──────────────────────────────────────────────────────────────────
+# "what editor does the user prefer"
+# Tool progression: vim (120d) -> VS Code (60d) -> Cursor (5d)
+# Medium-hard: query says "prefer" but memories describe adoption/switching
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what editor does the user prefer"
+
+[[cases.seeds]]
+id = "rt4_editor_vim"
+content = "Still using neovim with a custom Lua config for all coding. Fast startup and the modal editing flow is second nature after five years."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+age_days = 120
+
+[[cases.seeds]]
+id = "rt4_editor_vscode"
+content = "Switched from neovim to VS Code. The extension ecosystem and integrated terminal won out over raw speed. Installed the Vim keybindings extension to keep muscle memory."
+memory_type = "preference"
+domain = "work"
+relevance = 1
+age_days = 60
+supersedes = "rt4_editor_vim"
+
+[[cases.seeds]]
+id = "rt4_editor_cursor"
+content = "Primarily uses Cursor as the code editor. VS Code as fallback when Cursor's AI features are distracting during review work."
+memory_type = "preference"
+domain = "work"
+relevance = 3
+confirmed = true
+age_days = 5
+supersedes = "rt4_editor_vscode"
+
+[[cases.seeds]]
+id = "rt4_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_proj_rust"
+content = "Chose Rust for the server-side code."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_proj_react"
+content = "The UI layer uses React 19."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_proj_tauri"
+content = "Desktop shell is built with Tauri 2."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_proj_db"
+content = "All data lives in a single libSQL instance."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_pref_os"
+content = "Runs macOS Sequoia on a 2023 MacBook Pro M3 Max."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_pref_coffee"
+content = "Drinks oat milk lattes in the morning."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_health_sleep"
+content = "Targets 7.5 hours of sleep."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_health_allergy"
+content = "Has a mild tree nut allergy."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_finance_sub"
+content = "Monthly subscriptions total about $340."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_travel_home"
+content = "Lives in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_pref_music"
+content = "Listens to lo-fi hip hop while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_food_diet"
+content = "Mostly plant-based diet."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_pref_comms"
+content = "Prefers async communication."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_recap_week"
+content = "Week of March 24: shipped context composition PR."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_fitness"
+content = "Goes to the gym four mornings a week."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_pref_reading"
+content = "Reads mostly non-fiction."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_identity_values"
+content = "Values craftsmanship over speed."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+# Near-miss: mentions an IDE-like tool but for design
+[[cases.seeds]]
+id = "rt4_tools_figma"
+content = "Uses Figma for design mockups. Prefers designing directly in Figma rather than sketching on paper first."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt4_proj_testing"
+content = "Test suite covers frontend and Rust."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 5 ──────────────────────────────────────────────────────────────────
+# "what's the user's current fitness routine"
+# Progression: yoga only (90d) -> added gym (45d) -> gym + running (5d)
+# Query says "current" — must rank freshest memory highest
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what's the user's current fitness routine"
+
+[[cases.seeds]]
+id = "rt5_fitness_v1"
+content = "Doing yoga three times a week at a studio near the apartment. Also walking 20 minutes every morning before starting work."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+age_days = 90
+
+[[cases.seeds]]
+id = "rt5_fitness_v2"
+content = "Started going to a CrossFit gym. Three sessions a week on top of the yoga practice. Dropped the morning walks because the commute to the gym covers the distance."
+memory_type = "fact"
+domain = "health"
+relevance = 1
+age_days = 45
+supersedes = "rt5_fitness_v1"
+
+[[cases.seeds]]
+id = "rt5_fitness_v3"
+content = "Goes to the gym four mornings a week — two upper body sessions and two lower body. Runs 5K on Saturdays at Dolores Park when the weather is good. Dropped CrossFit because the class schedule was too rigid."
+memory_type = "fact"
+domain = "health"
+relevance = 3
+confirmed = true
+age_days = 5
+supersedes = "rt5_fitness_v2"
+
+[[cases.seeds]]
+id = "rt5_sleep"
+content = "Targets 7.5 hours of sleep. Uses a Whoop band to track recovery score and adjusts workout intensity accordingly."
+memory_type = "fact"
+domain = "health"
+relevance = 2
+
+[[cases.seeds]]
+id = "rt5_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_proj_rust"
+content = "Chose Rust for the server-side code."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_proj_react"
+content = "The UI layer uses React 19."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_proj_tauri"
+content = "Desktop shell is built with Tauri 2."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_proj_db"
+content = "All data lives in a single libSQL instance."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_pref_editor"
+content = "Primarily uses Cursor as the code editor."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_pref_os"
+content = "Runs macOS Sequoia on a MacBook Pro M3 Max."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_pref_coffee"
+content = "Drinks oat milk lattes in the morning."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_health_allergy"
+content = "Has a mild tree nut allergy."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_finance_sub"
+content = "Monthly subscriptions total about $340."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_travel_home"
+content = "Lives in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_pref_music"
+content = "Listens to lo-fi hip hop while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_food_diet"
+content = "Mostly plant-based diet."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_pref_comms"
+content = "Prefers async communication."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_recap_week"
+content = "Week of March 24: shipped context composition PR."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_pref_reading"
+content = "Reads mostly non-fiction."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_identity_values"
+content = "Values craftsmanship over speed."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_proj_testing"
+content = "Test suite covers frontend and Rust."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt5_proj_llm"
+content = "On-device inference runs Qwen3-4B via Metal GPU."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+# Near-miss: mentions physical activity but different context
+[[cases.seeds]]
+id = "rt5_standing_desk"
+content = "Switched to a standing desk in January. Alternates between standing and sitting every 45 minutes."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+
+# ─── CASE 6 ──────────────────────────────────────────────────────────────────
+# "when did the user's financial situation last change"
+# Hard temporal — requires interpreting "last change" as the most recent financial event.
+# Progression: full-time salary (180d) -> consulting income (90d) -> indie (burn savings, 30d)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "when did the user's financial situation last change"
+
+[[cases.seeds]]
+id = "rt6_finance_salary"
+content = "Drawing a $145K annual salary as a senior full-stack engineer at the SaaS company. Benefits include health insurance and 401k matching."
+memory_type = "fact"
+domain = "finance"
+relevance = 0
+age_days = 180
+
+[[cases.seeds]]
+id = "rt6_finance_consulting"
+content = "Switched to freelance consulting at $180/hour. Working about 25 hours a week to maintain flexibility while exploring product ideas."
+memory_type = "fact"
+domain = "finance"
+relevance = 1
+age_days = 90
+supersedes = "rt6_finance_salary"
+
+[[cases.seeds]]
+id = "rt6_finance_indie"
+content = "No income stream currently — burning savings while building the product. Current savings give about 8 months of runway before needing income. Not stressed yet but aware of the clock."
+memory_type = "fact"
+domain = "finance"
+relevance = 3
+confirmed = true
+age_days = 30
+supersedes = "rt6_finance_consulting"
+
+[[cases.seeds]]
+id = "rt6_finance_sub"
+content = "Monthly subscriptions total about $340: Cursor Pro, Linear, Notion, Figma, iCloud+, gym membership, and a few smaller tools."
+memory_type = "fact"
+domain = "finance"
+relevance = 1
+
+[[cases.seeds]]
+id = "rt6_identity_role"
+content = "Solo indie developer working on a personal AI memory product."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_proj_rust"
+content = "Chose Rust for the server-side code."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_proj_react"
+content = "The UI layer uses React 19."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_proj_tauri"
+content = "Desktop shell is built with Tauri 2."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_proj_db"
+content = "All data lives in a single libSQL instance."
+memory_type = "decision"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_pref_editor"
+content = "Primarily uses Cursor as the code editor."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_pref_os"
+content = "Runs macOS Sequoia on a MacBook Pro M3 Max."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_pref_coffee"
+content = "Drinks oat milk lattes in the morning."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_health_sleep"
+content = "Targets 7.5 hours of sleep."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_health_allergy"
+content = "Has a mild tree nut allergy."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_travel_home"
+content = "Lives in the Mission District, San Francisco."
+memory_type = "fact"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_pref_music"
+content = "Listens to lo-fi hip hop while coding."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_food_diet"
+content = "Mostly plant-based diet."
+memory_type = "preference"
+domain = "food"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_pref_comms"
+content = "Prefers async communication."
+memory_type = "preference"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_recap_week"
+content = "Week of March 24: shipped context composition PR."
+memory_type = "recap"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_goal_launch"
+content = "Primary goal for April: get the product to three beta testers."
+memory_type = "goal"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_fitness"
+content = "Goes to the gym four mornings a week."
+memory_type = "fact"
+domain = "health"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_pref_reading"
+content = "Reads mostly non-fiction."
+memory_type = "preference"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_identity_values"
+content = "Values craftsmanship over speed."
+memory_type = "identity"
+domain = "personal"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_proj_testing"
+content = "Test suite covers frontend and Rust."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_proj_embed"
+content = "Embeddings are produced by GTE-Base-EN-v1.5-Q."
+memory_type = "fact"
+domain = "work"
+relevance = 0
+
+[[cases.seeds]]
+id = "rt6_edu"
+content = "Studied computer science at UC Berkeley, graduated in 2019."
+memory_type = "identity"
+domain = "personal"
+relevance = 0

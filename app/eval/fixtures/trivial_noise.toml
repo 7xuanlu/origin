@@ -1,0 +1,88 @@
+# Trivial noise — generic/low-value memories should rank below actionable ones.
+# Pattern seen: "Tokio work-stealing", "node_modules sizes" appearing alongside
+# actionable project decisions in search results.
+
+[[cases]]
+query = "async runtime configuration"
+
+[[cases.seeds]]
+id = "mem_async_decision"
+content = "Tauri manages the Tokio runtime. In setup() closure, Handle::current() panics — must use tauri::async_runtime::block_on(async { Handle::current() }) instead."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_async_threading"
+content = "LLM inference runs on a dedicated std::thread to avoid blocking async tasks. The thread captures a tokio runtime Handle at spawn time for async DB callbacks via handle.block_on()."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Generic trivia that mentions async but has no actionable value
+[[cases.negative_seeds]]
+id = "mem_async_trivia"
+content = "Tokio uses a work-stealing scheduler. The default runtime is multi-threaded with one worker per CPU core."
+memory_type = "fact"
+domain = "general"
+
+[[cases.negative_seeds]]
+id = "mem_deps_trivia"
+content = "The node_modules directory is 847MB. pnpm uses content-addressable storage to share packages across projects."
+memory_type = "fact"
+domain = "general"
+
+# Hard negative: mentions async runtime and configuration but is about a different project's setup
+[[cases.negative_seeds]]
+id = "mem_async_other_project"
+content = "The web scraper configures a custom Tokio runtime with 4 worker threads and a 30-second task timeout. spawn_blocking handles CPU-intensive HTML parsing without starving the I/O reactor."
+memory_type = "fact"
+domain = "projectB"
+
+# Hard negative: mentions runtime Handle and threading but describes testing, not the actual setup
+[[cases.negative_seeds]]
+id = "mem_async_test_harness"
+content = "Integration tests create a separate Tokio runtime with current_thread flavor to avoid flaky behavior from shared state. The test harness captures Handle::current() in a once_cell for async assertions."
+memory_type = "fact"
+domain = "projectA"
+
+
+[[cases]]
+query = "privacy and data redaction"
+
+[[cases.seeds]]
+id = "mem_privacy_impl"
+content = "PII redaction pipeline detects credit card numbers, Social Security numbers, API keys, and email addresses. Patterns are applied before storage — redacted content uses [REDACTED] placeholders."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_privacy_apps"
+content = "Private browsing detection skips capture from incognito windows. Skip list includes password managers, banking apps, and messaging apps."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Generic privacy fact, not project-specific
+[[cases.negative_seeds]]
+id = "mem_privacy_generic"
+content = "GDPR requires data controllers to implement appropriate technical measures to protect personal data."
+memory_type = "fact"
+domain = "general"
+
+# Hard negative: mentions redaction and PII but is about audit logging, not the pipeline itself
+[[cases.negative_seeds]]
+id = "mem_privacy_audit"
+content = "Redacted PII events are written to the privacy_audit table with a hash of the original content, the redaction pattern that matched, and a timestamp. This audit trail enables compliance reporting without storing raw PII."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions privacy and data protection but is about user preferences for data sharing
+[[cases.negative_seeds]]
+id = "mem_privacy_sharing"
+content = "User opted out of anonymous telemetry and crash reporting. Data sharing preference stored in config.json under privacy.telemetry_enabled=false. No data leaves the device."
+memory_type = "preference"
+domain = "projectA"

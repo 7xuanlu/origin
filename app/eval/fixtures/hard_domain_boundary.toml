@@ -1,0 +1,131 @@
+# Domain boundary blur — technical content that exists in multiple projects.
+# Queries scoped to one domain, but the other domain has very similar content.
+# Tests that domain filtering + semantic search correctly isolate results.
+
+[[cases]]
+query = "error handling patterns in the API layer"
+domain = "projectA"
+
+[[cases.seeds]]
+id = "hdb_api_errors_a"
+memory_type = "fact"
+content = "API routes return structured error JSON with code, message, and optional detail fields. HTTP status codes follow REST conventions: 400 for validation, 404 for not found, 500 for internal."
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "hdb_error_types_a"
+memory_type = "fact"
+content = "Custom OriginError enum wraps VectorDb, Embedding, Generic, and IO variants. Axum's IntoResponse converts each variant to the appropriate HTTP status."
+domain = "projectA"
+relevance = 2
+confirmed = false
+
+[[cases.negative_seeds]]
+id = "hdb_api_errors_b"
+content = "API endpoints return JSON error responses with status, message, and trace_id. Standard HTTP codes: 400 for bad input, 401 for unauthorized, 500 for server errors."
+memory_type = "fact"
+domain = "projectB"
+
+[[cases.negative_seeds]]
+id = "hdb_error_types_b"
+content = "AppError enum covers Database, Auth, Validation, and NotFound variants. Each maps to a specific HTTP status code via the error handler middleware."
+memory_type = "fact"
+domain = "projectB"
+
+[[cases.seeds]]
+id = "hdb_rate_limiting_a"
+memory_type = "fact"
+content = "API rate limiting enforced at 100 requests per minute per client. Exceeded requests receive a 429 Too Many Requests response with a Retry-After header."
+domain = "projectA"
+relevance = 0
+confirmed = false
+
+[[cases.seeds]]
+id = "hdb_request_logging_a"
+memory_type = "fact"
+content = "All incoming API requests are logged with method, path, status code, and duration. Structured JSON logs emitted to stdout for downstream ingestion."
+domain = "projectA"
+relevance = 0
+confirmed = false
+
+[[cases.seeds]]
+id = "hdb_health_endpoint_a"
+memory_type = "fact"
+content = "The /api/health endpoint returns 200 OK with a JSON body containing version, uptime, and database connectivity status. Used by load balancers for liveness checks."
+domain = "projectA"
+relevance = 0
+confirmed = false
+
+[[cases.seeds]]
+id = "hdb_pagination_a"
+memory_type = "fact"
+content = "List endpoints support cursor-based pagination via a next_cursor field in the response envelope. Page size defaults to 20 and can be overridden up to 100 via the limit query parameter."
+domain = "projectA"
+relevance = 0
+confirmed = false
+
+[[cases.seeds]]
+id = "hdb_content_type_a"
+memory_type = "fact"
+content = "API endpoints validate the Content-Type header and reject non-JSON bodies with a 415 Unsupported Media Type response before parsing the request body."
+domain = "projectA"
+relevance = 0
+confirmed = false
+
+[[cases]]
+query = "how is state managed in the frontend"
+domain = "projectA"
+
+[[cases.seeds]]
+id = "hdb_state_a"
+memory_type = "fact"
+content = "Frontend state uses TanStack React Query for server state with automatic cache invalidation. Module-level stores with useSyncExternalStore for state that survives unmounts."
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "hdb_state_local_a"
+memory_type = "fact"
+content = "localStorage persists collapsed section state and sidebar toggle with 7-day TTL. QueryClient retains cache for 5 minutes before refetch."
+domain = "projectA"
+relevance = 2
+confirmed = false
+
+[[cases.negative_seeds]]
+id = "hdb_state_b"
+content = "React Query handles server state with staleTime of 30 seconds. Zustand stores manage client-side state with persist middleware writing to localStorage."
+memory_type = "fact"
+domain = "projectB"
+
+[[cases.negative_seeds]]
+id = "hdb_state_local_b"
+content = "User preferences stored in localStorage with JSON serialization. Redux Toolkit manages global UI state including sidebar, theme, and notification preferences."
+memory_type = "fact"
+domain = "projectB"
+
+[[cases.seeds]]
+id = "hdb_backend_state_a"
+memory_type = "fact"
+content = "Backend application state is held in Arc<RwLock<AppState>> managed by Tauri. Atomic flags (Arc<AtomicBool>) are used for feature toggles shared with sensor threads for lock-free reads."
+domain = "projectA"
+relevance = 0
+confirmed = false
+
+[[cases.seeds]]
+id = "hdb_processing_store_a"
+memory_type = "fact"
+content = "processingStore.ts uses the useSyncExternalStore pattern at module level so processing state survives React component unmounts between route navigations."
+domain = "projectA"
+relevance = 0
+confirmed = false
+
+[[cases.seeds]]
+id = "hdb_capture_heartbeat_a"
+memory_type = "fact"
+content = "captureHeartbeat.ts runs as a module-level singleton outside the React tree. It emits heartbeat ticks to indicate active capture sessions independent of component lifecycle."
+domain = "projectA"
+relevance = 0
+confirmed = false

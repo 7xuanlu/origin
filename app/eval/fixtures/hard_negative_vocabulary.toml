@@ -1,0 +1,98 @@
+# Hard negatives with high vocabulary overlap. Each negative shares key terms with the relevant
+# seed but answers a different question. Tests that the embedding model captures meaning, not
+# just word co-occurrence.
+
+# CASE 1: embedding generation
+# All seeds (relevant + negative) mention: embeddings, model, 768-dim, BGE-Base-Q.
+# The query asks HOW embeddings are generated. Negatives answer WHERE they are used (search),
+# WHEN they are rebuilt (migration), and HOW they are cached — not how they are produced.
+
+[[cases]]
+query = "how are embeddings generated for new memories"
+domain = "origin"
+
+# Relevance 3 — directly answers HOW generation works: thread, ONNX, prefix, 768-dim output.
+[[cases.seeds]]
+id = "hnv_embed_gen"
+content = "New memories are embedded on a dedicated std::thread using GTE-Base-EN-v1.5-Q (768-dim). The domain prefix is prepended to the raw content string before ONNX inference runs, producing a 768-dimensional F32 vector stored in the memories table."
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+# Relevance 2 — explains the prefix step that is part of generation, one level of detail up.
+[[cases.seeds]]
+id = "hnv_embed_prefix"
+content = "A domain prefix such as [conversation] or [origin] is prepended to memory content before the GTE-Base-EN-v1.5-Q model encodes it. Ablation testing showed prefix-only embedding yields +1.9% NDCG over bare content on retrieval benchmarks."
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+# Hard negative — same model and 768-dim vocabulary, but topic is SEARCH query embedding, not storage.
+[[cases.negative_seeds]]
+id = "hnv_neg_search"
+content = "Search queries are encoded with the same GTE-Base-EN-v1.5-Q model at query time, producing a 768-dim vector. Cosine distance is computed via DiskANN approximate nearest-neighbour index over the memories table."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative — same model and 768-dim vocabulary, but topic is MIGRATION recovery, not generation.
+[[cases.negative_seeds]]
+id = "hnv_neg_migration"
+content = "Migration 25 sets the embedding column to NULL for all rows in the memories table when the model changes. On next startup, the crash-recovery loop detects NULL 768-dim slots and re-embeds each row using GTE-Base-EN-v1.5-Q before accepting new writes."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative — same model and 768-dim vocabulary, but topic is CACHING, not generation.
+[[cases.negative_seeds]]
+id = "hnv_neg_cache"
+content = "An in-process LRU cache holds the 200 most recently computed 768-dim vectors produced by GTE-Base-EN-v1.5-Q. Cache hits skip ONNX inference entirely; misses fall through to the embedding thread."
+memory_type = "fact"
+domain = "origin"
+
+
+# CASE 2: quality gate rejection
+# All seeds (relevant + negative) mention: quality gate, reject/rejection, memory.
+# The query asks WHEN the gate rejects. Negatives answer what the gate ACCEPTS, what happens
+# to low-quality memories that are NOT rejected, and how rejection is surfaced to the user.
+
+[[cases]]
+query = "when does the quality gate reject a memory"
+domain = "origin"
+
+# Relevance 3 — directly answers the rejection conditions: short, URL-only, boilerplate.
+[[cases.seeds]]
+id = "hnv_gate_reject"
+content = "The quality gate rejects a memory and writes it to the rejected_memories table when it fails content checks: fewer than 10 words, URL-only content with no surrounding text, or matches a boilerplate pattern such as 'click here' or 'loading…'."
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+# Relevance 2 — explains the near-duplicate path to rejection, a second condition.
+[[cases.seeds]]
+id = "hnv_gate_novelty"
+content = "The quality gate rejects a memory as a near-duplicate when its embedding cosine similarity to an existing memory exceeds 0.92. The rejection record in rejected_memories logs the ID of the similar memory that caused the block."
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+# Hard negative — same vocabulary (quality gate, reject, memory), but answers what the gate ACCEPTS.
+[[cases.negative_seeds]]
+id = "hnv_neg_accept"
+content = "A memory passes the quality gate when it clears both the content check (at least 10 words, not URL-only, no boilerplate) and the novelty check (cosine similarity below 0.92 against all stored memories). Accepted memories enter the embedding pipeline."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative — same vocabulary, but answers what happens to LOW-QUALITY memories that are NOT rejected.
+[[cases.negative_seeds]]
+id = "hnv_neg_confidence"
+content = "Memories that the quality gate scores as low-quality but does not reject receive a 0.7x confidence multiplier at write time. They remain searchable but rank lower than confirmed or high-quality memories in retrieval scoring."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative — same vocabulary, but answers how rejection is SURFACED to the user, not when it occurs.
+[[cases.negative_seeds]]
+id = "hnv_neg_ui"
+content = "When the quality gate rejects a memory, a toast notification displays the reason (too short, duplicate, or boilerplate). The settings page exposes a toggle to disable content-length rejection for agents that store intentionally terse memories."
+memory_type = "fact"
+domain = "origin"

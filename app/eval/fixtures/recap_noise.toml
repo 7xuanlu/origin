@@ -1,0 +1,82 @@
+# Recap noise — original memories should rank above their recap summaries.
+# Pattern seen: recap chunks with mid-sentence fragments flooding top results,
+# same fact appearing 3x (original + 2 recap mentions).
+
+[[cases]]
+query = "how to configure build profiles"
+
+[[cases.seeds]]
+id = "mem_build_original"
+content = "Added preview-playstore build profile with distribution set to store and buildType app-bundle. This produces a signed AAB that the Play Store accepts."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_build_detail"
+content = "The build profile system supports multiple configurations: preview for internal testing with APK distribution, preview-playstore for store distribution with AAB, and production for release builds."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Recap of the same content — should rank below originals
+[[cases.negative_seeds]]
+id = "mem_build_recap"
+content = "Session recap: configured build profiles, set up EAS submit automation, tested store distribution workflow."
+memory_type = "recap"
+domain = "projectA"
+
+# Hard negative: mentions build profiles but describes a different platform's build system
+[[cases.negative_seeds]]
+id = "mem_build_xcode"
+content = "Xcode build profiles support Debug and Release configurations out of the box. Custom build profiles can override signing identity, provisioning profile, and optimization level per scheme."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions build configuration but is about CI, not local build profiles
+[[cases.negative_seeds]]
+id = "mem_build_ci"
+content = "GitHub Actions CI workflow uses a build matrix with three profiles: debug for quick checks, release for integration tests, and production for deployment artifacts. Each profile sets different RUSTFLAGS."
+memory_type = "fact"
+domain = "projectA"
+
+
+[[cases]]
+query = "search ranking algorithm"
+
+[[cases.seeds]]
+id = "mem_ranking_impl"
+content = "Search scoring combines RRF base score with confidence, recency decay, quality multiplier, confirmation boost, and domain relevance. Final score is normalized to 0-1 range."
+memory_type = "fact"
+domain = "projectB"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_ranking_rrf"
+content = "Reciprocal Rank Fusion merges vector similarity and full-text search rankings. Score formula: sum of 1/(60+rank) for each retrieval signal."
+memory_type = "fact"
+domain = "projectB"
+relevance = 2
+
+# Recap that mentions ranking tangentially
+[[cases.negative_seeds]]
+id = "mem_ranking_recap"
+content = "Session recap: investigated search quality issues, compared score ranges, tested domain filtering. Scores improved from 0.007-0.014 to 0.38-1.0 range."
+memory_type = "recap"
+domain = "projectB"
+
+# Hard negative: mentions ranking algorithm but is about FTS ranking, not the full pipeline
+[[cases.negative_seeds]]
+id = "mem_fts_ranking"
+content = "FTS5 uses BM25 for internal ranking of full-text matches. The rank column returned by FTS5 is a negative number where values closer to zero indicate better matches."
+memory_type = "fact"
+domain = "projectB"
+
+# Hard negative: mentions search scoring but is about the tuning config, not the algorithm
+[[cases.negative_seeds]]
+id = "mem_scoring_config"
+content = "SearchScoringConfig exposes rrf_k, confirmation_boost, recap_penalty, and domain_boost as tunable parameters. Changes take effect on the next query without restart."
+memory_type = "fact"
+domain = "projectB"

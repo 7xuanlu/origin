@@ -1,0 +1,87 @@
+# Contradiction detection — tests retrieval when conflicting memories exist.
+# Content is natural language. Structured fields enable field-level comparison.
+
+[[cases]]
+query = "preferred programming language for systems work"
+
+[[cases.seeds]]
+id = "mem_pref_rust"
+content = "I prefer Rust for systems programming because of memory safety guarantees"
+memory_type = "preference"
+domain = "engineering"
+relevance = 3
+confirmed = true
+structured_fields = '{"preference":"Rust","applies_when":"systems programming"}'
+
+# Older contradicting preference
+[[cases.seeds]]
+id = "mem_pref_python"
+content = "I prefer Python for systems programming because of rapid prototyping"
+memory_type = "preference"
+domain = "engineering"
+relevance = 1
+structured_fields = '{"preference":"Python","applies_when":"systems programming"}'
+
+[[cases.negative_seeds]]
+id = "mem_pref_unrelated"
+content = "I prefer Python for data analysis and machine learning work"
+memory_type = "preference"
+domain = "engineering"
+structured_fields = '{"preference":"Python","applies_when":"data analysis"}'
+
+# Hard negative: mentions language preference and systems work but is about C++ not a competing preference
+[[cases.negative_seeds]]
+id = "mem_pref_cpp"
+content = "I used C++ for systems programming at my previous job but found the build system and memory management overhead frustrating compared to modern alternatives"
+memory_type = "fact"
+domain = "engineering"
+
+# Hard negative: mentions Rust and programming preference but is about a library choice, not language preference
+[[cases.negative_seeds]]
+id = "mem_pref_rust_tokio"
+content = "I prefer using Tokio over async-std for async Rust because the ecosystem and documentation are more mature. Most Rust crates assume Tokio as the runtime."
+memory_type = "preference"
+domain = "engineering"
+
+
+[[cases]]
+query = "Origin launch status"
+
+[[cases.seeds]]
+id = "mem_goal_current"
+content = "The goal is to launch Origin publicly by April 2026, currently in progress with core features built"
+memory_type = "goal"
+domain = "origin"
+relevance = 3
+confirmed = true
+structured_fields = '{"objective":"launch Origin publicly","status":"in_progress","target_date":"2026-04"}'
+
+# Outdated status
+[[cases.seeds]]
+id = "mem_goal_old"
+content = "Planning to launch Origin publicly, still in early planning phase"
+memory_type = "goal"
+domain = "origin"
+relevance = 1
+structured_fields = '{"objective":"launch Origin publicly","status":"planning"}'
+
+[[cases.negative_seeds]]
+id = "mem_goal_other"
+content = "Need to publish origin-mcp to npm but blocked on distribution setup"
+memory_type = "goal"
+domain = "origin"
+structured_fields = '{"objective":"publish origin-mcp to npm","status":"blocked"}'
+
+# Hard negative: mentions Origin and launch but is about a feature launch, not the product launch
+[[cases.negative_seeds]]
+id = "mem_feature_launch"
+content = "The working context feature is planned for launch after the core memory pipeline stabilizes. It adds a hot tier for recently accessed memories with recency scoring."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative: mentions launch and status but is about a competitor's launch, not Origin
+[[cases.negative_seeds]]
+id = "mem_competitor_launch"
+content = "Mem0 launched their managed cloud platform in Q1 2026 with a free tier of 1000 memories. Their pricing starts at $99/month for the pro plan with unlimited storage."
+memory_type = "fact"
+domain = "market"

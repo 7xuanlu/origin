@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Test & Lint
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache FastEmbed model
+        uses: actions/cache@v4
+        with:
+          path: ~/.fastembed_cache
+          key: fastembed-bge-base-en-v15-q
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Create sidecar placeholders for Tauri build script
+        run: |
+          mkdir -p app/binaries
+          touch app/binaries/origin-server-aarch64-apple-darwin
+          touch app/binaries/origin-mcp-aarch64-apple-darwin
+          touch app/binaries/cloudflared-aarch64-apple-darwin
+
+      - name: Check Rust formatting
+        run: cargo fmt --check --all
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+      - name: Run frontend tests
+        run: pnpm test

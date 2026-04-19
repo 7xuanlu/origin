@@ -1,0 +1,240 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-tertiary: #0f3460;
+  --text-primary: #e8e8e8;
+  --text-secondary: #a0a0b0;
+  --accent: #6c63ff;
+  --accent-hover: #5a52d5;
+  --border: #2a2a4a;
+  --text-tertiary: #6a6a8a;
+  --separator: rgba(42, 42, 74, 0.65);
+  --overlay-subtle: rgba(255, 255, 255, 0.04);
+  --overlay-hover: rgba(255, 255, 255, 0.06);
+  --overlay-active: rgba(255, 255, 255, 0.08);
+  --overlay-ring: rgba(255, 255, 255, 0.04);
+  --overlay-border: rgba(255, 255, 255, 0.08);
+
+  /* Spotlight badge & highlight tokens */
+  --badge-entity: rgba(52, 211, 153, 0.12);
+  --badge-entity-text: #6ee7b7;
+  --badge-recap: rgba(129, 140, 248, 0.12);
+  --badge-recap-text: #a5b4fc;
+  --badge-file: rgba(96, 165, 250, 0.12);
+  --badge-file-text: #93c5fd;
+  --badge-clipboard: rgba(251, 191, 36, 0.12);
+  --badge-clipboard-text: #fcd34d;
+  --badge-capture: rgba(192, 132, 252, 0.12);
+  --badge-capture-text: #c4b5fd;
+  --badge-screen: rgba(74, 222, 128, 0.12);
+  --badge-screen-text: #86efac;
+  --highlight-match: rgba(74, 222, 128, 0.15);
+}
+
+html[data-theme="light"] {
+  --bg-primary: #f4f4f8;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e8eaef;
+  --text-primary: #1a1a2e;
+  --text-secondary: #5a5a6e;
+  --text-tertiary: #8a8a9a;
+  --accent: #6c63ff;
+  --accent-hover: #5a52d5;
+  --border: #d8d8e8;
+  --separator: rgba(0, 0, 0, 0.08);
+  --overlay-subtle: rgba(0, 0, 0, 0.03);
+  --overlay-hover: rgba(0, 0, 0, 0.05);
+  --overlay-active: rgba(0, 0, 0, 0.08);
+  --overlay-ring: rgba(0, 0, 0, 0.06);
+  --overlay-border: rgba(0, 0, 0, 0.1);
+
+  /* Spotlight badge & highlight tokens */
+  --badge-entity: rgba(16, 185, 129, 0.10);
+  --badge-entity-text: #059669;
+  --badge-recap: rgba(99, 102, 241, 0.10);
+  --badge-recap-text: #4f46e5;
+  --badge-file: rgba(59, 130, 246, 0.10);
+  --badge-file-text: #2563eb;
+  --badge-clipboard: rgba(245, 158, 11, 0.10);
+  --badge-clipboard-text: #d97706;
+  --badge-capture: rgba(168, 85, 247, 0.10);
+  --badge-capture-text: #7c3aed;
+  --badge-screen: rgba(34, 197, 94, 0.10);
+  --badge-screen-text: #16a34a;
+  --highlight-match: rgba(34, 197, 94, 0.12);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  background: transparent;
+  overflow: hidden;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--separator);
+  border-radius: 3px;
+}
+
+[data-sonner-toaster] {
+  --width: 310px;
+}
+
+/* Toast window is 340px — override sonner's mobile layout that kicks in <600px */
+@media (max-width: 600px) {
+  [data-sonner-toaster] {
+    right: 0;
+    left: auto;
+    width: var(--width);
+  }
+
+  [data-sonner-toaster] [data-sonner-toast] {
+    left: auto;
+    right: 0;
+    width: auto;
+  }
+}
+
+
+/* ── Memory Page Theme ──────────────────────────────────── */
+
+/* Shared fonts (theme-independent) */
+:root {
+  --mem-font-heading: 'Fraunces', Georgia, serif;
+  --mem-font-body: 'Instrument Sans', -apple-system, sans-serif;
+  --mem-font-mono: 'JetBrains Mono', monospace;
+}
+
+/* Dark (default — matches logo navy palette) */
+:root,
+html[data-theme="dark"] {
+  --mem-bg: #1a1a2e;
+  --mem-surface: #1e2140;
+  --mem-sidebar: #161830;
+  --mem-text: #e8e8f0;
+  --mem-text-secondary: #a0a0be;
+  --mem-text-tertiary: #6a6a8a;
+  --mem-accent-warm: #d4884a;
+  --mem-accent-amber: #e0a850;
+  --mem-accent-indigo: #7B7BE8;
+  --mem-accent-concept: #7B7BE8;
+  --mem-accent-sage: #8ab892;
+  --mem-accent-glow: #e8c97a;
+  --mem-border: #2a2a4a;
+  --mem-hover: rgba(123, 123, 232, 0.05);
+  --mem-hover-strong: rgba(123, 123, 232, 0.09);
+  --mem-confirm-bg: rgba(212, 136, 74, 0.12);
+  --mem-indigo-bg: rgba(108, 99, 255, 0.12);
+  --mem-distilled-border: rgba(123, 123, 232, 0.4);
+  --mem-distilled-bg: rgba(108, 99, 255, 0.06);
+  --mem-shimmer-color: rgba(108, 99, 255, 0.15);
+  /* Depth on dark: pronounced drop with a soft secondary halo so surfaces
+     lift cleanly off the navy canvas without a grey cast. */
+  --mem-shadow-toast:
+    0 14px 36px rgba(5, 6, 20, 0.55),
+    0 2px 6px rgba(5, 6, 20, 0.35);
+}
+
+/* Light (warm neutral) */
+html[data-theme="light"] {
+  --mem-bg: #FDFCFA;
+  --mem-surface: #FFFEFC;
+  --mem-sidebar: #F8F6F2;
+  --mem-text: #2C2820;
+  --mem-text-secondary: #847B6E;
+  --mem-text-tertiary: #B0A89C;
+  --mem-accent-warm: #C4733B;
+  --mem-accent-amber: #D4943A;
+  --mem-accent-indigo: #5E58C8;
+  --mem-accent-concept: #C4733B;
+  --mem-accent-sage: #7A9B7E;
+  --mem-accent-glow: #E8C97A;
+  --mem-border: #E8E4DE;
+  --mem-hover: rgba(140, 130, 115, 0.04);
+  --mem-hover-strong: rgba(140, 130, 115, 0.07);
+  --mem-confirm-bg: rgba(196, 115, 59, 0.08);
+  --mem-indigo-bg: rgba(91, 84, 212, 0.06);
+  --mem-distilled-border: rgba(94, 88, 200, 0.35);
+  --mem-distilled-bg: rgba(91, 84, 212, 0.04);
+  --mem-shimmer-color: rgba(91, 84, 212, 0.12);
+  /* Depth on light: a warm ink-toned shadow (anchored in the body text hue
+     rather than flat grey) so the toast feels letterpressed on cream. */
+  --mem-shadow-toast:
+    0 14px 36px rgba(44, 36, 23, 0.10),
+    0 2px 6px rgba(44, 36, 23, 0.06);
+}
+
+@keyframes mem-fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Masonry grid — react-masonry-css */
+.masonry-grid {
+  display: flex;
+  gap: 14px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.masonry-column {
+  background-clip: padding-box;
+  flex: 1;
+  min-width: 0;
+}
+
+@keyframes mem-shimmer {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 12px 2px var(--mem-shimmer-color); }
+}
+
+@keyframes mem-confirm {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.3); }
+  100% { transform: scale(1); }
+}
+
+@keyframes mem-type-in {
+  from { width: 0; }
+  to { width: 100%; }
+}
+
+@keyframes mem-collapse {
+  from { opacity: 1; max-height: 200px; }
+  to { opacity: 0; max-height: 0; padding: 0; margin: 0; border-width: 0; }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}

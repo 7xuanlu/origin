@@ -1,0 +1,80 @@
+# Identity leakage — personal identity memories should not appear in technical queries.
+# Pattern seen: querying "ruru hybrid search" returned name, employer, RSU details.
+
+[[cases]]
+query = "vector embedding model selection"
+
+[[cases.seeds]]
+id = "mem_embedding_choice"
+content = "Using AllMiniLM-L6-v2 with 384-dimensional embeddings via FastEmbed. Chosen for balance of quality and inference speed on-device."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_embedding_perf"
+content = "Embedding generation takes approximately 15ms per chunk on M-series GPU. Batch embedding of 100 chunks completes in under 2 seconds."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Identity memories that mention technical terms but are irrelevant
+[[cases.negative_seeds]]
+id = "mem_identity_employer"
+content = "Works as a senior engineer at a machine learning infrastructure company. Focuses on embedding pipelines and model serving."
+memory_type = "identity"
+domain = "personal"
+
+[[cases.negative_seeds]]
+id = "mem_identity_skills"
+content = "Experienced with PyTorch, ONNX runtime, and vector database systems. Previously worked on recommendation models."
+memory_type = "identity"
+domain = "personal"
+
+# Hard negative: mentions embedding model selection but is about a blog post read, not a project decision
+[[cases.negative_seeds]]
+id = "mem_embed_blog"
+content = "Read an article comparing MTEB leaderboard embeddings. GTE-Large outperforms all-MiniLM on retrieval tasks but is 4x slower. The author recommends MiniLM for latency-sensitive applications."
+memory_type = "fact"
+domain = "personal"
+
+# Hard negative: mentions vector model and dimensions but is about a course taken, not a selection decision
+[[cases.negative_seeds]]
+id = "mem_embed_course"
+content = "Completed a course on vector embeddings covering word2vec, GloVe, and transformer-based models. Key takeaway: 384-dim models offer the best quality-to-latency tradeoff for on-device inference."
+memory_type = "fact"
+domain = "personal"
+
+
+[[cases]]
+query = "API endpoint design patterns"
+
+[[cases.seeds]]
+id = "mem_api_patterns"
+content = "REST endpoints follow resource-based naming with /api prefix. Memory CRUD at /api/memory/store, /api/memory/search, /api/memory/delete. Health and status at /api/health."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+# Personal preference that mentions API but is irrelevant
+[[cases.negative_seeds]]
+id = "mem_pref_api"
+content = "Prefers RESTful APIs over GraphQL for simple CRUD applications. Uses OpenAPI specs for documentation."
+memory_type = "preference"
+domain = "personal"
+
+# Hard negative: mentions REST endpoints and API design but is about a different project's endpoints
+[[cases.negative_seeds]]
+id = "mem_api_other_project"
+content = "The analytics service exposes REST endpoints at /api/v2/events, /api/v2/metrics, and /api/v2/funnels. Rate limiting is enforced at 100 requests per minute per API key."
+memory_type = "fact"
+domain = "projectB"
+
+# Hard negative: mentions API patterns but is about WebSocket design, not REST endpoint patterns
+[[cases.negative_seeds]]
+id = "mem_api_websocket"
+content = "WebSocket API at /ws/updates uses a pub-sub pattern with topic subscriptions. Clients subscribe to memory.store, refinery.complete, and gate.reject event types via JSON messages."
+memory_type = "fact"
+domain = "projectA"

@@ -1,0 +1,58 @@
+# Dedup gap — near-duplicate content stored under different IDs.
+# Pattern from real DB: same PGroonga fact appeared 3x, Google Play setup stored twice.
+# Tests whether search surfaces the best version or floods with duplicates.
+
+[[cases]]
+query = "full-text search implementation"
+
+# Original fact
+[[cases.seeds]]
+id = "mem_fts_original"
+content = "Full-text search uses FTS5 virtual table (chunks_fts) with content and title columns. Auto-synced with chunks table via INSERT, UPDATE, and DELETE triggers."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+# Near-duplicate — slightly different wording, same information
+[[cases.seeds]]
+id = "mem_fts_neardup"
+content = "FTS5 virtual table chunks_fts indexes content and title fields. Triggers on the chunks table keep it synchronized on every insert, update, and delete."
+memory_type = "fact"
+domain = "projectA"
+relevance = 1
+
+# Recap mentioning FTS
+[[cases.negative_seeds]]
+id = "mem_fts_recap"
+content = "Session recap: added FTS5 indexing, created sync triggers, tested search with various query patterns."
+memory_type = "recap"
+domain = "projectA"
+
+
+[[cases]]
+query = "knowledge graph entity relationships"
+
+# Detailed original
+[[cases.seeds]]
+id = "mem_kg_original"
+content = "Knowledge graph uses three tables: entities (name, type, domain), relations (from_entity, to_entity, relation_type), and observations (entity_id, content, confidence). FK cascades handle cleanup on entity deletion."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+# Partial duplicate — subset of the same information
+[[cases.seeds]]
+id = "mem_kg_partial_dup"
+content = "Entities table stores name and type. Relations link entities with typed edges. Observations attach factual statements to entities with confidence scores."
+memory_type = "fact"
+domain = "projectA"
+relevance = 1
+
+# Different project's graph — should not appear
+[[cases.negative_seeds]]
+id = "mem_kg_other"
+content = "Neo4j graph database stores nodes with labels and properties. Cypher queries traverse relationships using MATCH patterns."
+memory_type = "fact"
+domain = "projectB"

@@ -1,0 +1,73 @@
+# Origin Intelligence Config — Baseline (2026-03-26)
+# Working defaults as of store+search quality v2 (PR #31).
+# Copy to ~/Library/Application Support/origin/intelligence.toml to override.
+#
+# Future: separate into open-infra (AGPL, shipped in repo) vs
+# closed-core (proprietary, loaded from prod config).
+
+[router]
+window_dedup_threshold = 0.85
+consumer_dedup_threshold = 0.85
+consumer_dedup_window_secs = 60
+hellinger_threshold = 0.002
+afk_threshold_secs = 60.0
+recent_focus_window_secs = 30
+
+[scoring]
+min_text_length = 80
+score_threshold = 0.15
+focus_bonus = 0.1
+keyword_min_threshold = 0.0005
+
+[refinery]
+max_proposals_per_sweep = 5
+min_memories_for_recap = 3
+recap_lookback_secs = 86400
+max_reweave_per_sweep = 20
+sweep_deadline_secs = 120
+dedup_similarity_threshold = 0.85
+entity_link_distance = 0.15
+consolidation_confidence_threshold = 0.3
+consolidation_batch_size = 3
+
+[narrative]
+stale_secs = 86400
+max_memories = 12
+
+[briefing]
+stale_secs = 21600
+stale_memory_delta = 5
+max_topic_memories = 5
+max_memory_chars = 100
+
+[confidence]
+protected_base = 0.90        # identity, preference
+standard_base = 0.70         # fact, decision
+ephemeral_base = 0.50        # goal
+protected_decay = 0.001      # very slow decay
+standard_decay = 0.01        # moderate decay
+ephemeral_decay = 0.05       # fast decay
+low_quality_multiplier = 0.7
+full_trust_weight = 1.0
+review_trust_weight = 0.7
+untrusted_weight = 0.4
+
+[packager]
+session_gap_secs = 600
+min_session_captures = 3
+max_session_duration_secs = 7200
+packager_interval_secs = 300
+
+[eval]
+enabled = true
+signal_capture = true
+auto_tune_enabled = false    # closed-core only
+llm_judge_enabled = false    # closed-core only
+llm_judge_sample_rate = 10
+min_signals_for_tune = 50
+tune_cooldown_days = 7
+tune_min_improvement = 0.005
+
+[search_scoring]
+confirmation_boost = 1.5
+recap_penalty = 0.3

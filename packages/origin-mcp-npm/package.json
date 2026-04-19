@@ -1,0 +1,27 @@
+{
+  "name": "origin-mcp",
+  "version": "0.1.0",
+  "description": "Origin — personal memory layer for AI agents. MCP server integration.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/7xuanlu/origin.git"
+  },
+  "homepage": "https://github.com/7xuanlu/origin",
+  "bugs": {
+    "url": "https://github.com/7xuanlu/origin/issues"
+  },
+  "keywords": ["origin", "mcp", "memory", "agents", "claude", "cursor"],
+  "bin": {
+    "origin-mcp": "./bin/run.js"
+  },
+  "files": ["bin", "scripts", "README.md", "LICENSE"],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"]
+}

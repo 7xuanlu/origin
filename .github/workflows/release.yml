@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Build origin-server
+        run: cargo build --release -p origin-server --target aarch64-apple-darwin
+
+      - name: Install origin-mcp sidecar
+        run: |
+          cargo install --git https://github.com/7xuanlu/origin-mcp --root ./tmp-mcp
+          mkdir -p app/binaries
+          cp tmp-mcp/bin/origin-mcp app/binaries/origin-mcp-aarch64-apple-darwin
+          chmod +x app/binaries/origin-mcp-aarch64-apple-darwin
+
+      - name: Download cloudflared sidecar
+        run: |
+          mkdir -p app/binaries
+          curl -fsSL -o /tmp/cloudflared.tgz \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+          tar -xzf /tmp/cloudflared.tgz -C /tmp
+          cp /tmp/cloudflared app/binaries/cloudflared-aarch64-apple-darwin
+          chmod 755 app/binaries/cloudflared-aarch64-apple-darwin
+          xattr -cr app/binaries/cloudflared-aarch64-apple-darwin
+
+      - name: Copy origin-server sidecar
+        run: |
+          cp target/aarch64-apple-darwin/release/origin-server app/binaries/origin-server-aarch64-apple-darwin
+          chmod +x app/binaries/origin-server-aarch64-apple-darwin
+
+      - name: Smoke test origin-server
+        run: ./target/aarch64-apple-darwin/release/origin-server --help
+
+      - name: Build and publish Tauri app
+        uses: tauri-apps/tauri-action@v0
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Origin v__VERSION__'
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          releaseBody: |
+            ## Install
+
+            **Desktop app (macOS Apple Silicon):**
+            Download the `.dmg` file below, open it, drag to Applications.
+            Then run: `xattr -cr /Applications/Origin.app`
+
+            **MCP integration (latest stable channel):**
+            ```
+            npx -y origin-mcp
+            ```
+
+            **Exact release on this page:**
+            ```
+            ORIGIN_RELEASE_TAG=v__VERSION__ npx -y origin-mcp
+            ```
+            Uses isolated port/data-dir defaults so it does not replace the stable runtime.
+
+            **Developer (headless daemon, latest stable):**
+            ```
+            curl -fsSL https://raw.githubusercontent.com/7xuanlu/origin/main/install.sh | bash
+            ```
+
+            **Exact shell install for this release:**
+            ```
+            curl -fsSL https://raw.githubusercontent.com/7xuanlu/origin/v__VERSION__/install.sh | ORIGIN_RELEASE_TAG=v__VERSION__ bash
+            ```
+            Downloads exact binaries and prints manual isolated daemon/MCP setup steps.
+
+            > **First launch** downloads a ~2.7GB AI model. Allow a few minutes on first run.
+          projectPath: app
+          args: --target aarch64-apple-darwin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload standalone origin-server binary
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          cp target/aarch64-apple-darwin/release/origin-server origin-server-aarch64-apple-darwin
+          gh release upload "$TAG" \
+            origin-server-aarch64-apple-darwin \
+            --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload standalone origin-mcp binary
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          cp tmp-mcp/bin/origin-mcp origin-mcp-aarch64-apple-darwin
+          gh release upload "$TAG" \
+            origin-mcp-aarch64-apple-darwin \
+            --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

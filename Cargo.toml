@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "app",
+    "crates/origin-types",
+    "crates/origin-core",
+    "crates/origin-server",
+]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+# Internal crates
+origin-types = { path = "crates/origin-types" }
+origin-core = { path = "crates/origin-core" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Identifiers
+uuid = { version = "1", features = ["v4"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracing-log"] }
+log = "0.4"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json"] }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+hyper = { version = "1.5", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+
+# Database
+libsql = { version = "0.9", default-features = false, features = ["core", "replication"] }
+
+# Embeddings & LLM
+fastembed = "5"
+llama-cpp-2 = { version = "0.1", features = ["metal", "sampler"] }
+
+# Utilities
+regex = "1"
+sha2 = "0.10"
+dirs = "6"
+hf-hub = "0.4"
+encoding_rs = "0.8"
+lru = "0.12"
+futures = "0.3"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tempfile = "3"
+pdf-extract = "0.10"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+sysinfo = "0.33"
+serde_yaml = "0.9"
+image = "0.25"
+toml = "0.8"

@@ -1,0 +1,110 @@
+# Basic search quality eval — seed fixtures
+# These test that the ranking pipeline correctly orders results by relevance.
+
+[[cases]]
+query = "memory deduplication threshold"
+
+[[cases.seeds]]
+id = "mem_dedup_decision"
+content = "Set dedup similarity threshold to 0.85 cosine. Values below 0.80 cause false merges, above 0.90 miss near-duplicates."
+memory_type = "decision"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_dedup_impl"
+content = "Post-ingest pipeline checks vector similarity. Matches above threshold queued as dedup_merge proposals for review."
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "mem_unrelated_identity"
+content = "User prefers dark mode in all applications"
+memory_type = "preference"
+domain = "personal"
+
+# Hard negative: mentions dedup and threshold but is about frame comparison, not memory dedup
+[[cases.negative_seeds]]
+id = "mem_frame_dedup_threshold"
+content = "Frame deduplication uses a Hellinger distance threshold of 0.15 on downscaled 64x64 pixel frames. Duplicate frames are dropped before OCR to reduce pipeline load."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative: mentions similarity and threshold but is about quality gate novelty check
+[[cases.negative_seeds]]
+id = "mem_novelty_threshold"
+content = "The novelty check in the quality gate uses a 0.92 cosine similarity threshold. Near-duplicate memories above this threshold are rejected and logged in the rejected_memories table."
+memory_type = "fact"
+domain = "origin"
+
+[[cases]]
+query = "how does confidence scoring work"
+
+[[cases.seeds]]
+id = "mem_confidence_formula"
+content = "Effective confidence = base_confidence(tier) * trust_weight(trust_level) * low_quality_multiplier. Protected tier base is 0.90, standard 0.70, ephemeral 0.50."
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_confidence_decay"
+content = "Confidence decays over time at tier-specific rates. Protected: 0.001/day, Standard: 0.01/day, Ephemeral: 0.05/day."
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+
+[[cases.seeds]]
+id = "mem_tangential"
+content = "The refinery runs periodic sweeps to update confidence values and generate recaps."
+memory_type = "fact"
+domain = "origin"
+relevance = 1
+
+# Hard negative: mentions confidence but is about agent trust levels, not the scoring formula
+[[cases.negative_seeds]]
+id = "mem_confidence_trust_level"
+content = "Agent trust levels determine the maximum confidence an agent can assign: trusted agents cap at 0.95, standard at 0.80, and untrusted at 0.50. Trust is set per agent profile."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative: mentions scoring and tiers but is about retrieval ranking, not confidence computation
+[[cases.negative_seeds]]
+id = "mem_retrieval_scoring"
+content = "Retrieval scoring multiplies the RRF base score by recency decay, quality multiplier, and domain boost. The final score is normalized to a 0-1 range for consumer display."
+memory_type = "fact"
+domain = "origin"
+
+[[cases]]
+query = "hybrid search reciprocal rank fusion"
+
+[[cases.seeds]]
+id = "mem_rrf_impl"
+content = "Hybrid search combines vector similarity and FTS5 full-text search using Reciprocal Rank Fusion. RRF score = sum(1/(60+rank)) for each signal."
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "mem_unrelated_recap"
+content = "Session recap: worked on UI styling for the memory page header"
+memory_type = "recap"
+domain = "origin"
+
+# Hard negative: mentions RRF and search but is about graph augmentation, not the core RRF fusion
+[[cases.negative_seeds]]
+id = "mem_graph_rrf"
+content = "Knowledge graph observations are merged into the search result set as a third RRF signal. Entity matches from 2-hop traversal receive a rank-based score that is added to the vector+FTS RRF total."
+memory_type = "fact"
+domain = "origin"
+
+# Hard negative: mentions search fusion but is about score normalization, not RRF mechanics
+[[cases.negative_seeds]]
+id = "mem_score_normalization"
+content = "After RRF fusion, the final result set is normalized so the top-scoring result has score 1.0 and all others are proportional fractions. This normalization runs after all boosts and penalties are applied."
+memory_type = "fact"
+domain = "origin"

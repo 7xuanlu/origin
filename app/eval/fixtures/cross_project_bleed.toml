@@ -1,0 +1,82 @@
+# Cross-project bleed — querying one project shouldn't surface another project's memories.
+# Pattern seen: querying "ruru" returned Origin UI decisions, and vice versa.
+
+[[cases]]
+query = "authentication flow for mobile app"
+domain = "projectA"
+
+[[cases.seeds]]
+id = "mem_auth_mobile"
+content = "Implemented Google Sign-In with SHA-1 fingerprint registration for production builds. Debug keystore uses a different signing key than EAS builds."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_auth_tokens"
+content = "Access tokens stored in secure storage with 24-hour expiry. Refresh tokens persist across app restarts."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Cross-project noise — same technical domain but different project
+[[cases.negative_seeds]]
+id = "mem_other_project_auth"
+content = "Added OAuth middleware to the admin dashboard. Session cookies expire after 30 minutes of inactivity."
+memory_type = "decision"
+domain = "projectB"
+
+[[cases.negative_seeds]]
+id = "mem_other_project_general"
+content = "Migrated the API gateway from Express to Fastify for better request throughput."
+memory_type = "decision"
+domain = "projectB"
+
+# Hard negative: same project auth topic but about token refresh edge cases, not the main flow
+[[cases.negative_seeds]]
+id = "mem_auth_refresh_edge"
+content = "Token refresh silently fails when the device clock is more than 5 minutes ahead of the server. The client catches 401 errors and forces re-authentication via the Google Sign-In prompt."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: same project auth topic but about deep linking, not the auth flow itself
+[[cases.negative_seeds]]
+id = "mem_auth_deeplink"
+content = "OAuth redirect URIs for mobile deep linking use the app scheme prefix. Universal links require an apple-app-site-association file hosted on the signing domain."
+memory_type = "fact"
+domain = "projectA"
+
+
+[[cases]]
+query = "database schema migration strategy"
+domain = "projectB"
+
+[[cases.seeds]]
+id = "mem_migration_strategy"
+content = "Using versioned migrations with PRAGMA user_version. Each migration checks the current version and applies changes incrementally."
+memory_type = "decision"
+domain = "projectB"
+relevance = 3
+confirmed = true
+
+# Should NOT appear — different project's DB decisions
+[[cases.negative_seeds]]
+id = "mem_other_db"
+content = "Switched from PostgreSQL to libSQL for local-first architecture. Vector columns use F32_BLOB with DiskANN indexing."
+memory_type = "decision"
+domain = "projectA"
+
+# Hard negative: mentions schema migration but is about data migration tooling, not the strategy
+[[cases.negative_seeds]]
+id = "mem_migration_tooling"
+content = "Evaluated Flyway and Liquibase for managing schema migrations. Both were rejected because the project uses SQLite-compatible PRAGMA-based versioning that does not need a separate migration framework."
+memory_type = "decision"
+domain = "projectB"
+
+# Hard negative: mentions migration and version but is about embedding model migration, not schema
+[[cases.negative_seeds]]
+id = "mem_embed_migration"
+content = "Migration 25 nullifies all embedding columns when the model changes. The crash-recovery loop on next startup detects NULL embeddings and re-embeds each row before accepting new writes."
+memory_type = "fact"
+domain = "projectB"

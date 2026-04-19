@@ -1,0 +1,56 @@
+# Quality gate noise pattern tests — verify gate rejects structural noise
+# while admitting legitimate memories.
+
+[[cases]]
+query = "what are the user's core preferences and technical stack decisions"
+
+# These should be REJECTED by the gate (negative_seeds = should not be in DB)
+[[cases.negative_seeds]]
+id = "noise_sys_prompt_1"
+content = "You are a helpful AI assistant. Your job is to answer questions accurately and concisely. Always be polite."
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_sys_prompt_2"
+content = "[INST] Always respond in JSON format. Never include personal opinions. Ensure all outputs are valid JSON. [/INST]"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_heartbeat_1"
+content = "heartbeat"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_timestamp_1"
+content = "2026-03-30T14:22:00Z ok"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_ack_1"
+content = "acknowledged"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_credential_1"
+content = "Set the API key to sk-abc123def456ghi789jkl012mno345pqr678stu901"
+memory_type = "fact"
+
+# These should be ADMITTED (positive seeds)
+[[cases.seeds]]
+id = "mem_real_pref"
+content = "User prefers dark mode for all code editors and terminal applications"
+memory_type = "preference"
+relevance = 3
+
+[[cases.seeds]]
+id = "mem_real_decision"
+content = "Decided to use libSQL instead of PostgreSQL because it supports embedded vector search natively without a separate service"
+memory_type = "decision"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_real_fact"
+content = "The Origin app uses Tauri 2 with a React 19 frontend and Rust backend running on macOS"
+memory_type = "fact"
+relevance = 2

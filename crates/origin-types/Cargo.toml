@@ -1,0 +1,16 @@
+[package]
+name = "origin-types"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Shared wire-format types for Origin — the personal agent memory system."
+repository = "https://github.com/7xuanlu/origin"
+homepage = "https://github.com/7xuanlu/origin"
+authors = ["Qi-Xuan Lu <h164654156465@gmail.com>"]
+readme = "README.md"
+keywords = ["memory", "mcp", "origin", "agent"]
+categories = ["data-structures", "api-bindings"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,243 @@
+# Quality gate duplicate-pollution tests — verify that near-duplicate memories
+# stored across multiple agent sessions don't crowd search results.
+# Seeds are the canonical versions; negative_seeds are the duplicates that
+# should have been rejected at ingest time (or de-ranked at retrieval time).
+
+# ── Case 1: preference — word-order and passive-voice variants ──────────────
+
+[[cases]]
+query = "preferred text editor"
+
+[[cases.seeds]]
+id = "mem_editor_pref"
+content = "User prefers VS Code as their primary text editor for all development work"
+memory_type = "preference"
+relevance = 3
+confirmed = true
+
+# Same fact, passive voice
+[[cases.negative_seeds]]
+id = "dup_editor_passive"
+content = "VS Code is preferred by the user for development work"
+memory_type = "preference"
+
+# Same fact, different word order
+[[cases.negative_seeds]]
+id = "dup_editor_reorder"
+content = "For all development work, VS Code is the user's preferred text editor"
+memory_type = "preference"
+
+# Same fact, agent-perspective framing
+[[cases.negative_seeds]]
+id = "dup_editor_agent_pov"
+content = "I learned that the user likes to use VS Code as their main editor"
+memory_type = "preference"
+
+# Same fact with unrelated noise appended
+[[cases.negative_seeds]]
+id = "dup_editor_noisy"
+content = "User prefers VS Code for development. Also mentioned the weather has been cold lately."
+memory_type = "preference"
+
+# Same fact, hedged past-tense form
+[[cases.negative_seeds]]
+id = "dup_editor_hedged"
+content = "The user has expressed a preference for VS Code when writing code"
+memory_type = "preference"
+
+
+# ── Case 2: decision — tense variants ──────────────────────────────────────
+
+[[cases]]
+query = "async runtime decision"
+
+[[cases.seeds]]
+id = "mem_tokio_decision"
+content = "Decided to use Tokio as the async runtime because it integrates natively with Tauri and the broader Rust ecosystem"
+memory_type = "decision"
+relevance = 3
+confirmed = true
+
+# Future-past tense
+[[cases.negative_seeds]]
+id = "dup_tokio_future_past"
+content = "We decided we would use Tokio for async because it works well with Tauri"
+memory_type = "decision"
+
+# Nominalised past
+[[cases.negative_seeds]]
+id = "dup_tokio_nominal"
+content = "The decision was to adopt Tokio as the async runtime given its Tauri compatibility"
+memory_type = "decision"
+
+# Present-tense statement of outcome
+[[cases.negative_seeds]]
+id = "dup_tokio_present"
+content = "Tokio is used as the async runtime, chosen for its tight integration with Tauri"
+memory_type = "decision"
+
+# Minimal restatement (detail stripped)
+[[cases.negative_seeds]]
+id = "dup_tokio_minimal"
+content = "Using Tokio for async in the Rust backend"
+memory_type = "decision"
+
+
+# ── Case 3: fact — level-of-detail variants ────────────────────────────────
+
+[[cases]]
+query = "programming language used for backend"
+
+[[cases.seeds]]
+id = "mem_rust_backend"
+content = "The backend is written in Rust using async Tokio, with Axum 0.8 for the HTTP layer and libSQL for storage"
+memory_type = "fact"
+relevance = 3
+confirmed = true
+
+# Coarse summary (less detail)
+[[cases.negative_seeds]]
+id = "dup_rust_coarse"
+content = "Backend uses Rust"
+memory_type = "fact"
+
+# Medium detail, no framework names
+[[cases.negative_seeds]]
+id = "dup_rust_medium"
+content = "The backend service is implemented in Rust with async support"
+memory_type = "fact"
+
+# Different framing, same core fact
+[[cases.negative_seeds]]
+id = "dup_rust_framing"
+content = "Rust powers the backend, handling HTTP requests and database operations asynchronously"
+memory_type = "fact"
+
+# Partial overlap — correct core but adds wrong/unrelated claim
+[[cases.negative_seeds]]
+id = "dup_rust_partial"
+content = "Backend is in Rust; frontend uses Vue.js and the app targets Linux primarily"
+memory_type = "fact"
+
+
+# ── Case 4: identity — pronoun and perspective shifts ──────────────────────
+
+[[cases]]
+query = "user's name"
+
+[[cases.seeds]]
+id = "mem_user_name"
+content = "The user's name is Lucian"
+memory_type = "identity"
+relevance = 3
+confirmed = true
+
+# Agent first-person
+[[cases.negative_seeds]]
+id = "dup_name_agent"
+content = "I was told the user goes by Lucian"
+memory_type = "identity"
+
+# Possessive reformulation
+[[cases.negative_seeds]]
+id = "dup_name_possessive"
+content = "Lucian is the name this user goes by"
+memory_type = "identity"
+
+# Greeting-style noise
+[[cases.negative_seeds]]
+id = "dup_name_greeting"
+content = "User introduced themselves as Lucian during our first session together"
+memory_type = "identity"
+
+# Embedded in longer sentence with irrelevant context
+[[cases.negative_seeds]]
+id = "dup_name_buried"
+content = "During onboarding the user confirmed their display name is Lucian and that notifications should go to their personal account"
+memory_type = "identity"
+
+
+# ── Case 5: preference — multi-session accumulation of the same UI pref ────
+
+[[cases]]
+query = "font size preference in code editor"
+
+[[cases.seeds]]
+id = "mem_font_size"
+content = "User sets editor font size to 14px and prefers JetBrains Mono as the coding font"
+memory_type = "preference"
+relevance = 3
+confirmed = true
+
+# Session 2 restatement
+[[cases.negative_seeds]]
+id = "dup_font_session2"
+content = "Coding font is JetBrains Mono at 14px in the editor"
+memory_type = "preference"
+
+# Session 3 — only font family mentioned
+[[cases.negative_seeds]]
+id = "dup_font_session3"
+content = "JetBrains Mono is the preferred programming font"
+memory_type = "preference"
+
+# Session 4 — inverted attribute order
+[[cases.negative_seeds]]
+id = "dup_font_session4"
+content = "Prefers 14px font size with JetBrains Mono for all code editing"
+memory_type = "preference"
+
+# Session 5 — agent-observation framing
+[[cases.negative_seeds]]
+id = "dup_font_session5"
+content = "I noticed the user consistently uses JetBrains Mono at 14 pixels across all their editor configs"
+memory_type = "preference"
+
+# Session 6 — partial with noise
+[[cases.negative_seeds]]
+id = "dup_font_session6"
+content = "Font: JetBrains Mono, size 14. User also asked about ligatures but no decision was made."
+memory_type = "preference"
+
+
+# ── Case 6: decision — architectural choice restated across agents ──────────
+
+[[cases]]
+query = "why libSQL was chosen over PostgreSQL"
+
+[[cases.seeds]]
+id = "mem_libsql_choice"
+content = "Chose libSQL over PostgreSQL because it runs embedded with no separate server, supports native vector search, FTS5, and knowledge graph in a single file"
+memory_type = "decision"
+relevance = 3
+confirmed = true
+
+# Second agent's shorter restatement
+[[cases.negative_seeds]]
+id = "dup_libsql_short"
+content = "libSQL was selected instead of PostgreSQL for its embedded vector and full-text search support"
+memory_type = "decision"
+
+# Third agent, present-state framing
+[[cases.negative_seeds]]
+id = "dup_libsql_present"
+content = "The project uses libSQL rather than PostgreSQL because it needs no separate database server process"
+memory_type = "decision"
+
+# Passive construction
+[[cases.negative_seeds]]
+id = "dup_libsql_passive"
+content = "PostgreSQL was ruled out in favour of libSQL due to the requirement for an embedded, serverless database"
+memory_type = "decision"
+
+# Different angle — focuses on single benefit
+[[cases.negative_seeds]]
+id = "dup_libsql_angle"
+content = "libSQL was picked because vector search is built in and the whole DB lives in one file"
+memory_type = "decision"
+
+# Partial overlap with extra unrelated claim
+[[cases.negative_seeds]]
+id = "dup_libsql_partial"
+content = "Using libSQL for the database, which supports vectors. Also considering Redis for caching later."
+memory_type = "decision"

@@ -1,0 +1,118 @@
+# Temporal ordering — does recency scoring rank newer above older?
+
+[[cases]]
+query = "what database does the project use"
+
+[[cases.seeds]]
+id = "old_db_decision"
+content = "Chose PostgreSQL for the backend database due to strong ecosystem and JSONB support"
+memory_type = "decision"
+domain = "project"
+relevance = 1
+age_days = 90
+confirmed = true
+
+[[cases.seeds]]
+id = "new_db_decision"
+content = "Migrated from PostgreSQL to libSQL for embedded vector support and local-first architecture"
+memory_type = "decision"
+domain = "project"
+relevance = 3
+age_days = 5
+supersedes = "old_db_decision"
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "neg_unrelated_pref"
+content = "User prefers dark mode in all code editors"
+memory_type = "preference"
+domain = "personal"
+
+[[cases]]
+query = "deployment strategy for the API"
+
+[[cases.seeds]]
+id = "old_deploy"
+content = "API deployed to Heroku with automatic scaling and Postgres add-on"
+memory_type = "decision"
+domain = "work"
+relevance = 1
+age_days = 120
+confirmed = true
+
+[[cases.seeds]]
+id = "new_deploy"
+content = "Moved API deployment to Fly.io with edge regions in US-East and EU-West for lower latency"
+memory_type = "decision"
+domain = "work"
+relevance = 3
+age_days = 3
+supersedes = "old_deploy"
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "neg_ci_config"
+content = "GitHub Actions workflow runs tests on push to main"
+memory_type = "fact"
+domain = "work"
+
+[[cases]]
+query = "preferred frontend framework"
+
+[[cases.seeds]]
+id = "old_framework"
+content = "Using Vue 3 with Composition API for all frontend projects"
+memory_type = "preference"
+domain = "work"
+relevance = 1
+age_days = 180
+
+[[cases.seeds]]
+id = "new_framework"
+content = "Switched to React 19 with TanStack Query for better ecosystem support and hiring"
+memory_type = "preference"
+domain = "work"
+relevance = 3
+age_days = 10
+supersedes = "old_framework"
+
+[[cases.negative_seeds]]
+id = "neg_backend_pref"
+content = "Prefers Rust over Go for backend services due to memory safety guarantees"
+memory_type = "preference"
+domain = "work"
+
+[[cases]]
+query = "team communication tool"
+
+[[cases.seeds]]
+id = "stale_comms"
+content = "Team uses Slack for all async communication with dedicated channels per project"
+memory_type = "fact"
+domain = "work"
+relevance = 2
+age_days = 60
+
+[[cases.seeds]]
+id = "fresh_comms"
+content = "Team switched to Discord for async communication, using threads heavily for topic isolation"
+memory_type = "fact"
+domain = "work"
+relevance = 3
+age_days = 2
+supersedes = "stale_comms"
+
+[[cases.seeds]]
+id = "very_relevant_old"
+content = "Communication tooling evaluation: considered Slack, Discord, Teams, and Zulip before deciding"
+memory_type = "fact"
+domain = "work"
+relevance = 3
+age_days = 65
+confirmed = true
+
+[[cases.negative_seeds]]
+id = "neg_email_pref"
+content = "User checks personal email twice per day, morning and evening"
+memory_type = "preference"
+domain = "personal"

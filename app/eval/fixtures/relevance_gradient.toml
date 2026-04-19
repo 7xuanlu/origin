@@ -1,0 +1,94 @@
+# Relevance gradient — tests that ranking correctly orders by semantic closeness.
+# Pattern seen: all results scored 0.007-0.014 with no meaningful differentiation.
+
+[[cases]]
+query = "memory deduplication and merge strategy"
+
+[[cases.seeds]]
+id = "mem_dedup_core"
+content = "Deduplication uses cosine similarity with 0.85 threshold. Matches above threshold are queued as merge proposals for human review. Recaps excluded from dedup since they are expected to overlap with originals."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_dedup_postingest"
+content = "Post-ingest enrichment pipeline runs dedup check after every store. Vector similarity query finds candidates, then RRF scoring confirms the match before queuing."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+[[cases.seeds]]
+id = "mem_dedup_tangential"
+content = "The enrichment pipeline also handles entity auto-linking and recap triggers. These run in sequence after the dedup check."
+memory_type = "fact"
+domain = "projectA"
+relevance = 1
+
+# Noise that shares vocabulary but is semantically distant
+[[cases.negative_seeds]]
+id = "mem_git_merge"
+content = "Always create new git commits rather than amending existing ones. Resolve merge conflicts rather than discarding changes."
+memory_type = "preference"
+domain = "personal"
+
+# Hard negative: mentions dedup and merge but is about entity resolution, not memory dedup
+[[cases.negative_seeds]]
+id = "mem_entity_merge"
+content = "Entity resolution merges duplicate entity records that refer to the same real-world object. When two entities have cosine similarity above 0.90 and matching types, they are flagged for merge review."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions dedup and cosine similarity but is about search result dedup, not storage dedup
+[[cases.negative_seeds]]
+id = "mem_search_dedup"
+content = "Search result deduplication removes entries sharing a source_id, then a bigram Jaccard pass drops near-duplicate text with similarity above 0.5 before the final ranked list is returned."
+memory_type = "fact"
+domain = "projectA"
+
+
+[[cases]]
+query = "on-device language model inference"
+
+[[cases.seeds]]
+id = "mem_llm_setup"
+content = "Running Qwen3 4B parameter model via Metal GPU acceleration. Dedicated std::thread for inference to avoid blocking the Tokio runtime. Bridge pattern uses runtime Handle for async DB callbacks."
+memory_type = "fact"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_llm_prompts"
+content = "LLM prompts loaded from PromptRegistry with TOML overrides at runtime. 17 prompt templates cover classification, quality assessment, reranking, entity extraction, and structured field extraction."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+[[cases.seeds]]
+id = "mem_llm_perf"
+content = "Inference timeout set to 10 seconds for reranking calls. Quality assessment runs asynchronously and does not block the store response."
+memory_type = "fact"
+domain = "projectA"
+relevance = 1
+
+[[cases.negative_seeds]]
+id = "mem_llm_noise"
+content = "Tokio uses a work-stealing scheduler with configurable thread count. Default is one thread per CPU core."
+memory_type = "fact"
+domain = "general"
+
+# Hard negative: mentions on-device LLM inference but is about model selection evaluation, not the running setup
+[[cases.negative_seeds]]
+id = "mem_llm_eval"
+content = "Evaluated Phi-3 Mini, Gemma 2B, and Qwen3 4B for on-device inference. Qwen3 won on quality per parameter but Phi-3 has 2x faster token generation on Metal. Decision was quality over speed."
+memory_type = "decision"
+domain = "projectA"
+
+# Hard negative: mentions language model and Metal GPU but is about embedding model, not the LLM formatter
+[[cases.negative_seeds]]
+id = "mem_embed_model_inference"
+content = "The GTE-Base-EN-v1.5-Q embedding model runs ONNX inference on a dedicated thread using CoreML acceleration on Apple Silicon. Each embedding takes approximately 8ms for a 512-token input."
+memory_type = "fact"
+domain = "projectA"

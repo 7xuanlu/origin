@@ -1,0 +1,171 @@
+# Cross-agent noise — same knowledge stored by different agents in different styles.
+# Tests that retrieval finds the most relevant version, not just any version.
+# Pattern: Claude Code writes terse technical facts, ChatGPT writes verbose explanations,
+# manual entries are informal notes.
+
+[[cases]]
+query = "what database does the project use"
+
+# Most relevant: terse, confirmed, technical — should rank first
+[[cases.seeds]]
+id = "hca_db_claude"
+content = "Project uses libSQL (Turso's SQLite fork) with F32_BLOB vector columns and DiskANN indexing. Single DB at ~/Library/Application Support/origin/memorydb/."
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+source_agent = "claude-code"
+
+# Same fact, verbose explanatory style — should rank second
+[[cases.seeds]]
+id = "hca_db_chatgpt"
+content = "The project uses libSQL, which is Turso's fork of SQLite. This was chosen because it provides built-in vector support via F32_BLOB columns and DiskANN indexing for approximate nearest neighbor search, while keeping everything local. All data lives in a single database file stored at ~/Library/Application Support/origin/memorydb/, which simplifies backup and avoids the need for a separate server process."
+memory_type = "fact"
+domain = "origin"
+relevance = 2
+source_agent = "chatgpt"
+
+# Same fact, informal shorthand — should rank third
+[[cases.seeds]]
+id = "hca_db_manual"
+content = "db = libsql, local file, vectors built in. chose over postgres bc no server needed."
+memory_type = "fact"
+domain = "origin"
+relevance = 1
+source_agent = "manual"
+
+# Distractor: session tracking consolidation — adjacent topic, not the answer
+[[cases.negative_seeds]]
+id = "hca_db_noise_session"
+content = "Session tracking was consolidated into memory_db.rs to reduce the number of open database connections and simplify the connection lifecycle."
+memory_type = "fact"
+domain = "origin"
+source_agent = "claude-code"
+
+# Distractor: PostgreSQL rejection rationale — mentions DB choice but is about what was NOT chosen
+[[cases.negative_seeds]]
+id = "hca_db_noise_postgres"
+content = "PostgreSQL was rejected early in the architecture evaluation. Running a server process locally conflicts with the local-first, zero-dependency installation goal."
+memory_type = "decision"
+domain = "origin"
+source_agent = "chatgpt"
+
+# Distractor: LanceDB evaluation — another DB mentioned but not the chosen one
+[[cases.negative_seeds]]
+id = "hca_db_noise_lancedb"
+content = "Evaluated LanceDB as an alternative for vector storage. Rust bindings were immature at the time and it would have required a second database for document and graph data."
+memory_type = "decision"
+domain = "origin"
+source_agent = "claude-code"
+
+# Distractor: tokio Mutex wrapping — DB internals, not which DB is used
+[[cases.negative_seeds]]
+id = "hca_db_noise_mutex"
+content = "libsql::Connection is Send but not Sync. Wrapped in tokio::sync::Mutex inside AppState so it can be shared across async tasks without data races."
+memory_type = "fact"
+domain = "origin"
+source_agent = "claude-code"
+
+# Distractor: WAL mode — a DB configuration detail, not which DB
+[[cases.negative_seeds]]
+id = "hca_db_noise_wal"
+content = "WAL mode is enabled at connection time via PRAGMA journal_mode=WAL. This allows concurrent reads to proceed while a write transaction is open."
+memory_type = "fact"
+domain = "origin"
+source_agent = "manual"
+
+# Distractor: FK constraints — schema enforcement detail
+[[cases.negative_seeds]]
+id = "hca_db_noise_fk"
+content = "Foreign key enforcement is activated with PRAGMA foreign_keys=ON at every connection. The knowledge graph tables (entities, relations, observations) rely on FK cascades for cleanup."
+memory_type = "fact"
+domain = "origin"
+source_agent = "chatgpt"
+
+# Distractor: schema tables list — structural detail, not DB identity
+[[cases.negative_seeds]]
+id = "hca_db_noise_schema"
+content = "Database schema includes: memories (vectors + FTS), entities, relations, observations, agent_profiles, sessions. All in one file."
+memory_type = "fact"
+domain = "origin"
+source_agent = "manual"
+
+# Distractor: parameterized queries — SQL safety convention, not DB choice
+[[cases.negative_seeds]]
+id = "hca_db_noise_params"
+content = "All SQL queries use parameterized placeholders (?) to prevent injection. Never interpolate user input directly into query strings."
+memory_type = "decision"
+domain = "origin"
+source_agent = "claude-code"
+
+
+[[cases]]
+query = "user's preferred coding workflow"
+
+# Most relevant: terse, confirmed, direct — should rank first
+[[cases.seeds]]
+id = "hca_wf_claude"
+content = "User prefers strict TDD with separate agents for test writing vs implementation. Tests first, then implementation, always."
+memory_type = "preference"
+domain = "personal"
+relevance = 3
+confirmed = true
+source_agent = "claude-code"
+
+# Same fact, verbose explanatory style — should rank second
+[[cases.seeds]]
+id = "hca_wf_chatgpt"
+content = "The user follows a strict test-driven development methodology. Before any implementation begins, tests are written independently — typically by a dedicated AI agent focused solely on test design. A separate AI agent then writes the implementation code against those tests. This separation ensures that the test suite is not biased by knowledge of how the implementation will work, providing genuine independent verification."
+memory_type = "preference"
+domain = "personal"
+relevance = 2
+source_agent = "chatgpt"
+
+# Same fact, informal shorthand — should rank third
+[[cases.seeds]]
+id = "hca_wf_manual"
+content = "tdd always. separate agents for tests vs code. never skip the test step."
+memory_type = "preference"
+domain = "personal"
+relevance = 1
+source_agent = "manual"
+
+# Distractor: language preferences — workflow-adjacent but not the coding workflow
+[[cases.negative_seeds]]
+id = "hca_wf_noise_lang"
+content = "User prefers Rust for backend systems and TypeScript for frontend. Avoids Python in production code."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+
+# Distractor: dark mode — a preference but entirely unrelated to coding workflow
+[[cases.negative_seeds]]
+id = "hca_wf_noise_darkmode"
+content = "User prefers dark mode in all development tools. VS Code, terminal, and browser devtools all configured with dark themes."
+memory_type = "preference"
+domain = "personal"
+source_agent = "manual"
+
+# Distractor: squash merge preference — git workflow, not coding workflow
+[[cases.negative_seeds]]
+id = "hca_wf_noise_squash"
+content = "User prefers squash merges for feature branches to keep main history linear. Conventional commit messages required for all commits."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+
+# Distractor: code review requirement — process step, not the core coding workflow
+[[cases.negative_seeds]]
+id = "hca_wf_noise_review"
+content = "Code review is required before merging. A code-reviewer agent is dispatched after implementation is complete; critical and important issues must be resolved before the PR merges."
+memory_type = "decision"
+domain = "personal"
+source_agent = "claude-code"
+
+# Distractor: git worktrees — tooling preference, not TDD workflow
+[[cases.negative_seeds]]
+id = "hca_wf_noise_worktree"
+content = "Always create a git worktree before writing code for a new feature. Worktree isolates the feature branch and allows parallel dev server instances."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"

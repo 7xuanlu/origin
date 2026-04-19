@@ -1,0 +1,342 @@
+# Noisy DB retrieval tests — verify that relevant memories surface above realistic
+# agent-generated noise in search results. Seeds are genuine useful memories;
+# negative_seeds are plausible-but-worthless content that should not rank highly.
+
+# Case 1: coding domain — editor preferences mixed with generic knowledge
+[[cases]]
+query = "what editor settings does the user prefer"
+
+[[cases.seeds]]
+id = "mem_editor_pref_1"
+content = "User prefers VS Code with Vim keybindings enabled, font size 14, and ligatures turned on"
+memory_type = "preference"
+domain = "coding"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_editor_pref_2"
+content = "User sets tab width to 2 spaces for TypeScript and JavaScript, 4 spaces for Rust and Python"
+memory_type = "preference"
+domain = "coding"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "noise_generic_editor_1"
+content = "VS Code is a popular source code editor developed by Microsoft and released in 2015"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_editor_2"
+content = "Vim is a highly configurable text editor built to make creating and changing any kind of text very efficient"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_vague_editor_1"
+content = "Something about editor configuration and user settings"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_status_editor_1"
+content = "Currently updating VS Code settings file with new configuration values"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_meta_editor_1"
+content = "I just stored a memory about the user's VS Code preferences and font settings"
+memory_type = "fact"
+
+
+# Case 2: project domain — architecture decisions mixed with tool output noise
+[[cases]]
+query = "why did we choose libSQL over other databases"
+
+[[cases.seeds]]
+id = "mem_db_decision_1"
+content = "Chose libSQL over PostgreSQL and SQLite because it supports native vector search, FTS5, and knowledge graph in a single embedded file with no separate service required"
+memory_type = "decision"
+domain = "project"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_db_decision_2"
+content = "libSQL chosen over Qdrant and Weaviate for vector storage because on-device embedding keeps all data local — no cloud dependency"
+memory_type = "decision"
+domain = "project"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "noise_tool_output_1"
+content = "cargo build output: Compiling libsql v0.9.29 (registry+https://github.com/rust-lang/crates.io-index) Finished release target in 47.3s"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_db_1"
+content = "SQLite is a C-language library that implements a small, fast, self-contained SQL database engine"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_db_2"
+content = "PostgreSQL is an advanced open-source relational database management system supporting ACID transactions"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_vague_db_1"
+content = "Something about databases and the storage layer decision"
+memory_type = "fact"
+
+
+# Case 3: personal domain — dietary preferences mixed with system prompt fragments
+[[cases]]
+query = "food allergies or dietary restrictions"
+
+[[cases.seeds]]
+id = "mem_diet_1"
+content = "User is lactose intolerant — avoid dairy in restaurant recommendations and meal suggestions"
+memory_type = "fact"
+domain = "personal"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_diet_2"
+content = "User eats mostly Mediterranean diet — prefers fish and vegetables over red meat"
+memory_type = "preference"
+domain = "personal"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "noise_sysprompt_diet_1"
+content = "When the user asks about food, always check for dietary restrictions and suggest healthy alternatives that fit their lifestyle"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_sysprompt_diet_2"
+content = "You are a helpful assistant. Always be considerate of user dietary needs and food preferences when making recommendations"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_diet_1"
+content = "Lactose intolerance is a common digestive problem where the body is unable to digest lactose"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_dup_diet_1"
+content = "The user has lactose intolerance and cannot consume dairy products or milk-based foods"
+memory_type = "fact"
+
+
+# Case 4: coding domain — language preferences mixed with transient status updates
+[[cases]]
+query = "preferred programming languages and when to use each"
+
+[[cases.seeds]]
+id = "mem_lang_pref_1"
+content = "User prefers Rust for performance-critical backend work and TypeScript for all frontend and tooling code"
+memory_type = "preference"
+domain = "coding"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_lang_pref_2"
+content = "Python is the go-to for quick scripts and data analysis; user avoids it for long-running services due to GIL constraints"
+memory_type = "preference"
+domain = "coding"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "noise_status_lang_1"
+content = "Currently debugging a TypeScript type error in the frontend authentication module"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_status_lang_2"
+content = "Just finished refactoring the Rust module and running cargo check to verify compilation"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_lang_1"
+content = "Python is a high-level general-purpose programming language known for its readability and simplicity"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_lang_2"
+content = "Rust is a systems programming language focused on safety, speed, and concurrency without a garbage collector"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_vague_lang_1"
+content = "Something about programming languages and when to use them in projects"
+memory_type = "fact"
+
+
+# Case 5: project domain — deployment preferences mixed with verbose tool output
+[[cases]]
+query = "how should the app be distributed to users"
+
+[[cases.seeds]]
+id = "mem_distrib_decision_1"
+content = "Origin will distribute via direct download from the website first, not the Mac App Store, to avoid sandboxing restrictions that break screen capture"
+memory_type = "decision"
+domain = "project"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_distrib_decision_2"
+content = "Code signing uses an Apple Developer ID certificate so Gatekeeper does not block installation on user machines"
+memory_type = "fact"
+domain = "project"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "noise_tool_output_2"
+content = "tauri build output: bundling application, creating dmg, signing with Developer ID Application certificate, notarizing with Apple, stapling ticket completed successfully"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_tool_output_3"
+content = "gh release create v0.4.1 uploaded origin_0.4.1_aarch64.dmg 47.2MB upload complete status 200 OK"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_distrib_1"
+content = "The Mac App Store is Apple's digital distribution platform for macOS applications reviewed by Apple"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_meta_distrib_1"
+content = "I just saved a memory about the distribution strategy decision for the Origin application"
+memory_type = "fact"
+
+
+# Case 6: personal domain — work schedule mixed with near-duplicate noise
+[[cases]]
+query = "when does the user prefer to do focused work"
+
+[[cases.seeds]]
+id = "mem_schedule_1"
+content = "User does best focused coding work in the morning between 8am and noon — avoids scheduling meetings before lunch"
+memory_type = "preference"
+domain = "personal"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_schedule_2"
+content = "User reserves Friday afternoons for exploratory work and reading — no sprint commitments on Friday after 2pm"
+memory_type = "preference"
+domain = "personal"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "noise_dup_schedule_1"
+content = "The user prefers to do focused deep work in the morning hours before noon each day"
+memory_type = "preference"
+
+[[cases.negative_seeds]]
+id = "noise_dup_schedule_2"
+content = "User's peak productivity hours are in the morning, from approximately 8 in the morning until midday"
+memory_type = "preference"
+
+[[cases.negative_seeds]]
+id = "noise_status_schedule_1"
+content = "Currently in a meeting, will be back to focused work in approximately 30 minutes"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_schedule_1"
+content = "Time blocking is a productivity technique where you schedule specific tasks into fixed time slots on your calendar"
+memory_type = "fact"
+
+
+# Case 7: architecture domain — API design decisions mixed with system prompt fragments
+[[cases]]
+query = "MCP server authentication approach"
+
+[[cases.seeds]]
+id = "mem_auth_decision_1"
+content = "origin-mcp uses bearer token authentication for HTTP transport — token stored in config.json at app startup"
+memory_type = "decision"
+domain = "architecture"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_auth_decision_2"
+content = "Claude.ai remote MCP requires OAuth 2.0 but origin-mcp only implements bearer tokens — this is the known auth gap blocking Claude.ai integration"
+memory_type = "fact"
+domain = "architecture"
+relevance = 3
+
+[[cases.negative_seeds]]
+id = "noise_sysprompt_auth_1"
+content = "Always validate authentication tokens before processing any request. Never expose credentials in logs or error messages."
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_auth_1"
+content = "OAuth 2.0 is an authorization framework that enables applications to obtain limited access to user accounts on HTTP services"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_auth_2"
+content = "Bearer tokens are a type of access token used in HTTP authentication where the token grants access to the bearer"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_vague_auth_1"
+content = "Something about authentication and how the MCP server handles access control"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_meta_auth_1"
+content = "I have stored a memory about the authentication design decision for the MCP server integration"
+memory_type = "fact"
+
+
+# Case 8: project domain — team process preferences mixed with verbose status noise
+[[cases]]
+query = "code review process and standards"
+
+[[cases.seeds]]
+id = "mem_review_pref_1"
+content = "All PRs require a code review agent pass before merge — critical and important issues must be fixed, style issues are optional"
+memory_type = "preference"
+domain = "project"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_review_pref_2"
+content = "Test coverage must stay above 90 percent — the pre-push git hook enforces this and blocks pushes that drop below the threshold"
+memory_type = "fact"
+domain = "project"
+relevance = 2
+
+[[cases.negative_seeds]]
+id = "noise_sysprompt_review_1"
+content = "When reviewing code, always check for security vulnerabilities, performance issues, and adherence to the project coding standards"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_status_review_1"
+content = "Currently reviewing pull request number 34 and checking the diff for any issues before approving"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_tool_output_4"
+content = "gh pr review 34 output: reviewed pull request adding 2 comments on 3 files changed 147 additions 52 deletions review submitted"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_generic_review_1"
+content = "Code review is a software quality assurance activity where one or more people check a program mainly by viewing and reading parts of its source code"
+memory_type = "fact"
+
+[[cases.negative_seeds]]
+id = "noise_dup_review_1"
+content = "The user requires code reviews before merging any pull requests and all critical issues need to be resolved first"
+memory_type = "preference"

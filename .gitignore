@@ -1,0 +1,75 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+target/
+app/target/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Tauri
+app/gen/
+
+# pnpm
+.pnpm-debug.log
+
+# Build artifacts
+tsconfig.tsbuildinfo
+*.dmg
+
+# Model cache
+.fastembed_cache
+app/.fastembed_cache/
+crates/*/.fastembed_cache
+*.gguf
+*.bin
+
+# Database files
+*.db
+
+# Claude
+.claude/
+.mcp.json
+
+# Coverage reports
+coverage/
+
+# Sidecar binaries (downloaded, not committed)
+app/binaries/
+
+# Git worktrees
+.worktrees/
+origin-mcp/
+.autopilot-task.md
+
+# Proprietary intelligence overrides (shipped in release builds, not in source)
+app/prompts/overrides/
+intelligence.toml
+
+# LongMemEval dataset files (15MB-2.7GB, downloaded on demand)
+app/eval/data/longmemeval_*.json
+
+# Eval baselines — competitive intelligence, keep local
+app/eval/baselines/
+
+# Superpowers working docs (specs, plans, research, prototypes)
+docs/superpowers/
+.superpowers/
+src-tauri/

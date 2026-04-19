@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Memory eval system — quality measurement and feedback capture.
+
+pub mod distillation_quality;
+pub mod fixtures;
+pub mod gen;
+pub mod lifebench;
+pub mod lifecycle;
+pub mod locomo;
+pub mod locomo_plus;
+pub mod longmemeval;
+pub mod metrics;
+pub mod report;
+pub mod runner;
+pub mod signals;
+pub mod store_quality;
+
+// Closed-core modules (proprietary, feature-gated)
+#[cfg(feature = "closed-core-eval")]
+pub mod auto_tune;
+#[cfg(feature = "closed-core-eval")]
+pub mod eval_judge;

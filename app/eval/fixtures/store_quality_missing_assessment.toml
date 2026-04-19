@@ -1,0 +1,40 @@
+# Missing quality assessment — 247/276 memories (89.5%) have NULL quality.
+# Tests that unassessed memories rank below quality-assessed ones.
+# Pattern: most memories skip LLM quality assessment, so quality_mult defaults
+# to 0.9 (medium/NULL) instead of differentiating high (1.0) vs low (0.7).
+
+[[cases]]
+query = "state management architecture"
+
+# High-quality assessed memory — should rank highest (quality_mult=1.0)
+[[cases.seeds]]
+id = "mem_state_high_quality"
+content = "AppState uses Arc<RwLock<AppState>> managed by Tauri. Atomic flags (Arc<AtomicBool>) for feature toggles shared with sensor threads — lock-free reads from hot loops avoid contention."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+quality = "high"
+
+# Unassessed memory — quality NULL, gets default 0.9x multiplier
+[[cases.seeds]]
+id = "mem_state_no_quality"
+content = "Frontend uses TanStack React Query for server state. Module-level stores with useSyncExternalStore pattern for state that survives React unmounts."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Low-quality assessed — should rank lowest (quality_mult=0.7)
+[[cases.seeds]]
+id = "mem_state_low_quality"
+content = "State can also be stored in localStorage but this has size limits."
+memory_type = "fact"
+domain = "projectA"
+relevance = 1
+quality = "low"
+
+[[cases.negative_seeds]]
+id = "mem_state_noise"
+content = "React 19 introduced use() hook for reading promises and context in render."
+memory_type = "fact"
+domain = "general"

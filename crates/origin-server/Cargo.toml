@@ -1,0 +1,36 @@
+[package]
+name = "origin-server"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "Headless daemon for Origin — HTTP/MCP server without Tauri"
+
+[[bin]]
+name = "origin-server"
+path = "src/main.rs"
+
+[dependencies]
+origin-types = { workspace = true }
+origin-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+futures = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }

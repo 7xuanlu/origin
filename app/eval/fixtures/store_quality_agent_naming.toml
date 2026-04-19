@@ -1,0 +1,92 @@
+# Agent naming inconsistency — same agent stored under multiple names.
+# Real DB: "claude-code" (103), "refinery" (100), "claude" (51),
+# "Claude Code" (10), "Cursor" (2), "Claude Desktop" (2).
+# "claude-code" and "Claude Code" are the same agent with different casing.
+# This fragments source_agent filtering — querying agent="claude-code" misses "Claude Code" memories.
+
+[[cases]]
+query = "code review suggestions"
+# No domain filter — tests cross-agent ranking
+
+[[cases.seeds]]
+id = "mem_review_agent1"
+content = "Always run the full test suite before creating a PR. Coverage gate requires 90% on push to main. Pre-commit hooks run fast checks only."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_review_agent2"
+content = "Use conventional commit messages: feat, fix, refactor, test, docs, chore prefixes. Include scope in parentheses for multi-module repos."
+memory_type = "preference"
+domain = "projectA"
+relevance = 2
+
+# Auto-generated recap from refinery agent — should rank below human-curated
+[[cases.negative_seeds]]
+id = "mem_review_recap"
+content = "Session recap: reviewed PR #15, added test coverage for auth module, fixed linting errors in three files."
+memory_type = "recap"
+domain = "projectA"
+
+# Generic fact from untrusted source
+[[cases.negative_seeds]]
+id = "mem_review_untrusted"
+content = "Code review tools include GitHub pull requests, GitLab merge requests, and Gerrit. Most teams review within 24 hours."
+memory_type = "fact"
+domain = "general"
+
+# Hard negative: mentions code review but is about automated CI checks, not review suggestions
+[[cases.negative_seeds]]
+id = "mem_review_ci"
+content = "Pre-commit hooks run cargo fmt and cargo clippy on staged files. Push hooks run the full test suite with a 90% coverage gate. Both are configured via scripts/setup-hooks.sh."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions review suggestions but is about PR template, not the review process
+[[cases.negative_seeds]]
+id = "mem_review_template"
+content = "PR template includes a Summary section, a Test Plan checklist, and a Reviewer Notes field. The template is enforced by a GitHub Actions check that rejects PRs with empty sections."
+memory_type = "decision"
+domain = "projectA"
+
+
+[[cases]]
+query = "memory storage decisions"
+
+[[cases.seeds]]
+id = "mem_storage_decision"
+content = "Single libSQL database for everything: document chunks with vector columns, knowledge graph tables, full-text search via FTS5. One DB file simplifies backup and migration."
+memory_type = "decision"
+domain = "projectA"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_storage_detail"
+content = "Chunks table uses F32_BLOB(384) for embeddings with DiskANN indexing on cosine metric. Max neighbors set to 32 for the vector index."
+memory_type = "fact"
+domain = "projectA"
+relevance = 2
+
+# Refinery-generated consolidation — mentions storage but is a recap
+[[cases.negative_seeds]]
+id = "mem_storage_refinery"
+content = "Consolidation sweep: merged 3 overlapping facts about database schema. Source memories superseded with mode=archive."
+memory_type = "recap"
+domain = "projectA"
+
+# Hard negative: mentions memory storage but is about config storage, not the memory DB
+[[cases.negative_seeds]]
+id = "mem_storage_config"
+content = "Persistent configuration is stored as JSON at ~/Library/Application Support/origin/config.json. Feature toggles are read at startup and exposed as AtomicBool flags for lock-free access."
+memory_type = "fact"
+domain = "projectA"
+
+# Hard negative: mentions storage decision but is about file watching, not DB storage
+[[cases.negative_seeds]]
+id = "mem_storage_files"
+content = "Watched files are stored on disk alongside their metadata in a sidecar JSON. The file watcher uses the notify crate with 2-second debounce to detect changes and queue re-indexing."
+memory_type = "decision"
+domain = "projectA"

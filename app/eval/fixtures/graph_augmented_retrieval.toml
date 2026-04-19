@@ -1,0 +1,93 @@
+# Graph-augmented retrieval — tests that entity observations surface in search results.
+# Phase A of quality v2: search_memory now includes knowledge graph via RRF merge.
+# Graded observations count toward MRR/NDCG — this measures graph augmentation value.
+
+[[cases]]
+query = "Rust programming language features"
+
+[[cases.seeds]]
+id = "mem_rust_borrow"
+content = "Rust uses a borrow checker to enforce memory safety at compile time without a garbage collector"
+memory_type = "fact"
+domain = "engineering"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "mem_rust_async"
+content = "Rust async/await is built on top of the Future trait and requires a runtime like Tokio"
+memory_type = "fact"
+domain = "engineering"
+relevance = 2
+
+[[cases.entities]]
+name = "Rust"
+entity_type = "technology"
+domain = "engineering"
+observations = [
+    { content = "Rust is a systems programming language focused on safety and performance", relevance = 2 },
+    { content = "Rust has a strong type system with ownership and borrowing", relevance = 2 },
+    { content = "Rust was originally developed by Mozilla Research", relevance = 1 },
+]
+
+[[cases.negative_seeds]]
+id = "mem_python_gc"
+content = "Python uses reference counting with a cycle-detecting garbage collector for memory management"
+memory_type = "fact"
+domain = "engineering"
+
+
+[[cases]]
+query = "libSQL database capabilities"
+
+[[cases.seeds]]
+id = "mem_libsql_vectors"
+content = "libSQL supports F32_BLOB vector columns with DiskANN indexing for approximate nearest neighbor search"
+memory_type = "fact"
+domain = "origin"
+relevance = 3
+confirmed = true
+
+[[cases.entities]]
+name = "libSQL"
+entity_type = "technology"
+domain = "origin"
+observations = [
+    { content = "libSQL is Turso's fork of SQLite with vector search and replication support", relevance = 3 },
+    { content = "libSQL supports FTS5 full-text search with auto-sync triggers", relevance = 2 },
+    { content = "libSQL Connection is Send but not Sync, wrap in tokio Mutex", relevance = 1 },
+]
+
+[[cases.negative_seeds]]
+id = "mem_postgres_vectors"
+content = "PostgreSQL supports vector search via the pgvector extension with IVFFlat and HNSW indexes"
+memory_type = "fact"
+domain = "general"
+
+
+[[cases]]
+query = "who is Lucian"
+
+[[cases.seeds]]
+id = "mem_lucian_role"
+content = "Lucian is a full-stack developer specializing in Rust and TypeScript"
+memory_type = "identity"
+domain = "personal"
+relevance = 3
+confirmed = true
+
+[[cases.entities]]
+name = "Lucian"
+entity_type = "person"
+domain = "personal"
+observations = [
+    { content = "Lucian is the founder of Origin, a personal agent memory layer", relevance = 3 },
+    { content = "Lucian prefers dark mode in all editors and terminals", relevance = 1 },
+    { content = "Lucian is a software engineer based in the US", relevance = 2 },
+]
+
+[[cases.negative_seeds]]
+id = "mem_other_person"
+content = "Alice is a data scientist who works on recommendation systems using PyTorch"
+memory_type = "identity"
+domain = "personal"
