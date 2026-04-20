@@ -1,0 +1,313 @@
+# Identity and profile fixture — tests retrieval from the profile memory tier.
+# Covers identity, preference, and goal memory types across 3 cases.
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# Query: who am I and what is my role
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "who am I and what is my role"
+
+[[cases.seeds]]
+id = "identity_name_role"
+content = "Name: Lucian. Current role: Staff Software Engineer and tech lead for the API platform team at a B2B SaaS company. 5 direct reports. Reports to VP of Engineering. 7 years of professional software engineering experience."
+memory_type = "identity"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "identity_background"
+content = "Computer Science degree from University of Washington (2017). First role was at a fintech startup working on bank data ingestion pipelines. Moved to a series-A startup after 2 years. Joined current company 4 years ago."
+memory_type = "identity"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "identity_location"
+content = "Based in Austin, Texas since 2021. Previously in San Francisco for 4 years after college. Grew up in Portland, Oregon. Prefers mountain environments over coastal."
+memory_type = "identity"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "identity_family"
+content = "Married to Jordan. Two kids, ages 4 and 7. Dog named Turing (beagle, age 3). Living in a 3-bedroom house in South Austin. Family is the primary non-work priority."
+memory_type = "identity"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 2
+
+[[cases.seeds]]
+id = "identity_expertise"
+content = "Primary expertise: distributed systems, Rust backend development, and API design. Secondary strengths: system design, technical leadership, and developer tooling. Known within the company for deep debugging skills."
+memory_type = "identity"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 2
+
+[[cases.seeds]]
+id = "identity_open_source"
+content = "Open source contributor: rust-analyzer (2 minor PRs), tokio (1 doc fix), axum (1 middleware example). Published crates: imgbatch (image resizing CLI, 312 GitHub stars). GitHub: @lucian."
+memory_type = "identity"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 2
+
+# Hard negatives — personal facts but not about identity/role
+
+[[cases.negative_seeds]]
+id = "identity_neg_project"
+content = "Current main project: Origin, a local-first AI memory layer. Building as a side project with potential to become a primary focus. Written in Rust with Tauri for the desktop UI and libSQL for storage."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "identity_neg_goals"
+content = "Professional goal for 2024: become a recognized voice in the Rust community. Tactics: publish 2 crates, give 2 conference talks, write 12 technical blog posts. Progress tracked in Obsidian."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "identity_neg_pref_tools"
+content = "Preferred coding tools: Zed editor for Rust, VS Code for TypeScript, Warp terminal, Raycast as launcher. All tools configured with Vim keybindings. Settings backed up in a dotfiles repo."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "identity_neg_routine"
+content = "Daily routine: wake 6:30am, journal 10 minutes, run or gym, deep work 9am-12pm (no meetings or Slack), lunch break 12-1pm, meetings and async work 1-5pm, family time from 5:30pm."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "identity_neg_finance"
+content = "Financial position: mortgage on South Austin house (6.1% 30-year fixed, refinanced January 2024), 401k at 10% contribution with 4% employer match, HSA maxed annually ($3,850). No consumer debt."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "identity_neg_work_style"
+content = "Work style: async-first, documentation-driven, TDD for all new features. Prefer written RFCs over verbal design discussions. Decisions logged as ADRs in the repo. Calendar protected for deep work blocks."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# Query: what are my coding preferences
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what are my coding preferences"
+
+[[cases.seeds]]
+id = "pref_lang_choice"
+content = "Preferred languages: Rust for performance-critical backend services and systems tools, TypeScript for frontend and build tooling. Avoid Python except for ML/data tasks. Go acceptable for simple CLI tools when Rust overhead isn't justified."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "pref_code_style"
+content = "Code style principles: functions under 40 lines, max 3 levels of nesting, no single-letter variable names outside iterators, descriptive names over short abbreviations. If it needs a comment to explain what it does, rename it."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "pref_error_handling"
+content = "Error handling preference in Rust: typed error enums (thiserror) for public API boundaries, anyhow for internal code. Never use unwrap() in production code except for genuinely impossible states. Always add context when propagating errors."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 3
+
+[[cases.seeds]]
+id = "pref_testing"
+content = "Testing approach: TDD for new features, write tests first before implementation. Test the behavior, not the implementation. Real dependencies over mocks where possible — use testcontainers for Postgres and Redis in integration tests."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 3
+
+[[cases.seeds]]
+id = "pref_comments"
+content = "Comments explain why, not what. Doc comments required on all public API items. Avoid commented-out code in committed files — use git stash or feature flags. TODOs must include a GitHub issue number."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 2
+
+[[cases.seeds]]
+id = "pref_deps"
+content = "Dependency selection: prefer crates with > 1000 GitHub stars, recent releases (< 12 months), and an active maintainer. Check crates.io download rank. Run cargo audit weekly. Never add a dep for < 10 lines of utility code."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 2
+
+[[cases.seeds]]
+id = "pref_git"
+content = "Git commit style: imperative mood, < 72 character subject line, blank separator, body explains why not what. Conventional commits format: feat, fix, refactor, docs, test, chore. Never commit with --no-verify unless pre-commit is known to be wrong."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 2
+
+# Hard negatives — code-adjacent but not coding preferences
+
+[[cases.negative_seeds]]
+id = "pref_neg_project_stack"
+content = "Origin stack: Rust daemon (Axum on 7878), libSQL database, FastEmbed embeddings, Qwen3-4B LLM, Tauri 2 desktop app. React 19 frontend with TanStack Query 5 and Tailwind CSS 4."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "pref_neg_career"
+content = "Career goal: CTO or VP Engineering at a company of 50-200 engineers within 5 years. Developing executive presence and building the leadership skills required. Working with an external leadership coach."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "pref_neg_books"
+content = "Technical reading list Q2: Programming Rust 3rd ed (in progress), The Staff Engineer's Path (queued), Designing Data-Intensive Applications (reference). One technical book per quarter minimum."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "pref_neg_hardware"
+content = "Hardware: M3 Pro MacBook Pro 14-inch (primary), Mac mini M4 (home server). Keychron Q3 with Gateron Brown switches (switched from Blue after noise complaints). LG 34-inch ultrawide external monitor."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "pref_neg_communication"
+content = "Communication preferences: async over sync, written over verbal, long-form over bullet points. Response SLA: 4 hours during business hours for Slack, same day for email. Phone call for urgent issues only."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "pref_neg_work_hours"
+content = "Work schedule: deep work 9am-12pm (blocked on calendar, Slack muted). Meetings clustered in the afternoon. Finish by 5:30pm for family time. No work on weekends except production incidents."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+
+
+# ─── CASE 3 ──────────────────────────────────────────────────────────────────
+# Query: what are my current project goals
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what are my current project goals"
+
+[[cases.seeds]]
+id = "goal_origin_launch"
+content = "Primary goal: public launch of Origin by April 30. Success criteria: npm package published, README live on GitHub with the Karpathy gist comment strategy, first 50 external users onboarded from the waitlist."
+memory_type = "goal"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "goal_origin_eval"
+content = "Origin eval goal: NDCG@10 > 0.80 on LoCoMo benchmark for the base retrieval pipeline before any retrieval changes merge. Reranked pipeline target is 0.87. Token efficiency eval is the next milestone after retrieval quality."
+memory_type = "goal"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 3
+
+[[cases.seeds]]
+id = "goal_saas_revenue"
+content = "SaaS project Q2 goal: reach $60k ARR (from $28k in Q1). Primary lever: content marketing pipeline — 2 blog posts per week and 1 guest post per month. No paid ads yet — CAC via content is near zero."
+memory_type = "goal"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "goal_origin_v02"
+content = "Origin v0.2.0 milestone: Homebrew tap for easy Mac install, release-please CI for automated changelog, and a public-facing documentation site. Target: 6 weeks after the v0.1.0 launch."
+memory_type = "goal"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 2
+
+[[cases.seeds]]
+id = "goal_personal_learn"
+content = "Learning goals for 2024: complete CS229 ML course on YouTube (Q2 target), build and publish 1 Rust crate to crates.io (Q3), read 12 technical or career books (1/month). Progress tracked weekly in Obsidian."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 2
+
+[[cases.seeds]]
+id = "goal_personal_fitness"
+content = "Fitness goal: run a sub-25 minute 5K by June 30 (current PB: 27:42). Training plan: 3 runs per week with one tempo run, 2 strength sessions. Tracking mileage and pace in Garmin Connect."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 2
+
+# Hard negatives — related to projects/goals but answer different questions
+
+[[cases.negative_seeds]]
+id = "goal_neg_saas_backlog"
+content = "SaaS backlog items: SSO/SAML support (May, Enterprise requirement), mobile app MVP (June), multi-currency billing (Q3). Backlog maintained in Linear. Items without DRI and acceptance criteria are not scheduled."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "goal_neg_origin_completed"
+content = "Origin v0.1.0 completed: hybrid search (vector+FTS+RRF), knowledge graph (entities+relations), Tauri desktop app, MCP server integration, on-device LLM (Qwen3-4B), LoCoMo/LongMemEval eval harness."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "goal_neg_career"
+content = "Career trajectory: Staff Engineer currently, targeting Principal Engineer or VP Engineering within 3-5 years. Key development areas: executive presence, public speaking, and organizational design at scale."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "goal_neg_finance"
+content = "Financial goal: pay off the car loan by end of year (balance $8,200). After that, redirect that payment toward the brokerage account. Target net worth by age 40: $1.2M."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "goal_neg_team"
+content = "Team-building goal: hire a senior DevOps engineer by Q2 and a second frontend engineer by Q3. Recruiting pipeline opened in February. Target: 2 screened candidates per week from the job posting."
+memory_type = "goal"
+domain = "work"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "goal_neg_community"
+content = "Community goal: give 2 conference talks in 2024 (RustConf proposal submitted, Austin DevFest accepted). Write 12 technical blog posts on the TIL blog. Contribute to 3 open source projects beyond current PRs."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
