@@ -14,6 +14,7 @@ pub mod report;
 pub mod runner;
 pub mod signals;
 pub mod store_quality;
+pub mod token_efficiency;
 
 // Closed-core modules (proprietary, feature-gated)
 #[cfg(feature = "closed-core-eval")]

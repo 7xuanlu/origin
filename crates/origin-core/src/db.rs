@@ -6134,6 +6134,61 @@ impl MemoryDB {
         Ok(merged)
     }
 
+    /// Vector-only search bypassing hybrid FTS+RRF pipeline — used as NaiveRag baseline.
+    /// Embeds the query, queries the DiskANN index, and returns results scored by
+    /// cosine similarity (1.0 - distance). No FTS, no RRF, no scoring adjustments.
+    pub(crate) async fn naive_vector_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, OriginError> {
+        let embedding = self.get_or_compute_embedding(query)?;
+        let vec_str = Self::vec_to_sql(&embedding);
+        let fetch_limit = limit as i64;
+
+        let conn = self.conn.lock().await;
+
+        let sql = "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
+                        c.chunk_index, c.last_modified, c.chunk_type, c.language, c.byte_start,
+                        c.byte_end, c.semantic_unit, c.memory_type, c.domain, c.source_agent,
+                        c.confidence, c.confirmed, c.stability, c.supersedes,
+                        c.entity_id, c.quality, c.is_recap, c.supersede_mode,
+                        c.structured_fields, c.retrieval_cue, c.source_text,
+                        vector_distance_cos(c.embedding, vector32(?1))
+                 FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
+                 JOIN memories c ON c.rowid = vt.id
+                 WHERE c.pending_revision = 0";
+
+        let mut results = Vec::new();
+        match conn
+            .query(sql, libsql::params![vec_str, fetch_limit])
+            .await
+        {
+            Ok(mut rows) => {
+                while let Ok(Some(row)) = rows.next().await {
+                    let distance: f64 = row.get(28).unwrap_or(1.0);
+                    let score = (1.0 - distance).max(0.0) as f32;
+                    if let Ok(result) = Self::row_to_search_result(&row, score) {
+                        results.push(result);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "[naive_vector_search] vector index query failed: {}",
+                    e
+                );
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(results)
+    }
+
     /// Search entities by vector similarity. Returns EntitySearchResult with full Entity data.
     /// Tries DiskANN index first, falls back to brute-force cosine similarity.
     pub async fn search_entities_by_vector(

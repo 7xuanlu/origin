@@ -59,4 +59,8 @@ tempfile = { workspace = true }
 # Benchmark binaries (model_benchmark, deep_distill, etc.)
 env_logger = "0.11"
 
+# tiktoken-rs is used from eval/ token_efficiency module (non-test code paths)
+# for BPE token counting in quality-cost benchmarks.
+tiktoken-rs = "0.6"
+
 [dev-dependencies]
