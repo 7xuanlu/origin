@@ -14,10 +14,41 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      pr: ${{ steps.release.outputs.pr }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          release-type: rust
+          release-type: simple
           manifest-file: .release-please-manifest.json
           config-file: release-please-config.json
+
+      # When a release PR is open, also bump Cargo.toml versions
+      # (release-please can't handle Cargo workspace manifests)
+      - name: Checkout (for Cargo version sync)
+        if: steps.release.outputs.pr != ''
+        uses: actions/checkout@v4
+        with:
+          ref: release-please--branches--main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync Cargo.toml versions to match release
+        if: steps.release.outputs.pr != ''
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          echo "Syncing Cargo.toml files to version $VERSION"
+
+          for f in app/Cargo.toml crates/origin-types/Cargo.toml crates/origin-core/Cargo.toml crates/origin-server/Cargo.toml; do
+            sed -i "s/^version = \".*\" # x-release-please-version/version = \"$VERSION\" # x-release-please-version/" "$f"
+            echo "  Updated $f"
+          done
+
+          if git diff --quiet; then
+            echo "No Cargo.toml changes needed"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "chore: sync Cargo.toml versions to $VERSION"
+            git push
+          fi

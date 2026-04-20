@@ -18,28 +18,9 @@
           "type": "json",
           "path": "packages/origin-mcp-npm/package.json",
           "jsonpath": "$.version"
-        },
-        {
-          "type": "generic",
-          "path": "app/Cargo.toml",
-          "glob": "app/Cargo.toml"
-        },
-        {
-          "type": "generic",
-          "path": "crates/origin-types/Cargo.toml",
-          "glob": "crates/origin-types/Cargo.toml"
-        },
-        {
-          "type": "generic",
-          "path": "crates/origin-core/Cargo.toml",
-          "glob": "crates/origin-core/Cargo.toml"
-        },
-        {
-          "type": "generic",
-          "path": "crates/origin-server/Cargo.toml",
-          "glob": "crates/origin-server/Cargo.toml"
         }
       ]
     }
-  }
+  },
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json"
 }
