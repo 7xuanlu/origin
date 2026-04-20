@@ -14,7 +14,7 @@
     "build:all": "pnpm build:daemon && pnpm build",
     "release:daemon": "cargo build --release -p origin-server",
     "release": "pnpm clean:release && TRIPLE=$(rustc -vV | grep host | awk '{print $2}') && pnpm release:daemon && cp target/release/origin-server app/binaries/origin-server-$TRIPLE && CXXFLAGS='-std=c++17' pnpm tauri build",
-    "release:dmg": "rm -f target/release/bundle/macos/rw.*.dmg && mkdir -p target/release/bundle/dmg && rm -f target/release/bundle/dmg/Origin_0.1.0_aarch64.dmg && hdiutil create -volname Origin -srcfolder target/release/bundle/macos -ov -format UDZO target/release/bundle/dmg/Origin_0.1.0_aarch64.dmg",
+    "release:dmg": "rm -f target/release/bundle/macos/rw.*.dmg && mkdir -p target/release/bundle/dmg && node -e \"const v=require('./package.json').version; const f='target/release/bundle/dmg/Origin_'+v+'_aarch64.dmg'; require('fs').rmSync(f,{force:true}); const {execSync}=require('child_process'); execSync('hdiutil create -volname Origin -srcfolder target/release/bundle/macos -ov -format UDZO '+f,{stdio:'inherit'}); console.log('Created',f);\"",
     "clean:dev": "pkill -9 -f origin-server 2>/dev/null; pkill -9 -f 'target/debug/origin' 2>/dev/null; lsof -ti :7878 2>/dev/null | xargs kill -9 2>/dev/null; lsof -ti :1420 2>/dev/null | xargs kill -9 2>/dev/null; sleep 0.3; echo 'Dev processes cleaned'",
     "clean:release": "rm -f target/release/bundle/macos/rw.*.dmg; rm -rf target/release/bundle/dmg/Origin_*.dmg; echo 'Release artifacts cleaned'",
     "clean:all": "pnpm clean:dev && pnpm clean:release && echo 'All cleaned'",

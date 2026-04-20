@@ -62,5 +62,14 @@ if [ -f "$NPM_PKG" ]; then
 fi
 
 echo ""
+echo "Regenerating Cargo.lock..."
+cargo generate-lockfile
+echo "  Updated Cargo.lock"
+
+echo ""
+echo "Changed files:"
+git diff --stat app/Cargo.toml crates/*/Cargo.toml package.json app/tauri.conf.json packages/origin-mcp-npm/package.json Cargo.lock 2>/dev/null || true
+
+echo ""
 echo "Done. Verify with:"
 echo '  grep -rn "version" app/Cargo.toml crates/*/Cargo.toml package.json app/tauri.conf.json | grep -E "^\S+:(version|\"version\")"'

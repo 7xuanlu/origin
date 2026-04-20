@@ -1,0 +1,13 @@
+{
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "bump-minor-pre-major": true,
+      "extra-files": [
+        "app/tauri.conf.json",
+        "package.json",
+        "packages/origin-mcp-npm/package.json"
+      ]
+    }
+  }
+}

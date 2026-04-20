@@ -20,6 +20,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate version consistency
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+
+          CARGO_VERSION=$(grep '^version = ' app/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAURI_VERSION=$(node -p "require('./app/tauri.conf.json').version")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+
+          echo "Tag version:         $TAG"
+          echo "app/Cargo.toml:      $CARGO_VERSION"
+          echo "app/tauri.conf.json: $TAURI_VERSION"
+          echo "package.json:        $PKG_VERSION"
+
+          MISMATCH=0
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "ERROR: tag $TAG does not match app/Cargo.toml version $CARGO_VERSION"
+            MISMATCH=1
+          fi
+          if [ "$TAG" != "$TAURI_VERSION" ]; then
+            echo "ERROR: tag $TAG does not match app/tauri.conf.json version $TAURI_VERSION"
+            MISMATCH=1
+          fi
+          if [ "$TAG" != "$PKG_VERSION" ]; then
+            echo "ERROR: tag $TAG does not match package.json version $PKG_VERSION"
+            MISMATCH=1
+          fi
+
+          if [ "$MISMATCH" -eq 1 ]; then
+            echo ""
+            echo "Fix: run 'bash scripts/bump-version.sh $TAG' and push the updated files before tagging."
+            exit 1
+          fi
+
+          echo "All versions consistent: $TAG"
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -108,6 +143,7 @@ jobs:
           args: --target aarch64-apple-darwin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CXXFLAGS: "-std=c++17"
 
       - name: Upload standalone origin-server binary
         run: |
@@ -128,3 +164,63 @@ jobs:
             --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    name: Publish npm package
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish origin-mcp to npm
+        run: npm publish --access public
+        working-directory: packages/origin-mcp-npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-crates:
+    name: Publish crates.io (origin-types)
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check if origin-types changed since last tag
+        id: check-changed
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found; publishing origin-types for the first time."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            CHANGED=$(git diff --name-only "$PREV_TAG" HEAD -- crates/origin-types/)
+            if [ -n "$CHANGED" ]; then
+              echo "origin-types changed since $PREV_TAG:"
+              echo "$CHANGED"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "origin-types unchanged since $PREV_TAG; skipping publish."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Publish origin-types to crates.io
+        if: steps.check-changed.outputs.changed == 'true'
+        run: cargo publish -p origin-types
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
