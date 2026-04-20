@@ -1,9 +1,14 @@
 {
   "packages": {
     ".": {
-      "release-type": "node",
+      "release-type": "simple",
       "bump-minor-pre-major": true,
       "extra-files": [
+        {
+          "type": "json",
+          "path": "package.json",
+          "jsonpath": "$.version"
+        },
         {
           "type": "json",
           "path": "app/tauri.conf.json",
@@ -15,24 +20,24 @@
           "jsonpath": "$.version"
         },
         {
-          "type": "toml",
+          "type": "generic",
           "path": "app/Cargo.toml",
-          "key": "package.version"
+          "glob": "app/Cargo.toml"
         },
         {
-          "type": "toml",
+          "type": "generic",
           "path": "crates/origin-types/Cargo.toml",
-          "key": "package.version"
+          "glob": "crates/origin-types/Cargo.toml"
         },
         {
-          "type": "toml",
+          "type": "generic",
           "path": "crates/origin-core/Cargo.toml",
-          "key": "package.version"
+          "glob": "crates/origin-core/Cargo.toml"
         },
         {
-          "type": "toml",
+          "type": "generic",
           "path": "crates/origin-server/Cargo.toml",
-          "key": "package.version"
+          "glob": "crates/origin-server/Cargo.toml"
         }
       ]
     }
