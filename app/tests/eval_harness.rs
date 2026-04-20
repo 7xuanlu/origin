@@ -951,6 +951,129 @@ async fn test_concept_retrieval_eval() {
     println!("{}", report.to_terminal());
 }
 
+// ---------------------------------------------------------------------------
+// Token efficiency / quality-cost tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_quality_cost_fixtures() {
+    use origin_lib::eval::token_efficiency::{run_quality_cost_eval, SearchStrategy};
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+
+    let strategies = vec![
+        SearchStrategy::Origin,
+        SearchStrategy::NaiveRag,
+        SearchStrategy::FullReplay,
+        SearchStrategy::NoMemory,
+    ];
+
+    let report = run_quality_cost_eval(&fixture_dir, &strategies, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(report.strategies.len(), 4);
+    assert!(report.headline.savings_pct > 0.0, "should show token savings");
+
+    // Origin should have better quality than NaiveRag
+    let origin = report.strategies.iter().find(|s| s.strategy == "origin").unwrap();
+    let naive = report.strategies.iter().find(|s| s.strategy == "naive_rag").unwrap();
+    assert!(
+        origin.ndcg_at_10 >= naive.ndcg_at_10,
+        "Origin NDCG ({:.3}) should be >= NaiveRag ({:.3})",
+        origin.ndcg_at_10,
+        naive.ndcg_at_10
+    );
+
+    println!("{}", report.to_terminal());
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_quality_cost_agent_workload() {
+    use origin_lib::eval::token_efficiency::{run_quality_cost_eval, SearchStrategy};
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+    if !fixture_dir.join("agent_coding_session.toml").exists() {
+        println!("SKIP: agent fixtures not found");
+        return;
+    }
+
+    let strategies = vec![
+        SearchStrategy::Origin,
+        SearchStrategy::NaiveRag,
+        SearchStrategy::FullReplay,
+        SearchStrategy::NoMemory,
+    ];
+
+    let report = run_quality_cost_eval(&fixture_dir, &strategies, 10)
+        .await
+        .unwrap();
+
+    assert!(report.headline.savings_pct > 0.0);
+    println!("{}", report.to_terminal());
+}
+
+#[tokio::test]
+#[ignore]
+async fn save_quality_cost_fixtures_baseline() {
+    use origin_lib::eval::token_efficiency::{run_quality_cost_eval, SearchStrategy};
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+    let baseline_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/quality_cost_fixtures_baseline.json");
+
+    let strategies = vec![
+        SearchStrategy::Origin,
+        SearchStrategy::NaiveRag,
+        SearchStrategy::FullReplay,
+        SearchStrategy::NoMemory,
+    ];
+
+    let report = run_quality_cost_eval(&fixture_dir, &strategies, 10)
+        .await
+        .unwrap();
+
+    println!("{}", report.to_terminal());
+    report.save_baseline(&baseline_path).unwrap();
+    println!("\nBaseline saved to {:?}", baseline_path);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_scaling_curve() {
+    use origin_lib::eval::token_efficiency::run_scaling_eval;
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+
+    let sizes = vec![5, 10, 20, 50];
+    let points = run_scaling_eval(&fixture_dir, &sizes, 10)
+        .await
+        .unwrap();
+
+    assert!(!points.is_empty(), "should produce scaling points");
+
+    println!("\n=== Scaling Curve ===");
+    println!("{:<12} | {:<15} | {:<15}", "Corpus Size", "Origin Tokens", "Replay Tokens");
+    println!("{:-<12}-+-{:-<15}-+-{:-<15}", "", "", "");
+    for p in &points {
+        println!("{:<12} | {:<15.0} | {:<15.0}", p.corpus_size, p.origin_tokens, p.replay_tokens);
+    }
+
+    // FullReplay should grow with corpus size
+    if points.len() >= 2 {
+        let first = &points[0];
+        let last = points.last().unwrap();
+        assert!(
+            last.replay_tokens > first.replay_tokens,
+            "FullReplay tokens should grow: {} -> {}",
+            first.replay_tokens,
+            last.replay_tokens
+        );
+    }
+}
+
 /// Concept impact across ALL fixture cases — single shared DB, no per-case ephemeral DBs.
 ///
 /// Seeds all fixture memories into one DB, creates concepts from seed clusters (grouped by

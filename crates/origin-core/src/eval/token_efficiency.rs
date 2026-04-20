@@ -450,6 +450,94 @@ fn count_results_tokens(results: &[crate::db::SearchResult]) -> usize {
     results.iter().map(|r| count_tokens(&r.content)).sum()
 }
 
+/// Run scaling evaluation: same queries at increasing corpus sizes.
+///
+/// For each size, seeds only the first N memories from each case, then runs
+/// Origin and FullReplay strategies to measure token cost scaling.
+pub async fn run_scaling_eval(
+    fixture_dir: &Path,
+    corpus_sizes: &[usize],
+    limit: usize,
+) -> Result<Vec<ScalingPoint>, OriginError> {
+    let cases = load_fixtures(fixture_dir)?;
+    if cases.is_empty() {
+        return Err(OriginError::Generic("no fixture cases found".to_string()));
+    }
+
+    let confidence_cfg = ConfidenceConfig::default();
+    let mut points = Vec::new();
+
+    for &size in corpus_sizes {
+        let mut origin_tokens_sum: f64 = 0.0;
+        let mut replay_tokens_sum: f64 = 0.0;
+        let mut case_count: f64 = 0.0;
+
+        for case in &cases {
+            if case.empty_set {
+                continue;
+            }
+
+            // Take first `size` seeds (positive + negative combined)
+            let all_seeds: Vec<&crate::eval::fixtures::SeedMemory> = case
+                .seeds
+                .iter()
+                .chain(case.negative_seeds.iter())
+                .collect();
+            let subset: Vec<&crate::eval::fixtures::SeedMemory> = all_seeds.into_iter().take(size).collect();
+            if subset.is_empty() {
+                continue;
+            }
+
+            // Seed ephemeral DB with subset
+            let case_tmp = tempfile::tempdir()
+                .map_err(|e| OriginError::Generic(format!("tmpdir: {e}")))?;
+            let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+
+            let docs: Vec<RawDocument> = subset
+                .iter()
+                .map(|s| crate::eval::runner::seed_to_doc(s, &confidence_cfg))
+                .collect();
+            db.upsert_documents(docs).await?;
+
+            // FullReplay: all subset content
+            let replay_content: String = subset
+                .iter()
+                .map(|s| s.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let replay_tokens = count_tokens(&replay_content);
+
+            // Origin: search and count
+            let results = db
+                .search_memory(
+                    &case.query, limit, None, case.domain.as_deref(),
+                    None, None, None, None,
+                )
+                .await?;
+            let origin_content: String = results
+                .iter()
+                .map(|r| r.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let origin_tok = count_tokens(&origin_content);
+
+            origin_tokens_sum += origin_tok as f64;
+            replay_tokens_sum += replay_tokens as f64;
+            case_count += 1.0;
+        }
+
+        if case_count > 0.0 {
+            points.push(ScalingPoint {
+                corpus_size: size,
+                origin_tokens: origin_tokens_sum / case_count,
+                replay_tokens: replay_tokens_sum / case_count,
+            });
+        }
+    }
+
+    Ok(points)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +763,27 @@ mod tests {
             output.contains("87.9") || output.contains("88.0"),
             "should show savings_pct"
         );
+    }
+
+    #[tokio::test]
+    async fn test_scaling_eval_basic() {
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../app/eval/fixtures");
+        if !fixture_dir.exists() {
+            return;
+        }
+
+        let sizes = vec![3, 5];
+        let points = run_scaling_eval(&fixture_dir, &sizes, 5).await.unwrap();
+
+        assert!(!points.is_empty(), "should produce at least one scaling point");
+        // With more seeds, replay tokens should increase
+        if points.len() >= 2 {
+            assert!(
+                points[1].replay_tokens >= points[0].replay_tokens,
+                "replay tokens should grow with corpus size"
+            );
+        }
     }
 
     #[test]
