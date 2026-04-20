@@ -45,7 +45,9 @@
     "active": true,
     "targets": "all",
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-",
+      "entitlements": "./Entitlements.plist"
     },
     "icon": [
       "icons/32x32.png",
