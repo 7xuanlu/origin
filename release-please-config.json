@@ -1,12 +1,39 @@
 {
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "node",
       "bump-minor-pre-major": true,
       "extra-files": [
-        "app/tauri.conf.json",
-        "package.json",
-        "packages/origin-mcp-npm/package.json"
+        {
+          "type": "json",
+          "path": "app/tauri.conf.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "packages/origin-mcp-npm/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "toml",
+          "path": "app/Cargo.toml",
+          "key": "package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/origin-types/Cargo.toml",
+          "key": "package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/origin-core/Cargo.toml",
+          "key": "package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/origin-server/Cargo.toml",
+          "key": "package.version"
+        }
       ]
     }
   }
