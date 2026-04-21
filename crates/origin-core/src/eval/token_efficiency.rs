@@ -2274,6 +2274,338 @@ pub async fn run_e2e_answer_eval(
     })
 }
 
+// ===== E2E LoCoMo Answer Quality Eval (On-Device LLM) =====
+
+/// Per-approach result for the E2E LoCoMo eval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2ELocomoResult {
+    /// Approach identifier: "origin", "full_replay", "no_context".
+    pub approach: String,
+    /// Mean keyword-overlap score between LLM answer and ground truth (0–1).
+    pub mean_answer_score: f64,
+    /// Mean tokens of context sent to the LLM.
+    pub mean_context_tokens: f64,
+    /// Number of QA pairs evaluated for this approach.
+    pub questions_evaluated: usize,
+    /// Mean character length of the LLM's response.
+    pub mean_answer_length: f64,
+}
+
+/// Full E2E LoCoMo benchmark report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2ELocomoReport {
+    /// Model name used for inference.
+    pub model: String,
+    /// Number of conversations evaluated.
+    pub conversations: usize,
+    /// Max QA pairs sampled per conversation.
+    pub questions_per_conv: usize,
+    /// Total QA pairs evaluated.
+    pub total_questions: usize,
+    /// Per-approach results.
+    pub results: Vec<E2ELocomoResult>,
+}
+
+/// Score an LLM answer against a ground-truth string using keyword overlap.
+///
+/// Splits the ground truth into words longer than 3 characters and measures
+/// what fraction appear in the (lowercased) answer.
+fn score_answer_against_ground_truth(answer: &str, ground_truth: &str) -> f64 {
+    let answer_lower = answer.to_lowercase();
+    let gt_words: Vec<&str> = ground_truth
+        .split_whitespace()
+        .filter(|w| w.len() > 3)
+        .collect();
+    if gt_words.is_empty() {
+        return 0.0;
+    }
+    let matches = gt_words
+        .iter()
+        .filter(|w| answer_lower.contains(&w.to_lowercase() as &str))
+        .count();
+    matches as f64 / gt_words.len() as f64
+}
+
+/// Run end-to-end answer quality evaluation on LoCoMo using the on-device LLM.
+///
+/// For each LoCoMo conversation:
+/// 1. Seeds all observations into an ephemeral DB.
+/// 2. For up to `max_questions_per_conv` non-adversarial QA pairs:
+///    - **origin**: retrieve top-`search_top_k` results, compose prompt, call LLM.
+///    - **full_replay**: use ALL observations as context (skipped if > 4000 tokens).
+///    - **no_context**: ask the question with no memory context.
+/// 3. Scores each LLM answer against the ground-truth via keyword overlap.
+///
+/// The `llm_provider` must be an `OnDeviceProvider` (or any `LlmProvider`).
+/// This function is `async` but LLM calls are routed through the provider's
+/// internal worker thread — no extra `spawn_blocking` needed here.
+///
+/// Returns an `E2ELocomoReport` with per-approach quality and token stats.
+pub async fn run_e2e_locomo_eval(
+    locomo_path: &Path,
+    max_questions_per_conv: usize,
+    search_top_k: usize,
+    llm_provider: Arc<dyn crate::llm_provider::LlmProvider>,
+) -> Result<E2ELocomoReport, OriginError> {
+    use crate::eval::locomo::{extract_observations, load_locomo};
+    use crate::llm_provider::{LlmRequest, strip_think_tags};
+
+    let samples = load_locomo(locomo_path)?;
+
+    // Accumulators: (answer_score, context_tokens, answer_len)
+    let approach_keys = ["origin", "full_replay", "no_context"];
+    let mut scores: std::collections::HashMap<&str, Vec<f64>> =
+        approach_keys.iter().map(|k| (*k, Vec::new())).collect();
+    let mut ctx_tokens: std::collections::HashMap<&str, Vec<f64>> =
+        approach_keys.iter().map(|k| (*k, Vec::new())).collect();
+    let mut ans_lens: std::collections::HashMap<&str, Vec<f64>> =
+        approach_keys.iter().map(|k| (*k, Vec::new())).collect();
+
+    let total_convs = samples.len();
+
+    for (conv_idx, sample) in samples.iter().enumerate() {
+        let memories = extract_observations(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        // Build full-replay corpus text (all observations concatenated).
+        let corpus_text: String = memories
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let corpus_tokens = count_tokens(&corpus_text);
+        // Cap full_replay at 4000 tokens to stay within model's synthesis limit.
+        const FULL_REPLAY_TOKEN_LIMIT: usize = 4000;
+        let full_replay_context: Option<String> = if corpus_tokens <= FULL_REPLAY_TOKEN_LIMIT {
+            Some(corpus_text.clone())
+        } else {
+            // Truncate by taking observations until we reach the limit.
+            let mut truncated = String::new();
+            for mem in &memories {
+                let candidate = if truncated.is_empty() {
+                    mem.content.clone()
+                } else {
+                    format!("{}\n\n{}", truncated, mem.content)
+                };
+                if count_tokens(&candidate) > FULL_REPLAY_TOKEN_LIMIT {
+                    break;
+                }
+                truncated = candidate;
+            }
+            if truncated.is_empty() {
+                None // even one observation exceeds the limit — skip full_replay
+            } else {
+                Some(truncated)
+            }
+        };
+
+        // Seed ephemeral DB for Origin retrieval.
+        let tmp = tempfile::tempdir()
+            .map_err(|e| OriginError::Generic(format!("tempdir e2e_locomo: {e}")))?;
+        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+
+        let docs: Vec<crate::sources::RawDocument> = memories
+            .iter()
+            .enumerate()
+            .map(|(i, mem)| crate::sources::RawDocument {
+                content: mem.content.clone(),
+                source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+                source: "memory".to_string(),
+                title: format!("{} session {}", mem.speaker, mem.session_num),
+                memory_type: Some("fact".to_string()),
+                domain: Some("conversation".to_string()),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            })
+            .collect();
+        db.upsert_documents(docs).await?;
+
+        // Iterate QA pairs (skip adversarial, cap at max_questions_per_conv).
+        let mut questions_done = 0usize;
+        for qa in &sample.qa {
+            if questions_done >= max_questions_per_conv {
+                break;
+            }
+            if qa.category == 5 {
+                continue; // skip adversarial
+            }
+
+            let ground_truth = qa
+                .answer
+                .as_ref()
+                .map(|v| {
+                    v.as_str()
+                        .unwrap_or(&v.to_string())
+                        .to_string()
+                })
+                .unwrap_or_default();
+
+            if ground_truth.is_empty() {
+                continue;
+            }
+
+            eprintln!(
+                "[e2e_locomo] Conv {}/{}, Q {}/{}...",
+                conv_idx + 1,
+                total_convs,
+                questions_done + 1,
+                max_questions_per_conv,
+            );
+
+            let system_prompt = "Answer the question using only the provided context. \
+                Be specific and concise. Respond in 1-3 sentences."
+                .to_string();
+
+            // ---- Origin approach: hybrid search ----
+            let origin_context = {
+                let results = db
+                    .search_memory(
+                        &qa.question,
+                        search_top_k,
+                        None,
+                        Some("conversation"),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let origin_ctx_tokens = count_tokens(&origin_context);
+
+            let origin_request = LlmRequest {
+                system_prompt: Some(system_prompt.clone()),
+                user_prompt: format!(
+                    "Context:\n{}\n\nQuestion: {}",
+                    origin_context, qa.question
+                ),
+                max_tokens: 200,
+                temperature: 0.1,
+                label: Some("e2e_locomo_origin".to_string()),
+            };
+            match llm_provider.generate(origin_request).await {
+                Ok(raw_answer) => {
+                    let answer = strip_think_tags(&raw_answer);
+                    let score =
+                        score_answer_against_ground_truth(&answer, &ground_truth);
+                    scores.get_mut("origin").unwrap().push(score);
+                    ctx_tokens
+                        .get_mut("origin")
+                        .unwrap()
+                        .push(origin_ctx_tokens as f64);
+                    ans_lens
+                        .get_mut("origin")
+                        .unwrap()
+                        .push(answer.len() as f64);
+                }
+                Err(e) => {
+                    log::warn!("[e2e_locomo] origin approach failed: {e}");
+                }
+            }
+
+            // ---- FullReplay approach ----
+            if let Some(ref replay_ctx) = full_replay_context {
+                let replay_ctx_tokens = count_tokens(replay_ctx);
+                let replay_request = LlmRequest {
+                    system_prompt: Some(system_prompt.clone()),
+                    user_prompt: format!(
+                        "Context:\n{}\n\nQuestion: {}",
+                        replay_ctx, qa.question
+                    ),
+                    max_tokens: 200,
+                    temperature: 0.1,
+                    label: Some("e2e_locomo_full_replay".to_string()),
+                };
+                match llm_provider.generate(replay_request).await {
+                    Ok(raw_answer) => {
+                        let answer = strip_think_tags(&raw_answer);
+                        let score =
+                            score_answer_against_ground_truth(&answer, &ground_truth);
+                        scores.get_mut("full_replay").unwrap().push(score);
+                        ctx_tokens
+                            .get_mut("full_replay")
+                            .unwrap()
+                            .push(replay_ctx_tokens as f64);
+                        ans_lens
+                            .get_mut("full_replay")
+                            .unwrap()
+                            .push(answer.len() as f64);
+                    }
+                    Err(e) => {
+                        log::warn!("[e2e_locomo] full_replay approach failed: {e}");
+                    }
+                }
+            }
+            // If full_replay was skipped (too long), we don't push to its accumulators.
+
+            // ---- NoContext approach ----
+            let no_ctx_request = LlmRequest {
+                system_prompt: Some(
+                    "Answer the question as best you can from your knowledge. \
+                    Be specific and concise. Respond in 1-3 sentences."
+                        .to_string(),
+                ),
+                user_prompt: format!("Question: {}", qa.question),
+                max_tokens: 200,
+                temperature: 0.1,
+                label: Some("e2e_locomo_no_context".to_string()),
+            };
+            match llm_provider.generate(no_ctx_request).await {
+                Ok(raw_answer) => {
+                    let answer = strip_think_tags(&raw_answer);
+                    let score =
+                        score_answer_against_ground_truth(&answer, &ground_truth);
+                    scores.get_mut("no_context").unwrap().push(score);
+                    ctx_tokens.get_mut("no_context").unwrap().push(0.0);
+                    ans_lens
+                        .get_mut("no_context")
+                        .unwrap()
+                        .push(answer.len() as f64);
+                }
+                Err(e) => {
+                    log::warn!("[e2e_locomo] no_context approach failed: {e}");
+                }
+            }
+
+            questions_done += 1;
+        }
+    }
+
+    // Aggregate per-approach
+    let total_questions = scores["origin"].len();
+    let mut results: Vec<E2ELocomoResult> = Vec::new();
+    for key in &approach_keys {
+        let score_vec = &scores[key];
+        let ctx_vec = &ctx_tokens[key];
+        let len_vec = &ans_lens[key];
+        let n = score_vec.len().max(1) as f64;
+
+        results.push(E2ELocomoResult {
+            approach: key.to_string(),
+            mean_answer_score: score_vec.iter().sum::<f64>() / n,
+            mean_context_tokens: ctx_vec.iter().sum::<f64>() / n,
+            questions_evaluated: score_vec.len(),
+            mean_answer_length: len_vec.iter().sum::<f64>() / n,
+        });
+    }
+
+    Ok(E2ELocomoReport {
+        model: llm_provider.name().to_string(),
+        conversations: samples.len(),
+        questions_per_conv: max_questions_per_conv,
+        total_questions,
+        results,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3509,5 +3841,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// E2E answer quality on LoCoMo using the on-device Qwen3-4B model.
+    ///
+    /// For each conversation in locomo10.json, seeds all observations, then for up to
+    /// `max_questions_per_conv` QA pairs runs three approaches (origin, full_replay,
+    /// no_context) and scores LLM answers against ground truth via keyword overlap.
+    ///
+    /// Takes ~10 minutes for 5 questions/conv x 10 convs = 150 LLM calls.
+    ///
+    /// Run with:
+    /// cargo test -p origin-core --lib eval::token_efficiency::tests::benchmark_e2e_locomo_on_device -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore] // Requires on-device Qwen3-4B model (~10 min)
+    async fn benchmark_e2e_locomo_on_device() {
+        use crate::llm_provider::OnDeviceProvider;
+        use crate::on_device_models;
+
+        // Check model available
+        let model_spec = on_device_models::get_default_model();
+        if !on_device_models::is_cached(model_spec) {
+            eprintln!(
+                "Skipping: {} not found in hf-hub cache. Download it first.",
+                model_spec.display_name
+            );
+            return;
+        }
+
+        let locomo_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("app/eval/data/locomo10.json");
+        if !locomo_path.exists() {
+            eprintln!("Skipping: locomo10.json not found at {:?}", locomo_path);
+            return;
+        }
+
+        // Load provider on a blocking thread (LlmEngine is not Send/Sync).
+        eprintln!("Loading {} ...", model_spec.display_name);
+        let provider: Arc<dyn crate::llm_provider::LlmProvider> =
+            match tokio::task::spawn_blocking(|| OnDeviceProvider::new()).await {
+                Ok(Ok(p)) => Arc::new(p),
+                Ok(Err(e)) => {
+                    eprintln!("Skipping: LLM provider init failed: {}", e);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Skipping: spawn_blocking panicked: {}", e);
+                    return;
+                }
+            };
+        eprintln!("Model loaded. Provider: {}", provider.name());
+
+        let report = run_e2e_locomo_eval(&locomo_path, 5, 10, provider)
+            .await
+            .unwrap();
+
+        eprintln!("\n=== E2E Answer Quality: LoCoMo (On-Device) ===");
+        eprintln!("Model: {}", report.model);
+        eprintln!(
+            "Questions: {} ({} per conv x {} convs)",
+            report.total_questions, report.questions_per_conv, report.conversations
+        );
+        eprintln!(
+            "{:<20} | {:<12} | {:<12} | {}",
+            "Approach", "Answer Score", "Context Tok", "Avg Answer Len"
+        );
+        eprintln!(
+            "{:-<20}-+-{:-<12}-+-{:-<12}-+-{:-<12}",
+            "", "", "", ""
+        );
+        for r in &report.results {
+            eprintln!(
+                "{:<20} | {:<12.3} | {:<12.0} | {:.0} chars",
+                r.approach, r.mean_answer_score, r.mean_context_tokens, r.mean_answer_length
+            );
+        }
+
+        // Origin should score at least as well as NoContext
+        let origin = report.results.iter().find(|r| r.approach == "origin").unwrap();
+        let no_ctx = report
+            .results
+            .iter()
+            .find(|r| r.approach == "no_context")
+            .unwrap();
+        eprintln!(
+            "\nOrigin vs NoContext: {:.3} vs {:.3} answer score",
+            origin.mean_answer_score, no_ctx.mean_answer_score
+        );
+
+        // Soft check: Origin with memory context should not be dramatically worse than no-context.
+        assert!(
+            origin.mean_answer_score >= no_ctx.mean_answer_score - 0.3,
+            "Origin answer score ({:.3}) was much worse than no-context ({:.3})",
+            origin.mean_answer_score,
+            no_ctx.mean_answer_score,
+        );
     }
 }
