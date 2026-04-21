@@ -6141,14 +6141,18 @@ impl MemoryDB {
         &self,
         query: &str,
         limit: usize,
+        domain: Option<&str>,
     ) -> Result<Vec<SearchResult>, OriginError> {
         let embedding = self.get_or_compute_embedding(query)?;
         let vec_str = Self::vec_to_sql(&embedding);
-        let fetch_limit = limit as i64;
+        // Fetch more candidates when domain filtering (some will be filtered out)
+        let fetch_limit = if domain.is_some() { (limit * 3) as i64 } else { limit as i64 };
 
         let conn = self.conn.lock().await;
 
-        let sql = "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
+        let (sql, params): (String, Vec<libsql::Value>) = if let Some(d) = domain {
+            (
+                "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
                         c.chunk_index, c.last_modified, c.chunk_type, c.language, c.byte_start,
                         c.byte_end, c.semantic_unit, c.memory_type, c.domain, c.source_agent,
                         c.confidence, c.confirmed, c.stability, c.supersedes,
@@ -6157,11 +6161,35 @@ impl MemoryDB {
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
-                 WHERE c.pending_revision = 0";
+                 WHERE c.pending_revision = 0 AND c.domain = ?3".to_string(),
+                vec![
+                    libsql::Value::Text(vec_str.clone()),
+                    libsql::Value::Integer(fetch_limit),
+                    libsql::Value::Text(d.to_string()),
+                ],
+            )
+        } else {
+            (
+                "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
+                        c.chunk_index, c.last_modified, c.chunk_type, c.language, c.byte_start,
+                        c.byte_end, c.semantic_unit, c.memory_type, c.domain, c.source_agent,
+                        c.confidence, c.confirmed, c.stability, c.supersedes,
+                        c.entity_id, c.quality, c.is_recap, c.supersede_mode,
+                        c.structured_fields, c.retrieval_cue, c.source_text,
+                        vector_distance_cos(c.embedding, vector32(?1))
+                 FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
+                 JOIN memories c ON c.rowid = vt.id
+                 WHERE c.pending_revision = 0".to_string(),
+                vec![
+                    libsql::Value::Text(vec_str.clone()),
+                    libsql::Value::Integer(fetch_limit),
+                ],
+            )
+        };
 
         let mut results = Vec::new();
         match conn
-            .query(sql, libsql::params![vec_str, fetch_limit])
+            .query(&sql, params)
             .await
         {
             Ok(mut rows) => {
@@ -6186,6 +6214,7 @@ impl MemoryDB {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        results.truncate(limit);
         Ok(results)
     }
 

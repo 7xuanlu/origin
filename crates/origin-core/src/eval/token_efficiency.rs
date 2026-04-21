@@ -13,11 +13,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use std::sync::LazyLock;
+
+/// Shared BPE tokenizer instance (cl100k_base). Initialized once on first use.
+static BPE: LazyLock<tiktoken_rs::CoreBPE> = LazyLock::new(|| {
+    tiktoken_rs::cl100k_base().expect("failed to load cl100k_base tokenizer")
+});
+
 /// Count tokens in text using tiktoken cl100k_base encoding.
 pub fn count_tokens(text: &str) -> usize {
-    use tiktoken_rs::cl100k_base;
-    let bpe = cl100k_base().expect("failed to load cl100k_base tokenizer");
-    bpe.encode_with_special_tokens(text).len()
+    BPE.encode_with_special_tokens(text).len()
 }
 
 // ===== Types =====
@@ -266,7 +271,7 @@ pub async fn run_quality_cost_eval(
             .chain(case.negative_seeds.iter())
             .map(|s| s.content.as_str())
             .collect::<Vec<_>>()
-            .join(" ");
+            .join("\n\n");
         let corpus_tokens = count_tokens(&corpus_text);
 
         // Seed an ephemeral DB
@@ -322,7 +327,7 @@ pub async fn run_quality_cost_eval(
                     (ctx_tokens, ndcg, mrr_v, r5)
                 }
                 SearchStrategy::NaiveRag => {
-                    let results = db.naive_vector_search(&case.query, limit).await?;
+                    let results = db.naive_vector_search(&case.query, limit, case.domain.as_deref()).await?;
                     let ctx_tokens = count_results_tokens(&results);
                     let ranked: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
                     let ndcg = metrics::ndcg_at_k(&ranked, &grades, 10);
@@ -643,7 +648,7 @@ mod tests {
         db.upsert_documents(docs).await.unwrap();
 
         let results = db
-            .naive_vector_search("async programming in Rust", 3)
+            .naive_vector_search("async programming in Rust", 3, None)
             .await
             .unwrap();
 
@@ -767,14 +772,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_scaling_eval_basic() {
-        let fixture_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../app/eval/fixtures");
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("app/eval/fixtures");
         if !fixture_dir.exists() {
+            eprintln!("Skipping: fixture dir not found at {:?}", fixture_dir);
             return;
         }
 
-        let sizes = vec![3, 5];
-        let points = run_scaling_eval(&fixture_dir, &sizes, 5).await.unwrap();
+        let sizes = vec![3, 5, 10, 20, 40];
+        let points = run_scaling_eval(&fixture_dir, &sizes, 10).await.unwrap();
 
         assert!(!points.is_empty(), "should produce at least one scaling point");
         // With more seeds, replay tokens should increase
