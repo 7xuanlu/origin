@@ -355,6 +355,127 @@ pub async fn handle_store_memory(
         None
     };
 
+    // --- Topic-match check (pre-batcher) ---
+    // Run before building RawDocument. If the incoming memory matches an existing
+    // topic (same domain+type, similar embedding), upsert in place and return early,
+    // skipping the batcher and avoiding duplicates.
+    {
+        let (db_arc, topic_cfg) = {
+            let s = state.read().await;
+            (
+                s.db.clone(),
+                s.tuning.refinery.topic_match.clone(),
+            )
+        };
+
+        if let Some(ref db) = db_arc {
+            // Compute embedding synchronously (CPU-bound, no DB lock needed)
+            let embedding_result = db.generate_embeddings(&[trimmed_content.to_string()]);
+
+            if let Ok(ref embeddings) = embedding_result {
+                if let Some(content_embedding) = embeddings.first() {
+                    let match_result = origin_core::topic_match::find_topic_match(
+                        db,
+                        trimmed_content,
+                        &title,
+                        validated_memory_type.as_deref(),
+                        req.domain.as_deref(),
+                        resolved_entity_id.as_deref(),
+                        content_embedding,
+                        &topic_cfg,
+                    )
+                    .await;
+
+                    if let Ok(ref result) = match_result {
+                        if let Some(ref matched_source_id) = result.matched_source_id {
+                            // Trust guardrail: don't overwrite protected memories in place.
+                            let is_protected = db
+                                .is_memory_protected(matched_source_id)
+                                .await
+                                .unwrap_or(false);
+
+                            if !is_protected {
+                                let upsert_result = db
+                                    .upsert_memory_in_place(
+                                        matched_source_id,
+                                        trimmed_content,
+                                        req.source_agent.as_deref(),
+                                        None, // incoming_source_id N/A (no new id yet)
+                                        topic_cfg.changelog_cap,
+                                    )
+                                    .await;
+
+                                if let Ok(()) = upsert_result {
+                                    // Spawn async staleness check for linked concepts.
+                                    let db_clone = db.clone();
+                                    let msid = matched_source_id.clone();
+                                    let old_emb = result.old_embedding.clone();
+                                    let new_emb = content_embedding.clone();
+                                    tokio::spawn(async move {
+                                        let sim = old_emb.as_deref().map(|oe| {
+                                            origin_core::topic_match::cosine_similarity(oe, &new_emb)
+                                        });
+                                        if let Ok(concepts) =
+                                            db_clone.get_concepts_for_memory(&msid).await
+                                        {
+                                            for concept in concepts {
+                                                let stale_reason =
+                                                    match sim {
+                                                        Some(s) if s > 0.90 => None, // trivial
+                                                        Some(s) if s > 0.60 => Some("source_updated"),
+                                                        _ => Some("source_conflict"),
+                                                    };
+                                                if let Some(reason) = stale_reason {
+                                                    let _ = db_clone
+                                                        .set_concept_stale(&concept.id, reason)
+                                                        .await;
+                                                } else {
+                                                    let _ = db_clone
+                                                        .increment_concept_sources_updated(
+                                                            &concept.id,
+                                                        )
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    tracing::info!(
+                                        "[topic_match] upserted in place: source_id={matched_source_id} signals={:?}",
+                                        result.signals
+                                    );
+                                    return Ok(Json(StoreMemoryResponse {
+                                        source_id: matched_source_id.clone(),
+                                        chunks_created: 1,
+                                        memory_type: validated_memory_type
+                                            .clone()
+                                            .unwrap_or_else(|| "fact".to_string()),
+                                        entity_id: resolved_entity_id,
+                                        quality: None,
+                                        warnings: vec![],
+                                        extraction_method: "agent".to_string(),
+                                        enrichment: "not_needed".to_string(),
+                                        hint: "topic_updated".to_string(),
+                                    }));
+                                } else if let Err(ref e) = upsert_result {
+                                    tracing::warn!(
+                                        "[topic_match] upsert_memory_in_place failed, \
+                                         falling through to normal store: {e}"
+                                    );
+                                }
+                            } else {
+                                tracing::info!(
+                                    "[topic_match] matched protected memory {matched_source_id}, \
+                                     falling through to normal store"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Phase 3: Confidence + auto-confirm + supersede gating
     let memory_type = Some(memory_type_str.clone());
     let tier = stability_tier(memory_type.as_deref());
