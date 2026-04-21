@@ -1949,6 +1949,50 @@ pub async fn handle_get_concept(
     }
 }
 
+/// GET /api/concepts/{id}/sources
+///
+/// Returns all source memories linked to a concept via the concept_sources join table,
+/// enriched with memory metadata for display.
+pub async fn handle_get_concept_sources(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<origin_types::ConceptSourceWithMemory>>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+
+    let sources = db
+        .get_concept_sources(&id)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+
+    let source_id_strings: Vec<String> = sources
+        .iter()
+        .map(|s| s.memory_source_id.clone())
+        .collect();
+    let memories = db
+        .get_memories_by_source_ids(&source_id_strings)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+
+    let result: Vec<origin_types::ConceptSourceWithMemory> = sources
+        .iter()
+        .map(|s| {
+            let memory = memories
+                .iter()
+                .find(|m| m.source_id == s.memory_source_id)
+                .cloned();
+            origin_types::ConceptSourceWithMemory {
+                source: s.clone(),
+                memory,
+            }
+        })
+        .collect();
+
+    Ok(Json(result))
+}
+
 /// POST /api/concepts/{id}/archive
 pub async fn handle_archive_concept(
     State(state): State<Arc<RwLock<ServerState>>>,

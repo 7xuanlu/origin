@@ -3,13 +3,13 @@ import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   getConcept,
-  listMemoriesByIds,
   listConcepts,
   updateConcept,
   deleteConcept,
   clipboardWrite,
   exportConceptToObsidian,
   listRegisteredSources,
+  getConceptSources,
   type MemoryItem,
   type Concept,
 } from "../../lib/tauri";
@@ -130,14 +130,16 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
     [registeredSources],
   );
 
-  const { data: sourceMemories } = useQuery({
-    queryKey: ["concept-sources", conceptId, concept?.source_memory_ids],
-    queryFn: () => {
-      if (!concept?.source_memory_ids.length) return Promise.resolve([]);
-      return listMemoriesByIds(concept.source_memory_ids);
-    },
-    enabled: !!concept?.source_memory_ids?.length,
+  const { data: conceptSources } = useQuery({
+    queryKey: ["concept-sources", conceptId],
+    queryFn: () => getConceptSources(conceptId),
+    enabled: !!conceptId,
   });
+
+  // Extract MemoryItems from the join table result for backward-compatible rendering.
+  const sourceMemories: MemoryItem[] | undefined = conceptSources
+    ?.filter((cs) => cs.memory !== null)
+    .map((cs) => cs.memory as MemoryItem);
 
   const updateMutation = useMutation({
     mutationFn: (content: string) => updateConcept(conceptId, content),
@@ -234,7 +236,7 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
     );
   }
 
-  const sourceCount = concept.source_memory_ids.length;
+  const sourceCount = conceptSources?.length ?? concept.source_memory_ids.length;
   const relatedConcepts = parseRelatedConcepts(concept.content);
 
   // Strip ## Sources (shown as MemoryCard UI below)

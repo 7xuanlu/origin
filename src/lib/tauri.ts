@@ -764,6 +764,32 @@ export interface Concept {
   created_at: string;
   last_compiled: string;
   last_modified: string;
+  // Staleness tracking (added in migration 40)
+  sources_updated_count?: number;
+  stale_reason?: string | null;
+  user_edited?: boolean;
+}
+
+export interface ConceptSource {
+  concept_id: string;
+  memory_source_id: string;
+  linked_at: number;
+  link_reason?: string | null;
+}
+
+export interface ConceptSourceWithMemory {
+  source: ConceptSource;
+  memory: MemoryItem | null;
+}
+
+export async function getConceptSources(
+  conceptId: string,
+): Promise<ConceptSourceWithMemory[]> {
+  const response = await fetch(
+    `http://127.0.0.1:7878/api/concepts/${conceptId}/sources`,
+  );
+  if (!response.ok) return [];
+  return response.json();
 }
 
 // ── Profiles & Agent Connections ─────────────────────────────────────
