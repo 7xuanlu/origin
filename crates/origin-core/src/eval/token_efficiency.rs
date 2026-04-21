@@ -727,7 +727,10 @@ pub struct PipelineTokenReport {
 /// 3. Concept: combine ALL seeds into one "compiled knowledge" entry, search
 ///
 /// Reports how consolidation reduces corpus tokens while maintaining (or improving) quality.
-pub async fn run_pipeline_token_eval(
+///
+/// This is a *simulation* — merging is synthetic (string concatenation), not LLM-driven.
+/// For real LLM distillation numbers see `benchmark_pipeline_token_real_llm` in tests.
+pub async fn run_pipeline_token_eval_simulated(
     fixture_dir: &Path,
     limit: usize,
 ) -> Result<PipelineTokenReport, OriginError> {
@@ -1803,17 +1806,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pipeline_token_eval() {
+    async fn test_pipeline_token_eval_simulated() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent().unwrap()
             .parent().unwrap()
             .join("app/eval/fixtures");
         if !fixture_dir.exists() {
-            eprintln!("Skipping test_pipeline_token_eval: fixture dir not found at {:?}", fixture_dir);
+            eprintln!("Skipping test_pipeline_token_eval_simulated: fixture dir not found at {:?}", fixture_dir);
             return;
         }
 
-        let report = run_pipeline_token_eval(&fixture_dir, 10).await.unwrap();
+        let report = run_pipeline_token_eval_simulated(&fixture_dir, 10).await.unwrap();
 
         assert_eq!(report.stages.len(), 3);
 
@@ -1849,5 +1852,202 @@ mod tests {
         }
         eprintln!("\nToken reduction (raw -> concept): {:.1}%", report.token_reduction_pct);
         eprintln!("Density improvement: {:.2}x", report.density_improvement);
+    }
+
+    /// Real-LLM pipeline token eval — runs actual distillation via Qwen3-4B and measures
+    /// how much context is delivered to an LLM before and after consolidation.
+    ///
+    /// Picks the fixture case with the most seeds, seeds a DB, measures raw token
+    /// counts, runs real LLM distillation (`distill_concepts`), then re-measures.
+    ///
+    /// Requires the Qwen3-4B model to be present in the hf-hub cache.
+    /// Run with: cargo test -p origin-core --lib eval::token_efficiency::tests::benchmark_pipeline_token_real_llm -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore] // Requires on-device LLM (Qwen3-4B) — use --ignored to run
+    async fn benchmark_pipeline_token_real_llm() {
+        use crate::llm_provider::OnDeviceProvider;
+        use crate::on_device_models;
+        use crate::prompts::PromptRegistry;
+        use crate::refinery::distill_concepts;
+        use crate::tuning::DistillationConfig;
+
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("app/eval/fixtures");
+
+        if !fixture_dir.exists() {
+            eprintln!("Skipping: fixture dir not found at {:?}", fixture_dir);
+            return;
+        }
+
+        // Check model is cached before trying to load it.
+        let model_spec = on_device_models::get_default_model();
+        if !on_device_models::is_cached(model_spec) {
+            eprintln!(
+                "Skipping: {} not found in hf-hub cache. Download it first via LlmEngine::download_model().",
+                model_spec.display_name
+            );
+            return;
+        }
+
+        // Load the model on a blocking thread (LlmEngine is not Send/Sync).
+        eprintln!("Loading {} ...", model_spec.display_name);
+        let llm_provider: Arc<dyn crate::llm_provider::LlmProvider> =
+            match tokio::task::spawn_blocking(|| OnDeviceProvider::new()).await {
+                Ok(Ok(p)) => Arc::new(p),
+                Ok(Err(e)) => {
+                    eprintln!("Skipping: LLM provider init failed: {}", e);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Skipping: spawn_blocking panicked: {}", e);
+                    return;
+                }
+            };
+        eprintln!("Model loaded. Provider: {}", llm_provider.name());
+
+        let cases = load_fixtures(&fixture_dir).unwrap();
+
+        // Pick the case with the most seeds (most realistic for distillation).
+        let best_case = match cases
+            .iter()
+            .filter(|c| !c.empty_set && c.seeds.len() >= 2)
+            .max_by_key(|c| c.seeds.len() + c.negative_seeds.len())
+        {
+            Some(c) => c,
+            None => {
+                eprintln!("Skipping: no fixture case with >= 2 seeds found");
+                return;
+            }
+        };
+
+        eprintln!(
+            "Using fixture case: {:?} ({} seeds, {} negative seeds)",
+            best_case.query,
+            best_case.seeds.len(),
+            best_case.negative_seeds.len()
+        );
+
+        let confidence_cfg = ConfidenceConfig::default();
+        let distillation_cfg = DistillationConfig::default();
+        let prompts = PromptRegistry::default();
+
+        // ---- Raw stage ----
+        let tmp_raw = tempfile::tempdir().unwrap();
+        let db_raw = MemoryDB::new(tmp_raw.path(), Arc::new(NoopEmitter))
+            .await
+            .unwrap();
+
+        let all_docs: Vec<RawDocument> = best_case
+            .seeds
+            .iter()
+            .chain(best_case.negative_seeds.iter())
+            .map(|s| crate::eval::runner::seed_to_doc(s, &confidence_cfg))
+            .collect();
+        let raw_doc_count = all_docs.len();
+
+        let corpus_text: String = all_docs
+            .iter()
+            .map(|d| d.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let corpus_tokens = count_tokens(&corpus_text);
+
+        db_raw.upsert_documents(all_docs).await.unwrap();
+
+        let raw_results = db_raw
+            .search_memory(
+                &best_case.query,
+                10,
+                None,
+                best_case.domain.as_deref(),
+                None,
+                Some(1.0),
+                Some(1.0),
+                None,
+            )
+            .await
+            .unwrap();
+        let raw_tokens = count_results_tokens(&raw_results);
+        let raw_result_count = raw_results.len();
+
+        eprintln!("\n=== Pipeline Token Eval (Real LLM: {}) ===", llm_provider.name());
+        eprintln!("Query: {}", best_case.query);
+        eprintln!("Corpus: {} memories, {} tokens", raw_doc_count, corpus_tokens);
+        eprintln!(
+            "Raw search: {} results, {} context tokens  (compression: {:.3})",
+            raw_result_count,
+            raw_tokens,
+            TokenMetrics::compute_compression_ratio(raw_tokens, corpus_tokens)
+        );
+
+        // ---- Run real distillation ----
+        // Seed the same DB for distillation (reuse db_raw).
+        eprintln!("\nRunning distillation ...");
+        let distill_start = std::time::Instant::now();
+        let concepts_created = distill_concepts(
+            &db_raw,
+            Some(&llm_provider),
+            &prompts,
+            &distillation_cfg,
+            None, // no knowledge_path in eval
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("  distill_concepts error (non-fatal): {}", e);
+            0
+        });
+        let distill_ms = distill_start.elapsed().as_millis();
+        eprintln!("Distillation done in {}ms, concepts created: {}", distill_ms, concepts_created);
+
+        // ---- Post-distillation stage ----
+        let distilled_results = db_raw
+            .search_memory(
+                &best_case.query,
+                10,
+                None,
+                best_case.domain.as_deref(),
+                None,
+                Some(1.0),
+                Some(1.0),
+                None,
+            )
+            .await
+            .unwrap();
+        let distilled_tokens = count_results_tokens(&distilled_results);
+        let distilled_result_count = distilled_results.len();
+
+        eprintln!(
+            "Post-distillation search: {} results, {} context tokens  (compression: {:.3})",
+            distilled_result_count,
+            distilled_tokens,
+            TokenMetrics::compute_compression_ratio(distilled_tokens, corpus_tokens)
+        );
+
+        // ---- Summary ----
+        let token_reduction = if raw_tokens > 0 {
+            (raw_tokens.saturating_sub(distilled_tokens)) as f64 / raw_tokens as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!("\n--- Summary ---");
+        eprintln!("  Corpus:          {} tokens", corpus_tokens);
+        eprintln!("  Raw search:      {} tokens ({} results)", raw_tokens, raw_result_count);
+        eprintln!(
+            "  Distilled search: {} tokens ({} results)",
+            distilled_tokens, distilled_result_count
+        );
+        eprintln!("  Token reduction: {:.1}% (raw -> distilled)", token_reduction);
+        eprintln!("  Concepts created: {}", concepts_created);
+
+        // Basic sanity: we should at least get some search results back.
+        assert!(
+            !distilled_results.is_empty() || raw_results.is_empty(),
+            "should return results if raw stage had results"
+        );
     }
 }
