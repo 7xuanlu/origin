@@ -314,8 +314,8 @@ pub async fn run_quality_cost_eval(
                             None,
                             case.domain.as_deref(),
                             None,
-                            None,
-                            None,
+                            Some(1.0), // neutralize confirmation boost — fixture bias
+                            Some(1.0), // neutralize recap penalty — fixture bias
                             None,
                         )
                         .await?;
@@ -512,11 +512,11 @@ pub async fn run_scaling_eval(
                 .join("\n\n");
             let replay_tokens = count_tokens(&replay_content);
 
-            // Origin: search and count
+            // Origin: search and count (neutralize confirmation/recap bias)
             let results = db
                 .search_memory(
                     &case.query, limit, None, case.domain.as_deref(),
-                    None, None, None, None,
+                    None, Some(1.0), Some(1.0), None,
                 )
                 .await?;
             let origin_content: String = results
