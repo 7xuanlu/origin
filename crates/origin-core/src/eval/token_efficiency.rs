@@ -1697,6 +1697,28 @@ pub struct MemoryLayerComparisonReport {
 ///
 /// Each approach is simulated faithfully against the same seeds and queries:
 /// - FlatMarkdown: all seeds concatenated as markdown, injected every turn
+/// Deterministic Fisher-Yates shuffle using the query string as a seed.
+/// Produces the same ordering for the same (items, seed_str) pair, ensuring
+/// reproducible NDCG measurements across runs while removing storage-order bias.
+fn deterministic_shuffle<T: Clone>(items: &[T], seed_str: &str) -> Vec<T> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    seed_str.hash(&mut hasher);
+    let seed = hasher.finish();
+
+    let mut shuffled = items.to_vec();
+    let len = shuffled.len();
+    let mut state = seed;
+    for i in (1..len).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (state as usize) % (i + 1);
+        shuffled.swap(i, j);
+    }
+    shuffled
+}
+
 /// - FactList: all seeds as discrete facts, capped at 200, all injected
 /// - SynthesizedSummary: concatenated content truncated to ~2K tokens (lossy)
 /// - OriginRetrieval: actual search_memory (hybrid vector+FTS) top-K
@@ -1752,6 +1774,9 @@ pub async fn run_memory_layer_comparison(
             .collect();
 
         // ---- FlatMarkdown ----
+        // Token count uses storage order (order doesn't affect token count).
+        // NDCG uses a deterministic shuffle to remove positive-seeds-first bias.
+        let flat_ndcg;
         {
             let markdown = all_seeds
                 .iter()
@@ -1760,21 +1785,25 @@ pub async fn run_memory_layer_comparison(
                 .collect::<Vec<_>>()
                 .join("\n\n");
             let tokens = count_tokens(&markdown) as f64;
-            // All seeds "returned" in storage order — no ranking
-            let all_ids: Vec<&str> = all_seeds.iter().map(|s| s.id.as_str()).collect();
-            let ndcg = metrics::ndcg_at_k(&all_ids, &grades, all_ids.len());
+            // Shuffle before NDCG: real native memory has no guaranteed ranking
+            let shuffled = deterministic_shuffle(&all_seeds, &case.query);
+            let all_ids: Vec<&str> = shuffled.iter().map(|s| s.id.as_str()).collect();
+            flat_ndcg = metrics::ndcg_at_k(&all_ids, &grades, all_ids.len());
             tokens_acc.get_mut(&MemoryLayerApproach::FlatMarkdown).unwrap().push(tokens);
-            ndcg_acc.get_mut(&MemoryLayerApproach::FlatMarkdown).unwrap().push(ndcg);
+            ndcg_acc.get_mut(&MemoryLayerApproach::FlatMarkdown).unwrap().push(flat_ndcg);
             // All seeds present — fully accessible
             accessible_acc.get_mut(&MemoryLayerApproach::FlatMarkdown).unwrap().push(1.0);
         }
 
         // ---- FactList (cap 200) ----
+        // Cap is applied after shuffle so the 200-item window is random, not biased toward positives.
         {
-            let capped: Vec<&crate::eval::fixtures::SeedMemory> = if all_seeds.len() > 200 {
-                all_seeds[..200].to_vec()
+            // Shuffle first so the cap doesn't preferentially keep positive seeds
+            let shuffled_all = deterministic_shuffle(&all_seeds, &case.query);
+            let capped: Vec<&crate::eval::fixtures::SeedMemory> = if shuffled_all.len() > 200 {
+                shuffled_all[..200].to_vec()
             } else {
-                all_seeds.clone()
+                shuffled_all
             };
             let tokens: f64 = capped.iter().map(|s| count_tokens(&s.content)).sum::<usize>() as f64;
             let capped_ids: Vec<&str> = capped.iter().map(|s| s.id.as_str()).collect();
@@ -1793,8 +1822,10 @@ pub async fn run_memory_layer_comparison(
         {
             // Rough budget: 2000 tokens * ~4 chars/token = 8000 chars
             let budget_chars = 8000usize;
-            let full_text = case
-                .seeds
+            // Shuffle before joining so truncation doesn't preferentially keep positive seeds
+            let seeds_ref: Vec<&crate::eval::fixtures::SeedMemory> = case.seeds.iter().collect();
+            let shuffled_seeds = deterministic_shuffle(&seeds_ref, &case.query);
+            let full_text = shuffled_seeds
                 .iter()
                 .map(|s| s.content.as_str())
                 .collect::<Vec<_>>()
@@ -1885,8 +1916,10 @@ pub async fn run_memory_layer_comparison(
                 .join("\n\n");
             let markdown_tokens = count_tokens(&markdown) as f64;
             let complement_tokens = markdown_tokens + origin_tokens;
-            // Quality is at least as good as Origin alone (it has all of Origin's results + full context)
-            let complement_ndcg = origin_ndcg;
+            // Quality is at least as good as the better of native or Origin alone.
+            // Native has all memories in random order; Origin has ranked retrieval.
+            // Together the LLM benefits from both, so the floor is max(flat_ndcg, origin_ndcg).
+            let complement_ndcg = flat_ndcg.max(origin_ndcg);
             tokens_acc.get_mut(&MemoryLayerApproach::OriginPlusNative).unwrap().push(complement_tokens);
             ndcg_acc.get_mut(&MemoryLayerApproach::OriginPlusNative).unwrap().push(complement_ndcg);
             accessible_acc.get_mut(&MemoryLayerApproach::OriginPlusNative).unwrap().push(1.0);
