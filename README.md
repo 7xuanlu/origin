@@ -36,7 +36,7 @@ Add to your MCP config:
 }
 ```
 
-On first run, `npx origin-mcp` downloads `origin-mcp` and `origin-server` into `~/.origin/bin/` and starts the daemon. Source: `[packages/origin-mcp-npm](packages/origin-mcp-npm)` in this repo bootstraps the companion [origin-mcp](https://github.com/7xuanlu/origin-mcp) binary.
+On first run, `npx origin-mcp` downloads `origin-mcp` and `origin-server` into `~/.origin/bin/` and starts the daemon. The npm package is published from the [origin-mcp repo](https://github.com/7xuanlu/origin-mcp).
 
 ### Desktop app
 
@@ -198,8 +198,7 @@ Bug fixes, eval cases, docs, and features are welcome. Start with [CONTRIBUTING.
 
 - `origin-types`, `origin-core`, `origin-server`: **Apache-2.0**
 - Desktop app (`app/`) and root frontend UI: **AGPL-3.0-only**
-- npm wrapper (`packages/origin-mcp-npm`): **MIT**
-- Companion MCP server binary ([origin-mcp](https://github.com/7xuanlu/origin-mcp)): **MIT**
+- [origin-mcp](https://github.com/7xuanlu/origin-mcp) (MCP server, npm package, Homebrew): **MIT**
 
 The split keeps the data layer permissively licensed for downstream tools while the shipped desktop app stays AGPL.
 

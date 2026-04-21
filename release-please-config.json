@@ -13,11 +13,6 @@
           "type": "json",
           "path": "app/tauri.conf.json",
           "jsonpath": "$.version"
-        },
-        {
-          "type": "json",
-          "path": "packages/origin-mcp-npm/package.json",
-          "jsonpath": "$.version"
         }
       ]
     }

@@ -54,13 +54,6 @@ TAURI_CONF="$REPO_ROOT/app/tauri.conf.json"
 sed -i '' -E 's/"version": "[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]*)?"/"version": "'"$NEW_VERSION"'"/' "$TAURI_CONF"
 echo "  Updated $TAURI_CONF"
 
-# Update npm wrapper package.json
-NPM_PKG="$REPO_ROOT/packages/origin-mcp-npm/package.json"
-if [ -f "$NPM_PKG" ]; then
-  sed -i '' -E 's/"version": "[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]*)?"/"version": "'"$NEW_VERSION"'"/' "$NPM_PKG"
-  echo "  Updated $NPM_PKG"
-fi
-
 echo ""
 echo "Regenerating Cargo.lock..."
 cargo generate-lockfile
@@ -68,7 +61,7 @@ echo "  Updated Cargo.lock"
 
 echo ""
 echo "Changed files:"
-git diff --stat app/Cargo.toml crates/*/Cargo.toml package.json app/tauri.conf.json packages/origin-mcp-npm/package.json Cargo.lock 2>/dev/null || true
+git diff --stat app/Cargo.toml crates/*/Cargo.toml package.json app/tauri.conf.json Cargo.lock 2>/dev/null || true
 
 echo ""
 echo "Done. Verify with:"

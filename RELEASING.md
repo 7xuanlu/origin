@@ -8,7 +8,6 @@ The `release-please-config.json` lists extra files that release-please also bump
 
 - `app/tauri.conf.json`
 - `package.json`
-- `packages/origin-mcp-npm/package.json`
 
 The root `Cargo.toml` workspace version is the canonical source; `app/Cargo.toml` and the other crate `Cargo.toml` files are bumped by running `bash scripts/bump-version.sh` manually when needed outside of release-please.
 
@@ -46,9 +45,9 @@ If any file is out of sync, the build fails immediately with instructions to run
 3. Fetches the `origin-mcp` binary from the separate repo and the `cloudflared` binary.
 4. Builds the Tauri app with `CXXFLAGS="-std=c++17"` (required for llama.cpp on macOS 26.x).
 5. Creates the GitHub release with DMG and standalone binaries attached.
-6. After the release job succeeds, two parallel jobs run:
-   - `publish-npm`: publishes `packages/origin-mcp-npm/` to npm.
-   - `publish-crates`: publishes `origin-types` to crates.io if it changed since the previous tag.
+6. After the release job succeeds, `publish-crates` publishes `origin-types` to crates.io if it changed since the previous tag.
+
+**Note:** The `origin-mcp` npm package is published from the [origin-mcp repo](https://github.com/7xuanlu/origin-mcp), not from this repo. That repo owns all origin-mcp distribution: npm, crates.io, and Homebrew.
 
 ## Cross-repo coordination with origin-mcp
 
