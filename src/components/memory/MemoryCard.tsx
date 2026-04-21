@@ -381,6 +381,12 @@ export default function MemoryCard({
                 )}
                 <span style={{ opacity: 0.4 }}>&middot;</span>
                 <span>{isNew ? "new" : timeAgo(memory.last_modified)}</span>
+                {(memory.version ?? 1) > 1 && (
+                  <>
+                    <span style={{ opacity: 0.4 }}>&middot;</span>
+                    <span style={{ color: "var(--mem-text-tertiary)" }}>v{memory.version}</span>
+                  </>
+                )}
                 {(memory.access_count ?? 0) >= 3 && (
                   <>
                     <span style={{ opacity: 0.4 }}>&middot;</span>

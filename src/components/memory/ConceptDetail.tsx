@@ -303,6 +303,14 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
               <span>Last distilled {relativeTimeFromISO(concept.last_compiled)}</span>
               <span style={{ opacity: 0.4 }}>&middot;</span>
               <span>from {sourceCount} {sourceCount === 1 ? "memory" : "memories"}</span>
+              {concept.stale_reason && (
+                <>
+                  <span style={{ opacity: 0.4 }}>&middot;</span>
+                  <span style={{ color: concept.stale_reason === "source_conflict" ? "var(--mem-accent-amber)" : "var(--mem-text-tertiary)" }}>
+                    {concept.stale_reason === "source_conflict" ? "needs review" : "updating..."}
+                  </span>
+                </>
+              )}
             </div>
           </div>
 

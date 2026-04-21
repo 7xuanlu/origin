@@ -719,6 +719,14 @@ export interface MemoryItem {
   structured_fields?: string | null;  // JSON string from Rust
   retrieval_cue?: string | null;
   access_count?: number;
+  version?: number;
+  changelog?: Array<{
+    version: number;
+    at: number;
+    delta: string;
+    source_agent?: string | null;
+    incoming_source_id?: string | null;
+  }>;
 }
 
 export interface DomainInfo {
