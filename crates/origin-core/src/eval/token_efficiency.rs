@@ -3447,8 +3447,7 @@ mod tests {
                 return;
             }
         };
-        // Set in env so run_e2e_answer_eval can pick it up
-        std::env::set_var("ANTHROPIC_API_KEY", &api_key);
+        let _ = api_key; // run_e2e_answer_eval reads ANTHROPIC_API_KEY from env directly
 
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
