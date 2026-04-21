@@ -658,7 +658,9 @@ CREATE TABLE IF NOT EXISTS memories (
     last_accessed INTEGER,
     refinement_status TEXT,
     effective_confidence REAL,
-    embedding F32_BLOB(768)
+    embedding F32_BLOB(768),
+    version INTEGER DEFAULT 1,
+    changelog TEXT DEFAULT '[]'
 );
 
 -- Access log: per-source access events for recency/frequency tracking
@@ -12191,6 +12193,8 @@ impl MemoryDB {
     }
 
     /// Update a concept's content and source memory ids. Increments version, updates timestamps.
+    /// Dual-writes: updates the JSON `source_memory_ids` column (backward compat) AND
+    /// inserts any new links into the `concept_sources` join table.
     pub async fn update_concept_content(
         &self,
         id: &str,
@@ -12200,13 +12204,24 @@ impl MemoryDB {
         let source_ids_json = serde_json::to_string(&source_memory_ids)
             .map_err(|e| OriginError::VectorDb(format!("serialize source_memory_ids: {e}")))?;
         let now = chrono::Utc::now().to_rfc3339();
+        let now_ts = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().await;
+        // Dual-write: update JSON column (backward compat) + increment version + timestamps
         conn.execute(
             "UPDATE concepts SET content = ?1, source_memory_ids = ?2, version = version + 1, last_compiled = ?3, last_modified = ?3 WHERE id = ?4",
             libsql::params![content, source_ids_json, now, id],
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("update_concept_content: {e}")))?;
+        // Dual-write: insert any new source links into the join table (idempotent)
+        for sid in source_memory_ids {
+            let _ = conn
+                .execute(
+                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, 'concept_growth')",
+                    libsql::params![id, sid, now_ts],
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -12510,6 +12525,248 @@ impl MemoryDB {
             stale_reason: row.get::<Option<String>>(13).unwrap_or(None),
             user_edited: row.get::<i64>(14).unwrap_or(0) != 0,
         })
+    }
+
+    // ===== Topic Match Helpers =====
+
+    /// Fetch lightweight candidate memories for topic matching.
+    /// Filters by domain + memory_type + chunk_index=0, ordered by last_modified DESC.
+    /// Returns an empty Vec when domain or memory_type is None (both are required).
+    pub async fn topic_match_candidates(
+        &self,
+        domain: Option<&str>,
+        memory_type: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<Vec<crate::topic_match::TopicMatchCandidate>, OriginError> {
+        let (d, mt) = match (domain, memory_type) {
+            (Some(d), Some(mt)) => (d, mt),
+            _ => return Ok(Vec::new()),
+        };
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_id, title, content, entity_id, embedding
+                 FROM memories
+                 WHERE domain = ?1 AND memory_type = ?2 AND chunk_index = 0 AND pending_revision = 0
+                 ORDER BY last_modified DESC
+                 LIMIT ?3",
+                libsql::params![d, mt, max_candidates as i64],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("topic_match_candidates: {e}")))?;
+
+        let mut candidates = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let source_id: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(format!("topic_cand source_id: {e}")))?;
+            let title: String = row.get::<String>(1).unwrap_or_default();
+            let content: String = row
+                .get(2)
+                .map_err(|e| OriginError::VectorDb(format!("topic_cand content: {e}")))?;
+            let entity_id: Option<String> = row.get::<Option<String>>(3).unwrap_or(None);
+            // Decode F32_BLOB (little-endian f32 bytes)
+            let embedding: Vec<f32> = row
+                .get::<Vec<u8>>(4)
+                .unwrap_or_default()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            candidates.push(crate::topic_match::TopicMatchCandidate {
+                source_id,
+                title,
+                content,
+                entity_id,
+                embedding,
+            });
+        }
+        Ok(candidates)
+    }
+
+    // ===== Concept Sources Join Table Methods =====
+
+    /// Link a memory to a concept in the concept_sources join table.
+    /// Idempotent: INSERT OR IGNORE on the composite primary key.
+    pub async fn link_concept_source(
+        &self,
+        concept_id: &str,
+        memory_source_id: &str,
+        link_reason: &str,
+    ) -> Result<(), OriginError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+            libsql::params![concept_id, memory_source_id, now, link_reason],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("link_concept_source: {e}")))?;
+        Ok(())
+    }
+
+    /// Get all source memories linked to a concept, ordered by linked_at ascending.
+    pub async fn get_concept_sources(
+        &self,
+        concept_id: &str,
+    ) -> Result<Vec<origin_types::ConceptSource>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT concept_id, memory_source_id, linked_at, link_reason FROM concept_sources WHERE concept_id = ?1 ORDER BY linked_at ASC",
+                libsql::params![concept_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_concept_sources: {e}")))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            result.push(origin_types::ConceptSource {
+                concept_id: row.get(0).map_err(|e| OriginError::VectorDb(format!("concept_sources concept_id: {e}")))?,
+                memory_source_id: row.get(1).map_err(|e| OriginError::VectorDb(format!("concept_sources memory_source_id: {e}")))?,
+                linked_at: row.get(2).unwrap_or(0),
+                link_reason: row.get::<Option<String>>(3).unwrap_or(None),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Reverse lookup: find all active concepts that reference a given memory source_id.
+    pub async fn get_concepts_for_memory(
+        &self,
+        memory_source_id: &str,
+    ) -> Result<Vec<crate::concepts::Concept>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT c.id, c.title, c.summary, c.content, c.entity_id, c.domain,
+                        c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
+                        COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0)
+                 FROM concepts c
+                 INNER JOIN concept_sources cs ON c.id = cs.concept_id
+                 WHERE cs.memory_source_id = ?1 AND c.status = 'active'",
+                libsql::params![memory_source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_concepts_for_memory: {e}")))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            result.push(Self::row_to_concept(&row)?);
+        }
+        Ok(result)
+    }
+
+    /// Remove concept_sources rows where the referenced memory no longer exists.
+    pub async fn cleanup_orphaned_concept_sources(&self) -> Result<usize, OriginError> {
+        let conn = self.conn.lock().await;
+        let rows_affected = conn
+            .execute(
+                "DELETE FROM concept_sources WHERE memory_source_id NOT IN (SELECT DISTINCT source_id FROM memories)",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("cleanup_orphaned_concept_sources: {e}")))?;
+        Ok(rows_affected as usize)
+    }
+
+    /// Check if a memory is protected from in-place upsert (confirmed or high-stability).
+    pub async fn is_memory_protected(&self, source_id: &str) -> Result<bool, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT confirmed, stability FROM memories WHERE source_id = ?1 AND chunk_index = 0 LIMIT 1",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("is_memory_protected: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let confirmed: i64 = row.get(0).unwrap_or(0);
+            let stability: Option<String> = row.get::<Option<String>>(1).unwrap_or(None);
+            Ok(confirmed != 0 || matches!(stability.as_deref(), Some("learned") | Some("confirmed")))
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Mark a concept as stale with a specific reason.
+    pub async fn set_concept_stale(
+        &self,
+        concept_id: &str,
+        reason: &str,
+    ) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE concepts SET stale_reason = ?1 WHERE id = ?2",
+            libsql::params![reason, concept_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("set_concept_stale: {e}")))?;
+        Ok(())
+    }
+
+    /// Increment a concept's sources_updated_count (for trivial/non-conflicting source changes).
+    pub async fn increment_concept_sources_updated(
+        &self,
+        concept_id: &str,
+    ) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE concepts SET sources_updated_count = sources_updated_count + 1 WHERE id = ?1",
+            libsql::params![concept_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("increment_concept_sources_updated: {e}")))?;
+        Ok(())
+    }
+
+    /// List active concepts with the given stale_reason, up to `limit` rows.
+    pub async fn list_stale_concepts(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<crate::concepts::Concept>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0) FROM concepts WHERE stale_reason = ?1 AND status = 'active' LIMIT 10",
+                libsql::params![reason],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("list_stale_concepts: {e}")))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            result.push(Self::row_to_concept(&row)?);
+        }
+        Ok(result)
+    }
+
+    /// Clear staleness fields after successful re-distillation.
+    pub async fn clear_concept_staleness(&self, concept_id: &str) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE concepts SET stale_reason = NULL, sources_updated_count = 0 WHERE id = ?1",
+            libsql::params![concept_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("clear_concept_staleness: {e}")))?;
+        Ok(())
     }
 
     // ===== Source Sync State Methods =====

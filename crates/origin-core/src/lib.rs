@@ -47,6 +47,7 @@ pub mod sources;
 pub mod spaces;
 pub mod system_info;
 pub mod tags;
+pub mod topic_match;
 pub mod tuning;
 pub mod working_memory;
 
