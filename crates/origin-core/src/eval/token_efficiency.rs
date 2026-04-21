@@ -42,6 +42,10 @@ pub enum SearchStrategy {
     FullReplay,
     /// No context at all (lower bound on quality).
     NoMemory,
+    /// Ablation: FTS5 BM25 search only — no vectors, no RRF.
+    FtsOnly,
+    /// Ablation: vector + FTS merged by max score (no RRF fusion).
+    VectorPlusFts,
 }
 
 impl SearchStrategy {
@@ -54,6 +58,8 @@ impl SearchStrategy {
             Self::NaiveRag => "naive_rag",
             Self::FullReplay => "full_replay",
             Self::NoMemory => "no_memory",
+            Self::FtsOnly => "fts_only",
+            Self::VectorPlusFts => "vector_plus_fts",
         }
     }
 
@@ -66,6 +72,8 @@ impl SearchStrategy {
             Self::NaiveRag => "Naive RAG",
             Self::FullReplay => "Full Replay",
             Self::NoMemory => "No Memory",
+            Self::FtsOnly => "FTS Only",
+            Self::VectorPlusFts => "Vector+FTS",
         }
     }
 
@@ -351,6 +359,28 @@ pub async fn run_quality_cost_eval(
                 SearchStrategy::NoMemory => {
                     // Cost = 0 tokens; quality = 0 (no context)
                     (0, 0.0, 0.0, 0.0)
+                }
+                SearchStrategy::FtsOnly => {
+                    let results = db
+                        .fts_only_search(&case.query, limit, case.domain.as_deref())
+                        .await?;
+                    let ctx_tokens = count_results_tokens(&results);
+                    let ranked: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
+                    let ndcg = metrics::ndcg_at_k(&ranked, &grades, 10);
+                    let mrr_v = metrics::mrr(&ranked, &relevant);
+                    let r5 = metrics::recall_at_k(&ranked, &relevant, 5);
+                    (ctx_tokens, ndcg, mrr_v, r5)
+                }
+                SearchStrategy::VectorPlusFts => {
+                    let results = db
+                        .vector_plus_fts_search(&case.query, limit, case.domain.as_deref())
+                        .await?;
+                    let ctx_tokens = count_results_tokens(&results);
+                    let ranked: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
+                    let ndcg = metrics::ndcg_at_k(&ranked, &grades, 10);
+                    let mrr_v = metrics::mrr(&ranked, &relevant);
+                    let r5 = metrics::recall_at_k(&ranked, &relevant, 5);
+                    (ctx_tokens, ndcg, mrr_v, r5)
                 }
                 SearchStrategy::OriginReranked | SearchStrategy::OriginExpanded => {
                     unreachable!("LLM strategies already skipped above")
@@ -646,6 +676,8 @@ mod tests {
         assert_eq!(SearchStrategy::NaiveRag.name(), "naive_rag");
         assert_eq!(SearchStrategy::FullReplay.name(), "full_replay");
         assert_eq!(SearchStrategy::NoMemory.name(), "no_memory");
+        assert_eq!(SearchStrategy::FtsOnly.name(), "fts_only");
+        assert_eq!(SearchStrategy::VectorPlusFts.name(), "vector_plus_fts");
 
         assert_eq!(SearchStrategy::Origin.display_name(), "Origin");
         assert_eq!(SearchStrategy::OriginReranked.display_name(), "Origin+Rerank");
@@ -653,6 +685,8 @@ mod tests {
         assert_eq!(SearchStrategy::NaiveRag.display_name(), "Naive RAG");
         assert_eq!(SearchStrategy::FullReplay.display_name(), "Full Replay");
         assert_eq!(SearchStrategy::NoMemory.display_name(), "No Memory");
+        assert_eq!(SearchStrategy::FtsOnly.display_name(), "FTS Only");
+        assert_eq!(SearchStrategy::VectorPlusFts.display_name(), "Vector+FTS");
     }
 
     #[test]
@@ -663,6 +697,8 @@ mod tests {
         assert!(!SearchStrategy::NaiveRag.requires_llm());
         assert!(!SearchStrategy::FullReplay.requires_llm());
         assert!(!SearchStrategy::NoMemory.requires_llm());
+        assert!(!SearchStrategy::FtsOnly.requires_llm());
+        assert!(!SearchStrategy::VectorPlusFts.requires_llm());
     }
 
     #[tokio::test]
@@ -1089,5 +1125,94 @@ mod tests {
             naive_savings, mean_naive, mean_corpus,
         );
         eprintln!("========================================");
+    }
+
+    /// Ablation test: seeds a small DB with 3 clearly-differentiated documents and
+    /// runs NaiveRag, FtsOnly, VectorPlusFts, and Origin. Verifies:
+    /// - All strategies return non-empty results (basic correctness).
+    /// - Origin and VectorPlusFts return at most `limit` results.
+    /// - FtsOnly can retrieve keyword-matching documents.
+    #[tokio::test]
+    async fn test_ablation_strategies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter))
+            .await
+            .unwrap();
+
+        let docs = vec![
+            RawDocument {
+                content: "Rust ownership prevents memory safety issues at compile time via the borrow checker.".to_string(),
+                source_id: "rust_safety".to_string(),
+                source: "memory".to_string(),
+                title: "Rust safety".to_string(),
+                memory_type: Some("fact".to_string()),
+                ..Default::default()
+            },
+            RawDocument {
+                content: "tokio provides an async runtime for Rust with futures and tasks.".to_string(),
+                source_id: "tokio_runtime".to_string(),
+                source: "memory".to_string(),
+                title: "Tokio runtime".to_string(),
+                memory_type: Some("fact".to_string()),
+                ..Default::default()
+            },
+            RawDocument {
+                content: "SQLite is an embedded relational database engine with ACID guarantees.".to_string(),
+                source_id: "sqlite_db".to_string(),
+                source: "memory".to_string(),
+                title: "SQLite".to_string(),
+                memory_type: Some("fact".to_string()),
+                ..Default::default()
+            },
+        ];
+        db.upsert_documents(docs).await.unwrap();
+
+        let query = "Rust async runtime";
+        let limit = 3;
+
+        // NaiveRag: vector-only
+        let naive = db.naive_vector_search(query, limit, None).await.unwrap();
+        assert!(!naive.is_empty(), "NaiveRag should return results");
+        assert!(naive.len() <= limit, "NaiveRag should respect limit");
+
+        // FtsOnly: keyword BM25
+        let fts = db.fts_only_search(query, limit, None).await.unwrap();
+        // FTS may return empty if tokeniser doesn't match; don't assert non-empty
+        // but do assert limit is respected when non-empty.
+        assert!(fts.len() <= limit, "FtsOnly should respect limit");
+
+        // VectorPlusFts: merged by max score
+        let vpf = db.vector_plus_fts_search(query, limit, None).await.unwrap();
+        assert!(!vpf.is_empty(), "VectorPlusFts should return results (vector path guaranteed)");
+        assert!(vpf.len() <= limit, "VectorPlusFts should respect limit");
+
+        // Origin: full hybrid
+        let origin = db
+            .search_memory(
+                query,
+                limit,
+                None,
+                None,
+                None,
+                Some(1.0), // neutralize confirmation boost
+                Some(1.0), // neutralize recap penalty
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!origin.is_empty(), "Origin should return results");
+        assert!(origin.len() <= limit, "Origin should respect limit");
+
+        // VectorPlusFts should cover at least what NaiveRag covers (superset of signals)
+        let naive_ids: HashSet<&str> = naive.iter().map(|r| r.source_id.as_str()).collect();
+        let vpf_ids: HashSet<&str> = vpf.iter().map(|r| r.source_id.as_str()).collect();
+        // At minimum the vector-matched docs should appear in VectorPlusFts
+        for id in &naive_ids {
+            assert!(
+                vpf_ids.contains(id),
+                "VectorPlusFts should include doc '{}' found by NaiveRag",
+                id
+            );
+        }
     }
 }

@@ -6218,6 +6218,140 @@ impl MemoryDB {
         Ok(results)
     }
 
+    /// FTS-only search (no vector, no RRF) — used as ablation baseline.
+    /// Runs BM25 FTS5 matching with AND-then-OR fallback; score = negated rank.
+    /// Eval-only: not used in production search paths.
+    pub(crate) async fn fts_only_search(
+        &self,
+        query: &str,
+        limit: usize,
+        domain: Option<&str>,
+    ) -> Result<Vec<SearchResult>, OriginError> {
+        let fetch_limit = if domain.is_some() { (limit * 3) as i64 } else { limit as i64 };
+
+        let conn = self.conn.lock().await;
+
+        let (domain_clause, domain_param): (String, Option<libsql::Value>) = if let Some(d) = domain {
+            ("AND c.domain = ?3".to_string(), Some(libsql::Value::Text(d.to_string())))
+        } else {
+            (String::new(), None)
+        };
+
+        let fts_sql = format!(
+            "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
+                    c.chunk_index, c.last_modified, c.chunk_type, c.language, c.byte_start,
+                    c.byte_end, c.semantic_unit, c.memory_type, c.domain, c.source_agent,
+                    c.confidence, c.confirmed, c.stability, c.supersedes,
+                    c.entity_id, c.quality, c.is_recap, c.supersede_mode,
+                    c.structured_fields, c.retrieval_cue, c.source_text,
+                    fts.rank
+             FROM memories_fts fts
+             JOIN memories c ON fts.rowid = c.rowid
+             WHERE memories_fts MATCH ?1
+               AND c.pending_revision = 0 {}
+             ORDER BY fts.rank
+             LIMIT ?2",
+            domain_clause
+        );
+
+        // AND match first, fall back to OR for multi-word queries
+        let fts_queries = vec![query.to_string(), Self::fts_or_query(query)];
+        let mut results: Vec<SearchResult> = Vec::new();
+
+        for fts_query in &fts_queries {
+            let mut params: Vec<libsql::Value> = vec![
+                libsql::Value::Text(fts_query.clone()),
+                libsql::Value::Integer(fetch_limit),
+            ];
+            if let Some(ref dp) = domain_param {
+                params.push(dp.clone());
+            }
+
+            match conn.query(&fts_sql, params).await {
+                Ok(mut rows) => {
+                    while let Ok(Some(row)) = rows.next().await {
+                        // FTS5 rank is negative BM25; negate so higher = better
+                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let score = (-rank) as f32;
+                        if let Ok(result) = Self::row_to_search_result(&row, score) {
+                            results.push(result);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[fts_only_search] FTS search failed: {}", e);
+                }
+            }
+            if !results.is_empty() {
+                break;
+            }
+        }
+
+        // Dedup by id (AND and OR passes shouldn't overlap, but guard anyway)
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|r| seen.insert(r.id.clone()));
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    /// Vector + FTS merged by max score per document (no RRF) — ablation baseline.
+    /// Merges both signal lists by taking the max score for any document appearing
+    /// in both, then sorts descending and truncates to limit.
+    /// Eval-only: not used in production search paths.
+    pub(crate) async fn vector_plus_fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+        domain: Option<&str>,
+    ) -> Result<Vec<SearchResult>, OriginError> {
+        // Run both searches independently; score normalization is done after merge.
+        let vec_results = self.naive_vector_search(query, limit, domain).await?;
+        let fts_results = self.fts_only_search(query, limit, domain).await?;
+
+        // Normalise vector scores (already in [0,1] as cosine similarity).
+        // Normalise FTS scores to [0,1] range so both signals are comparable.
+        let fts_max = fts_results
+            .iter()
+            .map(|r| r.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let fts_norm = if fts_max > 0.0 { fts_max } else { 1.0 };
+
+        let mut merged: std::collections::HashMap<String, SearchResult> = std::collections::HashMap::new();
+
+        for r in vec_results {
+            // Vector scores are already cosine similarity in [0,1]
+            let prev_score = merged.get(&r.id).map(|e| e.score).unwrap_or(f32::NEG_INFINITY);
+            if r.score > prev_score {
+                merged.insert(r.id.clone(), r);
+            }
+        }
+
+        for mut r in fts_results {
+            let normalised = r.score / fts_norm;
+            let prev_score = merged.get(&r.id).map(|e| e.score).unwrap_or(f32::NEG_INFINITY);
+            if normalised > prev_score {
+                r.score = normalised;
+                merged.insert(r.id.clone(), r);
+            }
+        }
+
+        let mut results: Vec<SearchResult> = merged.into_values().collect();
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source_id.cmp(&b.source_id))
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
     /// Search entities by vector similarity. Returns EntitySearchResult with full Entity data.
     /// Tries DiskANN index first, falls back to brute-force cosine similarity.
     pub async fn search_entities_by_vector(
