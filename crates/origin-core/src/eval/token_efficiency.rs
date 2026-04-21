@@ -270,6 +270,60 @@ impl QualityCostReport {
     }
 }
 
+// ===== Native Memory Baseline Types =====
+
+/// Token cost model for a native AI memory platform.
+///
+/// Token estimates sourced from public documentation, model cards, and community
+/// measurements as of April 2026. These are researched estimates, not measurements
+/// from those systems' APIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeMemoryBaseline {
+    /// Platform name.
+    pub platform: String,
+    /// Tokens injected per turn (memory content only, excluding base system prompt).
+    pub memory_tokens_per_turn: usize,
+    /// Whether memory content grows with usage or is capped.
+    /// One of: "unbounded", "capped", "synthesized"
+    pub growth_model: String,
+    /// Brief description of how memory is injected.
+    pub mechanism: String,
+}
+
+/// Comparison report: Origin vs native memory systems.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeMemoryComparisonReport {
+    /// Origin's token cost per query (mean across fixture cases).
+    pub origin_tokens_per_query: f64,
+    /// Native baselines for comparison.
+    pub baselines: Vec<NativeMemoryBaseline>,
+    /// Per-baseline savings.
+    pub comparisons: Vec<NativeMemoryComparison>,
+    /// Multi-turn comparison (10 turns).
+    pub multi_turn_10: MultiTurnNativeComparison,
+}
+
+/// Origin vs a single native platform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeMemoryComparison {
+    pub platform: String,
+    pub native_tokens_per_turn: usize,
+    pub origin_tokens_per_turn: f64,
+    pub savings_pct: f64,
+    /// Qualitative description of the retrieval quality difference.
+    pub quality_advantage: String,
+}
+
+/// Multi-turn cumulative token comparison (fixed number of turns).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiTurnNativeComparison {
+    pub turns: usize,
+    pub origin_total: f64,
+    pub claude_code_total: usize,
+    pub chatgpt_total: usize,
+    pub claude_ai_total: usize,
+}
+
 // ===== Runner =====
 
 /// Run a quality-cost evaluation across fixture cases.
@@ -675,6 +729,160 @@ pub async fn run_multi_turn_eval(
         total_origin_tokens,
         total_replay_tokens,
         savings_pct,
+    })
+}
+
+/// Compare Origin's retrieval-based memory against native platform memory injection.
+///
+/// Runs Origin search against fixtures to get actual mean tokens/query, then compares
+/// against known fixed-overhead native memory systems.
+///
+/// Note: the comparison is inherently apples-to-oranges. Native memory is always-on
+/// general context injected every turn regardless of relevance. Origin retrieves only
+/// what is relevant to the specific query. The `quality_advantage` field on each
+/// comparison entry describes this distinction honestly.
+///
+/// Native platform token estimates are researched estimates as of April 2026, sourced
+/// from public documentation, model cards, and community measurements. They are not
+/// measurements from those platforms' APIs.
+pub async fn run_native_memory_comparison(
+    fixture_dir: &Path,
+    limit: usize,
+) -> Result<NativeMemoryComparisonReport, OriginError> {
+    // Step 1: run Origin against fixtures to get actual mean tokens/query.
+    let cases = load_fixtures(fixture_dir)?;
+    let confidence_cfg = ConfidenceConfig::default();
+    let mut origin_token_samples: Vec<usize> = Vec::new();
+
+    for case in &cases {
+        if case.empty_set || case.seeds.is_empty() {
+            continue;
+        }
+
+        let case_tmp = tempfile::tempdir()
+            .map_err(|e| OriginError::Generic(format!("tempdir for native comparison: {}", e)))?;
+        let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+
+        let all_docs: Vec<RawDocument> = case
+            .seeds
+            .iter()
+            .chain(case.negative_seeds.iter())
+            .map(|seed| crate::eval::runner::seed_to_doc(seed, &confidence_cfg))
+            .collect();
+        db.upsert_documents(all_docs).await?;
+
+        let results = db
+            .search_memory(
+                &case.query,
+                limit,
+                None,
+                case.domain.as_deref(),
+                None,
+                Some(1.0), // neutralize confirmation boost
+                Some(1.0), // neutralize recap penalty
+                None,
+            )
+            .await?;
+
+        origin_token_samples.push(count_results_tokens(&results));
+    }
+
+    let origin_tokens_per_query = if origin_token_samples.is_empty() {
+        0.0
+    } else {
+        origin_token_samples.iter().sum::<usize>() as f64 / origin_token_samples.len() as f64
+    };
+
+    // Step 2: define native baselines with researched token costs (April 2026 estimates).
+    //
+    // Sources:
+    //   Claude Code: CLAUDE.md (~8K) + MEMORY.md project file (~3.3K) injected every turn.
+    //     Estimate: ~11,300 tokens/turn for memory content (excluding base system prompt overhead).
+    //   ChatGPT: up to ~200 discrete memory facts (~2,300 tok) + custom instructions (~750 tok).
+    //     Estimate: ~3,050 tokens/turn combined. Capped at ~200 facts.
+    //   Claude.ai: synthesized memory summary auto-pruned to fit context.
+    //     Estimate: ~2,000 tokens/turn (community observations; no official figure published).
+    let baselines = vec![
+        NativeMemoryBaseline {
+            platform: "Claude Code".to_string(),
+            memory_tokens_per_turn: 11_300,
+            growth_model: "unbounded".to_string(),
+            mechanism: "dumps full CLAUDE.md every turn regardless of query relevance".to_string(),
+        },
+        NativeMemoryBaseline {
+            platform: "ChatGPT".to_string(),
+            memory_tokens_per_turn: 3_050,
+            growth_model: "capped".to_string(),
+            mechanism: "injects all saved facts every turn; capped at ~200 entries".to_string(),
+        },
+        NativeMemoryBaseline {
+            platform: "Claude.ai".to_string(),
+            memory_tokens_per_turn: 2_000,
+            growth_model: "synthesized".to_string(),
+            mechanism: "synthesized summary, not query-specific; auto-pruned".to_string(),
+        },
+    ];
+
+    // Step 3: compute per-baseline savings.
+    let quality_advantages = [
+        "dumps full CLAUDE.md every turn regardless of query relevance",
+        "injects all saved facts every turn; capped at ~200 entries",
+        "synthesized summary, not query-specific; auto-pruned",
+    ];
+
+    let comparisons: Vec<NativeMemoryComparison> = baselines
+        .iter()
+        .zip(quality_advantages.iter())
+        .map(|(baseline, quality_adv)| {
+            let native = baseline.memory_tokens_per_turn as f64;
+            let savings_pct = if native > 0.0 {
+                (native - origin_tokens_per_query) / native * 100.0
+            } else {
+                0.0
+            };
+            NativeMemoryComparison {
+                platform: baseline.platform.clone(),
+                native_tokens_per_turn: baseline.memory_tokens_per_turn,
+                origin_tokens_per_turn: origin_tokens_per_query,
+                savings_pct,
+                quality_advantage: quality_adv.to_string(),
+            }
+        })
+        .collect();
+
+    // Step 4: compute 10-turn totals.
+    // Native platforms inject the same overhead every turn (always-on).
+    // Origin retrieves fresh relevant context each turn (constant per-query cost).
+    let turns = 10usize;
+    let claude_code = baselines
+        .iter()
+        .find(|b| b.platform == "Claude Code")
+        .map(|b| b.memory_tokens_per_turn)
+        .unwrap_or(0);
+    let chatgpt = baselines
+        .iter()
+        .find(|b| b.platform == "ChatGPT")
+        .map(|b| b.memory_tokens_per_turn)
+        .unwrap_or(0);
+    let claude_ai = baselines
+        .iter()
+        .find(|b| b.platform == "Claude.ai")
+        .map(|b| b.memory_tokens_per_turn)
+        .unwrap_or(0);
+
+    let multi_turn_10 = MultiTurnNativeComparison {
+        turns,
+        origin_total: origin_tokens_per_query * turns as f64,
+        claude_code_total: claude_code * turns,
+        chatgpt_total: chatgpt * turns,
+        claude_ai_total: claude_ai * turns,
+    };
+
+    Ok(NativeMemoryComparisonReport {
+        origin_tokens_per_query,
+        baselines,
+        comparisons,
+        multi_turn_10,
     })
 }
 
@@ -1852,6 +2060,50 @@ mod tests {
         }
         eprintln!("\nToken reduction (raw -> concept): {:.1}%", report.token_reduction_pct);
         eprintln!("Density improvement: {:.2}x", report.density_improvement);
+    }
+
+    #[tokio::test]
+    async fn test_native_memory_comparison() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()
+            .parent().unwrap()
+            .join("app/eval/fixtures");
+        if !fixture_dir.exists() {
+            eprintln!("Skipping test_native_memory_comparison: fixture dir not found at {:?}", fixture_dir);
+            return;
+        }
+
+        let report = run_native_memory_comparison(&fixture_dir, 10).await.unwrap();
+
+        assert!(!report.baselines.is_empty());
+        assert!(!report.comparisons.is_empty());
+
+        // Origin should use fewer tokens than all native platforms
+        for comp in &report.comparisons {
+            assert!(comp.savings_pct > 0.0,
+                "Origin should save vs {} but got {:.1}%", comp.platform, comp.savings_pct);
+        }
+
+        // Print comparison
+        eprintln!("\n=== Origin vs Native Memory Systems ===");
+        eprintln!("Origin: {:.0} tokens/query (retrieval-based, query-relevant)\n", report.origin_tokens_per_query);
+        eprintln!("{:<15} | {:<12} | {:<10} | {}", "Platform", "Tokens/turn", "Savings", "Mechanism");
+        eprintln!("{:-<15}-+-{:-<12}-+-{:-<10}-+-{:-<30}", "", "", "", "");
+        for comp in &report.comparisons {
+            eprintln!("{:<15} | {:<12} | {:<10.1}% | {}",
+                comp.platform, comp.native_tokens_per_turn, comp.savings_pct, comp.quality_advantage);
+        }
+        eprintln!("\n=== 10-Turn Session Total ===");
+        eprintln!("Origin:      {:.0} tokens", report.multi_turn_10.origin_total);
+        eprintln!("Claude Code: {} tokens ({:.0}x more)",
+            report.multi_turn_10.claude_code_total,
+            report.multi_turn_10.claude_code_total as f64 / report.multi_turn_10.origin_total);
+        eprintln!("ChatGPT:     {} tokens ({:.0}x more)",
+            report.multi_turn_10.chatgpt_total,
+            report.multi_turn_10.chatgpt_total as f64 / report.multi_turn_10.origin_total);
+        eprintln!("Claude.ai:   {} tokens ({:.0}x more)",
+            report.multi_turn_10.claude_ai_total,
+            report.multi_turn_10.claude_ai_total as f64 / report.multi_turn_10.origin_total);
     }
 
     /// Real-LLM pipeline token eval — runs actual distillation via Qwen3-4B and measures
