@@ -840,4 +840,186 @@ mod tests {
             (loaded.headline.savings_pct - report.headline.savings_pct).abs() < 1e-9
         );
     }
+
+    #[tokio::test]
+    #[ignore] // Takes ~10 minutes — seeds embeddings for ~5K observations across 10 conversations
+    async fn benchmark_locomo_token_efficiency() {
+        use crate::eval::locomo::{extract_observations, load_locomo};
+
+        let locomo_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("app/eval/data/locomo10.json");
+
+        if !locomo_path.exists() {
+            eprintln!("Skipping: locomo10.json not found at {:?}", locomo_path);
+            return;
+        }
+
+        let samples = load_locomo(&locomo_path).expect("failed to load LoCoMo dataset");
+        eprintln!("Loaded {} conversations", samples.len());
+
+        let search_limit = 10;
+
+        // Accumulators across all conversations and QA pairs
+        let mut origin_tokens_all: Vec<usize> = Vec::new();
+        let mut naive_tokens_all: Vec<usize> = Vec::new();
+        let mut corpus_tokens_all: Vec<usize> = Vec::new();
+        let mut total_questions = 0usize;
+        let mut total_observations = 0usize;
+
+        for (conv_idx, sample) in samples.iter().enumerate() {
+            let memories = extract_observations(sample);
+            let obs_count = memories.len();
+            total_observations += obs_count;
+
+            // Compute corpus tokens for this conversation (all observations concatenated)
+            let corpus_text: String = memories
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let conv_corpus_tokens = count_tokens(&corpus_text);
+
+            eprintln!(
+                "Conversation {}/{} ({}): {} observations, {} corpus tokens — seeding...",
+                conv_idx + 1,
+                samples.len(),
+                sample.sample_id,
+                obs_count,
+                conv_corpus_tokens,
+            );
+
+            // Create ephemeral DB and seed all observations
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter))
+                .await
+                .expect("MemoryDB::new");
+
+            let docs: Vec<RawDocument> = memories
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect();
+            db.upsert_documents(docs).await.expect("upsert_documents");
+
+            // Evaluate each non-adversarial QA pair
+            let mut conv_questions = 0usize;
+            let mut conv_origin_sum = 0usize;
+            let mut conv_naive_sum = 0usize;
+
+            for qa in &sample.qa {
+                if qa.category == 5 {
+                    continue; // skip adversarial
+                }
+
+                // Origin hybrid search
+                let origin_results = db
+                    .search_memory(
+                        &qa.question,
+                        search_limit,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("search_memory");
+                let origin_ctx_tokens = count_results_tokens(&origin_results);
+
+                // Naive vector search
+                let naive_results = db
+                    .naive_vector_search(&qa.question, search_limit, None)
+                    .await
+                    .expect("naive_vector_search");
+                let naive_ctx_tokens = count_results_tokens(&naive_results);
+
+                origin_tokens_all.push(origin_ctx_tokens);
+                naive_tokens_all.push(naive_ctx_tokens);
+                corpus_tokens_all.push(conv_corpus_tokens);
+
+                conv_questions += 1;
+                conv_origin_sum += origin_ctx_tokens;
+                conv_naive_sum += naive_ctx_tokens;
+            }
+
+            total_questions += conv_questions;
+
+            if conv_questions > 0 {
+                let conv_origin_mean = conv_origin_sum as f64 / conv_questions as f64;
+                let conv_naive_mean = conv_naive_sum as f64 / conv_questions as f64;
+                let conv_origin_pct = if conv_corpus_tokens > 0 {
+                    (1.0 - conv_origin_mean / conv_corpus_tokens as f64) * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  {} QA pairs | Origin: {:.0} tok/q ({:.1}% savings) | Naive: {:.0} tok/q | Corpus: {} tok",
+                    conv_questions,
+                    conv_origin_mean,
+                    conv_origin_pct,
+                    conv_naive_mean,
+                    conv_corpus_tokens,
+                );
+            }
+        }
+
+        // Global aggregates
+        let n = total_questions as f64;
+        let mean_origin = origin_tokens_all.iter().sum::<usize>() as f64 / n;
+        let mean_naive = naive_tokens_all.iter().sum::<usize>() as f64 / n;
+        let mean_corpus = corpus_tokens_all.iter().sum::<usize>() as f64 / n;
+
+        let origin_savings = (1.0 - mean_origin / mean_corpus) * 100.0;
+        let naive_savings = (1.0 - mean_naive / mean_corpus) * 100.0;
+
+        let origin_compression = mean_origin / mean_corpus;
+        let naive_compression = mean_naive / mean_corpus;
+
+        eprintln!("\n========================================");
+        eprintln!("LoCoMo Token Efficiency Results");
+        eprintln!("========================================");
+        eprintln!("Conversations:     {}", samples.len());
+        eprintln!("Total observations: {}", total_observations);
+        eprintln!("Total QA pairs:    {}", total_questions);
+        eprintln!("Search limit:      {}", search_limit);
+        eprintln!("Tokenizer:         cl100k_base");
+        eprintln!("----------------------------------------");
+        eprintln!("                   Tokens/Query  Compression  Savings");
+        eprintln!(
+            "Full Replay        {:>10.1}  {:>11.4}  {:>7.1}%",
+            mean_corpus, 1.0, 0.0
+        );
+        eprintln!(
+            "Origin (hybrid)    {:>10.1}  {:>11.4}  {:>7.1}%",
+            mean_origin, origin_compression, origin_savings
+        );
+        eprintln!(
+            "Naive RAG (vector) {:>10.1}  {:>11.4}  {:>7.1}%",
+            mean_naive, naive_compression, naive_savings
+        );
+        eprintln!("----------------------------------------");
+        eprintln!(
+            "Headline: Origin saves {:.1}% tokens vs Full Replay ({:.0} vs {:.0} tokens/query)",
+            origin_savings, mean_origin, mean_corpus,
+        );
+        eprintln!(
+            "          Naive RAG saves {:.1}% tokens vs Full Replay ({:.0} vs {:.0} tokens/query)",
+            naive_savings, mean_naive, mean_corpus,
+        );
+        eprintln!("========================================");
+    }
 }
