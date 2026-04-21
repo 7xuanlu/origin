@@ -270,7 +270,7 @@ impl QualityCostReport {
     }
 }
 
-// ===== Native Memory Baseline Types =====
+// ===== Native Memory Augmentation Types =====
 
 /// Token cost model for a native AI memory platform.
 ///
@@ -290,39 +290,58 @@ pub struct NativeMemoryBaseline {
     pub mechanism: String,
 }
 
-/// Comparison report: Origin vs native memory systems.
+/// One alternative scenario for recalling specific information (without Origin).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NativeMemoryComparisonReport {
-    /// Origin's token cost per query (mean across fixture cases).
-    pub origin_tokens_per_query: f64,
-    /// Native baselines for comparison.
-    pub baselines: Vec<NativeMemoryBaseline>,
-    /// Per-baseline savings.
-    pub comparisons: Vec<NativeMemoryComparison>,
-    /// Multi-turn comparison (10 turns).
-    pub multi_turn_10: MultiTurnNativeComparison,
+pub struct RecallAlternative {
+    /// Machine-readable identifier.
+    pub scenario: String,
+    /// Additional tokens needed on top of native memory per recall event.
+    pub tokens_per_recall: usize,
+    /// Human-readable description.
+    pub description: String,
 }
 
-/// Origin vs a single native platform.
+/// Multi-turn augmentation comparison: native-only vs native+Origin vs native+full-replay.
+///
+/// Models a 10-turn session where a fraction of turns need specific recall.
+/// Native memory is a constant cost already paid; Origin adds a small overhead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NativeMemoryComparison {
-    pub platform: String,
-    pub native_tokens_per_turn: usize,
-    pub origin_tokens_per_turn: f64,
-    pub savings_pct: f64,
-    /// Qualitative description of the retrieval quality difference.
-    pub quality_advantage: String,
-}
-
-/// Multi-turn cumulative token comparison (fixed number of turns).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MultiTurnNativeComparison {
+pub struct MultiTurnAugmentationComparison {
+    /// Total turns in the session.
     pub turns: usize,
-    pub origin_total: f64,
-    pub claude_code_total: usize,
-    pub chatgpt_total: usize,
-    pub claude_ai_total: usize,
+    /// Turns where specific recall is needed (not every turn requires it).
+    pub recall_turns: usize,
+    /// Native-only total: native_per_turn * turns (no specific recall capability).
+    pub native_only_total: usize,
+    /// Native + Origin: native_per_turn * turns + origin_retrieval * recall_turns.
+    pub native_plus_origin_total: usize,
+    /// Native + full replay: native_per_turn * turns + full_replay_tokens * recall_turns.
+    pub native_plus_replay_total: usize,
+    /// Origin's additional cost as a percentage of the native-only baseline.
+    pub origin_overhead_pct: f64,
 }
+
+/// Augmentation report: what Origin ADDS on top of native memory.
+///
+/// Origin does not replace native memory — users pay for native memory regardless.
+/// This report answers: "What does adding Origin cost, and what do you get?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeMemoryAugmentationReport {
+    /// What Origin adds per query on top of native memory (mean across fixture cases).
+    pub origin_retrieval_tokens: f64,
+    /// Native baselines for reference (cost already paid by the user).
+    pub baselines: Vec<NativeMemoryBaseline>,
+    /// Alternative costs when the user needs specific recall without Origin.
+    pub alternatives: Vec<RecallAlternative>,
+    /// Multi-turn comparison: native-only vs native+Origin vs native+full-replay.
+    pub multi_turn: MultiTurnAugmentationComparison,
+    /// Honest framing note explaining the augmentation model.
+    pub framing_note: String,
+}
+
+// Keep the old name as a type alias so any external callers don't break immediately.
+#[deprecated(since = "0.0.0", note = "Use NativeMemoryAugmentationReport instead")]
+pub type NativeMemoryComparisonReport = NativeMemoryAugmentationReport;
 
 // ===== Runner =====
 
@@ -732,27 +751,27 @@ pub async fn run_multi_turn_eval(
     })
 }
 
-/// Compare Origin's retrieval-based memory against native platform memory injection.
+/// Measure what Origin adds on top of native memory (augmentation framing).
 ///
-/// Runs Origin search against fixtures to get actual mean tokens/query, then compares
-/// against known fixed-overhead native memory systems.
+/// Users already pay for native memory (Claude Code's CLAUDE.md, ChatGPT's memory facts,
+/// etc.) regardless of whether they use Origin. Origin does not replace that cost.
+/// The real question is: "What does Origin cost on top, and what does it provide?"
 ///
-/// Note: the comparison is inherently apples-to-oranges. Native memory is always-on
-/// general context injected every turn regardless of relevance. Origin retrieves only
-/// what is relevant to the specific query. The `quality_advantage` field on each
-/// comparison entry describes this distinction honestly.
+/// This function runs Origin search against fixtures to get actual mean tokens/query,
+/// then models alternative recall costs and multi-turn overhead.
 ///
 /// Native platform token estimates are researched estimates as of April 2026, sourced
 /// from public documentation, model cards, and community measurements. They are not
 /// measurements from those platforms' APIs.
-pub async fn run_native_memory_comparison(
+pub async fn run_native_memory_augmentation(
     fixture_dir: &Path,
     limit: usize,
-) -> Result<NativeMemoryComparisonReport, OriginError> {
-    // Step 1: run Origin against fixtures to get actual mean tokens/query.
+) -> Result<NativeMemoryAugmentationReport, OriginError> {
+    // Step 1: run Origin against fixtures to get actual mean retrieval tokens/query.
     let cases = load_fixtures(fixture_dir)?;
     let confidence_cfg = ConfidenceConfig::default();
     let mut origin_token_samples: Vec<usize> = Vec::new();
+    let mut full_replay_samples: Vec<usize> = Vec::new();
 
     for case in &cases {
         if case.empty_set || case.seeds.is_empty() {
@@ -760,7 +779,7 @@ pub async fn run_native_memory_comparison(
         }
 
         let case_tmp = tempfile::tempdir()
-            .map_err(|e| OriginError::Generic(format!("tempdir for native comparison: {}", e)))?;
+            .map_err(|e| OriginError::Generic(format!("tempdir for augmentation eval: {}", e)))?;
         let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
 
         let all_docs: Vec<RawDocument> = case
@@ -785,12 +804,27 @@ pub async fn run_native_memory_comparison(
             .await?;
 
         origin_token_samples.push(count_results_tokens(&results));
+
+        // Full replay: entire corpus concatenated
+        let corpus_text: String = case
+            .seeds
+            .iter()
+            .chain(case.negative_seeds.iter())
+            .map(|s| s.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        full_replay_samples.push(count_tokens(&corpus_text));
     }
 
-    let origin_tokens_per_query = if origin_token_samples.is_empty() {
+    let origin_retrieval_tokens = if origin_token_samples.is_empty() {
         0.0
     } else {
         origin_token_samples.iter().sum::<usize>() as f64 / origin_token_samples.len() as f64
+    };
+    let mean_full_replay_tokens = if full_replay_samples.is_empty() {
+        0
+    } else {
+        full_replay_samples.iter().sum::<usize>() / full_replay_samples.len()
     };
 
     // Step 2: define native baselines with researched token costs (April 2026 estimates).
@@ -807,83 +841,107 @@ pub async fn run_native_memory_comparison(
             platform: "Claude Code".to_string(),
             memory_tokens_per_turn: 11_300,
             growth_model: "unbounded".to_string(),
-            mechanism: "dumps full CLAUDE.md every turn regardless of query relevance".to_string(),
+            mechanism: "full CLAUDE.md injected every turn; grows with project knowledge".to_string(),
         },
         NativeMemoryBaseline {
             platform: "ChatGPT".to_string(),
             memory_tokens_per_turn: 3_050,
             growth_model: "capped".to_string(),
-            mechanism: "injects all saved facts every turn; capped at ~200 entries".to_string(),
+            mechanism: "all saved facts injected every turn; capped at ~200 entries".to_string(),
         },
         NativeMemoryBaseline {
             platform: "Claude.ai".to_string(),
             memory_tokens_per_turn: 2_000,
             growth_model: "synthesized".to_string(),
-            mechanism: "synthesized summary, not query-specific; auto-pruned".to_string(),
+            mechanism: "synthesized summary injected every turn; auto-pruned to fit context".to_string(),
         },
     ];
 
-    // Step 3: compute per-baseline savings.
-    let quality_advantages = [
-        "dumps full CLAUDE.md every turn regardless of query relevance",
-        "injects all saved facts every turn; capped at ~200 entries",
-        "synthesized summary, not query-specific; auto-pruned",
+    // Step 3: define alternative recall scenarios.
+    // These are what a user pays ADDITIONALLY when they need specific information
+    // that native memory doesn't capture (e.g., a decision made 3 sessions ago).
+    let alternatives = vec![
+        RecallAlternative {
+            scenario: "no_recall".to_string(),
+            tokens_per_recall: 0,
+            description: "Skip it — information is lost; model proceeds without context".to_string(),
+        },
+        RecallAlternative {
+            scenario: "manual_reexplain".to_string(),
+            tokens_per_recall: 800,
+            description: "User re-types the context manually (~800 tokens of explanation)".to_string(),
+        },
+        RecallAlternative {
+            scenario: "paste_full_history".to_string(),
+            tokens_per_recall: mean_full_replay_tokens,
+            description: format!(
+                "Paste the full conversation history (~{} tokens, measured from fixtures)",
+                mean_full_replay_tokens
+            ),
+        },
+        RecallAlternative {
+            scenario: "origin_retrieval".to_string(),
+            tokens_per_recall: origin_retrieval_tokens.round() as usize,
+            description: format!(
+                "Origin finds relevant context automatically (~{} tokens, measured from fixtures)",
+                origin_retrieval_tokens.round() as usize
+            ),
+        },
     ];
 
-    let comparisons: Vec<NativeMemoryComparison> = baselines
-        .iter()
-        .zip(quality_advantages.iter())
-        .map(|(baseline, quality_adv)| {
-            let native = baseline.memory_tokens_per_turn as f64;
-            let savings_pct = if native > 0.0 {
-                (native - origin_tokens_per_query) / native * 100.0
-            } else {
-                0.0
-            };
-            NativeMemoryComparison {
-                platform: baseline.platform.clone(),
-                native_tokens_per_turn: baseline.memory_tokens_per_turn,
-                origin_tokens_per_turn: origin_tokens_per_query,
-                savings_pct,
-                quality_advantage: quality_adv.to_string(),
-            }
-        })
-        .collect();
-
-    // Step 4: compute 10-turn totals.
-    // Native platforms inject the same overhead every turn (always-on).
-    // Origin retrieves fresh relevant context each turn (constant per-query cost).
+    // Step 4: model 10-turn session overhead.
+    // Use Claude Code (11,300 tokens/turn) as the reference — most Origin users are Claude Code users.
+    // Assume 60% of turns need specific recall (realistic for coding sessions).
     let turns = 10usize;
-    let claude_code = baselines
-        .iter()
-        .find(|b| b.platform == "Claude Code")
-        .map(|b| b.memory_tokens_per_turn)
-        .unwrap_or(0);
-    let chatgpt = baselines
-        .iter()
-        .find(|b| b.platform == "ChatGPT")
-        .map(|b| b.memory_tokens_per_turn)
-        .unwrap_or(0);
-    let claude_ai = baselines
-        .iter()
-        .find(|b| b.platform == "Claude.ai")
-        .map(|b| b.memory_tokens_per_turn)
-        .unwrap_or(0);
+    let recall_turns = 6usize; // 60% of turns
+    let native_per_turn = 11_300usize; // Claude Code reference
 
-    let multi_turn_10 = MultiTurnNativeComparison {
-        turns,
-        origin_total: origin_tokens_per_query * turns as f64,
-        claude_code_total: claude_code * turns,
-        chatgpt_total: chatgpt * turns,
-        claude_ai_total: claude_ai * turns,
+    let native_only_total = native_per_turn * turns;
+    let native_plus_origin_total =
+        native_per_turn * turns + (origin_retrieval_tokens.round() as usize) * recall_turns;
+    let native_plus_replay_total =
+        native_per_turn * turns + mean_full_replay_tokens * recall_turns;
+    let origin_overhead_pct = if native_only_total > 0 {
+        (native_plus_origin_total.saturating_sub(native_only_total)) as f64
+            / native_only_total as f64
+            * 100.0
+    } else {
+        0.0
     };
 
-    Ok(NativeMemoryComparisonReport {
-        origin_tokens_per_query,
+    let multi_turn = MultiTurnAugmentationComparison {
+        turns,
+        recall_turns,
+        native_only_total,
+        native_plus_origin_total,
+        native_plus_replay_total,
+        origin_overhead_pct,
+    };
+
+    let framing_note =
+        "Native memory (CLAUDE.md, ChatGPT facts, Claude.ai summaries) is a fixed cost users \
+         already pay. Origin does not replace it — it augments it. The question is not \
+         'Origin vs native' but 'what does adding Origin cost, and what do you get in return?'"
+            .to_string();
+
+    Ok(NativeMemoryAugmentationReport {
+        origin_retrieval_tokens,
         baselines,
-        comparisons,
-        multi_turn_10,
+        alternatives,
+        multi_turn,
+        framing_note,
     })
+}
+
+/// Deprecated alias for [`run_native_memory_augmentation`].
+///
+/// Kept for backward compatibility. Prefer the new name which reflects the honest framing.
+#[deprecated(since = "0.0.0", note = "Use run_native_memory_augmentation instead")]
+pub async fn run_native_memory_comparison(
+    fixture_dir: &Path,
+    limit: usize,
+) -> Result<NativeMemoryAugmentationReport, OriginError> {
+    run_native_memory_augmentation(fixture_dir, limit).await
 }
 
 /// Count total tokens across a slice of SearchResults (content field only).
@@ -2063,47 +2121,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_native_memory_comparison() {
+    async fn test_native_memory_augmentation() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent().unwrap()
             .parent().unwrap()
             .join("app/eval/fixtures");
         if !fixture_dir.exists() {
-            eprintln!("Skipping test_native_memory_comparison: fixture dir not found at {:?}", fixture_dir);
+            eprintln!("Skipping test_native_memory_augmentation: fixture dir not found at {:?}", fixture_dir);
             return;
         }
 
-        let report = run_native_memory_comparison(&fixture_dir, 10).await.unwrap();
+        let report = run_native_memory_augmentation(&fixture_dir, 10).await.unwrap();
 
+        // Structural assertions
         assert!(!report.baselines.is_empty());
-        assert!(!report.comparisons.is_empty());
+        assert!(!report.alternatives.is_empty());
+        assert!(report.origin_retrieval_tokens > 0.0,
+            "Origin should retrieve some tokens from fixtures");
 
-        // Origin should use fewer tokens than all native platforms
-        for comp in &report.comparisons {
-            assert!(comp.savings_pct > 0.0,
-                "Origin should save vs {} but got {:.1}%", comp.platform, comp.savings_pct);
+        // The multi-turn model should show that Origin adds minimal overhead
+        let mt = &report.multi_turn;
+        assert!(mt.native_plus_origin_total >= mt.native_only_total,
+            "Origin is additive — total must be >= native-only");
+        assert!(mt.native_plus_replay_total >= mt.native_plus_origin_total,
+            "Full replay should cost more than Origin retrieval");
+        assert!(mt.origin_overhead_pct < 5.0,
+            "Origin overhead should be under 5% on a 10-turn Claude Code session, got {:.2}%",
+            mt.origin_overhead_pct);
+
+        // Origin retrieval should be cheaper than full replay per recall event
+        let origin_per_recall = report.alternatives.iter()
+            .find(|a| a.scenario == "origin_retrieval")
+            .map(|a| a.tokens_per_recall)
+            .unwrap_or(0);
+        let replay_per_recall = report.alternatives.iter()
+            .find(|a| a.scenario == "paste_full_history")
+            .map(|a| a.tokens_per_recall)
+            .unwrap_or(0);
+        assert!(origin_per_recall < replay_per_recall,
+            "Origin retrieval ({} tokens) should be cheaper than full replay ({} tokens)",
+            origin_per_recall, replay_per_recall);
+
+        // Print augmentation framing
+        eprintln!("\n=== Origin: Cost of Better Recall ===\n");
+        eprintln!("When you need specific information from past sessions:\n");
+        eprintln!("{:<28} | {:<19} | {}",
+            "Alternative", "Additional tokens", "Quality");
+        eprintln!("{:-<28}-+-{:-<19}-+-{:-<50}", "", "", "");
+        for alt in &report.alternatives {
+            eprintln!("{:<28} | {:<19} | {}",
+                alt.scenario, alt.tokens_per_recall, alt.description);
         }
 
-        // Print comparison
-        eprintln!("\n=== Origin vs Native Memory Systems ===");
-        eprintln!("Origin: {:.0} tokens/query (retrieval-based, query-relevant)\n", report.origin_tokens_per_query);
-        eprintln!("{:<15} | {:<12} | {:<10} | {}", "Platform", "Tokens/turn", "Savings", "Mechanism");
-        eprintln!("{:-<15}-+-{:-<12}-+-{:-<10}-+-{:-<30}", "", "", "", "");
-        for comp in &report.comparisons {
-            eprintln!("{:<15} | {:<12} | {:<10.1}% | {}",
-                comp.platform, comp.native_tokens_per_turn, comp.savings_pct, comp.quality_advantage);
+        eprintln!("\nOver a {}-turn Claude Code session ({} turns need recall):",
+            mt.turns, mt.recall_turns);
+        eprintln!("  Without Origin: {:>7} tokens (native memory only, no specific recall)",
+            mt.native_only_total);
+        eprintln!("  With Origin:    {:>7} tokens (+{:.1}% overhead, full specific recall)",
+            mt.native_plus_origin_total, mt.origin_overhead_pct);
+        eprintln!("  Full history:   {:>7} tokens (every recall pastes entire history)",
+            mt.native_plus_replay_total);
+
+        eprintln!("\nOrigin adds {:.1}% token overhead to give you automatic, precise recall.",
+            mt.origin_overhead_pct);
+
+        eprintln!("\nNative memory baselines (already paid, constant per turn):");
+        for b in &report.baselines {
+            eprintln!("  {:<12} {:>6} tokens/turn  [{}]  {}",
+                b.platform, b.memory_tokens_per_turn, b.growth_model, b.mechanism);
         }
-        eprintln!("\n=== 10-Turn Session Total ===");
-        eprintln!("Origin:      {:.0} tokens", report.multi_turn_10.origin_total);
-        eprintln!("Claude Code: {} tokens ({:.0}x more)",
-            report.multi_turn_10.claude_code_total,
-            report.multi_turn_10.claude_code_total as f64 / report.multi_turn_10.origin_total);
-        eprintln!("ChatGPT:     {} tokens ({:.0}x more)",
-            report.multi_turn_10.chatgpt_total,
-            report.multi_turn_10.chatgpt_total as f64 / report.multi_turn_10.origin_total);
-        eprintln!("Claude.ai:   {} tokens ({:.0}x more)",
-            report.multi_turn_10.claude_ai_total,
-            report.multi_turn_10.claude_ai_total as f64 / report.multi_turn_10.origin_total);
     }
 
     /// Real-LLM pipeline token eval — runs actual distillation via Qwen3-4B and measures
