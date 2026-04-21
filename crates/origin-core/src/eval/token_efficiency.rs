@@ -1326,6 +1326,213 @@ pub async fn run_pipeline_token_eval_simulated(
     })
 }
 
+// ===== Quality at Scale Types =====
+
+/// Quality-at-scale data point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityAtScalePoint {
+    /// Number of memories stored.
+    pub memory_count: usize,
+    /// Origin's measured retrieval quality (NDCG@10).
+    pub origin_ndcg: f64,
+    /// Origin's token cost per query.
+    pub origin_tokens: f64,
+    /// Native approach: all memories injected (tokens = total corpus).
+    pub native_tokens: f64,
+    /// Native approach: estimated effective quality (degrades with scale due to "lost in middle").
+    pub native_effective_quality: f64,
+    /// Origin's quality-per-token ratio.
+    pub origin_quality_per_1k_tokens: f64,
+    /// Native's quality-per-token ratio.
+    pub native_quality_per_1k_tokens: f64,
+}
+
+/// Full quality-at-scale report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityAtScaleReport {
+    pub points: Vec<QualityAtScalePoint>,
+    /// The crossover point: at what memory count does Origin's approach become clearly better?
+    pub crossover_memory_count: Option<usize>,
+    pub methodology_note: String,
+}
+
+// ===== Quality at Scale Runner =====
+
+/// Model the "lost in the middle" quality degradation for naive all-inject approaches.
+///
+/// Based on Liu et al., 2023 "Lost in the Middle: How Language Models Use Long Contexts".
+/// LLMs reliably use information at the start and end of a context window, but struggle
+/// with content positioned in the middle of long inputs.
+///
+/// At small counts (<=10 facts) the LLM can attend to everything. As N grows the relevant
+/// fact is increasingly likely to be buried, and effective retrieval quality degrades.
+/// The floor of 0.3 reflects that even with very large contexts the model retains some
+/// ability to locate key facts when explicitly prompted.
+fn native_quality_at_scale(memory_count: usize) -> f64 {
+    if memory_count <= 10 {
+        return 0.95;
+    }
+    // Logarithmic decay: 0.95 * (1 - 0.12 * ln(N/10))
+    let decay = 0.12 * (memory_count as f64 / 10.0).ln();
+    (0.95 * (1.0 - decay)).max(0.3)
+}
+
+/// Measure how recall quality and token cost compare as memory count grows.
+///
+/// At each corpus size: measures Origin's actual NDCG and tokens (via search),
+/// and models native memory's quality degradation (lost-in-the-middle effect).
+///
+/// For each size in `sizes`:
+/// 1. Takes the first N seeds across all non-empty fixture cases.
+/// 2. Seeds an ephemeral DB and runs Origin's hybrid search.
+/// 3. Measures Origin NDCG@10 and token cost from the retrieved results.
+/// 4. Computes native_tokens as the full corpus token count (all-inject).
+/// 5. Applies the lost-in-the-middle degradation model for native effective quality.
+/// 6. Reports quality-per-1k-tokens for both and finds the crossover point.
+pub async fn run_quality_at_scale_eval(
+    fixture_dir: &Path,
+    sizes: &[usize],
+    limit: usize,
+) -> Result<QualityAtScaleReport, OriginError> {
+    let cases = load_fixtures(fixture_dir)?;
+    if cases.is_empty() {
+        return Ok(QualityAtScaleReport {
+            points: Vec::new(),
+            crossover_memory_count: None,
+            methodology_note: "No fixture cases found.".to_string(),
+        });
+    }
+
+    let confidence_cfg = ConfidenceConfig::default();
+    let mut points: Vec<QualityAtScalePoint> = Vec::with_capacity(sizes.len());
+
+    for &size in sizes {
+        let mut origin_tokens_sum: f64 = 0.0;
+        let mut origin_ndcg_sum: f64 = 0.0;
+        let mut native_tokens_sum: f64 = 0.0;
+        let mut case_count: f64 = 0.0;
+
+        for case in &cases {
+            if case.empty_set {
+                continue;
+            }
+
+            // Collect seeds (positive first, then negative) and take first `size`.
+            let all_seeds: Vec<&crate::eval::fixtures::SeedMemory> = case
+                .seeds
+                .iter()
+                .chain(case.negative_seeds.iter())
+                .collect();
+            let subset: Vec<&crate::eval::fixtures::SeedMemory> =
+                all_seeds.into_iter().take(size).collect();
+            if subset.is_empty() {
+                continue;
+            }
+
+            // Seed ephemeral DB
+            let case_tmp = tempfile::tempdir()
+                .map_err(|e| OriginError::Generic(format!("tmpdir quality_at_scale: {e}")))?;
+            let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+
+            let docs: Vec<RawDocument> = subset
+                .iter()
+                .map(|s| crate::eval::runner::seed_to_doc(s, &confidence_cfg))
+                .collect();
+            db.upsert_documents(docs).await?;
+
+            // Build grading map from the positive seeds present in this subset
+            let subset_ids: std::collections::HashSet<&str> =
+                subset.iter().map(|s| s.id.as_str()).collect();
+            let grades: HashMap<&str, u8> = case
+                .seeds
+                .iter()
+                .filter(|s| subset_ids.contains(s.id.as_str()))
+                .map(|s| (s.id.as_str(), s.relevance))
+                .collect();
+
+            // Origin: hybrid search
+            let results = db
+                .search_memory(
+                    &case.query,
+                    limit,
+                    None,
+                    case.domain.as_deref(),
+                    None,
+                    Some(1.0), // neutralize confirmation boost — fixture bias
+                    Some(1.0), // neutralize recap penalty — fixture bias
+                    None,
+                )
+                .await?;
+
+            let origin_tok = count_results_tokens(&results) as f64;
+            let ranked: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
+            let ndcg = metrics::ndcg_at_k(&ranked, &grades, 10);
+
+            // Native: all-inject — corpus token count
+            let native_content: String = subset
+                .iter()
+                .map(|s| s.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let native_tok = count_tokens(&native_content) as f64;
+
+            origin_tokens_sum += origin_tok;
+            origin_ndcg_sum += ndcg;
+            native_tokens_sum += native_tok;
+            case_count += 1.0;
+        }
+
+        if case_count == 0.0 {
+            continue;
+        }
+
+        let origin_tokens = origin_tokens_sum / case_count;
+        let origin_ndcg = origin_ndcg_sum / case_count;
+        let native_tokens = native_tokens_sum / case_count;
+        let native_effective_quality = native_quality_at_scale(size);
+
+        // Quality-per-1k-tokens: guard against zero tokens
+        let origin_quality_per_1k_tokens = if origin_tokens > 0.0 {
+            origin_ndcg / (origin_tokens / 1000.0)
+        } else {
+            0.0
+        };
+        let native_quality_per_1k_tokens = if native_tokens > 0.0 {
+            native_effective_quality / (native_tokens / 1000.0)
+        } else {
+            0.0
+        };
+
+        points.push(QualityAtScalePoint {
+            memory_count: size,
+            origin_ndcg,
+            origin_tokens,
+            native_tokens,
+            native_effective_quality,
+            origin_quality_per_1k_tokens,
+            native_quality_per_1k_tokens,
+        });
+    }
+
+    // Crossover: first point where Origin's quality-per-1k-tokens exceeds native's.
+    let crossover_memory_count = points
+        .iter()
+        .find(|p| p.origin_quality_per_1k_tokens > p.native_quality_per_1k_tokens)
+        .map(|p| p.memory_count);
+
+    let methodology_note = "Native quality estimated using lost-in-the-middle degradation model \
+        (Liu et al., 2023). At ≤10 facts native quality ≈ 0.95; degrades logarithmically \
+        thereafter (floor 0.30). Origin quality is measured directly via NDCG@10 on fixture \
+        cases. Token counts use cl100k_base tokenizer."
+        .to_string();
+
+    Ok(QualityAtScaleReport {
+        points,
+        crossover_memory_count,
+        methodology_note,
+    })
+}
+
 /// Run scaling evaluation: same queries at increasing corpus sizes.
 ///
 /// For each size, seeds only the first N memories from each case, then runs
@@ -2387,5 +2594,60 @@ mod tests {
             !distilled_results.is_empty() || raw_results.is_empty(),
             "should return results if raw stage had results"
         );
+    }
+
+    #[tokio::test]
+    async fn test_quality_at_scale() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()
+            .parent().unwrap()
+            .join("app/eval/fixtures");
+        if !fixture_dir.exists() {
+            eprintln!("Skipping test_quality_at_scale: fixture dir not found");
+            return;
+        }
+
+        let sizes = vec![5, 10, 20, 40, 80];
+        let report = run_quality_at_scale_eval(&fixture_dir, &sizes, 10).await.unwrap();
+
+        assert!(!report.points.is_empty());
+
+        eprintln!("\n=== Quality at Scale: Origin vs Native Memory ===");
+        eprintln!("{:<10} | {:<12} | {:<12} | {:<12} | {:<12} | {:<12} | {:<12}",
+            "Memories", "Origin NDCG", "Native NDCG*", "Origin Tok", "Native Tok", "Origin Q/kT", "Native Q/kT");
+        eprintln!("{:-<10}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}",
+            "", "", "", "", "", "", "");
+        for p in &report.points {
+            eprintln!("{:<10} | {:<12.3} | {:<12.3} | {:<12.0} | {:<12.0} | {:<12.3} | {:<12.3}",
+                p.memory_count, p.origin_ndcg, p.native_effective_quality,
+                p.origin_tokens, p.native_tokens,
+                p.origin_quality_per_1k_tokens, p.native_quality_per_1k_tokens);
+        }
+        if let Some(cross) = report.crossover_memory_count {
+            eprintln!("\nCrossover at {} memories: Origin becomes more efficient per token", cross);
+        } else {
+            eprintln!("\nNo crossover observed in measured range");
+        }
+        eprintln!("\n* Native quality estimated using lost-in-the-middle degradation model (Liu et al., 2023)");
+        eprintln!("  {}", report.methodology_note);
+    }
+
+    #[test]
+    fn test_native_quality_at_scale_model() {
+        // At 10 or fewer memories quality should be 0.95
+        assert_eq!(native_quality_at_scale(10), 0.95);
+        assert_eq!(native_quality_at_scale(1), 0.95);
+
+        // Quality should degrade monotonically as count grows
+        let q20 = native_quality_at_scale(20);
+        let q50 = native_quality_at_scale(50);
+        let q100 = native_quality_at_scale(100);
+        let q500 = native_quality_at_scale(500);
+        assert!(q20 < 0.95, "q20={q20} should be below 0.95");
+        assert!(q50 < q20, "should degrade: q50={q50} < q20={q20}");
+        assert!(q100 < q50, "should degrade: q100={q100} < q50={q50}");
+        assert!(q500 < q100, "should degrade: q500={q500} < q100={q100}");
+        // Floor at 0.30
+        assert!(native_quality_at_scale(10_000) >= 0.30);
     }
 }
