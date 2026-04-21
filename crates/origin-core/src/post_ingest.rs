@@ -41,10 +41,14 @@ pub async fn run_post_ingest_enrichment(
 ) -> Result<(), OriginError> {
     log::info!("[post_ingest] enriching {source_id}");
 
-    // 1. Dedup check
+    // 1. Dedup check (safety net — topic matching handles most cases pre-batcher;
+    //    this fires only when a duplicate slips through)
     match check_dedup(db, source_id, content, tuning).await {
         Ok(n) if n > 0 => {
-            log::info!("[post_ingest] {source_id}: {n} duplicate candidate(s) queued")
+            log::warn!(
+                "[post_ingest] dedup safety net fired for {source_id}: {n} duplicate candidate(s) queued. \
+                 This suggests a gap in topic matching or novelty gate."
+            )
         }
         Ok(_) => {}
         Err(e) => log::warn!("[post_ingest] dedup check failed: {e}"),
