@@ -107,10 +107,15 @@ pub struct StrategyReport {
     pub strategy: String,
     pub mean_context_tokens: f64,
     pub median_context_tokens: f64,
+    pub p25_context_tokens: f64,
+    pub p75_context_tokens: f64,
+    pub stddev_context_tokens: f64,
     pub mean_compression_ratio: f64,
     pub ndcg_at_10: f64,
     pub mrr: f64,
     pub recall_at_5: f64,
+    pub stddev_ndcg: f64,
+    pub stddev_mrr: f64,
 }
 
 /// Top-line token-efficiency comparison: Origin vs FullReplay.
@@ -155,7 +160,8 @@ impl QualityCostReport {
         out.push_str(&format!("Timestamp: {}\n", self.timestamp));
         out.push_str(&format!("Tokenizer: {}\n\n", self.tokenizer));
 
-        let col_widths = (16usize, 10usize, 8usize, 10usize, 13usize, 13usize);
+        // Column widths: Strategy, NDCG@10±σ, MRR±σ, Recall@5, Tokens±σ, Compression
+        let col_widths = (16usize, 14usize, 12usize, 10usize, 16usize, 13usize);
         out.push_str(&format!(
             "{:<w0$}  {:>w1$}  {:>w2$}  {:>w3$}  {:>w4$}  {:>w5$}\n",
             "Strategy",
@@ -177,13 +183,16 @@ impl QualityCostReport {
         out.push('\n');
 
         for s in &self.strategies {
+            let ndcg_str = format!("{:.4}±{:.4}", s.ndcg_at_10, s.stddev_ndcg);
+            let mrr_str = format!("{:.4}±{:.4}", s.mrr, s.stddev_mrr);
+            let tok_str = format!("{:.1}±{:.1}", s.mean_context_tokens, s.stddev_context_tokens);
             out.push_str(&format!(
-                "{:<w0$}  {:>w1$.4}  {:>w2$.4}  {:>w3$.4}  {:>w4$.1}  {:>w5$.4}\n",
+                "{:<w0$}  {:>w1$}  {:>w2$}  {:>w3$.4}  {:>w4$}  {:>w5$.4}\n",
                 s.strategy,
-                s.ndcg_at_10,
-                s.mrr,
+                ndcg_str,
+                mrr_str,
                 s.recall_at_5,
-                s.mean_context_tokens,
+                tok_str,
                 s.mean_compression_ratio,
                 w0 = col_widths.0,
                 w1 = col_widths.1,
@@ -382,30 +391,74 @@ pub async fn run_quality_cost_eval(
         let n = ctx_vec.len().max(1) as f64;
 
         let mean_ctx = ctx_vec.iter().sum::<usize>() as f64 / n;
-        let median_ctx = {
+        let (median_ctx, p25_ctx, p75_ctx) = {
             let mut sorted = ctx_vec.clone();
             sorted.sort_unstable();
             if sorted.is_empty() {
-                0.0
-            } else if sorted.len() % 2 == 0 {
-                (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) as f64 / 2.0
+                (0.0, 0.0, 0.0)
             } else {
-                sorted[sorted.len() / 2] as f64
+                let len = sorted.len();
+                let median = if len % 2 == 0 {
+                    (sorted[len / 2 - 1] + sorted[len / 2]) as f64 / 2.0
+                } else {
+                    sorted[len / 2] as f64
+                };
+                let p25 = sorted[(len as f64 * 0.25) as usize] as f64;
+                let p75 = sorted[((len as f64 * 0.75) as usize).min(len - 1)] as f64;
+                (median, p25, p75)
             }
+        };
+        let stddev_ctx = {
+            let variance = ctx_vec
+                .iter()
+                .map(|&x| {
+                    let diff = x as f64 - mean_ctx;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / n;
+            variance.sqrt()
         };
         let mean_comp = comp_vec.iter().sum::<f64>() / n;
         let mean_ndcg = ndcg_vec.iter().sum::<f64>() / n;
         let mean_mrr = mrr_vec.iter().sum::<f64>() / n;
         let mean_r5 = r5_vec.iter().sum::<f64>() / n;
+        let stddev_ndcg = {
+            let variance = ndcg_vec
+                .iter()
+                .map(|&x| {
+                    let diff = x - mean_ndcg;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / n;
+            variance.sqrt()
+        };
+        let stddev_mrr = {
+            let variance = mrr_vec
+                .iter()
+                .map(|&x| {
+                    let diff = x - mean_mrr;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / n;
+            variance.sqrt()
+        };
 
         strategy_reports.push(StrategyReport {
             strategy: strategy.name().to_string(),
             mean_context_tokens: mean_ctx,
             median_context_tokens: median_ctx,
+            p25_context_tokens: p25_ctx,
+            p75_context_tokens: p75_ctx,
+            stddev_context_tokens: stddev_ctx,
             mean_compression_ratio: mean_comp,
             ndcg_at_10: mean_ndcg,
             mrr: mean_mrr,
             recall_at_5: mean_r5,
+            stddev_ndcg,
+            stddev_mrr,
         });
     }
 
@@ -723,19 +776,29 @@ mod tests {
                     strategy: "origin".to_string(),
                     mean_context_tokens: 120.5,
                     median_context_tokens: 100.0,
+                    p25_context_tokens: 0.0,
+                    p75_context_tokens: 0.0,
+                    stddev_context_tokens: 0.0,
                     mean_compression_ratio: 0.12,
                     ndcg_at_10: 0.82,
                     mrr: 0.75,
                     recall_at_5: 0.68,
+                    stddev_ndcg: 0.0,
+                    stddev_mrr: 0.0,
                 },
                 StrategyReport {
                     strategy: "full_replay".to_string(),
                     mean_context_tokens: 1000.0,
                     median_context_tokens: 950.0,
+                    p25_context_tokens: 0.0,
+                    p75_context_tokens: 0.0,
+                    stddev_context_tokens: 0.0,
                     mean_compression_ratio: 1.0,
                     ndcg_at_10: 1.0,
                     mrr: 1.0,
                     recall_at_5: 1.0,
+                    stddev_ndcg: 0.0,
+                    stddev_mrr: 0.0,
                 },
             ],
             headline: HeadlineMetrics {
@@ -806,10 +869,15 @@ mod tests {
                 strategy: "origin".to_string(),
                 mean_context_tokens: 42.0,
                 median_context_tokens: 40.0,
+                p25_context_tokens: 0.0,
+                p75_context_tokens: 0.0,
+                stddev_context_tokens: 0.0,
                 mean_compression_ratio: 0.05,
                 ndcg_at_10: 0.9,
                 mrr: 0.88,
                 recall_at_5: 0.77,
+                stddev_ndcg: 0.0,
+                stddev_mrr: 0.0,
             }],
             headline: HeadlineMetrics {
                 savings_pct: 95.0,
