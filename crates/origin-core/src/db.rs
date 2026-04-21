@@ -12769,6 +12769,234 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Update a memory's content in-place for topic-key upsert.
+    ///
+    /// Workflow:
+    /// 1. Reads existing row metadata (outside transaction, outside lock).
+    /// 2. Computes new embedding (sync, CPU-bound, outside lock).
+    /// 3. Inside a single transaction: deletes all chunks for source_id, re-inserts
+    ///    one chunk with new content + embedding + incremented version + changelog.
+    ///
+    /// Preserves: title, source, source_id, memory_type, domain, entity_id, confirmed,
+    /// stability, quality, structured_fields, created_at, and all other metadata.
+    /// Updates: content, embedding, version, changelog, last_modified, word_count.
+    pub async fn upsert_memory_in_place(
+        &self,
+        source_id: &str,
+        new_content: &str,
+        source_agent: Option<&str>,
+        incoming_source_id: Option<&str>,
+        changelog_cap: usize,
+    ) -> Result<(), OriginError> {
+        // ---- Step 1: read existing row metadata (need lock briefly) ----
+        struct SavedMeta {
+            source: String,
+            title: String,
+            summary: Option<String>,
+            url: Option<String>,
+            chunk_type: String,
+            language: Option<String>,
+            memory_type: Option<String>,
+            domain: Option<String>,
+            confidence: Option<f64>,
+            confirmed: i64,
+            stability: String,
+            entity_id: Option<String>,
+            enrichment_status: String,
+            quality: Option<String>,
+            is_recap: i64,
+            structured_fields: Option<String>,
+            retrieval_cue: Option<String>,
+            source_text: Option<String>,
+            created_at: i64,
+            version: i64,
+            changelog: String,
+        }
+
+        let saved = {
+            let conn = self.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT source, title, summary, url, chunk_type, language,
+                            memory_type, domain, confidence, confirmed, stability,
+                            entity_id, enrichment_status, quality, is_recap,
+                            structured_fields, retrieval_cue, source_text,
+                            COALESCE(created_at, last_modified),
+                            COALESCE(version, 1), COALESCE(changelog, '[]')
+                     FROM memories
+                     WHERE source_id = ?1 AND chunk_index = 0
+                     LIMIT 1",
+                    libsql::params![source_id],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("upsert_in_place read: {e}")))?;
+
+            let row = rows
+                .next()
+                .await
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?
+                .ok_or_else(|| {
+                    OriginError::VectorDb(format!(
+                        "upsert_memory_in_place: source_id {source_id} not found"
+                    ))
+                })?;
+
+            SavedMeta {
+                source: row.get::<String>(0).unwrap_or_else(|_| "memory".to_string()),
+                title: row.get::<String>(1).unwrap_or_default(),
+                summary: row.get::<Option<String>>(2).unwrap_or(None),
+                url: row.get::<Option<String>>(3).unwrap_or(None),
+                chunk_type: row.get::<String>(4).unwrap_or_else(|_| "prose".to_string()),
+                language: row.get::<Option<String>>(5).unwrap_or(None),
+                memory_type: row.get::<Option<String>>(6).unwrap_or(None),
+                domain: row.get::<Option<String>>(7).unwrap_or(None),
+                confidence: row.get::<Option<f64>>(8).unwrap_or(None),
+                confirmed: row.get::<i64>(9).unwrap_or(0),
+                stability: row
+                    .get::<String>(10)
+                    .unwrap_or_else(|_| "new".to_string()),
+                entity_id: row.get::<Option<String>>(11).unwrap_or(None),
+                enrichment_status: row
+                    .get::<String>(12)
+                    .unwrap_or_else(|_| "enriched".to_string()),
+                quality: row.get::<Option<String>>(13).unwrap_or(None),
+                is_recap: row.get::<i64>(14).unwrap_or(0),
+                structured_fields: row.get::<Option<String>>(15).unwrap_or(None),
+                retrieval_cue: row.get::<Option<String>>(16).unwrap_or(None),
+                source_text: row.get::<Option<String>>(17).unwrap_or(None),
+                created_at: row.get::<i64>(18).unwrap_or_else(|_| {
+                    chrono::Utc::now().timestamp()
+                }),
+                version: row.get::<i64>(19).unwrap_or(1),
+                changelog: row.get::<String>(20).unwrap_or_else(|_| "[]".to_string()),
+            }
+        };
+
+        // ---- Step 2: compute new embedding (CPU-bound, outside DB lock) ----
+        let embeddings = self.generate_embeddings(&[new_content.to_string()])?;
+        let embedding = embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| OriginError::Embedding("empty embeddings result".to_string()))?;
+        let vec_sql = Self::vec_to_sql(&embedding);
+
+        // ---- Step 3: build new changelog entry and version ----
+        let now_ts = chrono::Utc::now().timestamp();
+        let new_version = saved.version + 1;
+        let entry = serde_json::json!({
+            "version": new_version,
+            "at": now_ts,
+            "delta": "",   // placeholder — async LLM can fill this later
+            "source_agent": source_agent,
+            "incoming_source_id": incoming_source_id,
+        });
+        let mut changelog: Vec<serde_json::Value> =
+            serde_json::from_str(&saved.changelog).unwrap_or_default();
+        changelog.push(entry);
+        while changelog.len() > changelog_cap {
+            changelog.remove(0);
+        }
+        let changelog_json = serde_json::to_string(&changelog)
+            .map_err(|e| OriginError::VectorDb(format!("serialize changelog: {e}")))?;
+
+        // Recount words for the new content
+        let new_word_count = new_content.split_whitespace().count() as i64;
+
+        // Generate a fresh chunk id (old id is deleted; avoids PK edge-cases during replay)
+        let new_chunk_id = format!(
+            "mem_{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .replace('-', "")
+                .chars()
+                .take(12)
+                .collect::<String>()
+        );
+
+        // ---- Step 4: transaction — delete old chunks, insert new chunk ----
+        {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("upsert_in_place BEGIN: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM memories WHERE source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("upsert_in_place DELETE: {e}")))?;
+
+            let insert_sql = format!(
+                "INSERT INTO memories (
+                    id, content, source, source_id, title, summary, url,
+                    chunk_index, last_modified, chunk_type, language, byte_start, byte_end,
+                    semantic_unit, memory_type, domain, source_agent, confidence, confirmed,
+                    stability, supersedes, pending_revision, word_count,
+                    entity_id, enrichment_status, quality, is_recap, supersede_mode,
+                    structured_fields, retrieval_cue, source_text,
+                    embedding, created_at, version, changelog
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    0, ?8, ?9, ?10, NULL, NULL,
+                    NULL, ?11, ?12, ?13, ?14, ?15,
+                    ?16, NULL, 0, ?17,
+                    ?18, ?19, ?20, ?21, 'hide',
+                    ?22, ?23, ?24,
+                    vector32(?25), ?26, ?27, ?28
+                )"
+            );
+
+            conn.execute(
+                &insert_sql,
+                libsql::params![
+                    new_chunk_id,
+                    new_content,
+                    saved.source,
+                    source_id,
+                    saved.title,
+                    saved.summary,
+                    saved.url,
+                    now_ts,
+                    saved.chunk_type,
+                    saved.language,
+                    saved.memory_type,
+                    saved.domain,
+                    source_agent,
+                    saved.confidence,
+                    saved.confirmed,
+                    saved.stability,
+                    new_word_count,
+                    saved.entity_id,
+                    saved.enrichment_status,
+                    saved.quality,
+                    saved.is_recap,
+                    saved.structured_fields,
+                    saved.retrieval_cue,
+                    saved.source_text,
+                    vec_sql,
+                    saved.created_at,
+                    new_version,
+                    changelog_json
+                ],
+            )
+            .await
+            .map_err(|e| {
+                OriginError::VectorDb(format!("upsert_in_place INSERT: {e}"))
+            })?;
+
+            conn.execute("COMMIT", ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("upsert_in_place COMMIT: {e}")))?;
+        }
+
+        log::info!(
+            "[db] upsert_memory_in_place: source_id={source_id} v{} → v{new_version}",
+            saved.version
+        );
+        Ok(())
+    }
+
     // ===== Source Sync State Methods =====
 
     /// Insert or update sync state for a file tracked by a knowledge source.
