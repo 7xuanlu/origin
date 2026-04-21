@@ -148,6 +148,36 @@ pub struct ScalingPoint {
     pub replay_tokens: f64,
 }
 
+/// Per-turn token counts in a multi-turn session simulation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiTurnPoint {
+    /// 1-based turn number.
+    pub turn: usize,
+    /// Origin tokens used this turn (fresh retrieval).
+    pub origin_tokens: usize,
+    /// Replay tokens used this turn (corpus + accumulated history).
+    pub replay_tokens: usize,
+    /// Cumulative Origin tokens up to and including this turn.
+    pub cumulative_origin: usize,
+    /// Cumulative Replay tokens up to and including this turn.
+    pub cumulative_replay: usize,
+}
+
+/// Report from a multi-turn token accumulation simulation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiTurnReport {
+    /// Number of turns simulated.
+    pub turns: usize,
+    /// Per-turn breakdown.
+    pub per_turn: Vec<MultiTurnPoint>,
+    /// Total Origin tokens across all turns.
+    pub total_origin_tokens: usize,
+    /// Total Replay tokens across all turns.
+    pub total_replay_tokens: usize,
+    /// Percentage savings: (replay - origin) / replay * 100.
+    pub savings_pct: f64,
+}
+
 /// Full quality-cost evaluation report, serializable to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityCostReport {
@@ -533,6 +563,121 @@ pub async fn run_quality_cost_eval(
     })
 }
 
+/// Simulate multi-turn token accumulation.
+///
+/// Seeds a DB with fixture memories, then simulates N turns of an agent session.
+/// Each turn runs an Origin search (constant cost) vs full replay (accumulating cost).
+/// The `response_overhead` parameter estimates tokens per LLM response that accumulate
+/// in the without-Origin conversation history.
+///
+/// Picks the fixture case with the most seeds (positive + negative) for the most
+/// realistic numbers. Uses multiple fixture queries (rotating) if available.
+pub async fn run_multi_turn_eval(
+    fixture_dir: &Path,
+    turns: usize,
+    limit: usize,
+    response_overhead: usize,
+) -> Result<MultiTurnReport, OriginError> {
+    let cases = load_fixtures(fixture_dir)?;
+
+    // Pick the non-empty case with the most seeds for the most realistic numbers.
+    let best_case = cases
+        .iter()
+        .filter(|c| !c.empty_set && !c.seeds.is_empty())
+        .max_by_key(|c| c.seeds.len() + c.negative_seeds.len())
+        .ok_or_else(|| OriginError::Generic("no non-empty fixture cases found".to_string()))?;
+
+    // Collect all non-empty cases to rotate queries across turns (more realistic).
+    let query_cases: Vec<&crate::eval::fixtures::EvalCase> = cases
+        .iter()
+        .filter(|c| !c.empty_set && !c.seeds.is_empty())
+        .collect();
+
+    // Compute corpus tokens from the selected case.
+    let corpus_text: String = best_case
+        .seeds
+        .iter()
+        .chain(best_case.negative_seeds.iter())
+        .map(|s| s.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let corpus_tokens = count_tokens(&corpus_text);
+
+    // Seed an ephemeral DB with the best case's memories.
+    let confidence_cfg = crate::tuning::ConfidenceConfig::default();
+    let case_tmp = tempfile::tempdir()
+        .map_err(|e| OriginError::Generic(format!("tempdir for multi-turn eval: {}", e)))?;
+    let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+
+    let all_docs: Vec<RawDocument> = best_case
+        .seeds
+        .iter()
+        .chain(best_case.negative_seeds.iter())
+        .map(|seed| crate::eval::runner::seed_to_doc(seed, &confidence_cfg))
+        .collect();
+    db.upsert_documents(all_docs).await?;
+
+    // Simulate N turns.
+    let mut per_turn: Vec<MultiTurnPoint> = Vec::with_capacity(turns);
+    let mut cumulative_origin = 0usize;
+    let mut cumulative_replay = 0usize;
+
+    for turn in 1..=turns {
+        // Rotate through available queries for variety across turns.
+        let query_case = query_cases[(turn - 1) % query_cases.len()];
+        let query = &query_case.query;
+
+        // Origin: fresh retrieval each turn — constant cost.
+        let results = db
+            .search_memory(
+                query,
+                limit,
+                None,
+                best_case.domain.as_deref(),
+                None,
+                Some(1.0), // neutralize confirmation boost
+                Some(1.0), // neutralize recap penalty
+                None,
+            )
+            .await?;
+        let origin_tokens = count_results_tokens(&results);
+
+        // Replay: full corpus + accumulated conversation history.
+        // Turn 1: corpus_tokens (no prior history yet)
+        // Turn N: corpus_tokens + (N-1) * response_overhead
+        let replay_tokens = corpus_tokens + (turn - 1) * response_overhead;
+
+        cumulative_origin += origin_tokens;
+        cumulative_replay += replay_tokens;
+
+        per_turn.push(MultiTurnPoint {
+            turn,
+            origin_tokens,
+            replay_tokens,
+            cumulative_origin,
+            cumulative_replay,
+        });
+    }
+
+    let total_origin_tokens = cumulative_origin;
+    let total_replay_tokens = cumulative_replay;
+    let savings_pct = if total_replay_tokens > 0 {
+        (total_replay_tokens.saturating_sub(total_origin_tokens)) as f64
+            / total_replay_tokens as f64
+            * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(MultiTurnReport {
+        turns,
+        per_turn,
+        total_origin_tokens,
+        total_replay_tokens,
+        savings_pct,
+    })
+}
+
 /// Count total tokens across a slice of SearchResults (content field only).
 fn count_results_tokens(results: &[crate::db::SearchResult]) -> usize {
     results.iter().map(|r| count_tokens(&r.content)).sum()
@@ -866,6 +1011,73 @@ mod tests {
         assert!(
             output.contains("87.9") || output.contains("88.0"),
             "should show savings_pct"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_turn_eval() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()
+            .parent().unwrap()
+            .join("app/eval/fixtures");
+        if !fixture_dir.exists() {
+            eprintln!("Skipping test_multi_turn_eval: fixture dir not found at {:?}", fixture_dir);
+            return;
+        }
+
+        let report = run_multi_turn_eval(&fixture_dir, 10, 10, 200).await.unwrap();
+
+        assert_eq!(report.turns, 10);
+        assert_eq!(report.per_turn.len(), 10);
+
+        // Origin total should be MUCH less than replay total
+        assert!(
+            report.total_origin_tokens < report.total_replay_tokens,
+            "Origin {} should be < Replay {}",
+            report.total_origin_tokens, report.total_replay_tokens
+        );
+
+        // Replay should grow each turn (each turn adds response_overhead)
+        for i in 1..report.per_turn.len() {
+            assert!(
+                report.per_turn[i].replay_tokens >= report.per_turn[i - 1].replay_tokens,
+                "Replay should grow turn-over-turn: turn {} ({}) < turn {} ({})",
+                i + 1, report.per_turn[i].replay_tokens,
+                i, report.per_turn[i - 1].replay_tokens
+            );
+        }
+
+        // Origin should stay roughly constant (allow up to 50% drift due to query rotation)
+        let first = report.per_turn[0].origin_tokens;
+        let last = report.per_turn.last().unwrap().origin_tokens;
+        if first > 0 {
+            let drift = (last as f64 - first as f64).abs() / first as f64;
+            assert!(
+                drift < 0.5,
+                "Origin should stay roughly constant, drift={:.1}%",
+                drift * 100.0
+            );
+        }
+
+        // Print results
+        eprintln!("\n=== Multi-Turn Token Accumulation ({} turns) ===", report.turns);
+        eprintln!(
+            "{:<6} | {:<15} | {:<15} | {:<15} | {:<15}",
+            "Turn", "Origin/turn", "Replay/turn", "Origin cumul", "Replay cumul"
+        );
+        eprintln!(
+            "{:-<6}-+-{:-<15}-+-{:-<15}-+-{:-<15}-+-{:-<15}",
+            "", "", "", "", ""
+        );
+        for p in &report.per_turn {
+            eprintln!(
+                "{:<6} | {:<15} | {:<15} | {:<15} | {:<15}",
+                p.turn, p.origin_tokens, p.replay_tokens, p.cumulative_origin, p.cumulative_replay
+            );
+        }
+        eprintln!(
+            "\nTotal: Origin={}, Replay={}, Savings={:.1}%",
+            report.total_origin_tokens, report.total_replay_tokens, report.savings_pct
         );
     }
 
