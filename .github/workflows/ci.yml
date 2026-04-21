@@ -33,10 +33,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cache FastEmbed model
+        id: fastembed-cache
         uses: actions/cache@v4
         with:
           path: ~/.fastembed_cache
-          key: fastembed-bge-base-en-v15-q
+          key: fastembed-bge-base-en-v15-q-v1
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4

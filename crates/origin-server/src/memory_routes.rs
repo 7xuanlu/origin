@@ -3180,7 +3180,6 @@ mod search_agent_attribution_tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires FastEmbed model cache
     async fn search_with_x_agent_name_header_persists_attribution() {
         let (state, _tmp) = build_state_with_db().await;
         let app = crate::router::build_router(state);

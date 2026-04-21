@@ -1,12 +1,11 @@
 //! Integration test: eval harness runs against seeded DB with fixture data.
 //!
-//! All tests require the FastEmbed model cache and are meant to run locally,
-//! not on CI. Mark every test `#[ignore]` and run with `--ignored` flag.
+//! Tests using bundled fixtures run in CI (FastEmbed model cached in GitHub Actions).
+//! Tests needing external data (locomo10.json, longmemeval) or real GPU LLM stay `#[ignore]`.
 
 use origin_lib::eval::runner::{run_eval, GateMode};
 
 #[tokio::test]
-#[ignore]
 async fn test_eval_harness_produces_report() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
     let tmp = tempfile::tempdir().unwrap();
@@ -34,7 +33,6 @@ async fn test_eval_harness_produces_report() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_eval_metrics_are_bounded() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
     let tmp = tempfile::tempdir().unwrap();
@@ -63,7 +61,6 @@ async fn test_eval_metrics_are_bounded() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_eval_baseline_comparison() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
     let tmp = tempfile::tempdir().unwrap();
@@ -98,7 +95,6 @@ async fn test_eval_baseline_comparison() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_eval_with_gate_filter() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
     let tmp = tempfile::tempdir().unwrap();
@@ -485,7 +481,6 @@ async fn test_longmemeval_gate_comparison() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
 async fn test_lifecycle_fixture_with_mock_llm() {
     use origin_lib::eval::lifecycle::{run_lifecycle_fixture, EvalMockLlm};
     use std::sync::Arc;
@@ -545,7 +540,6 @@ async fn test_lifecycle_fixture_with_mock_llm() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_lifecycle_fixture_no_llm() {
     use origin_lib::eval::lifecycle::run_lifecycle_fixture;
 
@@ -646,7 +640,6 @@ async fn test_lifecycle_longmemeval_with_mock_llm() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_eval_empty_set_and_temporal() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
     let tmp = tempfile::tempdir().unwrap();
@@ -858,7 +851,6 @@ async fn save_locomo_plus_baseline() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_lifecycle_pipeline_quality() {
     use origin_lib::eval::lifecycle::{run_lifecycle_fixture, EvalMockLlm};
     use std::sync::Arc;
@@ -903,7 +895,6 @@ async fn test_lifecycle_pipeline_quality() {
 /// accessible from integration tests, so we use `run_lifecycle_fixture` which invokes the full
 /// pipeline internally and exposes the ConceptRetrieval phase in the report.
 #[tokio::test]
-#[ignore]
 async fn test_concept_retrieval_eval() {
     use origin_lib::eval::lifecycle::{run_lifecycle_fixture, EvalMockLlm, LifecyclePhase};
     use std::sync::Arc;
@@ -966,7 +957,6 @@ async fn test_concept_retrieval_eval() {
 /// domain + case), then measures combined recall (search_memory ∪ concept source_ids) vs
 /// memory-only recall across every fixture query.
 #[tokio::test]
-#[ignore]
 async fn test_concept_before_after_comparison() {
     use origin_lib::eval::fixtures::load_fixtures;
     use origin_lib::eval::metrics;
