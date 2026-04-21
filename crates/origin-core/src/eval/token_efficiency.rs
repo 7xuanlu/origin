@@ -1971,6 +1971,309 @@ pub async fn run_memory_layer_comparison(
     })
 }
 
+// ===== Phase 2: End-to-End LLM Answer Evaluation =====
+
+/// End-to-end answer quality for one approach.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2EAnswerResult {
+    pub approach: String,
+    /// 0–1: fraction of relevant info captured in answer
+    pub mean_answer_score: f64,
+    /// tokens sent as context (measured via tiktoken)
+    pub mean_context_tokens: f64,
+    /// tokens in LLM response (from API usage field)
+    pub mean_answer_tokens: f64,
+    /// context + answer
+    pub mean_total_tokens: f64,
+    pub queries_evaluated: usize,
+}
+
+/// Full end-to-end evaluation report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2EEvalReport {
+    pub results: Vec<E2EAnswerResult>,
+    pub model: String,
+    pub methodology: String,
+}
+
+/// Score an LLM answer against relevant seeds using keyword overlap.
+///
+/// For each relevant seed, extracts key words (length > 4) and checks
+/// whether at least 30% of them appear in the answer. Score = fraction
+/// of relevant seeds whose key content appears in the answer.
+fn score_answer(answer: &str, relevant_seeds: &[&str]) -> f64 {
+    if relevant_seeds.is_empty() {
+        return 0.0;
+    }
+
+    let answer_lower = answer.to_lowercase();
+    let mut found = 0usize;
+
+    for seed_content in relevant_seeds {
+        let key_words: Vec<&str> = seed_content
+            .split_whitespace()
+            .filter(|w| w.len() > 4)
+            .collect();
+
+        if key_words.is_empty() {
+            continue;
+        }
+
+        let matches = key_words
+            .iter()
+            .filter(|w| answer_lower.contains(&w.to_lowercase() as &str))
+            .count();
+
+        if matches as f64 / key_words.len() as f64 >= 0.3 {
+            found += 1;
+        }
+    }
+
+    found as f64 / relevant_seeds.len() as f64
+}
+
+/// Call the Anthropic API and return (answer_text, input_tokens, output_tokens).
+/// Returns Err on API failure (caller should skip the case rather than panic).
+async fn call_llm_for_answer(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<(String, usize, usize), String> {
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 300,
+        "messages": [{"role": "user", "content": prompt}]
+    });
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("API error {status}: {text}"));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse error: {e}"))?;
+
+    let answer = json["content"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|block| block["text"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let input_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0) as usize;
+    let output_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0) as usize;
+
+    Ok((answer, input_tokens, output_tokens))
+}
+
+/// End-to-end answer evaluation: send context to LLM, judge answer quality.
+///
+/// Requires ANTHROPIC_API_KEY environment variable.
+///
+/// Tests three approaches:
+/// - FlatMarkdown: all seeds as markdown context
+/// - Origin: search results as context
+/// - NoContext: no context (LLM baseline)
+///
+/// For each case, composes a prompt with context + query, sends to Haiku,
+/// and scores the answer via keyword overlap against relevant seeds.
+///
+/// `limit` controls the search top-K; `max_cases` caps API calls for cost control
+/// (each case = 3 API calls, one per approach).
+pub async fn run_e2e_answer_eval(
+    fixture_dir: &Path,
+    limit: usize,
+    max_cases: usize,
+) -> Result<E2EEvalReport, OriginError> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| OriginError::Generic("ANTHROPIC_API_KEY not set".to_string()))?;
+
+    let model = "claude-haiku-4-5-20251001";
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("failed to build reqwest client: {e}")))?;
+
+    let cases = load_fixtures(fixture_dir)?;
+    let confidence_cfg = ConfidenceConfig::default();
+
+    // Per-approach accumulators: answer_score, context_tokens, answer_tokens
+    let approach_keys = ["flat_markdown", "origin", "no_context"];
+    let mut scores: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut ctx_tokens: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut ans_tokens: HashMap<&str, Vec<f64>> = HashMap::new();
+    for key in &approach_keys {
+        scores.insert(key, Vec::new());
+        ctx_tokens.insert(key, Vec::new());
+        ans_tokens.insert(key, Vec::new());
+    }
+
+    let mut cases_done = 0usize;
+
+    for case in &cases {
+        if cases_done >= max_cases {
+            break;
+        }
+        if case.empty_set || case.seeds.is_empty() {
+            continue;
+        }
+
+        // Gather relevant seeds (relevance >= 2) for judging
+        let relevant_seed_contents: Vec<&str> = case
+            .seeds
+            .iter()
+            .filter(|s| s.relevance >= 2)
+            .map(|s| s.content.as_str())
+            .collect();
+        if relevant_seed_contents.is_empty() {
+            continue;
+        }
+
+        let all_seeds: Vec<&crate::eval::fixtures::SeedMemory> = case
+            .seeds
+            .iter()
+            .chain(case.negative_seeds.iter())
+            .collect();
+
+        // ---- Build contexts for each approach ----
+
+        // FlatMarkdown: all seeds as numbered markdown sections
+        let flat_context = all_seeds
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("## Memory {}\n{}", i + 1, s.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // Origin: seed ephemeral DB, run hybrid search
+        let origin_context = {
+            let case_tmp = tempfile::tempdir()
+                .map_err(|e| OriginError::Generic(format!("tempdir e2e: {e}")))?;
+            let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+            let docs: Vec<RawDocument> = all_seeds
+                .iter()
+                .map(|seed| crate::eval::runner::seed_to_doc(seed, &confidence_cfg))
+                .collect();
+            db.upsert_documents(docs).await?;
+            let results = db
+                .search_memory(
+                    &case.query,
+                    limit,
+                    None,
+                    case.domain.as_deref(),
+                    None,
+                    Some(1.0),
+                    Some(1.0),
+                    None,
+                )
+                .await?;
+            results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| format!("## Result {}\n{}", i + 1, r.content))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        // ---- Send each approach to the LLM ----
+
+        let approaches: &[(&str, &str)] = &[
+            ("flat_markdown", &flat_context),
+            ("origin", &origin_context),
+            ("no_context", ""),
+        ];
+
+        for (approach_key, context) in approaches {
+            let prompt = if context.is_empty() {
+                format!(
+                    "Question: {}\n\nAnswer the question as best you can. Be specific and concise.",
+                    case.query
+                )
+            } else {
+                format!(
+                    "Context:\n{}\n\nQuestion: {}\n\nAnswer the question using only the context provided. Be specific and concise.",
+                    context, case.query
+                )
+            };
+
+            let ctx_tok_count = if context.is_empty() {
+                0usize
+            } else {
+                count_tokens(context)
+            };
+
+            // Rate limit between calls
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            match call_llm_for_answer(&client, &api_key, model, &prompt).await {
+                Ok((answer, _input_tok, output_tok)) => {
+                    let score = score_answer(&answer, &relevant_seed_contents);
+                    scores.get_mut(approach_key).unwrap().push(score);
+                    ctx_tokens
+                        .get_mut(approach_key)
+                        .unwrap()
+                        .push(ctx_tok_count as f64);
+                    ans_tokens
+                        .get_mut(approach_key)
+                        .unwrap()
+                        .push(output_tok as f64);
+                }
+                Err(e) => {
+                    log::warn!("[e2e_eval] case '{}' approach '{}' skipped: {}", case.query, approach_key, e);
+                }
+            }
+        }
+
+        cases_done += 1;
+    }
+
+    // Aggregate
+    let mut results: Vec<E2EAnswerResult> = Vec::new();
+    for key in &approach_keys {
+        let score_vec = &scores[key];
+        let ctx_vec = &ctx_tokens[key];
+        let ans_vec = &ans_tokens[key];
+        let n = score_vec.len().max(1) as f64;
+
+        let mean_score = score_vec.iter().sum::<f64>() / n;
+        let mean_ctx = ctx_vec.iter().sum::<f64>() / n;
+        let mean_ans = ans_vec.iter().sum::<f64>() / n;
+        let mean_total = mean_ctx + mean_ans;
+
+        results.push(E2EAnswerResult {
+            approach: key.to_string(),
+            mean_answer_score: mean_score,
+            mean_context_tokens: mean_ctx,
+            mean_answer_tokens: mean_ans,
+            mean_total_tokens: mean_total,
+            queries_evaluated: score_vec.len(),
+        });
+    }
+
+    Ok(E2EEvalReport {
+        results,
+        model: model.to_string(),
+        methodology: "Keyword overlap judge: answer scores 1 for a relevant seed when ≥30% of its \
+            key words (len>4) appear in the answer. Final score = fraction of relevant seeds \
+            matched. Context tokens counted via cl100k_base; answer tokens from API usage field."
+            .to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3089,5 +3392,123 @@ mod tests {
         }
         eprintln!("\nComplement: {}", report.complement_advantage);
         eprintln!("Methodology: {}", report.methodology);
+    }
+
+    // ---- score_answer unit tests ----
+
+    #[test]
+    fn test_score_answer_perfect_match() {
+        let answer = "The project uses SQLite as the database backend and Rust as the language.";
+        let seeds = &["SQLite database backend for storage", "Rust programming language for safety"];
+        let score = score_answer(answer, seeds);
+        assert!(score > 0.0, "answer clearly mentions both seeds, score should be positive");
+    }
+
+    #[test]
+    fn test_score_answer_no_match() {
+        let answer = "I do not know the answer to this question.";
+        let seeds = &["SQLite is used as the embedded relational database"];
+        let score = score_answer(answer, seeds);
+        // "sqlite" is > 4 chars and not in "i do not know the answer to this question"
+        assert_eq!(score, 0.0, "no key words match — should be 0.0");
+    }
+
+    #[test]
+    fn test_score_answer_empty_seeds() {
+        let answer = "some answer";
+        let score = score_answer(answer, &[]);
+        assert_eq!(score, 0.0, "empty relevant seeds should return 0.0");
+    }
+
+    #[test]
+    fn test_score_answer_partial_match() {
+        // Answer matches first seed but not second
+        let answer = "The architecture uses SQLite for storage with ACID transactions.";
+        let seeds = &[
+            "SQLite is used for ACID-compliant storage",
+            "Redis is used for caching and pub-sub messaging",
+        ];
+        let score = score_answer(answer, seeds);
+        // First seed: "sqlite" ✓, "used" (4 chars, skip), "acid-compliant" ✓, "storage" ✓ → matches
+        // Second seed: "redis", "used", "caching", "pub-sub", "messaging" — none appear → no match
+        assert!(
+            score > 0.0 && score < 1.0,
+            "partial match should be between 0 and 1, got {score}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires ANTHROPIC_API_KEY
+    async fn benchmark_e2e_answer_quality() {
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("Skipping: ANTHROPIC_API_KEY not set");
+                return;
+            }
+        };
+        // Set in env so run_e2e_answer_eval can pick it up
+        std::env::set_var("ANTHROPIC_API_KEY", &api_key);
+
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("app/eval/fixtures");
+        if !fixture_dir.exists() {
+            eprintln!("Skipping: fixture dir not found at {:?}", fixture_dir);
+            return;
+        }
+
+        let report = run_e2e_answer_eval(&fixture_dir, 10, 5)
+            .await
+            .expect("run_e2e_answer_eval failed");
+
+        assert!(!report.results.is_empty(), "should have results");
+        assert_eq!(report.model, "claude-haiku-4-5-20251001");
+
+        eprintln!("\n=== End-to-End Answer Quality ===");
+        eprintln!("Model: {}", report.model);
+        eprintln!(
+            "{:<20} | {:<12} | {:<12} | {:<12} | {}",
+            "Approach", "Answer Score", "Context Tok", "Answer Tok", "Queries"
+        );
+        eprintln!(
+            "{:-<20}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<8}",
+            "", "", "", "", ""
+        );
+        for r in &report.results {
+            eprintln!(
+                "{:<20} | {:<12.3} | {:<12.0} | {:<12.0} | {}",
+                r.approach,
+                r.mean_answer_score,
+                r.mean_context_tokens,
+                r.mean_answer_tokens,
+                r.queries_evaluated
+            );
+        }
+        eprintln!("\nMethodology: {}", report.methodology);
+
+        // Origin should score >= NoContext (it has relevant info; no-context relies on world knowledge only)
+        let origin = report.results.iter().find(|r| r.approach == "origin");
+        let no_ctx = report.results.iter().find(|r| r.approach == "no_context");
+        if let (Some(o), Some(n)) = (origin, no_ctx) {
+            // Soft check: Origin's answer score should not be worse than no-context minus a tolerance
+            assert!(
+                o.mean_answer_score >= n.mean_answer_score - 0.2,
+                "Origin answer score ({:.3}) was much worse than no-context ({:.3})",
+                o.mean_answer_score, n.mean_answer_score
+            );
+            // Origin should use fewer tokens than FlatMarkdown
+            let flat = report.results.iter().find(|r| r.approach == "flat_markdown");
+            if let Some(f) = flat {
+                assert!(
+                    o.mean_context_tokens <= f.mean_context_tokens,
+                    "Origin context ({:.0} tok) should be <= FlatMarkdown ({:.0} tok)",
+                    o.mean_context_tokens, f.mean_context_tokens
+                );
+            }
+        }
     }
 }
