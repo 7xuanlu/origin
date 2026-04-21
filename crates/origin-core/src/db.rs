@@ -3575,6 +3575,118 @@ impl MemoryDB {
                     .map_err(|e| OriginError::VectorDb(format!("migration 39 bump: {e}")))?;
                 log::info!("[migration] Migration 39 applied: archived ugly remnants + deduped identical titles");
             }
+
+            // Migration 40: topic-key upsert schema + concept_sources join table.
+            // Adds version/changelog columns to memories, staleness columns to concepts,
+            // and the concept_sources join table (with backfill from source_memory_ids JSON).
+            if version < 40 {
+                let conn = self.conn.lock().await;
+
+                // Add version + changelog to memories (topic-key upsert tracking)
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE memories ADD COLUMN version INTEGER DEFAULT 1",
+                        (),
+                    )
+                    .await;
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE memories ADD COLUMN changelog TEXT DEFAULT '[]'",
+                        (),
+                    )
+                    .await;
+
+                // Add staleness-tracking columns to concepts
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE concepts ADD COLUMN sources_updated_count INTEGER DEFAULT 0",
+                        (),
+                    )
+                    .await;
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE concepts ADD COLUMN stale_reason TEXT",
+                        (),
+                    )
+                    .await;
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE concepts ADD COLUMN user_edited INTEGER DEFAULT 0",
+                        (),
+                    )
+                    .await;
+
+                // Create concept_sources join table (replaces source_memory_ids JSON column)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS concept_sources (
+                        concept_id        TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+                        memory_source_id  TEXT NOT NULL,
+                        linked_at         INTEGER NOT NULL,
+                        link_reason       TEXT,
+                        PRIMARY KEY (concept_id, memory_source_id)
+                    )",
+                    (),
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 create concept_sources: {e}")))?;
+
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_concept_sources_memory ON concept_sources(memory_source_id)",
+                    (),
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 idx: {e}")))?;
+
+                // Backfill concept_sources from existing source_memory_ids JSON
+                {
+                    let mut rows = conn
+                        .query(
+                            "SELECT id, source_memory_ids, created_at FROM concepts WHERE source_memory_ids != '[]' AND source_memory_ids IS NOT NULL",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("migration 40 backfill query: {e}")))?;
+
+                    let mut backfill_rows: Vec<(String, String, String)> = Vec::new();
+                    while let Some(row) = rows
+                        .next()
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("migration 40 backfill next: {e}")))?
+                    {
+                        let concept_id: String = row
+                            .get(0)
+                            .map_err(|e| OriginError::VectorDb(format!("migration 40 backfill id: {e}")))?;
+                        let json_str: String = row
+                            .get(1)
+                            .unwrap_or_else(|_| "[]".to_string());
+                        let created_at_str: String = row
+                            .get(2)
+                            .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
+                        backfill_rows.push((concept_id, json_str, created_at_str));
+                    }
+
+                    for (concept_id, json_str, created_at_str) in backfill_rows {
+                        let linked_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                            .map(|dt| dt.timestamp())
+                            .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+                        let source_ids: Vec<String> =
+                            serde_json::from_str(&json_str).unwrap_or_default();
+                        for sid in &source_ids {
+                            let _ = conn
+                                .execute(
+                                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, 'backfill')",
+                                    libsql::params![concept_id.clone(), sid.clone(), linked_at],
+                                )
+                                .await;
+                        }
+                    }
+                }
+
+                conn.execute("PRAGMA user_version = 40", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 40 bump: {e}")))?;
+                log::info!("[migration] Migration 40 applied: topic-key upsert columns + concept_sources join table");
+            }
         }
 
         Ok(())
@@ -8828,7 +8940,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = 'active' ORDER BY created_at ASC LIMIT 1",
                 (),
             )
@@ -11946,7 +12058,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE id = ?1",
                 libsql::params![id],
             )
@@ -11967,7 +12079,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE entity_id = ?1 AND status = 'active' LIMIT 1",
                 libsql::params![entity_id],
             )
@@ -12018,7 +12130,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = ?1 ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3",
                 libsql::params![status, limit, offset],
             )
@@ -12042,7 +12154,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let (sql, params): (String, Vec<libsql::Value>) = if let Some(d) = domain {
             (
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = ?1 AND domain = ?2 ORDER BY last_modified DESC LIMIT ?3 OFFSET ?4".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
@@ -12053,7 +12165,7 @@ impl MemoryDB {
             )
         } else {
             (
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = ?1 ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
@@ -12119,6 +12231,7 @@ impl MemoryDB {
             .query(
                 "SELECT c.id, c.title, c.summary, c.content, c.entity_id, c.domain,
                         c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
+                        COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0),
                         vector_distance_cos(c.embedding, vector32(?1)) as dist
                  FROM concepts c
                  WHERE c.status = 'active' AND c.embedding IS NOT NULL
@@ -12133,7 +12246,7 @@ impl MemoryDB {
             .await
             .map_err(|e| OriginError::VectorDb(e.to_string()))?
         {
-            let dist: f64 = row.get(12).unwrap_or(1.0);
+            let dist: f64 = row.get(15).unwrap_or(1.0);
             let similarity = 1.0 - dist;
             if similarity >= similarity_threshold {
                 return Ok(Some(Self::row_to_concept(&row)?));
@@ -12341,7 +12454,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn.query(
             "SELECT c.id, c.title, c.summary, c.content, c.entity_id, c.domain,
-                    c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified
+                    c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
+                    COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0)
              FROM concepts c
              JOIN concepts_fts f ON c.rowid = f.rowid
              WHERE concepts_fts MATCH ?1 AND c.status = 'active'
@@ -12392,6 +12506,9 @@ impl MemoryDB {
             last_modified: row
                 .get::<String>(11)
                 .map_err(|e| OriginError::VectorDb(format!("concept last_modified: {e}")))?,
+            sources_updated_count: row.get::<i64>(12).unwrap_or(0),
+            stale_reason: row.get::<Option<String>>(13).unwrap_or(None),
+            user_edited: row.get::<i64>(14).unwrap_or(0) != 0,
         })
     }
 
