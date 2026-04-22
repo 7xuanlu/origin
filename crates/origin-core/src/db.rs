@@ -3585,43 +3585,45 @@ impl MemoryDB {
                         "
                         -- 1. Entity aliases table
                         CREATE TABLE IF NOT EXISTS entity_aliases (
-                            entity_id  TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-                            alias      TEXT NOT NULL,
-                            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                            PRIMARY KEY (entity_id, alias)
+                            alias_name TEXT NOT NULL,
+                            canonical_entity_id TEXT NOT NULL REFERENCES entities(id),
+                            created_at INTEGER NOT NULL,
+                            source TEXT DEFAULT 'auto'
                         );
-                        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_lower
-                            ON entity_aliases(entity_id, LOWER(alias));
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_alias_name ON entity_aliases(alias_name);
 
                         -- 2. Relation type vocabulary
                         CREATE TABLE IF NOT EXISTS relation_type_vocabulary (
-                            relation_type TEXT PRIMARY KEY,
-                            description   TEXT,
-                            bidirectional INTEGER NOT NULL DEFAULT 0
+                            canonical TEXT PRIMARY KEY,
+                            aliases TEXT,
+                            category TEXT,
+                            count INTEGER DEFAULT 0
                         );
-                        INSERT OR IGNORE INTO relation_type_vocabulary (relation_type, description, bidirectional) VALUES
-                            ('is_a',            'Subtype or category relationship', 0),
-                            ('part_of',         'Component/part to whole', 0),
-                            ('has_part',        'Whole to component/part', 0),
-                            ('related_to',      'General association', 1),
-                            ('uses',            'Entity uses or depends on another', 0),
-                            ('created_by',      'Entity was created by an agent or person', 0),
-                            ('located_in',      'Physical or logical location', 0),
-                            ('works_at',        'Person works at an organization', 0),
-                            ('knows',           'Person knows another person', 1),
-                            ('owns',            'Ownership relationship', 0),
-                            ('causes',          'Causal relationship', 0),
-                            ('contradicts',     'Mutually exclusive or opposing claims', 1),
-                            ('implements',      'Concrete implementation of an abstraction', 0),
-                            ('depends_on',      'Runtime or build-time dependency', 0),
-                            ('successor_of',    'Temporal or logical succession', 0),
-                            ('predecessor_of',  'Temporal or logical precedence', 0),
-                            ('associated_with', 'Loose contextual association', 1),
-                            ('member_of',       'Entity is a member of a group or collection', 0);
+
+                        -- Seed vocabulary (18 entries)
+                        INSERT OR IGNORE INTO relation_type_vocabulary (canonical, aliases, category, count) VALUES
+                            ('works_on', '[\"working_at\",\"works_at\",\"working_on\"]', 'professional', 0),
+                            ('leads', '[\"leading\",\"manages\",\"heads\"]', 'professional', 0),
+                            ('member_of', '[\"belongs_to\",\"part_of_team\"]', 'professional', 0),
+                            ('authored', '[\"wrote\",\"created_doc\"]', 'professional', 0),
+                            ('knows', '[\"familiar_with\",\"met\"]', 'personal', 0),
+                            ('located_in', '[\"lives_in\",\"based_in\"]', 'personal', 0),
+                            ('uses', '[\"utilizes\",\"leverages\",\"using\"]', 'technical', 0),
+                            ('depends_on', '[\"requires\",\"needs\"]', 'technical', 0),
+                            ('created', '[\"built\",\"made\",\"developed\"]', 'technical', 0),
+                            ('part_of', '[\"component_of\",\"subset_of\"]', 'structural', 0),
+                            ('prefers', '[\"favors\",\"likes\",\"chooses\"]', 'personal', 0),
+                            ('decided', '[\"chose\",\"selected\",\"committed_to\"]', 'personal', 0),
+                            ('learned_from', '[\"discovered_via\",\"taught_by\"]', 'personal', 0),
+                            ('contradicts', '[\"conflicts_with\",\"opposes\"]', 'structural', 0),
+                            ('replaced_by', '[\"superseded_by\",\"deprecated_by\"]', 'structural', 0),
+                            ('blocked_by', '[\"waiting_on\",\"stuck_on\"]', 'structural', 0),
+                            ('discussed_in', '[\"mentioned_in\",\"referenced_in\"]', 'structural', 0),
+                            ('related_to', '[\"associated_with\",\"connected_to\"]', 'structural', 0);
 
                         -- 3. New columns on relations
-                        ALTER TABLE relations ADD COLUMN confidence      REAL;
-                        ALTER TABLE relations ADD COLUMN explanation     TEXT;
+                        ALTER TABLE relations ADD COLUMN confidence REAL;
+                        ALTER TABLE relations ADD COLUMN explanation TEXT;
                         ALTER TABLE relations ADD COLUMN source_memory_id TEXT;
 
                         -- 4. New column on entities
@@ -3682,8 +3684,8 @@ impl MemoryDB {
 
         // Seed self-aliases for all existing entities (idempotent via INSERT OR IGNORE)
         conn.execute_batch(
-            "INSERT OR IGNORE INTO entity_aliases (entity_id, alias, created_at)
-             SELECT id, name, created_at FROM entities;",
+            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source)
+             SELECT LOWER(name), id, created_at, 'migration' FROM entities;",
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("migration 40 seed aliases: {e}")))?;
@@ -3762,7 +3764,7 @@ impl MemoryDB {
             for loser_id in &loser_ids {
                 // Redirect aliases from loser to winner
                 conn.execute(
-                    "UPDATE OR IGNORE entity_aliases SET entity_id = ?1 WHERE entity_id = ?2",
+                    "UPDATE OR IGNORE entity_aliases SET canonical_entity_id = ?1 WHERE canonical_entity_id = ?2",
                     libsql::params![winner_id.clone(), loser_id.clone()],
                 )
                 .await
@@ -19959,10 +19961,10 @@ pub(crate) mod tests {
         let (db, _dir) = test_db().await;
         let conn = db.conn.lock().await;
 
-        // 1. entity_aliases table exists
+        // 1. entity_aliases table exists with correct columns
         let _rows = conn
             .query(
-                "SELECT entity_id, alias, created_at FROM entity_aliases LIMIT 1",
+                "SELECT alias_name, canonical_entity_id, created_at, source FROM entity_aliases LIMIT 1",
                 (),
             )
             .await
