@@ -12997,8 +12997,7 @@ impl MemoryDB {
             .await
             .map_err(|e| OriginError::VectorDb(format!("upsert_in_place DELETE: {e}")))?;
 
-            let insert_sql = format!(
-                "INSERT INTO memories (
+            let insert_sql = "INSERT INTO memories (
                     id, content, source, source_id, title, summary, url,
                     chunk_index, last_modified, chunk_type, language, byte_start, byte_end,
                     semantic_unit, memory_type, domain, source_agent, confidence, confirmed,
@@ -13014,11 +13013,10 @@ impl MemoryDB {
                     ?18, ?19, ?20, ?21, 'hide',
                     ?22, ?23, ?24,
                     vector32(?25), ?26, ?27, ?28
-                )"
-            );
+                )";
 
             conn.execute(
-                &insert_sql,
+                insert_sql,
                 libsql::params![
                     new_chunk_id,
                     new_content,
@@ -20934,7 +20932,7 @@ pub(crate) mod tests {
         for i in 0..55 {
             let content = format!("Iteration {i} content for cap test.");
             let embedding = db
-                .generate_embeddings(&[content.clone()])
+                .generate_embeddings(std::slice::from_ref(&content))
                 .unwrap()
                 .into_iter()
                 .next()
