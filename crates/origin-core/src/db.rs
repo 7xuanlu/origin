@@ -20396,4 +20396,941 @@ pub(crate) mod tests {
             );
         }
     }
+
+    // ==================== Topic-key upsert feature tests ====================
+
+    // ---- link_concept_source + get_concept_sources ----
+
+    #[tokio::test]
+    async fn test_link_concept_source_idempotent() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Insert a concept and a memory to satisfy FK + existence expectations.
+        db.insert_concept("c1", "Concept One", None, "content", None, None, &[], &now)
+            .await
+            .unwrap();
+        let mem_doc = make_memory_doc(
+            "src1",
+            "Some content about topic.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![mem_doc]).await.unwrap();
+
+        // Link once.
+        db.link_concept_source("c1", "src1", "initial_link")
+            .await
+            .unwrap();
+        // Link again with the same (concept_id, memory_source_id) — idempotent INSERT OR IGNORE.
+        db.link_concept_source("c1", "src1", "duplicate_link")
+            .await
+            .unwrap();
+
+        let sources = db.get_concept_sources("c1").await.unwrap();
+        assert_eq!(
+            sources.len(),
+            1,
+            "idempotent insert should produce exactly 1 row"
+        );
+        assert_eq!(sources[0].concept_id, "c1");
+        assert_eq!(sources[0].memory_source_id, "src1");
+    }
+
+    #[tokio::test]
+    async fn test_get_concept_sources_ordered() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_ord",
+            "Ordering test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Insert two memories.
+        db.upsert_documents(vec![make_memory_doc(
+            "src_a",
+            "Alpha content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "src_b",
+            "Beta content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Manually insert with controlled linked_at values so order is deterministic.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!["c_ord", "src_b", 200i64, "later"],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!["c_ord", "src_a", 100i64, "earlier"],
+            )
+            .await
+            .unwrap();
+        }
+
+        let sources = db.get_concept_sources("c_ord").await.unwrap();
+        assert_eq!(sources.len(), 2);
+        // Should be ordered by linked_at ASC: src_a first, src_b second.
+        assert_eq!(sources[0].memory_source_id, "src_a");
+        assert_eq!(sources[1].memory_source_id, "src_b");
+    }
+
+    // ---- get_concepts_for_memory ----
+
+    #[tokio::test]
+    async fn test_get_concepts_for_memory_reverse_lookup() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_rev",
+            "Reverse lookup content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        db.insert_concept(
+            "concept_x",
+            "Concept X",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.insert_concept(
+            "concept_y",
+            "Concept Y",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Link the same memory to both concepts.
+        db.link_concept_source("concept_x", "mem_rev", "reason_x")
+            .await
+            .unwrap();
+        db.link_concept_source("concept_y", "mem_rev", "reason_y")
+            .await
+            .unwrap();
+
+        let concepts = db.get_concepts_for_memory("mem_rev").await.unwrap();
+        assert_eq!(concepts.len(), 2, "memory should be linked to 2 concepts");
+
+        let ids: Vec<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"concept_x"), "concept_x should be in result");
+        assert!(ids.contains(&"concept_y"), "concept_y should be in result");
+    }
+
+    #[tokio::test]
+    async fn test_get_concepts_for_memory_excludes_archived() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_arc",
+            "Archived concept test",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        db.insert_concept(
+            "c_active",
+            "Active concept",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.insert_concept(
+            "c_archived",
+            "Archived concept",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_archived").await.unwrap();
+
+        db.link_concept_source("c_active", "mem_arc", "r")
+            .await
+            .unwrap();
+        db.link_concept_source("c_archived", "mem_arc", "r")
+            .await
+            .unwrap();
+
+        let concepts = db.get_concepts_for_memory("mem_arc").await.unwrap();
+        // Only active concepts should be returned.
+        assert_eq!(concepts.len(), 1);
+        assert_eq!(concepts[0].id, "c_active");
+    }
+
+    // ---- cleanup_orphaned_concept_sources ----
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_concept_sources() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_clean",
+            "Cleanup test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Insert a memory, link it, then delete it directly.
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_ghost",
+            "Ghost memory",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.link_concept_source("c_clean", "mem_ghost", "reason")
+            .await
+            .unwrap();
+
+        // Delete the memory directly to simulate an orphan.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM memories WHERE source_id = 'mem_ghost'", ())
+                .await
+                .unwrap();
+        }
+
+        // Confirm orphan exists.
+        let sources_before = db.get_concept_sources("c_clean").await.unwrap();
+        assert_eq!(
+            sources_before.len(),
+            1,
+            "orphan row should be present before cleanup"
+        );
+
+        let removed = db.cleanup_orphaned_concept_sources().await.unwrap();
+        assert_eq!(removed, 1, "should remove exactly 1 orphaned row");
+
+        let sources_after = db.get_concept_sources("c_clean").await.unwrap();
+        assert_eq!(
+            sources_after.len(),
+            0,
+            "orphan row should be gone after cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_concept_sources_keeps_valid() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_keep",
+            "Keep test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_valid",
+            "Valid memory",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.link_concept_source("c_keep", "mem_valid", "reason")
+            .await
+            .unwrap();
+
+        let removed = db.cleanup_orphaned_concept_sources().await.unwrap();
+        assert_eq!(
+            removed, 0,
+            "no orphans should be removed when all memories exist"
+        );
+
+        let sources = db.get_concept_sources("c_keep").await.unwrap();
+        assert_eq!(sources.len(), 1, "valid row should be intact");
+    }
+
+    // ---- topic_match_candidates ----
+
+    #[tokio::test]
+    async fn test_topic_match_candidates_filters() {
+        let (db, _dir) = test_db().await;
+
+        // Insert memories with different domain/type combinations.
+        db.upsert_documents(vec![make_memory_doc(
+            "m_work_know",
+            "Work knowledge content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "m_work_pref",
+            "Work preference content",
+            "preference",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "m_personal_know",
+            "Personal knowledge content",
+            "knowledge",
+            "personal",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Query for domain=work, type=knowledge — should return only m_work_know.
+        let candidates = db
+            .topic_match_candidates(Some("work"), Some("knowledge"), 100)
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = candidates.iter().map(|c| c.source_id.as_str()).collect();
+        assert!(
+            ids.contains(&"m_work_know"),
+            "m_work_know should match domain+type filter"
+        );
+        assert!(!ids.contains(&"m_work_pref"), "m_work_pref has wrong type");
+        assert!(
+            !ids.contains(&"m_personal_know"),
+            "m_personal_know has wrong domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_candidates_returns_empty_on_missing_filter() {
+        let (db, _dir) = test_db().await;
+
+        db.upsert_documents(vec![make_memory_doc(
+            "m1",
+            "Some content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Missing domain => empty result (guard in implementation).
+        let candidates = db
+            .topic_match_candidates(None, Some("knowledge"), 100)
+            .await
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "missing domain should yield empty candidates"
+        );
+
+        // Missing type => empty result.
+        let candidates = db
+            .topic_match_candidates(Some("work"), None, 100)
+            .await
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "missing type should yield empty candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_candidates_respects_max() {
+        let (db, _dir) = test_db().await;
+
+        for i in 0..5 {
+            let sid = format!("m_max_{i}");
+            let content = format!("Content item number {i} about some topic");
+            db.upsert_documents(vec![make_memory_doc(
+                &sid,
+                &content,
+                "knowledge",
+                "work",
+                "agent",
+            )])
+            .await
+            .unwrap();
+        }
+
+        let candidates = db
+            .topic_match_candidates(Some("work"), Some("knowledge"), 3)
+            .await
+            .unwrap();
+        assert!(
+            candidates.len() <= 3,
+            "max_candidates limit should be respected"
+        );
+    }
+
+    // ---- upsert_memory_in_place ----
+
+    #[tokio::test]
+    async fn test_upsert_memory_in_place_updates_version() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_uip",
+            "Original content for upsert test.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Compute an embedding for the new content.
+        let new_content = "Updated content after in-place upsert.";
+        let embedding = db
+            .generate_embeddings(&[new_content.to_string()])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        db.upsert_memory_in_place(
+            "mem_uip",
+            new_content,
+            &embedding,
+            Some("test-agent"),
+            None,
+            50,
+        )
+        .await
+        .unwrap();
+
+        // Verify content and version via direct DB query.
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT content, version FROM memories WHERE source_id = 'mem_uip' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("row should exist");
+        let content: String = row.get(0).unwrap();
+        let version: i64 = row.get(1).unwrap();
+
+        assert_eq!(content, new_content, "content should be updated");
+        assert_eq!(version, 2, "version should be incremented to 2");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_memory_in_place_changelog() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_cl", "Initial content.", "knowledge", "work", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let new_content = "Content after first upsert.";
+        let embedding = db
+            .generate_embeddings(&[new_content.to_string()])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        db.upsert_memory_in_place(
+            "mem_cl",
+            new_content,
+            &embedding,
+            Some("my-agent"),
+            Some("ext-src-1"),
+            50,
+        )
+        .await
+        .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT changelog FROM memories WHERE source_id = 'mem_cl' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("row should exist");
+        let changelog_json: String = row.get(0).unwrap();
+        let changelog: Vec<serde_json::Value> = serde_json::from_str(&changelog_json).unwrap();
+
+        assert_eq!(changelog.len(), 1, "one changelog entry after first upsert");
+        assert_eq!(changelog[0]["version"], 2);
+        assert_eq!(changelog[0]["source_agent"], "my-agent");
+        assert_eq!(changelog[0]["incoming_source_id"], "ext-src-1");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_memory_in_place_changelog_cap() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_cap", "Starting content.", "knowledge", "work", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let cap = 50usize;
+        // Upsert 55 times; changelog should be capped at `cap` entries.
+        for i in 0..55 {
+            let content = format!("Iteration {i} content for cap test.");
+            let embedding = db
+                .generate_embeddings(&[content.clone()])
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            db.upsert_memory_in_place("mem_cap", &content, &embedding, None, None, cap)
+                .await
+                .unwrap();
+        }
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT changelog FROM memories WHERE source_id = 'mem_cap' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("row should exist");
+        let changelog_json: String = row.get(0).unwrap();
+        let changelog: Vec<serde_json::Value> = serde_json::from_str(&changelog_json).unwrap();
+
+        assert_eq!(
+            changelog.len(),
+            cap,
+            "changelog should be capped at {cap} entries, got {}",
+            changelog.len()
+        );
+    }
+
+    // ---- is_memory_protected ----
+
+    #[tokio::test]
+    async fn test_is_memory_protected_confirmed() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_prot_conf",
+            "Content to protect.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Initially not protected.
+        assert!(!db.is_memory_protected("mem_prot_conf").await.unwrap());
+
+        // Set confirmed=1 directly.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET confirmed = 1 WHERE source_id = 'mem_prot_conf'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.is_memory_protected("mem_prot_conf").await.unwrap(),
+            "confirmed memory should be protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_memory_protected_stability_learned() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_prot_stab",
+            "Content to protect by stability.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Initially not protected (stability='new' by default).
+        assert!(!db.is_memory_protected("mem_prot_stab").await.unwrap());
+
+        // Set stability='learned'.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET stability = 'learned' WHERE source_id = 'mem_prot_stab'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.is_memory_protected("mem_prot_stab").await.unwrap(),
+            "stability='learned' memory should be protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_memory_protected_stability_confirmed() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_prot_stab2",
+            "Content for stability confirmed.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET stability = 'confirmed' WHERE source_id = 'mem_prot_stab2'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.is_memory_protected("mem_prot_stab2").await.unwrap(),
+            "stability='confirmed' memory should be protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_memory_protected_nonexistent() {
+        let (db, _dir) = test_db().await;
+        // Non-existent source_id should return false, not an error.
+        let result = db.is_memory_protected("no_such_id").await.unwrap();
+        assert!(!result, "non-existent memory should not be protected");
+    }
+
+    // ---- set_concept_stale / clear_concept_staleness / list_stale_concepts ----
+
+    #[tokio::test]
+    async fn test_stale_concepts_lifecycle() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_stale",
+            "Stale concept",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Initially no stale concepts.
+        let stale = db.list_stale_concepts("source_updated").await.unwrap();
+        assert!(stale.is_empty(), "no stale concepts initially");
+
+        // Mark stale.
+        db.set_concept_stale("c_stale", "source_updated")
+            .await
+            .unwrap();
+
+        let stale = db.list_stale_concepts("source_updated").await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "c_stale");
+        assert_eq!(stale[0].stale_reason.as_deref(), Some("source_updated"));
+
+        // Clear staleness.
+        db.clear_concept_staleness("c_stale").await.unwrap();
+
+        let stale_after = db.list_stale_concepts("source_updated").await.unwrap();
+        assert!(stale_after.is_empty(), "staleness should be cleared");
+
+        // Verify stale_reason is NULL and sources_updated_count is 0 after clearing.
+        let c = db.get_concept("c_stale").await.unwrap().unwrap();
+        assert!(
+            c.stale_reason.is_none(),
+            "stale_reason should be None after clearing"
+        );
+        assert_eq!(c.sources_updated_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_stale_concepts_excludes_archived() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_stale_arc",
+            "Stale archived",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.set_concept_stale("c_stale_arc", "source_updated")
+            .await
+            .unwrap();
+        db.archive_concept("c_stale_arc").await.unwrap();
+
+        let stale = db.list_stale_concepts("source_updated").await.unwrap();
+        assert!(
+            stale.is_empty(),
+            "archived concepts should not appear in stale list"
+        );
+    }
+
+    // ---- increment_concept_sources_updated ----
+
+    #[tokio::test]
+    async fn test_increment_concept_sources_updated() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_inc",
+            "Increment test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // sources_updated_count starts at 0.
+        let c = db.get_concept("c_inc").await.unwrap().unwrap();
+        assert_eq!(c.sources_updated_count, 0);
+
+        db.increment_concept_sources_updated("c_inc").await.unwrap();
+        db.increment_concept_sources_updated("c_inc").await.unwrap();
+
+        let c = db.get_concept("c_inc").await.unwrap().unwrap();
+        assert_eq!(
+            c.sources_updated_count, 2,
+            "should be 2 after two increments"
+        );
+    }
+
+    // ---- get_memories_by_source_ids ----
+
+    #[tokio::test]
+    async fn test_get_memories_by_source_ids() {
+        let (db, _dir) = test_db().await;
+
+        // Insert 3 memories.
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_1",
+            "First memory content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_2",
+            "Second memory content",
+            "preference",
+            "personal",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_3",
+            "Third memory content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Fetch only 2 of the 3.
+        let ids = vec!["sid_1".to_string(), "sid_3".to_string()];
+        let results = db.get_memories_by_source_ids(&ids).await.unwrap();
+
+        assert_eq!(results.len(), 2, "should return exactly 2 memories");
+        let result_ids: Vec<&str> = results.iter().map(|m| m.source_id.as_str()).collect();
+        assert!(result_ids.contains(&"sid_1"));
+        assert!(result_ids.contains(&"sid_3"));
+        assert!(!result_ids.contains(&"sid_2"), "sid_2 was not requested");
+    }
+
+    #[tokio::test]
+    async fn test_get_memories_by_source_ids_empty_input() {
+        let (db, _dir) = test_db().await;
+
+        let results = db.get_memories_by_source_ids(&[]).await.unwrap();
+        assert!(results.is_empty(), "empty input should return empty result");
+    }
+
+    #[tokio::test]
+    async fn test_get_memories_by_source_ids_missing_id() {
+        let (db, _dir) = test_db().await;
+
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_real",
+            "Real memory",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Request one real and one non-existent id.
+        let ids = vec!["sid_real".to_string(), "sid_fake".to_string()];
+        let results = db.get_memories_by_source_ids(&ids).await.unwrap();
+
+        assert_eq!(results.len(), 1, "should only return the existing memory");
+        assert_eq!(results[0].source_id, "sid_real");
+    }
+
+    // ---- topic_match_title_fts ----
+
+    #[tokio::test]
+    async fn test_topic_match_title_fts_basic() {
+        let (db, _dir) = test_db().await;
+
+        // Insert a memory whose title contains a searchable word.
+        let doc = crate::sources::RawDocument {
+            source: "memory".to_string(),
+            source_id: "fts_mem".to_string(),
+            title: "Rust programming tips".to_string(),
+            content: "Some content about Rust programming.".to_string(),
+            memory_type: Some("knowledge".to_string()),
+            domain: Some("work".to_string()),
+            source_agent: Some("agent".to_string()),
+            confidence: Some(0.9),
+            confirmed: Some(false),
+            supersede_mode: "hide".to_string(),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Searching for "Rust" in title should match "fts_mem".
+        let matched = db
+            .topic_match_title_fts("Rust programming", &["fts_mem"])
+            .await
+            .unwrap();
+        assert!(
+            matched.contains(&"fts_mem".to_string()),
+            "fts_mem should match title search for 'Rust'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_title_fts_candidate_filter() {
+        let (db, _dir) = test_db().await;
+
+        // Insert two memories with similar titles.
+        for sid in &["fts_a", "fts_b"] {
+            let doc = crate::sources::RawDocument {
+                source: "memory".to_string(),
+                source_id: sid.to_string(),
+                title: format!("Machine learning notes {sid}"),
+                content: format!("Content for {sid}"),
+                memory_type: Some("knowledge".to_string()),
+                domain: Some("work".to_string()),
+                source_agent: Some("agent".to_string()),
+                confidence: Some(0.9),
+                confirmed: Some(false),
+                supersede_mode: "hide".to_string(),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
+
+        // Only pass "fts_a" as a candidate — "fts_b" should be excluded even if it matches FTS.
+        let matched = db
+            .topic_match_title_fts("Machine learning", &["fts_a"])
+            .await
+            .unwrap();
+        assert!(matched.contains(&"fts_a".to_string()), "fts_a should match");
+        assert!(
+            !matched.contains(&"fts_b".to_string()),
+            "fts_b not in candidate set, should be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_title_fts_empty_candidates() {
+        let (db, _dir) = test_db().await;
+
+        let matched = db.topic_match_title_fts("anything", &[]).await.unwrap();
+        assert!(
+            matched.is_empty(),
+            "empty candidate set should yield empty result"
+        );
+    }
 }
