@@ -42,18 +42,33 @@ jobs:
       - name: Download FastEmbed model if not cached
         if: steps.fastembed-cache.outputs.cache-hit != 'true'
         run: |
+          # FastEmbed uses HuggingFace hub cache format: blobs (content-addressed)
+          # + snapshots (symlinks to blobs) + refs (pointer to snapshot hash).
+          REPO="models--Qdrant--bge-base-en-v1.5-onnx-Q"
           SNAPSHOT="738cad1c108e2f23649db9e44b2eab988626493b"
-          MODEL_DIR="$HOME/.fastembed_cache/models--Qdrant--bge-base-en-v1.5-onnx-Q/snapshots/$SNAPSHOT"
-          mkdir -p "$MODEL_DIR"
+          CACHE="$HOME/.fastembed_cache/$REPO"
+          mkdir -p "$CACHE/blobs" "$CACHE/snapshots/$SNAPSHOT" "$CACHE/refs"
+
           BASE_URL="https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main"
-          for f in model_optimized.onnx tokenizer.json config.json special_tokens_map.json tokenizer_config.json; do
-            curl -fsSL "$BASE_URL/$f" -o "$MODEL_DIR/$f"
+
+          # Download each file into blobs with its content hash, then symlink
+          declare -A FILE_HASHES=(
+            ["config.json"]="40bfd889c495f985894a15b90c2aa8243e6e7e95"
+            ["model_optimized.onnx"]="4e556722bc4f65716c544c8a931f1e90fb3f866e5741fd93a96f051d673339c7"
+            ["special_tokens_map.json"]="9bbecc17cabbcbd3112c14d6982b51403b264bfa"
+            ["tokenizer_config.json"]="75305659f7795d4549f0e23688b52fa20a32f925"
+            ["tokenizer.json"]="688882a79f44442ddc1f60d70334a7ff5df0fb47"
+          )
+
+          for f in "${!FILE_HASHES[@]}"; do
+            HASH="${FILE_HASHES[$f]}"
+            curl -fsSL "$BASE_URL/$f" -o "$CACHE/blobs/$HASH"
+            ln -sf "../../blobs/$HASH" "$CACHE/snapshots/$SNAPSHOT/$f"
           done
-          # Create refs pointer (HuggingFace hub cache format)
-          mkdir -p "$HOME/.fastembed_cache/models--Qdrant--bge-base-en-v1.5-onnx-Q/refs"
-          echo "$SNAPSHOT" > "$HOME/.fastembed_cache/models--Qdrant--bge-base-en-v1.5-onnx-Q/refs/main"
-          echo "FastEmbed model downloaded to $MODEL_DIR"
-          ls -la "$MODEL_DIR"
+
+          echo "$SNAPSHOT" > "$CACHE/refs/main"
+          echo "FastEmbed model ready:"
+          ls -la "$CACHE/snapshots/$SNAPSHOT/"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
