@@ -1272,3 +1272,111 @@ async fn test_concept_before_after_comparison() {
         avg_recall_before
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pipeline eval: LoCoMo + LongMemEval through Origin's full pipeline
+// ---------------------------------------------------------------------------
+
+/// Run LoCoMo through Origin's full pipeline: flat → enriched → distilled.
+/// Requires Metal GPU (run with sandbox disabled).
+#[tokio::test]
+#[ignore]
+async fn benchmark_locomo_pipeline() {
+    use origin_lib::eval::token_efficiency::run_locomo_pipeline_eval;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found at {:?}", locomo_path);
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    let report = run_locomo_pipeline_eval(&locomo_path, llm, 10, 10)
+        .await
+        .expect("run_locomo_pipeline_eval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    // Sanity checks
+    assert!(
+        report.total_queries > 0,
+        "Expected >0 queries, got {}",
+        report.total_queries
+    );
+    assert!(
+        !report.aggregate.is_empty(),
+        "Should have aggregate metrics"
+    );
+
+    // Flat/Origin should have non-zero NDCG
+    let flat_origin = report
+        .aggregate
+        .iter()
+        .find(|c| c.condition == "flat" && c.strategy == "origin");
+    assert!(
+        flat_origin.is_some(),
+        "Should have flat/origin aggregate cell"
+    );
+    assert!(
+        flat_origin.unwrap().ndcg_at_10 > 0.0,
+        "Flat/Origin NDCG should be > 0"
+    );
+}
+
+/// Run LongMemEval through Origin's full pipeline: flat → enriched → distilled.
+/// Requires Metal GPU (run with sandbox disabled).
+/// Caps at 100 questions for reasonable runtime.
+#[tokio::test]
+#[ignore]
+async fn benchmark_longmemeval_pipeline() {
+    use origin_lib::eval::token_efficiency::run_longmemeval_pipeline_eval;
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found at {:?}", path);
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    let report = run_longmemeval_pipeline_eval(&path, llm, 10, 500)
+        .await
+        .expect("run_longmemeval_pipeline_eval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    // Sanity checks
+    assert!(
+        report.total_queries > 0,
+        "Expected >0 queries, got {}",
+        report.total_queries
+    );
+    assert!(
+        !report.aggregate.is_empty(),
+        "Should have aggregate metrics"
+    );
+
+    let flat_origin = report
+        .aggregate
+        .iter()
+        .find(|c| c.condition == "flat" && c.strategy == "origin");
+    assert!(
+        flat_origin.is_some(),
+        "Should have flat/origin aggregate cell"
+    );
+    assert!(
+        flat_origin.unwrap().ndcg_at_10 > 0.0,
+        "Flat/Origin NDCG should be > 0"
+    );
+}
