@@ -37,7 +37,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.fastembed_cache
-          key: fastembed-bge-base-en-v15-q-v1
+          key: fastembed-bge-base-en-v15-q-v2
 
       - name: Download FastEmbed model if not cached
         if: steps.fastembed-cache.outputs.cache-hit != 'true'
