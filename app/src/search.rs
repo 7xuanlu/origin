@@ -1195,6 +1195,8 @@ pub async fn list_memories_cmd(
             retrieval_cue: None,
             source_text: None,
             access_count: 0,
+            version: 1,
+            changelog: None,
         })
         .collect();
     Ok(items)

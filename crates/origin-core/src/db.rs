@@ -6495,6 +6495,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(items)
@@ -6567,6 +6569,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             }))
         } else {
             Ok(None)
@@ -6611,7 +6615,9 @@ impl MemoryDB {
                 MAX(structured_fields) as structured_fields,
                 MAX(retrieval_cue) as retrieval_cue,
                 SUM(access_count) as access_count,
-                MAX(source_text) as source_text
+                MAX(source_text) as source_text,
+                MAX(version) as version,
+                MAX(changelog) as changelog
              FROM memories
              WHERE pending_revision = 0
                AND source_id IN ({placeholders})
@@ -6659,6 +6665,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: row.get::<i64>(23).unwrap_or(1),
+                changelog: row.get::<Option<String>>(24).unwrap_or(None),
             };
             map.insert(item.source_id.clone(), item);
         }
@@ -6758,6 +6766,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(items)
@@ -6850,6 +6860,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(items)
@@ -9238,6 +9250,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(19).unwrap_or(None),
                 access_count: row.get::<u64>(20).unwrap_or(0),
                 source_text: row.get::<Option<String>>(21).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(results)

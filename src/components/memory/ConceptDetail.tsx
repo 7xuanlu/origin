@@ -590,7 +590,7 @@ function EvidenceCard({
   onClick: (sourceId: string) => void;
 }) {
   const [hover, setHover] = useState(false);
-  const ts = mem.last_modified ? relativeMs(mem.last_modified) : null;
+  const ts = mem.last_modified ? relativeMs(mem.last_modified * 1000) : null;
   const agent = mem.source_agent ? prettyAgent(mem.source_agent) : null;
   const kind = sourceKindLabel(mem);
   const snippet = mem.content
