@@ -3575,6 +3575,231 @@ impl MemoryDB {
                     .map_err(|e| OriginError::VectorDb(format!("migration 39 bump: {e}")))?;
                 log::info!("[migration] Migration 39 applied: archived ugly remnants + deduped identical titles");
             }
+
+            // Migration 40: KG quality — alias table, relation vocabulary, new columns,
+            // entity/relation deduplication, and unique index on relations.
+            if version < 40 {
+                {
+                    let conn = self.conn.lock().await;
+                    conn.execute_batch(
+                        "
+                        -- 1. Entity aliases table
+                        CREATE TABLE IF NOT EXISTS entity_aliases (
+                            entity_id  TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                            alias      TEXT NOT NULL,
+                            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                            PRIMARY KEY (entity_id, alias)
+                        );
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_lower
+                            ON entity_aliases(entity_id, LOWER(alias));
+
+                        -- 2. Relation type vocabulary
+                        CREATE TABLE IF NOT EXISTS relation_type_vocabulary (
+                            relation_type TEXT PRIMARY KEY,
+                            description   TEXT,
+                            bidirectional INTEGER NOT NULL DEFAULT 0
+                        );
+                        INSERT OR IGNORE INTO relation_type_vocabulary (relation_type, description, bidirectional) VALUES
+                            ('is_a',            'Subtype or category relationship', 0),
+                            ('part_of',         'Component/part to whole', 0),
+                            ('has_part',        'Whole to component/part', 0),
+                            ('related_to',      'General association', 1),
+                            ('uses',            'Entity uses or depends on another', 0),
+                            ('created_by',      'Entity was created by an agent or person', 0),
+                            ('located_in',      'Physical or logical location', 0),
+                            ('works_at',        'Person works at an organization', 0),
+                            ('knows',           'Person knows another person', 1),
+                            ('owns',            'Ownership relationship', 0),
+                            ('causes',          'Causal relationship', 0),
+                            ('contradicts',     'Mutually exclusive or opposing claims', 1),
+                            ('implements',      'Concrete implementation of an abstraction', 0),
+                            ('depends_on',      'Runtime or build-time dependency', 0),
+                            ('successor_of',    'Temporal or logical succession', 0),
+                            ('predecessor_of',  'Temporal or logical precedence', 0),
+                            ('associated_with', 'Loose contextual association', 1),
+                            ('member_of',       'Entity is a member of a group or collection', 0);
+
+                        -- 3. New columns on relations
+                        ALTER TABLE relations ADD COLUMN confidence      REAL;
+                        ALTER TABLE relations ADD COLUMN explanation     TEXT;
+                        ALTER TABLE relations ADD COLUMN source_memory_id TEXT;
+
+                        -- 4. New column on entities
+                        ALTER TABLE entities ADD COLUMN embedding_updated_at INTEGER;
+                        ",
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 40 DDL: {e}")))?;
+                }
+                // conn guard is dropped here so dedup helpers can re-acquire
+
+                // 5. Populate entity_aliases with one self-alias per existing entity,
+                //    then deduplicate entities with identical lowercase names.
+                self.migrate_40_dedup_entities().await?;
+
+                {
+                    let conn = self.conn.lock().await;
+
+                    // 6. Deduplicate relations: for each (from_entity, to_entity,
+                    //    relation_type) group keep the row with the smallest rowid and
+                    //    delete the rest.
+                    conn.execute(
+                        "DELETE FROM relations
+                         WHERE rowid NOT IN (
+                             SELECT MIN(rowid)
+                             FROM relations
+                             GROUP BY from_entity, to_entity, relation_type
+                         )",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 40 dedup relations: {e}")))?;
+
+                    // 7. Unique index on relations
+                    conn.execute_batch(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique
+                             ON relations(from_entity, to_entity, relation_type);",
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 40 relations unique idx: {e}")))?;
+
+                    conn.execute("PRAGMA user_version = 40", ())
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("migration 40 bump: {e}")))?;
+                    log::info!("[migration] Migration 40 applied: alias table, relation vocabulary, dedup, unique index");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migration 40 helper: seed one self-alias per entity, then collapse
+    /// entities that share the same lowercase name by keeping the
+    /// most-observed one and redirecting the others as aliases.
+    async fn migrate_40_dedup_entities(&self) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+
+        // Seed self-aliases for all existing entities (idempotent via INSERT OR IGNORE)
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO entity_aliases (entity_id, alias, created_at)
+             SELECT id, name, created_at FROM entities;",
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("migration 40 seed aliases: {e}")))?;
+
+        // Find all groups of entities that share the same lowercase name
+        // and have more than one member.
+        let mut dup_rows = conn
+            .query(
+                "SELECT LOWER(name) AS lname
+                 FROM entities
+                 GROUP BY LOWER(name)
+                 HAVING COUNT(*) > 1",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("migration 40 find dups: {e}")))?;
+
+        let mut dup_names: Vec<String> = Vec::new();
+        while let Some(row) = dup_rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("migration 40 dup row: {e}")))?
+        {
+            dup_names.push(row.get(0).unwrap_or_default());
+        }
+        drop(dup_rows);
+
+        // For each duplicated lowercase name, keep the entity with the most
+        // observations (tie-break: most recent updated_at), then:
+        //   - redirect all aliases from losers to the winner
+        //   - redirect all relations from losers to the winner
+        //   - delete losers
+        for lname in dup_names {
+            // Find winner (most observations, then latest update)
+            let mut winner_rows = conn
+                .query(
+                    "SELECT e.id
+                     FROM entities e
+                     LEFT JOIN observations o ON o.entity_id = e.id
+                     WHERE LOWER(e.name) = ?1
+                     GROUP BY e.id
+                     ORDER BY COUNT(o.id) DESC, e.updated_at DESC
+                     LIMIT 1",
+                    libsql::params![lname.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 winner: {e}")))?;
+            let winner_id: String = match winner_rows
+                .next()
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 winner row: {e}")))?
+            {
+                Some(row) => row.get(0).unwrap_or_default(),
+                None => continue,
+            };
+            drop(winner_rows);
+
+            // Collect loser ids
+            let mut loser_rows = conn
+                .query(
+                    "SELECT id FROM entities WHERE LOWER(name) = ?1 AND id != ?2",
+                    libsql::params![lname.clone(), winner_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 losers: {e}")))?;
+            let mut loser_ids: Vec<String> = Vec::new();
+            while let Some(row) = loser_rows
+                .next()
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 loser row: {e}")))?
+            {
+                loser_ids.push(row.get(0).unwrap_or_default());
+            }
+            drop(loser_rows);
+
+            for loser_id in &loser_ids {
+                // Redirect aliases from loser to winner
+                conn.execute(
+                    "UPDATE OR IGNORE entity_aliases SET entity_id = ?1 WHERE entity_id = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir alias: {e}")))?;
+
+                // Redirect observations from loser to winner
+                conn.execute(
+                    "UPDATE observations SET entity_id = ?1 WHERE entity_id = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir obs: {e}")))?;
+
+                // Redirect relations: from_entity references
+                conn.execute(
+                    "UPDATE OR IGNORE relations SET from_entity = ?1 WHERE from_entity = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir rel from: {e}")))?;
+
+                // Redirect relations: to_entity references
+                conn.execute(
+                    "UPDATE OR IGNORE relations SET to_entity = ?1 WHERE to_entity = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir rel to: {e}")))?;
+
+                // Delete the loser entity (CASCADE will clean up remaining aliases/obs/rels)
+                conn.execute(
+                    "DELETE FROM entities WHERE id = ?1",
+                    libsql::params![loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 del loser: {e}")))?;
+            }
         }
 
         Ok(())
@@ -19725,5 +19950,61 @@ pub(crate) mod tests {
                 item.badge
             );
         }
+    }
+
+    // ==================== Migration 40 ====================
+
+    #[tokio::test]
+    async fn test_migration_40_kg_quality_tables() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+
+        // 1. entity_aliases table exists
+        let _rows = conn
+            .query(
+                "SELECT entity_id, alias, created_at FROM entity_aliases LIMIT 1",
+                (),
+            )
+            .await
+            .expect("entity_aliases table should exist after migration 40");
+        drop(_rows);
+
+        // 2. relation_type_vocabulary has >= 15 seed entries
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM relation_type_vocabulary",
+                (),
+            )
+            .await
+            .expect("relation_type_vocabulary table should exist after migration 40");
+        let row = rows.next().await.unwrap().unwrap();
+        let count: i64 = row.get(0).unwrap();
+        assert!(
+            count >= 15,
+            "relation_type_vocabulary should have at least 15 seed entries, got {count}"
+        );
+        drop(rows);
+
+        // 3. relations table has confidence, explanation, source_memory_id columns
+        let _rows = conn
+            .query(
+                "SELECT id, confidence, explanation, source_memory_id FROM relations LIMIT 1",
+                (),
+            )
+            .await
+            .expect("relations should have confidence, explanation, source_memory_id columns after migration 40");
+        drop(_rows);
+
+        // 4. entities table has embedding_updated_at column
+        let _rows = conn
+            .query(
+                "SELECT id, embedding_updated_at FROM entities LIMIT 1",
+                (),
+            )
+            .await
+            .expect("entities should have embedding_updated_at column after migration 40");
+        drop(_rows);
+
+        drop(conn);
     }
 }
