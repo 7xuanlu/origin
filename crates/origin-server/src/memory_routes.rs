@@ -1796,11 +1796,12 @@ pub async fn handle_list_concepts(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("active");
-    let limit: i64 = params
+    let domain = params.get("domain").map(|s| s.as_str());
+    let limit: usize = params
         .get("limit")
         .and_then(|l| l.parse().ok())
         .unwrap_or(50);
-    let offset: i64 = params
+    let offset: usize = params
         .get("offset")
         .and_then(|o| o.parse().ok())
         .unwrap_or(0);
@@ -1808,7 +1809,7 @@ pub async fn handle_list_concepts(
     let s = state.read().await;
     let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
     let concepts = db
-        .list_concepts(status, limit, offset)
+        .list_concepts_by_domain(status, domain, limit, offset)
         .await
         .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
     Ok(Json(serde_json::json!({ "concepts": concepts })))
