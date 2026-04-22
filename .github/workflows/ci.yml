@@ -39,6 +39,22 @@ jobs:
           path: ~/.fastembed_cache
           key: fastembed-bge-base-en-v15-q-v1
 
+      - name: Download FastEmbed model if not cached
+        if: steps.fastembed-cache.outputs.cache-hit != 'true'
+        run: |
+          SNAPSHOT="738cad1c108e2f23649db9e44b2eab988626493b"
+          MODEL_DIR="$HOME/.fastembed_cache/models--Qdrant--bge-base-en-v1.5-onnx-Q/snapshots/$SNAPSHOT"
+          mkdir -p "$MODEL_DIR"
+          BASE_URL="https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main"
+          for f in model_optimized.onnx tokenizer.json config.json special_tokens_map.json tokenizer_config.json; do
+            curl -fsSL "$BASE_URL/$f" -o "$MODEL_DIR/$f"
+          done
+          # Create refs pointer (HuggingFace hub cache format)
+          mkdir -p "$HOME/.fastembed_cache/models--Qdrant--bge-base-en-v1.5-onnx-Q/refs"
+          echo "$SNAPSHOT" > "$HOME/.fastembed_cache/models--Qdrant--bge-base-en-v1.5-onnx-Q/refs/main"
+          echo "FastEmbed model downloaded to $MODEL_DIR"
+          ls -la "$MODEL_DIR"
+
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
