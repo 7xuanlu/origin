@@ -7144,7 +7144,155 @@ impl MemoryDB {
         .await
         .map_err(|e| OriginError::VectorDb(format!("store_entity: {}", e)))?;
 
+        // Auto-create a self-alias for the entity name (lowercase).
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), 'auto')",
+            libsql::params![name.to_lowercase(), id.clone()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("store_entity alias: {}", e)))?;
+
         Ok(id)
+    }
+
+    /// Resolve an entity ID from an alias (case-insensitive).
+    pub async fn resolve_entity_by_alias(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT canonical_entity_id FROM entity_aliases WHERE alias_name = ?1",
+                libsql::params![name.to_lowercase()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("alias lookup: {}", e)))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("alias row: {}", e)))?
+        {
+            Ok(Some(row.get::<String>(0).unwrap()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Add an alias entry for an entity.
+    pub async fn add_entity_alias(
+        &self,
+        alias: &str,
+        entity_id: &str,
+        source: &str,
+    ) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), ?3)",
+            libsql::params![alias.to_lowercase(), entity_id.to_string(), source.to_string()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("add alias: {}", e)))?;
+        Ok(())
+    }
+
+    /// Resolve a relation type string against the vocabulary.
+    /// Returns the canonical form if the input matches a canonical or an alias,
+    /// otherwise returns the input unchanged.
+    pub async fn resolve_relation_type(&self, relation_type: &str) -> Result<String, OriginError> {
+        let conn = self.conn.lock().await;
+
+        // Check if input is already a canonical key.
+        let mut rows = conn
+            .query(
+                "SELECT canonical FROM relation_type_vocabulary WHERE canonical = ?1",
+                libsql::params![relation_type.to_string()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type canonical: {}", e)))?;
+        if rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type row: {}", e)))?
+            .is_some()
+        {
+            return Ok(relation_type.to_string());
+        }
+        drop(rows);
+
+        // Scan aliases JSON arrays for a match.
+        let mut rows = conn
+            .query(
+                "SELECT canonical, aliases FROM relation_type_vocabulary WHERE aliases IS NOT NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type aliases: {}", e)))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type alias row: {}", e)))?
+        {
+            let canonical = row.get::<String>(0).unwrap_or_default();
+            let aliases_json = row.get::<String>(1).unwrap_or_default();
+            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(&aliases_json) {
+                for v in &arr {
+                    if let Some(alias) = v.as_str() {
+                        if alias == relation_type {
+                            return Ok(canonical);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Not found — return input unchanged.
+        Ok(relation_type.to_string())
+    }
+
+    /// Increment the usage count for a canonical relation type.
+    pub async fn increment_relation_type_count(&self, canonical: &str) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE relation_type_vocabulary SET count = count + 1 WHERE canonical = ?1",
+            libsql::params![canonical.to_string()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("increment_relation_type_count: {}", e)))?;
+        Ok(())
+    }
+
+    /// Search entities by exact name (case-insensitive).
+    pub async fn search_entities_by_name(&self, name: &str) -> Result<Vec<Entity>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, name, entity_type, domain, source_agent, confidence, confirmed, created_at, updated_at
+                 FROM entities WHERE LOWER(name) = LOWER(?1)",
+                libsql::params![name.to_string()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("search_entities_by_name: {}", e)))?;
+
+        let mut entities = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            entities.push(Entity {
+                id: row.get::<String>(0).unwrap_or_default(),
+                name: row.get::<String>(1).unwrap_or_default(),
+                entity_type: row.get::<String>(2).unwrap_or_default(),
+                domain: row.get::<Option<String>>(3).unwrap_or(None),
+                source_agent: row.get::<Option<String>>(4).unwrap_or(None),
+                confidence: row.get::<Option<f64>>(5).unwrap_or(None).map(|v| v as f32),
+                confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
+                created_at: row.get::<i64>(7).unwrap_or(0),
+                updated_at: row.get::<i64>(8).unwrap_or(0),
+            });
+        }
+        Ok(entities)
     }
 
     /// Add an observation to an entity.
@@ -7412,6 +7560,13 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("delete_entity cascade memories: {}", e)))?;
+        // Remove aliases referencing this entity before deleting it (FK constraint)
+        conn.execute(
+            "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("delete_entity cascade aliases: {}", e)))?;
         conn.execute(
             "DELETE FROM entities WHERE id = ?1",
             libsql::params![entity_id],
@@ -20008,5 +20163,65 @@ pub(crate) mod tests {
         drop(_rows);
 
         drop(conn);
+    }
+
+    #[tokio::test]
+    async fn test_alias_resolution() {
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity("Alice Chen", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        let resolved = db.resolve_entity_by_alias("alice chen").await.unwrap();
+        assert_eq!(resolved, Some(id.clone()));
+        let resolved2 = db.resolve_entity_by_alias("Alice Chen").await.unwrap();
+        assert_eq!(resolved2, Some(id.clone()));
+        let resolved3 = db.resolve_entity_by_alias("bob").await.unwrap();
+        assert_eq!(resolved3, None);
+    }
+
+    #[tokio::test]
+    async fn test_add_entity_alias() {
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity("Alice Chen", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        db.add_entity_alias("alice", &id, "auto").await.unwrap();
+        let r1 = db.resolve_entity_by_alias("alice chen").await.unwrap();
+        let r2 = db.resolve_entity_by_alias("alice").await.unwrap();
+        assert_eq!(r1, Some(id.clone()));
+        assert_eq!(r2, Some(id.clone()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_relation_type() {
+        let (db, _dir) = test_db().await;
+        assert_eq!(
+            db.resolve_relation_type("works_on").await.unwrap(),
+            "works_on"
+        );
+        assert_eq!(
+            db.resolve_relation_type("working_at").await.unwrap(),
+            "works_on"
+        );
+        assert_eq!(
+            db.resolve_relation_type("custom_type").await.unwrap(),
+            "custom_type"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_entities_by_name() {
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity("Alice Chen", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        let results = db.search_entities_by_name("alice chen").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+        let empty: Vec<Entity> = db.search_entities_by_name("bob").await.unwrap();
+        assert!(empty.is_empty());
     }
 }
