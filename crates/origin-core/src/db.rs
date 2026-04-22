@@ -3606,10 +3606,7 @@ impl MemoryDB {
                     )
                     .await;
                 let _ = conn
-                    .execute(
-                        "ALTER TABLE concepts ADD COLUMN stale_reason TEXT",
-                        (),
-                    )
+                    .execute("ALTER TABLE concepts ADD COLUMN stale_reason TEXT", ())
                     .await;
                 let _ = conn
                     .execute(
@@ -3630,7 +3627,9 @@ impl MemoryDB {
                     (),
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 create concept_sources: {e}")))?;
+                .map_err(|e| {
+                    OriginError::VectorDb(format!("migration 40 create concept_sources: {e}"))
+                })?;
 
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_concept_sources_memory ON concept_sources(memory_source_id)",
@@ -3641,6 +3640,10 @@ impl MemoryDB {
 
                 // Backfill concept_sources from existing source_memory_ids JSON
                 {
+                    conn.execute("BEGIN", ()).await.map_err(|e| {
+                        OriginError::VectorDb(format!("migration 40 backfill begin: {e}"))
+                    })?;
+
                     let mut rows = conn
                         .query(
                             "SELECT id, source_memory_ids, created_at FROM concepts WHERE source_memory_ids != '[]' AND source_memory_ids IS NOT NULL",
@@ -3650,17 +3653,13 @@ impl MemoryDB {
                         .map_err(|e| OriginError::VectorDb(format!("migration 40 backfill query: {e}")))?;
 
                     let mut backfill_rows: Vec<(String, String, String)> = Vec::new();
-                    while let Some(row) = rows
-                        .next()
-                        .await
-                        .map_err(|e| OriginError::VectorDb(format!("migration 40 backfill next: {e}")))?
-                    {
-                        let concept_id: String = row
-                            .get(0)
-                            .map_err(|e| OriginError::VectorDb(format!("migration 40 backfill id: {e}")))?;
-                        let json_str: String = row
-                            .get(1)
-                            .unwrap_or_else(|_| "[]".to_string());
+                    while let Some(row) = rows.next().await.map_err(|e| {
+                        OriginError::VectorDb(format!("migration 40 backfill next: {e}"))
+                    })? {
+                        let concept_id: String = row.get(0).map_err(|e| {
+                            OriginError::VectorDb(format!("migration 40 backfill id: {e}"))
+                        })?;
+                        let json_str: String = row.get(1).unwrap_or_else(|_| "[]".to_string());
                         let created_at_str: String = row
                             .get(2)
                             .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
@@ -3682,6 +3681,10 @@ impl MemoryDB {
                                 .await;
                         }
                     }
+
+                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                        OriginError::VectorDb(format!("migration 40 backfill commit: {e}"))
+                    })?;
                 }
 
                 conn.execute("PRAGMA user_version = 40", ())
@@ -12200,6 +12203,7 @@ impl MemoryDB {
         id: &str,
         content: &str,
         source_memory_ids: &[&str],
+        link_reason: &str,
     ) -> Result<(), OriginError> {
         let source_ids_json = serde_json::to_string(&source_memory_ids)
             .map_err(|e| OriginError::VectorDb(format!("serialize source_memory_ids: {e}")))?;
@@ -12217,8 +12221,8 @@ impl MemoryDB {
         for sid in source_memory_ids {
             let _ = conn
                 .execute(
-                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, 'concept_growth')",
-                    libsql::params![id, sid, now_ts],
+                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+                    libsql::params![id, sid, now_ts, link_reason],
                 )
                 .await;
         }
@@ -12587,6 +12591,65 @@ impl MemoryDB {
         Ok(candidates)
     }
 
+    /// FTS5-based title matching for topic matching.
+    ///
+    /// Queries `memories_fts` with a `title:` column filter and returns the
+    /// `source_id` values that match. The caller intersects this set with
+    /// the pre-fetched candidates in Rust.
+    ///
+    /// Words shorter than 2 chars are skipped so that tokens like "SQL",
+    /// "API", "Go" are retained while noise particles like "a" are dropped.
+    pub async fn topic_match_title_fts(
+        &self,
+        title: &str,
+        candidate_source_ids: &[&str],
+    ) -> Result<Vec<String>, OriginError> {
+        // Build list of significant words (2+ char, alphanumeric only).
+        let words: Vec<String> = title
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 2)
+            .map(|w| format!("title:{w}"))
+            .collect();
+
+        if words.is_empty() || candidate_source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let fts_query = words.join(" OR ");
+
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT c.source_id
+                 FROM memories_fts fts
+                 JOIN memories c ON fts.rowid = c.rowid
+                 WHERE memories_fts MATCH ?1
+                   AND c.chunk_index = 0
+                   AND c.pending_revision = 0",
+                libsql::params![fts_query],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("topic_match_title_fts: {e}")))?;
+
+        // Collect matching source_ids and intersect with candidate set.
+        let candidate_set: std::collections::HashSet<&str> =
+            candidate_source_ids.iter().copied().collect();
+        let mut matched = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let sid: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(format!("topic_title_fts sid: {e}")))?;
+            if candidate_set.contains(sid.as_str()) {
+                matched.push(sid);
+            }
+        }
+        Ok(matched)
+    }
+
     // ===== Concept Sources Join Table Methods =====
 
     /// Link a memory to a concept in the concept_sources join table.
@@ -12628,8 +12691,12 @@ impl MemoryDB {
             .map_err(|e| OriginError::VectorDb(e.to_string()))?
         {
             result.push(origin_types::ConceptSource {
-                concept_id: row.get(0).map_err(|e| OriginError::VectorDb(format!("concept_sources concept_id: {e}")))?,
-                memory_source_id: row.get(1).map_err(|e| OriginError::VectorDb(format!("concept_sources memory_source_id: {e}")))?,
+                concept_id: row.get(0).map_err(|e| {
+                    OriginError::VectorDb(format!("concept_sources concept_id: {e}"))
+                })?,
+                memory_source_id: row.get(1).map_err(|e| {
+                    OriginError::VectorDb(format!("concept_sources memory_source_id: {e}"))
+                })?,
                 linked_at: row.get(2).unwrap_or(0),
                 link_reason: row.get::<Option<String>>(3).unwrap_or(None),
             });
@@ -12696,7 +12763,8 @@ impl MemoryDB {
         {
             let confirmed: i64 = row.get(0).unwrap_or(0);
             let stability: Option<String> = row.get::<Option<String>>(1).unwrap_or(None);
-            Ok(confirmed != 0 || matches!(stability.as_deref(), Some("learned") | Some("confirmed")))
+            Ok(confirmed != 0
+                || matches!(stability.as_deref(), Some("learned") | Some("confirmed")))
         } else {
             Ok(false)
         }
@@ -12784,6 +12852,7 @@ impl MemoryDB {
         &self,
         source_id: &str,
         new_content: &str,
+        content_embedding: &[f32],
         source_agent: Option<&str>,
         incoming_source_id: Option<&str>,
         changelog_cap: usize,
@@ -12842,7 +12911,9 @@ impl MemoryDB {
                 })?;
 
             SavedMeta {
-                source: row.get::<String>(0).unwrap_or_else(|_| "memory".to_string()),
+                source: row
+                    .get::<String>(0)
+                    .unwrap_or_else(|_| "memory".to_string()),
                 title: row.get::<String>(1).unwrap_or_default(),
                 summary: row.get::<Option<String>>(2).unwrap_or(None),
                 url: row.get::<Option<String>>(3).unwrap_or(None),
@@ -12852,9 +12923,7 @@ impl MemoryDB {
                 domain: row.get::<Option<String>>(7).unwrap_or(None),
                 confidence: row.get::<Option<f64>>(8).unwrap_or(None),
                 confirmed: row.get::<i64>(9).unwrap_or(0),
-                stability: row
-                    .get::<String>(10)
-                    .unwrap_or_else(|_| "new".to_string()),
+                stability: row.get::<String>(10).unwrap_or_else(|_| "new".to_string()),
                 entity_id: row.get::<Option<String>>(11).unwrap_or(None),
                 enrichment_status: row
                     .get::<String>(12)
@@ -12864,21 +12933,16 @@ impl MemoryDB {
                 structured_fields: row.get::<Option<String>>(15).unwrap_or(None),
                 retrieval_cue: row.get::<Option<String>>(16).unwrap_or(None),
                 source_text: row.get::<Option<String>>(17).unwrap_or(None),
-                created_at: row.get::<i64>(18).unwrap_or_else(|_| {
-                    chrono::Utc::now().timestamp()
-                }),
+                created_at: row
+                    .get::<i64>(18)
+                    .unwrap_or_else(|_| chrono::Utc::now().timestamp()),
                 version: row.get::<i64>(19).unwrap_or(1),
                 changelog: row.get::<String>(20).unwrap_or_else(|_| "[]".to_string()),
             }
         };
 
-        // ---- Step 2: compute new embedding (CPU-bound, outside DB lock) ----
-        let embeddings = self.generate_embeddings(&[new_content.to_string()])?;
-        let embedding = embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| OriginError::Embedding("empty embeddings result".to_string()))?;
-        let vec_sql = Self::vec_to_sql(&embedding);
+        // ---- Step 2: use the caller-supplied embedding (already computed for topic matching) ----
+        let vec_sql = Self::vec_to_sql(content_embedding);
 
         // ---- Step 3: build new changelog entry and version ----
         let now_ts = chrono::Utc::now().timestamp();
@@ -12893,8 +12957,8 @@ impl MemoryDB {
         let mut changelog: Vec<serde_json::Value> =
             serde_json::from_str(&saved.changelog).unwrap_or_default();
         changelog.push(entry);
-        while changelog.len() > changelog_cap {
-            changelog.remove(0);
+        if changelog.len() > changelog_cap {
+            changelog.drain(..changelog.len() - changelog_cap);
         }
         let changelog_json = serde_json::to_string(&changelog)
             .map_err(|e| OriginError::VectorDb(format!("serialize changelog: {e}")))?;
@@ -12914,6 +12978,12 @@ impl MemoryDB {
         );
 
         // ---- Step 4: transaction — delete old chunks, insert new chunk ----
+        // TODO(multi-chunk-upsert): For most memories content fits in a single chunk.
+        // If content exceeds the chunk size limit (~2000 chars / 512 tokens), this
+        // currently stores the full content as chunk_index=0 only. A future improvement
+        // should reuse the chunker module to split `new_content` and insert multiple
+        // chunks with sequential chunk_index values, mirroring how `upsert_documents`
+        // handles multi-chunk RawDocuments.
         {
             let conn = self.conn.lock().await;
             conn.execute("BEGIN", ())
@@ -12981,9 +13051,7 @@ impl MemoryDB {
                 ],
             )
             .await
-            .map_err(|e| {
-                OriginError::VectorDb(format!("upsert_in_place INSERT: {e}"))
-            })?;
+            .map_err(|e| OriginError::VectorDb(format!("upsert_in_place INSERT: {e}")))?;
 
             conn.execute("COMMIT", ())
                 .await
@@ -18782,7 +18850,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        db.update_concept_content("concept_u1", "v2 content", &["m1", "m2"])
+        db.update_concept_content("concept_u1", "v2 content", &["m1", "m2"], "concept_growth")
             .await
             .unwrap();
         let c = db.get_concept("concept_u1").await.unwrap().unwrap();

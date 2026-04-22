@@ -793,11 +793,7 @@ export interface ConceptSourceWithMemory {
 export async function getConceptSources(
   conceptId: string,
 ): Promise<ConceptSourceWithMemory[]> {
-  const response = await fetch(
-    `http://127.0.0.1:7878/api/concepts/${conceptId}/sources`,
-  );
-  if (!response.ok) return [];
-  return response.json();
+  return invoke("get_concept_sources", { conceptId });
 }
 
 // ── Profiles & Agent Connections ─────────────────────────────────────

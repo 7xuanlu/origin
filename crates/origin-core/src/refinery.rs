@@ -1445,7 +1445,12 @@ async fn assign_orphan_memories(
                                 let refs: Vec<&str> =
                                     merged_sources.iter().map(|s| s.as_str()).collect();
                                 let _ = db
-                                    .update_concept_content(concept_id, &concept.content, &refs)
+                                    .update_concept_content(
+                                        concept_id,
+                                        &concept.content,
+                                        &refs,
+                                        "concept_growth",
+                                    )
                                     .await;
                                 assigned += 1;
                             }
@@ -1694,7 +1699,7 @@ async fn recompile_single_concept(
                     .iter()
                     .map(|s| s.as_str())
                     .collect();
-                db.update_concept_content(&concept.id, &content, &source_refs)
+                db.update_concept_content(&concept.id, &content, &source_refs, "re_distill")
                     .await?;
                 log::info!("[re-distill] refreshed concept '{}'", concept.title);
                 return Ok(true);
@@ -1729,7 +1734,10 @@ pub(crate) async fn re_distill_stale_concepts(
     let llm_ref = match llm {
         Some(l) if l.is_available() => l,
         _ => {
-            log::debug!("[re-distill-stale] no LLM available, skipping {} stale concepts", stale.len());
+            log::debug!(
+                "[re-distill-stale] no LLM available, skipping {} stale concepts",
+                stale.len()
+            );
             return Ok(0);
         }
     };
@@ -1752,7 +1760,10 @@ pub(crate) async fn re_distill_stale_concepts(
             sources.iter().map(|s| s.memory_source_id.clone()).collect();
         let source_id_refs: Vec<&str> = source_id_strings.iter().map(|s| s.as_str()).collect();
         if source_id_strings.is_empty() {
-            log::warn!("[re-distill-stale] concept '{}' has no sources in join table, clearing staleness", concept.title);
+            log::warn!(
+                "[re-distill-stale] concept '{}' has no sources in join table, clearing staleness",
+                concept.title
+            );
             db.clear_concept_staleness(&concept.id).await?;
             continue;
         }
@@ -1760,7 +1771,10 @@ pub(crate) async fn re_distill_stale_concepts(
         // Fetch memory contents.
         let memories = db.get_memories_by_source_ids(&source_id_strings).await?;
         if memories.is_empty() {
-            log::warn!("[re-distill-stale] concept '{}' sources are all orphaned, clearing staleness", concept.title);
+            log::warn!(
+                "[re-distill-stale] concept '{}' sources are all orphaned, clearing staleness",
+                concept.title
+            );
             db.clear_concept_staleness(&concept.id).await?;
             continue;
         }
@@ -1798,13 +1812,17 @@ pub(crate) async fn re_distill_stale_concepts(
                     .trim()
                     .to_string();
                 if !content.is_empty() {
-                    db.update_concept_content(&concept.id, &content, &source_id_refs).await?;
+                    db.update_concept_content(&concept.id, &content, &source_id_refs, "re_distill")
+                        .await?;
                     db.clear_concept_staleness(&concept.id).await?;
                     recompiled += 1;
                     log::info!("[re-distill-stale] refreshed concept '{}'", concept.title);
                 }
             }
-            Ok(_) => log::warn!("[re-distill-stale] empty LLM output for '{}'", concept.title),
+            Ok(_) => log::warn!(
+                "[re-distill-stale] empty LLM output for '{}'",
+                concept.title
+            ),
             Err(e) => log::warn!("[re-distill-stale] LLM error for '{}': {}", concept.id, e),
         }
     }
@@ -1873,7 +1891,7 @@ async fn global_concept_review(
                         }
                         let refs: Vec<&str> = merged_sources.iter().map(|s| s.as_str()).collect();
                         let _ = db
-                            .update_concept_content(keep_id, &keep.content, &refs)
+                            .update_concept_content(keep_id, &keep.content, &refs, "re_distill")
                             .await;
                         let _ = db.archive_concept(remove_id).await;
                         changes += 1;
@@ -1990,7 +2008,7 @@ pub async fn deep_distill_single(
         .iter()
         .map(|s| s.as_str())
         .collect();
-    db.update_concept_content(concept_id, &content, &source_refs)
+    db.update_concept_content(concept_id, &content, &source_refs, "distill")
         .await?;
 
     log::info!(
@@ -3921,6 +3939,7 @@ mod tests {
             "c_int",
             "## Key Facts\n- updated",
             &["lifecycle_0", "lifecycle_1", "lifecycle_2", "lifecycle_3"],
+            "concept_growth",
         )
         .await
         .unwrap();

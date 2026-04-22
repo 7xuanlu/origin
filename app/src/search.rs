@@ -2687,6 +2687,15 @@ pub async fn search_concepts(
 }
 
 #[tauri::command]
+pub async fn get_concept_sources(
+    state: tauri::State<'_, State>,
+    concept_id: String,
+) -> Result<Vec<origin_types::ConceptSourceWithMemory>, String> {
+    let client = { state.read().await.client.clone() };
+    client.get_concept_sources(&concept_id).await
+}
+
+#[tauri::command]
 pub async fn export_concepts_to_obsidian(
     state: tauri::State<'_, State>,
     vault_path: String,

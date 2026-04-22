@@ -359,13 +359,13 @@ pub async fn handle_store_memory(
     // Run before building RawDocument. If the incoming memory matches an existing
     // topic (same domain+type, similar embedding), upsert in place and return early,
     // skipping the batcher and avoiding duplicates.
+    // When a protected memory is matched we fall through to normal store but flag
+    // the new memory as a pending revision so the UI can surface it for review.
+    let mut topic_match_protected_id: Option<String> = None;
     {
         let (db_arc, topic_cfg) = {
             let s = state.read().await;
-            (
-                s.db.clone(),
-                s.tuning.refinery.topic_match.clone(),
-            )
+            (s.db.clone(), s.tuning.refinery.topic_match.clone())
         };
 
         if let Some(ref db) = db_arc {
@@ -376,7 +376,6 @@ pub async fn handle_store_memory(
                 if let Some(content_embedding) = embeddings.first() {
                     let match_result = origin_core::topic_match::find_topic_match(
                         db,
-                        trimmed_content,
                         &title,
                         validated_memory_type.as_deref(),
                         req.domain.as_deref(),
@@ -399,6 +398,7 @@ pub async fn handle_store_memory(
                                     .upsert_memory_in_place(
                                         matched_source_id,
                                         trimmed_content,
+                                        content_embedding,
                                         req.source_agent.as_deref(),
                                         None, // incoming_source_id N/A (no new id yet)
                                         topic_cfg.changelog_cap,
@@ -411,20 +411,21 @@ pub async fn handle_store_memory(
                                     let msid = matched_source_id.clone();
                                     let old_emb = result.old_embedding.clone();
                                     let new_emb = content_embedding.clone();
-                                    tokio::spawn(async move {
+                                    let handle = tokio::spawn(async move {
                                         let sim = old_emb.as_deref().map(|oe| {
-                                            origin_core::topic_match::cosine_similarity(oe, &new_emb)
+                                            origin_core::topic_match::cosine_similarity(
+                                                oe, &new_emb,
+                                            )
                                         });
                                         if let Ok(concepts) =
                                             db_clone.get_concepts_for_memory(&msid).await
                                         {
                                             for concept in concepts {
-                                                let stale_reason =
-                                                    match sim {
-                                                        Some(s) if s > 0.90 => None, // trivial
-                                                        Some(s) if s > 0.60 => Some("source_updated"),
-                                                        _ => Some("source_conflict"),
-                                                    };
+                                                let stale_reason = match sim {
+                                                    Some(s) if s > 0.90 => None, // trivial
+                                                    Some(s) if s > 0.60 => Some("source_updated"),
+                                                    _ => Some("source_conflict"),
+                                                };
                                                 if let Some(reason) = stale_reason {
                                                     let _ = db_clone
                                                         .set_concept_stale(&concept.id, reason)
@@ -437,6 +438,13 @@ pub async fn handle_store_memory(
                                                         .await;
                                                 }
                                             }
+                                        }
+                                    });
+                                    tokio::spawn(async move {
+                                        if let Err(e) = handle.await {
+                                            tracing::warn!(
+                                                "[topic_match] staleness check task panicked: {e}"
+                                            );
                                         }
                                     });
 
@@ -466,8 +474,9 @@ pub async fn handle_store_memory(
                             } else {
                                 tracing::info!(
                                     "[topic_match] matched protected memory {matched_source_id}, \
-                                     falling through to normal store"
+                                     storing as new pending_revision"
                                 );
+                                topic_match_protected_id = Some(matched_source_id.clone());
                             }
                         }
                     }
@@ -499,38 +508,10 @@ pub async fn handle_store_memory(
     };
     let confirmed = Some(stability == "confirmed");
 
-    let mut pending_revision = false;
-    let mut final_supersedes = req.supersedes.clone();
-
-    if let Some(ref supersedes_id) = req.supersedes {
-        let s = state.read().await;
-        let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-
-        let old_type = db.get_memory_type(supersedes_id).await.ok().flatten();
-        let target_exists = db.source_id_exists(supersedes_id).await.unwrap_or(false);
-
-        if old_type.is_none() && !target_exists {
-            tracing::warn!(
-                "Supersedes target {} not found, dropping reference",
-                supersedes_id
-            );
-            final_supersedes = None;
-        } else {
-            let old_tier = stability_tier(old_type.as_deref());
-            match old_tier {
-                StabilityTier::Protected => {
-                    pending_revision = true;
-                }
-                StabilityTier::Standard | StabilityTier::Ephemeral => {}
-            }
-            if !pending_revision {
-                let old_stability = db.get_stability(supersedes_id).await.ok().flatten();
-                if old_stability.as_deref() == Some("confirmed") {
-                    pending_revision = true;
-                }
-            }
-        }
-    }
+    // A topic-match against a protected memory also flags this as a pending revision.
+    let pending_revision = topic_match_protected_id.is_some();
+    // Agent-declared supersedes: trust the caller directly, no auto-detection.
+    let final_supersedes = req.supersedes.clone();
 
     let agent_for_activity = {
         let s = state.read().await;
@@ -1967,10 +1948,8 @@ pub async fn handle_get_concept_sources(
         .await
         .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
 
-    let source_id_strings: Vec<String> = sources
-        .iter()
-        .map(|s| s.memory_source_id.clone())
-        .collect();
+    let source_id_strings: Vec<String> =
+        sources.iter().map(|s| s.memory_source_id.clone()).collect();
     let memories = db
         .get_memories_by_source_ids(&source_id_strings)
         .await
@@ -3112,7 +3091,7 @@ pub async fn handle_update_concept(
         .map(|c| c.source_memory_ids)
         .unwrap_or_default();
     let existing_refs: Vec<&str> = existing_sources.iter().map(String::as_str).collect();
-    db.update_concept_content(&id, &req.content, &existing_refs)
+    db.update_concept_content(&id, &req.content, &existing_refs, "manual_edit")
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Json(origin_types::responses::SuccessResponse { ok: true }))
