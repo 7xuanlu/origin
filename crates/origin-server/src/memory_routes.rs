@@ -1149,6 +1149,9 @@ pub async fn handle_create_relation(
             &req.to_entity,
             &req.relation_type,
             req.source_agent.as_deref(),
+            None,
+            None,
+            None,
         )
         .await
         .map_err(|e| ServerError::IngestFailed(e.to_string()))?;

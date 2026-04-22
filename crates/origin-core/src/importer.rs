@@ -682,7 +682,7 @@ pub async fn import_phase3_store(
             let to_id = entity_cache.get(&rel.to.to_lowercase()).cloned();
             if let (Some(from), Some(to)) = (from_id, to_id) {
                 if db
-                    .create_relation(&from, &to, &rel.relation_type, Some(source))
+                    .create_relation(&from, &to, &rel.relation_type, Some(source), rel.confidence, rel.explanation.as_deref(), None)
                     .await
                     .is_ok()
                 {

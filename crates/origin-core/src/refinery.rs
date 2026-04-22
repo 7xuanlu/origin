@@ -812,7 +812,7 @@ pub async fn extract_single_memory_entities(
             let to_id = entity_cache.get(&rel.to.to_lowercase()).cloned();
             if let (Some(from), Some(to)) = (from_id, to_id) {
                 let _ = db
-                    .create_relation(&from, &to, &rel.relation_type, Some("post_ingest"))
+                    .create_relation(&from, &to, &rel.relation_type, Some("post_ingest"), rel.confidence, rel.explanation.as_deref(), None)
                     .await;
             }
         }

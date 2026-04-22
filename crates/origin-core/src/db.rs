@@ -7334,26 +7334,39 @@ impl MemoryDB {
     }
 
     /// Create a relation between two entities.
+    /// The relation type is normalized against the vocabulary via `resolve_relation_type`
+    /// before insertion. Duplicate relations (same from/to/type) are silently ignored.
     pub async fn create_relation(
         &self,
         from_entity: &str,
         to_entity: &str,
         relation_type: &str,
         source_agent: Option<&str>,
+        confidence: Option<f64>,
+        explanation: Option<&str>,
+        source_memory_id: Option<&str>,
     ) -> Result<String, OriginError> {
+        // Normalize relation type against vocabulary.
+        // NOTE: resolve_relation_type acquires the conn lock, so we must not hold it here.
+        let canonical = self.resolve_relation_type(relation_type).await?;
+        self.increment_relation_type_count(&canonical).await.ok();
+
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
 
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO relations (id, from_entity, to_entity, relation_type, source_agent, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO relations (id, from_entity, to_entity, relation_type, source_agent, confidence, explanation, source_memory_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             libsql::params![
                 id.clone(),
                 from_entity.to_string(),
                 to_entity.to_string(),
-                relation_type.to_string(),
+                canonical,
                 source_agent.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
+                confidence.map(libsql::Value::Real).unwrap_or(libsql::Value::Null),
+                explanation.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
+                source_memory_id.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
                 now
             ],
         )
@@ -14638,7 +14651,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let rel_id = db
-            .create_relation(&e1, &e2, "works_on", Some("claude"))
+            .create_relation(&e1, &e2, "works_on", Some("claude"), None, None, None)
             .await
             .unwrap();
         assert!(!rel_id.is_empty());
@@ -14661,15 +14674,15 @@ pub(crate) mod tests {
             .unwrap();
 
         let r1 = db
-            .create_relation(&alice, &project, "leads", None)
+            .create_relation(&alice, &project, "leads", None, None, None, None)
             .await
             .unwrap();
         let r2 = db
-            .create_relation(&bob, &project, "contributes_to", None)
+            .create_relation(&bob, &project, "contributes_to", None, None, None, None)
             .await
             .unwrap();
         let r3 = db
-            .create_relation(&alice, &bob, "manages", None)
+            .create_relation(&alice, &bob, "manages", None, None, None, None)
             .await
             .unwrap();
 
@@ -14724,7 +14737,7 @@ pub(crate) mod tests {
 
         // Create relation
         let rel = db
-            .create_relation(&origin, &rust, "uses", Some("claude"))
+            .create_relation(&origin, &rust, "uses", Some("claude"), None, None, None)
             .await
             .unwrap();
         assert!(!rel.is_empty());
@@ -15113,7 +15126,7 @@ pub(crate) mod tests {
         db.add_observation(&alice_id, "Prefers TDD", Some("claude"), Some(0.95))
             .await
             .unwrap();
-        db.create_relation(&alice_id, &origin_id, "works_on", Some("claude"))
+        db.create_relation(&alice_id, &origin_id, "works_on", Some("claude"), None, None, None)
             .await
             .unwrap();
 
@@ -15187,7 +15200,7 @@ pub(crate) mod tests {
         db.add_observation(&alice_id, "Obs", None, None)
             .await
             .unwrap();
-        db.create_relation(&alice_id, &bob_id, "knows", None)
+        db.create_relation(&alice_id, &bob_id, "knows", None, None, None, None)
             .await
             .unwrap();
 
@@ -15866,7 +15879,7 @@ pub(crate) mod tests {
             .store_entity("Bob", "person", None, None, None)
             .await
             .unwrap();
-        let rid = db.create_relation(&e1, &e2, "knows", None).await.unwrap();
+        let rid = db.create_relation(&e1, &e2, "knows", None, None, None, None).await.unwrap();
 
         let conn = db.conn.lock().await;
         let mut rows = conn
@@ -15883,6 +15896,53 @@ pub(crate) mod tests {
             "source_agent should be NULL, got {:?}",
             val
         );
+    }
+
+    // ==================== Knowledge Graph: relation type normalization ====================
+
+    #[tokio::test]
+    async fn test_relation_type_normalized_at_insert() {
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .store_entity("Alice", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        let e2 = db
+            .store_entity("ProjectX", "project", None, Some("test"), None)
+            .await
+            .unwrap();
+
+        // Insert with alias type "working_at" -- should normalize to "works_on"
+        db.create_relation(
+            &e1,
+            &e2,
+            "working_at",
+            Some("test"),
+            Some(0.9),
+            Some("she works there"),
+            Some("mem_1"),
+        )
+        .await
+        .unwrap();
+
+        // Query the relation to verify normalization
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT relation_type, confidence, explanation, source_memory_id FROM relations WHERE from_entity = ?1",
+                libsql::params![e1.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let stored_type: String = row.get(0).unwrap();
+        assert_eq!(stored_type, "works_on", "working_at should normalize to works_on");
+        let stored_conf: f64 = row.get(1).unwrap();
+        assert!((stored_conf - 0.9).abs() < 0.01);
+        let stored_explanation: String = row.get(2).unwrap();
+        assert_eq!(stored_explanation, "she works there");
+        let stored_source_id: String = row.get(3).unwrap();
+        assert_eq!(stored_source_id, "mem_1");
     }
 
     // ==================== load_memories_by_type ====================
