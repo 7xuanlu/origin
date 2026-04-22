@@ -2306,6 +2306,282 @@ pub struct E2ELocomoReport {
     pub results: Vec<E2ELocomoResult>,
 }
 
+// ===== LLM-as-Judge Types =====
+
+/// A single E2E answer to be judged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgmentTuple {
+    pub question: String,
+    pub ground_truth: String,
+    pub approach: String,
+    pub answer: String,
+    pub context_tokens: usize,
+}
+
+/// Result from the LLM judge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgmentResult {
+    pub question: String,
+    pub approach: String,
+    /// 0 or 1.
+    pub score: u8,
+    pub reason: String,
+    pub context_tokens: usize,
+}
+
+/// Per-approach aggregated result in a judged E2E report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgedApproachResult {
+    pub approach: String,
+    /// Fraction of questions scoring 1.
+    pub accuracy: f64,
+    pub total: usize,
+    pub correct: usize,
+    pub mean_context_tokens: f64,
+}
+
+/// Full judged E2E report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgedE2EReport {
+    pub judge_model: String,
+    pub total_judged: usize,
+    pub results_by_approach: Vec<JudgedApproachResult>,
+}
+
+// ===== LLM-as-Judge Functions =====
+
+/// Save E2E answer tuples to JSON for offline judging.
+pub fn save_judgment_tuples(tuples: &[JudgmentTuple], path: &Path) -> Result<(), std::io::Error> {
+    let json = serde_json::to_string_pretty(tuples).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+/// Load previously saved judgment tuples from JSON.
+pub fn load_judgment_tuples(path: &Path) -> Result<Vec<JudgmentTuple>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    serde_json::from_str(&content).map_err(std::io::Error::other)
+}
+
+/// Judge answer tuples using Claude via the `claude -p` CLI.
+///
+/// Requires Claude Code CLI installed (`claude --version` must succeed).
+/// Uses Haiku via the user's existing Max subscription — no API key needed.
+/// Runs up to `concurrency` judgments in parallel.
+pub async fn judge_with_claude(
+    tuples: &[JudgmentTuple],
+    concurrency: usize,
+) -> Result<Vec<JudgmentResult>, OriginError> {
+    use tokio::sync::Semaphore;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+
+    for tuple in tuples {
+        let sem = semaphore.clone();
+        let tuple = tuple.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            judge_single_tuple(&tuple).await
+        });
+        handles.push(handle);
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(e)) => log::warn!("[judge] judgment failed: {}", e),
+            Err(e) => log::warn!("[judge] task panicked: {}", e),
+        }
+    }
+
+    Ok(results)
+}
+
+/// Judge a single (question, ground_truth, answer) tuple via `claude -p`.
+///
+/// Passes the prompt via stdin and disables all tools (`--allowedTools ""`), which
+/// prevents Claude Code's agentic tool-calling loop and gets a direct text/JSON response.
+/// OAuth auth from the user's existing login is used (no API key required).
+pub async fn judge_single_tuple(tuple: &JudgmentTuple) -> Result<JudgmentResult, OriginError> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let prompt = format!(
+        "Question: {}\n\nReference answer: {}\n\nCandidate answer: {}\n\nIs the candidate answer correct? Compare against the reference.",
+        tuple.question, tuple.ground_truth, tuple.answer
+    );
+
+    let json_schema = r#"{"type":"object","properties":{"score":{"type":"integer","enum":[0,1]},"reason":{"type":"string"}},"required":["score","reason"]}"#;
+
+    let system_prompt = "You are an expert evaluator judging answer correctness. \
+        Score 1 if the candidate answer contains the key information from the reference answer \
+        (even if worded differently). Score 0 if the candidate answer is wrong, missing key \
+        information, or irrelevant. Think step by step before scoring.";
+
+    // Pipe the prompt via stdin. Use --allowedTools "" to disable all tool calls so the
+    // model responds directly without entering an agentic loop (which would fail at max-turns).
+    let mut child = Command::new("claude")
+        .args([
+            "-p",
+            "--model",
+            "haiku",
+            "--output-format",
+            "json",
+            "--json-schema",
+            json_schema,
+            "--system-prompt",
+            system_prompt,
+            "--no-session-persistence",
+            "--allowedTools",
+            "",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| OriginError::Generic(format!("claude -p failed to start: {}", e)))?;
+
+    // Write prompt to stdin then close it.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| OriginError::Generic(format!("write to claude stdin failed: {}", e)))?;
+        // drop closes stdin
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| OriginError::Generic(format!("claude -p wait failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout_preview = String::from_utf8_lossy(&output.stdout);
+        return Err(OriginError::Generic(format!(
+            "claude -p exited with error: stderr={} stdout={}",
+            stderr.trim(),
+            stdout_preview.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse the JSON response. `--output-format json` returns an envelope; the structured
+    // output lives in the `structured_output` field when `--json-schema` is used.
+    let parsed: serde_json::Value = parse_judge_json(&stdout)
+        .map_err(|e| OriginError::Generic(format!("judge response parse error: {} — raw: {}", e, stdout)))?;
+
+    let score = parsed.get("score")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u8;
+    let reason = parsed.get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no reason")
+        .to_string();
+
+    Ok(JudgmentResult {
+        question: tuple.question.clone(),
+        approach: tuple.approach.clone(),
+        score,
+        reason,
+        context_tokens: tuple.context_tokens,
+    })
+}
+
+/// Try to extract the judgment JSON object from `claude -p` output.
+///
+/// When `--output-format json` is combined with `--json-schema`, Claude Code returns an
+/// envelope like:
+/// ```json
+/// {"type":"result", "structured_output": {"score":1, "reason":"..."}, ...}
+/// ```
+/// We try several strategies to locate the score/reason object:
+/// 1. `structured_output` field in the envelope (primary path).
+/// 2. `result` field in the envelope (fallback for older CLI versions).
+/// 3. Top-level object if it already contains `score`.
+/// 4. Extract any `{...}` substring (last resort).
+fn parse_judge_json(stdout: &str) -> Result<serde_json::Value, serde_json::Error> {
+    let trimmed = stdout.trim();
+
+    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // Strategy 1: structured_output field (primary — used when --json-schema is set).
+        if let Some(so) = envelope.get("structured_output") {
+            if so.get("score").is_some() {
+                return Ok(so.clone());
+            }
+        }
+        // Strategy 2: result field (text-mode fallback).
+        if let Some(result) = envelope.get("result") {
+            if result.get("score").is_some() {
+                return Ok(result.clone());
+            }
+            // result may be a JSON string — try to parse it.
+            if let Some(s) = result.as_str() {
+                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+                    if inner.get("score").is_some() {
+                        return Ok(inner);
+                    }
+                }
+            }
+        }
+        // Strategy 3: top-level already has score.
+        if envelope.get("score").is_some() {
+            return Ok(envelope);
+        }
+    }
+
+    // Strategy 4: extract the first balanced {...} block.
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start <= end {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                if v.get("score").is_some() {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+
+    // Final fallback: return a parse error to surface the raw output.
+    serde_json::from_str(trimmed)
+}
+
+/// Aggregate judgment results into a report sorted by accuracy descending.
+pub fn aggregate_judgments(results: &[JudgmentResult], judge_model: &str) -> JudgedE2EReport {
+    let mut by_approach: HashMap<String, Vec<&JudgmentResult>> = HashMap::new();
+    for r in results {
+        by_approach.entry(r.approach.clone()).or_default().push(r);
+    }
+
+    let mut approach_results: Vec<JudgedApproachResult> =
+        by_approach.iter().map(|(approach, items)| {
+            let total = items.len();
+            let correct = items.iter().filter(|r| r.score == 1).count();
+            let accuracy = correct as f64 / total.max(1) as f64;
+            let mean_tokens = items.iter().map(|r| r.context_tokens as f64).sum::<f64>()
+                / total.max(1) as f64;
+            JudgedApproachResult {
+                approach: approach.clone(),
+                accuracy,
+                total,
+                correct,
+                mean_context_tokens: mean_tokens,
+            }
+        }).collect();
+
+    approach_results.sort_by(|a, b| {
+        b.accuracy.partial_cmp(&a.accuracy).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    JudgedE2EReport {
+        judge_model: judge_model.to_string(),
+        total_judged: results.len(),
+        results_by_approach: approach_results,
+    }
+}
+
 /// Score an LLM answer against a ground-truth string using keyword overlap.
 ///
 /// Splits the ground truth into words longer than 3 characters and measures
@@ -2340,13 +2616,17 @@ fn score_answer_against_ground_truth(answer: &str, ground_truth: &str) -> f64 {
 /// This function is `async` but LLM calls are routed through the provider's
 /// internal worker thread — no extra `spawn_blocking` needed here.
 ///
-/// Returns an `E2ELocomoReport` with per-approach quality and token stats.
+/// Returns an `(E2ELocomoReport, Vec<JudgmentTuple>)` tuple.
+///
+/// The `JudgmentTuple` list contains raw (question, ground_truth, approach, answer,
+/// context_tokens) records for every answered question. Save them with
+/// [`save_judgment_tuples`] and score offline with [`judge_with_claude`].
 pub async fn run_e2e_locomo_eval(
     locomo_path: &Path,
     max_questions_per_conv: usize,
     search_top_k: usize,
     llm_provider: Arc<dyn crate::llm_provider::LlmProvider>,
-) -> Result<E2ELocomoReport, OriginError> {
+) -> Result<(E2ELocomoReport, Vec<JudgmentTuple>), OriginError> {
     use crate::eval::locomo::{extract_observations, load_locomo};
     use crate::llm_provider::{LlmRequest, strip_think_tags};
 
@@ -2360,6 +2640,9 @@ pub async fn run_e2e_locomo_eval(
         approach_keys.iter().map(|k| (*k, Vec::new())).collect();
     let mut ans_lens: std::collections::HashMap<&str, Vec<f64>> =
         approach_keys.iter().map(|k| (*k, Vec::new())).collect();
+
+    // Collect raw tuples for offline LLM judging.
+    let mut judgment_tuples: Vec<JudgmentTuple> = Vec::new();
 
     let total_convs = samples.len();
 
@@ -2505,6 +2788,13 @@ pub async fn run_e2e_locomo_eval(
                         .get_mut("origin")
                         .unwrap()
                         .push(answer.len() as f64);
+                    judgment_tuples.push(JudgmentTuple {
+                        question: qa.question.clone(),
+                        ground_truth: ground_truth.clone(),
+                        approach: "origin".to_string(),
+                        answer,
+                        context_tokens: origin_ctx_tokens,
+                    });
                 }
                 Err(e) => {
                     log::warn!("[e2e_locomo] origin approach failed: {e}");
@@ -2538,6 +2828,13 @@ pub async fn run_e2e_locomo_eval(
                             .get_mut("full_replay")
                             .unwrap()
                             .push(answer.len() as f64);
+                        judgment_tuples.push(JudgmentTuple {
+                            question: qa.question.clone(),
+                            ground_truth: ground_truth.clone(),
+                            approach: "full_replay".to_string(),
+                            answer,
+                            context_tokens: replay_ctx_tokens,
+                        });
                     }
                     Err(e) => {
                         log::warn!("[e2e_locomo] full_replay approach failed: {e}");
@@ -2569,6 +2866,13 @@ pub async fn run_e2e_locomo_eval(
                         .get_mut("no_context")
                         .unwrap()
                         .push(answer.len() as f64);
+                    judgment_tuples.push(JudgmentTuple {
+                        question: qa.question.clone(),
+                        ground_truth: ground_truth.clone(),
+                        approach: "no_context".to_string(),
+                        answer,
+                        context_tokens: 0,
+                    });
                 }
                 Err(e) => {
                     log::warn!("[e2e_locomo] no_context approach failed: {e}");
@@ -2597,13 +2901,16 @@ pub async fn run_e2e_locomo_eval(
         });
     }
 
-    Ok(E2ELocomoReport {
-        model: llm_provider.name().to_string(),
-        conversations: samples.len(),
-        questions_per_conv: max_questions_per_conv,
-        total_questions,
-        results,
-    })
+    Ok((
+        E2ELocomoReport {
+            model: llm_provider.name().to_string(),
+            conversations: samples.len(),
+            questions_per_conv: max_questions_per_conv,
+            total_questions,
+            results,
+        },
+        judgment_tuples,
+    ))
 }
 
 #[cfg(test)]
@@ -3896,7 +4203,7 @@ mod tests {
             };
         eprintln!("Model loaded. Provider: {}", provider.name());
 
-        let report = run_e2e_locomo_eval(&locomo_path, 5, 10, provider)
+        let (report, _tuples) = run_e2e_locomo_eval(&locomo_path, 5, 10, provider)
             .await
             .unwrap();
 
@@ -3940,5 +4247,154 @@ mod tests {
             origin.mean_answer_score,
             no_ctx.mean_answer_score,
         );
+    }
+
+    /// Judge a single hardcoded tuple via `claude -p` CLI.
+    ///
+    /// Run with:
+    /// cargo test -p origin-core --lib eval::token_efficiency::tests::test_judge_single_tuple -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore] // Requires claude CLI with active Max subscription
+    async fn test_judge_single_tuple() {
+        // Check claude CLI is available.
+        let check = tokio::process::Command::new("claude")
+            .arg("--version")
+            .output()
+            .await;
+        match check {
+            Err(e) => {
+                eprintln!("Skipping: claude CLI not available: {}", e);
+                return;
+            }
+            Ok(out) if !out.status.success() => {
+                eprintln!("Skipping: claude --version failed");
+                return;
+            }
+            Ok(out) => {
+                let ver = String::from_utf8_lossy(&out.stdout);
+                eprintln!("claude CLI: {}", ver.trim());
+            }
+        }
+
+        let tuple = JudgmentTuple {
+            question: "What database does Origin use?".to_string(),
+            ground_truth: "Origin uses libSQL (Turso's SQLite fork)".to_string(),
+            approach: "test".to_string(),
+            answer: "Origin uses libSQL, which is Turso's fork of SQLite, for its database layer."
+                .to_string(),
+            context_tokens: 50,
+        };
+
+        let result = judge_single_tuple(&tuple).await.unwrap();
+        eprintln!("Score: {}, Reason: {}", result.score, result.reason);
+        assert_eq!(result.score, 1, "correct answer should score 1");
+    }
+
+    /// E2E LoCoMo eval with Claude Haiku judge (two-phase: generate then judge).
+    ///
+    /// Phase 1: run on-device Qwen3-4B to collect raw answers and tuples.
+    /// Phase 2: feed tuples to `claude -p haiku` as binary judge.
+    ///
+    /// Run with:
+    /// cargo test -p origin-core --lib eval::token_efficiency::tests::benchmark_e2e_locomo_judged -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore] // Requires on-device Qwen3-4B model AND claude CLI with Max subscription (~15 min)
+    async fn benchmark_e2e_locomo_judged() {
+        use crate::llm_provider::OnDeviceProvider;
+        use crate::on_device_models;
+
+        // Check model available.
+        let model_spec = on_device_models::get_default_model();
+        if !on_device_models::is_cached(model_spec) {
+            eprintln!(
+                "Skipping: {} not found in hf-hub cache. Download it first.",
+                model_spec.display_name
+            );
+            return;
+        }
+
+        // Check claude CLI available.
+        let check = tokio::process::Command::new("claude")
+            .arg("--version")
+            .output()
+            .await;
+        match check {
+            Err(e) => {
+                eprintln!("Skipping: claude CLI not available: {}", e);
+                return;
+            }
+            Ok(out) if !out.status.success() => {
+                eprintln!("Skipping: claude --version failed");
+                return;
+            }
+            Ok(out) => {
+                let ver = String::from_utf8_lossy(&out.stdout);
+                eprintln!("claude CLI: {}", ver.trim());
+            }
+        }
+
+        let locomo_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("app/eval/data/locomo10.json");
+
+        if !locomo_path.exists() {
+            eprintln!("Skipping: locomo10.json not found at {:?}", locomo_path);
+            return;
+        }
+
+        // Phase 1: run E2E eval to collect tuples.
+        eprintln!("Loading {} ...", model_spec.display_name);
+        let provider: Arc<dyn crate::llm_provider::LlmProvider> =
+            match tokio::task::spawn_blocking(|| OnDeviceProvider::new()).await {
+                Ok(Ok(p)) => Arc::new(p),
+                Ok(Err(e)) => {
+                    eprintln!("Skipping: LLM provider init failed: {}", e);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Skipping: spawn_blocking panicked: {}", e);
+                    return;
+                }
+            };
+        eprintln!("Model loaded. Provider: {}", provider.name());
+
+        eprintln!("Phase 1: generating answers (5 questions/conv)...");
+        let (_keyword_report, tuples) = run_e2e_locomo_eval(&locomo_path, 5, 10, provider)
+            .await
+            .unwrap();
+
+        eprintln!("Collected {} tuples. Saving to tempdir...", tuples.len());
+        let tmp = tempfile::tempdir().unwrap();
+        let tuples_path = tmp.path().join("judgment_tuples.json");
+        save_judgment_tuples(&tuples, &tuples_path).unwrap();
+        eprintln!("Saved tuples to {:?}", tuples_path);
+
+        // Phase 2: judge with Claude Haiku via `claude -p`.
+        eprintln!("Phase 2: judging {} tuples with Claude Haiku (concurrency=3)...", tuples.len());
+        let results = judge_with_claude(&tuples, 3).await.unwrap();
+        eprintln!("Judged {} / {} tuples.", results.len(), tuples.len());
+
+        // Aggregate and print.
+        let report = aggregate_judgments(&results, "haiku");
+        eprintln!("\n=== E2E Answer Quality: LoCoMo (Claude Haiku Judge) ===");
+        eprintln!(
+            "{:<20} | {:<10} | {:<10} | {:<14} | {}",
+            "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+        );
+        eprintln!("{:-<20}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+        for r in &report.results_by_approach {
+            eprintln!(
+                "{:<20} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+                r.approach,
+                r.accuracy * 100.0,
+                r.correct,
+                r.mean_context_tokens,
+                r.total
+            );
+        }
+        eprintln!("\nTotal judged: {}", report.total_judged);
     }
 }
