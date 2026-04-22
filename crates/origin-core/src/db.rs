@@ -7295,6 +7295,31 @@ impl MemoryDB {
         Ok(entities)
     }
 
+    /// Refresh an entity's embedding by recomputing from the provided text.
+    /// Also updates `embedding_updated_at` and `updated_at` timestamps.
+    pub async fn refresh_entity_embedding(
+        &self,
+        entity_id: &str,
+        text: &str,
+    ) -> Result<(), OriginError> {
+        let embeddings = self.generate_embeddings(&[text.to_string()])?;
+        if embeddings.is_empty() {
+            return Err(OriginError::VectorDb(
+                "refresh_entity_embedding: empty embedding result".into(),
+            ));
+        }
+        let vec_str = Self::vec_to_sql(&embeddings[0]);
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE entities SET embedding = vector32(?1), embedding_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+            libsql::params![vec_str, now, entity_id.to_string()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("refresh_entity_embedding: {}", e)))?;
+        Ok(())
+    }
+
     /// Add an observation to an entity.
     pub async fn add_observation(
         &self,

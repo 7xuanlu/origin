@@ -156,6 +156,9 @@ fn d_13_f32() -> f32 {
 fn d_30_i64() -> i64 {
     30
 }
+fn d_168_u64() -> u64 {
+    168
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -225,6 +228,8 @@ pub struct RefineryConfig {
     pub consolidation_batch_size: usize,
     #[serde(default = "d_30_i64")]
     pub batch_window_secs: i64,
+    #[serde(default = "d_168_u64")]
+    pub kg_rethink_interval_hours: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -416,6 +421,7 @@ impl Default for RefineryConfig {
             consolidation_confidence_threshold: d_03(),
             consolidation_batch_size: d_10_usize(),
             batch_window_secs: d_30_i64(),
+            kg_rethink_interval_hours: d_168_u64(),
         }
     }
 }
@@ -568,6 +574,7 @@ mod tests {
         assert_eq!(cfg.refinery.consolidation_confidence_threshold, 0.3);
         assert_eq!(cfg.refinery.consolidation_batch_size, 10);
         assert_eq!(cfg.refinery.batch_window_secs, 30);
+        assert_eq!(cfg.refinery.kg_rethink_interval_hours, 168);
         // Narrative
         assert_eq!(cfg.narrative.stale_secs, 86400);
         assert_eq!(cfg.narrative.max_memories, 12);
