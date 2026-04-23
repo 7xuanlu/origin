@@ -147,13 +147,13 @@ pub async fn run_rethink(
     _llm: Option<&Arc<dyn LlmProvider>>,
     _config: &RefineryConfig,
 ) -> Result<RethinkReport, OriginError> {
-    let mut report = RethinkReport::default();
-
-    report.merge_candidates = find_merge_candidates(db).await?;
-    report.types_normalized = normalize_non_vocabulary_relations(db).await?;
-    report.embeddings_refreshed = refresh_stale_entity_embeddings(db).await?;
-    report.stale_relations_flagged = detect_stale_relations(db).await?;
-    report.contradictions_found = scan_contradictions(db).await?;
+    let report = RethinkReport {
+        merge_candidates: find_merge_candidates(db).await?,
+        types_normalized: normalize_non_vocabulary_relations(db).await?,
+        embeddings_refreshed: refresh_stale_entity_embeddings(db).await?,
+        stale_relations_flagged: detect_stale_relations(db).await?,
+        contradictions_found: scan_contradictions(db).await?,
+    };
 
     Ok(report)
 }
@@ -322,7 +322,11 @@ pub async fn refresh_stale_entity_embeddings(db: &MemoryDB) -> Result<usize, Ori
                 refreshed += 1;
                 log::info!("[rethink] refreshed embedding for entity '{}'", name);
             }
-            Err(e) => log::warn!("[rethink] refresh_entity_embedding failed for '{}': {}", name, e),
+            Err(e) => log::warn!(
+                "[rethink] refresh_entity_embedding failed for '{}': {}",
+                name,
+                e
+            ),
         }
     }
     Ok(refreshed)
@@ -403,12 +407,9 @@ mod tests {
     async fn test_db() -> (MemoryDB, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = MemoryDB::new(
-            db_path.as_path(),
-            Arc::new(crate::events::NoopEmitter),
-        )
-        .await
-        .unwrap();
+        let db = MemoryDB::new(db_path.as_path(), Arc::new(crate::events::NoopEmitter))
+            .await
+            .unwrap();
         (db, dir)
     }
 
@@ -476,9 +477,13 @@ mod tests {
             .store_entity("Rust", "technology", None, Some("test"), None)
             .await
             .unwrap();
-        let result = verify_entity(&db, &id, "completely unrelated query that won't match Rust at all")
-            .await
-            .unwrap();
+        let result = verify_entity(
+            &db,
+            &id,
+            "completely unrelated query that won't match Rust at all",
+        )
+        .await
+        .unwrap();
         // With only one entity in the DB, vector search should still return it as
         // closest result even for an unrelated query, so this may still pass.
         // The important thing is the function executes without error.
@@ -646,7 +651,10 @@ mod tests {
                 .unwrap();
             while let Some(row) = rows.next().await.unwrap() {
                 let rt: String = row.get::<String>(0).unwrap();
-                assert_eq!(rt, "works_on", "expected all relations normalized to 'works_on'");
+                assert_eq!(
+                    rt, "works_on",
+                    "expected all relations normalized to 'works_on'"
+                );
             }
         }
 
@@ -656,11 +664,9 @@ mod tests {
 
         // 6. Relation verification
         assert!(verify_relation(&db, &id1, &proj, "works_on").await.unwrap());
-        assert!(
-            !verify_relation(&db, "nonexistent", &proj, "works_on")
-                .await
-                .unwrap()
-        );
+        assert!(!verify_relation(&db, "nonexistent", &proj, "works_on")
+            .await
+            .unwrap());
 
         // 7. Rethink completes successfully
         let config = RefineryConfig::default();

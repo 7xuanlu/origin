@@ -130,6 +130,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 'Origin v__VERSION__'
+          releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           releaseBody: |
             ## Install

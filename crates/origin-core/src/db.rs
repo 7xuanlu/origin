@@ -3771,7 +3771,12 @@ impl MemoryDB {
                                 (),
                             )
                             .await
-                            .map_err(|e| OriginError::VectorDb(format!("migration 41 add {}.{}: {e}", table, col)))?;
+                            .map_err(|e| {
+                                OriginError::VectorDb(format!(
+                                    "migration 41 add {}.{}: {e}",
+                                    table, col
+                                ))
+                            })?;
                         }
                     }
                 }
@@ -3797,7 +3802,9 @@ impl MemoryDB {
                         (),
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("migration 41 dedup relations: {e}")))?;
+                    .map_err(|e| {
+                        OriginError::VectorDb(format!("migration 41 dedup relations: {e}"))
+                    })?;
 
                     // 7. Unique index on relations
                     conn.execute_batch(
@@ -3805,7 +3812,9 @@ impl MemoryDB {
                              ON relations(from_entity, to_entity, relation_type);",
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("migration 41 relations unique idx: {e}")))?;
+                    .map_err(|e| {
+                        OriginError::VectorDb(format!("migration 41 relations unique idx: {e}"))
+                    })?;
 
                     conn.execute("PRAGMA user_version = 41", ())
                         .await
@@ -3942,7 +3951,9 @@ impl MemoryDB {
                     libsql::params![loser_id.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 41 del loser aliases: {e}")))?;
+                .map_err(|e| {
+                    OriginError::VectorDb(format!("migration 41 del loser aliases: {e}"))
+                })?;
 
                 // Delete the loser entity
                 conn.execute(
@@ -7318,10 +7329,7 @@ impl MemoryDB {
     }
 
     /// Resolve an entity ID from an alias (case-insensitive).
-    pub async fn resolve_entity_by_alias(
-        &self,
-        name: &str,
-    ) -> Result<Option<String>, OriginError> {
+    pub async fn resolve_entity_by_alias(&self, name: &str) -> Result<Option<String>, OriginError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
@@ -7372,7 +7380,9 @@ impl MemoryDB {
                 libsql::params![lower.clone()],
             )
             .await
-            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type canonical: {}", e)))?;
+            .map_err(|e| {
+                OriginError::VectorDb(format!("resolve_relation_type canonical: {}", e))
+            })?;
         if rows
             .next()
             .await
@@ -7526,6 +7536,7 @@ impl MemoryDB {
     /// before insertion. On conflict (same from/to/type), updates confidence if higher
     /// and fills in explanation/source_memory_id if previously null.
     /// Returns the ID of the inserted or existing relation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_relation(
         &self,
         from_entity: &str,
@@ -15954,9 +15965,17 @@ pub(crate) mod tests {
         db.add_observation(&alice_id, "Prefers TDD", Some("claude"), Some(0.95))
             .await
             .unwrap();
-        db.create_relation(&alice_id, &origin_id, "works_on", Some("claude"), None, None, None)
-            .await
-            .unwrap();
+        db.create_relation(
+            &alice_id,
+            &origin_id,
+            "works_on",
+            Some("claude"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let detail = db.get_entity_detail(&alice_id).await.unwrap();
         assert_eq!(detail.entity.name, "Alice");
@@ -16707,7 +16726,10 @@ pub(crate) mod tests {
             .store_entity("Bob", "person", None, None, None)
             .await
             .unwrap();
-        let rid = db.create_relation(&e1, &e2, "knows", None, None, None, None).await.unwrap();
+        let rid = db
+            .create_relation(&e1, &e2, "knows", None, None, None, None)
+            .await
+            .unwrap();
 
         let conn = db.conn.lock().await;
         let mut rows = conn
@@ -16764,7 +16786,10 @@ pub(crate) mod tests {
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         let stored_type: String = row.get(0).unwrap();
-        assert_eq!(stored_type, "works_on", "working_at should normalize to works_on");
+        assert_eq!(
+            stored_type, "works_on",
+            "working_at should normalize to works_on"
+        );
         let stored_conf: f64 = row.get(1).unwrap();
         assert!((stored_conf - 0.9).abs() < 0.01);
         let stored_explanation: String = row.get(2).unwrap();
@@ -21016,10 +21041,7 @@ pub(crate) mod tests {
 
         // 2. relation_type_vocabulary has >= 15 seed entries
         let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM relation_type_vocabulary",
-                (),
-            )
+            .query("SELECT COUNT(*) FROM relation_type_vocabulary", ())
             .await
             .expect("relation_type_vocabulary table should exist after migration 40");
         let row = rows.next().await.unwrap().unwrap();
@@ -21042,10 +21064,7 @@ pub(crate) mod tests {
 
         // 4. entities table has embedding_updated_at column
         let _rows = conn
-            .query(
-                "SELECT id, embedding_updated_at FROM entities LIMIT 1",
-                (),
-            )
+            .query("SELECT id, embedding_updated_at FROM entities LIMIT 1", ())
             .await
             .expect("entities should have embedding_updated_at column after migration 40");
         drop(_rows);

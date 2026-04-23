@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Pre-push: running full test suite with coverage..."
+echo "Pre-push: running clippy + full test suite with coverage..."
+
+# Clippy lint check (catches errors that only show up in CI)
+echo "  Running Clippy..."
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 || {
+    echo "FAIL: Clippy warnings found. Fix before pushing."
+    exit 1
+}
 
 # Check for cargo-llvm-cov
 if ! command -v cargo-llvm-cov &> /dev/null && ! cargo llvm-cov --version &> /dev/null 2>&1; then

@@ -9,6 +9,12 @@ HAS_RUST=$(echo "$STAGED_FILES" | grep -q '\.rs$' && echo "yes" || echo "no")
 HAS_FRONTEND=$(echo "$STAGED_FILES" | grep -qE '\.(ts|tsx)$' && echo "yes" || echo "no")
 
 if [ "$HAS_RUST" = "yes" ]; then
+    echo "  Checking Rust formatting..."
+    cargo fmt --check --all 2>&1 || {
+        echo "FAIL: Rust formatting. Run 'cargo fmt --all' to fix."
+        exit 1
+    }
+
     echo "  Checking Rust compilation..."
     (cd app && cargo check --lib 2>&1) || {
         echo "FAIL: Rust compilation errors. Fix before committing."
