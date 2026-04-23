@@ -1380,3 +1380,37 @@ async fn benchmark_longmemeval_pipeline() {
         "Flat/Origin NDCG should be > 0"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Context path eval: recall vs context coverage comparison
+// ---------------------------------------------------------------------------
+
+/// Compare recall (search_memory only) vs context (search + concepts + graph).
+/// Requires Metal GPU for enrichment/distillation. Run with sandbox disabled.
+#[tokio::test]
+#[ignore]
+async fn benchmark_context_path() {
+    use origin_lib::eval::token_efficiency::run_context_path_eval;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    // 1 conversation for quick validation, 10 for full benchmark
+    let report = run_context_path_eval(&locomo_path, llm, 10, 1)
+        .await
+        .expect("run_context_path_eval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    assert!(report.total_questions > 0);
+}
