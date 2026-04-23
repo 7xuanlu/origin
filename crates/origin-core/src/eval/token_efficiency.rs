@@ -3186,89 +3186,52 @@ async fn count_corpus_tokens(db: &MemoryDB) -> Result<(usize, usize), OriginErro
 
 /// Expand evidence sets to include merged/distilled source_ids.
 ///
-/// For each evidence source_id, check if it was consumed by a distillation cluster.
-/// If so, add the merged source_id to the evidence set so NDCG gives credit for
-/// retrieving the distilled version.
+/// Expand evidence sets to include concept source_ids via the `concept_sources` join table.
+///
+/// After distillation, concepts link to their source memories via `concept_sources` (PR4).
+/// For each evidence source_id, check if any concept consumed it. If so, add the concept's
+/// merged memory source_id to the evidence set so NDCG credits distilled retrieval.
 async fn expand_evidence_for_distillation(
     db: &MemoryDB,
     original_evidence: &[HashSet<String>],
 ) -> Result<Vec<HashSet<String>>, OriginError> {
     let conn = db.conn.lock().await;
 
-    // Get all merged memories with their contributing source_ids from the DB.
-    // The distill_concepts function stores contributing source_ids as a JSON array
-    // in the metadata field, or links them via entities/observations.
-    // Let's check memories table directly for merged entries.
-    let mut merged_rows = conn
+    // Build reverse map: memory_source_id -> [concept merged source_ids]
+    // Uses the concept_sources join table (PR4) for precise lineage tracking.
+    let mut rows = conn
         .query(
-            "SELECT source_id, content FROM memories \
-             WHERE source_id LIKE 'merged_%' AND chunk_index = 0",
+            "SELECT cs.memory_source_id, m.source_id AS concept_mem_sid \
+             FROM concept_sources cs \
+             JOIN concepts c ON cs.concept_id = c.id \
+             JOIN memories m ON m.source_id LIKE 'merged_%' \
+               AND m.chunk_index = 0 \
+               AND m.entity_id = c.entity_id \
+             WHERE c.status = 'active'",
             (),
         )
         .await
-        .map_err(|e| OriginError::Generic(format!("expand_evidence merged: {e}")))?;
+        .map_err(|e| OriginError::Generic(format!("expand_evidence: {e}")))?;
 
-    let mut merged_contents: Vec<(String, String)> = Vec::new();
-    while let Some(row) = merged_rows
+    let mut mem_to_concepts: HashMap<String, Vec<String>> = HashMap::new();
+    while let Some(row) = rows
         .next()
         .await
         .map_err(|e| OriginError::Generic(e.to_string()))?
     {
-        let source_id: String = row
-            .get(0)
-            .map_err(|e| OriginError::Generic(e.to_string()))?;
-        let content: String = row
-            .get(1)
-            .map_err(|e| OriginError::Generic(e.to_string()))?;
-        merged_contents.push((source_id, content));
+        let memory_sid: String = row.get(0).map_err(|e| OriginError::Generic(e.to_string()))?;
+        let concept_sid: String = row.get(1).map_err(|e| OriginError::Generic(e.to_string()))?;
+        mem_to_concepts.entry(memory_sid).or_default().push(concept_sid);
     }
-    drop(merged_rows);
-
-    // Also get original memory contents for matching
-    let mut orig_rows = conn
-        .query(
-            "SELECT source_id, content FROM memories \
-             WHERE source_id NOT LIKE 'merged_%' AND chunk_index = 0",
-            (),
-        )
-        .await
-        .map_err(|e| OriginError::Generic(format!("expand_evidence orig: {e}")))?;
-
-    let mut orig_contents: HashMap<String, String> = HashMap::new();
-    while let Some(row) = orig_rows
-        .next()
-        .await
-        .map_err(|e| OriginError::Generic(e.to_string()))?
-    {
-        let source_id: String = row
-            .get(0)
-            .map_err(|e| OriginError::Generic(e.to_string()))?;
-        let content: String = row
-            .get(1)
-            .map_err(|e| OriginError::Generic(e.to_string()))?;
-        orig_contents.insert(source_id, content);
-    }
-    drop(orig_rows);
+    drop(rows);
     drop(conn);
 
-    // For each merged memory, check if it contains content from any evidence source.
-    // Use substring matching: if the original memory's content appears within the
-    // merged memory's content, the merged memory covers that evidence.
     let mut expanded: Vec<HashSet<String>> = original_evidence.to_vec();
-
     for evidence_set in &mut expanded {
         let mut additions: Vec<String> = Vec::new();
         for evidence_id in evidence_set.iter() {
-            if let Some(orig_content) = orig_contents.get(evidence_id) {
-                for (merged_id, merged_content) in &merged_contents {
-                    // If the original content is substantively present in the merged content,
-                    // the merged memory covers this evidence.
-                    if merged_content.contains(orig_content)
-                        || content_overlap_high(orig_content, merged_content)
-                    {
-                        additions.push(merged_id.clone());
-                    }
-                }
+            if let Some(concept_sids) = mem_to_concepts.get(evidence_id) {
+                additions.extend(concept_sids.iter().cloned());
             }
         }
         for a in additions {
@@ -3277,31 +3240,6 @@ async fn expand_evidence_for_distillation(
     }
 
     Ok(expanded)
-}
-
-/// Extract a JSON array from a response that may have markdown fences or extra text.
-fn extract_json_array_from_response(text: &str) -> String {
-    // Try to find JSON array between [ and ]
-    if let Some(start) = text.find('[') {
-        if let Some(end) = text.rfind(']') {
-            if end > start {
-                return text[start..=end].to_string();
-            }
-        }
-    }
-    text.to_string()
-}
-
-/// Check if two texts have high word overlap (>60% of shorter text's words in longer).
-fn content_overlap_high(a: &str, b: &str) -> bool {
-    let words_a: HashSet<&str> = a.split_whitespace().collect();
-    let words_b: HashSet<&str> = b.split_whitespace().collect();
-    let intersection = words_a.intersection(&words_b).count();
-    let shorter = words_a.len().min(words_b.len());
-    if shorter == 0 {
-        return false;
-    }
-    intersection as f64 / shorter as f64 > 0.6
 }
 
 /// Run LoCoMo through Origin's full pipeline: flat, enriched, distilled.
@@ -3894,127 +3832,40 @@ pub async fn run_longmemeval_pipeline_eval(
     })
 }
 
-/// Run entity extraction for eval purposes (simplified: extract entities from batches).
+/// Run entity extraction using Origin's production pipeline (refinery path).
+///
+/// Uses `extract_entities_from_memories` which calls `extract_single_memory_entities`
+/// with the production EXTRACT_KNOWLEDGE_GRAPH prompt (PR5) and proper Qwen chat
+/// template formatting. Much more reliable than the old custom JSON extraction.
+///
+/// Runs in batches of `batch_size` unlinked memories until all are processed.
 async fn run_entity_extraction_for_eval(
     db: &MemoryDB,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
 ) -> Result<usize, OriginError> {
-    use crate::llm_provider::LlmRequest;
+    use crate::prompts::PromptRegistry;
 
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT source_id, content FROM memories \
-             WHERE chunk_index = 0 AND entity_id IS NULL \
-             ORDER BY last_modified DESC LIMIT 500",
-            (),
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let batch_size = 10;
+    let mut total = 0usize;
+
+    // Keep extracting until no unlinked memories remain (or no progress)
+    loop {
+        let extracted = crate::refinery::extract_entities_from_memories(
+            db,
+            Some(llm),
+            &prompts,
+            batch_size,
         )
-        .await
-        .map_err(|e| OriginError::Generic(format!("entity_extract fetch: {e}")))?;
-
-    let mut memories_to_extract: Vec<(String, String)> = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| OriginError::Generic(e.to_string()))?
-    {
-        let source_id: String = row
-            .get(0)
-            .map_err(|e| OriginError::Generic(e.to_string()))?;
-        let content: String = row
-            .get(1)
-            .map_err(|e| OriginError::Generic(e.to_string()))?;
-        memories_to_extract.push((source_id, content));
-    }
-    drop(rows);
-    drop(conn);
-
-    if memories_to_extract.is_empty() {
-        return Ok(0);
-    }
-
-    // Batch memories into groups of 5 for extraction efficiency
-    let mut total_entities = 0usize;
-    for batch in memories_to_extract.chunks(5) {
-        let combined = batch
-            .iter()
-            .map(|(sid, content)| format!("[{}] {}", sid, content))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        let request = LlmRequest {
-            system_prompt: Some(
-                "Extract named entities (people, places, organizations, topics) from these memories. \
-                 Return ONLY a JSON array: [{\"name\": \"...\", \"type\": \"person|place|org|topic\"}]. \
-                 Only extract clearly named entities. No markdown, no explanation.\n/no_think"
-                    .to_string(),
-            ),
-            user_prompt: combined,
-            max_tokens: 500,
-            temperature: 0.1,
-            label: Some("eval_entity_extract".to_string()),
-        };
-
-        match llm.generate(request).await {
-            Ok(response) => {
-                let cleaned = crate::llm_provider::strip_think_tags(&response);
-                // Try to extract JSON array from the response (may have markdown fences)
-                let json_str = extract_json_array_from_response(&cleaned);
-                let parse_result = serde_json::from_str::<Vec<serde_json::Value>>(&json_str);
-                match parse_result {
-                    Err(e) => {
-                        eprintln!(
-                            "    [entity_extract] JSON parse failed: {e}\n      raw: {}\n      cleaned: {}",
-                            &response.chars().take(200).collect::<String>(),
-                            &json_str.chars().take(200).collect::<String>(),
-                        );
-                    }
-                    Ok(entities) => {
-                        for entity_val in &entities {
-                            if let Some(name) = entity_val.get("name").and_then(|n| n.as_str()) {
-                                let entity_type = entity_val
-                                    .get("type")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("topic");
-
-                                let entity_id =
-                                    match db.resolve_entity_by_name(name).await? {
-                                        Some(id) => id,
-                                        None => {
-                                            db.store_entity(
-                                                name,
-                                                entity_type,
-                                                Some("conversation"),
-                                                Some("eval"),
-                                                None,
-                                            )
-                                            .await?
-                                        }
-                                    };
-
-                                for (sid, content) in batch {
-                                    if content
-                                        .to_lowercase()
-                                        .contains(&name.to_lowercase())
-                                    {
-                                        let _ = db
-                                            .update_memory_entity_id(sid, &entity_id)
-                                            .await;
-                                    }
-                                }
-                                total_entities += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("[eval] entity extraction failed: {e}");
-            }
+        .await?;
+        if extracted == 0 {
+            break;
         }
+        total += extracted;
+        eprintln!("    [entity_extract] batch: +{} entities (total: {})", extracted, total);
     }
 
-    Ok(total_entities)
+    Ok(total)
 }
 
 #[cfg(test)]
