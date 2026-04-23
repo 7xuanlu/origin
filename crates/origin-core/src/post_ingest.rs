@@ -205,18 +205,15 @@ pub async fn run_post_ingest_enrichment(
         .await
         .unwrap_or(entity_id.map(|s| s.to_string()));
     if let Some(ref eid) = final_entity_id {
-        match db.get_entity_detail(eid).await {
-            Ok(detail) => {
-                match crate::kg_quality::verify_entity(db, eid, &detail.entity.name).await {
-                    Ok(ref result) => {
-                        for warning in &result.warnings {
-                            log::warn!("[post_ingest] {}", warning);
-                        }
+        if let Ok(detail) = db.get_entity_detail(eid).await {
+            match crate::kg_quality::verify_entity(db, eid, &detail.entity.name).await {
+                Ok(ref result) => {
+                    for warning in &result.warnings {
+                        log::warn!("[post_ingest] {}", warning);
                     }
-                    Err(e) => log::warn!("[post_ingest] entity verification failed: {e}"),
                 }
+                Err(e) => log::warn!("[post_ingest] entity verification failed: {e}"),
             }
-            Err(_) => {} // Entity not found, skip verification
         }
     }
 
