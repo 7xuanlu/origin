@@ -24,7 +24,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
 
-          CARGO_VERSION=$(grep '^version = ' app/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          CARGO_VERSION=$(grep '^version = ' app/Cargo.toml | head -1 | sed 's/version = "\([^"]*\)".*/\1/')
           TAURI_VERSION=$(node -p "require('./app/tauri.conf.json').version")
           PKG_VERSION=$(node -p "require('./package.json').version")
 
