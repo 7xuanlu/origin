@@ -3621,17 +3621,42 @@ impl MemoryDB {
                             ('discussed_in', '[\"mentioned_in\",\"referenced_in\"]', 'structural', 0),
                             ('related_to', '[\"associated_with\",\"connected_to\"]', 'structural', 0);
 
-                        -- 3. New columns on relations
-                        ALTER TABLE relations ADD COLUMN confidence REAL;
-                        ALTER TABLE relations ADD COLUMN explanation TEXT;
-                        ALTER TABLE relations ADD COLUMN source_memory_id TEXT;
-
-                        -- 4. New column on entities
-                        ALTER TABLE entities ADD COLUMN embedding_updated_at INTEGER;
+                        -- 3. New columns on relations (idempotent via INSERT trick)
+                        -- SQLite lacks IF NOT EXISTS for ALTER TABLE, so we check the schema.
                         ",
                     )
                     .await
                     .map_err(|e| OriginError::VectorDb(format!("migration 40 DDL: {e}")))?;
+
+                    // Add columns idempotently -- check if they exist first.
+                    for (table, col, col_type) in [
+                        ("relations", "confidence", "REAL"),
+                        ("relations", "explanation", "TEXT"),
+                        ("relations", "source_memory_id", "TEXT"),
+                        ("entities", "embedding_updated_at", "INTEGER"),
+                    ] {
+                        let has_col: bool = {
+                            let mut rows = conn
+                                .query(
+                                    &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = ?1", table),
+                                    libsql::params![col.to_string()],
+                                )
+                                .await
+                                .map_err(|e| OriginError::VectorDb(format!("migration 40 col check: {e}")))?;
+                            match rows.next().await {
+                                Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+                                _ => false,
+                            }
+                        };
+                        if !has_col {
+                            conn.execute(
+                                &format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type),
+                                (),
+                            )
+                            .await
+                            .map_err(|e| OriginError::VectorDb(format!("migration 40 add {}.{}: {e}", table, col)))?;
+                        }
+                    }
                 }
                 // conn guard is dropped here so dedup helpers can re-acquire
 
@@ -7196,17 +7221,18 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Resolve a relation type string against the vocabulary.
+    /// Resolve a relation type string against the vocabulary (case-insensitive).
     /// Returns the canonical form if the input matches a canonical or an alias,
-    /// otherwise returns the input unchanged.
+    /// otherwise returns the input unchanged (lowercased).
     pub async fn resolve_relation_type(&self, relation_type: &str) -> Result<String, OriginError> {
+        let lower = relation_type.to_lowercase();
         let conn = self.conn.lock().await;
 
-        // Check if input is already a canonical key.
+        // Check if input is already a canonical key (canonicals are lowercase).
         let mut rows = conn
             .query(
                 "SELECT canonical FROM relation_type_vocabulary WHERE canonical = ?1",
-                libsql::params![relation_type.to_string()],
+                libsql::params![lower.clone()],
             )
             .await
             .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type canonical: {}", e)))?;
@@ -7216,11 +7242,11 @@ impl MemoryDB {
             .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type row: {}", e)))?
             .is_some()
         {
-            return Ok(relation_type.to_string());
+            return Ok(lower);
         }
         drop(rows);
 
-        // Scan aliases JSON arrays for a match.
+        // Scan aliases JSON arrays for a case-insensitive match.
         let mut rows = conn
             .query(
                 "SELECT canonical, aliases FROM relation_type_vocabulary WHERE aliases IS NOT NULL",
@@ -7238,7 +7264,7 @@ impl MemoryDB {
             if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(&aliases_json) {
                 for v in &arr {
                     if let Some(alias) = v.as_str() {
-                        if alias == relation_type {
+                        if alias.to_lowercase() == lower {
                             return Ok(canonical);
                         }
                     }
@@ -7246,8 +7272,8 @@ impl MemoryDB {
             }
         }
 
-        // Not found — return input unchanged.
-        Ok(relation_type.to_string())
+        // Not found — return lowercased input unchanged.
+        Ok(lower)
     }
 
     /// Increment the usage count for a canonical relation type.
@@ -7360,7 +7386,9 @@ impl MemoryDB {
 
     /// Create a relation between two entities.
     /// The relation type is normalized against the vocabulary via `resolve_relation_type`
-    /// before insertion. Duplicate relations (same from/to/type) are silently ignored.
+    /// before insertion. On conflict (same from/to/type), updates confidence if higher
+    /// and fills in explanation/source_memory_id if previously null.
+    /// Returns the ID of the inserted or existing relation.
     pub async fn create_relation(
         &self,
         from_entity: &str,
@@ -7374,20 +7402,29 @@ impl MemoryDB {
         // Normalize relation type against vocabulary.
         // NOTE: resolve_relation_type acquires the conn lock, so we must not hold it here.
         let canonical = self.resolve_relation_type(relation_type).await?;
-        self.increment_relation_type_count(&canonical).await.ok();
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
 
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT OR IGNORE INTO relations (id, from_entity, to_entity, relation_type, source_agent, confidence, explanation, source_memory_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+
+        // Upsert: insert new or update existing if new confidence is higher.
+        let affected = conn.execute(
+            "INSERT INTO relations (id, from_entity, to_entity, relation_type, source_agent, confidence, explanation, source_memory_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(from_entity, to_entity, relation_type) DO UPDATE SET
+                 confidence = CASE
+                     WHEN EXCLUDED.confidence IS NOT NULL AND (confidence IS NULL OR EXCLUDED.confidence > confidence)
+                     THEN EXCLUDED.confidence ELSE confidence END,
+                 explanation = CASE
+                     WHEN EXCLUDED.confidence IS NOT NULL AND (confidence IS NULL OR EXCLUDED.confidence > confidence)
+                     THEN COALESCE(EXCLUDED.explanation, explanation) ELSE explanation END,
+                 source_memory_id = COALESCE(EXCLUDED.source_memory_id, source_memory_id)",
             libsql::params![
                 id.clone(),
                 from_entity.to_string(),
                 to_entity.to_string(),
-                canonical,
+                canonical.clone(),
                 source_agent.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
                 confidence.map(libsql::Value::Real).unwrap_or(libsql::Value::Null),
                 explanation.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
@@ -7398,6 +7435,32 @@ impl MemoryDB {
         .await
         .map_err(|e| OriginError::VectorDb(format!("create_relation: {}", e)))?;
 
+        // Only increment vocabulary count for genuinely new relations.
+        if affected > 0 {
+            // Check if this was an insert (the id we generated exists) vs an update.
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    libsql::params![from_entity.to_string(), to_entity.to_string(), canonical.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("create_relation check: {}", e)))?;
+            let existing_id = match rows.next().await {
+                Ok(Some(row)) => row.get::<String>(0).unwrap_or(id.clone()),
+                _ => id.clone(),
+            };
+            drop(rows);
+            drop(conn);
+
+            // Only count new inserts (our generated id matches the stored id).
+            if existing_id == id {
+                self.increment_relation_type_count(&canonical).await.ok();
+            }
+
+            return Ok(existing_id);
+        }
+
+        drop(conn);
         Ok(id)
     }
 
