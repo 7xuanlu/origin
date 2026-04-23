@@ -2,7 +2,7 @@
 
 > *"A large fraction of my recent token throughput is going less into manipulating code, and more into manipulating knowledge. The LLM is rediscovering knowledge from scratch on every question. There's no accumulation."* -- [Andrej Karpathy](https://x.com/karpathy/status/2039805659525644595), April 2026
 
-Origin is a local-first companion for people who work with AI every day. It's where your AI thinking takes shape and keeps sharpening into something you can trust. Conversations across Claude, ChatGPT, Cursor, and other tools become connected, deduplicated, and editable. Any agent you grant access can read them through MCP, with distilled context that saves tokens every session.
+Origin is a local-first memory app that captures knowledge, decisions, and insights from every AI conversation. Everything you've figured out across Claude, ChatGPT, Cursor, and other tools, compounding instead of disappearing. It distills what matters, makes every memory visible and editable, and gets sharper the longer you use it.
 
 ![Origin demo](https://github.com/user-attachments/assets/d77806a4-69c2-4580-b95d-f8152323d122)
 
@@ -13,13 +13,13 @@ https://github.com/user-attachments/assets/6407e96a-9b84-4506-b702-c4a5f8da2920
 
 </details>
 
-**Status:** Early and exploratory. `v0.1.0` is a research preview running on macOS Apple Silicon. The shape of the product is still moving with usage. Expect changes, sharp edges, and fast iteration.
+**Status:** Early and exploratory. The [current release](https://github.com/7xuanlu/origin/releases/latest) is a research preview running on macOS Apple Silicon. The shape of the product is still moving with usage. Expect changes, sharp edges, and fast iteration.
 
 ---
 
 ## Quickstart
 
-**Platform:** macOS Apple Silicon (M1+) at `v0.1.0`. Linux, Intel Mac, and Windows are not supported yet.
+**Platform:** macOS Apple Silicon (M1+). Linux, Intel Mac, and Windows are not supported yet.
 
 ### Use with Claude Code, Cursor, or Claude Desktop
 
@@ -61,25 +61,29 @@ origin-server status
 
 ## Why Origin?
 
-Native memory in Claude, ChatGPT, and Cursor works. It's a good start. Origin makes it much better in three ways:
+AI was supposed to reduce work. Instead: more to manage, more to keep up with. Every conversation starts from scratch. What you figured out yesterday doesn't exist today. And the memory that does exist? Stale facts, contradicted decisions, wrong inferences you can't tell from real ones.
 
-**Trust.** Native memory stores what the AI decided was important. You can't inspect the full picture, correct what's wrong, or trace where a fact came from. Origin gives you an editable, searchable layer where every memory is visible, correctable, and yours.
+**Distills what matters.** Less to track, less to worry about. Origin reduces the noise to what you actually need.
 
-**Token efficiency.** Every conversation starts from scratch. Agents re-explain context you've already established, burning tokens on repetition. Origin distills your history into compact, structured concepts that agents retrieve on demand. A 200-token concept summary replaces thousands of tokens of re-sent conversation. The longer you use Origin, the more you save per session.
+**Visible and yours.** Every memory editable, traceable to its source. You control what your AI knows.
 
-**Understanding compounds.** Origin doesn't just store, it refines. A background engine deduplicates, links related memories into concepts, detects contradictions, and distills patterns. The quality of what your agents know improves every day without you doing anything. What you figured out in March is sharper in April. What you told Claude, Cursor can see too.
+**Gets sharper over time.** Links, deduplicates, detects contradictions. March's insight is sharper in April.
+
+**96% fewer tokens per query.** Same cost as basic vector search, but 19% more relevant context. 168 tokens instead of 4,505 for full replay. Measured on LoCoMo (2,531 memories, 1,540 queries). Eval harness at `crates/origin-core/src/eval/`.
 
 ---
 
 ## What you actually get
 
-Origin keeps many things from your work with AI: memories, concepts, decisions, observations, gotchas, learnings, and more. Each one is editable, inspectable, and traceable back to the conversation it came from.
+Origin keeps memories, concepts, decisions, observations, gotchas, and learnings from your work with AI. Each one is editable, inspectable, and traceable back to the conversation it came from.
 
-- **Self-refining.** A background engine dedups overlapping captures, links related items into concepts, and surfaces contradictions for your attention. The longer you use Origin, the cleaner and more interconnected everything becomes.
-- **Import and go.** Drop in your ChatGPT export or Obsidian vault and Origin starts refining immediately. No waiting period before it's useful.
-- **MCP-native.** Add `origin-mcp` to Claude Code, Claude Desktop, Cursor, ChatGPT (App Directory), or Gemini CLI. The agent then recalls, stores, and searches across your shared context.
-- **Local-first.** Everything stays on your machine. Nothing leaves by default.
-- **Curated by you.** The desktop app gives you a timeline, concept browser, knowledge graph, and edit-anything controls. The daemon doesn't need it; most days it just runs.
+- **Self-evolving.** Deduplicates, links related memories into concepts, detects contradictions. Your understanding matures while you work.
+- **Hybrid memory engine.** Vector search, full-text search, and knowledge graph unified in one local database with Reciprocal Rank Fusion.
+- **Associative recall.** Ask about one thing, get related context you didn't search for. Entities and relations link your knowledge so retrieval goes beyond keyword matching.
+- **On-device intelligence.** Qwen3-4B and Qwen3.5-9B run on Apple Silicon Metal GPU. Your data never leaves your machine for processing.
+- **MCP-native.** Any MCP-compatible agent reads and writes your memory. Claude Code, Claude Desktop, Cursor, ChatGPT (App Directory), Gemini CLI.
+- **Memory lineage.** Every memory traces back to the conversation it came from. Full provenance: see where it was learned, when it was refined, and why it's there.
+- **Import and go.** Drop in your ChatGPT export or Obsidian vault and Origin starts refining immediately. No cold start.
 - **Markdown export.** Concepts and decisions export to Obsidian or any vault as plain markdown.
 
 ---
@@ -95,7 +99,7 @@ Retrieval quality on standard long-memory benchmarks. Numbers come from BGE-Base
 | LoCoMo (locomo10)           | 67.3%    | 58.9% | 64.0%   |
 
 
-The optional LLM reranker (`search_memory_reranked`) is wired in but does not currently lift these benchmarks; reranker prompt and configuration are an active research area. LoCoMo-Plus (semantic-disconnect variant) deferred for v0.1.1.
+The optional LLM reranker (`search_memory_reranked`) is wired in but does not currently lift these benchmarks; reranker prompt and configuration are an active research area. LoCoMo-Plus (semantic-disconnect variant) deferred to a future release.
 
 ---
 
@@ -112,7 +116,7 @@ The daemon owns all data and business logic. The Tauri app and MCP clients are t
 | `app/` + root frontend | Tauri desktop client, frontend UI, macOS sensors          | AGPL-3.0-only |
 
 
-**Stack:** Rust · Tauri 2 · libSQL · Tokio · FastEmbed (BGE-Base-EN-v1.5-Q, 768-dim) · llama-cpp-2 (Qwen3-4B via Metal GPU) · Axum 0.8 · React 19 · Tailwind CSS 4
+**Stack:** Rust · Tauri 2 · libSQL · Tokio · FastEmbed (BGE-Base-EN-v1.5-Q, 768-dim) · llama-cpp-2 (Qwen3-4B / Qwen3.5-9B via Metal GPU) · Axum 0.8 · React 19 · Tailwind CSS 4
 
 Full module-by-module map is in [CLAUDE.md](CLAUDE.md).
 
@@ -154,7 +158,7 @@ First build takes several minutes while `llama.cpp` compiles for Metal.
 
 These are directions informed by usage, not a committed roadmap. Direction shifts when the data does.
 
-- `**MEMORY.md` cooperation**: read from and write into Claude Code's per-project `MEMORY.md` so the two systems stay aligned rather than duplicating.
+- **`MEMORY.md` cooperation**: read from and write into Claude Code's per-project `MEMORY.md` so the two systems stay aligned rather than duplicating.
 - **Skills grounded in what Origin holds**: workflows that operate against what you've worked through, not generic prompts.
 - **Working context**: narrowing AI retrieval to the project you're currently in, not your whole history.
 - **Spaces**: auto-scoped per repository or project so work-machine context and hobby code don't bleed into each other.
@@ -164,12 +168,12 @@ These are directions informed by usage, not a committed roadmap. Direction shift
 
 ## What it isn't
 
+- Not another memory MCP. Origin is a product built on top of memory, not just a store.
 - Not a notes app or a Notion / Obsidian replacement.
 - Not a chat UI. The conversation stays in Claude / ChatGPT / Cursor.
 - Not a graph visualization tool. The graph is a means, not the product.
 - Not a memory infrastructure SDK. Origin is meant for people, not as a backend for other apps.
-- Not a browser extension.
-- Not Windows or Linux at `v0.1.0`.
+- Not Windows or Linux yet.
 
 If you want to assemble a different architecture, [PAI](https://github.com/danielmiessler/PAI), [claude-memory-compiler](https://github.com/coleam00/claude-memory-compiler), and Palinode are good starting points and are explicitly building in this space.
 
