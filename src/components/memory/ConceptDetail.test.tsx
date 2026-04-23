@@ -20,30 +20,36 @@ vi.mock("../../lib/tauri", () => ({
     last_compiled: "2026-04-07T12:00:00+00:00",
     last_modified: "2026-04-07T12:00:00+00:00",
   }),
-  listMemoriesByIds: vi.fn().mockResolvedValue([
+  getConceptSources: vi.fn().mockResolvedValue([
     {
-      source_id: "mem_1",
-      title: "libSQL stores vectors",
-      content: "libSQL stores vectors in F32_BLOB columns",
-      summary: null,
-      memory_type: "fact",
-      domain: "architecture",
-      source_agent: "claude",
-      confidence: 0.9,
-      confirmed: false,
-      last_modified: 1712000000,
+      source: { concept_id: "concept_abc", memory_source_id: "mem_1", linked_at: 1712000000, link_reason: "concept_growth" },
+      memory: {
+        source_id: "mem_1",
+        title: "libSQL stores vectors",
+        content: "libSQL stores vectors in F32_BLOB columns",
+        summary: null,
+        memory_type: "fact",
+        domain: "architecture",
+        source_agent: "claude",
+        confidence: 0.9,
+        confirmed: false,
+        last_modified: 1712000000,
+      },
     },
     {
-      source_id: "mem_2",
-      title: "DiskANN indexing strategy",
-      content: "DiskANN provides fast approximate nearest neighbor search",
-      summary: null,
-      memory_type: "fact",
-      domain: "architecture",
-      source_agent: "claude-code",
-      confidence: 0.85,
-      confirmed: true,
-      last_modified: 1712100000,
+      source: { concept_id: "concept_abc", memory_source_id: "mem_2", linked_at: 1712100000, link_reason: "concept_growth" },
+      memory: {
+        source_id: "mem_2",
+        title: "DiskANN indexing strategy",
+        content: "DiskANN provides fast approximate nearest neighbor search",
+        summary: null,
+        memory_type: "fact",
+        domain: "architecture",
+        source_agent: "claude-code",
+        confidence: 0.85,
+        confirmed: true,
+        last_modified: 1712100000,
+      },
     },
   ]),
   clipboardWrite: vi.fn().mockResolvedValue(undefined),
@@ -173,9 +179,9 @@ describe("ConceptDetail", () => {
   });
 
   it("shows loading placeholders while source memories are fetching", async () => {
-    const { listMemoriesByIds } = await import("../../lib/tauri");
+    const { getConceptSources } = await import("../../lib/tauri");
     let resolveMemories!: (v: unknown[]) => void;
-    (listMemoriesByIds as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+    (getConceptSources as ReturnType<typeof vi.fn>).mockReturnValueOnce(
       new Promise((res) => { resolveMemories = res; }),
     );
     renderWithQuery(<ConceptDetail {...defaultProps} />);
@@ -202,11 +208,11 @@ describe("ConceptDetail", () => {
     expect(defaultProps.onMemoryClick).toHaveBeenCalledWith("mem_1");
   });
 
-  it("uses listMemoriesByIds (batch) not individual getMemoryDetail calls", async () => {
-    const { listMemoriesByIds } = await import("../../lib/tauri");
+  it("uses getConceptSources (join table) not listMemoriesByIds", async () => {
+    const { getConceptSources } = await import("../../lib/tauri");
     renderWithQuery(<ConceptDetail {...defaultProps} />);
     await screen.findByText("libSQL stores vectors");
-    expect(listMemoriesByIds).toHaveBeenCalledTimes(1);
-    expect(listMemoriesByIds).toHaveBeenCalledWith(["mem_1", "mem_2"]);
+    expect(getConceptSources).toHaveBeenCalledTimes(1);
+    expect(getConceptSources).toHaveBeenCalledWith("concept_abc");
   });
 });

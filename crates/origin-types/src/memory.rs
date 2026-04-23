@@ -91,6 +91,14 @@ pub struct MemoryItem {
     pub access_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_text: Option<String>,
+    #[serde(default = "default_version")]
+    pub version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
+}
+
+fn default_version() -> i64 {
+    1
 }
 
 /// A single item in a version chain.

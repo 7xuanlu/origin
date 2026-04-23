@@ -124,7 +124,8 @@ pub(crate) const DISTILL_CONCEPT: &str = "\
 Compile these memories into a wiki-style knowledge page.\n\
 \n\
 Format:\n\
-Start with a one-sentence TLDR summary.\n\
+Do NOT start with a title heading (# Title) -- the title is displayed separately by the UI.\n\
+Start directly with a one-sentence TLDR summary.\n\
 \n\
 Then write the body organized with short topical headers (## Header) and prose paragraphs under each, \
 like a Wikipedia article with sections. \
@@ -150,6 +151,7 @@ You maintain a wiki-style knowledge page. Update it with new information.\n\
 Integrate new facts into the existing prose naturally — don't just append bullets.\n\
 If the new information contradicts existing content, note it in Open Questions.\n\
 Do not remove existing content unless it is explicitly superseded.\n\
+Do NOT include a title heading (# Title) -- the title is displayed separately by the UI.\n\
 Output the complete updated page in the same format (TLDR, prose paragraphs, Open Questions, Sources).";
 
 pub(crate) const ASSIGN_ORPHANS: &str = r#"You are a knowledge organization assistant. Given a list of unassigned memories and existing concepts, for each memory:

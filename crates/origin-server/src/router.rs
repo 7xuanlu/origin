@@ -215,6 +215,10 @@ pub fn build_router(state: SharedState) -> Router {
             get(memory_routes::handle_get_concept).delete(memory_routes::handle_delete_concept),
         )
         .route(
+            "/api/concepts/{id}/sources",
+            get(memory_routes::handle_get_concept_sources),
+        )
+        .route(
             "/api/concepts/{id}/archive",
             post(memory_routes::handle_archive_concept),
         )

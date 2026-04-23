@@ -3,13 +3,13 @@ import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   getConcept,
-  listMemoriesByIds,
   listConcepts,
   updateConcept,
   deleteConcept,
   clipboardWrite,
   exportConceptToObsidian,
   listRegisteredSources,
+  getConceptSources,
   type MemoryItem,
   type Concept,
 } from "../../lib/tauri";
@@ -130,14 +130,23 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
     [registeredSources],
   );
 
-  const { data: sourceMemories } = useQuery({
-    queryKey: ["concept-sources", conceptId, concept?.source_memory_ids],
-    queryFn: () => {
-      if (!concept?.source_memory_ids.length) return Promise.resolve([]);
-      return listMemoriesByIds(concept.source_memory_ids);
-    },
-    enabled: !!concept?.source_memory_ids?.length,
+  const { data: conceptSources } = useQuery({
+    queryKey: ["concept-sources", conceptId],
+    queryFn: () => getConceptSources(conceptId),
+    enabled: !!conceptId,
   });
+
+  // Extract MemoryItems from the join table result.
+  // Sort: versioned (updated) memories first, then by last_modified descending.
+  const sourceMemories: MemoryItem[] | undefined = conceptSources
+    ?.filter((cs) => cs.memory !== null)
+    .map((cs) => cs.memory as MemoryItem)
+    .sort((a, b) => {
+      const aVersioned = (a.version ?? 1) > 1 ? 1 : 0;
+      const bVersioned = (b.version ?? 1) > 1 ? 1 : 0;
+      if (aVersioned !== bVersioned) return bVersioned - aVersioned; // versioned first
+      return (b.last_modified ?? 0) - (a.last_modified ?? 0); // then by recency
+    });
 
   const updateMutation = useMutation({
     mutationFn: (content: string) => updateConcept(conceptId, content),
@@ -234,12 +243,13 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
     );
   }
 
-  const sourceCount = concept.source_memory_ids.length;
+  const sourceCount = conceptSources?.length ?? concept.source_memory_ids.length;
   const relatedConcepts = parseRelatedConcepts(concept.content);
 
   // Strip ## Sources (shown as MemoryCard UI below)
   // Convert [[wikilinks]] to markdown links if they resolve to concepts, else plain text
-  const displayContent = concept.content
+  const cleanedContent = concept.content
+    .replace(/^#\s+.*\n+/, "") // Strip title heading (displayed separately by UI)
     .replace(/## Sources\n[\s\S]*?(?=\n## |\s*$)/, "")
     .replace(/\[\[([^\]]+)\]\]/g, (_match, title) => {
       const cid = conceptLookup.get(title.toLowerCase());
@@ -247,6 +257,16 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
       return title;
     })
     .trim();
+
+  // Extract TLDR (first sentence) for native rendering under title.
+  // Match first sentence ending with ". " or ".\n" — but not inside [[wikilinks]] or after abbreviations.
+  const sentenceEnd = cleanedContent.search(/\.\s/);
+  const tldr = sentenceEnd > 0 && sentenceEnd < 400
+    ? cleanedContent.slice(0, sentenceEnd + 1).trim()
+    : "";
+  const displayContent = tldr
+    ? cleanedContent.slice(sentenceEnd + 1).trim()
+    : cleanedContent;
 
   // Intercept concept/memory link clicks in rendered content (capture phase beats target="_blank")
   const handleContentClick = (e: React.MouseEvent) => {
@@ -301,6 +321,14 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
               <span>Last distilled {relativeTimeFromISO(concept.last_compiled)}</span>
               <span style={{ opacity: 0.4 }}>&middot;</span>
               <span>from {sourceCount} {sourceCount === 1 ? "memory" : "memories"}</span>
+              {concept.stale_reason && (
+                <>
+                  <span style={{ opacity: 0.4 }}>&middot;</span>
+                  <span style={{ color: concept.stale_reason === "source_conflict" ? "var(--mem-accent-amber)" : "var(--mem-text-tertiary)" }}>
+                    {concept.stale_reason === "source_conflict" ? "needs review" : "updating..."}
+                  </span>
+                </>
+              )}
             </div>
           </div>
 
@@ -417,26 +445,6 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
         </div>
       </div>
 
-      {/* Summary / TLDR */}
-      {concept.summary && !editing && (
-        <div
-          className="pl-4 py-2"
-          style={{ borderLeft: "3px solid var(--mem-accent-concept)" }}
-        >
-          <p
-            style={{
-              fontFamily: "var(--mem-font-body)",
-              fontSize: "15px",
-              color: "var(--mem-text)",
-              lineHeight: "1.7",
-              fontStyle: "italic",
-            }}
-          >
-            {concept.summary}
-          </p>
-        </div>
-      )}
-
       {/* Content — edit mode or rendered */}
       {editing ? (
         <div className="flex flex-col gap-2">
@@ -476,6 +484,24 @@ export default function ConceptDetail({ conceptId, onBack, onMemoryClick, onConc
         </div>
       ) : (
         <div onClickCapture={handleContentClick}>
+          {(concept.summary || tldr) && (
+            <div
+              className="pl-4 py-2 mb-4"
+              style={{ borderLeft: "3px solid var(--mem-accent-concept)" }}
+            >
+              <p
+                style={{
+                  fontFamily: "var(--mem-font-body)",
+                  fontSize: "14px",
+                  color: "var(--mem-text-secondary)",
+                  lineHeight: "1.7",
+                  fontStyle: "italic",
+                }}
+              >
+                {concept.summary || tldr}
+              </p>
+            </div>
+          )}
           <ContentRenderer content={displayContent} variant="detail" />
         </div>
       )}
@@ -580,7 +606,7 @@ function EvidenceCard({
   onClick: (sourceId: string) => void;
 }) {
   const [hover, setHover] = useState(false);
-  const ts = mem.last_modified ? relativeMs(mem.last_modified) : null;
+  const ts = mem.last_modified ? relativeMs(mem.last_modified * 1000) : null;
   const agent = mem.source_agent ? prettyAgent(mem.source_agent) : null;
   const kind = sourceKindLabel(mem);
   const snippet = mem.content
@@ -640,6 +666,21 @@ function EvidenceCard({
         >
           {kind}
         </span>
+        {mem.version != null && mem.version > 1 && (
+          <span
+            style={{
+              fontFamily: "var(--mem-font-mono)",
+              fontSize: "10px",
+              color: "var(--mem-accent-blue, #60a5fa)",
+              background: "color-mix(in srgb, var(--mem-accent-blue, #60a5fa) 15%, transparent)",
+              padding: "1px 5px",
+              borderRadius: "3px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            v{mem.version}
+          </span>
+        )}
       </div>
       {mem.title && (
         <p

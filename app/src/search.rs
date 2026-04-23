@@ -1195,6 +1195,8 @@ pub async fn list_memories_cmd(
             retrieval_cue: None,
             source_text: None,
             access_count: 0,
+            version: 1,
+            changelog: None,
         })
         .collect();
     Ok(items)
@@ -2684,6 +2686,15 @@ pub async fn search_concepts(
     let req = requests::SearchConceptsRequest { query, limit };
     let resp: ListConceptsWire = client.post_json("/api/concepts/search", &req).await?;
     Ok(resp.concepts)
+}
+
+#[tauri::command]
+pub async fn get_concept_sources(
+    state: tauri::State<'_, State>,
+    concept_id: String,
+) -> Result<Vec<origin_types::ConceptSourceWithMemory>, String> {
+    let client = { state.read().await.client.clone() };
+    client.get_concept_sources(&concept_id).await
 }
 
 #[tauri::command]

@@ -117,6 +117,9 @@ mod tests {
             created_at: "2026-04-01T00:00:00+00:00".to_string(),
             last_compiled: "2026-04-07T00:00:00+00:00".to_string(),
             last_modified: "2026-04-07T00:00:00+00:00".to_string(),
+            sources_updated_count: 0,
+            stale_reason: None,
+            user_edited: false,
         }
     }
 
