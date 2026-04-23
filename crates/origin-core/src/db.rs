@@ -12548,27 +12548,37 @@ impl MemoryDB {
     // ===== Topic Match Helpers =====
 
     /// Fetch lightweight candidate memories for topic matching.
-    /// Filters by domain + memory_type + chunk_index=0, ordered by last_modified DESC.
-    /// Returns an empty Vec when domain or memory_type is None (both are required).
+    /// Prefers same domain + memory_type but does not require them.
+    /// Returns candidates with domain/type metadata so the caller can compute
+    /// tiered thresholds (exact match → lower threshold, no match → higher).
     pub async fn topic_match_candidates(
         &self,
         domain: Option<&str>,
         memory_type: Option<&str>,
         max_candidates: usize,
     ) -> Result<Vec<crate::topic_match::TopicMatchCandidate>, OriginError> {
-        let (d, mt) = match (domain, memory_type) {
-            (Some(d), Some(mt)) => (d, mt),
-            _ => return Ok(Vec::new()),
-        };
         let conn = self.conn.lock().await;
+
+        // Build a flexible query: prefer same domain+type, but include all recent
+        // chunk_index=0 memories as candidates. ORDER BY gives priority to exact
+        // domain+type matches, then partial, then everything else.
+        let sql = "SELECT source_id, title, content, entity_id, embedding, domain, memory_type
+                   FROM memories
+                   WHERE chunk_index = 0 AND pending_revision = 0
+                   ORDER BY
+                     CASE WHEN domain = ?1 AND memory_type = ?2 THEN 0
+                          WHEN domain = ?1 OR memory_type = ?2 THEN 1
+                          ELSE 2 END,
+                     last_modified DESC
+                   LIMIT ?3";
         let mut rows = conn
             .query(
-                "SELECT source_id, title, content, entity_id, embedding
-                 FROM memories
-                 WHERE domain = ?1 AND memory_type = ?2 AND chunk_index = 0 AND pending_revision = 0
-                 ORDER BY last_modified DESC
-                 LIMIT ?3",
-                libsql::params![d, mt, max_candidates as i64],
+                sql,
+                libsql::params![
+                    domain.unwrap_or(""),
+                    memory_type.unwrap_or(""),
+                    max_candidates as i64
+                ],
             )
             .await
             .map_err(|e| OriginError::VectorDb(format!("topic_match_candidates: {e}")))?;
@@ -12594,12 +12604,16 @@ impl MemoryDB {
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
+            let cand_domain: Option<String> = row.get::<Option<String>>(5).unwrap_or(None);
+            let cand_type: Option<String> = row.get::<Option<String>>(6).unwrap_or(None);
             candidates.push(crate::topic_match::TopicMatchCandidate {
                 source_id,
                 title,
                 content,
                 entity_id,
                 embedding,
+                domain: cand_domain,
+                memory_type: cand_type,
             });
         }
         Ok(candidates)
@@ -20760,7 +20774,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        // Query for domain=work, type=knowledge — should return only m_work_know.
+        // Query for domain=work, type=knowledge — exact match should come first.
         let candidates = db
             .topic_match_candidates(Some("work"), Some("knowledge"), 100)
             .await
@@ -20769,17 +20783,19 @@ pub(crate) mod tests {
         let ids: Vec<&str> = candidates.iter().map(|c| c.source_id.as_str()).collect();
         assert!(
             ids.contains(&"m_work_know"),
-            "m_work_know should match domain+type filter"
+            "m_work_know should be in candidates"
         );
-        assert!(!ids.contains(&"m_work_pref"), "m_work_pref has wrong type");
+        // Flexible matching: all candidates returned, exact match prioritized
         assert!(
-            !ids.contains(&"m_personal_know"),
-            "m_personal_know has wrong domain"
+            ids[0] == "m_work_know",
+            "exact domain+type match should be first"
         );
+        // Other memories are also returned (lower priority)
+        assert!(ids.len() == 3, "all 3 memories should be candidates");
     }
 
     #[tokio::test]
-    async fn test_topic_match_candidates_returns_empty_on_missing_filter() {
+    async fn test_topic_match_candidates_works_with_missing_filters() {
         let (db, _dir) = test_db().await;
 
         db.upsert_documents(vec![make_memory_doc(
@@ -20792,24 +20808,24 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        // Missing domain => empty result (guard in implementation).
+        // Missing domain => still returns candidates (flexible matching).
         let candidates = db
             .topic_match_candidates(None, Some("knowledge"), 100)
             .await
             .unwrap();
         assert!(
-            candidates.is_empty(),
-            "missing domain should yield empty candidates"
+            !candidates.is_empty(),
+            "missing domain should still return candidates"
         );
 
-        // Missing type => empty result.
+        // Missing type => still returns candidates.
         let candidates = db
             .topic_match_candidates(Some("work"), None, 100)
             .await
             .unwrap();
         assert!(
-            candidates.is_empty(),
-            "missing type should yield empty candidates"
+            !candidates.is_empty(),
+            "missing type should still return candidates"
         );
     }
 

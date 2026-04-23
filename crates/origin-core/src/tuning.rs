@@ -206,6 +206,12 @@ pub struct ScoringConfig {
 fn d_070_topic() -> f64 {
     0.70
 }
+fn d_080_topic() -> f64 {
+    0.80
+}
+fn d_090_topic() -> f64 {
+    0.90
+}
 fn d_20_topic() -> usize {
     20
 }
@@ -216,10 +222,16 @@ fn d_50_changelog() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TopicMatchConfig {
-    /// Cosine similarity threshold for embedding-based topic matching.
+    /// Embedding threshold when domain + type both match (high confidence).
     #[serde(default = "d_070_topic")]
-    pub embedding_threshold: f64,
-    /// Maximum number of candidate memories to consider per domain+type.
+    pub threshold_exact: f64,
+    /// Embedding threshold when only domain OR type matches (partial context).
+    #[serde(default = "d_080_topic")]
+    pub threshold_partial: f64,
+    /// Embedding threshold when neither domain nor type matches (semantic only).
+    #[serde(default = "d_090_topic")]
+    pub threshold_none: f64,
+    /// Maximum number of candidate memories to consider.
     #[serde(default = "d_20_topic")]
     pub max_candidates: usize,
     /// Maximum changelog entries to retain before trimming oldest.
@@ -230,7 +242,9 @@ pub struct TopicMatchConfig {
 impl Default for TopicMatchConfig {
     fn default() -> Self {
         Self {
-            embedding_threshold: 0.70,
+            threshold_exact: 0.70,
+            threshold_partial: 0.80,
+            threshold_none: 0.90,
             max_candidates: 20,
             changelog_cap: 50,
         }

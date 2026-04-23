@@ -36,6 +36,8 @@ pub struct TopicMatchCandidate {
     pub content: String,
     pub entity_id: Option<String>,
     pub embedding: Vec<f32>,
+    pub domain: Option<String>,
+    pub memory_type: Option<String>,
 }
 
 /// Check if an incoming memory matches an existing topic for in-place upsert.
@@ -43,10 +45,12 @@ pub struct TopicMatchCandidate {
 /// Runs pre-batcher in `handle_store_memory`. Returns the matched memory's
 /// source_id if a topic match is found, `None` otherwise.
 ///
-/// Matching strategy (in priority order):
-/// 1. Entity ID overlap (strongest signal — same entity = same topic)
-/// 2. FTS5 title hit AND embedding similarity above threshold
-/// 3. Embedding-only similarity above threshold (weaker fallback)
+/// Matching uses tiered thresholds based on domain+type overlap:
+/// - Both match: 0.70 (high confidence context)
+/// - One matches: 0.80 (partial context)
+/// - Neither: 0.90 (semantic-only, very conservative)
+///
+/// Priority: entity overlap > title+embedding > embedding-only.
 pub async fn find_topic_match(
     db: &MemoryDB,
     title: &str,
@@ -63,12 +67,7 @@ pub async fn find_topic_match(
         signals: MatchSignals::default(),
     };
 
-    // Both domain and memory_type must be present for a meaningful topic match.
-    let (Some(_d), Some(_mt)) = (domain, memory_type) else {
-        return Ok(no_match);
-    };
-
-    // Step 1: Fetch candidates (same domain + same memory_type, most recent first).
+    // Fetch candidates: prefers same domain+type but includes all recent memories.
     let candidates = db
         .topic_match_candidates(domain, memory_type, config.max_candidates)
         .await?;
@@ -82,7 +81,7 @@ pub async fn find_topic_match(
         ..Default::default()
     };
 
-    // Step 2: Entity ID overlap (strongest signal).
+    // Step 1: Entity ID overlap (strongest signal — bypasses thresholds).
     if let Some(eid) = entity_id {
         if let Some(matched) = candidates
             .iter()
@@ -102,7 +101,7 @@ pub async fn find_topic_match(
         }
     }
 
-    // Step 3: FTS5 title query against memories_fts (DB-backed, uses title: column filter).
+    // Step 2: FTS5 title query against memories_fts.
     let candidate_ids: Vec<&str> = candidates.iter().map(|c| c.source_id.as_str()).collect();
     let fts_hits: std::collections::HashSet<String> = db
         .topic_match_title_fts(title, &candidate_ids)
@@ -110,7 +109,7 @@ pub async fn find_topic_match(
         .into_iter()
         .collect();
 
-    // Rank candidates by embedding similarity.
+    // Step 3: Rank candidates by embedding similarity, apply tiered thresholds.
     let mut ranked: Vec<(&TopicMatchCandidate, f64)> = candidates
         .iter()
         .map(|c| {
@@ -123,23 +122,33 @@ pub async fn find_topic_match(
     for (candidate, similarity) in &ranked {
         let title_hit = fts_hits.contains(&candidate.source_id);
 
-        if similarity > &config.embedding_threshold {
-            if title_hit {
-                signals.fts_title_hit = true;
-                signals.embedding_similarity = Some(*similarity);
-                log::info!(
-                    "[topic_match] title+embedding match: sim={:.3} source_id={}",
-                    similarity,
-                    candidate.source_id
-                );
-            } else {
-                signals.embedding_similarity = Some(*similarity);
-                log::info!(
-                    "[topic_match] embedding-only match: sim={:.3} source_id={}",
-                    similarity,
-                    candidate.source_id
-                );
-            }
+        // Compute tiered threshold based on domain+type overlap
+        let domain_match = domain.is_some() && candidate.domain.as_deref() == domain;
+        let type_match = memory_type.is_some() && candidate.memory_type.as_deref() == memory_type;
+
+        let threshold = match (domain_match, type_match) {
+            (true, true) => config.threshold_exact, // 0.70
+            (true, false) | (false, true) => config.threshold_partial, // 0.80
+            (false, false) => config.threshold_none, // 0.90
+        };
+
+        if *similarity >= threshold {
+            signals.fts_title_hit = title_hit;
+            signals.embedding_similarity = Some(*similarity);
+            let tier = match (domain_match, type_match) {
+                (true, true) => "exact",
+                (true, false) | (false, true) => "partial",
+                (false, false) => "semantic-only",
+            };
+            log::info!(
+                "[topic_match] {} match (tier={}, threshold={:.2}): sim={:.3} title_fts={} source_id={}",
+                if title_hit { "title+embedding" } else { "embedding" },
+                tier,
+                threshold,
+                similarity,
+                title_hit,
+                candidate.source_id,
+            );
             return Ok(TopicMatchResult {
                 matched_source_id: Some(candidate.source_id.clone()),
                 old_content: Some(candidate.content.clone()),
