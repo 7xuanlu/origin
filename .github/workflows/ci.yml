@@ -86,9 +86,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run Rust tests
-        env:
-          ORIGIN_TEST_FASTEMBED_CACHE: ${{ runner.home }}/.fastembed_cache
-        run: cargo test --workspace
+        run: ORIGIN_TEST_FASTEMBED_CACHE="$HOME/.fastembed_cache" cargo test --workspace
 
       - name: Run frontend tests
         run: pnpm test
