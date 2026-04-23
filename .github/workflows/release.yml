@@ -14,7 +14,7 @@ env:
 jobs:
   release:
     name: Build & Publish Release
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
