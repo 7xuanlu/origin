@@ -3743,7 +3743,7 @@ impl MemoryDB {
                         ",
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("migration 40 DDL: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("migration 41 DDL: {e}")))?;
 
                     // Add columns idempotently -- check if they exist first.
                     for (table, col, col_type) in [
@@ -3759,7 +3759,7 @@ impl MemoryDB {
                                     libsql::params![col.to_string()],
                                 )
                                 .await
-                                .map_err(|e| OriginError::VectorDb(format!("migration 40 col check: {e}")))?;
+                                .map_err(|e| OriginError::VectorDb(format!("migration 41 col check: {e}")))?;
                             match rows.next().await {
                                 Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
                                 _ => false,
@@ -3771,7 +3771,7 @@ impl MemoryDB {
                                 (),
                             )
                             .await
-                            .map_err(|e| OriginError::VectorDb(format!("migration 40 add {}.{}: {e}", table, col)))?;
+                            .map_err(|e| OriginError::VectorDb(format!("migration 41 add {}.{}: {e}", table, col)))?;
                         }
                     }
                 }
@@ -3797,7 +3797,7 @@ impl MemoryDB {
                         (),
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("migration 40 dedup relations: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("migration 41 dedup relations: {e}")))?;
 
                     // 7. Unique index on relations
                     conn.execute_batch(
@@ -3805,7 +3805,7 @@ impl MemoryDB {
                              ON relations(from_entity, to_entity, relation_type);",
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("migration 40 relations unique idx: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("migration 41 relations unique idx: {e}")))?;
 
                     conn.execute("PRAGMA user_version = 41", ())
                         .await
@@ -3830,7 +3830,7 @@ impl MemoryDB {
              SELECT LOWER(name), id, created_at, 'migration' FROM entities;",
         )
         .await
-        .map_err(|e| OriginError::VectorDb(format!("migration 40 seed aliases: {e}")))?;
+        .map_err(|e| OriginError::VectorDb(format!("migration 41 seed aliases: {e}")))?;
 
         // Find all groups of entities that share the same lowercase name
         // and have more than one member.
@@ -3843,13 +3843,13 @@ impl MemoryDB {
                 (),
             )
             .await
-            .map_err(|e| OriginError::VectorDb(format!("migration 40 find dups: {e}")))?;
+            .map_err(|e| OriginError::VectorDb(format!("migration 41 find dups: {e}")))?;
 
         let mut dup_names: Vec<String> = Vec::new();
         while let Some(row) = dup_rows
             .next()
             .await
-            .map_err(|e| OriginError::VectorDb(format!("migration 40 dup row: {e}")))?
+            .map_err(|e| OriginError::VectorDb(format!("migration 41 dup row: {e}")))?
         {
             dup_names.push(row.get(0).unwrap_or_default());
         }
@@ -3874,11 +3874,11 @@ impl MemoryDB {
                     libsql::params![lname.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 winner: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 winner: {e}")))?;
             let winner_id: String = match winner_rows
                 .next()
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 winner row: {e}")))?
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 winner row: {e}")))?
             {
                 Some(row) => row.get(0).unwrap_or_default(),
                 None => continue,
@@ -3892,12 +3892,12 @@ impl MemoryDB {
                     libsql::params![lname.clone(), winner_id.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 losers: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 losers: {e}")))?;
             let mut loser_ids: Vec<String> = Vec::new();
             while let Some(row) = loser_rows
                 .next()
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 loser row: {e}")))?
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 loser row: {e}")))?
             {
                 loser_ids.push(row.get(0).unwrap_or_default());
             }
@@ -3910,7 +3910,7 @@ impl MemoryDB {
                     libsql::params![winner_id.clone(), loser_id.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir alias: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir alias: {e}")))?;
 
                 // Redirect observations from loser to winner
                 conn.execute(
@@ -3918,7 +3918,7 @@ impl MemoryDB {
                     libsql::params![winner_id.clone(), loser_id.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir obs: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir obs: {e}")))?;
 
                 // Redirect relations: from_entity references
                 conn.execute(
@@ -3926,7 +3926,7 @@ impl MemoryDB {
                     libsql::params![winner_id.clone(), loser_id.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir rel from: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir rel from: {e}")))?;
 
                 // Redirect relations: to_entity references
                 conn.execute(
@@ -3934,9 +3934,17 @@ impl MemoryDB {
                     libsql::params![winner_id.clone(), loser_id.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 redir rel to: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir rel to: {e}")))?;
 
-                // Delete the loser entity (CASCADE will clean up remaining aliases/obs/rels)
+                // Clean up any remaining aliases pointing to loser (no CASCADE on FK)
+                conn.execute(
+                    "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
+                    libsql::params![loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 del loser aliases: {e}")))?;
+
+                // Delete the loser entity
                 conn.execute(
                     "DELETE FROM entities WHERE id = ?1",
                     libsql::params![loser_id.clone()],
@@ -20956,7 +20964,7 @@ pub(crate) mod tests {
     // ==================== Migration 41 (KG quality) ====================
 
     #[tokio::test]
-    async fn test_migration_40_kg_quality_tables() {
+    async fn test_migration_41_kg_quality_tables() {
         let (db, _dir) = test_db().await;
         let conn = db.conn.lock().await;
 
