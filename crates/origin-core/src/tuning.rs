@@ -206,6 +206,54 @@ pub struct ScoringConfig {
     pub keyword_min_threshold: f64,
 }
 
+fn d_070_topic() -> f64 {
+    0.70
+}
+fn d_080_topic() -> f64 {
+    0.80
+}
+fn d_090_topic() -> f64 {
+    0.90
+}
+fn d_20_topic() -> usize {
+    20
+}
+fn d_50_changelog() -> usize {
+    50
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TopicMatchConfig {
+    /// Embedding threshold when domain + type both match (high confidence).
+    #[serde(default = "d_070_topic")]
+    pub threshold_exact: f64,
+    /// Embedding threshold when only domain OR type matches (partial context).
+    #[serde(default = "d_080_topic")]
+    pub threshold_partial: f64,
+    /// Embedding threshold when neither domain nor type matches (semantic only).
+    #[serde(default = "d_090_topic")]
+    pub threshold_none: f64,
+    /// Maximum number of candidate memories to consider.
+    #[serde(default = "d_20_topic")]
+    pub max_candidates: usize,
+    /// Maximum changelog entries to retain before trimming oldest.
+    #[serde(default = "d_50_changelog")]
+    pub changelog_cap: usize,
+}
+
+impl Default for TopicMatchConfig {
+    fn default() -> Self {
+        Self {
+            threshold_exact: 0.70,
+            threshold_partial: 0.80,
+            threshold_none: 0.90,
+            max_candidates: 20,
+            changelog_cap: 50,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RefineryConfig {
     #[serde(default = "d_5_usize")]
@@ -230,6 +278,8 @@ pub struct RefineryConfig {
     pub batch_window_secs: i64,
     #[serde(default = "d_168_u64")]
     pub kg_rethink_interval_hours: u64,
+    #[serde(default)]
+    pub topic_match: TopicMatchConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -422,6 +472,7 @@ impl Default for RefineryConfig {
             consolidation_batch_size: d_10_usize(),
             batch_window_secs: d_30_i64(),
             kg_rethink_interval_hours: d_168_u64(),
+            topic_match: TopicMatchConfig::default(),
         }
     }
 }

@@ -12,12 +12,19 @@ pub struct Concept {
     pub content: String,
     pub entity_id: Option<String>,
     pub domain: Option<String>,
+    /// Kept for dual-write transition; prefer concept_sources join table for new reads.
     pub source_memory_ids: Vec<String>,
     pub version: i64,
     pub status: String,
     pub created_at: String,
     pub last_compiled: String,
     pub last_modified: String,
+    /// How many source memories were updated since last distillation.
+    pub sources_updated_count: i64,
+    /// Why this concept is stale: "source_updated" | "source_conflict" | None.
+    pub stale_reason: Option<String>,
+    /// True if a human has edited this concept's content directly.
+    pub user_edited: bool,
 }
 
 impl Concept {

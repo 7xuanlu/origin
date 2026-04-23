@@ -284,4 +284,12 @@ impl OriginClient {
         }
         self.get_json(&path).await
     }
+
+    pub async fn get_concept_sources(
+        &self,
+        concept_id: &str,
+    ) -> Result<Vec<origin_types::ConceptSourceWithMemory>, String> {
+        let path = format!("/api/concepts/{}/sources", concept_id);
+        self.get_json(&path).await
+    }
 }

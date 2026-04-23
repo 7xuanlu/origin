@@ -719,6 +719,14 @@ export interface MemoryItem {
   structured_fields?: string | null;  // JSON string from Rust
   retrieval_cue?: string | null;
   access_count?: number;
+  version?: number;
+  changelog?: Array<{
+    version: number;
+    at: number;
+    delta: string;
+    source_agent?: string | null;
+    incoming_source_id?: string | null;
+  }>;
 }
 
 export interface DomainInfo {
@@ -764,6 +772,28 @@ export interface Concept {
   created_at: string;
   last_compiled: string;
   last_modified: string;
+  // Staleness tracking (added in migration 40)
+  sources_updated_count?: number;
+  stale_reason?: string | null;
+  user_edited?: boolean;
+}
+
+export interface ConceptSource {
+  concept_id: string;
+  memory_source_id: string;
+  linked_at: number;
+  link_reason?: string | null;
+}
+
+export interface ConceptSourceWithMemory {
+  source: ConceptSource;
+  memory: MemoryItem | null;
+}
+
+export async function getConceptSources(
+  conceptId: string,
+): Promise<ConceptSourceWithMemory[]> {
+  return invoke("get_concept_sources", { conceptId });
 }
 
 // ── Profiles & Agent Connections ─────────────────────────────────────

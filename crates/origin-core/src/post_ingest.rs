@@ -41,10 +41,14 @@ pub async fn run_post_ingest_enrichment(
 ) -> Result<(), OriginError> {
     log::info!("[post_ingest] enriching {source_id}");
 
-    // 1. Dedup check
+    // 1. Dedup check (safety net — topic matching handles most cases pre-batcher;
+    //    this fires only when a duplicate slips through)
     match check_dedup(db, source_id, content, tuning).await {
         Ok(n) if n > 0 => {
-            log::info!("[post_ingest] {source_id}: {n} duplicate candidate(s) queued")
+            log::warn!(
+                "[post_ingest] dedup safety net fired for {source_id}: {n} duplicate candidate(s) queued. \
+                 This suggests a gap in topic matching or novelty gate."
+            )
         }
         Ok(_) => {}
         Err(e) => log::warn!("[post_ingest] dedup check failed: {e}"),
@@ -394,7 +398,7 @@ async fn check_concept_contradiction(
             let refs: Vec<&str> = new_sources.iter().map(|s| s.as_str()).collect();
             // Update sources without changing content — re-distill will recompile
             let _ = db
-                .update_concept_content(&concept.id, &concept.content, &refs)
+                .update_concept_content(&concept.id, &concept.content, &refs, "concept_growth")
                 .await;
             log::info!("[post_ingest] concept '{}' flagged for re-distill due to potential contradiction from {}",
                 concept.title, source_id);
@@ -505,7 +509,7 @@ async fn grow_concept(
         source_ids.push(source_id.to_string());
     }
     let source_refs: Vec<&str> = source_ids.iter().map(|s| s.as_str()).collect();
-    db.update_concept_content(&concept.id, updated, &source_refs)
+    db.update_concept_content(&concept.id, updated, &source_refs, "concept_growth")
         .await?;
 
     // Log activity: attribute to the agent who authored the triggering memory.

@@ -25,6 +25,42 @@ pub use memory::{
 };
 pub use sources::{MemoryType, RawDocument, SourceType, StabilityTier, SyncStatus};
 
+use serde::{Deserialize, Serialize};
+
+/// A single revision entry in a memory's changelog (topic-key upsert history).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangelogEntry {
+    pub version: i64,
+    /// Unix timestamp of when this revision was written.
+    pub at: i64,
+    /// Human-readable one-liner describing what changed. May be empty when
+    /// the LLM delta hasn't been generated yet (async fill-in).
+    pub delta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_agent: Option<String>,
+    /// The source_id of the incoming memory that triggered this upsert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incoming_source_id: Option<String>,
+}
+
+/// A link between a concept and one of its source memories (concept_sources join table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptSource {
+    pub concept_id: String,
+    pub memory_source_id: String,
+    /// Unix timestamp of when this link was created.
+    pub linked_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_reason: Option<String>,
+}
+
+/// Concept source enriched with the memory's metadata (for the API response).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptSourceWithMemory {
+    pub source: ConceptSource,
+    pub memory: Option<crate::memory::MemoryItem>,
+}
+
 /// Crate version.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

@@ -909,6 +909,7 @@ pub fn run() {
             search::get_rejection_log,
             // Concept commands
             search::get_concept,
+            search::get_concept_sources,
             search::update_concept,
             search::archive_concept,
             search::delete_concept,

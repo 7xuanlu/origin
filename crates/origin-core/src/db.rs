@@ -658,7 +658,9 @@ CREATE TABLE IF NOT EXISTS memories (
     last_accessed INTEGER,
     refinement_status TEXT,
     effective_confidence REAL,
-    embedding F32_BLOB(768)
+    embedding F32_BLOB(768),
+    version INTEGER DEFAULT 1,
+    changelog TEXT DEFAULT '[]'
 );
 
 -- Access log: per-source access events for recency/frequency tracking
@@ -3576,9 +3578,124 @@ impl MemoryDB {
                 log::info!("[migration] Migration 39 applied: archived ugly remnants + deduped identical titles");
             }
 
-            // Migration 40: KG quality — alias table, relation vocabulary, new columns,
-            // entity/relation deduplication, and unique index on relations.
+            // Migration 40: topic-key upsert schema + concept_sources join table.
+            // Adds version/changelog columns to memories, staleness columns to concepts,
+            // and the concept_sources join table (with backfill from source_memory_ids JSON).
             if version < 40 {
+                let conn = self.conn.lock().await;
+
+                // Add version + changelog to memories (topic-key upsert tracking)
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE memories ADD COLUMN version INTEGER DEFAULT 1",
+                        (),
+                    )
+                    .await;
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE memories ADD COLUMN changelog TEXT DEFAULT '[]'",
+                        (),
+                    )
+                    .await;
+
+                // Add staleness-tracking columns to concepts
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE concepts ADD COLUMN sources_updated_count INTEGER DEFAULT 0",
+                        (),
+                    )
+                    .await;
+                let _ = conn
+                    .execute("ALTER TABLE concepts ADD COLUMN stale_reason TEXT", ())
+                    .await;
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE concepts ADD COLUMN user_edited INTEGER DEFAULT 0",
+                        (),
+                    )
+                    .await;
+
+                // Create concept_sources join table (replaces source_memory_ids JSON column)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS concept_sources (
+                        concept_id        TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+                        memory_source_id  TEXT NOT NULL,
+                        linked_at         INTEGER NOT NULL,
+                        link_reason       TEXT,
+                        PRIMARY KEY (concept_id, memory_source_id)
+                    )",
+                    (),
+                )
+                .await
+                .map_err(|e| {
+                    OriginError::VectorDb(format!("migration 40 create concept_sources: {e}"))
+                })?;
+
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_concept_sources_memory ON concept_sources(memory_source_id)",
+                    (),
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 40 idx: {e}")))?;
+
+                // Backfill concept_sources from existing source_memory_ids JSON
+                {
+                    conn.execute("BEGIN", ()).await.map_err(|e| {
+                        OriginError::VectorDb(format!("migration 40 backfill begin: {e}"))
+                    })?;
+
+                    let mut rows = conn
+                        .query(
+                            "SELECT id, source_memory_ids, created_at FROM concepts WHERE source_memory_ids != '[]' AND source_memory_ids IS NOT NULL",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("migration 40 backfill query: {e}")))?;
+
+                    let mut backfill_rows: Vec<(String, String, String)> = Vec::new();
+                    while let Some(row) = rows.next().await.map_err(|e| {
+                        OriginError::VectorDb(format!("migration 40 backfill next: {e}"))
+                    })? {
+                        let concept_id: String = row.get(0).map_err(|e| {
+                            OriginError::VectorDb(format!("migration 40 backfill id: {e}"))
+                        })?;
+                        let json_str: String = row.get(1).unwrap_or_else(|_| "[]".to_string());
+                        let created_at_str: String = row
+                            .get(2)
+                            .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
+                        backfill_rows.push((concept_id, json_str, created_at_str));
+                    }
+
+                    for (concept_id, json_str, created_at_str) in backfill_rows {
+                        let linked_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                            .map(|dt| dt.timestamp())
+                            .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+                        let source_ids: Vec<String> =
+                            serde_json::from_str(&json_str).unwrap_or_default();
+                        for sid in &source_ids {
+                            let _ = conn
+                                .execute(
+                                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, 'backfill')",
+                                    libsql::params![concept_id.clone(), sid.clone(), linked_at],
+                                )
+                                .await;
+                        }
+                    }
+
+                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                        OriginError::VectorDb(format!("migration 40 backfill commit: {e}"))
+                    })?;
+                }
+
+                conn.execute("PRAGMA user_version = 40", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 40 bump: {e}")))?;
+                log::info!("[migration] Migration 40 applied: topic-key upsert columns + concept_sources join table");
+            }
+
+            // Migration 41: KG quality — alias table, relation vocabulary, new columns,
+            // entity/relation deduplication, and unique index on relations.
+            if version < 41 {
                 {
                     let conn = self.conn.lock().await;
                     conn.execute_batch(
@@ -3662,7 +3779,7 @@ impl MemoryDB {
 
                 // 5. Populate entity_aliases with one self-alias per existing entity,
                 //    then deduplicate entities with identical lowercase names.
-                self.migrate_40_dedup_entities().await?;
+                self.migrate_41_dedup_entities().await?;
 
                 {
                     let conn = self.conn.lock().await;
@@ -3690,10 +3807,10 @@ impl MemoryDB {
                     .await
                     .map_err(|e| OriginError::VectorDb(format!("migration 40 relations unique idx: {e}")))?;
 
-                    conn.execute("PRAGMA user_version = 40", ())
+                    conn.execute("PRAGMA user_version = 41", ())
                         .await
-                        .map_err(|e| OriginError::VectorDb(format!("migration 40 bump: {e}")))?;
-                    log::info!("[migration] Migration 40 applied: alias table, relation vocabulary, dedup, unique index");
+                        .map_err(|e| OriginError::VectorDb(format!("migration 41 bump: {e}")))?;
+                    log::info!("[migration] Migration 41 applied: alias table, relation vocabulary, dedup, unique index");
                 }
             }
         }
@@ -3701,10 +3818,10 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Migration 40 helper: seed one self-alias per entity, then collapse
+    /// Migration 41 helper: seed one self-alias per entity, then collapse
     /// entities that share the same lowercase name by keeping the
     /// most-observed one and redirecting the others as aliases.
-    async fn migrate_40_dedup_entities(&self) -> Result<(), OriginError> {
+    async fn migrate_41_dedup_entities(&self) -> Result<(), OriginError> {
         let conn = self.conn.lock().await;
 
         // Seed self-aliases for all existing entities (idempotent via INSERT OR IGNORE)
@@ -3825,7 +3942,7 @@ impl MemoryDB {
                     libsql::params![loser_id.clone()],
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("migration 40 del loser: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 del loser: {e}")))?;
             }
         }
 
@@ -6630,6 +6747,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(items)
@@ -6702,6 +6821,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             }))
         } else {
             Ok(None)
@@ -6746,7 +6867,9 @@ impl MemoryDB {
                 MAX(structured_fields) as structured_fields,
                 MAX(retrieval_cue) as retrieval_cue,
                 SUM(access_count) as access_count,
-                MAX(source_text) as source_text
+                MAX(source_text) as source_text,
+                MAX(version) as version,
+                MAX(changelog) as changelog
              FROM memories
              WHERE pending_revision = 0
                AND source_id IN ({placeholders})
@@ -6794,6 +6917,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: row.get::<i64>(23).unwrap_or(1),
+                changelog: row.get::<Option<String>>(24).unwrap_or(None),
             };
             map.insert(item.source_id.clone(), item);
         }
@@ -6893,6 +7018,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(items)
@@ -6985,6 +7112,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
                 access_count: row.get::<u64>(21).unwrap_or(0),
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(items)
@@ -9311,7 +9440,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = 'active' ORDER BY created_at ASC LIMIT 1",
                 (),
             )
@@ -9604,6 +9733,8 @@ impl MemoryDB {
                 retrieval_cue: row.get::<Option<String>>(19).unwrap_or(None),
                 access_count: row.get::<u64>(20).unwrap_or(0),
                 source_text: row.get::<Option<String>>(21).unwrap_or(None),
+                version: 1,
+                changelog: None,
             });
         }
         Ok(results)
@@ -12429,7 +12560,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE id = ?1",
                 libsql::params![id],
             )
@@ -12450,7 +12581,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE entity_id = ?1 AND status = 'active' LIMIT 1",
                 libsql::params![entity_id],
             )
@@ -12501,7 +12632,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = ?1 ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3",
                 libsql::params![status, limit, offset],
             )
@@ -12525,7 +12656,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let (sql, params): (String, Vec<libsql::Value>) = if let Some(d) = domain {
             (
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = ?1 AND domain = ?2 ORDER BY last_modified DESC LIMIT ?3 OFFSET ?4".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
@@ -12536,7 +12667,7 @@ impl MemoryDB {
             )
         } else {
             (
-                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
                  FROM concepts WHERE status = ?1 ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
@@ -12562,22 +12693,36 @@ impl MemoryDB {
     }
 
     /// Update a concept's content and source memory ids. Increments version, updates timestamps.
+    /// Dual-writes: updates the JSON `source_memory_ids` column (backward compat) AND
+    /// inserts any new links into the `concept_sources` join table.
     pub async fn update_concept_content(
         &self,
         id: &str,
         content: &str,
         source_memory_ids: &[&str],
+        link_reason: &str,
     ) -> Result<(), OriginError> {
         let source_ids_json = serde_json::to_string(&source_memory_ids)
             .map_err(|e| OriginError::VectorDb(format!("serialize source_memory_ids: {e}")))?;
         let now = chrono::Utc::now().to_rfc3339();
+        let now_ts = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().await;
+        // Dual-write: update JSON column (backward compat) + increment version + timestamps
         conn.execute(
             "UPDATE concepts SET content = ?1, source_memory_ids = ?2, version = version + 1, last_compiled = ?3, last_modified = ?3 WHERE id = ?4",
             libsql::params![content, source_ids_json, now, id],
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("update_concept_content: {e}")))?;
+        // Dual-write: insert any new source links into the join table (idempotent)
+        for sid in source_memory_ids {
+            let _ = conn
+                .execute(
+                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+                    libsql::params![id, sid, now_ts, link_reason],
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -12602,6 +12747,7 @@ impl MemoryDB {
             .query(
                 "SELECT c.id, c.title, c.summary, c.content, c.entity_id, c.domain,
                         c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
+                        COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0),
                         vector_distance_cos(c.embedding, vector32(?1)) as dist
                  FROM concepts c
                  WHERE c.status = 'active' AND c.embedding IS NOT NULL
@@ -12616,7 +12762,7 @@ impl MemoryDB {
             .await
             .map_err(|e| OriginError::VectorDb(e.to_string()))?
         {
-            let dist: f64 = row.get(12).unwrap_or(1.0);
+            let dist: f64 = row.get(15).unwrap_or(1.0);
             let similarity = 1.0 - dist;
             if similarity >= similarity_threshold {
                 return Ok(Some(Self::row_to_concept(&row)?));
@@ -12824,7 +12970,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn.query(
             "SELECT c.id, c.title, c.summary, c.content, c.entity_id, c.domain,
-                    c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified
+                    c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
+                    COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0)
              FROM concepts c
              JOIN concepts_fts f ON c.rowid = f.rowid
              WHERE concepts_fts MATCH ?1 AND c.status = 'active'
@@ -12875,7 +13022,556 @@ impl MemoryDB {
             last_modified: row
                 .get::<String>(11)
                 .map_err(|e| OriginError::VectorDb(format!("concept last_modified: {e}")))?,
+            sources_updated_count: row.get::<i64>(12).unwrap_or(0),
+            stale_reason: row.get::<Option<String>>(13).unwrap_or(None),
+            user_edited: row.get::<i64>(14).unwrap_or(0) != 0,
         })
+    }
+
+    // ===== Topic Match Helpers =====
+
+    /// Fetch lightweight candidate memories for topic matching.
+    /// Prefers same domain + memory_type but does not require them.
+    /// Returns candidates with domain/type metadata so the caller can compute
+    /// tiered thresholds (exact match → lower threshold, no match → higher).
+    pub async fn topic_match_candidates(
+        &self,
+        domain: Option<&str>,
+        memory_type: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<Vec<crate::topic_match::TopicMatchCandidate>, OriginError> {
+        let conn = self.conn.lock().await;
+
+        // Build a flexible query: prefer same domain+type, but include all recent
+        // chunk_index=0 memories as candidates. ORDER BY gives priority to exact
+        // domain+type matches, then partial, then everything else.
+        let sql = "SELECT source_id, title, content, entity_id, embedding, domain, memory_type
+                   FROM memories
+                   WHERE chunk_index = 0 AND pending_revision = 0
+                   ORDER BY
+                     CASE WHEN domain = ?1 AND memory_type = ?2 THEN 0
+                          WHEN domain = ?1 OR memory_type = ?2 THEN 1
+                          ELSE 2 END,
+                     last_modified DESC
+                   LIMIT ?3";
+        let mut rows = conn
+            .query(
+                sql,
+                libsql::params![
+                    domain.unwrap_or(""),
+                    memory_type.unwrap_or(""),
+                    max_candidates as i64
+                ],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("topic_match_candidates: {e}")))?;
+
+        let mut candidates = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let source_id: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(format!("topic_cand source_id: {e}")))?;
+            let title: String = row.get::<String>(1).unwrap_or_default();
+            let content: String = row
+                .get(2)
+                .map_err(|e| OriginError::VectorDb(format!("topic_cand content: {e}")))?;
+            let entity_id: Option<String> = row.get::<Option<String>>(3).unwrap_or(None);
+            // Decode F32_BLOB (little-endian f32 bytes)
+            let embedding: Vec<f32> = row
+                .get::<Vec<u8>>(4)
+                .unwrap_or_default()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let cand_domain: Option<String> = row.get::<Option<String>>(5).unwrap_or(None);
+            let cand_type: Option<String> = row.get::<Option<String>>(6).unwrap_or(None);
+            candidates.push(crate::topic_match::TopicMatchCandidate {
+                source_id,
+                title,
+                content,
+                entity_id,
+                embedding,
+                domain: cand_domain,
+                memory_type: cand_type,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// FTS5-based title matching for topic matching.
+    ///
+    /// Queries `memories_fts` with a `title:` column filter and returns the
+    /// `source_id` values that match. The caller intersects this set with
+    /// the pre-fetched candidates in Rust.
+    ///
+    /// Words shorter than 2 chars are skipped so that tokens like "SQL",
+    /// "API", "Go" are retained while noise particles like "a" are dropped.
+    pub async fn topic_match_title_fts(
+        &self,
+        title: &str,
+        candidate_source_ids: &[&str],
+    ) -> Result<Vec<String>, OriginError> {
+        // Build list of significant words (2+ char, alphanumeric only).
+        let words: Vec<String> = title
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 2)
+            .map(|w| format!("title:{w}"))
+            .collect();
+
+        if words.is_empty() || candidate_source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let fts_query = words.join(" OR ");
+
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT c.source_id
+                 FROM memories_fts fts
+                 JOIN memories c ON fts.rowid = c.rowid
+                 WHERE memories_fts MATCH ?1
+                   AND c.chunk_index = 0
+                   AND c.pending_revision = 0",
+                libsql::params![fts_query],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("topic_match_title_fts: {e}")))?;
+
+        // Collect matching source_ids and intersect with candidate set.
+        let candidate_set: std::collections::HashSet<&str> =
+            candidate_source_ids.iter().copied().collect();
+        let mut matched = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let sid: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(format!("topic_title_fts sid: {e}")))?;
+            if candidate_set.contains(sid.as_str()) {
+                matched.push(sid);
+            }
+        }
+        Ok(matched)
+    }
+
+    // ===== Concept Sources Join Table Methods =====
+
+    /// Link a memory to a concept in the concept_sources join table.
+    /// Idempotent: INSERT OR IGNORE on the composite primary key.
+    pub async fn link_concept_source(
+        &self,
+        concept_id: &str,
+        memory_source_id: &str,
+        link_reason: &str,
+    ) -> Result<(), OriginError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+            libsql::params![concept_id, memory_source_id, now, link_reason],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("link_concept_source: {e}")))?;
+        Ok(())
+    }
+
+    /// Get all source memories linked to a concept, ordered by linked_at ascending.
+    pub async fn get_concept_sources(
+        &self,
+        concept_id: &str,
+    ) -> Result<Vec<origin_types::ConceptSource>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT concept_id, memory_source_id, linked_at, link_reason FROM concept_sources WHERE concept_id = ?1 ORDER BY linked_at ASC",
+                libsql::params![concept_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_concept_sources: {e}")))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            result.push(origin_types::ConceptSource {
+                concept_id: row.get(0).map_err(|e| {
+                    OriginError::VectorDb(format!("concept_sources concept_id: {e}"))
+                })?,
+                memory_source_id: row.get(1).map_err(|e| {
+                    OriginError::VectorDb(format!("concept_sources memory_source_id: {e}"))
+                })?,
+                linked_at: row.get(2).unwrap_or(0),
+                link_reason: row.get::<Option<String>>(3).unwrap_or(None),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Reverse lookup: find all active concepts that reference a given memory source_id.
+    pub async fn get_concepts_for_memory(
+        &self,
+        memory_source_id: &str,
+    ) -> Result<Vec<crate::concepts::Concept>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT c.id, c.title, c.summary, c.content, c.entity_id, c.domain,
+                        c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
+                        COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0)
+                 FROM concepts c
+                 INNER JOIN concept_sources cs ON c.id = cs.concept_id
+                 WHERE cs.memory_source_id = ?1 AND c.status = 'active'",
+                libsql::params![memory_source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_concepts_for_memory: {e}")))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            result.push(Self::row_to_concept(&row)?);
+        }
+        Ok(result)
+    }
+
+    /// Remove concept_sources rows where the referenced memory no longer exists.
+    pub async fn cleanup_orphaned_concept_sources(&self) -> Result<usize, OriginError> {
+        let conn = self.conn.lock().await;
+        let rows_affected = conn
+            .execute(
+                "DELETE FROM concept_sources WHERE memory_source_id NOT IN (SELECT DISTINCT source_id FROM memories)",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("cleanup_orphaned_concept_sources: {e}")))?;
+        Ok(rows_affected as usize)
+    }
+
+    /// Check if a memory is protected from in-place upsert (confirmed or high-stability).
+    pub async fn is_memory_protected(&self, source_id: &str) -> Result<bool, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT confirmed, stability FROM memories WHERE source_id = ?1 AND chunk_index = 0 LIMIT 1",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("is_memory_protected: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let confirmed: i64 = row.get(0).unwrap_or(0);
+            let stability: Option<String> = row.get::<Option<String>>(1).unwrap_or(None);
+            Ok(confirmed != 0
+                || matches!(stability.as_deref(), Some("learned") | Some("confirmed")))
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Mark a concept as stale with a specific reason.
+    pub async fn set_concept_stale(
+        &self,
+        concept_id: &str,
+        reason: &str,
+    ) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE concepts SET stale_reason = ?1 WHERE id = ?2",
+            libsql::params![reason, concept_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("set_concept_stale: {e}")))?;
+        Ok(())
+    }
+
+    /// Increment a concept's sources_updated_count (for trivial/non-conflicting source changes).
+    pub async fn increment_concept_sources_updated(
+        &self,
+        concept_id: &str,
+    ) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE concepts SET sources_updated_count = sources_updated_count + 1 WHERE id = ?1",
+            libsql::params![concept_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("increment_concept_sources_updated: {e}")))?;
+        Ok(())
+    }
+
+    /// List active concepts with the given stale_reason, up to `limit` rows.
+    pub async fn list_stale_concepts(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<crate::concepts::Concept>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0) FROM concepts WHERE stale_reason = ?1 AND status = 'active' LIMIT 10",
+                libsql::params![reason],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("list_stale_concepts: {e}")))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            result.push(Self::row_to_concept(&row)?);
+        }
+        Ok(result)
+    }
+
+    /// Clear staleness fields after successful re-distillation.
+    pub async fn clear_concept_staleness(&self, concept_id: &str) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE concepts SET stale_reason = NULL, sources_updated_count = 0 WHERE id = ?1",
+            libsql::params![concept_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("clear_concept_staleness: {e}")))?;
+        Ok(())
+    }
+
+    /// Update a memory's content in-place for topic-key upsert.
+    ///
+    /// Workflow:
+    /// 1. Reads existing row metadata (outside transaction, outside lock).
+    /// 2. Computes new embedding (sync, CPU-bound, outside lock).
+    /// 3. Inside a single transaction: deletes all chunks for source_id, re-inserts
+    ///    one chunk with new content + embedding + incremented version + changelog.
+    ///
+    /// Preserves: title, source, source_id, memory_type, domain, entity_id, confirmed,
+    /// stability, quality, structured_fields, created_at, and all other metadata.
+    /// Updates: content, embedding, version, changelog, last_modified, word_count.
+    pub async fn upsert_memory_in_place(
+        &self,
+        source_id: &str,
+        new_content: &str,
+        content_embedding: &[f32],
+        source_agent: Option<&str>,
+        incoming_source_id: Option<&str>,
+        changelog_cap: usize,
+    ) -> Result<(), OriginError> {
+        // ---- Step 1: read existing row metadata (need lock briefly) ----
+        struct SavedMeta {
+            source: String,
+            title: String,
+            summary: Option<String>,
+            url: Option<String>,
+            chunk_type: String,
+            language: Option<String>,
+            memory_type: Option<String>,
+            domain: Option<String>,
+            confidence: Option<f64>,
+            confirmed: i64,
+            stability: String,
+            entity_id: Option<String>,
+            enrichment_status: String,
+            quality: Option<String>,
+            is_recap: i64,
+            structured_fields: Option<String>,
+            retrieval_cue: Option<String>,
+            source_text: Option<String>,
+            created_at: i64,
+            version: i64,
+            changelog: String,
+        }
+
+        let saved = {
+            let conn = self.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT source, title, summary, url, chunk_type, language,
+                            memory_type, domain, confidence, confirmed, stability,
+                            entity_id, enrichment_status, quality, is_recap,
+                            structured_fields, retrieval_cue, source_text,
+                            COALESCE(created_at, last_modified),
+                            COALESCE(version, 1), COALESCE(changelog, '[]')
+                     FROM memories
+                     WHERE source_id = ?1 AND chunk_index = 0
+                     LIMIT 1",
+                    libsql::params![source_id],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("upsert_in_place read: {e}")))?;
+
+            let row = rows
+                .next()
+                .await
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?
+                .ok_or_else(|| {
+                    OriginError::VectorDb(format!(
+                        "upsert_memory_in_place: source_id {source_id} not found"
+                    ))
+                })?;
+
+            SavedMeta {
+                source: row
+                    .get::<String>(0)
+                    .unwrap_or_else(|_| "memory".to_string()),
+                title: row.get::<String>(1).unwrap_or_default(),
+                summary: row.get::<Option<String>>(2).unwrap_or(None),
+                url: row.get::<Option<String>>(3).unwrap_or(None),
+                chunk_type: row.get::<String>(4).unwrap_or_else(|_| "prose".to_string()),
+                language: row.get::<Option<String>>(5).unwrap_or(None),
+                memory_type: row.get::<Option<String>>(6).unwrap_or(None),
+                domain: row.get::<Option<String>>(7).unwrap_or(None),
+                confidence: row.get::<Option<f64>>(8).unwrap_or(None),
+                confirmed: row.get::<i64>(9).unwrap_or(0),
+                stability: row.get::<String>(10).unwrap_or_else(|_| "new".to_string()),
+                entity_id: row.get::<Option<String>>(11).unwrap_or(None),
+                enrichment_status: row
+                    .get::<String>(12)
+                    .unwrap_or_else(|_| "enriched".to_string()),
+                quality: row.get::<Option<String>>(13).unwrap_or(None),
+                is_recap: row.get::<i64>(14).unwrap_or(0),
+                structured_fields: row.get::<Option<String>>(15).unwrap_or(None),
+                retrieval_cue: row.get::<Option<String>>(16).unwrap_or(None),
+                source_text: row.get::<Option<String>>(17).unwrap_or(None),
+                created_at: row
+                    .get::<i64>(18)
+                    .unwrap_or_else(|_| chrono::Utc::now().timestamp()),
+                version: row.get::<i64>(19).unwrap_or(1),
+                changelog: row.get::<String>(20).unwrap_or_else(|_| "[]".to_string()),
+            }
+        };
+
+        // ---- Step 2: use the caller-supplied embedding (already computed for topic matching) ----
+        let vec_sql = Self::vec_to_sql(content_embedding);
+
+        // ---- Step 3: build new changelog entry and version ----
+        let now_ts = chrono::Utc::now().timestamp();
+        let new_version = saved.version + 1;
+        let entry = serde_json::json!({
+            "version": new_version,
+            "at": now_ts,
+            "delta": "",   // placeholder — async LLM can fill this later
+            "source_agent": source_agent,
+            "incoming_source_id": incoming_source_id,
+        });
+        let mut changelog: Vec<serde_json::Value> =
+            serde_json::from_str(&saved.changelog).unwrap_or_default();
+        changelog.push(entry);
+        if changelog.len() > changelog_cap {
+            changelog.drain(..changelog.len() - changelog_cap);
+        }
+        let changelog_json = serde_json::to_string(&changelog)
+            .map_err(|e| OriginError::VectorDb(format!("serialize changelog: {e}")))?;
+
+        // Recount words for the new content
+        let new_word_count = new_content.split_whitespace().count() as i64;
+
+        // Generate a fresh chunk id (old id is deleted; avoids PK edge-cases during replay)
+        let new_chunk_id = format!(
+            "mem_{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .replace('-', "")
+                .chars()
+                .take(12)
+                .collect::<String>()
+        );
+
+        // ---- Step 4: transaction — delete old chunks, insert new chunk ----
+        // TODO(multi-chunk-upsert): For most memories content fits in a single chunk.
+        // If content exceeds the chunk size limit (~2000 chars / 512 tokens), this
+        // currently stores the full content as chunk_index=0 only. A future improvement
+        // should reuse the chunker module to split `new_content` and insert multiple
+        // chunks with sequential chunk_index values, mirroring how `upsert_documents`
+        // handles multi-chunk RawDocuments.
+        {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("upsert_in_place BEGIN: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM memories WHERE source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("upsert_in_place DELETE: {e}")))?;
+
+            let insert_sql = "INSERT INTO memories (
+                    id, content, source, source_id, title, summary, url,
+                    chunk_index, last_modified, chunk_type, language, byte_start, byte_end,
+                    semantic_unit, memory_type, domain, source_agent, confidence, confirmed,
+                    stability, supersedes, pending_revision, word_count,
+                    entity_id, enrichment_status, quality, is_recap, supersede_mode,
+                    structured_fields, retrieval_cue, source_text,
+                    embedding, created_at, version, changelog
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    0, ?8, ?9, ?10, NULL, NULL,
+                    NULL, ?11, ?12, ?13, ?14, ?15,
+                    ?16, NULL, 0, ?17,
+                    ?18, ?19, ?20, ?21, 'hide',
+                    ?22, ?23, ?24,
+                    vector32(?25), ?26, ?27, ?28
+                )";
+
+            conn.execute(
+                insert_sql,
+                libsql::params![
+                    new_chunk_id,
+                    new_content,
+                    saved.source,
+                    source_id,
+                    saved.title,
+                    saved.summary,
+                    saved.url,
+                    now_ts,
+                    saved.chunk_type,
+                    saved.language,
+                    saved.memory_type,
+                    saved.domain,
+                    source_agent,
+                    saved.confidence,
+                    saved.confirmed,
+                    saved.stability,
+                    new_word_count,
+                    saved.entity_id,
+                    saved.enrichment_status,
+                    saved.quality,
+                    saved.is_recap,
+                    saved.structured_fields,
+                    saved.retrieval_cue,
+                    saved.source_text,
+                    vec_sql,
+                    saved.created_at,
+                    new_version,
+                    changelog_json
+                ],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("upsert_in_place INSERT: {e}")))?;
+
+            conn.execute("COMMIT", ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("upsert_in_place COMMIT: {e}")))?;
+        }
+
+        log::info!(
+            "[db] upsert_memory_in_place: source_id={source_id} v{} → v{new_version}",
+            saved.version
+        );
+        Ok(())
     }
 
     // ===== Source Sync State Methods =====
@@ -18710,7 +19406,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        db.update_concept_content("concept_u1", "v2 content", &["m1", "m2"])
+        db.update_concept_content("concept_u1", "v2 content", &["m1", "m2"], "concept_growth")
             .await
             .unwrap();
         let c = db.get_concept("concept_u1").await.unwrap().unwrap();
@@ -20257,7 +20953,7 @@ pub(crate) mod tests {
         }
     }
 
-    // ==================== Migration 40 ====================
+    // ==================== Migration 41 (KG quality) ====================
 
     #[tokio::test]
     async fn test_migration_40_kg_quality_tables() {
@@ -20359,17 +21055,1185 @@ pub(crate) mod tests {
         );
     }
 
+    // ==================== Topic-key upsert feature tests ====================
+
+    // ---- link_concept_source + get_concept_sources ----
+
     #[tokio::test]
-    async fn test_search_entities_by_name() {
+    async fn test_link_concept_source_idempotent() {
         let (db, _dir) = test_db().await;
-        let id = db
-            .store_entity("Alice Chen", "person", None, Some("test"), None)
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Insert a concept and a memory to satisfy FK + existence expectations.
+        db.insert_concept("c1", "Concept One", None, "content", None, None, &[], &now)
             .await
             .unwrap();
-        let results = db.search_entities_by_name("alice chen").await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, id);
-        let empty: Vec<Entity> = db.search_entities_by_name("bob").await.unwrap();
-        assert!(empty.is_empty());
+        let mem_doc = make_memory_doc(
+            "src1",
+            "Some content about topic.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![mem_doc]).await.unwrap();
+
+        // Link once.
+        db.link_concept_source("c1", "src1", "initial_link")
+            .await
+            .unwrap();
+        // Link again with the same (concept_id, memory_source_id) — idempotent INSERT OR IGNORE.
+        db.link_concept_source("c1", "src1", "duplicate_link")
+            .await
+            .unwrap();
+
+        let sources = db.get_concept_sources("c1").await.unwrap();
+        assert_eq!(
+            sources.len(),
+            1,
+            "idempotent insert should produce exactly 1 row"
+        );
+        assert_eq!(sources[0].concept_id, "c1");
+        assert_eq!(sources[0].memory_source_id, "src1");
+    }
+
+    #[tokio::test]
+    async fn test_get_concept_sources_ordered() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_ord",
+            "Ordering test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Insert two memories.
+        db.upsert_documents(vec![make_memory_doc(
+            "src_a",
+            "Alpha content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "src_b",
+            "Beta content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Manually insert with controlled linked_at values so order is deterministic.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!["c_ord", "src_b", 200i64, "later"],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!["c_ord", "src_a", 100i64, "earlier"],
+            )
+            .await
+            .unwrap();
+        }
+
+        let sources = db.get_concept_sources("c_ord").await.unwrap();
+        assert_eq!(sources.len(), 2);
+        // Should be ordered by linked_at ASC: src_a first, src_b second.
+        assert_eq!(sources[0].memory_source_id, "src_a");
+        assert_eq!(sources[1].memory_source_id, "src_b");
+    }
+
+    // ---- get_concepts_for_memory ----
+
+    #[tokio::test]
+    async fn test_get_concepts_for_memory_reverse_lookup() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_rev",
+            "Reverse lookup content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        db.insert_concept(
+            "concept_x",
+            "Concept X",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.insert_concept(
+            "concept_y",
+            "Concept Y",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Link the same memory to both concepts.
+        db.link_concept_source("concept_x", "mem_rev", "reason_x")
+            .await
+            .unwrap();
+        db.link_concept_source("concept_y", "mem_rev", "reason_y")
+            .await
+            .unwrap();
+
+        let concepts = db.get_concepts_for_memory("mem_rev").await.unwrap();
+        assert_eq!(concepts.len(), 2, "memory should be linked to 2 concepts");
+
+        let ids: Vec<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"concept_x"), "concept_x should be in result");
+        assert!(ids.contains(&"concept_y"), "concept_y should be in result");
+    }
+
+    #[tokio::test]
+    async fn test_get_concepts_for_memory_excludes_archived() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_arc",
+            "Archived concept test",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        db.insert_concept(
+            "c_active",
+            "Active concept",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.insert_concept(
+            "c_archived",
+            "Archived concept",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_archived").await.unwrap();
+
+        db.link_concept_source("c_active", "mem_arc", "r")
+            .await
+            .unwrap();
+        db.link_concept_source("c_archived", "mem_arc", "r")
+            .await
+            .unwrap();
+
+        let concepts = db.get_concepts_for_memory("mem_arc").await.unwrap();
+        // Only active concepts should be returned.
+        assert_eq!(concepts.len(), 1);
+        assert_eq!(concepts[0].id, "c_active");
+    }
+
+    // ---- cleanup_orphaned_concept_sources ----
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_concept_sources() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_clean",
+            "Cleanup test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Insert a memory, link it, then delete it directly.
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_ghost",
+            "Ghost memory",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.link_concept_source("c_clean", "mem_ghost", "reason")
+            .await
+            .unwrap();
+
+        // Delete the memory directly to simulate an orphan.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM memories WHERE source_id = 'mem_ghost'", ())
+                .await
+                .unwrap();
+        }
+
+        // Confirm orphan exists.
+        let sources_before = db.get_concept_sources("c_clean").await.unwrap();
+        assert_eq!(
+            sources_before.len(),
+            1,
+            "orphan row should be present before cleanup"
+        );
+
+        let removed = db.cleanup_orphaned_concept_sources().await.unwrap();
+        assert_eq!(removed, 1, "should remove exactly 1 orphaned row");
+
+        let sources_after = db.get_concept_sources("c_clean").await.unwrap();
+        assert_eq!(
+            sources_after.len(),
+            0,
+            "orphan row should be gone after cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_concept_sources_keeps_valid() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_keep",
+            "Keep test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_valid",
+            "Valid memory",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.link_concept_source("c_keep", "mem_valid", "reason")
+            .await
+            .unwrap();
+
+        let removed = db.cleanup_orphaned_concept_sources().await.unwrap();
+        assert_eq!(
+            removed, 0,
+            "no orphans should be removed when all memories exist"
+        );
+
+        let sources = db.get_concept_sources("c_keep").await.unwrap();
+        assert_eq!(sources.len(), 1, "valid row should be intact");
+    }
+
+    // ---- topic_match_candidates ----
+
+    #[tokio::test]
+    async fn test_topic_match_candidates_filters() {
+        let (db, _dir) = test_db().await;
+
+        // Insert memories with different domain/type combinations.
+        db.upsert_documents(vec![make_memory_doc(
+            "m_work_know",
+            "Work knowledge content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "m_work_pref",
+            "Work preference content",
+            "preference",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "m_personal_know",
+            "Personal knowledge content",
+            "knowledge",
+            "personal",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Query for domain=work, type=knowledge — exact match should come first.
+        let candidates = db
+            .topic_match_candidates(Some("work"), Some("knowledge"), 100)
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = candidates.iter().map(|c| c.source_id.as_str()).collect();
+        assert!(
+            ids.contains(&"m_work_know"),
+            "m_work_know should be in candidates"
+        );
+        // Flexible matching: all candidates returned, exact match prioritized
+        assert!(
+            ids[0] == "m_work_know",
+            "exact domain+type match should be first"
+        );
+        // Other memories are also returned (lower priority)
+        assert!(ids.len() == 3, "all 3 memories should be candidates");
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_candidates_works_with_missing_filters() {
+        let (db, _dir) = test_db().await;
+
+        db.upsert_documents(vec![make_memory_doc(
+            "m1",
+            "Some content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Missing domain => still returns candidates (flexible matching).
+        let candidates = db
+            .topic_match_candidates(None, Some("knowledge"), 100)
+            .await
+            .unwrap();
+        assert!(
+            !candidates.is_empty(),
+            "missing domain should still return candidates"
+        );
+
+        // Missing type => still returns candidates.
+        let candidates = db
+            .topic_match_candidates(Some("work"), None, 100)
+            .await
+            .unwrap();
+        assert!(
+            !candidates.is_empty(),
+            "missing type should still return candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_candidates_respects_max() {
+        let (db, _dir) = test_db().await;
+
+        for i in 0..5 {
+            let sid = format!("m_max_{i}");
+            let content = format!("Content item number {i} about some topic");
+            db.upsert_documents(vec![make_memory_doc(
+                &sid,
+                &content,
+                "knowledge",
+                "work",
+                "agent",
+            )])
+            .await
+            .unwrap();
+        }
+
+        let candidates = db
+            .topic_match_candidates(Some("work"), Some("knowledge"), 3)
+            .await
+            .unwrap();
+        assert!(
+            candidates.len() <= 3,
+            "max_candidates limit should be respected"
+        );
+    }
+
+    // ---- find_topic_match tiered thresholds ----
+
+    /// Helper: store a memory and return its embedding for use in topic-match tests.
+    async fn store_and_embed(
+        db: &MemoryDB,
+        source_id: &str,
+        content: &str,
+        memory_type: &str,
+        domain: &str,
+    ) -> Vec<f32> {
+        db.upsert_documents(vec![make_memory_doc(
+            source_id,
+            content,
+            memory_type,
+            domain,
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.generate_embeddings(&[content.to_string()])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_exact_tier() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        // Store a memory about Rust async patterns
+        let _ = store_and_embed(
+            &db,
+            "m_rust",
+            "Rust async patterns use tokio runtime with spawn and select macros",
+            "knowledge",
+            "rust-project",
+        )
+        .await;
+
+        // Query with SAME domain+type — should use exact tier (0.70)
+        let query_emb = db
+            .generate_embeddings(&[
+                "Rust async patterns with tokio runtime and spawn for concurrency".to_string(),
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Rust async patterns",
+            Some("knowledge"),
+            Some("rust-project"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.matched_source_id.is_some(),
+            "exact tier (domain+type match) should find a match"
+        );
+        assert_eq!(result.matched_source_id.as_deref(), Some("m_rust"));
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_partial_tier_different_type() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_db",
+            "PostgreSQL database with pgvector extension for vector search",
+            "decision",
+            "myproject",
+        )
+        .await;
+
+        // Query with same domain but DIFFERENT type — partial tier (0.80)
+        let query_emb = db
+            .generate_embeddings(&[
+                "PostgreSQL database using pgvector for vector similarity search".to_string(),
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Database choice",
+            Some("fact"),
+            Some("myproject"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // Similarity should be high enough for partial tier
+        assert!(
+            result.matched_source_id.is_some(),
+            "partial tier (same domain, different type) should match when similarity is high"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_no_domain_still_matches() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_theme",
+            "Dark mode theme preference for all editors and terminals",
+            "preference",
+            "personal",
+        )
+        .await;
+
+        // Query with NO domain — should still find match if similarity is very high
+        let query_emb = db
+            .generate_embeddings(&[
+                "Dark mode theme preference for all editors and terminals".to_string()
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Theme preference",
+            None,
+            None,
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // Near-identical content should pass even the semantic-only tier (0.90)
+        assert!(
+            result.matched_source_id.is_some(),
+            "semantic-only tier should match with very high similarity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_different_topic_no_match() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_frontend",
+            "React 19 with server components for the frontend UI layer",
+            "decision",
+            "myproject",
+        )
+        .await;
+
+        // Query about a completely different topic
+        let query_emb = db
+            .generate_embeddings(&[
+                "Kubernetes deployment strategy using blue-green rollouts for zero downtime"
+                    .to_string(),
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Deployment strategy",
+            Some("decision"),
+            Some("myproject"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.matched_source_id.is_none(),
+            "completely different topic should not match even with same domain+type"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_below_partial_threshold_no_match() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_auth",
+            "JWT authentication with RS256 signing for API endpoints",
+            "decision",
+            "backend",
+        )
+        .await;
+
+        // Somewhat related content but different domain+type — needs 0.80 for partial tier
+        let query_emb = db
+            .generate_embeddings(&[
+                "OAuth2 authorization flow with PKCE for mobile app login".to_string()
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Auth approach",
+            Some("fact"),
+            Some("mobile"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // Related but different enough that it should NOT match at the none tier (0.90)
+        // This tests that the tiered thresholds actually prevent false positives
+        assert!(
+            result.matched_source_id.is_none(),
+            "related-but-different content should not match across domain+type at high threshold"
+        );
+    }
+
+    // ---- upsert_memory_in_place ----
+
+    #[tokio::test]
+    async fn test_upsert_memory_in_place_updates_version() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_uip",
+            "Original content for upsert test.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Compute an embedding for the new content.
+        let new_content = "Updated content after in-place upsert.";
+        let embedding = db
+            .generate_embeddings(&[new_content.to_string()])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        db.upsert_memory_in_place(
+            "mem_uip",
+            new_content,
+            &embedding,
+            Some("test-agent"),
+            None,
+            50,
+        )
+        .await
+        .unwrap();
+
+        // Verify content and version via direct DB query.
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT content, version FROM memories WHERE source_id = 'mem_uip' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("row should exist");
+        let content: String = row.get(0).unwrap();
+        let version: i64 = row.get(1).unwrap();
+
+        assert_eq!(content, new_content, "content should be updated");
+        assert_eq!(version, 2, "version should be incremented to 2");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_memory_in_place_changelog() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_cl", "Initial content.", "knowledge", "work", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let new_content = "Content after first upsert.";
+        let embedding = db
+            .generate_embeddings(&[new_content.to_string()])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        db.upsert_memory_in_place(
+            "mem_cl",
+            new_content,
+            &embedding,
+            Some("my-agent"),
+            Some("ext-src-1"),
+            50,
+        )
+        .await
+        .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT changelog FROM memories WHERE source_id = 'mem_cl' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("row should exist");
+        let changelog_json: String = row.get(0).unwrap();
+        let changelog: Vec<serde_json::Value> = serde_json::from_str(&changelog_json).unwrap();
+
+        assert_eq!(changelog.len(), 1, "one changelog entry after first upsert");
+        assert_eq!(changelog[0]["version"], 2);
+        assert_eq!(changelog[0]["source_agent"], "my-agent");
+        assert_eq!(changelog[0]["incoming_source_id"], "ext-src-1");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_memory_in_place_changelog_cap() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_cap", "Starting content.", "knowledge", "work", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let cap = 50usize;
+        // Upsert 55 times; changelog should be capped at `cap` entries.
+        for i in 0..55 {
+            let content = format!("Iteration {i} content for cap test.");
+            let embedding = db
+                .generate_embeddings(std::slice::from_ref(&content))
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            db.upsert_memory_in_place("mem_cap", &content, &embedding, None, None, cap)
+                .await
+                .unwrap();
+        }
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT changelog FROM memories WHERE source_id = 'mem_cap' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("row should exist");
+        let changelog_json: String = row.get(0).unwrap();
+        let changelog: Vec<serde_json::Value> = serde_json::from_str(&changelog_json).unwrap();
+
+        assert_eq!(
+            changelog.len(),
+            cap,
+            "changelog should be capped at {cap} entries, got {}",
+            changelog.len()
+        );
+    }
+
+    // ---- is_memory_protected ----
+
+    #[tokio::test]
+    async fn test_is_memory_protected_confirmed() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_prot_conf",
+            "Content to protect.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Initially not protected.
+        assert!(!db.is_memory_protected("mem_prot_conf").await.unwrap());
+
+        // Set confirmed=1 directly.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET confirmed = 1 WHERE source_id = 'mem_prot_conf'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.is_memory_protected("mem_prot_conf").await.unwrap(),
+            "confirmed memory should be protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_memory_protected_stability_learned() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_prot_stab",
+            "Content to protect by stability.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Initially not protected (stability='new' by default).
+        assert!(!db.is_memory_protected("mem_prot_stab").await.unwrap());
+
+        // Set stability='learned'.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET stability = 'learned' WHERE source_id = 'mem_prot_stab'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.is_memory_protected("mem_prot_stab").await.unwrap(),
+            "stability='learned' memory should be protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_memory_protected_stability_confirmed() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_prot_stab2",
+            "Content for stability confirmed.",
+            "knowledge",
+            "work",
+            "agent",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET stability = 'confirmed' WHERE source_id = 'mem_prot_stab2'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.is_memory_protected("mem_prot_stab2").await.unwrap(),
+            "stability='confirmed' memory should be protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_memory_protected_nonexistent() {
+        let (db, _dir) = test_db().await;
+        // Non-existent source_id should return false, not an error.
+        let result = db.is_memory_protected("no_such_id").await.unwrap();
+        assert!(!result, "non-existent memory should not be protected");
+    }
+
+    // ---- set_concept_stale / clear_concept_staleness / list_stale_concepts ----
+
+    #[tokio::test]
+    async fn test_stale_concepts_lifecycle() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_stale",
+            "Stale concept",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Initially no stale concepts.
+        let stale = db.list_stale_concepts("source_updated").await.unwrap();
+        assert!(stale.is_empty(), "no stale concepts initially");
+
+        // Mark stale.
+        db.set_concept_stale("c_stale", "source_updated")
+            .await
+            .unwrap();
+
+        let stale = db.list_stale_concepts("source_updated").await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "c_stale");
+        assert_eq!(stale[0].stale_reason.as_deref(), Some("source_updated"));
+
+        // Clear staleness.
+        db.clear_concept_staleness("c_stale").await.unwrap();
+
+        let stale_after = db.list_stale_concepts("source_updated").await.unwrap();
+        assert!(stale_after.is_empty(), "staleness should be cleared");
+
+        // Verify stale_reason is NULL and sources_updated_count is 0 after clearing.
+        let c = db.get_concept("c_stale").await.unwrap().unwrap();
+        assert!(
+            c.stale_reason.is_none(),
+            "stale_reason should be None after clearing"
+        );
+        assert_eq!(c.sources_updated_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_stale_concepts_excludes_archived() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_stale_arc",
+            "Stale archived",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.set_concept_stale("c_stale_arc", "source_updated")
+            .await
+            .unwrap();
+        db.archive_concept("c_stale_arc").await.unwrap();
+
+        let stale = db.list_stale_concepts("source_updated").await.unwrap();
+        assert!(
+            stale.is_empty(),
+            "archived concepts should not appear in stale list"
+        );
+    }
+
+    // ---- increment_concept_sources_updated ----
+
+    #[tokio::test]
+    async fn test_increment_concept_sources_updated() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.insert_concept(
+            "c_inc",
+            "Increment test",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // sources_updated_count starts at 0.
+        let c = db.get_concept("c_inc").await.unwrap().unwrap();
+        assert_eq!(c.sources_updated_count, 0);
+
+        db.increment_concept_sources_updated("c_inc").await.unwrap();
+        db.increment_concept_sources_updated("c_inc").await.unwrap();
+
+        let c = db.get_concept("c_inc").await.unwrap().unwrap();
+        assert_eq!(
+            c.sources_updated_count, 2,
+            "should be 2 after two increments"
+        );
+    }
+
+    // ---- get_memories_by_source_ids ----
+
+    #[tokio::test]
+    async fn test_get_memories_by_source_ids() {
+        let (db, _dir) = test_db().await;
+
+        // Insert 3 memories.
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_1",
+            "First memory content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_2",
+            "Second memory content",
+            "preference",
+            "personal",
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_3",
+            "Third memory content",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Fetch only 2 of the 3.
+        let ids = vec!["sid_1".to_string(), "sid_3".to_string()];
+        let results = db.get_memories_by_source_ids(&ids).await.unwrap();
+
+        assert_eq!(results.len(), 2, "should return exactly 2 memories");
+        let result_ids: Vec<&str> = results.iter().map(|m| m.source_id.as_str()).collect();
+        assert!(result_ids.contains(&"sid_1"));
+        assert!(result_ids.contains(&"sid_3"));
+        assert!(!result_ids.contains(&"sid_2"), "sid_2 was not requested");
+    }
+
+    #[tokio::test]
+    async fn test_get_memories_by_source_ids_empty_input() {
+        let (db, _dir) = test_db().await;
+
+        let results = db.get_memories_by_source_ids(&[]).await.unwrap();
+        assert!(results.is_empty(), "empty input should return empty result");
+    }
+
+    #[tokio::test]
+    async fn test_get_memories_by_source_ids_missing_id() {
+        let (db, _dir) = test_db().await;
+
+        db.upsert_documents(vec![make_memory_doc(
+            "sid_real",
+            "Real memory",
+            "knowledge",
+            "work",
+            "agent",
+        )])
+        .await
+        .unwrap();
+
+        // Request one real and one non-existent id.
+        let ids = vec!["sid_real".to_string(), "sid_fake".to_string()];
+        let results = db.get_memories_by_source_ids(&ids).await.unwrap();
+
+        assert_eq!(results.len(), 1, "should only return the existing memory");
+        assert_eq!(results[0].source_id, "sid_real");
+    }
+
+    // ---- topic_match_title_fts ----
+
+    #[tokio::test]
+    async fn test_topic_match_title_fts_basic() {
+        let (db, _dir) = test_db().await;
+
+        // Insert a memory whose title contains a searchable word.
+        let doc = crate::sources::RawDocument {
+            source: "memory".to_string(),
+            source_id: "fts_mem".to_string(),
+            title: "Rust programming tips".to_string(),
+            content: "Some content about Rust programming.".to_string(),
+            memory_type: Some("knowledge".to_string()),
+            domain: Some("work".to_string()),
+            source_agent: Some("agent".to_string()),
+            confidence: Some(0.9),
+            confirmed: Some(false),
+            supersede_mode: "hide".to_string(),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Searching for "Rust" in title should match "fts_mem".
+        let matched = db
+            .topic_match_title_fts("Rust programming", &["fts_mem"])
+            .await
+            .unwrap();
+        assert!(
+            matched.contains(&"fts_mem".to_string()),
+            "fts_mem should match title search for 'Rust'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_title_fts_candidate_filter() {
+        let (db, _dir) = test_db().await;
+
+        // Insert two memories with similar titles.
+        for sid in &["fts_a", "fts_b"] {
+            let doc = crate::sources::RawDocument {
+                source: "memory".to_string(),
+                source_id: sid.to_string(),
+                title: format!("Machine learning notes {sid}"),
+                content: format!("Content for {sid}"),
+                memory_type: Some("knowledge".to_string()),
+                domain: Some("work".to_string()),
+                source_agent: Some("agent".to_string()),
+                confidence: Some(0.9),
+                confirmed: Some(false),
+                supersede_mode: "hide".to_string(),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
+
+        // Only pass "fts_a" as a candidate — "fts_b" should be excluded even if it matches FTS.
+        let matched = db
+            .topic_match_title_fts("Machine learning", &["fts_a"])
+            .await
+            .unwrap();
+        assert!(matched.contains(&"fts_a".to_string()), "fts_a should match");
+        assert!(
+            !matched.contains(&"fts_b".to_string()),
+            "fts_b not in candidate set, should be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topic_match_title_fts_empty_candidates() {
+        let (db, _dir) = test_db().await;
+
+        let matched = db.topic_match_title_fts("anything", &[]).await.unwrap();
+        assert!(
+            matched.is_empty(),
+            "empty candidate set should yield empty result"
+        );
     }
 }

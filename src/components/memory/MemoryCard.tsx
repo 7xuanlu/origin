@@ -53,6 +53,7 @@ export default function MemoryCard({
 }: MemoryCardProps) {
   const [deleting, setDeleting] = useState(false);
   const [pendingRevision, setPendingRevision] = useState<PendingRevision | null>(null);
+  const [showChangelog, setShowChangelog] = useState(false);
 
   const facetType = memory.memory_type ?? "fact";
   const isRecap = memory.is_recap === true;
@@ -381,6 +382,28 @@ export default function MemoryCard({
                 )}
                 <span style={{ opacity: 0.4 }}>&middot;</span>
                 <span>{isNew ? "new" : timeAgo(memory.last_modified)}</span>
+                {(memory.version ?? 1) > 1 && (
+                  <>
+                    <span style={{ opacity: 0.4 }}>&middot;</span>
+                    <button
+                      onClick={() => setShowChangelog(!showChangelog)}
+                      className="text-xs text-zinc-400 hover:text-zinc-300 ml-1"
+                    >
+                      v{memory.version}
+                    </button>
+                  </>
+                )}
+                {showChangelog && memory.changelog && memory.changelog.length > 0 && (
+                  <div className="mt-1.5 pl-2 border-l border-zinc-700 space-y-1">
+                    {memory.changelog.map((entry, i) => (
+                      <div key={i} className="text-xs text-zinc-500">
+                        <span className="text-zinc-400">v{entry.version}</span>
+                        {' '}{entry.delta || 'updated'}
+                        <span className="text-zinc-600 ml-1">{timeAgo(entry.at)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {(memory.access_count ?? 0) >= 3 && (
                   <>
                     <span style={{ opacity: 0.4 }}>&middot;</span>
