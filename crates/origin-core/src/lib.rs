@@ -28,6 +28,7 @@ pub mod events;
 pub mod export;
 pub mod extract;
 pub mod importer;
+pub mod kg_quality;
 pub mod llm_classifier;
 pub mod llm_provider;
 pub mod memory_schema;

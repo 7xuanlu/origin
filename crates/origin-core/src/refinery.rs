@@ -27,6 +27,7 @@ pub const ALL_PHASES: &[&str] = &[
     "decision_logs",
     "decision_backfill",
     "prune_rejections",
+    "kg_rethink",
 ];
 
 /// What triggered a refinery cycle. Different triggers run different subsets
@@ -68,6 +69,7 @@ impl TriggerKind {
                     | "entity_extraction"
                     | "decision_backfill"
                     | "prune_rejections"
+                    | "kg_rethink"
             ),
         }
     }
@@ -662,6 +664,107 @@ pub async fn run_periodic_steep_with_api(
         phases.push(phase);
     }
 
+    // Phase 9: Entity backfill — gradually re-extract entities from memories
+    // that were stored before the chat template fix (or where extraction silently
+    // failed). Processes a small batch per steep to avoid GPU overload.
+    if trigger.runs_phase("entity_backfill") {
+        if let Some(llm_ref) = llm {
+            let phase = run_phase("entity_backfill", || async {
+                let batch = db_ref
+                    .find_memories_without_entities(tuning.entity_backfill_batch_size)
+                    .await?;
+                if batch.is_empty() {
+                    return Ok(PhaseOutput {
+                        items_processed: 0,
+                        nudge: Nudge::Silent,
+                        headline: None,
+                    });
+                }
+                let mut extracted = 0usize;
+                for (source_id, content) in &batch {
+                    match extract_single_memory_entities(
+                        db_ref, llm_ref, prompts, source_id, content,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => extracted += 1,
+                        Ok(None) => {
+                            // Mark as attempted so we don't retry forever
+                            let _ = db_ref
+                                .update_memory_entity_id(source_id, "")
+                                .await;
+                        }
+                        Err(e) => {
+                            log::warn!("[refinery] entity_backfill failed for {}: {e}", source_id);
+                            break; // LLM may be down, stop batch
+                        }
+                    }
+                }
+                if extracted > 0 {
+                    log::info!(
+                        "[refinery] entity_backfill: extracted entities for {}/{} memories",
+                        extracted,
+                        batch.len()
+                    );
+                }
+                let (nudge, headline) = classify_backfill(extracted);
+                Ok(PhaseOutput {
+                    items_processed: extracted,
+                    nudge,
+                    headline,
+                })
+            })
+            .await;
+            phases.push(phase);
+        }
+    }
+
+    // Phase 10: KG rethink — periodic knowledge graph quality maintenance.
+    // Rate-limited by `kg_rethink_interval_hours` (default 168h = weekly)
+    // via `app_metadata.last_kg_rethink_ts`. All five sub-phases are cheap
+    // when the graph is clean; the gate mainly avoids redundant log spam.
+    if trigger.runs_phase("kg_rethink") {
+        let interval_secs = (tuning.kg_rethink_interval_hours as i64).saturating_mul(3600);
+        let now = chrono::Utc::now().timestamp();
+        let last_ts: i64 = db
+            .get_app_metadata("last_kg_rethink_ts")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if now.saturating_sub(last_ts) >= interval_secs {
+            let phase = run_phase("kg_rethink", || async {
+                let report = crate::kg_quality::run_rethink(db_ref, llm, tuning).await?;
+                let total = report.merge_candidates
+                    + report.types_normalized
+                    + report.embeddings_refreshed
+                    + report.stale_relations_flagged
+                    + report.contradictions_found;
+                log::info!(
+                    "[refinery] kg_rethink: {} merges, {} normalized, {} refreshed, {} stale, {} contradictions",
+                    report.merge_candidates,
+                    report.types_normalized,
+                    report.embeddings_refreshed,
+                    report.stale_relations_flagged,
+                    report.contradictions_found,
+                );
+                let (nudge, headline) = classify_backfill(total);
+                Ok(PhaseOutput {
+                    items_processed: total,
+                    nudge,
+                    headline,
+                })
+            })
+            .await;
+            // Persist timestamp only if the phase itself didn't error.
+            if phase.error.is_none() {
+                let _ = db.set_app_metadata("last_kg_rethink_ts", &now.to_string()).await;
+            }
+            phases.push(phase);
+        }
+    }
+
     let elapsed = steep_start.elapsed();
     log::info!(
         "[refinery] steep complete in {}ms — {} phases, {} errors",
@@ -823,7 +926,7 @@ pub async fn extract_single_memory_entities(
             let to_id = entity_cache.get(&rel.to.to_lowercase()).cloned();
             if let (Some(from), Some(to)) = (from_id, to_id) {
                 let _ = db
-                    .create_relation(&from, &to, &rel.relation_type, Some("post_ingest"))
+                    .create_relation(&from, &to, &rel.relation_type, Some("post_ingest"), rel.confidence, rel.explanation.as_deref(), Some(source_id))
                     .await;
             }
         }
@@ -3236,8 +3339,14 @@ mod tests {
             "entity_extraction",
             "decision_backfill",
             "prune_rejections",
+            "kg_rethink",
         ];
         for &exp in expected {
+            // kg_rethink is rate-limited by app_metadata — it may or may not run
+            // on any given steep. Everything else must run.
+            if exp == "kg_rethink" {
+                continue;
+            }
             assert!(
                 phase_names.contains(&exp),
                 "Daily should run {}, got {:?}",
@@ -3285,8 +3394,9 @@ mod tests {
 
         let phase_names: Vec<&str> = result.phases.iter().map(|p| p.name.as_str()).collect();
 
-        // All 14 phases must run with Backstop (13 original + prune_rejections
-        // promoted to a tracked phase in Task 4).
+        // All 15 phases must run with Backstop (14 prior + kg_rethink added
+        // in the KG quality work). `kg_rethink` is rate-limited, so on a
+        // fresh DB (last_kg_rethink_ts=0) it runs on the first steep.
         let expected: &[&str] = &[
             "decay",
             "promote",
@@ -3302,6 +3412,7 @@ mod tests {
             "decision_logs",
             "decision_backfill",
             "prune_rejections",
+            "kg_rethink",
         ];
         for &exp in expected {
             assert!(

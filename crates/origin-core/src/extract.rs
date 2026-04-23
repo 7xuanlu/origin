@@ -27,6 +27,8 @@ pub struct ExtractedRelation {
     pub to: String,
     #[serde(alias = "type")]
     pub relation_type: String,
+    pub confidence: Option<f64>,
+    pub explanation: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -189,5 +191,25 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].entities.len(), 1);
         assert!(results[1].entities.is_empty());
+    }
+
+    #[test]
+    fn test_parse_kg_response_with_confidence_and_explanation() {
+        let raw = r#"[{"i": 0, "entities": [{"name": "Alice", "type": "person"}], "observations": [{"entity": "Alice", "content": "leads backend team"}], "relations": [{"from": "Alice", "to": "Backend Team", "type": "leads", "confidence": 0.9, "explanation": "Alice is the tech lead for the backend team"}]}]"#;
+        let memories = vec![(0, "Alice leads the backend team".to_string())];
+        let results = parse_kg_response(raw, &memories);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].relations.len(), 1);
+        assert_eq!(results[0].relations[0].confidence, Some(0.9));
+        assert_eq!(results[0].relations[0].explanation.as_deref(), Some("Alice is the tech lead for the backend team"));
+    }
+
+    #[test]
+    fn test_parse_kg_response_missing_confidence_defaults_none() {
+        let raw = r#"[{"i": 0, "entities": [], "observations": [], "relations": [{"from": "A", "to": "B", "type": "uses"}]}]"#;
+        let memories = vec![(0, "test".to_string())];
+        let results = parse_kg_response(raw, &memories);
+        assert_eq!(results[0].relations[0].confidence, None);
+        assert_eq!(results[0].relations[0].explanation, None);
     }
 }

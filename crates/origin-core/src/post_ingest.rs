@@ -199,6 +199,27 @@ pub async fn run_post_ingest_enrichment(
         Err(e) => log::warn!("[post_ingest] concept growth failed: {e}"),
     }
 
+    // 7b. KG quality verification — check entity self-retrieval after all linking/extraction
+    let final_entity_id = db
+        .get_memory_entity_id(source_id)
+        .await
+        .unwrap_or(entity_id.map(|s| s.to_string()));
+    if let Some(ref eid) = final_entity_id {
+        match db.get_entity_detail(eid).await {
+            Ok(detail) => {
+                match crate::kg_quality::verify_entity(db, eid, &detail.entity.name).await {
+                    Ok(ref result) => {
+                        for warning in &result.warnings {
+                            log::warn!("[post_ingest] {}", warning);
+                        }
+                    }
+                    Err(e) => log::warn!("[post_ingest] entity verification failed: {e}"),
+                }
+            }
+            Err(_) => {} // Entity not found, skip verification
+        }
+    }
+
     // 8. Mark enriched (even on partial failure above)
     if let Err(e) = db.mark_enriched(source_id).await {
         log::warn!("[post_ingest] mark_enriched failed: {e}");

@@ -98,9 +98,21 @@ Classify each memory. Return a JSON array.\n\
 For each: {\"i\": <number>, \"type\": \"<identity|preference|fact|decision|goal>\", \"domain\": \"<work|personal|health|finance|technology|travel|food>\", \"tags\": [\"<tag>\"]}";
 
 pub(crate) const EXTRACT_KNOWLEDGE_GRAPH: &str = "\
-Extract entities and facts from each memory. Return a JSON array.\n\
-For each: {\"i\": <number>, \"entities\": [{\"name\": \"...\", \"type\": \"person|project|technology|organization|place|concept\"}], \"observations\": [{\"entity\": \"...\", \"content\": \"...\"}], \"relations\": [{\"from\": \"...\", \"to\": \"...\", \"type\": \"...\"}]}\n\
-Include \"user\" (person) when the memory is about the user.";
+Extract entities and relations from these memories.\n\
+\n\
+Entity types: person, project, technology, organization, place, concept\n\
+Relation types (pick from this list): works_on, uses, prefers, decided, leads, knows, created, part_of, contradicts, replaced_by, learned_from, blocked_by, depends_on, related_to, discussed_in, authored, located_in, member_of\n\
+If none fit, propose a new type as lowercase_snake_case.\n\
+\n\
+Return JSON array. For each memory:\n\
+{\"i\": <number>, \"entities\": [{\"name\": \"...\", \"type\": \"...\"}], \"observations\": [{\"entity\": \"...\", \"content\": \"...\"}], \"relations\": [{\"from\": \"...\", \"to\": \"...\", \"type\": \"...\", \"confidence\": 0.0-1.0, \"explanation\": \"one sentence why\"}]}\n\
+\n\
+Rules:\n\
+- Normalize entity names: title case for people/orgs (\"Alice Chen\"), lowercase for tech/concepts (\"rust\", \"tdd\")\n\
+- Include \"user\" (person) when memory is about the user\n\
+- One observation per distinct fact (not summaries)\n\
+- Skip relations you're unsure about rather than guessing\n\
+- confidence: 0.9+ for explicitly stated, 0.5-0.8 for inferred";
 
 pub(crate) const EXTRACT_STRUCTURED_FIELDS: &str = "\
 Extract structured fields from this {memory_type} memory. Respond with ONLY valid JSON:\n\

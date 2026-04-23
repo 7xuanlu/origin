@@ -3692,6 +3692,266 @@ impl MemoryDB {
                     .map_err(|e| OriginError::VectorDb(format!("migration 40 bump: {e}")))?;
                 log::info!("[migration] Migration 40 applied: topic-key upsert columns + concept_sources join table");
             }
+
+            // Migration 41: KG quality — alias table, relation vocabulary, new columns,
+            // entity/relation deduplication, and unique index on relations.
+            if version < 41 {
+                {
+                    let conn = self.conn.lock().await;
+                    conn.execute_batch(
+                        "
+                        -- 1. Entity aliases table
+                        CREATE TABLE IF NOT EXISTS entity_aliases (
+                            alias_name TEXT NOT NULL,
+                            canonical_entity_id TEXT NOT NULL REFERENCES entities(id),
+                            created_at INTEGER NOT NULL,
+                            source TEXT DEFAULT 'auto'
+                        );
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_alias_name ON entity_aliases(alias_name);
+
+                        -- 2. Relation type vocabulary
+                        CREATE TABLE IF NOT EXISTS relation_type_vocabulary (
+                            canonical TEXT PRIMARY KEY,
+                            aliases TEXT,
+                            category TEXT,
+                            count INTEGER DEFAULT 0
+                        );
+
+                        -- Seed vocabulary (18 entries)
+                        INSERT OR IGNORE INTO relation_type_vocabulary (canonical, aliases, category, count) VALUES
+                            ('works_on', '[\"working_at\",\"works_at\",\"working_on\"]', 'professional', 0),
+                            ('leads', '[\"leading\",\"manages\",\"heads\"]', 'professional', 0),
+                            ('member_of', '[\"belongs_to\",\"part_of_team\"]', 'professional', 0),
+                            ('authored', '[\"wrote\",\"created_doc\"]', 'professional', 0),
+                            ('knows', '[\"familiar_with\",\"met\"]', 'personal', 0),
+                            ('located_in', '[\"lives_in\",\"based_in\"]', 'personal', 0),
+                            ('uses', '[\"utilizes\",\"leverages\",\"using\"]', 'technical', 0),
+                            ('depends_on', '[\"requires\",\"needs\"]', 'technical', 0),
+                            ('created', '[\"built\",\"made\",\"developed\"]', 'technical', 0),
+                            ('part_of', '[\"component_of\",\"subset_of\"]', 'structural', 0),
+                            ('prefers', '[\"favors\",\"likes\",\"chooses\"]', 'personal', 0),
+                            ('decided', '[\"chose\",\"selected\",\"committed_to\"]', 'personal', 0),
+                            ('learned_from', '[\"discovered_via\",\"taught_by\"]', 'personal', 0),
+                            ('contradicts', '[\"conflicts_with\",\"opposes\"]', 'structural', 0),
+                            ('replaced_by', '[\"superseded_by\",\"deprecated_by\"]', 'structural', 0),
+                            ('blocked_by', '[\"waiting_on\",\"stuck_on\"]', 'structural', 0),
+                            ('discussed_in', '[\"mentioned_in\",\"referenced_in\"]', 'structural', 0),
+                            ('related_to', '[\"associated_with\",\"connected_to\"]', 'structural', 0);
+
+                        -- 3. New columns on relations (idempotent via INSERT trick)
+                        -- SQLite lacks IF NOT EXISTS for ALTER TABLE, so we check the schema.
+                        ",
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 41 DDL: {e}")))?;
+
+                    // Add columns idempotently -- check if they exist first.
+                    for (table, col, col_type) in [
+                        ("relations", "confidence", "REAL"),
+                        ("relations", "explanation", "TEXT"),
+                        ("relations", "source_memory_id", "TEXT"),
+                        ("entities", "embedding_updated_at", "INTEGER"),
+                    ] {
+                        let has_col: bool = {
+                            let mut rows = conn
+                                .query(
+                                    &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = ?1", table),
+                                    libsql::params![col.to_string()],
+                                )
+                                .await
+                                .map_err(|e| OriginError::VectorDb(format!("migration 41 col check: {e}")))?;
+                            match rows.next().await {
+                                Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+                                _ => false,
+                            }
+                        };
+                        if !has_col {
+                            conn.execute(
+                                &format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type),
+                                (),
+                            )
+                            .await
+                            .map_err(|e| OriginError::VectorDb(format!("migration 41 add {}.{}: {e}", table, col)))?;
+                        }
+                    }
+                }
+                // conn guard is dropped here so dedup helpers can re-acquire
+
+                // 5. Populate entity_aliases with one self-alias per existing entity,
+                //    then deduplicate entities with identical lowercase names.
+                self.migrate_41_dedup_entities().await?;
+
+                {
+                    let conn = self.conn.lock().await;
+
+                    // 6. Deduplicate relations: for each (from_entity, to_entity,
+                    //    relation_type) group keep the row with the smallest rowid and
+                    //    delete the rest.
+                    conn.execute(
+                        "DELETE FROM relations
+                         WHERE rowid NOT IN (
+                             SELECT MIN(rowid)
+                             FROM relations
+                             GROUP BY from_entity, to_entity, relation_type
+                         )",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 41 dedup relations: {e}")))?;
+
+                    // 7. Unique index on relations
+                    conn.execute_batch(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique
+                             ON relations(from_entity, to_entity, relation_type);",
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 41 relations unique idx: {e}")))?;
+
+                    conn.execute("PRAGMA user_version = 41", ())
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("migration 41 bump: {e}")))?;
+                    log::info!("[migration] Migration 41 applied: alias table, relation vocabulary, dedup, unique index");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migration 41 helper: seed one self-alias per entity, then collapse
+    /// entities that share the same lowercase name by keeping the
+    /// most-observed one and redirecting the others as aliases.
+    async fn migrate_41_dedup_entities(&self) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+
+        // Seed self-aliases for all existing entities (idempotent via INSERT OR IGNORE)
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source)
+             SELECT LOWER(name), id, created_at, 'migration' FROM entities;",
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("migration 41 seed aliases: {e}")))?;
+
+        // Find all groups of entities that share the same lowercase name
+        // and have more than one member.
+        let mut dup_rows = conn
+            .query(
+                "SELECT LOWER(name) AS lname
+                 FROM entities
+                 GROUP BY LOWER(name)
+                 HAVING COUNT(*) > 1",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("migration 41 find dups: {e}")))?;
+
+        let mut dup_names: Vec<String> = Vec::new();
+        while let Some(row) = dup_rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("migration 41 dup row: {e}")))?
+        {
+            dup_names.push(row.get(0).unwrap_or_default());
+        }
+        drop(dup_rows);
+
+        // For each duplicated lowercase name, keep the entity with the most
+        // observations (tie-break: most recent updated_at), then:
+        //   - redirect all aliases from losers to the winner
+        //   - redirect all relations from losers to the winner
+        //   - delete losers
+        for lname in dup_names {
+            // Find winner (most observations, then latest update)
+            let mut winner_rows = conn
+                .query(
+                    "SELECT e.id
+                     FROM entities e
+                     LEFT JOIN observations o ON o.entity_id = e.id
+                     WHERE LOWER(e.name) = ?1
+                     GROUP BY e.id
+                     ORDER BY COUNT(o.id) DESC, e.updated_at DESC
+                     LIMIT 1",
+                    libsql::params![lname.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 winner: {e}")))?;
+            let winner_id: String = match winner_rows
+                .next()
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 winner row: {e}")))?
+            {
+                Some(row) => row.get(0).unwrap_or_default(),
+                None => continue,
+            };
+            drop(winner_rows);
+
+            // Collect loser ids
+            let mut loser_rows = conn
+                .query(
+                    "SELECT id FROM entities WHERE LOWER(name) = ?1 AND id != ?2",
+                    libsql::params![lname.clone(), winner_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 losers: {e}")))?;
+            let mut loser_ids: Vec<String> = Vec::new();
+            while let Some(row) = loser_rows
+                .next()
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 loser row: {e}")))?
+            {
+                loser_ids.push(row.get(0).unwrap_or_default());
+            }
+            drop(loser_rows);
+
+            for loser_id in &loser_ids {
+                // Redirect aliases from loser to winner
+                conn.execute(
+                    "UPDATE OR IGNORE entity_aliases SET canonical_entity_id = ?1 WHERE canonical_entity_id = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir alias: {e}")))?;
+
+                // Redirect observations from loser to winner
+                conn.execute(
+                    "UPDATE observations SET entity_id = ?1 WHERE entity_id = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir obs: {e}")))?;
+
+                // Redirect relations: from_entity references
+                conn.execute(
+                    "UPDATE OR IGNORE relations SET from_entity = ?1 WHERE from_entity = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir rel from: {e}")))?;
+
+                // Redirect relations: to_entity references
+                conn.execute(
+                    "UPDATE OR IGNORE relations SET to_entity = ?1 WHERE to_entity = ?2",
+                    libsql::params![winner_id.clone(), loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 redir rel to: {e}")))?;
+
+                // Clean up any remaining aliases pointing to loser (no CASCADE on FK)
+                conn.execute(
+                    "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
+                    libsql::params![loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 del loser aliases: {e}")))?;
+
+                // Delete the loser entity
+                conn.execute(
+                    "DELETE FROM entities WHERE id = ?1",
+                    libsql::params![loser_id.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("migration 41 del loser: {e}")))?;
+            }
         }
 
         Ok(())
@@ -7046,7 +7306,181 @@ impl MemoryDB {
         .await
         .map_err(|e| OriginError::VectorDb(format!("store_entity: {}", e)))?;
 
+        // Auto-create a self-alias for the entity name (lowercase).
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), 'auto')",
+            libsql::params![name.to_lowercase(), id.clone()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("store_entity alias: {}", e)))?;
+
         Ok(id)
+    }
+
+    /// Resolve an entity ID from an alias (case-insensitive).
+    pub async fn resolve_entity_by_alias(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT canonical_entity_id FROM entity_aliases WHERE alias_name = ?1",
+                libsql::params![name.to_lowercase()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("alias lookup: {}", e)))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("alias row: {}", e)))?
+        {
+            Ok(Some(row.get::<String>(0).unwrap()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Add an alias entry for an entity.
+    pub async fn add_entity_alias(
+        &self,
+        alias: &str,
+        entity_id: &str,
+        source: &str,
+    ) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), ?3)",
+            libsql::params![alias.to_lowercase(), entity_id.to_string(), source.to_string()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("add alias: {}", e)))?;
+        Ok(())
+    }
+
+    /// Resolve a relation type string against the vocabulary (case-insensitive).
+    /// Returns the canonical form if the input matches a canonical or an alias,
+    /// otherwise returns the input unchanged (lowercased).
+    pub async fn resolve_relation_type(&self, relation_type: &str) -> Result<String, OriginError> {
+        let lower = relation_type.to_lowercase();
+        let conn = self.conn.lock().await;
+
+        // Check if input is already a canonical key (canonicals are lowercase).
+        let mut rows = conn
+            .query(
+                "SELECT canonical FROM relation_type_vocabulary WHERE canonical = ?1",
+                libsql::params![lower.clone()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type canonical: {}", e)))?;
+        if rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type row: {}", e)))?
+            .is_some()
+        {
+            return Ok(lower);
+        }
+        drop(rows);
+
+        // Scan aliases JSON arrays for a case-insensitive match.
+        let mut rows = conn
+            .query(
+                "SELECT canonical, aliases FROM relation_type_vocabulary WHERE aliases IS NOT NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type aliases: {}", e)))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("resolve_relation_type alias row: {}", e)))?
+        {
+            let canonical = row.get::<String>(0).unwrap_or_default();
+            let aliases_json = row.get::<String>(1).unwrap_or_default();
+            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(&aliases_json) {
+                for v in &arr {
+                    if let Some(alias) = v.as_str() {
+                        if alias.to_lowercase() == lower {
+                            return Ok(canonical);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Not found — return lowercased input unchanged.
+        Ok(lower)
+    }
+
+    /// Increment the usage count for a canonical relation type.
+    pub async fn increment_relation_type_count(&self, canonical: &str) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE relation_type_vocabulary SET count = count + 1 WHERE canonical = ?1",
+            libsql::params![canonical.to_string()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("increment_relation_type_count: {}", e)))?;
+        Ok(())
+    }
+
+    /// Search entities by exact name (case-insensitive).
+    pub async fn search_entities_by_name(&self, name: &str) -> Result<Vec<Entity>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, name, entity_type, domain, source_agent, confidence, confirmed, created_at, updated_at
+                 FROM entities WHERE LOWER(name) = LOWER(?1)",
+                libsql::params![name.to_string()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("search_entities_by_name: {}", e)))?;
+
+        let mut entities = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            entities.push(Entity {
+                id: row.get::<String>(0).unwrap_or_default(),
+                name: row.get::<String>(1).unwrap_or_default(),
+                entity_type: row.get::<String>(2).unwrap_or_default(),
+                domain: row.get::<Option<String>>(3).unwrap_or(None),
+                source_agent: row.get::<Option<String>>(4).unwrap_or(None),
+                confidence: row.get::<Option<f64>>(5).unwrap_or(None).map(|v| v as f32),
+                confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
+                created_at: row.get::<i64>(7).unwrap_or(0),
+                updated_at: row.get::<i64>(8).unwrap_or(0),
+            });
+        }
+        Ok(entities)
+    }
+
+    /// Refresh an entity's embedding by recomputing from the provided text.
+    /// Also updates `embedding_updated_at` and `updated_at` timestamps.
+    pub async fn refresh_entity_embedding(
+        &self,
+        entity_id: &str,
+        text: &str,
+    ) -> Result<(), OriginError> {
+        let embeddings = self.generate_embeddings(&[text.to_string()])?;
+        if embeddings.is_empty() {
+            return Err(OriginError::VectorDb(
+                "refresh_entity_embedding: empty embedding result".into(),
+            ));
+        }
+        let vec_str = Self::vec_to_sql(&embeddings[0]);
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE entities SET embedding = vector32(?1), embedding_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+            libsql::params![vec_str, now, entity_id.to_string()],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("refresh_entity_embedding: {}", e)))?;
+        Ok(())
     }
 
     /// Add an observation to an entity.
@@ -7088,32 +7522,82 @@ impl MemoryDB {
     }
 
     /// Create a relation between two entities.
+    /// The relation type is normalized against the vocabulary via `resolve_relation_type`
+    /// before insertion. On conflict (same from/to/type), updates confidence if higher
+    /// and fills in explanation/source_memory_id if previously null.
+    /// Returns the ID of the inserted or existing relation.
     pub async fn create_relation(
         &self,
         from_entity: &str,
         to_entity: &str,
         relation_type: &str,
         source_agent: Option<&str>,
+        confidence: Option<f64>,
+        explanation: Option<&str>,
+        source_memory_id: Option<&str>,
     ) -> Result<String, OriginError> {
+        // Normalize relation type against vocabulary.
+        // NOTE: resolve_relation_type acquires the conn lock, so we must not hold it here.
+        let canonical = self.resolve_relation_type(relation_type).await?;
+
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
 
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO relations (id, from_entity, to_entity, relation_type, source_agent, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+
+        // Upsert: insert new or update existing if new confidence is higher.
+        let affected = conn.execute(
+            "INSERT INTO relations (id, from_entity, to_entity, relation_type, source_agent, confidence, explanation, source_memory_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(from_entity, to_entity, relation_type) DO UPDATE SET
+                 confidence = CASE
+                     WHEN EXCLUDED.confidence IS NOT NULL AND (confidence IS NULL OR EXCLUDED.confidence > confidence)
+                     THEN EXCLUDED.confidence ELSE confidence END,
+                 explanation = CASE
+                     WHEN EXCLUDED.confidence IS NOT NULL AND (confidence IS NULL OR EXCLUDED.confidence > confidence)
+                     THEN COALESCE(EXCLUDED.explanation, explanation) ELSE explanation END,
+                 source_memory_id = COALESCE(EXCLUDED.source_memory_id, source_memory_id)",
             libsql::params![
                 id.clone(),
                 from_entity.to_string(),
                 to_entity.to_string(),
-                relation_type.to_string(),
+                canonical.clone(),
                 source_agent.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
+                confidence.map(libsql::Value::Real).unwrap_or(libsql::Value::Null),
+                explanation.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
+                source_memory_id.map(|s| libsql::Value::Text(s.to_string())).unwrap_or(libsql::Value::Null),
                 now
             ],
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("create_relation: {}", e)))?;
 
+        // Only increment vocabulary count for genuinely new relations.
+        if affected > 0 {
+            // Check if this was an insert (the id we generated exists) vs an update.
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    libsql::params![from_entity.to_string(), to_entity.to_string(), canonical.clone()],
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("create_relation check: {}", e)))?;
+            let existing_id = match rows.next().await {
+                Ok(Some(row)) => row.get::<String>(0).unwrap_or(id.clone()),
+                _ => id.clone(),
+            };
+            drop(rows);
+            drop(conn);
+
+            // Only count new inserts (our generated id matches the stored id).
+            if existing_id == id {
+                self.increment_relation_type_count(&canonical).await.ok();
+            }
+
+            return Ok(existing_id);
+        }
+
+        drop(conn);
         Ok(id)
     }
 
@@ -7314,6 +7798,13 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("delete_entity cascade memories: {}", e)))?;
+        // Remove aliases referencing this entity before deleting it (FK constraint)
+        conn.execute(
+            "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("delete_entity cascade aliases: {}", e)))?;
         conn.execute(
             "DELETE FROM entities WHERE id = ?1",
             libsql::params![entity_id],
@@ -7447,6 +7938,42 @@ impl MemoryDB {
             .await
             .map_err(|e| OriginError::VectorDb(format!("find_recent_batch: {}", e)))?;
 
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let source_id: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?;
+            let content: String = row
+                .get(1)
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?;
+            results.push((source_id, content));
+        }
+        Ok(results)
+    }
+
+    /// Find memories that have no entity extraction (entity_id IS NULL).
+    /// Used by the refinery's entity backfill phase to gradually self-heal.
+    /// Returns `Vec<(source_id, content)>` ordered by last_modified DESC (newest first).
+    pub async fn find_memories_without_entities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_id, content FROM memories
+                 WHERE (entity_id IS NULL)
+                   AND content IS NOT NULL AND content != ''
+                 ORDER BY last_modified DESC
+                 LIMIT ?1",
+                libsql::params![limit as i64],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("find_memories_without_entities: {e}")))?;
         let mut results = Vec::new();
         while let Some(row) = rows
             .next()
@@ -14952,7 +15479,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let rel_id = db
-            .create_relation(&e1, &e2, "works_on", Some("claude"))
+            .create_relation(&e1, &e2, "works_on", Some("claude"), None, None, None)
             .await
             .unwrap();
         assert!(!rel_id.is_empty());
@@ -14975,15 +15502,15 @@ pub(crate) mod tests {
             .unwrap();
 
         let r1 = db
-            .create_relation(&alice, &project, "leads", None)
+            .create_relation(&alice, &project, "leads", None, None, None, None)
             .await
             .unwrap();
         let r2 = db
-            .create_relation(&bob, &project, "contributes_to", None)
+            .create_relation(&bob, &project, "contributes_to", None, None, None, None)
             .await
             .unwrap();
         let r3 = db
-            .create_relation(&alice, &bob, "manages", None)
+            .create_relation(&alice, &bob, "manages", None, None, None, None)
             .await
             .unwrap();
 
@@ -15038,7 +15565,7 @@ pub(crate) mod tests {
 
         // Create relation
         let rel = db
-            .create_relation(&origin, &rust, "uses", Some("claude"))
+            .create_relation(&origin, &rust, "uses", Some("claude"), None, None, None)
             .await
             .unwrap();
         assert!(!rel.is_empty());
@@ -15427,7 +15954,7 @@ pub(crate) mod tests {
         db.add_observation(&alice_id, "Prefers TDD", Some("claude"), Some(0.95))
             .await
             .unwrap();
-        db.create_relation(&alice_id, &origin_id, "works_on", Some("claude"))
+        db.create_relation(&alice_id, &origin_id, "works_on", Some("claude"), None, None, None)
             .await
             .unwrap();
 
@@ -15501,7 +16028,7 @@ pub(crate) mod tests {
         db.add_observation(&alice_id, "Obs", None, None)
             .await
             .unwrap();
-        db.create_relation(&alice_id, &bob_id, "knows", None)
+        db.create_relation(&alice_id, &bob_id, "knows", None, None, None, None)
             .await
             .unwrap();
 
@@ -16180,7 +16707,7 @@ pub(crate) mod tests {
             .store_entity("Bob", "person", None, None, None)
             .await
             .unwrap();
-        let rid = db.create_relation(&e1, &e2, "knows", None).await.unwrap();
+        let rid = db.create_relation(&e1, &e2, "knows", None, None, None, None).await.unwrap();
 
         let conn = db.conn.lock().await;
         let mut rows = conn
@@ -16197,6 +16724,53 @@ pub(crate) mod tests {
             "source_agent should be NULL, got {:?}",
             val
         );
+    }
+
+    // ==================== Knowledge Graph: relation type normalization ====================
+
+    #[tokio::test]
+    async fn test_relation_type_normalized_at_insert() {
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .store_entity("Alice", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        let e2 = db
+            .store_entity("ProjectX", "project", None, Some("test"), None)
+            .await
+            .unwrap();
+
+        // Insert with alias type "working_at" -- should normalize to "works_on"
+        db.create_relation(
+            &e1,
+            &e2,
+            "working_at",
+            Some("test"),
+            Some(0.9),
+            Some("she works there"),
+            Some("mem_1"),
+        )
+        .await
+        .unwrap();
+
+        // Query the relation to verify normalization
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT relation_type, confidence, explanation, source_memory_id FROM relations WHERE from_entity = ?1",
+                libsql::params![e1.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let stored_type: String = row.get(0).unwrap();
+        assert_eq!(stored_type, "works_on", "working_at should normalize to works_on");
+        let stored_conf: f64 = row.get(1).unwrap();
+        assert!((stored_conf - 0.9).abs() < 0.01);
+        let stored_explanation: String = row.get(2).unwrap();
+        assert_eq!(stored_explanation, "she works there");
+        let stored_source_id: String = row.get(3).unwrap();
+        assert_eq!(stored_source_id, "mem_1");
     }
 
     // ==================== load_memories_by_type ====================
@@ -20421,6 +20995,108 @@ pub(crate) mod tests {
                 item.badge
             );
         }
+    }
+
+    // ==================== Migration 41 (KG quality) ====================
+
+    #[tokio::test]
+    async fn test_migration_41_kg_quality_tables() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+
+        // 1. entity_aliases table exists with correct columns
+        let _rows = conn
+            .query(
+                "SELECT alias_name, canonical_entity_id, created_at, source FROM entity_aliases LIMIT 1",
+                (),
+            )
+            .await
+            .expect("entity_aliases table should exist after migration 40");
+        drop(_rows);
+
+        // 2. relation_type_vocabulary has >= 15 seed entries
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM relation_type_vocabulary",
+                (),
+            )
+            .await
+            .expect("relation_type_vocabulary table should exist after migration 40");
+        let row = rows.next().await.unwrap().unwrap();
+        let count: i64 = row.get(0).unwrap();
+        assert!(
+            count >= 15,
+            "relation_type_vocabulary should have at least 15 seed entries, got {count}"
+        );
+        drop(rows);
+
+        // 3. relations table has confidence, explanation, source_memory_id columns
+        let _rows = conn
+            .query(
+                "SELECT id, confidence, explanation, source_memory_id FROM relations LIMIT 1",
+                (),
+            )
+            .await
+            .expect("relations should have confidence, explanation, source_memory_id columns after migration 40");
+        drop(_rows);
+
+        // 4. entities table has embedding_updated_at column
+        let _rows = conn
+            .query(
+                "SELECT id, embedding_updated_at FROM entities LIMIT 1",
+                (),
+            )
+            .await
+            .expect("entities should have embedding_updated_at column after migration 40");
+        drop(_rows);
+
+        drop(conn);
+    }
+
+    #[tokio::test]
+    async fn test_alias_resolution() {
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity("Alice Chen", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        let resolved = db.resolve_entity_by_alias("alice chen").await.unwrap();
+        assert_eq!(resolved, Some(id.clone()));
+        let resolved2 = db.resolve_entity_by_alias("Alice Chen").await.unwrap();
+        assert_eq!(resolved2, Some(id.clone()));
+        let resolved3 = db.resolve_entity_by_alias("bob").await.unwrap();
+        assert_eq!(resolved3, None);
+    }
+
+    #[tokio::test]
+    async fn test_add_entity_alias() {
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity("Alice Chen", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        db.add_entity_alias("alice", &id, "auto").await.unwrap();
+        let r1 = db.resolve_entity_by_alias("alice chen").await.unwrap();
+        let r2 = db.resolve_entity_by_alias("alice").await.unwrap();
+        assert_eq!(r1, Some(id.clone()));
+        assert_eq!(r2, Some(id.clone()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_relation_type() {
+        let (db, _dir) = test_db().await;
+        assert_eq!(
+            db.resolve_relation_type("works_on").await.unwrap(),
+            "works_on"
+        );
+        assert_eq!(
+            db.resolve_relation_type("working_at").await.unwrap(),
+            "works_on"
+        );
+        assert_eq!(
+            db.resolve_relation_type("custom_type").await.unwrap(),
+            "custom_type"
+        );
     }
 
     // ==================== Topic-key upsert feature tests ====================

@@ -244,10 +244,21 @@ impl OnDeviceProvider {
             .spawn(move || {
                 log::info!("[on_device_provider] worker thread started");
                 while let Ok(req) = rx.recv() {
-                    // Combine system prompt and user prompt
+                    // Wrap in Qwen chat template so the model sees
+                    // system/user/assistant turns instead of a raw blob.
                     let full_prompt = match &req.system_prompt {
-                        Some(sys) => format!("{}\n\n{}", sys, req.prompt),
-                        None => req.prompt,
+                        Some(sys) => format!(
+                            "<|im_start|>system\n{sys}\n<|im_end|>\n\
+                             <|im_start|>user\n{user}\n<|im_end|>\n\
+                             <|im_start|>assistant\n",
+                            sys = sys,
+                            user = req.prompt,
+                        ),
+                        None => format!(
+                            "<|im_start|>user\n{user}\n<|im_end|>\n\
+                             <|im_start|>assistant\n",
+                            user = req.prompt,
+                        ),
                     };
 
                     let result = engine.run_inference(
