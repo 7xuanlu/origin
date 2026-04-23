@@ -32,34 +32,6 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Cache FastEmbed model
-        id: fastembed-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.fastembed_cache
-          key: fastembed-bge-base-en-v15-q-v2
-
-      - name: Download FastEmbed model if not cached
-        if: steps.fastembed-cache.outputs.cache-hit != 'true'
-        run: |
-          REPO="models--Qdrant--bge-base-en-v1.5-onnx-Q"
-          SNAP="738cad1c108e2f23649db9e44b2eab988626493b"
-          C="$HOME/.fastembed_cache/$REPO"
-          mkdir -p "$C/blobs" "$C/snapshots/$SNAP" "$C/refs"
-          URL="https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main"
-          curl -fsSL "$URL/config.json"              -o "$C/blobs/40bfd889c495f985894a15b90c2aa8243e6e7e95"
-          curl -fsSL "$URL/model_optimized.onnx"     -o "$C/blobs/4e556722bc4f65716c544c8a931f1e90fb3f866e5741fd93a96f051d673339c7"
-          curl -fsSL "$URL/special_tokens_map.json"  -o "$C/blobs/9bbecc17cabbcbd3112c14d6982b51403b264bfa"
-          curl -fsSL "$URL/tokenizer_config.json"    -o "$C/blobs/75305659f7795d4549f0e23688b52fa20a32f925"
-          curl -fsSL "$URL/tokenizer.json"           -o "$C/blobs/688882a79f44442ddc1f60d70334a7ff5df0fb47"
-          ln -sf "../../blobs/40bfd889c495f985894a15b90c2aa8243e6e7e95" "$C/snapshots/$SNAP/config.json"
-          ln -sf "../../blobs/4e556722bc4f65716c544c8a931f1e90fb3f866e5741fd93a96f051d673339c7" "$C/snapshots/$SNAP/model_optimized.onnx"
-          ln -sf "../../blobs/9bbecc17cabbcbd3112c14d6982b51403b264bfa" "$C/snapshots/$SNAP/special_tokens_map.json"
-          ln -sf "../../blobs/75305659f7795d4549f0e23688b52fa20a32f925" "$C/snapshots/$SNAP/tokenizer_config.json"
-          ln -sf "../../blobs/688882a79f44442ddc1f60d70334a7ff5df0fb47" "$C/snapshots/$SNAP/tokenizer.json"
-          echo "$SNAP" > "$C/refs/main"
-          echo "FastEmbed model ready:" && ls -la "$C/snapshots/$SNAP/"
-
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
@@ -86,7 +58,19 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run Rust tests
-        run: ORIGIN_TEST_FASTEMBED_CACHE="$HOME/.fastembed_cache" cargo test --workspace
+        run: cargo test -p origin-types -p origin-core -p origin-server
+
+      # Eval harness integration tests (app/tests/eval_harness.rs) need the
+      # FastEmbed BGE-Base-EN-v1.5-Q model (~200MB ONNX) which auto-downloads
+      # on first run. GitHub Actions macOS runners lack Metal GPU support and
+      # the hf-hub crate can't resolve manually seeded cache files.
+      #
+      # Run eval tests locally:
+      #   cargo test -p origin --test eval_harness
+      #
+      # The model downloads once into ~/.fastembed_cache and is reused.
+      - name: Run app unit tests (eval harness runs locally)
+        run: cargo test -p origin --lib
 
       - name: Run frontend tests
         run: pnpm test
