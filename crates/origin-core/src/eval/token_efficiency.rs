@@ -3960,42 +3960,50 @@ async fn run_entity_extraction_for_eval(
                 let cleaned = crate::llm_provider::strip_think_tags(&response);
                 // Try to extract JSON array from the response (may have markdown fences)
                 let json_str = extract_json_array_from_response(&cleaned);
-                if let Ok(entities) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    for entity_val in &entities {
-                        if let Some(name) = entity_val.get("name").and_then(|n| n.as_str()) {
-                            let entity_type = entity_val
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("topic");
+                let parse_result = serde_json::from_str::<Vec<serde_json::Value>>(&json_str);
+                match parse_result {
+                    Err(e) => {
+                        eprintln!(
+                            "    [entity_extract] JSON parse failed: {e}\n      raw: {}\n      cleaned: {}",
+                            &response.chars().take(200).collect::<String>(),
+                            &json_str.chars().take(200).collect::<String>(),
+                        );
+                    }
+                    Ok(entities) => {
+                        for entity_val in &entities {
+                            if let Some(name) = entity_val.get("name").and_then(|n| n.as_str()) {
+                                let entity_type = entity_val
+                                    .get("type")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("topic");
 
-                            // Resolve existing or create new entity
-                            let entity_id =
-                                match db.resolve_entity_by_name(name).await? {
-                                    Some(id) => id,
-                                    None => {
-                                        db.store_entity(
-                                            name,
-                                            entity_type,
-                                            Some("conversation"),
-                                            Some("eval"),
-                                            None,
-                                        )
-                                        .await?
+                                let entity_id =
+                                    match db.resolve_entity_by_name(name).await? {
+                                        Some(id) => id,
+                                        None => {
+                                            db.store_entity(
+                                                name,
+                                                entity_type,
+                                                Some("conversation"),
+                                                Some("eval"),
+                                                None,
+                                            )
+                                            .await?
+                                        }
+                                    };
+
+                                for (sid, content) in batch {
+                                    if content
+                                        .to_lowercase()
+                                        .contains(&name.to_lowercase())
+                                    {
+                                        let _ = db
+                                            .update_memory_entity_id(sid, &entity_id)
+                                            .await;
                                     }
-                                };
-
-                            // Link memories in this batch that mention this entity
-                            for (sid, content) in batch {
-                                if content
-                                    .to_lowercase()
-                                    .contains(&name.to_lowercase())
-                                {
-                                    let _ = db
-                                        .update_memory_entity_id(sid, &entity_id)
-                                        .await;
                                 }
+                                total_entities += 1;
                             }
-                            total_entities += 1;
                         }
                     }
                 }
