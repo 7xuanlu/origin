@@ -278,6 +278,8 @@ pub struct RefineryConfig {
     pub batch_window_secs: i64,
     #[serde(default = "d_168_u64")]
     pub kg_rethink_interval_hours: u64,
+    #[serde(default = "d_5_usize")]
+    pub entity_backfill_batch_size: usize,
     #[serde(default)]
     pub topic_match: TopicMatchConfig,
 }
@@ -472,6 +474,7 @@ impl Default for RefineryConfig {
             consolidation_batch_size: d_10_usize(),
             batch_window_secs: d_30_i64(),
             kg_rethink_interval_hours: d_168_u64(),
+            entity_backfill_batch_size: d_5_usize(),
             topic_match: TopicMatchConfig::default(),
         }
     }

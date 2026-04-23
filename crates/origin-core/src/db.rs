@@ -7955,6 +7955,42 @@ impl MemoryDB {
         Ok(results)
     }
 
+    /// Find memories that have no entity extraction (entity_id IS NULL).
+    /// Used by the refinery's entity backfill phase to gradually self-heal.
+    /// Returns `Vec<(source_id, content)>` ordered by last_modified DESC (newest first).
+    pub async fn find_memories_without_entities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_id, content FROM memories
+                 WHERE (entity_id IS NULL)
+                   AND content IS NOT NULL AND content != ''
+                 ORDER BY last_modified DESC
+                 LIMIT ?1",
+                libsql::params![limit as i64],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("find_memories_without_entities: {e}")))?;
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let source_id: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?;
+            let content: String = row
+                .get(1)
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?;
+            results.push((source_id, content));
+        }
+        Ok(results)
+    }
+
     /// Get enrichment status for a chunk (for testing and diagnostics).
     pub async fn get_enrichment_status(
         &self,

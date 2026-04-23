@@ -664,7 +664,62 @@ pub async fn run_periodic_steep_with_api(
         phases.push(phase);
     }
 
-    // Phase 9: KG rethink — periodic knowledge graph quality maintenance.
+    // Phase 9: Entity backfill — gradually re-extract entities from memories
+    // that were stored before the chat template fix (or where extraction silently
+    // failed). Processes a small batch per steep to avoid GPU overload.
+    if trigger.runs_phase("entity_backfill") {
+        if let Some(llm_ref) = llm {
+            let phase = run_phase("entity_backfill", || async {
+                let batch = db_ref
+                    .find_memories_without_entities(tuning.entity_backfill_batch_size)
+                    .await?;
+                if batch.is_empty() {
+                    return Ok(PhaseOutput {
+                        items_processed: 0,
+                        nudge: Nudge::Silent,
+                        headline: None,
+                    });
+                }
+                let mut extracted = 0usize;
+                for (source_id, content) in &batch {
+                    match extract_single_memory_entities(
+                        db_ref, llm_ref, prompts, source_id, content,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => extracted += 1,
+                        Ok(None) => {
+                            // Mark as attempted so we don't retry forever
+                            let _ = db_ref
+                                .update_memory_entity_id(source_id, "")
+                                .await;
+                        }
+                        Err(e) => {
+                            log::warn!("[refinery] entity_backfill failed for {}: {e}", source_id);
+                            break; // LLM may be down, stop batch
+                        }
+                    }
+                }
+                if extracted > 0 {
+                    log::info!(
+                        "[refinery] entity_backfill: extracted entities for {}/{} memories",
+                        extracted,
+                        batch.len()
+                    );
+                }
+                let (nudge, headline) = classify_backfill(extracted);
+                Ok(PhaseOutput {
+                    items_processed: extracted,
+                    nudge,
+                    headline,
+                })
+            })
+            .await;
+            phases.push(phase);
+        }
+    }
+
+    // Phase 10: KG rethink — periodic knowledge graph quality maintenance.
     // Rate-limited by `kg_rethink_interval_hours` (default 168h = weekly)
     // via `app_metadata.last_kg_rethink_ts`. All five sub-phases are cheap
     // when the graph is clean; the gate mainly avoids redundant log spam.
