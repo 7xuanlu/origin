@@ -20857,6 +20857,249 @@ pub(crate) mod tests {
         );
     }
 
+    // ---- find_topic_match tiered thresholds ----
+
+    /// Helper: store a memory and return its embedding for use in topic-match tests.
+    async fn store_and_embed(
+        db: &MemoryDB,
+        source_id: &str,
+        content: &str,
+        memory_type: &str,
+        domain: &str,
+    ) -> Vec<f32> {
+        db.upsert_documents(vec![make_memory_doc(
+            source_id,
+            content,
+            memory_type,
+            domain,
+            "agent",
+        )])
+        .await
+        .unwrap();
+        db.generate_embeddings(&[content.to_string()])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_exact_tier() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        // Store a memory about Rust async patterns
+        let _ = store_and_embed(
+            &db,
+            "m_rust",
+            "Rust async patterns use tokio runtime with spawn and select macros",
+            "knowledge",
+            "rust-project",
+        )
+        .await;
+
+        // Query with SAME domain+type — should use exact tier (0.70)
+        let query_emb = db
+            .generate_embeddings(&[
+                "Rust async patterns with tokio runtime and spawn for concurrency".to_string(),
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Rust async patterns",
+            Some("knowledge"),
+            Some("rust-project"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.matched_source_id.is_some(),
+            "exact tier (domain+type match) should find a match"
+        );
+        assert_eq!(result.matched_source_id.as_deref(), Some("m_rust"));
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_partial_tier_different_type() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_db",
+            "PostgreSQL database with pgvector extension for vector search",
+            "decision",
+            "myproject",
+        )
+        .await;
+
+        // Query with same domain but DIFFERENT type — partial tier (0.80)
+        let query_emb = db
+            .generate_embeddings(&[
+                "PostgreSQL database using pgvector for vector similarity search".to_string(),
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Database choice",
+            Some("fact"),
+            Some("myproject"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // Similarity should be high enough for partial tier
+        assert!(
+            result.matched_source_id.is_some(),
+            "partial tier (same domain, different type) should match when similarity is high"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_no_domain_still_matches() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_theme",
+            "Dark mode theme preference for all editors and terminals",
+            "preference",
+            "personal",
+        )
+        .await;
+
+        // Query with NO domain — should still find match if similarity is very high
+        let query_emb = db
+            .generate_embeddings(&[
+                "Dark mode theme preference for all editors and terminals".to_string()
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Theme preference",
+            None,
+            None,
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // Near-identical content should pass even the semantic-only tier (0.90)
+        assert!(
+            result.matched_source_id.is_some(),
+            "semantic-only tier should match with very high similarity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_different_topic_no_match() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_frontend",
+            "React 19 with server components for the frontend UI layer",
+            "decision",
+            "myproject",
+        )
+        .await;
+
+        // Query about a completely different topic
+        let query_emb = db
+            .generate_embeddings(&[
+                "Kubernetes deployment strategy using blue-green rollouts for zero downtime"
+                    .to_string(),
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Deployment strategy",
+            Some("decision"),
+            Some("myproject"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.matched_source_id.is_none(),
+            "completely different topic should not match even with same domain+type"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_topic_match_below_partial_threshold_no_match() {
+        let (db, _dir) = test_db().await;
+        let config = crate::tuning::TopicMatchConfig::default();
+
+        let _ = store_and_embed(
+            &db,
+            "m_auth",
+            "JWT authentication with RS256 signing for API endpoints",
+            "decision",
+            "backend",
+        )
+        .await;
+
+        // Somewhat related content but different domain+type — needs 0.80 for partial tier
+        let query_emb = db
+            .generate_embeddings(&[
+                "OAuth2 authorization flow with PKCE for mobile app login".to_string()
+            ])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let result = crate::topic_match::find_topic_match(
+            &db,
+            "Auth approach",
+            Some("fact"),
+            Some("mobile"),
+            None,
+            &query_emb,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // Related but different enough that it should NOT match at the none tier (0.90)
+        // This tests that the tiered thresholds actually prevent false positives
+        assert!(
+            result.matched_source_id.is_none(),
+            "related-but-different content should not match across domain+type at high threshold"
+        );
+    }
+
     // ---- upsert_memory_in_place ----
 
     #[tokio::test]
