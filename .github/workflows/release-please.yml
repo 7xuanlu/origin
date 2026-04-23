@@ -28,23 +28,30 @@ jobs:
           ref: release-please--branches--main
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync Cargo.toml versions to match release
+      - name: Sync all version files to match release
         if: steps.release.outputs.pr != ''
         run: |
           VERSION=$(cat version.txt | tr -d '[:space:]')
-          echo "Syncing Cargo.toml files to version $VERSION"
+          echo "Syncing version files to $VERSION"
 
+          # Cargo.toml files (sed marker)
           for f in app/Cargo.toml crates/origin-types/Cargo.toml crates/origin-core/Cargo.toml crates/origin-server/Cargo.toml; do
             sed -i "s/^version = \".*\" # x-release-please-version/version = \"$VERSION\" # x-release-please-version/" "$f"
             echo "  Updated $f"
           done
 
+          # JSON files (release-please extra-files jsonpath is unreliable with simple type)
+          for f in package.json app/tauri.conf.json; do
+            node -e "const fs=require('fs'); const p='$f'; const j=JSON.parse(fs.readFileSync(p,'utf8')); j.version='$VERSION'; fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+            echo "  Updated $f"
+          done
+
           if git diff --quiet; then
-            echo "No Cargo.toml changes needed"
+            echo "No version changes needed"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -A
-            git commit -m "chore: sync Cargo.toml versions to $VERSION"
+            git commit -m "chore: sync all versions to $VERSION"
             git push
           fi
