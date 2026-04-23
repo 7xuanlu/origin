@@ -3822,6 +3822,39 @@ impl MemoryDB {
                     log::info!("[migration] Migration 41 applied: alias table, relation vocabulary, dedup, unique index");
                 }
             }
+
+            // Migration 42: Recreate concepts vector index with tuning params +
+            // backfill NULL concept embeddings.
+            if version < 42 {
+                {
+                    let conn = self.conn.lock().await;
+
+                    // Drop the untuned index (created in migration 26 with no params)
+                    conn.execute("DROP INDEX IF EXISTS idx_concepts_embedding", ())
+                        .await
+                        .ok(); // tolerate if already dropped
+
+                    // Recreate with cosine metric + float8 compression (matches memories_vec_idx)
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_concepts_embedding ON concepts (\
+                         libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("migration 42 concepts idx: {e}")))?;
+
+                    conn.execute("PRAGMA user_version = 42", ())
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("migration 42 bump: {e}")))?;
+                }
+
+                // Backfill embeddings for concepts that have NULL embedding
+                let backfilled = self.backfill_concept_embeddings().await.unwrap_or(0);
+                log::info!(
+                    "[migration] Migration 42 applied: concepts vector index with cosine+float8, backfilled {} embeddings",
+                    backfilled
+                );
+            }
         }
 
         Ok(())
@@ -13016,33 +13049,175 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Search concepts via FTS5 (full body) + vector similarity (title+summary).
+    /// Search concepts via vector similarity + FTS5 with RRF fusion.
+    ///
+    /// Embeds the query, runs DiskANN vector search on concept embeddings
+    /// (title+summary), runs FTS5 MATCH on concept content, then merges
+    /// results with Reciprocal Rank Fusion (same pattern as search_memory).
     pub async fn search_concepts(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<Concept>, OriginError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT c.id, c.title, c.summary, c.content, c.entity_id, c.domain,
-                    c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
-                    COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0)
-             FROM concepts c
-             JOIN concepts_fts f ON c.rowid = f.rowid
-             WHERE concepts_fts MATCH ?1 AND c.status = 'active'
-             ORDER BY rank LIMIT ?2",
-            libsql::params![query, limit as i64],
-        ).await.map_err(|e| OriginError::VectorDb(format!("search concepts: {}", e)))?;
+        // Embed query before acquiring conn lock (same pattern as search_memory)
+        let embedding = self.get_or_compute_embedding(query)?;
+        let vec_str = Self::vec_to_sql(&embedding);
+        let fetch_limit = (limit * 3) as i64;
 
-        let mut results = vec![];
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| OriginError::VectorDb(e.to_string()))?
-        {
-            results.push(Self::row_to_concept(&row)?);
+        let conn = self.conn.lock().await;
+
+        let concept_select = "c.id, c.title, c.summary, c.content, c.entity_id, c.domain, \
+                              c.source_memory_ids, c.version, c.status, c.created_at, \
+                              c.last_compiled, c.last_modified, \
+                              COALESCE(c.sources_updated_count, 0), c.stale_reason, \
+                              COALESCE(c.user_edited, 0)";
+
+        // --- Vector search via DiskANN index ---
+        let mut vector_results: Vec<(String, f64, Concept)> = Vec::new();
+        let vec_sql = format!(
+            "SELECT {}, vector_distance_cos(c.embedding, vector32(?1)) AS dist \
+             FROM vector_top_k('idx_concepts_embedding', vector32(?1), ?2) AS vt \
+             JOIN concepts c ON c.rowid = vt.id \
+             WHERE c.status = 'active'",
+            concept_select,
+        );
+        match conn.query(&vec_sql, libsql::params![vec_str, fetch_limit]).await {
+            Ok(mut rows) => {
+                while let Ok(Some(row)) = rows.next().await {
+                    let concept = Self::row_to_concept(&row)?;
+                    let distance: f64 = row.get(15).unwrap_or(1.0);
+                    let id = concept.id.clone();
+                    vector_results.push((id, distance, concept));
+                }
+            }
+            Err(e) => {
+                log::warn!("[search_concepts] vector search failed: {e}");
+            }
         }
-        Ok(results)
+
+        // --- FTS search with AND-then-OR fallback ---
+        let mut fts_results: Vec<(String, Concept)> = Vec::new();
+        let fts_sql = format!(
+            "SELECT {} \
+             FROM concepts c \
+             JOIN concepts_fts f ON c.rowid = f.rowid \
+             WHERE concepts_fts MATCH ?1 AND c.status = 'active' \
+             ORDER BY rank LIMIT ?2",
+            concept_select,
+        );
+        let fts_queries = vec![query.to_string(), Self::fts_or_query(query)];
+        for fts_q in &fts_queries {
+            match conn.query(&fts_sql, libsql::params![fts_q.clone(), fetch_limit]).await {
+                Ok(mut rows) => {
+                    while let Ok(Some(row)) = rows.next().await {
+                        let concept = Self::row_to_concept(&row)?;
+                        let id = concept.id.clone();
+                        fts_results.push((id, concept));
+                    }
+                }
+                Err(e) => {
+                    log::debug!("[search_concepts] FTS query failed ({}): {e}", fts_q);
+                }
+            }
+            if !fts_results.is_empty() {
+                break; // AND matched, skip OR fallback
+            }
+        }
+
+        drop(conn);
+
+        // --- RRF fusion (distance-weighted, same as search_memory) ---
+        let rrf_k = 60.0f32;
+        let fts_weight = 0.2f32;
+        let mut score_map: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
+        let mut concept_map: std::collections::HashMap<String, Concept> =
+            std::collections::HashMap::new();
+
+        for (rank, (id, distance, concept)) in vector_results.into_iter().enumerate() {
+            let similarity = (1.0 - distance as f32).max(0.01);
+            let rrf_score = similarity / (rrf_k + rank as f32);
+            *score_map.entry(id.clone()).or_default() += rrf_score;
+            concept_map.entry(id).or_insert(concept);
+        }
+
+        for (rank, (id, concept)) in fts_results.into_iter().enumerate() {
+            let rrf_score = fts_weight / (rrf_k + rank as f32);
+            *score_map.entry(id.clone()).or_default() += rrf_score;
+            concept_map.entry(id).or_insert(concept);
+        }
+
+        // Sort by combined RRF score, return top limit
+        let mut final_results: Vec<Concept> = concept_map.into_values().collect();
+        final_results.sort_by(|a, b| {
+            let sa = score_map.get(&a.id).unwrap_or(&0.0);
+            let sb = score_map.get(&b.id).unwrap_or(&0.0);
+            sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        final_results.truncate(limit);
+        Ok(final_results)
+    }
+
+    /// Backfill embeddings for concepts with NULL embedding column.
+    ///
+    /// Called by migration 42 and can be run manually for maintenance.
+    /// Computes embeddings from title + summary (same as insert_concept).
+    pub async fn backfill_concept_embeddings(&self) -> Result<usize, OriginError> {
+        let needs_embed: Vec<(String, String)> = {
+            let conn = self.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT id, title, summary FROM concepts WHERE embedding IS NULL",
+                    (),
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("backfill concepts fetch: {e}")))?;
+
+            let mut out = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let id: String = row.get(0).unwrap_or_default();
+                let title: String = row.get(1).unwrap_or_default();
+                let summary: Option<String> = row.get::<String>(2).ok();
+                let embed_text = match summary {
+                    Some(s) if !s.is_empty() => format!("{} {}", title, s),
+                    _ => title,
+                };
+                out.push((id, embed_text));
+            }
+            out
+        }; // conn lock dropped
+
+        if needs_embed.is_empty() {
+            return Ok(0);
+        }
+
+        let texts: Vec<String> = needs_embed.iter().map(|(_, t)| t.clone()).collect();
+        let embeddings = self.generate_embeddings(&texts)?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("backfill begin: {e}")))?;
+
+        let mut count = 0usize;
+        for ((id, _), emb) in needs_embed.iter().zip(embeddings.iter()) {
+            let emb_sql = Self::vec_to_sql(emb);
+            if conn
+                .execute(
+                    "UPDATE concepts SET embedding = vector32(?1) WHERE id = ?2",
+                    libsql::params![emb_sql, id.clone()],
+                )
+                .await
+                .is_ok()
+            {
+                count += 1;
+            }
+        }
+
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("backfill commit: {e}")))?;
+        Ok(count)
     }
 
     /// Parse a row into a Concept. Column order must match the SELECT used in concept queries.
@@ -19608,6 +19783,35 @@ pub(crate) mod tests {
         let results = db.search_concepts("DiskANN vector", 10).await.unwrap();
         assert!(!results.is_empty(), "should find concept via FTS");
         assert_eq!(results[0].id, "c_search");
+    }
+
+    #[tokio::test]
+    async fn test_search_concepts_vector() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_concept(
+            "c_vec",
+            "Database Architecture",
+            Some("How data is stored and indexed in the system"),
+            "## Storage\n- Uses libSQL (Turso fork)\n- DiskANN for vector indexing\n- FTS5 for keyword search",
+            None,
+            Some("architecture"),
+            &["m1"],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Query with different words than the concept (no keyword overlap)
+        let results = db
+            .search_concepts("what databases does the project use", 10)
+            .await
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "should find concept via vector similarity even without keyword match"
+        );
+        assert_eq!(results[0].id, "c_vec");
     }
 
     #[tokio::test]
