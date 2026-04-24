@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! fixture-gen: Generate eval fixtures and run store quality checks.
 //!
+//! Dev-only. Gated behind the `fixture-gen` feature so release builds
+//! skip it (otherwise Tauri bundles every crate binary into Origin.app).
+//!
 //! Usage:
-//!   cargo run --bin fixture_gen -- --mode regression --count 6 --out eval/fixtures/gen/regression
-//!   cargo run --bin fixture_gen -- --mode blind --count 10 --out eval/fixtures/gen/blind
-//!   cargo run --bin fixture_gen -- --mode store-quality --db-path ~/Library/Application\ Support/origin/memorydb/
-//!   cargo run --bin fixture_gen -- --help
+//!   cargo run --features fixture-gen --bin fixture_gen -- --mode regression --count 6 --out eval/fixtures/gen/regression
+//!   cargo run --features fixture-gen --bin fixture_gen -- --mode blind --count 10 --out eval/fixtures/gen/blind
+//!   cargo run --features fixture-gen --bin fixture_gen -- --mode store-quality --db-path ~/Library/Application\ Support/origin/memorydb/
+//!   cargo run --features fixture-gen --bin fixture_gen -- --help
 
 use origin_lib::eval::gen;
 use origin_lib::llm_provider::OnDeviceProvider;
