@@ -3951,14 +3951,14 @@ impl MemoryDB {
             }
         }
 
-        // Migration 42: enrichment_steps table + needs_reembed column + summary view
+        // Migration 43: enrichment_steps table + needs_reembed column + summary view
         {
             let version: i64 = {
                 let conn = self.conn.lock().await;
                 let mut rows = conn
                     .query("PRAGMA user_version", ())
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("read version for m42: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("read version for m43: {e}")))?;
                 if let Some(row) = rows
                     .next()
                     .await
@@ -3970,7 +3970,7 @@ impl MemoryDB {
                 }
             };
 
-            if version < 42 {
+            if version < 43 {
                 let conn = self.conn.lock().await;
 
                 // Create enrichment_steps table if not exists (idempotent)
@@ -3981,7 +3981,7 @@ impl MemoryDB {
                             (),
                         )
                         .await
-                        .map_err(|e| OriginError::VectorDb(format!("m42 table check: {e}")))?;
+                        .map_err(|e| OriginError::VectorDb(format!("m43 table check: {e}")))?;
                     if let Some(row) = rows
                         .next()
                         .await
@@ -3996,7 +3996,7 @@ impl MemoryDB {
 
                 conn.execute("BEGIN", ())
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m42 begin: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("m43 begin: {e}")))?;
 
                 if !table_exists {
                     conn.execute(
@@ -4012,14 +4012,14 @@ impl MemoryDB {
                         (),
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m42 create table: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("m43 create table: {e}")))?;
 
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_enrichment_steps_failed ON enrichment_steps(status) WHERE status = 'failed'",
                         (),
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m42 create index: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("m43 create index: {e}")))?;
                 }
 
                 // Add needs_reembed column if missing
@@ -4027,7 +4027,7 @@ impl MemoryDB {
                     let mut rows = conn
                         .query("PRAGMA table_info(memories)", ())
                         .await
-                        .map_err(|e| OriginError::VectorDb(format!("m42 pragma: {e}")))?;
+                        .map_err(|e| OriginError::VectorDb(format!("m43 pragma: {e}")))?;
                     let mut found = false;
                     while let Ok(Some(row)) = rows.next().await {
                         let col_name: String = row.get(1).unwrap_or_default();
@@ -4045,7 +4045,7 @@ impl MemoryDB {
                         (),
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m42 add column: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("m43 add column: {e}")))?;
 
                     // Backfill: mark existing reembed_pending memories
                     conn.execute(
@@ -4053,7 +4053,7 @@ impl MemoryDB {
                         (),
                     )
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m42 backfill: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("m43 backfill: {e}")))?;
                 }
 
                 // Create summary view
@@ -4073,17 +4073,17 @@ impl MemoryDB {
                     (),
                 )
                 .await
-                .map_err(|e| OriginError::VectorDb(format!("m42 create view: {e}")))?;
+                .map_err(|e| OriginError::VectorDb(format!("m43 create view: {e}")))?;
 
                 conn.execute("COMMIT", ())
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m42 commit: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("m43 commit: {e}")))?;
 
-                conn.execute("PRAGMA user_version = 42", ())
+                conn.execute("PRAGMA user_version = 43", ())
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m42 bump: {e}")))?;
+                    .map_err(|e| OriginError::VectorDb(format!("m43 bump: {e}")))?;
 
-                log::info!("[migration] Migration 42 applied: enrichment_steps table, needs_reembed column, memory_enrichment_summary view");
+                log::info!("[migration] Migration 43 applied: enrichment_steps table, needs_reembed column, memory_enrichment_summary view");
             }
         }
 
@@ -23262,7 +23262,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ==================== Migration 42: enrichment_steps ====================
+    // ==================== Migration 43: enrichment_steps ====================
 
     #[tokio::test]
     async fn test_record_and_get_enrichment_steps() {
