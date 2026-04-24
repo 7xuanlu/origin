@@ -633,7 +633,7 @@ pub fn run() {
             // The shell plugin kills the child when the Tauri app exits.
             {
                 use tauri_plugin_shell::ShellExt;
-                match app.shell().sidecar("binaries/origin-server") {
+                match app.shell().sidecar("origin-server") {
                     Ok(sidecar) => match sidecar.spawn() {
                         Ok((mut rx, _child)) => {
                             log::info!(
