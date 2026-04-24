@@ -167,12 +167,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CXXFLAGS: "-std=c++17"
-          # Use ad-hoc signing ("-") when no Apple Developer identity is configured.
-          # Empty APPLE_SIGNING_IDENTITY makes Tauri search the keychain and fail.
+          # Ad-hoc sign ("-") when no Apple Developer cert is configured.
+          # APPLE_ID/PASSWORD/TEAM_ID must be omitted (not empty) or Tauri
+          # attempts notarization and fails on "Team ID must be at least 3 characters".
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
       - name: Upload standalone origin-server binary
         run: |
