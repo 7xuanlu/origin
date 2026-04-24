@@ -18,6 +18,9 @@ jobs:
           release-type: simple
           manifest-file: .release-please-manifest.json
           config-file: release-please-config.json
+          # GITHUB_TOKEN events don't trigger other workflows (GitHub security policy).
+          # A fine-grained PAT with contents:write lets the tag push trigger release.yml.
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       # When a release PR is open, also bump Cargo.toml versions
       # (release-please can't handle Cargo workspace manifests)
