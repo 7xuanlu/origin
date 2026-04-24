@@ -695,7 +695,6 @@ impl LlmProvider for OpenAICompatibleProvider {
     }
 }
 
-/// Mock provider for testing -- returns a fixed response.
 // ---------------------------------------------------------------------------
 // ClaudeCliProvider — uses `claude -p` CLI (Max plan, no API key)
 // ---------------------------------------------------------------------------
@@ -796,6 +795,7 @@ impl LlmProvider for ClaudeCliProvider {
     }
 }
 
+/// Mock provider for testing -- returns a fixed response.
 #[cfg(test)]
 pub struct MockProvider {
     response: Option<String>,

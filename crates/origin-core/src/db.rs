@@ -6219,6 +6219,7 @@ impl MemoryDB {
     /// Vector-only search bypassing hybrid FTS+RRF pipeline — used as NaiveRag baseline.
     /// Embeds the query, queries the DiskANN index, and returns results scored by
     /// cosine similarity (1.0 - distance). No FTS, no RRF, no scoring adjustments.
+    #[allow(dead_code)] // Used by eval module (token_efficiency.rs)
     pub(crate) async fn naive_vector_search(
         &self,
         query: &str,
@@ -6303,6 +6304,7 @@ impl MemoryDB {
     /// FTS-only search (no vector, no RRF) — used as ablation baseline.
     /// Runs BM25 FTS5 matching with AND-then-OR fallback; score = negated rank.
     /// Eval-only: not used in production search paths.
+    #[allow(dead_code)] // Used by eval module (token_efficiency.rs)
     pub(crate) async fn fts_only_search(
         &self,
         query: &str,
@@ -6394,6 +6396,7 @@ impl MemoryDB {
     /// Merges both signal lists by taking the max score for any document appearing
     /// in both, then sorts descending and truncates to limit.
     /// Eval-only: not used in production search paths.
+    #[allow(dead_code)] // Used by eval module (token_efficiency.rs)
     pub(crate) async fn vector_plus_fts_search(
         &self,
         query: &str,
