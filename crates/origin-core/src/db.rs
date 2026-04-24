@@ -554,6 +554,17 @@ pub struct PendingRevision {
     pub source_agent: Option<String>,
 }
 
+/// A memory chunk that needs its embedding refreshed.
+#[derive(Debug, Clone)]
+pub struct PendingReembed {
+    /// The `id` primary key of the chunk row (passed to `reembed_memory`).
+    pub chunk_id: String,
+    /// The `source_id` of the parent memory (used for look-ups and assertions).
+    pub source_id: String,
+    /// The text to embed (source_text when available, otherwise content).
+    pub embed_text: String,
+}
+
 /// An activity row from the consolidated activities table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityRow {
@@ -2072,7 +2083,8 @@ impl MemoryDB {
 
         // Migration 19: Flatten existing structured_fields into content, mark for re-embedding
         // Reads each memory with structured_fields, flattens to pipe-delimited string,
-        // moves original prose to source_text, and marks reembed_pending.
+        // moves original prose to source_text, and marks enrichment_status = 'reembed_pending'
+        // (migration 42 backfills this into needs_reembed later).
         if version < 19 {
             let conn = self.conn.lock().await;
             // Fetch all memories with structured_fields that haven't been flattened yet
@@ -4670,7 +4682,7 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT id, content, source_text, structured_fields FROM memories
-                 WHERE enrichment_status = 'reembed_pending' AND source = 'memory'
+                 WHERE needs_reembed = 1 AND source = 'memory'
                  ORDER BY last_modified DESC LIMIT ?1",
                 libsql::params![limit as i64],
             )
@@ -4689,6 +4701,37 @@ impl MemoryDB {
         Ok(results)
     }
 
+    /// Get memories that need re-embedding, keyed by source_id (needs_reembed = 1).
+    pub async fn get_pending_reembeds(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingReembed>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, source_id, content, source_text FROM memories
+                 WHERE needs_reembed = 1 AND source = 'memory'
+                 ORDER BY last_modified DESC LIMIT ?1",
+                libsql::params![limit as i64],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_pending_reembeds: {}", e)))?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let chunk_id: String = row.get(0).unwrap_or_default();
+            let source_id: String = row.get(1).unwrap_or_default();
+            let content: String = row.get(2).unwrap_or_default();
+            let source_text: Option<String> = row.get::<Option<String>>(3).unwrap_or(None);
+            let embed_text = source_text.unwrap_or_else(|| content.clone());
+            results.push(PendingReembed {
+                chunk_id,
+                source_id,
+                embed_text,
+            });
+        }
+        Ok(results)
+    }
+
     /// Re-embed a single memory with fresh embedding from its current content.
     pub async fn reembed_memory(&self, chunk_id: &str, content: &str) -> Result<(), OriginError> {
         let embeddings = self.generate_embeddings(&[content.to_string()])?;
@@ -4697,7 +4740,7 @@ impl MemoryDB {
         }
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE memories SET embedding = vector32(?1), enrichment_status = 'enriched' WHERE id = ?2",
+            "UPDATE memories SET embedding = vector32(?1), enrichment_status = 'enriched', needs_reembed = 0 WHERE id = ?2",
             libsql::params![Self::vec_to_sql(&embeddings[0]), chunk_id],
         )
         .await
@@ -11879,7 +11922,7 @@ impl MemoryDB {
     ) -> Result<(), OriginError> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE memories SET structured_fields = ?1, enrichment_status = 'reembed_pending' \
+            "UPDATE memories SET structured_fields = ?1, needs_reembed = 1 \
              WHERE source_id = ?2 AND chunk_index = 0",
             libsql::params![structured_fields_json, source_id],
         )
@@ -11931,10 +11974,7 @@ impl MemoryDB {
                 "UPDATE memories SET
                     structured_fields = COALESCE(?1, structured_fields),
                     retrieval_cue = COALESCE(?2, retrieval_cue),
-                    enrichment_status = CASE
-                        WHEN ?1 IS NOT NULL THEN 'reembed_pending'
-                        ELSE enrichment_status
-                    END
+                    needs_reembed = CASE WHEN ?1 IS NOT NULL THEN 1 ELSE needs_reembed END
                  WHERE source_id = ?3 AND chunk_index = 0",
                 libsql::params![structured_fields, retrieval_cue, source_id],
             )
@@ -19490,8 +19530,8 @@ pub(crate) mod tests {
     ///     preserve the caller-supplied original, `Some` replaces.
     ///   * `structured_fields` / `retrieval_cue` only touch `chunk_index = 0`
     ///     (those fields live on the lead chunk only).
-    ///   * `enrichment_status` flips to `reembed_pending` iff structured
-    ///     fields were provided (so the re-embed pass picks it up).
+    ///   * `needs_reembed` flips to `1` iff structured fields were provided
+    ///     (so the re-embed pass picks it up).
     #[tokio::test]
     async fn test_apply_enrichment_writes_classification_and_extraction() {
         let (db, _dir) = test_db().await;
@@ -19525,7 +19565,7 @@ pub(crate) mod tests {
         let mut rows = conn
             .query(
                 "SELECT memory_type, domain, quality, supersede_mode,
-                        structured_fields, retrieval_cue, enrichment_status
+                        structured_fields, retrieval_cue, needs_reembed
                  FROM memories WHERE source_id = 'mem_apply' AND chunk_index = 0",
                 (),
             )
@@ -19538,7 +19578,7 @@ pub(crate) mod tests {
         let supersede_mode: String = row.get(3).unwrap();
         let sf: Option<String> = row.get(4).unwrap();
         let cue: Option<String> = row.get(5).unwrap();
-        let status: String = row.get(6).unwrap();
+        let needs_reembed: i64 = row.get(6).unwrap();
 
         assert_eq!(memory_type, "preference");
         assert_eq!(
@@ -19552,8 +19592,8 @@ pub(crate) mod tests {
         assert!(sf.unwrap().contains("dark mode"));
         assert_eq!(cue.as_deref(), Some("What editor theme does Alice use?"));
         assert_eq!(
-            status, "reembed_pending",
-            "structured_fields update must flip status so re-embed picks it up"
+            needs_reembed, 1,
+            "structured_fields update must set needs_reembed = 1 so re-embed picks it up"
         );
     }
 
@@ -19896,12 +19936,12 @@ pub(crate) mod tests {
     async fn test_get_reembed_candidates() {
         let (db, _dir) = test_db().await;
         let conn = db.conn.lock().await;
-        // Insert a memory with source_text and reembed_pending status
+        // Insert a memory with source_text and needs_reembed = 1
         conn.execute(
             "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified,
-             chunk_type, word_count, source_text, enrichment_status, structured_fields)
+             chunk_type, word_count, source_text, needs_reembed, structured_fields)
              VALUES ('rc1', 'preference: dark mode', 'memory', 'mem_rc1', 'test', 0, 0,
-             'text', 1, 'I prefer dark mode', 'reembed_pending', '{\"preference\":\"dark mode\"}')",
+             'text', 1, 'I prefer dark mode', 1, '{\"preference\":\"dark mode\"}')",
             (),
         ).await.unwrap();
         // Insert a normal enriched memory (should NOT be returned)
@@ -19922,12 +19962,12 @@ pub(crate) mod tests {
     async fn test_reembed_memory() {
         let (db, _dir) = test_db().await;
         let conn = db.conn.lock().await;
-        // Insert a reembed_pending memory
+        // Insert a memory that needs re-embedding (needs_reembed = 1)
         conn.execute(
             "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified,
-             chunk_type, word_count, enrichment_status, structured_fields)
+             chunk_type, word_count, needs_reembed, structured_fields)
              VALUES ('re1', 'preference: dark mode', 'memory', 'mem_re1', 'test', 0, 0,
-             'text', 1, 'reembed_pending', '{\"preference\":\"dark mode\"}')",
+             'text', 1, 1, '{\"preference\":\"dark mode\"}')",
             (),
         ).await.unwrap();
         drop(conn);
@@ -19947,6 +19987,30 @@ pub(crate) mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let status: String = row.get(0).unwrap();
         assert_eq!(status, "enriched");
+    }
+
+    #[tokio::test]
+    async fn test_needs_reembed_replaces_reembed_pending() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_reembed_test", "dark mode preference", "preference", "tools", "test");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Memory starts with needs_reembed = 0
+        let pending = db.get_pending_reembeds(10).await.unwrap();
+        assert!(!pending.iter().any(|r| r.source_id == "mem_reembed_test"));
+
+        // Mark needs_reembed = 1 (simulating a structured_fields update)
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET needs_reembed = 1 WHERE source_id = 'mem_reembed_test'",
+                (),
+            ).await.unwrap();
+        }
+
+        // Should now appear in pending reembeds
+        let pending = db.get_pending_reembeds(10).await.unwrap();
+        assert!(pending.iter().any(|r| r.source_id == "mem_reembed_test"));
     }
 
     #[tokio::test]
