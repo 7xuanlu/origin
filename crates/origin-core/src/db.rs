@@ -2084,7 +2084,7 @@ impl MemoryDB {
         // Migration 19: Flatten existing structured_fields into content, mark for re-embedding
         // Reads each memory with structured_fields, flattens to pipe-delimited string,
         // moves original prose to source_text, and marks enrichment_status = 'reembed_pending'
-        // (migration 42 backfills this into needs_reembed later).
+        // (migration 43 backfills this into needs_reembed later).
         if version < 19 {
             let conn = self.conn.lock().await;
             // Fetch all memories with structured_fields that haven't been flattened yet
@@ -5106,6 +5106,10 @@ impl MemoryDB {
             pending_revision: bool,
             word_count: i64,
             entity_id: Option<String>,
+            // Retired column: kept in struct for compatibility with RawDocument
+            // but ignored on INSERT (always written as "legacy"). Status is now
+            // derived from the enrichment_steps table.
+            #[allow(dead_code)]
             enrichment_status: String,
             quality: Option<String>,
             is_recap: bool,
@@ -14308,6 +14312,8 @@ impl MemoryDB {
             confirmed: i64,
             stability: String,
             entity_id: Option<String>,
+            // Retired: see MemoryRow.enrichment_status above.
+            #[allow(dead_code)]
             enrichment_status: String,
             quality: Option<String>,
             is_recap: i64,
