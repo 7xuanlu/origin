@@ -83,16 +83,18 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 3. The `v*` tag push triggers `.github/workflows/release.yml`, which builds the Tauri app, bundles sidecars, uploads DMG + standalone binaries to the release, and publishes it (draft -> public).
 4. The release-please workflow also syncs `Cargo.toml` + `package.json` + `tauri.conf.json` versions on the release branch (release-please can't handle Cargo workspaces or JSON extra-files reliably with `simple` release type).
 
-**Commit messages control version bumps.** Pre-1.0, with `bump-patch-for-minor-pre-major: true`:
+**Commit messages control version bumps.** Pre-1.0:
 
 | Commit prefix | Version bump | Example |
 |---|---|---|
 | `fix:` | patch | 0.1.1 -> 0.1.2 |
-| `feat:` | **patch** (not minor) | 0.1.1 -> 0.1.2 |
-| `BREAKING CHANGE` | minor | 0.1.1 -> 0.2.0 |
+| `feat:` | **minor** | 0.1.1 -> 0.2.0 |
+| `BREAKING CHANGE` | minor (capped) | 0.1.1 -> 0.2.0 |
 | `chore:`, `ci:`, `docs:`, `refactor:`, `test:` | no bump | (hidden in changelog) |
 
 After 1.0, standard semver: `feat:` bumps minor, `BREAKING CHANGE` bumps major.
+
+**IMPORTANT: `feat:` bumps minor, not patch.** Use `fix:` for small features that don't warrant a minor bump. Only use `feat:` when you intentionally want 0.x.0 -> 0.(x+1).0. The `bump-patch-for-minor-pre-major` config flag exists but does not work reliably with release-please v17 + simple release type.
 
 **Config files:**
 - `release-please-config.json` -- release type, version bump behavior, extra files
