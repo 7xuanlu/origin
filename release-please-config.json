@@ -3,8 +3,6 @@
     ".": {
       "release-type": "simple",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
-      "release-as": "0.1.2",
       "draft": true,
       "extra-files": [
         {
