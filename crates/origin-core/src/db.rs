@@ -12902,7 +12902,13 @@ impl MemoryDB {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT source_id, content FROM memories WHERE source_id IN ({}) AND chunk_index = 0",
+            "SELECT source_id, content FROM memories WHERE source_id IN ({}) AND chunk_index = 0 \
+             AND source_id NOT IN (\
+                 SELECT supersedes FROM memories \
+                 WHERE supersedes IS NOT NULL AND pending_revision = 0 \
+                 AND source = 'memory' AND supersede_mode = 'hide' \
+                 GROUP BY supersedes\
+             )",
             placeholders
         );
         let params: Vec<libsql::Value> = source_ids
@@ -14823,6 +14829,94 @@ pub(crate) mod tests {
         assert!(
             !source_ids.contains(&"hide_old"),
             "old fact should be hidden (supersede_mode=hide)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_memory_contents_by_ids_excludes_superseded_hide() {
+        let (db, _dir) = test_db().await;
+
+        // Store old fact
+        let old_doc = make_memory_doc(
+            "recompile_old",
+            "I prefer Python for all projects",
+            "fact",
+            "personal",
+            "claude",
+        );
+        db.upsert_documents(vec![old_doc]).await.unwrap();
+
+        // Store new fact that supersedes old one (hide mode)
+        let mut new_doc = make_memory_doc(
+            "recompile_new",
+            "I prefer Rust for all projects",
+            "fact",
+            "personal",
+            "claude",
+        );
+        new_doc.supersedes = Some("recompile_old".to_string());
+        db.upsert_documents(vec![new_doc]).await.unwrap();
+
+        // get_memory_contents_by_ids should exclude the superseded memory
+        let results = db
+            .get_memory_contents_by_ids(&[
+                "recompile_old".to_string(),
+                "recompile_new".to_string(),
+            ])
+            .await
+            .unwrap();
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            !ids.contains(&"recompile_old"),
+            "superseded (hide) memory should be excluded from concept recompilation"
+        );
+        assert!(
+            ids.contains(&"recompile_new"),
+            "current memory should be included"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_memory_contents_by_ids_includes_superseded_archive() {
+        let (db, _dir) = test_db().await;
+
+        // Store old decision (decisions get supersede_mode='archive')
+        let old_doc = make_memory_doc(
+            "decision_old",
+            "We chose PostgreSQL for the database",
+            "decision",
+            "work",
+            "claude",
+        );
+        db.upsert_documents(vec![old_doc]).await.unwrap();
+
+        // Store new decision that supersedes old one (archive mode)
+        let mut new_doc = make_memory_doc(
+            "decision_new",
+            "We migrated from PostgreSQL to libSQL",
+            "decision",
+            "work",
+            "claude",
+        );
+        new_doc.supersedes = Some("decision_old".to_string());
+        db.upsert_documents(vec![new_doc]).await.unwrap();
+
+        // get_memory_contents_by_ids should INCLUDE archived decisions
+        let results = db
+            .get_memory_contents_by_ids(&[
+                "decision_old".to_string(),
+                "decision_new".to_string(),
+            ])
+            .await
+            .unwrap();
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&"decision_old"),
+            "archived (decision) memory should still be included"
+        );
+        assert!(
+            ids.contains(&"decision_new"),
+            "current memory should be included"
         );
     }
 
