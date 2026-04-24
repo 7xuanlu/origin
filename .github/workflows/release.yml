@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual trigger for re-running a release build (e.g. after transient CI failure).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to build (e.g. v0.1.2)'
+        required: true
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  # Resolved once, used everywhere. workflow_dispatch supplies the tag via input;
+  # push supplies it via GITHUB_REF.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -19,10 +28,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Validate version consistency
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
+          TAG="${RELEASE_TAG#v}"
 
           CARGO_VERSION=$(grep '^version = ' app/Cargo.toml | head -1 | sed 's/version = "\([^"]*\)".*/\1/')
           TAURI_VERSION=$(node -p "require('./app/tauri.conf.json').version")
@@ -131,7 +142,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'Origin v__VERSION__'
           releaseDraft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           releaseBody: |
             ## Install
 
@@ -174,7 +185,7 @@ jobs:
 
       - name: Upload standalone origin-server binary
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="$RELEASE_TAG"
           cp target/aarch64-apple-darwin/release/origin-server origin-server-aarch64-apple-darwin
           gh release upload "$TAG" \
             origin-server-aarch64-apple-darwin \
@@ -184,7 +195,7 @@ jobs:
 
       - name: Upload standalone origin-mcp binary
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="$RELEASE_TAG"
           cp tmp-mcp/bin/origin-mcp origin-mcp-aarch64-apple-darwin
           gh release upload "$TAG" \
             origin-mcp-aarch64-apple-darwin \
