@@ -1565,21 +1565,13 @@ async fn judge_e2e_context_locomo() {
 // API-based E2E: Haiku as answer model, Sonnet as judge
 // ---------------------------------------------------------------------------
 
-/// Generate E2E answers using Claude Haiku (API) instead of Qwen 4B (on-device).
-/// Requires ANTHROPIC_API_KEY env var.
+/// Generate E2E answers using Claude Haiku (Max plan via CLI) instead of Qwen 4B.
+/// No API key needed -- uses `claude -p` with OAuth.
 #[tokio::test]
 #[ignore]
 async fn generate_e2e_context_tuples_locomo_api() {
     use origin_lib::eval::token_efficiency::{run_e2e_context_eval, save_judgment_tuples};
     use std::sync::Arc;
-
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("SKIP: ANTHROPIC_API_KEY not set");
-            return;
-        }
-    };
 
     let locomo_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
@@ -1589,18 +1581,15 @@ async fn generate_e2e_context_tuples_locomo_api() {
     }
 
     let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
-        origin_lib::llm_provider::ApiProvider::new(
-            api_key,
-            "claude-haiku-4-5-20251001".to_string(),
-        ),
+        origin_lib::llm_provider::ClaudeCliProvider::haiku(),
     );
 
     // 1 conversation, 20 questions for quick validation
     let tuples = run_e2e_context_eval(&locomo_path, llm, 10, 1, 20)
         .await
-        .expect("run_e2e_context_eval with API failed");
+        .expect("run_e2e_context_eval with Haiku CLI failed");
 
-    eprintln!("Generated {} judgment tuples (Haiku API)", tuples.len());
+    eprintln!("Generated {} judgment tuples (Haiku CLI)", tuples.len());
     assert!(!tuples.is_empty());
 
     let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
