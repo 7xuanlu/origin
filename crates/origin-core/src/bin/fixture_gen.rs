@@ -1,17 +1,21 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! fixture-gen: Generate eval fixtures and run store quality checks.
 //!
-//! Dev-only. Gated behind the `fixture-gen` feature so release builds
-//! skip it (otherwise Tauri bundles every crate binary into Origin.app).
+//! Lives in origin-core (not the Tauri app crate) so Tauri's bundler
+//! doesn't copy it into Origin.app/Contents/MacOS. Binaries under
+//! `origin-core/src/bin/` are discoverable by cargo but invisible to
+//! `tauri build`, which only scans the app crate's `[[bin]]` entries.
 //!
 //! Usage:
-//!   cargo run --features fixture-gen --bin fixture_gen -- --mode regression --count 6 --out eval/fixtures/gen/regression
-//!   cargo run --features fixture-gen --bin fixture_gen -- --mode blind --count 10 --out eval/fixtures/gen/blind
-//!   cargo run --features fixture-gen --bin fixture_gen -- --mode store-quality --db-path ~/Library/Application\ Support/origin/memorydb/
-//!   cargo run --features fixture-gen --bin fixture_gen -- --help
+//!   cargo run -p origin-core --bin fixture_gen -- --mode regression --count 6 --out eval/fixtures/gen/regression
+//!   cargo run -p origin-core --bin fixture_gen -- --mode blind --count 10 --out eval/fixtures/gen/blind
+//!   cargo run -p origin-core --bin fixture_gen -- --mode store-quality --db-path ~/Library/Application\ Support/origin/memorydb/
+//!   cargo run -p origin-core --bin fixture_gen -- --help
 
-use origin_lib::eval::gen;
-use origin_lib::llm_provider::OnDeviceProvider;
+use origin_core::db::MemoryDB;
+use origin_core::eval::{gen, store_quality};
+use origin_core::events::{EventEmitter, NoopEmitter};
+use origin_core::llm_provider::{LlmProvider, OnDeviceProvider};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,7 +34,7 @@ fn parse_args() -> Result<Args, String> {
         eprintln!("fixture-gen: Generate eval fixtures and run store quality checks\n");
         eprintln!("Usage:");
         eprintln!(
-            "  cargo run --bin fixture_gen -- --mode <regression|blind|store-quality> [OPTIONS]\n"
+            "  cargo run -p origin-core --bin fixture_gen -- --mode <regression|blind|store-quality> [OPTIONS]\n"
         );
         eprintln!("Modes:");
         eprintln!("  regression     Pipeline-aware adversarial fixtures (requires on-device LLM)");
@@ -97,7 +101,7 @@ async fn main() {
             eprintln!("count={}, out={}", args.count, args.out_dir.display());
             eprintln!("Loading on-device LLM (this may download the model on first run)...");
             let provider = match OnDeviceProvider::new() {
-                Ok(p) => Arc::new(p) as Arc<dyn origin_lib::llm_provider::LlmProvider>,
+                Ok(p) => Arc::new(p) as Arc<dyn LlmProvider>,
                 Err(e) => {
                     eprintln!("Failed to initialize LLM: {e}");
                     eprintln!("The on-device model (Qwen3-4B) is required for fixture generation.");
@@ -134,9 +138,8 @@ async fn main() {
             };
 
             eprintln!("Opening DB at {}...", db_path.display());
-            let emitter: std::sync::Arc<dyn origin_core::events::EventEmitter> =
-                std::sync::Arc::new(origin_core::events::NoopEmitter);
-            let db = match origin_lib::memory_db::MemoryDB::new(&db_path, emitter).await {
+            let emitter: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+            let db = match MemoryDB::new(&db_path, emitter).await {
                 Ok(db) => db,
                 Err(e) => {
                     eprintln!("Failed to open DB at {}: {e}", db_path.display());
@@ -144,7 +147,7 @@ async fn main() {
                 }
             };
 
-            match origin_lib::eval::store_quality::run_store_quality(&db).await {
+            match store_quality::run_store_quality(&db).await {
                 Ok(report) => {
                     eprintln!("{}", report.to_terminal());
                 }
