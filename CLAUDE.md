@@ -94,7 +94,9 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 
 After 1.0, standard semver: `feat:` bumps minor, `BREAKING CHANGE` bumps major.
 
-**IMPORTANT: `feat:` bumps minor, not patch.** Use `fix:` for small features that don't warrant a minor bump. Only use `feat:` when you intentionally want 0.x.0 -> 0.(x+1).0. The `bump-patch-for-minor-pre-major` config flag exists but does not work reliably with release-please v17 + simple release type.
+**IMPORTANT: `feat:` bumps minor, not patch.** Use `fix:` for small features, improvements, and bug fixes. Only use `feat:` when you intentionally want 0.x.0 -> 0.(x+1).0. The `bump-patch-for-minor-pre-major` and `release-as` config flags do NOT work with release-please v17 + simple release type. If a `feat:` commit lands on main, the only way to prevent the minor bump is to rewrite the commit message via `git filter-branch` and force-push.
+
+**Squash merge commit messages matter.** When GitHub squash-merges a PR, the commit message defaults to the PR title. A PR titled `feat: ...` creates a `feat:` commit on main, triggering a minor version bump. Review PR titles before merging -- rename to `fix:` if a minor bump is not intended.
 
 **Config files:**
 - `release-please-config.json` -- release type, version bump behavior, extra files
