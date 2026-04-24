@@ -20,6 +20,7 @@
     "clean:all": "pnpm clean:dev && pnpm clean:release && echo 'All cleaned'",
     "preview": "vite preview",
     "tauri": "TAURI_DIR=app tauri",
+    "postinstall": "git config core.hooksPath .githooks 2>/dev/null && chmod +x .githooks/* 2>/dev/null || true",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

@@ -71,7 +71,7 @@ cargo test -p origin --test eval_harness save_longmemeval_expanded_baseline -- -
 # Baselines saved to app/eval/baselines/*.json (gitignored)
 ```
 
-Frontend tests use Vitest + React Testing Library. Git hooks enforce tests on commit (fast) and push (full + 90% coverage gate). Run `bash scripts/setup-hooks.sh` to activate.
+Frontend tests use Vitest + React Testing Library. Git hooks auto-activate on `pnpm install` -- pre-commit auto-formats and checks compilation, pre-push runs clippy + full tests with 90% coverage gate.
 
 ## Releasing (release-please)
 
@@ -124,11 +124,13 @@ cat .release-please-manifest.json
 
 Main branch has: required CI ("Test & Lint") before merge, no force pushes, no deletion. `enforce_admins: false` so the repo owner can push directly for hotfixes. Force push requires temporarily enabling it via API (remember to re-disable after).
 
-### Git hooks
+### Git hooks (auto-activated)
 
-Pre-commit: `cargo fmt --check` + `cargo check` + vitest (fast).
+Hooks activate automatically on `pnpm install` (postinstall script sets `core.hooksPath`). No manual setup needed.
+
+Pre-commit: **auto-formats** Rust (`cargo fmt --all`, re-stages changed files) + `cargo check` + vitest. Formatting issues can never reach CI.
 Pre-push: `cargo clippy -- -D warnings` + full test suite + coverage gate.
-Run `bash scripts/setup-hooks.sh` to activate.
+Manual setup: `bash scripts/setup-hooks.sh` (only needed if you skip `pnpm install`).
 
 ## Architecture
 
