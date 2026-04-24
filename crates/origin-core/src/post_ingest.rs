@@ -972,4 +972,42 @@ mod tests {
         assert_eq!(claude_ids, vec!["mem_iso_claude"]);
         assert_eq!(cursor_ids, vec!["mem_iso_cursor"]);
     }
+
+    #[tokio::test]
+    async fn test_enrichment_honesty_end_to_end() {
+        let (db, _dir) = test_db().await;
+
+        // Store memory A -- full enrichment (no LLM, so LLM steps get skipped)
+        let doc_a = make_doc("mem_honest_a", "The Eiffel Tower is in Paris");
+        db.upsert_documents(vec![doc_a]).await.unwrap();
+        run_post_ingest_enrichment(
+            &db, "mem_honest_a", "The Eiffel Tower is in Paris",
+            None, Some("fact"), None, None, None,
+            &crate::prompts::PromptRegistry::default(),
+            &crate::tuning::RefineryConfig::default(),
+            &crate::tuning::DistillationConfig::default(),
+            None,
+        ).await.unwrap();
+
+        // Summary should be enriched (all non-LLM steps ok, LLM steps skipped)
+        let summary_a = db.get_enrichment_summary("mem_honest_a").await.unwrap();
+        assert_eq!(summary_a, "enriched");
+
+        // list_memories should show enriched
+        let items = db.list_memories(None, None, None, None, 10).await.unwrap();
+        let item_a = items.iter().find(|i| i.source_id == "mem_honest_a").unwrap();
+        assert_eq!(item_a.enrichment_status, "enriched");
+
+        // Store memory B -- no enrichment run yet
+        let doc_b = make_doc("mem_honest_b", "Tokyo is the capital of Japan");
+        db.upsert_documents(vec![doc_b]).await.unwrap();
+
+        // Should be raw (no steps recorded)
+        let summary_b = db.get_enrichment_summary("mem_honest_b").await.unwrap();
+        assert_eq!(summary_b, "raw");
+
+        let items = db.list_memories(None, None, None, None, 10).await.unwrap();
+        let item_b = items.iter().find(|i| i.source_id == "mem_honest_b").unwrap();
+        assert_eq!(item_b.enrichment_status, "raw");
+    }
 }
