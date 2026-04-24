@@ -1448,9 +1448,10 @@ async fn generate_e2e_context_tuples_locomo() {
     eprintln!("Generated {} judgment tuples", tuples.len());
     assert!(!tuples.is_empty(), "should generate at least some tuples");
 
-    // Save for offline judging
-    let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("eval/baselines/e2e_context_tuples_locomo.json");
+    // Save for offline judging (try baselines dir, fallback to tmpdir)
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_locomo.json");
     save_judgment_tuples(&tuples, &out_path).expect("save tuples");
     eprintln!("Saved to {:?}", out_path);
 }
@@ -1482,8 +1483,9 @@ async fn generate_e2e_context_tuples_longmemeval() {
     eprintln!("Generated {} judgment tuples", tuples.len());
     assert!(!tuples.is_empty());
 
-    let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("eval/baselines/e2e_context_tuples_longmemeval.json");
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_longmemeval.json");
     save_judgment_tuples(&tuples, &out_path).expect("save tuples");
     eprintln!("Saved to {:?}", out_path);
 }
