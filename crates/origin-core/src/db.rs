@@ -12978,10 +12978,13 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
 
         // Enrichment status breakdown — derived from enrichment_steps table
-        let mut rows = conn.query(
-            "SELECT status, COUNT(*) FROM enrichment_steps GROUP BY status",
-            (),
-        ).await.map_err(|e| OriginError::VectorDb(format!("pipeline_status enrichment: {e}")))?;
+        let mut rows = conn
+            .query(
+                "SELECT status, COUNT(*) FROM enrichment_steps GROUP BY status",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("pipeline_status enrichment: {e}")))?;
         let mut enrichment = serde_json::Map::new();
         while let Ok(Some(row)) = rows.next().await {
             let status: String = row.get(0).unwrap_or_default();
@@ -12996,7 +12999,10 @@ impl MemoryDB {
         if let Ok(Some(row)) = raw_rows.next().await {
             let raw_count: i64 = row.get(0).unwrap_or(0);
             if raw_count > 0 {
-                enrichment.insert("raw".to_string(), serde_json::Value::Number(raw_count.into()));
+                enrichment.insert(
+                    "raw".to_string(),
+                    serde_json::Value::Number(raw_count.into()),
+                );
             }
         }
 
@@ -20023,21 +20029,27 @@ pub(crate) mod tests {
 
         let conn = db.conn.lock().await;
         let mut rows = conn
-            .query(
-                "SELECT needs_reembed FROM memories WHERE id = 're1'",
-                (),
-            )
+            .query("SELECT needs_reembed FROM memories WHERE id = 're1'", ())
             .await
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         let needs_reembed: i64 = row.get(0).unwrap();
-        assert_eq!(needs_reembed, 0, "needs_reembed should be cleared after re-embedding");
+        assert_eq!(
+            needs_reembed, 0,
+            "needs_reembed should be cleared after re-embedding"
+        );
     }
 
     #[tokio::test]
     async fn test_needs_reembed_replaces_reembed_pending() {
         let (db, _dir) = test_db().await;
-        let doc = make_memory_doc("mem_reembed_test", "dark mode preference", "preference", "tools", "test");
+        let doc = make_memory_doc(
+            "mem_reembed_test",
+            "dark mode preference",
+            "preference",
+            "tools",
+            "test",
+        );
         db.upsert_documents(vec![doc]).await.unwrap();
 
         // Memory starts with needs_reembed = 0
@@ -20050,7 +20062,9 @@ pub(crate) mod tests {
             conn.execute(
                 "UPDATE memories SET needs_reembed = 1 WHERE source_id = 'mem_reembed_test'",
                 (),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
         }
 
         // Should now appear in pending reembeds
@@ -21536,8 +21550,12 @@ pub(crate) mod tests {
         )
         .await;
         // Record enrichment steps so the derived status is 'enriched'
-        db.record_enrichment_step("mem_ref", "dedup", "ok", None).await.unwrap();
-        db.record_enrichment_step("mem_ref", "entity_link", "ok", None).await.unwrap();
+        db.record_enrichment_step("mem_ref", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_ref", "entity_link", "ok", None)
+            .await
+            .unwrap();
 
         let items = db
             .list_recent_memories(10, Some(400_000_000))
@@ -23275,9 +23293,15 @@ pub(crate) mod tests {
         let (db, _dir) = test_db().await;
         let doc = make_memory_doc("mem_step_test", "Rust is great", "fact", "tech", "agent");
         db.upsert_documents(vec![doc]).await.unwrap();
-        db.record_enrichment_step("mem_step_test", "dedup", "ok", None).await.unwrap();
-        db.record_enrichment_step("mem_step_test", "entity_link", "failed", Some("timeout")).await.unwrap();
-        db.record_enrichment_step("mem_step_test", "title_enrich", "skipped", None).await.unwrap();
+        db.record_enrichment_step("mem_step_test", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_step_test", "entity_link", "failed", Some("timeout"))
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_step_test", "title_enrich", "skipped", None)
+            .await
+            .unwrap();
         let steps = db.get_enrichment_steps("mem_step_test").await.unwrap();
         assert_eq!(steps.len(), 3);
         let dedup = steps.iter().find(|s| s.step == "dedup").unwrap();
@@ -23296,14 +23320,30 @@ pub(crate) mod tests {
         let (db, _dir) = test_db().await;
         let doc = make_memory_doc("mem_upsert_step", "test content", "fact", "tech", "agent");
         db.upsert_documents(vec![doc]).await.unwrap();
-        db.record_enrichment_step("mem_upsert_step", "entity_extract", "failed", Some("LLM down")).await.unwrap();
+        db.record_enrichment_step(
+            "mem_upsert_step",
+            "entity_extract",
+            "failed",
+            Some("LLM down"),
+        )
+        .await
+        .unwrap();
         let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
         assert_eq!(steps[0].attempts, 1);
-        db.record_enrichment_step("mem_upsert_step", "entity_extract", "failed", Some("still down")).await.unwrap();
+        db.record_enrichment_step(
+            "mem_upsert_step",
+            "entity_extract",
+            "failed",
+            Some("still down"),
+        )
+        .await
+        .unwrap();
         let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
         assert_eq!(steps[0].attempts, 2);
         assert_eq!(steps[0].error.as_deref(), Some("still down"));
-        db.record_enrichment_step("mem_upsert_step", "entity_extract", "ok", None).await.unwrap();
+        db.record_enrichment_step("mem_upsert_step", "entity_extract", "ok", None)
+            .await
+            .unwrap();
         let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
         assert_eq!(steps[0].status, "ok");
         assert!(steps[0].error.is_none());
@@ -23317,11 +23357,17 @@ pub(crate) mod tests {
         db.upsert_documents(vec![doc]).await.unwrap();
         let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
         assert_eq!(summary, "raw");
-        db.record_enrichment_step("mem_summary_test", "dedup", "ok", None).await.unwrap();
-        db.record_enrichment_step("mem_summary_test", "entity_link", "skipped", None).await.unwrap();
+        db.record_enrichment_step("mem_summary_test", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_summary_test", "entity_link", "skipped", None)
+            .await
+            .unwrap();
         let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
         assert_eq!(summary, "enriched");
-        db.record_enrichment_step("mem_summary_test", "title_enrich", "failed", Some("err")).await.unwrap();
+        db.record_enrichment_step("mem_summary_test", "title_enrich", "failed", Some("err"))
+            .await
+            .unwrap();
         let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
         assert_eq!(summary, "enrichment_partial");
     }
@@ -23331,8 +23377,12 @@ pub(crate) mod tests {
         let (db, _dir) = test_db().await;
         let doc = make_memory_doc("mem_all_fail", "test", "fact", "tech", "agent");
         db.upsert_documents(vec![doc]).await.unwrap();
-        db.record_enrichment_step("mem_all_fail", "dedup", "failed", Some("err1")).await.unwrap();
-        db.record_enrichment_step("mem_all_fail", "entity_link", "failed", Some("err2")).await.unwrap();
+        db.record_enrichment_step("mem_all_fail", "dedup", "failed", Some("err1"))
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_all_fail", "entity_link", "failed", Some("err2"))
+            .await
+            .unwrap();
         let summary = db.get_enrichment_summary("mem_all_fail").await.unwrap();
         assert_eq!(summary, "enrichment_failed");
     }
@@ -23342,8 +23392,17 @@ pub(crate) mod tests {
         let (db, _dir) = test_db().await;
         let doc = make_memory_doc("mem_abandon_test", "test", "fact", "tech", "agent");
         db.upsert_documents(vec![doc]).await.unwrap();
-        db.record_enrichment_step("mem_abandon_test", "entity_extract", "abandoned", Some("gave up")).await.unwrap();
-        db.record_enrichment_step("mem_abandon_test", "dedup", "ok", None).await.unwrap();
+        db.record_enrichment_step(
+            "mem_abandon_test",
+            "entity_extract",
+            "abandoned",
+            Some("gave up"),
+        )
+        .await
+        .unwrap();
+        db.record_enrichment_step("mem_abandon_test", "dedup", "ok", None)
+            .await
+            .unwrap();
         let reset = db.reset_abandoned_steps("mem_abandon_test").await.unwrap();
         assert_eq!(reset, 1);
         let steps = db.get_enrichment_steps("mem_abandon_test").await.unwrap();
@@ -23355,24 +23414,55 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_list_memories_derives_enrichment_status_from_steps() {
         let (db, _dir) = test_db().await;
-        let doc = make_memory_doc("mem_list_enrich", "Rust ownership model", "fact", "tech", "test");
+        let doc = make_memory_doc(
+            "mem_list_enrich",
+            "Rust ownership model",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc]).await.unwrap();
 
         // Before any steps are recorded, status should be "raw"
         let items = db.list_memories(None, None, None, None, 10).await.unwrap();
-        let item = items.iter().find(|i| i.source_id == "mem_list_enrich").unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.source_id == "mem_list_enrich")
+            .unwrap();
         assert_eq!(item.enrichment_status, "raw", "no steps => raw");
 
         // Record one ok step and one failed step => partial
-        db.record_enrichment_step("mem_list_enrich", "dedup", "ok", None).await.unwrap();
-        db.record_enrichment_step("mem_list_enrich", "entity_link", "failed", Some("no entities")).await.unwrap();
+        db.record_enrichment_step("mem_list_enrich", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step(
+            "mem_list_enrich",
+            "entity_link",
+            "failed",
+            Some("no entities"),
+        )
+        .await
+        .unwrap();
 
         let items = db.list_memories(None, None, None, None, 10).await.unwrap();
-        let item = items.iter().find(|i| i.source_id == "mem_list_enrich").unwrap();
-        assert_eq!(item.enrichment_status, "enrichment_partial", "mix of ok and failed => partial");
+        let item = items
+            .iter()
+            .find(|i| i.source_id == "mem_list_enrich")
+            .unwrap();
+        assert_eq!(
+            item.enrichment_status, "enrichment_partial",
+            "mix of ok and failed => partial"
+        );
 
         // Also verify get_memory_detail derives from steps
-        let detail = db.get_memory_detail("mem_list_enrich").await.unwrap().unwrap();
-        assert_eq!(detail.enrichment_status, "enrichment_partial", "detail also derives from steps");
+        let detail = db
+            .get_memory_detail("mem_list_enrich")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.enrichment_status, "enrichment_partial",
+            "detail also derives from steps"
+        );
     }
 }

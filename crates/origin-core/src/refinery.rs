@@ -3011,11 +3011,9 @@ pub(crate) async fn retry_failed_enrichment(
             "dedup" => crate::post_ingest::check_dedup(db, source_id, content, tuning)
                 .await
                 .map(|_| ()),
-            "entity_link" => {
-                crate::post_ingest::auto_link_entity(db, source_id, content, tuning)
-                    .await
-                    .map(|_| ())
-            }
+            "entity_link" => crate::post_ingest::auto_link_entity(db, source_id, content, tuning)
+                .await
+                .map(|_| ()),
             "contradiction" => {
                 let mt = db.get_memory_type(source_id).await.unwrap_or(None);
                 let domain = db.get_memory_domain(source_id).await.unwrap_or(None);
@@ -3039,9 +3037,7 @@ pub(crate) async fn retry_failed_enrichment(
                     .await
                     .map(|_| ())
             }
-            "entity_suggestion" => {
-                crate::post_ingest::suggest_entity_creation(db, content).await
-            }
+            "entity_suggestion" => crate::post_ingest::suggest_entity_creation(db, content).await,
             // LLM-requiring steps can't be retried without LLM
             _ => {
                 log::info!("[refinery] step '{step_name}' requires LLM, skipping");
@@ -3063,7 +3059,12 @@ pub(crate) async fn retry_failed_enrichment(
                     .get_enrichment_steps(source_id)
                     .await
                     .ok()
-                    .and_then(|steps| steps.iter().find(|s| s.step == *step_name).map(|s| s.attempts))
+                    .and_then(|steps| {
+                        steps
+                            .iter()
+                            .find(|s| s.step == *step_name)
+                            .map(|s| s.attempts)
+                    })
                     .unwrap_or(0);
                 // record_enrichment_step increments attempts via UPSERT, so
                 // after this call attempts = current_attempts + 1.
@@ -3076,7 +3077,10 @@ pub(crate) async fn retry_failed_enrichment(
                     .await
                     .ok();
                 if status == "abandoned" {
-                    log::info!("[refinery] step '{step_name}' for {source_id} abandoned after {} attempts", current_attempts + 1);
+                    log::info!(
+                        "[refinery] step '{step_name}' for {source_id} abandoned after {} attempts",
+                        current_attempts + 1
+                    );
                 }
                 retried += 1;
             }
