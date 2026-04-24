@@ -201,7 +201,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].relations.len(), 1);
         assert_eq!(results[0].relations[0].confidence, Some(0.9));
-        assert_eq!(results[0].relations[0].explanation.as_deref(), Some("Alice is the tech lead for the backend team"));
+        assert_eq!(
+            results[0].relations[0].explanation.as_deref(),
+            Some("Alice is the tech lead for the backend team")
+        );
     }
 
     #[test]

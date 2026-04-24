@@ -332,7 +332,9 @@ pub async fn resolve_or_create_entity(
     if let Ok(results) = db.search_entities_by_name(&entity.name).await {
         if let Some(existing) = results.first() {
             entity_cache.insert(name_lower.clone(), existing.id.clone());
-            db.add_entity_alias(&name_lower, &existing.id, "auto").await.ok();
+            db.add_entity_alias(&name_lower, &existing.id, "auto")
+                .await
+                .ok();
             return Ok((existing.id.clone(), false));
         }
     }
@@ -342,7 +344,9 @@ pub async fn resolve_or_create_entity(
         if let Some(result) = results.first() {
             if result.distance < 0.1 {
                 entity_cache.insert(name_lower.clone(), result.entity.id.clone());
-                db.add_entity_alias(&name_lower, &result.entity.id, "auto").await.ok();
+                db.add_entity_alias(&name_lower, &result.entity.id, "auto")
+                    .await
+                    .ok();
                 return Ok((result.entity.id.clone(), false));
             }
         }
@@ -683,7 +687,15 @@ pub async fn import_phase3_store(
             if let (Some(from), Some(to)) = (from_id, to_id) {
                 let mem_source_id = format!("import_{}_{}", batch_id, kg.index);
                 if db
-                    .create_relation(&from, &to, &rel.relation_type, Some(source), rel.confidence, rel.explanation.as_deref(), Some(&mem_source_id))
+                    .create_relation(
+                        &from,
+                        &to,
+                        &rel.relation_type,
+                        Some(source),
+                        rel.confidence,
+                        rel.explanation.as_deref(),
+                        Some(&mem_source_id),
+                    )
                     .await
                     .is_ok()
                 {
@@ -940,14 +952,18 @@ mod tests {
         };
 
         // First call: creates entity + alias
-        let (id1, created1) = resolve_or_create_entity(&db, &mut cache, &entity, "test").await.unwrap();
+        let (id1, created1) = resolve_or_create_entity(&db, &mut cache, &entity, "test")
+            .await
+            .unwrap();
         assert!(created1);
 
         // Clear cache to force alias lookup
         cache.clear();
 
         // Second call with same case: should resolve via alias, not create
-        let (id2, created2) = resolve_or_create_entity(&db, &mut cache, &entity, "test").await.unwrap();
+        let (id2, created2) = resolve_or_create_entity(&db, &mut cache, &entity, "test")
+            .await
+            .unwrap();
         assert!(!created2);
         assert_eq!(id1, id2);
 
@@ -959,7 +975,9 @@ mod tests {
             name: "alice chen".to_string(),
             entity_type: "person".to_string(),
         };
-        let (id3, created3) = resolve_or_create_entity(&db, &mut cache, &entity_lower, "test").await.unwrap();
+        let (id3, created3) = resolve_or_create_entity(&db, &mut cache, &entity_lower, "test")
+            .await
+            .unwrap();
         assert!(!created3);
         assert_eq!(id1, id3);
     }

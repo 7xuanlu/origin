@@ -14859,10 +14859,7 @@ pub(crate) mod tests {
 
         // get_memory_contents_by_ids should exclude the superseded memory
         let results = db
-            .get_memory_contents_by_ids(&[
-                "recompile_old".to_string(),
-                "recompile_new".to_string(),
-            ])
+            .get_memory_contents_by_ids(&["recompile_old".to_string(), "recompile_new".to_string()])
             .await
             .unwrap();
         let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
@@ -14903,10 +14900,7 @@ pub(crate) mod tests {
 
         // get_memory_contents_by_ids should INCLUDE archived decisions
         let results = db
-            .get_memory_contents_by_ids(&[
-                "decision_old".to_string(),
-                "decision_new".to_string(),
-            ])
+            .get_memory_contents_by_ids(&["decision_old".to_string(), "decision_new".to_string()])
             .await
             .unwrap();
         let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();

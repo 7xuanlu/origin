@@ -690,9 +690,7 @@ pub async fn run_periodic_steep_with_api(
                         Ok(Some(_)) => extracted += 1,
                         Ok(None) => {
                             // Mark as attempted so we don't retry forever
-                            let _ = db_ref
-                                .update_memory_entity_id(source_id, "")
-                                .await;
+                            let _ = db_ref.update_memory_entity_id(source_id, "").await;
                         }
                         Err(e) => {
                             log::warn!("[refinery] entity_backfill failed for {}: {e}", source_id);
@@ -759,7 +757,9 @@ pub async fn run_periodic_steep_with_api(
             .await;
             // Persist timestamp only if the phase itself didn't error.
             if phase.error.is_none() {
-                let _ = db.set_app_metadata("last_kg_rethink_ts", &now.to_string()).await;
+                let _ = db
+                    .set_app_metadata("last_kg_rethink_ts", &now.to_string())
+                    .await;
             }
             phases.push(phase);
         }
@@ -926,7 +926,15 @@ pub async fn extract_single_memory_entities(
             let to_id = entity_cache.get(&rel.to.to_lowercase()).cloned();
             if let (Some(from), Some(to)) = (from_id, to_id) {
                 let _ = db
-                    .create_relation(&from, &to, &rel.relation_type, Some("post_ingest"), rel.confidence, rel.explanation.as_deref(), Some(source_id))
+                    .create_relation(
+                        &from,
+                        &to,
+                        &rel.relation_type,
+                        Some("post_ingest"),
+                        rel.confidence,
+                        rel.explanation.as_deref(),
+                        Some(source_id),
+                    )
                     .await;
             }
         }
