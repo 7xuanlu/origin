@@ -2,7 +2,6 @@
   "packages": {
     ".": {
       "release-type": "simple",
-      "bump-minor-pre-major": true,
       "skip-github-release": true,
       "extra-files": [
         {
