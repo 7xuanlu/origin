@@ -3939,6 +3939,142 @@ impl MemoryDB {
             }
         }
 
+        // Migration 42: enrichment_steps table + needs_reembed column + summary view
+        {
+            let version: i64 = {
+                let conn = self.conn.lock().await;
+                let mut rows = conn
+                    .query("PRAGMA user_version", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("read version for m42: {e}")))?;
+                if let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| OriginError::VectorDb(e.to_string()))?
+                {
+                    row.get(0).unwrap_or(0)
+                } else {
+                    0
+                }
+            };
+
+            if version < 42 {
+                let conn = self.conn.lock().await;
+
+                // Create enrichment_steps table if not exists (idempotent)
+                let table_exists: bool = {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='enrichment_steps'",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("m42 table check: {e}")))?;
+                    if let Some(row) = rows
+                        .next()
+                        .await
+                        .map_err(|e| OriginError::VectorDb(e.to_string()))?
+                    {
+                        let count: i64 = row.get(0).unwrap_or(0);
+                        count > 0
+                    } else {
+                        false
+                    }
+                };
+
+                conn.execute("BEGIN", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m42 begin: {e}")))?;
+
+                if !table_exists {
+                    conn.execute(
+                        "CREATE TABLE enrichment_steps (
+                            source_id TEXT NOT NULL,
+                            step_name TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            error TEXT,
+                            attempts INTEGER NOT NULL DEFAULT 1,
+                            updated_at INTEGER NOT NULL,
+                            PRIMARY KEY (source_id, step_name)
+                        )",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m42 create table: {e}")))?;
+
+                    conn.execute(
+                        "CREATE INDEX idx_enrichment_steps_failed ON enrichment_steps(status) WHERE status = 'failed'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m42 create index: {e}")))?;
+                }
+
+                // Add needs_reembed column if missing
+                let col_exists: bool = {
+                    let mut rows = conn
+                        .query("PRAGMA table_info(memories)", ())
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("m42 pragma: {e}")))?;
+                    let mut found = false;
+                    while let Ok(Some(row)) = rows.next().await {
+                        let col_name: String = row.get(1).unwrap_or_default();
+                        if col_name == "needs_reembed" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                };
+
+                if !col_exists {
+                    conn.execute(
+                        "ALTER TABLE memories ADD COLUMN needs_reembed INTEGER NOT NULL DEFAULT 0",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m42 add column: {e}")))?;
+
+                    // Backfill: mark existing reembed_pending memories
+                    conn.execute(
+                        "UPDATE memories SET needs_reembed = 1 WHERE enrichment_status = 'reembed_pending'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m42 backfill: {e}")))?;
+                }
+
+                // Create summary view
+                conn.execute(
+                    "CREATE VIEW IF NOT EXISTS memory_enrichment_summary AS
+                     SELECT
+                         m.source_id,
+                         CASE
+                             WHEN COUNT(s.step_name) = 0 THEN 'raw'
+                             WHEN SUM(CASE WHEN s.status IN ('failed','abandoned') THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                             WHEN SUM(CASE WHEN s.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                             ELSE 'enrichment_partial'
+                         END AS summary
+                     FROM (SELECT DISTINCT source_id FROM memories) m
+                     LEFT JOIN enrichment_steps s ON s.source_id = m.source_id
+                     GROUP BY m.source_id",
+                    (),
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("m42 create view: {e}")))?;
+
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m42 commit: {e}")))?;
+
+                conn.execute("PRAGMA user_version = 42", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m42 bump: {e}")))?;
+
+                log::info!("[migration] Migration 42 applied: enrichment_steps table, needs_reembed column, memory_enrichment_summary view");
+            }
+        }
+
         Ok(())
     }
 
@@ -8384,6 +8520,103 @@ impl MemoryDB {
         .await
         .map_err(|e| OriginError::VectorDb(format!("mark_enriched: {}", e)))?;
         Ok(())
+    }
+
+    /// Record (or upsert) a single enrichment step outcome for a memory.
+    /// If a row for (source_id, step_name) already exists, increments attempts and updates status/error.
+    pub async fn record_enrichment_step(
+        &self,
+        source_id: &str,
+        step_name: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), OriginError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO enrichment_steps (source_id, step_name, status, error, attempts, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5)
+             ON CONFLICT(source_id, step_name) DO UPDATE SET
+                status = ?3, error = ?4, attempts = enrichment_steps.attempts + 1, updated_at = ?5",
+            libsql::params![source_id, step_name, status, error, now],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("record_enrichment_step: {e}")))?;
+        Ok(())
+    }
+
+    /// Return all enrichment step records for a memory, ordered by insertion.
+    pub async fn get_enrichment_steps(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<origin_types::EnrichmentStepStatus>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT step_name, status, error, attempts FROM enrichment_steps WHERE source_id = ?1 ORDER BY rowid",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_enrichment_steps: {e}")))?;
+        let mut steps = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            steps.push(origin_types::EnrichmentStepStatus {
+                step: row.get::<String>(0).unwrap_or_default(),
+                status: row.get::<String>(1).unwrap_or_default(),
+                error: row.get::<Option<String>>(2).ok().flatten(),
+                attempts: row.get::<u32>(3).unwrap_or(0),
+            });
+        }
+        Ok(steps)
+    }
+
+    /// Derive a summary string from the enrichment_steps for a memory.
+    /// Returns: "raw" (no steps), "enriched" (all ok/skipped), "enrichment_failed" (all failed/abandoned),
+    /// or "enrichment_partial" (mixed).
+    pub async fn get_enrichment_summary(&self, source_id: &str) -> Result<String, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) as total,
+                        SUM(CASE WHEN status = 'failed' OR status = 'abandoned' THEN 1 ELSE 0 END) as failed_count,
+                        SUM(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) as ok_count
+                 FROM enrichment_steps WHERE source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_enrichment_summary: {e}")))?;
+        if let Ok(Some(row)) = rows.next().await {
+            let total: i64 = row.get(0).unwrap_or(0);
+            let failed: i64 = row.get(1).unwrap_or(0);
+            let ok: i64 = row.get(2).unwrap_or(0);
+            Ok(if total == 0 {
+                "raw".to_string()
+            } else if failed == 0 {
+                "enriched".to_string()
+            } else if ok == 0 {
+                "enrichment_failed".to_string()
+            } else {
+                "enrichment_partial".to_string()
+            })
+        } else {
+            Ok("raw".to_string())
+        }
+    }
+
+    /// Reset any "abandoned" steps for a memory back to "failed" with attempts = 0.
+    /// Returns the number of rows updated.
+    pub async fn reset_abandoned_steps(&self, source_id: &str) -> Result<u64, OriginError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        let rows_affected = conn
+            .execute(
+                "UPDATE enrichment_steps SET status = 'failed', attempts = 0, updated_at = ?1
+                 WHERE source_id = ?2 AND status = 'abandoned'",
+                libsql::params![now, source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("reset_abandoned_steps: {e}")))?;
+        Ok(rows_affected)
     }
 
     pub async fn confirm_entity(
@@ -22921,5 +23154,89 @@ pub(crate) mod tests {
             matched.is_empty(),
             "empty candidate set should yield empty result"
         );
+    }
+
+    // ==================== Migration 42: enrichment_steps ====================
+
+    #[tokio::test]
+    async fn test_record_and_get_enrichment_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_step_test", "Rust is great", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_step_test", "dedup", "ok", None).await.unwrap();
+        db.record_enrichment_step("mem_step_test", "entity_link", "failed", Some("timeout")).await.unwrap();
+        db.record_enrichment_step("mem_step_test", "title_enrich", "skipped", None).await.unwrap();
+        let steps = db.get_enrichment_steps("mem_step_test").await.unwrap();
+        assert_eq!(steps.len(), 3);
+        let dedup = steps.iter().find(|s| s.step == "dedup").unwrap();
+        assert_eq!(dedup.status, "ok");
+        assert!(dedup.error.is_none());
+        assert_eq!(dedup.attempts, 1);
+        let entity = steps.iter().find(|s| s.step == "entity_link").unwrap();
+        assert_eq!(entity.status, "failed");
+        assert_eq!(entity.error.as_deref(), Some("timeout"));
+        let title = steps.iter().find(|s| s.step == "title_enrich").unwrap();
+        assert_eq!(title.status, "skipped");
+    }
+
+    #[tokio::test]
+    async fn test_record_enrichment_step_upserts_on_retry() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_upsert_step", "test content", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_upsert_step", "entity_extract", "failed", Some("LLM down")).await.unwrap();
+        let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
+        assert_eq!(steps[0].attempts, 1);
+        db.record_enrichment_step("mem_upsert_step", "entity_extract", "failed", Some("still down")).await.unwrap();
+        let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
+        assert_eq!(steps[0].attempts, 2);
+        assert_eq!(steps[0].error.as_deref(), Some("still down"));
+        db.record_enrichment_step("mem_upsert_step", "entity_extract", "ok", None).await.unwrap();
+        let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
+        assert_eq!(steps[0].status, "ok");
+        assert!(steps[0].error.is_none());
+        assert_eq!(steps[0].attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_enrichment_summary() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_summary_test", "test", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
+        assert_eq!(summary, "raw");
+        db.record_enrichment_step("mem_summary_test", "dedup", "ok", None).await.unwrap();
+        db.record_enrichment_step("mem_summary_test", "entity_link", "skipped", None).await.unwrap();
+        let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
+        assert_eq!(summary, "enriched");
+        db.record_enrichment_step("mem_summary_test", "title_enrich", "failed", Some("err")).await.unwrap();
+        let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
+        assert_eq!(summary, "enrichment_partial");
+    }
+
+    #[tokio::test]
+    async fn test_get_enrichment_summary_all_failed() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_all_fail", "test", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_all_fail", "dedup", "failed", Some("err1")).await.unwrap();
+        db.record_enrichment_step("mem_all_fail", "entity_link", "failed", Some("err2")).await.unwrap();
+        let summary = db.get_enrichment_summary("mem_all_fail").await.unwrap();
+        assert_eq!(summary, "enrichment_failed");
+    }
+
+    #[tokio::test]
+    async fn test_reset_abandoned_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_abandon_test", "test", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_abandon_test", "entity_extract", "abandoned", Some("gave up")).await.unwrap();
+        db.record_enrichment_step("mem_abandon_test", "dedup", "ok", None).await.unwrap();
+        let reset = db.reset_abandoned_steps("mem_abandon_test").await.unwrap();
+        assert_eq!(reset, 1);
+        let steps = db.get_enrichment_steps("mem_abandon_test").await.unwrap();
+        let extract = steps.iter().find(|s| s.step == "entity_extract").unwrap();
+        assert_eq!(extract.status, "failed");
+        assert_eq!(extract.attempts, 0);
     }
 }
