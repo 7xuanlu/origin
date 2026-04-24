@@ -3,7 +3,7 @@
     ".": {
       "release-type": "simple",
       "bump-minor-pre-major": true,
-      "draft": true,
+      "skip-github-release": true,
       "extra-files": [
         {
           "type": "json",

@@ -30,6 +30,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Validate version consistency
         run: |
@@ -136,6 +138,56 @@ jobs:
           echo "Certificate imported successfully"
           security find-identity -v "$KEYCHAIN_PATH"
 
+      - name: Compose release body
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          # Extract the latest version section from CHANGELOG.md (between first two ## headings)
+          CHANGELOG=$(awk '/^## \['"$VERSION"'\]/{found=1; next} found && /^## \[/{exit} found' CHANGELOG.md)
+          # Find the previous tag for the compare link
+          PREV_TAG=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
+
+          cat > release-body.md <<INSTALL_EOF
+          ## What's Changed
+
+          $CHANGELOG
+
+          **Full Changelog**: https://github.com/7xuanlu/origin/compare/${PREV_TAG}...${RELEASE_TAG}
+
+          ## Install
+
+          **Desktop app (macOS Apple Silicon):**
+          Download the \`.dmg\` file below, open it, drag to Applications.
+          Then run: \`xattr -cr /Applications/Origin.app\`
+
+          **MCP integration (latest stable channel):**
+          \`\`\`
+          npx -y origin-mcp
+          \`\`\`
+
+          **Exact release on this page:**
+          \`\`\`
+          ORIGIN_RELEASE_TAG=${RELEASE_TAG} npx -y origin-mcp
+          \`\`\`
+          Uses isolated port/data-dir defaults so it does not replace the stable runtime.
+
+          **Developer (headless daemon, latest stable):**
+          \`\`\`
+          curl -fsSL https://raw.githubusercontent.com/7xuanlu/origin/main/install.sh | bash
+          \`\`\`
+
+          **Exact shell install for this release:**
+          \`\`\`
+          curl -fsSL https://raw.githubusercontent.com/7xuanlu/origin/${RELEASE_TAG}/install.sh | ORIGIN_RELEASE_TAG=${RELEASE_TAG} bash
+          \`\`\`
+          Downloads exact binaries and prints manual isolated daemon/MCP setup steps.
+
+          > **First launch** downloads a ~2.7GB AI model. Allow a few minutes on first run.
+          INSTALL_EOF
+
+          # Strip leading whitespace from heredoc indentation
+          sed -i '' 's/^          //' release-body.md
+          echo "Release body written ($(wc -c < release-body.md) bytes)"
+
       - name: Build and publish Tauri app
         uses: tauri-apps/tauri-action@v0
         with:
@@ -143,36 +195,7 @@ jobs:
           releaseName: 'Origin v__VERSION__'
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
-          releaseBody: |
-            ## Install
-
-            **Desktop app (macOS Apple Silicon):**
-            Download the `.dmg` file below, open it, drag to Applications.
-            Then run: `xattr -cr /Applications/Origin.app`
-
-            **MCP integration (latest stable channel):**
-            ```
-            npx -y origin-mcp
-            ```
-
-            **Exact release on this page:**
-            ```
-            ORIGIN_RELEASE_TAG=v__VERSION__ npx -y origin-mcp
-            ```
-            Uses isolated port/data-dir defaults so it does not replace the stable runtime.
-
-            **Developer (headless daemon, latest stable):**
-            ```
-            curl -fsSL https://raw.githubusercontent.com/7xuanlu/origin/main/install.sh | bash
-            ```
-
-            **Exact shell install for this release:**
-            ```
-            curl -fsSL https://raw.githubusercontent.com/7xuanlu/origin/v__VERSION__/install.sh | ORIGIN_RELEASE_TAG=v__VERSION__ bash
-            ```
-            Downloads exact binaries and prints manual isolated daemon/MCP setup steps.
-
-            > **First launch** downloads a ~2.7GB AI model. Allow a few minutes on first run.
+          releaseBody: 'Building...'
           projectPath: app
           args: --target aarch64-apple-darwin
         env:
@@ -200,6 +223,12 @@ jobs:
           gh release upload "$TAG" \
             origin-mcp-aarch64-apple-darwin \
             --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release body with changelog
+        run: |
+          gh release edit "$RELEASE_TAG" --notes-file release-body.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
