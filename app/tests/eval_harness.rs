@@ -974,11 +974,22 @@ async fn test_quality_cost_fixtures() {
         .unwrap();
 
     assert_eq!(report.strategies.len(), 4);
-    assert!(report.headline.savings_pct > 0.0, "should show token savings");
+    assert!(
+        report.headline.savings_pct > 0.0,
+        "should show token savings"
+    );
 
     // Origin should have better quality than NaiveRag
-    let origin = report.strategies.iter().find(|s| s.strategy == "origin").unwrap();
-    let naive = report.strategies.iter().find(|s| s.strategy == "naive_rag").unwrap();
+    let origin = report
+        .strategies
+        .iter()
+        .find(|s| s.strategy == "origin")
+        .unwrap();
+    let naive = report
+        .strategies
+        .iter()
+        .find(|s| s.strategy == "naive_rag")
+        .unwrap();
     assert!(
         origin.ndcg_at_10 >= naive.ndcg_at_10,
         "Origin NDCG ({:.3}) should be >= NaiveRag ({:.3})",
@@ -1048,17 +1059,21 @@ async fn test_scaling_curve() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
 
     let sizes = vec![5, 10, 20, 50];
-    let points = run_scaling_eval(&fixture_dir, &sizes, 10)
-        .await
-        .unwrap();
+    let points = run_scaling_eval(&fixture_dir, &sizes, 10).await.unwrap();
 
     assert!(!points.is_empty(), "should produce scaling points");
 
     println!("\n=== Scaling Curve ===");
-    println!("{:<12} | {:<15} | {:<15}", "Corpus Size", "Origin Tokens", "Replay Tokens");
+    println!(
+        "{:<12} | {:<15} | {:<15}",
+        "Corpus Size", "Origin Tokens", "Replay Tokens"
+    );
     println!("{:-<12}-+-{:-<15}-+-{:-<15}", "", "", "");
     for p in &points {
-        println!("{:<12} | {:<15.0} | {:<15.0}", p.corpus_size, p.origin_tokens, p.replay_tokens);
+        println!(
+            "{:<12} | {:<15.0} | {:<15.0}",
+            p.corpus_size, p.origin_tokens, p.replay_tokens
+        );
     }
 
     // FullReplay should grow with corpus size
@@ -1466,8 +1481,7 @@ async fn generate_e2e_context_tuples_locomo() {
     }
 
     let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
-        origin_lib::llm_provider::OnDeviceProvider::new()
-            .expect("Failed to init on-device LLM"),
+        origin_lib::llm_provider::OnDeviceProvider::new().expect("Failed to init on-device LLM"),
     );
 
     // 1 conversation, 20 questions for quick validation
@@ -1490,7 +1504,9 @@ async fn generate_e2e_context_tuples_locomo() {
 #[tokio::test]
 #[ignore]
 async fn generate_e2e_context_tuples_longmemeval() {
-    use origin_lib::eval::token_efficiency::{run_e2e_context_eval_longmemeval, save_judgment_tuples};
+    use origin_lib::eval::token_efficiency::{
+        run_e2e_context_eval_longmemeval, save_judgment_tuples,
+    };
     use std::sync::Arc;
 
     let path =
@@ -1501,8 +1517,7 @@ async fn generate_e2e_context_tuples_longmemeval() {
     }
 
     let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
-        origin_lib::llm_provider::OnDeviceProvider::new()
-            .expect("Failed to init on-device LLM"),
+        origin_lib::llm_provider::OnDeviceProvider::new().expect("Failed to init on-device LLM"),
     );
 
     // 50 questions for validation
@@ -1547,7 +1562,10 @@ async fn judge_e2e_context_locomo() {
         "{:<25} | {:<10} | {:<10} | {:<14} | {}",
         "Approach", "Accuracy", "Correct", "Context Tok", "Total"
     );
-    eprintln!("{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
     for r in &report.results_by_approach {
         eprintln!(
             "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
@@ -1580,9 +1598,8 @@ async fn generate_e2e_context_tuples_locomo_api() {
         return;
     }
 
-    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
-        origin_lib::llm_provider::ClaudeCliProvider::haiku(),
-    );
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> =
+        Arc::new(origin_lib::llm_provider::ClaudeCliProvider::haiku());
 
     // 1 conversation, 20 questions for quick validation
     let tuples = run_e2e_context_eval(&locomo_path, llm, 10, 1, 20)
@@ -1628,7 +1645,10 @@ async fn judge_e2e_context_locomo_api_sonnet() {
         "{:<25} | {:<10} | {:<10} | {:<14} | {}",
         "Approach", "Accuracy", "Correct", "Context Tok", "Total"
     );
-    eprintln!("{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
     for r in &report.results_by_approach {
         eprintln!(
             "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
@@ -1671,7 +1691,10 @@ async fn judge_e2e_context_locomo_sonnet() {
         "{:<25} | {:<10} | {:<10} | {:<14} | {}",
         "Approach", "Accuracy", "Correct", "Context Tok", "Total"
     );
-    eprintln!("{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
     for r in &report.results_by_approach {
         eprintln!(
             "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",

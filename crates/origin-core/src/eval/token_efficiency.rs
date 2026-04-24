@@ -16,9 +16,8 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 /// Shared BPE tokenizer instance (cl100k_base). Initialized once on first use.
-static BPE: LazyLock<tiktoken_rs::CoreBPE> = LazyLock::new(|| {
-    tiktoken_rs::cl100k_base().expect("failed to load cl100k_base tokenizer")
-});
+static BPE: LazyLock<tiktoken_rs::CoreBPE> =
+    LazyLock::new(|| tiktoken_rs::cl100k_base().expect("failed to load cl100k_base tokenizer"));
 
 /// Count tokens in text using tiktoken cl100k_base encoding.
 pub fn count_tokens(text: &str) -> usize {
@@ -215,15 +214,23 @@ impl QualityCostReport {
             w4 = col_widths.4,
             w5 = col_widths.5,
         ));
-        let sep_len = col_widths.0 + col_widths.1 + col_widths.2 + col_widths.3
-            + col_widths.4 + col_widths.5 + 10;
+        let sep_len = col_widths.0
+            + col_widths.1
+            + col_widths.2
+            + col_widths.3
+            + col_widths.4
+            + col_widths.5
+            + 10;
         out.push_str(&"-".repeat(sep_len));
         out.push('\n');
 
         for s in &self.strategies {
             let ndcg_str = format!("{:.4}±{:.4}", s.ndcg_at_10, s.stddev_ndcg);
             let mrr_str = format!("{:.4}±{:.4}", s.mrr, s.stddev_mrr);
-            let tok_str = format!("{:.1}±{:.1}", s.mean_context_tokens, s.stddev_context_tokens);
+            let tok_str = format!(
+                "{:.1}±{:.1}",
+                s.mean_context_tokens, s.stddev_context_tokens
+            );
             out.push_str(&format!(
                 "{:<w0$}  {:>w1$}  {:>w2$}  {:>w3$.4}  {:>w4$}  {:>w5$.4}\n",
                 s.strategy,
@@ -244,9 +251,7 @@ impl QualityCostReport {
         out.push('\n');
         out.push_str(&format!(
             "Headline: {:.1}% token savings vs Full Replay ({:.1} vs {:.1} tokens/query)\n",
-            self.headline.savings_pct,
-            self.headline.origin_tokens,
-            self.headline.replay_tokens,
+            self.headline.savings_pct, self.headline.origin_tokens, self.headline.replay_tokens,
         ));
         out.push_str(&format!(
             "          {:.1}% quality retained (NDCG@10 vs Full Replay)\n",
@@ -265,8 +270,7 @@ impl QualityCostReport {
     /// Load a previously saved report from disk.
     pub fn load_baseline(path: &Path) -> Result<QualityCostReport, std::io::Error> {
         let raw = std::fs::read_to_string(path)?;
-        serde_json::from_str(&raw)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 }
 
@@ -447,7 +451,9 @@ pub async fn run_quality_cost_eval(
                     (ctx_tokens, ndcg, mrr_v, r5)
                 }
                 SearchStrategy::NaiveRag => {
-                    let results = db.naive_vector_search(&case.query, limit, case.domain.as_deref()).await?;
+                    let results = db
+                        .naive_vector_search(&case.query, limit, case.domain.as_deref())
+                        .await?;
                     let ctx_tokens = count_results_tokens(&results);
                     let ranked: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
                     let ndcg = metrics::ndcg_at_k(&ranked, &grades, 10);
@@ -497,14 +503,10 @@ pub async fn run_quality_cost_eval(
                 .get_mut(strategy)
                 .unwrap()
                 .push(context_tokens);
-            compression_all
-                .get_mut(strategy)
-                .unwrap()
-                .push(compression);
+            compression_all.get_mut(strategy).unwrap().push(compression);
             ndcg_all.get_mut(strategy).unwrap().push(ndcg);
             mrr_all.get_mut(strategy).unwrap().push(mrr_score);
             recall5_all.get_mut(strategy).unwrap().push(recall5);
-
         }
     }
 
@@ -616,7 +618,12 @@ pub async fn run_quality_cost_eval(
                 } else {
                     100.0
                 };
-                (o.mean_context_tokens, r.mean_context_tokens, savings, quality)
+                (
+                    o.mean_context_tokens,
+                    r.mean_context_tokens,
+                    savings,
+                    quality,
+                )
             }
             _ => (0.0, 0.0, 0.0, 0.0),
         };
@@ -841,7 +848,8 @@ pub async fn run_native_memory_augmentation(
             platform: "Claude Code".to_string(),
             memory_tokens_per_turn: 11_300,
             growth_model: "unbounded".to_string(),
-            mechanism: "full CLAUDE.md injected every turn; grows with project knowledge".to_string(),
+            mechanism: "full CLAUDE.md injected every turn; grows with project knowledge"
+                .to_string(),
         },
         NativeMemoryBaseline {
             platform: "ChatGPT".to_string(),
@@ -853,7 +861,8 @@ pub async fn run_native_memory_augmentation(
             platform: "Claude.ai".to_string(),
             memory_tokens_per_turn: 2_000,
             growth_model: "synthesized".to_string(),
-            mechanism: "synthesized summary injected every turn; auto-pruned to fit context".to_string(),
+            mechanism: "synthesized summary injected every turn; auto-pruned to fit context"
+                .to_string(),
         },
     ];
 
@@ -864,12 +873,14 @@ pub async fn run_native_memory_augmentation(
         RecallAlternative {
             scenario: "no_recall".to_string(),
             tokens_per_recall: 0,
-            description: "Skip it — information is lost; model proceeds without context".to_string(),
+            description: "Skip it — information is lost; model proceeds without context"
+                .to_string(),
         },
         RecallAlternative {
             scenario: "manual_reexplain".to_string(),
             tokens_per_recall: 800,
-            description: "User re-types the context manually (~800 tokens of explanation)".to_string(),
+            description: "User re-types the context manually (~800 tokens of explanation)"
+                .to_string(),
         },
         RecallAlternative {
             scenario: "paste_full_history".to_string(),
@@ -899,8 +910,7 @@ pub async fn run_native_memory_augmentation(
     let native_only_total = native_per_turn * turns;
     let native_plus_origin_total =
         native_per_turn * turns + (origin_retrieval_tokens.round() as usize) * recall_turns;
-    let native_plus_replay_total =
-        native_per_turn * turns + mean_full_replay_tokens * recall_turns;
+    let native_plus_replay_total = native_per_turn * turns + mean_full_replay_tokens * recall_turns;
     let origin_overhead_pct = if native_only_total > 0 {
         (native_plus_origin_total.saturating_sub(native_only_total)) as f64
             / native_only_total as f64
@@ -1040,7 +1050,11 @@ pub async fn run_pipeline_token_eval_simulated(
                 .map(|s| crate::eval::runner::seed_to_doc(s, &confidence_cfg))
                 .collect();
 
-            let corpus_text: String = all_docs.iter().map(|d| d.content.as_str()).collect::<Vec<_>>().join("\n\n");
+            let corpus_text: String = all_docs
+                .iter()
+                .map(|d| d.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
             let corpus_tok = count_tokens(&corpus_text);
 
             let tmp = tempfile::tempdir()
@@ -1075,9 +1089,13 @@ pub async fn run_pipeline_token_eval_simulated(
         // Group positive seeds by memory_type; merge groups of 2+ into single entries.
         // Keep negative seeds as-is.
         {
-            let mut type_groups: HashMap<&str, Vec<&crate::eval::fixtures::SeedMemory>> = HashMap::new();
+            let mut type_groups: HashMap<&str, Vec<&crate::eval::fixtures::SeedMemory>> =
+                HashMap::new();
             for seed in &case.seeds {
-                type_groups.entry(seed.memory_type.as_str()).or_default().push(seed);
+                type_groups
+                    .entry(seed.memory_type.as_str())
+                    .or_default()
+                    .push(seed);
             }
 
             let mut distilled_docs: Vec<RawDocument> = Vec::new();
@@ -1104,7 +1122,8 @@ pub async fn run_pipeline_token_eval_simulated(
                 } else {
                     // Single member: keep as-is
                     for seed in group {
-                        distilled_docs.push(crate::eval::runner::seed_to_doc(seed, &confidence_cfg));
+                        distilled_docs
+                            .push(crate::eval::runner::seed_to_doc(seed, &confidence_cfg));
                     }
                 }
             }
@@ -1114,7 +1133,11 @@ pub async fn run_pipeline_token_eval_simulated(
                 distilled_docs.push(crate::eval::runner::seed_to_doc(neg, &confidence_cfg));
             }
 
-            let corpus_text: String = distilled_docs.iter().map(|d| d.content.as_str()).collect::<Vec<_>>().join("\n\n");
+            let corpus_text: String = distilled_docs
+                .iter()
+                .map(|d| d.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
             let corpus_tok = count_tokens(&corpus_text);
             let doc_count = distilled_docs.len();
 
@@ -1177,9 +1200,10 @@ pub async fn run_pipeline_token_eval_simulated(
                     .join(". ")
             );
             let concept_id = "concept_compiled";
-            let concept_domain = case.domain.clone().or_else(|| {
-                case.seeds.first().and_then(|s| s.domain.clone())
-            });
+            let concept_domain = case
+                .domain
+                .clone()
+                .or_else(|| case.seeds.first().and_then(|s| s.domain.clone()));
             let concept_doc = RawDocument {
                 content: combined_content,
                 source_id: concept_id.to_string(),
@@ -1195,7 +1219,11 @@ pub async fn run_pipeline_token_eval_simulated(
                 concept_docs.push(crate::eval::runner::seed_to_doc(neg, &confidence_cfg));
             }
 
-            let corpus_text: String = concept_docs.iter().map(|d| d.content.as_str()).collect::<Vec<_>>().join("\n\n");
+            let corpus_text: String = concept_docs
+                .iter()
+                .map(|d| d.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
             let corpus_tok = count_tokens(&corpus_text);
             let doc_count = concept_docs.len();
 
@@ -1220,7 +1248,8 @@ pub async fn run_pipeline_token_eval_simulated(
             let search_tok = count_results_tokens(&results) as f64;
             // Concept entry gets the highest relevance from the positive seeds
             let best_relevance = case.seeds.iter().map(|s| s.relevance).max().unwrap_or(0);
-            let concept_grades: HashMap<&str, u8> = [(concept_id, best_relevance)].into_iter().collect();
+            let concept_grades: HashMap<&str, u8> =
+                [(concept_id, best_relevance)].into_iter().collect();
             let ranked: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
             let ndcg = metrics::ndcg_at_k(&ranked, &concept_grades, 10);
 
@@ -1234,7 +1263,11 @@ pub async fn run_pipeline_token_eval_simulated(
     let n = raw_corpus.len().max(1) as f64;
 
     fn mean_f64(v: &[f64]) -> f64 {
-        if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
     }
     fn total_usize(v: &[usize]) -> usize {
         v.iter().sum()
@@ -1249,10 +1282,14 @@ pub async fn run_pipeline_token_eval_simulated(
     let raw_mean_ndcg = mean_f64(&raw_ndcg);
     let raw_mean_tok_per_mem = if raw_total_count > 0 {
         raw_total_corpus as f64 / raw_total_count as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let raw_density = if raw_mean_search > 0.0 {
         raw_mean_ndcg / (raw_mean_search / 1000.0)
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     let dist_total_corpus = total_usize(&distilled_corpus);
     let dist_total_count = total_usize(&distilled_counts);
@@ -1260,10 +1297,14 @@ pub async fn run_pipeline_token_eval_simulated(
     let dist_mean_ndcg = mean_f64(&distilled_ndcg);
     let dist_mean_tok_per_mem = if dist_total_count > 0 {
         dist_total_corpus as f64 / dist_total_count as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let dist_density = if dist_mean_search > 0.0 {
         dist_mean_ndcg / (dist_mean_search / 1000.0)
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     let conc_total_corpus = total_usize(&concept_corpus);
     let conc_total_count = total_usize(&concept_counts);
@@ -1271,10 +1312,14 @@ pub async fn run_pipeline_token_eval_simulated(
     let conc_mean_ndcg = mean_f64(&concept_ndcg);
     let conc_mean_tok_per_mem = if conc_total_count > 0 {
         conc_total_corpus as f64 / conc_total_count as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let conc_density = if conc_mean_search > 0.0 {
         conc_mean_ndcg / (conc_mean_search / 1000.0)
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     // Token reduction is measured on search result tokens (context delivered to LLM),
     // not raw corpus size — since simulated concept entries have the same text length
@@ -1283,11 +1328,15 @@ pub async fn run_pipeline_token_eval_simulated(
     // fewer, denser entries, so the LLM receives fewer tokens while preserving quality.
     let token_reduction_pct = if raw_mean_search > 0.0 {
         ((raw_mean_search - conc_mean_search) / raw_mean_search * 100.0).max(0.0)
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     let density_improvement = if raw_density > 0.0 {
         conc_density / raw_density
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     let stages = vec![
         PipelineStageMetrics {
@@ -1566,14 +1615,15 @@ pub async fn run_scaling_eval(
                 .iter()
                 .chain(case.negative_seeds.iter())
                 .collect();
-            let subset: Vec<&crate::eval::fixtures::SeedMemory> = all_seeds.into_iter().take(size).collect();
+            let subset: Vec<&crate::eval::fixtures::SeedMemory> =
+                all_seeds.into_iter().take(size).collect();
             if subset.is_empty() {
                 continue;
             }
 
             // Seed ephemeral DB with subset
-            let case_tmp = tempfile::tempdir()
-                .map_err(|e| OriginError::Generic(format!("tmpdir: {e}")))?;
+            let case_tmp =
+                tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tmpdir: {e}")))?;
             let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
 
             let docs: Vec<RawDocument> = subset
@@ -1593,8 +1643,14 @@ pub async fn run_scaling_eval(
             // Origin: search and count (neutralize confirmation/recap bias)
             let results = db
                 .search_memory(
-                    &case.query, limit, None, case.domain.as_deref(),
-                    None, Some(1.0), Some(1.0), None,
+                    &case.query,
+                    limit,
+                    None,
+                    case.domain.as_deref(),
+                    None,
+                    Some(1.0),
+                    Some(1.0),
+                    None,
                 )
                 .await?;
             let origin_content: String = results
@@ -1661,11 +1717,19 @@ impl MemoryLayerApproach {
 
     fn description(&self) -> &'static str {
         match self {
-            Self::FlatMarkdown => "All memories in one markdown doc, injected every turn (Claude Code style)",
-            Self::FactList => "Flat fact list, all injected per turn, capped at 200 (ChatGPT style)",
-            Self::SynthesizedSummary => "Lossy compressed summary ~2K tokens, fixed budget (Claude.ai style)",
+            Self::FlatMarkdown => {
+                "All memories in one markdown doc, injected every turn (Claude Code style)"
+            }
+            Self::FactList => {
+                "Flat fact list, all injected per turn, capped at 200 (ChatGPT style)"
+            }
+            Self::SynthesizedSummary => {
+                "Lossy compressed summary ~2K tokens, fixed budget (Claude.ai style)"
+            }
             Self::OriginRetrieval => "Query-specific retrieval, top-K relevant results only",
-            Self::OriginPlusNative => "Native markdown context + Origin retrieval on top (complement)",
+            Self::OriginPlusNative => {
+                "Native markdown context + Origin retrieval on top (complement)"
+            }
         }
     }
 }
@@ -1712,7 +1776,9 @@ fn deterministic_shuffle<T: Clone>(items: &[T], seed_str: &str) -> Vec<T> {
     let len = shuffled.len();
     let mut state = seed;
     for i in (1..len).rev() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (state as usize) % (i + 1);
         shuffled.swap(i, j);
     }
@@ -1789,10 +1855,19 @@ pub async fn run_memory_layer_comparison(
             let shuffled = deterministic_shuffle(&all_seeds, &case.query);
             let all_ids: Vec<&str> = shuffled.iter().map(|s| s.id.as_str()).collect();
             flat_ndcg = metrics::ndcg_at_k(&all_ids, &grades, all_ids.len());
-            tokens_acc.get_mut(&MemoryLayerApproach::FlatMarkdown).unwrap().push(tokens);
-            ndcg_acc.get_mut(&MemoryLayerApproach::FlatMarkdown).unwrap().push(flat_ndcg);
+            tokens_acc
+                .get_mut(&MemoryLayerApproach::FlatMarkdown)
+                .unwrap()
+                .push(tokens);
+            ndcg_acc
+                .get_mut(&MemoryLayerApproach::FlatMarkdown)
+                .unwrap()
+                .push(flat_ndcg);
             // All seeds present — fully accessible
-            accessible_acc.get_mut(&MemoryLayerApproach::FlatMarkdown).unwrap().push(1.0);
+            accessible_acc
+                .get_mut(&MemoryLayerApproach::FlatMarkdown)
+                .unwrap()
+                .push(1.0);
         }
 
         // ---- FactList (cap 200) ----
@@ -1805,7 +1880,10 @@ pub async fn run_memory_layer_comparison(
             } else {
                 shuffled_all
             };
-            let tokens: f64 = capped.iter().map(|s| count_tokens(&s.content)).sum::<usize>() as f64;
+            let tokens: f64 = capped
+                .iter()
+                .map(|s| count_tokens(&s.content))
+                .sum::<usize>() as f64;
             let capped_ids: Vec<&str> = capped.iter().map(|s| s.id.as_str()).collect();
             let ndcg = metrics::ndcg_at_k(&capped_ids, &grades, capped_ids.len());
             let relevant_in_capped = relevant
@@ -1813,9 +1891,18 @@ pub async fn run_memory_layer_comparison(
                 .filter(|id| capped_ids.contains(&id.as_str()))
                 .count();
             let accessible = relevant_in_capped as f64 / relevant.len().max(1) as f64;
-            tokens_acc.get_mut(&MemoryLayerApproach::FactList).unwrap().push(tokens);
-            ndcg_acc.get_mut(&MemoryLayerApproach::FactList).unwrap().push(ndcg);
-            accessible_acc.get_mut(&MemoryLayerApproach::FactList).unwrap().push(accessible);
+            tokens_acc
+                .get_mut(&MemoryLayerApproach::FactList)
+                .unwrap()
+                .push(tokens);
+            ndcg_acc
+                .get_mut(&MemoryLayerApproach::FactList)
+                .unwrap()
+                .push(ndcg);
+            accessible_acc
+                .get_mut(&MemoryLayerApproach::FactList)
+                .unwrap()
+                .push(accessible);
         }
 
         // ---- SynthesizedSummary (truncate to ~2K tokens) ----
@@ -1858,14 +1945,19 @@ pub async fn run_memory_layer_comparison(
                 })
                 .map(|s| s.id.as_str())
                 .collect();
-            let ndcg = metrics::ndcg_at_k(
-                &accessible_ids,
-                &grades,
-                accessible_ids.len().min(10),
-            );
-            tokens_acc.get_mut(&MemoryLayerApproach::SynthesizedSummary).unwrap().push(tokens);
-            ndcg_acc.get_mut(&MemoryLayerApproach::SynthesizedSummary).unwrap().push(ndcg);
-            accessible_acc.get_mut(&MemoryLayerApproach::SynthesizedSummary).unwrap().push(accessible);
+            let ndcg = metrics::ndcg_at_k(&accessible_ids, &grades, accessible_ids.len().min(10));
+            tokens_acc
+                .get_mut(&MemoryLayerApproach::SynthesizedSummary)
+                .unwrap()
+                .push(tokens);
+            ndcg_acc
+                .get_mut(&MemoryLayerApproach::SynthesizedSummary)
+                .unwrap()
+                .push(ndcg);
+            accessible_acc
+                .get_mut(&MemoryLayerApproach::SynthesizedSummary)
+                .unwrap()
+                .push(accessible);
         }
 
         // ---- OriginRetrieval ----
@@ -1899,10 +1991,19 @@ pub async fn run_memory_layer_comparison(
             let ranked: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
             origin_ndcg = metrics::ndcg_at_k(&ranked, &grades, 10);
         }
-        tokens_acc.get_mut(&MemoryLayerApproach::OriginRetrieval).unwrap().push(origin_tokens);
-        ndcg_acc.get_mut(&MemoryLayerApproach::OriginRetrieval).unwrap().push(origin_ndcg);
+        tokens_acc
+            .get_mut(&MemoryLayerApproach::OriginRetrieval)
+            .unwrap()
+            .push(origin_tokens);
+        ndcg_acc
+            .get_mut(&MemoryLayerApproach::OriginRetrieval)
+            .unwrap()
+            .push(origin_ndcg);
         // Origin can potentially find any stored memory
-        accessible_acc.get_mut(&MemoryLayerApproach::OriginRetrieval).unwrap().push(1.0);
+        accessible_acc
+            .get_mut(&MemoryLayerApproach::OriginRetrieval)
+            .unwrap()
+            .push(1.0);
 
         // ---- OriginPlusNative (complement) ----
         // Tokens = flat markdown tokens + origin retrieval tokens
@@ -1920,9 +2021,18 @@ pub async fn run_memory_layer_comparison(
             // Native has all memories in random order; Origin has ranked retrieval.
             // Together the LLM benefits from both, so the floor is max(flat_ndcg, origin_ndcg).
             let complement_ndcg = flat_ndcg.max(origin_ndcg);
-            tokens_acc.get_mut(&MemoryLayerApproach::OriginPlusNative).unwrap().push(complement_tokens);
-            ndcg_acc.get_mut(&MemoryLayerApproach::OriginPlusNative).unwrap().push(complement_ndcg);
-            accessible_acc.get_mut(&MemoryLayerApproach::OriginPlusNative).unwrap().push(1.0);
+            tokens_acc
+                .get_mut(&MemoryLayerApproach::OriginPlusNative)
+                .unwrap()
+                .push(complement_tokens);
+            ndcg_acc
+                .get_mut(&MemoryLayerApproach::OriginPlusNative)
+                .unwrap()
+                .push(complement_ndcg);
+            accessible_acc
+                .get_mut(&MemoryLayerApproach::OriginPlusNative)
+                .unwrap()
+                .push(1.0);
         }
     }
 
@@ -2062,10 +2172,7 @@ async fn call_llm_for_answer(
         return Err(format!("API error {status}: {text}"));
     }
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse error: {e}"))?;
 
     let answer = json["content"]
         .as_array()
@@ -2233,7 +2340,12 @@ pub async fn run_e2e_answer_eval(
                         .push(output_tok as f64);
                 }
                 Err(e) => {
-                    log::warn!("[e2e_eval] case '{}' approach '{}' skipped: {}", case.query, approach_key, e);
+                    log::warn!(
+                        "[e2e_eval] case '{}' approach '{}' skipped: {}",
+                        case.query,
+                        approach_key,
+                        e
+                    );
                 }
             }
         }
@@ -2419,7 +2531,10 @@ pub async fn judge_single_tuple(tuple: &JudgmentTuple) -> Result<JudgmentResult,
 }
 
 /// Judge a single tuple with a specific Claude model.
-pub async fn judge_single_tuple_model(tuple: &JudgmentTuple, model: &str) -> Result<JudgmentResult, OriginError> {
+pub async fn judge_single_tuple_model(
+    tuple: &JudgmentTuple,
+    model: &str,
+) -> Result<JudgmentResult, OriginError> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
@@ -2484,13 +2599,16 @@ pub async fn judge_single_tuple_model(tuple: &JudgmentTuple, model: &str) -> Res
 
     // Parse the JSON response. `--output-format json` returns an envelope; the structured
     // output lives in the `structured_output` field when `--json-schema` is used.
-    let parsed: serde_json::Value = parse_judge_json(&stdout)
-        .map_err(|e| OriginError::Generic(format!("judge response parse error: {} — raw: {}", e, stdout)))?;
+    let parsed: serde_json::Value = parse_judge_json(&stdout).map_err(|e| {
+        OriginError::Generic(format!(
+            "judge response parse error: {} — raw: {}",
+            e, stdout
+        ))
+    })?;
 
-    let score = parsed.get("score")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u8;
-    let reason = parsed.get("reason")
+    let score = parsed.get("score").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let reason = parsed
+        .get("reason")
         .and_then(|v| v.as_str())
         .unwrap_or("no reason")
         .to_string();
@@ -2568,13 +2686,14 @@ pub fn aggregate_judgments(results: &[JudgmentResult], judge_model: &str) -> Jud
         by_approach.entry(r.approach.clone()).or_default().push(r);
     }
 
-    let mut approach_results: Vec<JudgedApproachResult> =
-        by_approach.iter().map(|(approach, items)| {
+    let mut approach_results: Vec<JudgedApproachResult> = by_approach
+        .iter()
+        .map(|(approach, items)| {
             let total = items.len();
             let correct = items.iter().filter(|r| r.score == 1).count();
             let accuracy = correct as f64 / total.max(1) as f64;
-            let mean_tokens = items.iter().map(|r| r.context_tokens as f64).sum::<f64>()
-                / total.max(1) as f64;
+            let mean_tokens =
+                items.iter().map(|r| r.context_tokens as f64).sum::<f64>() / total.max(1) as f64;
             JudgedApproachResult {
                 approach: approach.clone(),
                 accuracy,
@@ -2582,10 +2701,13 @@ pub fn aggregate_judgments(results: &[JudgmentResult], judge_model: &str) -> Jud
                 correct,
                 mean_context_tokens: mean_tokens,
             }
-        }).collect();
+        })
+        .collect();
 
     approach_results.sort_by(|a, b| {
-        b.accuracy.partial_cmp(&a.accuracy).unwrap_or(std::cmp::Ordering::Equal)
+        b.accuracy
+            .partial_cmp(&a.accuracy)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     JudgedE2EReport {
@@ -2641,7 +2763,7 @@ pub async fn run_e2e_locomo_eval(
     llm_provider: Arc<dyn crate::llm_provider::LlmProvider>,
 ) -> Result<(E2ELocomoReport, Vec<JudgmentTuple>), OriginError> {
     use crate::eval::locomo::{extract_observations, load_locomo};
-    use crate::llm_provider::{LlmRequest, strip_think_tags};
+    use crate::llm_provider::{strip_think_tags, LlmRequest};
 
     let samples = load_locomo(locomo_path)?;
 
@@ -2731,11 +2853,7 @@ pub async fn run_e2e_locomo_eval(
             let ground_truth = qa
                 .answer
                 .as_ref()
-                .map(|v| {
-                    v.as_str()
-                        .unwrap_or(&v.to_string())
-                        .to_string()
-                })
+                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
                 .unwrap_or_default();
 
             if ground_truth.is_empty() {
@@ -2779,10 +2897,7 @@ pub async fn run_e2e_locomo_eval(
 
             let origin_request = LlmRequest {
                 system_prompt: Some(system_prompt.clone()),
-                user_prompt: format!(
-                    "Context:\n{}\n\nQuestion: {}",
-                    origin_context, qa.question
-                ),
+                user_prompt: format!("Context:\n{}\n\nQuestion: {}", origin_context, qa.question),
                 max_tokens: 200,
                 temperature: 0.1,
                 label: Some("e2e_locomo_origin".to_string()),
@@ -2790,8 +2905,7 @@ pub async fn run_e2e_locomo_eval(
             match llm_provider.generate(origin_request).await {
                 Ok(raw_answer) => {
                     let answer = strip_think_tags(&raw_answer);
-                    let score =
-                        score_answer_against_ground_truth(&answer, &ground_truth);
+                    let score = score_answer_against_ground_truth(&answer, &ground_truth);
                     scores.get_mut("origin").unwrap().push(score);
                     ctx_tokens
                         .get_mut("origin")
@@ -2819,10 +2933,7 @@ pub async fn run_e2e_locomo_eval(
                 let replay_ctx_tokens = count_tokens(replay_ctx);
                 let replay_request = LlmRequest {
                     system_prompt: Some(system_prompt.clone()),
-                    user_prompt: format!(
-                        "Context:\n{}\n\nQuestion: {}",
-                        replay_ctx, qa.question
-                    ),
+                    user_prompt: format!("Context:\n{}\n\nQuestion: {}", replay_ctx, qa.question),
                     max_tokens: 200,
                     temperature: 0.1,
                     label: Some("e2e_locomo_full_replay".to_string()),
@@ -2830,8 +2941,7 @@ pub async fn run_e2e_locomo_eval(
                 match llm_provider.generate(replay_request).await {
                     Ok(raw_answer) => {
                         let answer = strip_think_tags(&raw_answer);
-                        let score =
-                            score_answer_against_ground_truth(&answer, &ground_truth);
+                        let score = score_answer_against_ground_truth(&answer, &ground_truth);
                         scores.get_mut("full_replay").unwrap().push(score);
                         ctx_tokens
                             .get_mut("full_replay")
@@ -2871,8 +2981,7 @@ pub async fn run_e2e_locomo_eval(
             match llm_provider.generate(no_ctx_request).await {
                 Ok(raw_answer) => {
                     let answer = strip_think_tags(&raw_answer);
-                    let score =
-                        score_answer_against_ground_truth(&answer, &ground_truth);
+                    let score = score_answer_against_ground_truth(&answer, &ground_truth);
                     scores.get_mut("no_context").unwrap().push(score);
                     ctx_tokens.get_mut("no_context").unwrap().push(0.0);
                     ans_lens
@@ -3076,9 +3185,7 @@ async fn run_strategy_search(
         }
         SearchStrategy::NaiveRag => db.naive_vector_search(query, limit, domain).await?,
         SearchStrategy::FtsOnly => db.fts_only_search(query, limit, domain).await?,
-        SearchStrategy::VectorPlusFts => {
-            db.vector_plus_fts_search(query, limit, domain).await?
-        }
+        SearchStrategy::VectorPlusFts => db.vector_plus_fts_search(query, limit, domain).await?,
         _ => return Ok((vec![], 0)),
     };
     let ids: Vec<String> = results.iter().map(|r| r.source_id.clone()).collect();
@@ -3127,9 +3234,7 @@ async fn evaluate_condition<Q: AsRef<str>>(
             // Build grades for this query's results
             let grades: HashMap<&str, u8> = result_refs
                 .iter()
-                .map(|id| {
-                    (*id, *relevance_map.get(*id).unwrap_or(&0))
-                })
+                .map(|id| (*id, *relevance_map.get(*id).unwrap_or(&0)))
                 .collect();
 
             let relevant_set: HashSet<&str> =
@@ -3232,9 +3337,16 @@ async fn expand_evidence_for_distillation(
         .await
         .map_err(|e| OriginError::Generic(e.to_string()))?
     {
-        let memory_sid: String = row.get(0).map_err(|e| OriginError::Generic(e.to_string()))?;
-        let concept_sid: String = row.get(1).map_err(|e| OriginError::Generic(e.to_string()))?;
-        mem_to_concepts.entry(memory_sid).or_default().push(concept_sid);
+        let memory_sid: String = row
+            .get(0)
+            .map_err(|e| OriginError::Generic(e.to_string()))?;
+        let concept_sid: String = row
+            .get(1)
+            .map_err(|e| OriginError::Generic(e.to_string()))?;
+        mem_to_concepts
+            .entry(memory_sid)
+            .or_default()
+            .push(concept_sid);
     }
     drop(rows);
     drop(conn);
@@ -3414,14 +3526,8 @@ pub async fn run_locomo_pipeline_eval(
 
         // ---- Condition 3: Distilled (real LLM) ----
         eprintln!("  [distilled] running distillation...");
-        let distilled_count = crate::refinery::distill_concepts(
-            &db,
-            Some(&llm),
-            &prompts,
-            &tuning,
-            None,
-        )
-        .await?;
+        let distilled_count =
+            crate::refinery::distill_concepts(&db, Some(&llm), &prompts, &tuning, None).await?;
         eprintln!("    distilled {} concepts", distilled_count);
 
         // Count clusters that were found (for reporting)
@@ -3438,8 +3544,7 @@ pub async fn run_locomo_pipeline_eval(
         let (distilled_corpus_tokens, distilled_mem_count) = count_corpus_tokens(&db).await?;
 
         // Expand evidence sets to credit merged memories
-        let expanded_evidence =
-            expand_evidence_for_distillation(&db, &evidence_sets).await?;
+        let expanded_evidence = expand_evidence_for_distillation(&db, &evidence_sets).await?;
 
         // Rebuild relevance map to include merged source_ids
         let mut distilled_relevance = relevance_map.clone();
@@ -3494,18 +3599,16 @@ pub async fn run_locomo_pipeline_eval(
         });
 
         // Print per-conversation summary
-        if let Some(flat_origin) = per_conversation
-            .last()
-            .and_then(|c| c.cells.iter().find(|c| c.condition == "flat" && c.strategy == "origin"))
-        {
-            if let Some(dist_origin) = per_conversation
-                .last()
-                .and_then(|c| {
-                    c.cells
-                        .iter()
-                        .find(|c| c.condition == "distilled" && c.strategy == "origin")
-                })
-            {
+        if let Some(flat_origin) = per_conversation.last().and_then(|c| {
+            c.cells
+                .iter()
+                .find(|c| c.condition == "flat" && c.strategy == "origin")
+        }) {
+            if let Some(dist_origin) = per_conversation.last().and_then(|c| {
+                c.cells
+                    .iter()
+                    .find(|c| c.condition == "distilled" && c.strategy == "origin")
+            }) {
                 eprintln!(
                     "  Flat NDCG={:.3} @{:.0}tok -> Distilled NDCG={:.3} @{:.0}tok ({}c, {}m->{}m)",
                     flat_origin.ndcg_at_10,
@@ -3636,7 +3739,10 @@ pub async fn run_longmemeval_pipeline_eval(
         let mut relevance_map: HashMap<String, u8> = HashMap::new();
 
         for (_i, mem) in memories.iter().enumerate() {
-            let sid = format!("lme_{}_{}_t{}", sample.question_id, mem.session_idx, mem.turn_idx);
+            let sid = format!(
+                "lme_{}_{}_t{}",
+                sample.question_id, mem.session_idx, mem.turn_idx
+            );
             let grade = if mem.has_answer {
                 3
             } else if evidence_session_set.contains(mem.session_id.as_str()) {
@@ -3659,11 +3765,14 @@ pub async fn run_longmemeval_pipeline_eval(
         total_queries += 1;
 
         // Create DB with shared embedder
-        let tmp = tempfile::tempdir()
-            .map_err(|e| OriginError::Generic(format!("tempdir lme: {e}")))?;
+        let tmp =
+            tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir lme: {e}")))?;
         let db = MemoryDB::new_with_shared_embedder(
-            tmp.path(), Arc::new(NoopEmitter), shared_embedder.clone(),
-        ).await?;
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
@@ -3722,14 +3831,8 @@ pub async fn run_longmemeval_pipeline_eval(
         .await?;
 
         // ---- Distilled ----
-        let distilled_count = crate::refinery::distill_concepts(
-            &db,
-            Some(&llm),
-            &prompts,
-            &tuning,
-            None,
-        )
-        .await?;
+        let distilled_count =
+            crate::refinery::distill_concepts(&db, Some(&llm), &prompts, &tuning, None).await?;
 
         let clusters = db
             .find_distillation_clusters(
@@ -3743,8 +3846,7 @@ pub async fn run_longmemeval_pipeline_eval(
 
         let (distilled_corpus, distilled_mem_count) = count_corpus_tokens(&db).await?;
 
-        let expanded_evidence =
-            expand_evidence_for_distillation(&db, &evidence_sets).await?;
+        let expanded_evidence = expand_evidence_for_distillation(&db, &evidence_sets).await?;
         let mut distilled_relevance = relevance_map.clone();
         for evidence_set in &expanded_evidence {
             for id in evidence_set {
@@ -3872,18 +3974,17 @@ async fn run_entity_extraction_for_eval(
 
     // Keep extracting until no unlinked memories remain (or no progress)
     loop {
-        let extracted = crate::refinery::extract_entities_from_memories(
-            db,
-            Some(llm),
-            &prompts,
-            batch_size,
-        )
-        .await?;
+        let extracted =
+            crate::refinery::extract_entities_from_memories(db, Some(llm), &prompts, batch_size)
+                .await?;
         if extracted == 0 {
             break;
         }
         total += extracted;
-        eprintln!("    [entity_extract] batch: +{} entities (total: {})", extracted, total);
+        eprintln!(
+            "    [entity_extract] batch: +{} entities (total: {})",
+            extracted, total
+        );
     }
 
     Ok(total)
@@ -3946,15 +4047,21 @@ impl ContextPathReport {
             "{:<20} | {:<10} | {:<10} | {:<8} | {:<8}\n",
             "Path", "Coverage", "Tok/Q", "Improved", "Recovered"
         ));
-        out.push_str(&format!("{:-<20}-+-{:-<10}-+-{:-<10}-+-{:-<8}-+-{:-<8}\n", "", "", "", "", ""));
+        out.push_str(&format!(
+            "{:-<20}-+-{:-<10}-+-{:-<10}-+-{:-<8}-+-{:-<8}\n",
+            "", "", "", "", ""
+        ));
         out.push_str(&format!(
             "{:<20} | {:<10.4} | {:<10.1} | {:<8} | {:<8}\n",
             "recall (search only)", self.mean_recall_coverage, self.mean_recall_tokens, "-", "-"
         ));
         out.push_str(&format!(
             "{:<20} | {:<10.4} | {:<10.1} | {:<8} | {:<8}\n",
-            "context (full)", self.mean_context_coverage, self.mean_context_tokens,
-            self.questions_improved, self.total_evidence_recovered
+            "context (full)",
+            self.mean_context_coverage,
+            self.mean_context_tokens,
+            self.questions_improved,
+            self.total_evidence_recovered
         ));
         out.push_str(&format!(
             "\nCoverage delta: {:+.4} ({:.1}% relative improvement)\n",
@@ -3971,8 +4078,11 @@ impl ContextPathReport {
             for cat in &self.per_category {
                 out.push_str(&format!(
                     "  {} (n={}): recall={:.3} context={:.3} delta={:+.3}\n",
-                    cat.category, cat.count, cat.mean_recall_coverage,
-                    cat.mean_context_coverage, cat.delta,
+                    cat.category,
+                    cat.count,
+                    cat.mean_recall_coverage,
+                    cat.mean_context_coverage,
+                    cat.delta,
                 ));
             }
         }
@@ -4016,7 +4126,10 @@ pub async fn run_context_path_eval(
 
         eprintln!(
             "[context_eval] Conv {}/{} ({}): {} observations",
-            conv_idx + 1, conv_limit, sample.sample_id, memories.len(),
+            conv_idx + 1,
+            conv_limit,
+            sample.sample_id,
+            memories.len(),
         );
 
         // Build evidence mapping
@@ -4024,7 +4137,10 @@ pub async fn run_context_path_eval(
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                (m.dia_id.clone(), format!("locomo_{}_obs_{}", sample.sample_id, i))
+                (
+                    m.dia_id.clone(),
+                    format!("locomo_{}_obs_{}", sample.sample_id, i),
+                )
             })
             .collect();
 
@@ -4054,26 +4170,40 @@ pub async fn run_context_path_eval(
         let entities = run_entity_extraction_for_eval(&db, &llm).await?;
         eprintln!("  [enriching] {} entities. distilling...", entities);
 
-        let concepts = crate::refinery::distill_concepts(
-            &db, Some(&llm), &prompts, &tuning, None,
-        ).await?;
+        let concepts =
+            crate::refinery::distill_concepts(&db, Some(&llm), &prompts, &tuning, None).await?;
         eprintln!("  [enriched] {} concepts. evaluating...", concepts);
 
         // Evaluate each question
         for qa in &sample.qa {
-            if qa.category == 5 { continue; }
+            if qa.category == 5 {
+                continue;
+            }
 
-            let evidence_ids: HashSet<String> = qa.evidence.iter()
+            let evidence_ids: HashSet<String> = qa
+                .evidence
+                .iter()
                 .filter_map(|did| dia_to_source.get(did).cloned())
                 .collect();
-            if evidence_ids.is_empty() { continue; }
+            if evidence_ids.is_empty() {
+                continue;
+            }
 
             // --- Recall path: search_memory only ---
             let recall_results = db
-                .search_memory(&qa.question, search_limit, None, Some("conversation"), None, None, None, None)
+                .search_memory(
+                    &qa.question,
+                    search_limit,
+                    None,
+                    Some("conversation"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await?;
-            let recall_ids: HashSet<String> = recall_results.iter()
-                .map(|r| r.source_id.clone()).collect();
+            let recall_ids: HashSet<String> =
+                recall_results.iter().map(|r| r.source_id.clone()).collect();
             let recall_tokens = count_results_tokens(&recall_results);
 
             let recall_found = evidence_ids.intersection(&recall_ids).count();
@@ -4083,11 +4213,17 @@ pub async fn run_context_path_eval(
             let mut context_tokens = recall_tokens;
 
             // Add concept source_ids
-            let concept_results = db.search_concepts(&qa.question, 3).await.unwrap_or_default();
+            let concept_results = db
+                .search_concepts(&qa.question, 3)
+                .await
+                .unwrap_or_default();
             for concept in &concept_results {
                 context_tokens += count_tokens(&concept.content);
                 // Get source memories via concept_sources join table
-                let sources = db.get_concept_sources(&concept.id).await.unwrap_or_default();
+                let sources = db
+                    .get_concept_sources(&concept.id)
+                    .await
+                    .unwrap_or_default();
                 for src in &sources {
                     context_ids.insert(src.memory_source_id.clone());
                 }
@@ -4098,7 +4234,8 @@ pub async fn run_context_path_eval(
             }
 
             let context_found = evidence_ids.intersection(&context_ids).count();
-            let recovered: Vec<String> = evidence_ids.iter()
+            let recovered: Vec<String> = evidence_ids
+                .iter()
                 .filter(|id| context_ids.contains(*id) && !recall_ids.contains(*id))
                 .cloned()
                 .collect();
@@ -4117,14 +4254,19 @@ pub async fn run_context_path_eval(
             });
         }
 
-        let conv_results: Vec<&ContextPathResult> = all_results.iter()
+        let conv_results: Vec<&ContextPathResult> = all_results
+            .iter()
             .rev()
             .take_while(|r| r.question.len() > 0) // all from this conv
             .collect();
-        let improved = conv_results.iter().filter(|r| r.context_found > r.recall_found).count();
+        let improved = conv_results
+            .iter()
+            .filter(|r| r.context_found > r.recall_found)
+            .count();
         eprintln!(
             "  {} questions, {} improved by context path",
-            conv_results.len(), improved,
+            conv_results.len(),
+            improved,
         );
     }
 
@@ -4132,29 +4274,47 @@ pub async fn run_context_path_eval(
     let n = all_results.len().max(1) as f64;
     let mean_recall_cov = all_results.iter().map(|r| r.recall_coverage).sum::<f64>() / n;
     let mean_context_cov = all_results.iter().map(|r| r.context_coverage).sum::<f64>() / n;
-    let questions_improved = all_results.iter().filter(|r| r.context_found > r.recall_found).count();
+    let questions_improved = all_results
+        .iter()
+        .filter(|r| r.context_found > r.recall_found)
+        .count();
     let total_recovered: usize = all_results.iter().map(|r| r.recovered_ids.len()).sum();
-    let mean_recall_tok = all_results.iter().map(|r| r.recall_tokens as f64).sum::<f64>() / n;
-    let mean_context_tok = all_results.iter().map(|r| r.context_tokens as f64).sum::<f64>() / n;
+    let mean_recall_tok = all_results
+        .iter()
+        .map(|r| r.recall_tokens as f64)
+        .sum::<f64>()
+        / n;
+    let mean_context_tok = all_results
+        .iter()
+        .map(|r| r.context_tokens as f64)
+        .sum::<f64>()
+        / n;
 
     // Per-category
     let mut cat_map: HashMap<String, Vec<&ContextPathResult>> = HashMap::new();
     for r in &all_results {
         cat_map.entry(r.category.clone()).or_default().push(r);
     }
-    let mut per_category: Vec<ContextPathCategoryResult> = cat_map.iter().map(|(cat, results)| {
-        let cn = results.len().max(1) as f64;
-        let rc = results.iter().map(|r| r.recall_coverage).sum::<f64>() / cn;
-        let cc = results.iter().map(|r| r.context_coverage).sum::<f64>() / cn;
-        ContextPathCategoryResult {
-            category: cat.clone(),
-            count: results.len(),
-            mean_recall_coverage: rc,
-            mean_context_coverage: cc,
-            delta: cc - rc,
-        }
-    }).collect();
-    per_category.sort_by(|a, b| b.delta.partial_cmp(&a.delta).unwrap_or(std::cmp::Ordering::Equal));
+    let mut per_category: Vec<ContextPathCategoryResult> = cat_map
+        .iter()
+        .map(|(cat, results)| {
+            let cn = results.len().max(1) as f64;
+            let rc = results.iter().map(|r| r.recall_coverage).sum::<f64>() / cn;
+            let cc = results.iter().map(|r| r.context_coverage).sum::<f64>() / cn;
+            ContextPathCategoryResult {
+                category: cat.clone(),
+                count: results.len(),
+                mean_recall_coverage: rc,
+                mean_context_coverage: cc,
+                delta: cc - rc,
+            }
+        })
+        .collect();
+    per_category.sort_by(|a, b| {
+        b.delta
+            .partial_cmp(&a.delta)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(ContextPathReport {
         benchmark: "LoCoMo".to_string(),
@@ -4190,16 +4350,26 @@ async fn generate_e2e_answers_for_question(
     search_limit: usize,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
 ) -> Result<Vec<JudgmentTuple>, OriginError> {
-    use crate::llm_provider::{LlmRequest, strip_think_tags};
+    use crate::llm_provider::{strip_think_tags, LlmRequest};
 
     let system_prompt = "Answer the question using only the provided context. \
-        Be specific and concise. Respond in 1-3 sentences.".to_string();
+        Be specific and concise. Respond in 1-3 sentences."
+        .to_string();
 
     let mut tuples = Vec::new();
 
     // --- Flat context: search_memory only ---
     let flat_results = db
-        .search_memory(question, search_limit, None, Some("conversation"), None, None, None, None)
+        .search_memory(
+            question,
+            search_limit,
+            None,
+            Some("conversation"),
+            None,
+            None,
+            None,
+            None,
+        )
         .await?;
     let flat_context: String = flat_results
         .iter()
@@ -4302,7 +4472,10 @@ pub async fn run_e2e_context_eval(
 
         eprintln!(
             "[e2e_context] Conv {}/{} ({}): {} observations",
-            conv_idx + 1, conv_limit, sample.sample_id, memories.len(),
+            conv_idx + 1,
+            conv_limit,
+            sample.sample_id,
+            memories.len(),
         );
 
         // Seed DB
@@ -4329,10 +4502,12 @@ pub async fn run_e2e_context_eval(
         // Enrich + distill
         eprintln!("  [enriching]...");
         let entities = run_entity_extraction_for_eval(&db, &llm).await?;
-        let concepts = crate::refinery::distill_concepts(
-            &db, Some(&llm), &prompts, &tuning, None,
-        ).await?;
-        eprintln!("  [enriched] {} entities, {} concepts. generating answers...", entities, concepts);
+        let concepts =
+            crate::refinery::distill_concepts(&db, Some(&llm), &prompts, &tuning, None).await?;
+        eprintln!(
+            "  [enriched] {} entities, {} concepts. generating answers...",
+            entities, concepts
+        );
 
         // Generate answers for each question
         let mut questions_done = 0usize;
@@ -4344,7 +4519,8 @@ pub async fn run_e2e_context_eval(
                 continue;
             }
 
-            let ground_truth = qa.answer
+            let ground_truth = qa
+                .answer
                 .as_ref()
                 .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
                 .unwrap_or_default();
@@ -4355,8 +4531,15 @@ pub async fn run_e2e_context_eval(
             let category = category_name(qa.category);
 
             match generate_e2e_answers_for_question(
-                &db, &qa.question, &ground_truth, category, search_limit, &llm,
-            ).await {
+                &db,
+                &qa.question,
+                &ground_truth,
+                category,
+                search_limit,
+                &llm,
+            )
+            .await
+            {
                 Ok(tuples) => {
                     all_tuples.extend(tuples);
                 }
@@ -4367,19 +4550,24 @@ pub async fn run_e2e_context_eval(
 
             questions_done += 1;
             if questions_done % 10 == 0 {
-                eprintln!("  [progress] {}/{} questions", questions_done, max_questions_per_conv);
+                eprintln!(
+                    "  [progress] {}/{} questions",
+                    questions_done, max_questions_per_conv
+                );
             }
         }
 
         eprintln!(
             "  Conv done: {} answers generated ({} tuples total)",
-            questions_done, all_tuples.len(),
+            questions_done,
+            all_tuples.len(),
         );
     }
 
     eprintln!(
         "[e2e_context] Total: {} judgment tuples ({} questions x 2 approaches)",
-        all_tuples.len(), all_tuples.len() / 2,
+        all_tuples.len(),
+        all_tuples.len() / 2,
     );
 
     Ok(all_tuples)
@@ -4417,7 +4605,10 @@ pub async fn run_e2e_context_eval_longmemeval(
         if q_idx % 25 == 0 {
             eprintln!(
                 "[e2e_context_lme] Q {}/{} ({}): {} memories",
-                q_idx + 1, sample_limit, sample.question_id, memories.len(),
+                q_idx + 1,
+                sample_limit,
+                sample.question_id,
+                memories.len(),
             );
         }
 
@@ -4425,18 +4616,29 @@ pub async fn run_e2e_context_eval_longmemeval(
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir e2e_lme: {e}")))?;
         let db = MemoryDB::new_with_shared_embedder(
-            tmp.path(), Arc::new(NoopEmitter), shared_embedder.clone(),
-        ).await?;
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
             .map(|mem| RawDocument {
                 content: mem.content.clone(),
-                source_id: format!("lme_{}_{}_t{}", sample.question_id, mem.session_idx, mem.turn_idx),
+                source_id: format!(
+                    "lme_{}_{}_t{}",
+                    sample.question_id, mem.session_idx, mem.turn_idx
+                ),
                 source: "memory".to_string(),
                 title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
                 memory_type: Some(
-                    if sample.question_type == "single-session-preference" { "preference" } else { "fact" }.to_string(),
+                    if sample.question_type == "single-session-preference" {
+                        "preference"
+                    } else {
+                        "fact"
+                    }
+                    .to_string(),
                 ),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
@@ -4447,12 +4649,13 @@ pub async fn run_e2e_context_eval_longmemeval(
 
         // Enrich + distill
         let _entities = run_entity_extraction_for_eval(&db, &llm).await?;
-        let _concepts = crate::refinery::distill_concepts(
-            &db, Some(&llm), &prompts, &tuning, None,
-        ).await?;
+        let _concepts =
+            crate::refinery::distill_concepts(&db, Some(&llm), &prompts, &tuning, None).await?;
 
         // Generate answers
-        let ground_truth = sample.answer.as_str()
+        let ground_truth = sample
+            .answer
+            .as_str()
             .unwrap_or(&sample.answer.to_string())
             .to_string();
         if ground_truth.is_empty() {
@@ -4462,13 +4665,25 @@ pub async fn run_e2e_context_eval_longmemeval(
         let category = category_name(&sample.question_type);
 
         if let Ok(tuples) = generate_e2e_answers_for_question(
-            &db, &sample.question, &ground_truth, category, search_limit, &llm,
-        ).await {
+            &db,
+            &sample.question,
+            &ground_truth,
+            category,
+            search_limit,
+            &llm,
+        )
+        .await
+        {
             all_tuples.extend(tuples);
         }
 
         if q_idx % 50 == 49 {
-            eprintln!("  [progress] {}/{} questions, {} tuples", q_idx + 1, sample_limit, all_tuples.len());
+            eprintln!(
+                "  [progress] {}/{} questions, {} tuples",
+                q_idx + 1,
+                sample_limit,
+                all_tuples.len()
+            );
         }
     }
 
@@ -4501,7 +4716,10 @@ pub async fn run_context_path_eval_longmemeval(
     // Pre-create shared embedder — loads 140MB ONNX model once instead of per-question
     eprintln!("[context_path_lme] loading shared embedder...");
     let shared_embedder = MemoryDB::create_shared_embedder().await?;
-    eprintln!("[context_path_lme] embedder ready, processing {} questions", samples.len().min(max_questions));
+    eprintln!(
+        "[context_path_lme] embedder ready, processing {} questions",
+        samples.len().min(max_questions)
+    );
 
     let mut all_results: Vec<ContextPathResult> = Vec::new();
     let sample_limit = max_questions.min(samples.len());
@@ -4515,22 +4733,31 @@ pub async fn run_context_path_eval_longmemeval(
         if q_idx % 25 == 0 {
             eprintln!(
                 "[context_path_lme] Q {}/{} ({}): {} memories{}",
-                q_idx + 1, sample_limit, sample.question_id, memories.len(),
-                if memories.len() < 15 { " (skip distill)" } else { "" },
+                q_idx + 1,
+                sample_limit,
+                sample.question_id,
+                memories.len(),
+                if memories.len() < 15 {
+                    " (skip distill)"
+                } else {
+                    ""
+                },
             );
         }
 
         // Build evidence mapping: memories from answer sessions are evidence
-        let answer_session_set: HashSet<String> = sample
-            .answer_session_ids
-            .iter()
-            .cloned()
-            .collect();
+        let answer_session_set: HashSet<String> =
+            sample.answer_session_ids.iter().cloned().collect();
 
         let evidence_source_ids: HashSet<String> = memories
             .iter()
             .filter(|m| answer_session_set.contains(&m.session_id))
-            .map(|m| format!("lme_{}_{}_t{}", sample.question_id, m.session_idx, m.turn_idx))
+            .map(|m| {
+                format!(
+                    "lme_{}_{}_t{}",
+                    sample.question_id, m.session_idx, m.turn_idx
+                )
+            })
             .collect();
 
         if evidence_source_ids.is_empty() {
@@ -4541,18 +4768,29 @@ pub async fn run_context_path_eval_longmemeval(
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir ctx_lme: {e}")))?;
         let db = MemoryDB::new_with_shared_embedder(
-            tmp.path(), Arc::new(NoopEmitter), shared_embedder.clone(),
-        ).await?;
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
             .map(|mem| RawDocument {
                 content: mem.content.clone(),
-                source_id: format!("lme_{}_{}_t{}", sample.question_id, mem.session_idx, mem.turn_idx),
+                source_id: format!(
+                    "lme_{}_{}_t{}",
+                    sample.question_id, mem.session_idx, mem.turn_idx
+                ),
                 source: "memory".to_string(),
                 title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
                 memory_type: Some(
-                    if sample.question_type == "single-session-preference" { "preference" } else { "fact" }.to_string(),
+                    if sample.question_type == "single-session-preference" {
+                        "preference"
+                    } else {
+                        "fact"
+                    }
+                    .to_string(),
                 ),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
@@ -4565,17 +4803,25 @@ pub async fn run_context_path_eval_longmemeval(
         // LME has avg 11 memories per question — most won't produce concepts.
         // Each distillation call takes ~30s (LLM inference), so skipping saves hours.
         if memories.len() >= 15 {
-            let _concepts = crate::refinery::distill_concepts(
-                &db, Some(&llm), &prompts, &tuning, None,
-            ).await?;
+            let _concepts =
+                crate::refinery::distill_concepts(&db, Some(&llm), &prompts, &tuning, None).await?;
         }
 
         // --- Recall path ---
         let recall_results = db
-            .search_memory(&sample.question, search_limit, None, Some("conversation"), None, None, None, None)
+            .search_memory(
+                &sample.question,
+                search_limit,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
             .await?;
-        let recall_ids: HashSet<String> = recall_results.iter()
-            .map(|r| r.source_id.clone()).collect();
+        let recall_ids: HashSet<String> =
+            recall_results.iter().map(|r| r.source_id.clone()).collect();
         let recall_tokens = count_results_tokens(&recall_results);
         let recall_found = evidence_source_ids.intersection(&recall_ids).count();
 
@@ -4583,10 +4829,16 @@ pub async fn run_context_path_eval_longmemeval(
         let mut context_ids = recall_ids.clone();
         let mut context_tokens = recall_tokens;
 
-        let concept_results = db.search_concepts(&sample.question, 3).await.unwrap_or_default();
+        let concept_results = db
+            .search_concepts(&sample.question, 3)
+            .await
+            .unwrap_or_default();
         for concept in &concept_results {
             context_tokens += count_tokens(&concept.content);
-            let sources = db.get_concept_sources(&concept.id).await.unwrap_or_default();
+            let sources = db
+                .get_concept_sources(&concept.id)
+                .await
+                .unwrap_or_default();
             for src in &sources {
                 context_ids.insert(src.memory_source_id.clone());
             }
@@ -4596,7 +4848,8 @@ pub async fn run_context_path_eval_longmemeval(
         }
 
         let context_found = evidence_source_ids.intersection(&context_ids).count();
-        let recovered: Vec<String> = evidence_source_ids.iter()
+        let recovered: Vec<String> = evidence_source_ids
+            .iter()
             .filter(|id| context_ids.contains(*id) && !recall_ids.contains(*id))
             .cloned()
             .collect();
@@ -4617,10 +4870,15 @@ pub async fn run_context_path_eval_longmemeval(
         });
 
         if q_idx % 50 == 49 {
-            let improved = all_results.iter().filter(|r| r.context_found > r.recall_found).count();
+            let improved = all_results
+                .iter()
+                .filter(|r| r.context_found > r.recall_found)
+                .count();
             eprintln!(
                 "  [progress] {}/{} questions, {} improved",
-                q_idx + 1, sample_limit, improved,
+                q_idx + 1,
+                sample_limit,
+                improved,
             );
         }
     }
@@ -4629,29 +4887,47 @@ pub async fn run_context_path_eval_longmemeval(
     let n = all_results.len().max(1) as f64;
     let mean_recall_cov = all_results.iter().map(|r| r.recall_coverage).sum::<f64>() / n;
     let mean_context_cov = all_results.iter().map(|r| r.context_coverage).sum::<f64>() / n;
-    let questions_improved = all_results.iter().filter(|r| r.context_found > r.recall_found).count();
+    let questions_improved = all_results
+        .iter()
+        .filter(|r| r.context_found > r.recall_found)
+        .count();
     let total_recovered: usize = all_results.iter().map(|r| r.recovered_ids.len()).sum();
-    let mean_recall_tok = all_results.iter().map(|r| r.recall_tokens as f64).sum::<f64>() / n;
-    let mean_context_tok = all_results.iter().map(|r| r.context_tokens as f64).sum::<f64>() / n;
+    let mean_recall_tok = all_results
+        .iter()
+        .map(|r| r.recall_tokens as f64)
+        .sum::<f64>()
+        / n;
+    let mean_context_tok = all_results
+        .iter()
+        .map(|r| r.context_tokens as f64)
+        .sum::<f64>()
+        / n;
 
     // Per-category
     let mut cat_map: HashMap<String, Vec<&ContextPathResult>> = HashMap::new();
     for r in &all_results {
         cat_map.entry(r.category.clone()).or_default().push(r);
     }
-    let mut per_category: Vec<ContextPathCategoryResult> = cat_map.iter().map(|(cat, results)| {
-        let cn = results.len().max(1) as f64;
-        let rc = results.iter().map(|r| r.recall_coverage).sum::<f64>() / cn;
-        let cc = results.iter().map(|r| r.context_coverage).sum::<f64>() / cn;
-        ContextPathCategoryResult {
-            category: cat.clone(),
-            count: results.len(),
-            mean_recall_coverage: rc,
-            mean_context_coverage: cc,
-            delta: cc - rc,
-        }
-    }).collect();
-    per_category.sort_by(|a, b| b.delta.partial_cmp(&a.delta).unwrap_or(std::cmp::Ordering::Equal));
+    let mut per_category: Vec<ContextPathCategoryResult> = cat_map
+        .iter()
+        .map(|(cat, results)| {
+            let cn = results.len().max(1) as f64;
+            let rc = results.iter().map(|r| r.recall_coverage).sum::<f64>() / cn;
+            let cc = results.iter().map(|r| r.context_coverage).sum::<f64>() / cn;
+            ContextPathCategoryResult {
+                category: cat.clone(),
+                count: results.len(),
+                mean_recall_coverage: rc,
+                mean_context_coverage: cc,
+                delta: cc - rc,
+            }
+        })
+        .collect();
+    per_category.sort_by(|a, b| {
+        b.delta
+            .partial_cmp(&a.delta)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(ContextPathReport {
         benchmark: "LongMemEval".to_string(),
@@ -4694,10 +4970,18 @@ mod tests {
     #[test]
     fn test_token_metrics_compression_ratio() {
         let ratio = TokenMetrics::compute_compression_ratio(100, 1000);
-        assert!((ratio - 0.1).abs() < 1e-9, "100/1000 should be 0.1, got {}", ratio);
+        assert!(
+            (ratio - 0.1).abs() < 1e-9,
+            "100/1000 should be 0.1, got {}",
+            ratio
+        );
 
         let ratio2 = TokenMetrics::compute_compression_ratio(50, 200);
-        assert!((ratio2 - 0.25).abs() < 1e-9, "50/200 should be 0.25, got {}", ratio2);
+        assert!(
+            (ratio2 - 0.25).abs() < 1e-9,
+            "50/200 should be 0.25, got {}",
+            ratio2
+        );
     }
 
     #[test]
@@ -4706,7 +4990,10 @@ mod tests {
         assert_eq!(ratio, 0.0, "zero corpus should return 0.0");
 
         let ratio2 = TokenMetrics::compute_compression_ratio(100, 0);
-        assert_eq!(ratio2, 0.0, "non-zero context with zero corpus should return 0.0");
+        assert_eq!(
+            ratio2, 0.0,
+            "non-zero context with zero corpus should return 0.0"
+        );
     }
 
     #[test]
@@ -4721,8 +5008,14 @@ mod tests {
         assert_eq!(SearchStrategy::VectorPlusFts.name(), "vector_plus_fts");
 
         assert_eq!(SearchStrategy::Origin.display_name(), "Origin");
-        assert_eq!(SearchStrategy::OriginReranked.display_name(), "Origin+Rerank");
-        assert_eq!(SearchStrategy::OriginExpanded.display_name(), "Origin+Expand");
+        assert_eq!(
+            SearchStrategy::OriginReranked.display_name(),
+            "Origin+Rerank"
+        );
+        assert_eq!(
+            SearchStrategy::OriginExpanded.display_name(),
+            "Origin+Expand"
+        );
         assert_eq!(SearchStrategy::NaiveRag.display_name(), "Naive RAG");
         assert_eq!(SearchStrategy::FullReplay.display_name(), "Full Replay");
         assert_eq!(SearchStrategy::NoMemory.display_name(), "No Memory");
@@ -4759,7 +5052,8 @@ mod tests {
                 ..Default::default()
             },
             RawDocument {
-                content: "tokio is an async runtime for Rust using the executor pattern.".to_string(),
+                content: "tokio is an async runtime for Rust using the executor pattern."
+                    .to_string(),
                 source_id: "tokio_async".to_string(),
                 source: "memory".to_string(),
                 title: "Tokio async".to_string(),
@@ -4767,7 +5061,8 @@ mod tests {
                 ..Default::default()
             },
             RawDocument {
-                content: "SQLite is an embedded relational database with ACID guarantees.".to_string(),
+                content: "SQLite is an embedded relational database with ACID guarantees."
+                    .to_string(),
                 source_id: "sqlite_db".to_string(),
                 source: "memory".to_string(),
                 title: "SQLite".to_string(),
@@ -4890,7 +5185,10 @@ mod tests {
         let output = report.to_terminal();
 
         // Header
-        assert!(output.contains("test-bench"), "should contain benchmark name");
+        assert!(
+            output.contains("test-bench"),
+            "should contain benchmark name"
+        );
         assert!(output.contains("cl100k_base"), "should contain tokenizer");
 
         // Column headers
@@ -4901,7 +5199,10 @@ mod tests {
 
         // Data rows
         assert!(output.contains("origin"), "should contain origin row");
-        assert!(output.contains("full_replay"), "should contain full_replay row");
+        assert!(
+            output.contains("full_replay"),
+            "should contain full_replay row"
+        );
 
         // Headline
         assert!(
@@ -4913,15 +5214,22 @@ mod tests {
     #[tokio::test]
     async fn test_multi_turn_eval() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap()
-            .parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("app/eval/fixtures");
         if !fixture_dir.exists() {
-            eprintln!("Skipping test_multi_turn_eval: fixture dir not found at {:?}", fixture_dir);
+            eprintln!(
+                "Skipping test_multi_turn_eval: fixture dir not found at {:?}",
+                fixture_dir
+            );
             return;
         }
 
-        let report = run_multi_turn_eval(&fixture_dir, 10, 10, 200).await.unwrap();
+        let report = run_multi_turn_eval(&fixture_dir, 10, 10, 200)
+            .await
+            .unwrap();
 
         assert_eq!(report.turns, 10);
         assert_eq!(report.per_turn.len(), 10);
@@ -4930,7 +5238,8 @@ mod tests {
         assert!(
             report.total_origin_tokens < report.total_replay_tokens,
             "Origin {} should be < Replay {}",
-            report.total_origin_tokens, report.total_replay_tokens
+            report.total_origin_tokens,
+            report.total_replay_tokens
         );
 
         // Replay should grow each turn (each turn adds response_overhead)
@@ -4938,8 +5247,10 @@ mod tests {
             assert!(
                 report.per_turn[i].replay_tokens >= report.per_turn[i - 1].replay_tokens,
                 "Replay should grow turn-over-turn: turn {} ({}) < turn {} ({})",
-                i + 1, report.per_turn[i].replay_tokens,
-                i, report.per_turn[i - 1].replay_tokens
+                i + 1,
+                report.per_turn[i].replay_tokens,
+                i,
+                report.per_turn[i - 1].replay_tokens
             );
         }
 
@@ -4956,7 +5267,10 @@ mod tests {
         }
 
         // Print results
-        eprintln!("\n=== Multi-Turn Token Accumulation ({} turns) ===", report.turns);
+        eprintln!(
+            "\n=== Multi-Turn Token Accumulation ({} turns) ===",
+            report.turns
+        );
         eprintln!(
             "{:<6} | {:<15} | {:<15} | {:<15} | {:<15}",
             "Turn", "Origin/turn", "Replay/turn", "Origin cumul", "Replay cumul"
@@ -4993,7 +5307,10 @@ mod tests {
         let sizes = vec![3, 5, 10, 20, 40];
         let points = run_scaling_eval(&fixture_dir, &sizes, 10).await.unwrap();
 
-        assert!(!points.is_empty(), "should produce at least one scaling point");
+        assert!(
+            !points.is_empty(),
+            "should produce at least one scaling point"
+        );
         // With more seeds, replay tokens should increase
         if points.len() >= 2 {
             assert!(
@@ -5035,7 +5352,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("token_efficiency_baseline.json");
 
-        report.save_baseline(&path).expect("save_baseline should succeed");
+        report
+            .save_baseline(&path)
+            .expect("save_baseline should succeed");
         assert!(path.exists(), "baseline file should exist after save");
 
         let loaded = QualityCostReport::load_baseline(&path).expect("load_baseline should succeed");
@@ -5045,12 +5364,8 @@ mod tests {
         assert_eq!(loaded.tokenizer, report.tokenizer);
         assert_eq!(loaded.strategies.len(), report.strategies.len());
         assert_eq!(loaded.strategies[0].strategy, report.strategies[0].strategy);
-        assert!(
-            (loaded.strategies[0].ndcg_at_10 - report.strategies[0].ndcg_at_10).abs() < 1e-9
-        );
-        assert!(
-            (loaded.headline.savings_pct - report.headline.savings_pct).abs() < 1e-9
-        );
+        assert!((loaded.strategies[0].ndcg_at_10 - report.strategies[0].ndcg_at_10).abs() < 1e-9);
+        assert!((loaded.headline.savings_pct - report.headline.savings_pct).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -5291,7 +5606,10 @@ mod tests {
 
         // VectorPlusFts: merged by max score
         let vpf = db.vector_plus_fts_search(query, limit, None).await.unwrap();
-        assert!(!vpf.is_empty(), "VectorPlusFts should return results (vector path guaranteed)");
+        assert!(
+            !vpf.is_empty(),
+            "VectorPlusFts should return results (vector path guaranteed)"
+        );
         assert!(vpf.len() <= limit, "VectorPlusFts should respect limit");
 
         // Origin: full hybrid
@@ -5327,121 +5645,189 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_token_eval_simulated() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap()
-            .parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("app/eval/fixtures");
         if !fixture_dir.exists() {
-            eprintln!("Skipping test_pipeline_token_eval_simulated: fixture dir not found at {:?}", fixture_dir);
+            eprintln!(
+                "Skipping test_pipeline_token_eval_simulated: fixture dir not found at {:?}",
+                fixture_dir
+            );
             return;
         }
 
-        let report = run_pipeline_token_eval_simulated(&fixture_dir, 10).await.unwrap();
+        let report = run_pipeline_token_eval_simulated(&fixture_dir, 10)
+            .await
+            .unwrap();
 
         assert_eq!(report.stages.len(), 3);
 
         // Distilled should have fewer memories than raw
         let raw = &report.stages[0];
         let distilled = &report.stages[1];
-        assert!(distilled.memory_count <= raw.memory_count,
+        assert!(
+            distilled.memory_count <= raw.memory_count,
             "distilled memory count {} should be <= raw {}",
-            distilled.memory_count, raw.memory_count);
+            distilled.memory_count,
+            raw.memory_count
+        );
 
         // Concept should have fewest memories
         let concept = &report.stages[2];
-        assert!(concept.memory_count <= distilled.memory_count,
+        assert!(
+            concept.memory_count <= distilled.memory_count,
             "concept memory count {} should be <= distilled {}",
-            concept.memory_count, distilled.memory_count);
+            concept.memory_count,
+            distilled.memory_count
+        );
 
         // Token reduction should be non-negative (concept stage delivers fewer search result
         // tokens to the LLM context — it consolidates many entries into one).
         // Note: in simulation, corpus size stays roughly equal (content is concatenated not
         // condensed), so reduction is measured on retrieved context tokens.
-        assert!(report.token_reduction_pct >= 0.0,
+        assert!(
+            report.token_reduction_pct >= 0.0,
             "token_reduction_pct should be >= 0, got {}",
-            report.token_reduction_pct);
+            report.token_reduction_pct
+        );
 
         // Print results
         eprintln!("\n=== Pipeline Token Efficiency ===");
-        eprintln!("{:<12} | {:<8} | {:<12} | {:<12} | {:<8} | {}",
-            "Stage", "Memories", "Corpus Tok", "Search Tok", "NDCG", "Density");
-        eprintln!("{:-<12}-+-{:-<8}-+-{:-<12}-+-{:-<12}-+-{:-<8}-+-{:-<8}", "", "", "", "", "", "");
+        eprintln!(
+            "{:<12} | {:<8} | {:<12} | {:<12} | {:<8} | {}",
+            "Stage", "Memories", "Corpus Tok", "Search Tok", "NDCG", "Density"
+        );
+        eprintln!(
+            "{:-<12}-+-{:-<8}-+-{:-<12}-+-{:-<12}-+-{:-<8}-+-{:-<8}",
+            "", "", "", "", "", ""
+        );
         for s in &report.stages {
-            eprintln!("{:<12} | {:<8} | {:<12} | {:<12.1} | {:<8.3} | {:.4}",
-                s.stage, s.memory_count, s.total_corpus_tokens, s.search_result_tokens, s.ndcg_at_10, s.information_density);
+            eprintln!(
+                "{:<12} | {:<8} | {:<12} | {:<12.1} | {:<8.3} | {:.4}",
+                s.stage,
+                s.memory_count,
+                s.total_corpus_tokens,
+                s.search_result_tokens,
+                s.ndcg_at_10,
+                s.information_density
+            );
         }
-        eprintln!("\nToken reduction (raw -> concept): {:.1}%", report.token_reduction_pct);
+        eprintln!(
+            "\nToken reduction (raw -> concept): {:.1}%",
+            report.token_reduction_pct
+        );
         eprintln!("Density improvement: {:.2}x", report.density_improvement);
     }
 
     #[tokio::test]
     async fn test_native_memory_augmentation() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap()
-            .parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("app/eval/fixtures");
         if !fixture_dir.exists() {
-            eprintln!("Skipping test_native_memory_augmentation: fixture dir not found at {:?}", fixture_dir);
+            eprintln!(
+                "Skipping test_native_memory_augmentation: fixture dir not found at {:?}",
+                fixture_dir
+            );
             return;
         }
 
-        let report = run_native_memory_augmentation(&fixture_dir, 10).await.unwrap();
+        let report = run_native_memory_augmentation(&fixture_dir, 10)
+            .await
+            .unwrap();
 
         // Structural assertions
         assert!(!report.baselines.is_empty());
         assert!(!report.alternatives.is_empty());
-        assert!(report.origin_retrieval_tokens > 0.0,
-            "Origin should retrieve some tokens from fixtures");
+        assert!(
+            report.origin_retrieval_tokens > 0.0,
+            "Origin should retrieve some tokens from fixtures"
+        );
 
         // The multi-turn model should show that Origin adds minimal overhead
         let mt = &report.multi_turn;
-        assert!(mt.native_plus_origin_total >= mt.native_only_total,
-            "Origin is additive — total must be >= native-only");
-        assert!(mt.native_plus_replay_total >= mt.native_plus_origin_total,
-            "Full replay should cost more than Origin retrieval");
-        assert!(mt.origin_overhead_pct < 5.0,
+        assert!(
+            mt.native_plus_origin_total >= mt.native_only_total,
+            "Origin is additive — total must be >= native-only"
+        );
+        assert!(
+            mt.native_plus_replay_total >= mt.native_plus_origin_total,
+            "Full replay should cost more than Origin retrieval"
+        );
+        assert!(
+            mt.origin_overhead_pct < 5.0,
             "Origin overhead should be under 5% on a 10-turn Claude Code session, got {:.2}%",
-            mt.origin_overhead_pct);
+            mt.origin_overhead_pct
+        );
 
         // Origin retrieval should be cheaper than full replay per recall event
-        let origin_per_recall = report.alternatives.iter()
+        let origin_per_recall = report
+            .alternatives
+            .iter()
             .find(|a| a.scenario == "origin_retrieval")
             .map(|a| a.tokens_per_recall)
             .unwrap_or(0);
-        let replay_per_recall = report.alternatives.iter()
+        let replay_per_recall = report
+            .alternatives
+            .iter()
             .find(|a| a.scenario == "paste_full_history")
             .map(|a| a.tokens_per_recall)
             .unwrap_or(0);
-        assert!(origin_per_recall < replay_per_recall,
+        assert!(
+            origin_per_recall < replay_per_recall,
             "Origin retrieval ({} tokens) should be cheaper than full replay ({} tokens)",
-            origin_per_recall, replay_per_recall);
+            origin_per_recall,
+            replay_per_recall
+        );
 
         // Print augmentation framing
         eprintln!("\n=== Origin: Cost of Better Recall ===\n");
         eprintln!("When you need specific information from past sessions:\n");
-        eprintln!("{:<28} | {:<19} | {}",
-            "Alternative", "Additional tokens", "Quality");
+        eprintln!(
+            "{:<28} | {:<19} | {}",
+            "Alternative", "Additional tokens", "Quality"
+        );
         eprintln!("{:-<28}-+-{:-<19}-+-{:-<50}", "", "", "");
         for alt in &report.alternatives {
-            eprintln!("{:<28} | {:<19} | {}",
-                alt.scenario, alt.tokens_per_recall, alt.description);
+            eprintln!(
+                "{:<28} | {:<19} | {}",
+                alt.scenario, alt.tokens_per_recall, alt.description
+            );
         }
 
-        eprintln!("\nOver a {}-turn Claude Code session ({} turns need recall):",
-            mt.turns, mt.recall_turns);
-        eprintln!("  Without Origin: {:>7} tokens (native memory only, no specific recall)",
-            mt.native_only_total);
-        eprintln!("  With Origin:    {:>7} tokens (+{:.1}% overhead, full specific recall)",
-            mt.native_plus_origin_total, mt.origin_overhead_pct);
-        eprintln!("  Full history:   {:>7} tokens (every recall pastes entire history)",
-            mt.native_plus_replay_total);
+        eprintln!(
+            "\nOver a {}-turn Claude Code session ({} turns need recall):",
+            mt.turns, mt.recall_turns
+        );
+        eprintln!(
+            "  Without Origin: {:>7} tokens (native memory only, no specific recall)",
+            mt.native_only_total
+        );
+        eprintln!(
+            "  With Origin:    {:>7} tokens (+{:.1}% overhead, full specific recall)",
+            mt.native_plus_origin_total, mt.origin_overhead_pct
+        );
+        eprintln!(
+            "  Full history:   {:>7} tokens (every recall pastes entire history)",
+            mt.native_plus_replay_total
+        );
 
-        eprintln!("\nOrigin adds {:.1}% token overhead to give you automatic, precise recall.",
-            mt.origin_overhead_pct);
+        eprintln!(
+            "\nOrigin adds {:.1}% token overhead to give you automatic, precise recall.",
+            mt.origin_overhead_pct
+        );
 
         eprintln!("\nNative memory baselines (already paid, constant per turn):");
         for b in &report.baselines {
-            eprintln!("  {:<12} {:>6} tokens/turn  [{}]  {}",
-                b.platform, b.memory_tokens_per_turn, b.growth_model, b.mechanism);
+            eprintln!(
+                "  {:<12} {:>6} tokens/turn  [{}]  {}",
+                b.platform, b.memory_tokens_per_turn, b.growth_model, b.mechanism
+            );
         }
     }
 
@@ -5565,9 +5951,15 @@ mod tests {
         let raw_tokens = count_results_tokens(&raw_results);
         let raw_result_count = raw_results.len();
 
-        eprintln!("\n=== Pipeline Token Eval (Real LLM: {}) ===", llm_provider.name());
+        eprintln!(
+            "\n=== Pipeline Token Eval (Real LLM: {}) ===",
+            llm_provider.name()
+        );
         eprintln!("Query: {}", best_case.query);
-        eprintln!("Corpus: {} memories, {} tokens", raw_doc_count, corpus_tokens);
+        eprintln!(
+            "Corpus: {} memories, {} tokens",
+            raw_doc_count, corpus_tokens
+        );
         eprintln!(
             "Raw search: {} results, {} context tokens  (compression: {:.3})",
             raw_result_count,
@@ -5592,7 +5984,10 @@ mod tests {
             0
         });
         let distill_ms = distill_start.elapsed().as_millis();
-        eprintln!("Distillation done in {}ms, concepts created: {}", distill_ms, concepts_created);
+        eprintln!(
+            "Distillation done in {}ms, concepts created: {}",
+            distill_ms, concepts_created
+        );
 
         // ---- Post-distillation stage ----
         let distilled_results = db_raw
@@ -5627,12 +6022,18 @@ mod tests {
 
         eprintln!("\n--- Summary ---");
         eprintln!("  Corpus:          {} tokens", corpus_tokens);
-        eprintln!("  Raw search:      {} tokens ({} results)", raw_tokens, raw_result_count);
+        eprintln!(
+            "  Raw search:      {} tokens ({} results)",
+            raw_tokens, raw_result_count
+        );
         eprintln!(
             "  Distilled search: {} tokens ({} results)",
             distilled_tokens, distilled_result_count
         );
-        eprintln!("  Token reduction: {:.1}% (raw -> distilled)", token_reduction);
+        eprintln!(
+            "  Token reduction: {:.1}% (raw -> distilled)",
+            token_reduction
+        );
         eprintln!("  Concepts created: {}", concepts_created);
 
         // Basic sanity: we should at least get some search results back.
@@ -5645,8 +6046,10 @@ mod tests {
     #[tokio::test]
     async fn test_quality_at_scale() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap()
-            .parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("app/eval/fixtures");
         if !fixture_dir.exists() {
             eprintln!("Skipping test_quality_at_scale: fixture dir not found");
@@ -5654,23 +6057,44 @@ mod tests {
         }
 
         let sizes = vec![5, 10, 20, 40, 80];
-        let report = run_quality_at_scale_eval(&fixture_dir, &sizes, 10).await.unwrap();
+        let report = run_quality_at_scale_eval(&fixture_dir, &sizes, 10)
+            .await
+            .unwrap();
 
         assert!(!report.points.is_empty());
 
         eprintln!("\n=== Quality at Scale: Origin vs Native Memory ===");
-        eprintln!("{:<10} | {:<12} | {:<12} | {:<12} | {:<12} | {:<12} | {:<12}",
-            "Memories", "Origin NDCG", "Native NDCG*", "Origin Tok", "Native Tok", "Origin Q/kT", "Native Q/kT");
-        eprintln!("{:-<10}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}",
-            "", "", "", "", "", "", "");
+        eprintln!(
+            "{:<10} | {:<12} | {:<12} | {:<12} | {:<12} | {:<12} | {:<12}",
+            "Memories",
+            "Origin NDCG",
+            "Native NDCG*",
+            "Origin Tok",
+            "Native Tok",
+            "Origin Q/kT",
+            "Native Q/kT"
+        );
+        eprintln!(
+            "{:-<10}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}",
+            "", "", "", "", "", "", ""
+        );
         for p in &report.points {
-            eprintln!("{:<10} | {:<12.3} | {:<12.3} | {:<12.0} | {:<12.0} | {:<12.3} | {:<12.3}",
-                p.memory_count, p.origin_ndcg, p.native_effective_quality,
-                p.origin_tokens, p.native_tokens,
-                p.origin_quality_per_1k_tokens, p.native_quality_per_1k_tokens);
+            eprintln!(
+                "{:<10} | {:<12.3} | {:<12.3} | {:<12.0} | {:<12.0} | {:<12.3} | {:<12.3}",
+                p.memory_count,
+                p.origin_ndcg,
+                p.native_effective_quality,
+                p.origin_tokens,
+                p.native_tokens,
+                p.origin_quality_per_1k_tokens,
+                p.native_quality_per_1k_tokens
+            );
         }
         if let Some(cross) = report.crossover_memory_count {
-            eprintln!("\nCrossover at {} memories: Origin becomes more efficient per token", cross);
+            eprintln!(
+                "\nCrossover at {} memories: Origin becomes more efficient per token",
+                cross
+            );
         } else {
             eprintln!("\nNo crossover observed in measured range");
         }
@@ -5716,20 +6140,48 @@ mod tests {
 
         let report = run_memory_layer_comparison(&fixture_dir, 10).await.unwrap();
 
-        assert_eq!(report.approaches.len(), 5, "should have exactly 5 approaches");
+        assert_eq!(
+            report.approaches.len(),
+            5,
+            "should have exactly 5 approaches"
+        );
 
         // Verify all expected approaches are present
-        let approach_keys: Vec<&str> = report.approaches.iter().map(|a| a.approach.as_str()).collect();
-        assert!(approach_keys.contains(&"flat_markdown"), "missing flat_markdown");
+        let approach_keys: Vec<&str> = report
+            .approaches
+            .iter()
+            .map(|a| a.approach.as_str())
+            .collect();
+        assert!(
+            approach_keys.contains(&"flat_markdown"),
+            "missing flat_markdown"
+        );
         assert!(approach_keys.contains(&"fact_list"), "missing fact_list");
-        assert!(approach_keys.contains(&"synthesized_summary"), "missing synthesized_summary");
-        assert!(approach_keys.contains(&"origin_retrieval"), "missing origin_retrieval");
-        assert!(approach_keys.contains(&"origin_plus_native"), "missing origin_plus_native");
+        assert!(
+            approach_keys.contains(&"synthesized_summary"),
+            "missing synthesized_summary"
+        );
+        assert!(
+            approach_keys.contains(&"origin_retrieval"),
+            "missing origin_retrieval"
+        );
+        assert!(
+            approach_keys.contains(&"origin_plus_native"),
+            "missing origin_plus_native"
+        );
 
         // Origin should have better quality-per-token than flat markdown
         // (Origin retrieves only relevant results; flat markdown dumps everything unranked)
-        let origin = report.approaches.iter().find(|a| a.approach == "origin_retrieval").unwrap();
-        let flat = report.approaches.iter().find(|a| a.approach == "flat_markdown").unwrap();
+        let origin = report
+            .approaches
+            .iter()
+            .find(|a| a.approach == "origin_retrieval")
+            .unwrap();
+        let flat = report
+            .approaches
+            .iter()
+            .find(|a| a.approach == "flat_markdown")
+            .unwrap();
         assert!(
             origin.quality_per_1k_tokens > flat.quality_per_1k_tokens,
             "Origin quality/token ({:.3}) should exceed flat markdown ({:.3})",
@@ -5738,7 +6190,11 @@ mod tests {
         );
 
         // Origin+Native has higher tokens than Origin alone (it includes the markdown too)
-        let complement = report.approaches.iter().find(|a| a.approach == "origin_plus_native").unwrap();
+        let complement = report
+            .approaches
+            .iter()
+            .find(|a| a.approach == "origin_plus_native")
+            .unwrap();
         assert!(
             complement.mean_tokens_per_query >= origin.mean_tokens_per_query,
             "complement tokens ({:.0}) should be >= origin tokens ({:.0})",
@@ -5751,12 +6207,14 @@ mod tests {
             assert!(
                 a.mean_ndcg >= 0.0 && a.mean_ndcg <= 1.0,
                 "approach {} NDCG {:.3} out of range",
-                a.approach, a.mean_ndcg,
+                a.approach,
+                a.mean_ndcg,
             );
             assert!(
                 a.memories_accessible >= 0.0 && a.memories_accessible <= 1.0,
                 "approach {} accessible {:.3} out of range",
-                a.approach, a.memories_accessible,
+                a.approach,
+                a.memories_accessible,
             );
         }
 
@@ -5792,9 +6250,15 @@ mod tests {
     #[test]
     fn test_score_answer_perfect_match() {
         let answer = "The project uses SQLite as the database backend and Rust as the language.";
-        let seeds = &["SQLite database backend for storage", "Rust programming language for safety"];
+        let seeds = &[
+            "SQLite database backend for storage",
+            "Rust programming language for safety",
+        ];
         let score = score_answer(answer, seeds);
-        assert!(score > 0.0, "answer clearly mentions both seeds, score should be positive");
+        assert!(
+            score > 0.0,
+            "answer clearly mentions both seeds, score should be positive"
+        );
     }
 
     #[test]
@@ -5890,15 +6354,20 @@ mod tests {
             assert!(
                 o.mean_answer_score >= n.mean_answer_score - 0.2,
                 "Origin answer score ({:.3}) was much worse than no-context ({:.3})",
-                o.mean_answer_score, n.mean_answer_score
+                o.mean_answer_score,
+                n.mean_answer_score
             );
             // Origin should use fewer tokens than FlatMarkdown
-            let flat = report.results.iter().find(|r| r.approach == "flat_markdown");
+            let flat = report
+                .results
+                .iter()
+                .find(|r| r.approach == "flat_markdown");
             if let Some(f) = flat {
                 assert!(
                     o.mean_context_tokens <= f.mean_context_tokens,
                     "Origin context ({:.0} tok) should be <= FlatMarkdown ({:.0} tok)",
-                    o.mean_context_tokens, f.mean_context_tokens
+                    o.mean_context_tokens,
+                    f.mean_context_tokens
                 );
             }
         }
@@ -5971,10 +6440,7 @@ mod tests {
             "{:<20} | {:<12} | {:<12} | {}",
             "Approach", "Answer Score", "Context Tok", "Avg Answer Len"
         );
-        eprintln!(
-            "{:-<20}-+-{:-<12}-+-{:-<12}-+-{:-<12}",
-            "", "", "", ""
-        );
+        eprintln!("{:-<20}-+-{:-<12}-+-{:-<12}-+-{:-<12}", "", "", "", "");
         for r in &report.results {
             eprintln!(
                 "{:<20} | {:<12.3} | {:<12.0} | {:.0} chars",
@@ -5983,7 +6449,11 @@ mod tests {
         }
 
         // Origin should score at least as well as NoContext
-        let origin = report.results.iter().find(|r| r.approach == "origin").unwrap();
+        let origin = report
+            .results
+            .iter()
+            .find(|r| r.approach == "origin")
+            .unwrap();
         let no_ctx = report
             .results
             .iter()
@@ -6127,7 +6597,10 @@ mod tests {
         eprintln!("Saved tuples to {:?}", tuples_path);
 
         // Phase 2: judge with Claude Haiku via `claude -p`.
-        eprintln!("Phase 2: judging {} tuples with Claude Haiku (concurrency=3)...", tuples.len());
+        eprintln!(
+            "Phase 2: judging {} tuples with Claude Haiku (concurrency=3)...",
+            tuples.len()
+        );
         let results = judge_with_claude(&tuples, 3).await.unwrap();
         eprintln!("Judged {} / {} tuples.", results.len(), tuples.len());
 
@@ -6138,7 +6611,10 @@ mod tests {
             "{:<20} | {:<10} | {:<10} | {:<14} | {}",
             "Approach", "Accuracy", "Correct", "Context Tok", "Total"
         );
-        eprintln!("{:-<20}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+        eprintln!(
+            "{:-<20}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+            "", "", "", "", ""
+        );
         for r in &report.results_by_approach {
             eprintln!(
                 "{:<20} | {:<10.1}% | {:<10} | {:<14.0} | {}",

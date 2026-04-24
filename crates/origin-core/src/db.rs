@@ -1124,7 +1124,8 @@ impl MemoryDB {
 
     /// Create a shared embedder that can be passed to `new_with_shared_embedder`.
     /// Loads the BGE-Base-EN-v1.5-Q model once (10-30s), then reuse across DB instances.
-    pub async fn create_shared_embedder() -> Result<Arc<std::sync::Mutex<TextEmbedding>>, OriginError> {
+    pub async fn create_shared_embedder(
+    ) -> Result<Arc<std::sync::Mutex<TextEmbedding>>, OriginError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("embedder-init-shared".into())
@@ -6227,7 +6228,11 @@ impl MemoryDB {
         let embedding = self.get_or_compute_embedding(query)?;
         let vec_str = Self::vec_to_sql(&embedding);
         // Fetch more candidates when domain filtering (some will be filtered out)
-        let fetch_limit = if domain.is_some() { (limit * 3) as i64 } else { limit as i64 };
+        let fetch_limit = if domain.is_some() {
+            (limit * 3) as i64
+        } else {
+            limit as i64
+        };
 
         let conn = self.conn.lock().await;
 
@@ -6242,7 +6247,8 @@ impl MemoryDB {
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
-                 WHERE c.pending_revision = 0 AND c.domain = ?3".to_string(),
+                 WHERE c.pending_revision = 0 AND c.domain = ?3"
+                    .to_string(),
                 vec![
                     libsql::Value::Text(vec_str.clone()),
                     libsql::Value::Integer(fetch_limit),
@@ -6260,7 +6266,8 @@ impl MemoryDB {
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
-                 WHERE c.pending_revision = 0".to_string(),
+                 WHERE c.pending_revision = 0"
+                    .to_string(),
                 vec![
                     libsql::Value::Text(vec_str.clone()),
                     libsql::Value::Integer(fetch_limit),
@@ -6269,10 +6276,7 @@ impl MemoryDB {
         };
 
         let mut results = Vec::new();
-        match conn
-            .query(&sql, params)
-            .await
-        {
+        match conn.query(&sql, params).await {
             Ok(mut rows) => {
                 while let Ok(Some(row)) = rows.next().await {
                     let distance: f64 = row.get(28).unwrap_or(1.0);
@@ -6283,10 +6287,7 @@ impl MemoryDB {
                 }
             }
             Err(e) => {
-                log::warn!(
-                    "[naive_vector_search] vector index query failed: {}",
-                    e
-                );
+                log::warn!("[naive_vector_search] vector index query failed: {}", e);
             }
         }
 
@@ -6308,12 +6309,20 @@ impl MemoryDB {
         limit: usize,
         domain: Option<&str>,
     ) -> Result<Vec<SearchResult>, OriginError> {
-        let fetch_limit = if domain.is_some() { (limit * 3) as i64 } else { limit as i64 };
+        let fetch_limit = if domain.is_some() {
+            (limit * 3) as i64
+        } else {
+            limit as i64
+        };
 
         let conn = self.conn.lock().await;
 
-        let (domain_clause, domain_param): (String, Option<libsql::Value>) = if let Some(d) = domain {
-            ("AND c.domain = ?3".to_string(), Some(libsql::Value::Text(d.to_string())))
+        let (domain_clause, domain_param): (String, Option<libsql::Value>) = if let Some(d) = domain
+        {
+            (
+                "AND c.domain = ?3".to_string(),
+                Some(libsql::Value::Text(d.to_string())),
+            )
         } else {
             (String::new(), None)
         };
@@ -6403,11 +6412,15 @@ impl MemoryDB {
             .fold(f32::NEG_INFINITY, f32::max);
         let fts_norm = if fts_max > 0.0 { fts_max } else { 1.0 };
 
-        let mut merged: std::collections::HashMap<String, SearchResult> = std::collections::HashMap::new();
+        let mut merged: std::collections::HashMap<String, SearchResult> =
+            std::collections::HashMap::new();
 
         for r in vec_results {
             // Vector scores are already cosine similarity in [0,1]
-            let prev_score = merged.get(&r.id).map(|e| e.score).unwrap_or(f32::NEG_INFINITY);
+            let prev_score = merged
+                .get(&r.id)
+                .map(|e| e.score)
+                .unwrap_or(f32::NEG_INFINITY);
             if r.score > prev_score {
                 merged.insert(r.id.clone(), r);
             }
@@ -6415,7 +6428,10 @@ impl MemoryDB {
 
         for mut r in fts_results {
             let normalised = r.score / fts_norm;
-            let prev_score = merged.get(&r.id).map(|e| e.score).unwrap_or(f32::NEG_INFINITY);
+            let prev_score = merged
+                .get(&r.id)
+                .map(|e| e.score)
+                .unwrap_or(f32::NEG_INFINITY);
             if normalised > prev_score {
                 r.score = normalised;
                 merged.insert(r.id.clone(), r);
