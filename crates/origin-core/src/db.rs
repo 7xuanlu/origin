@@ -8665,6 +8665,39 @@ impl MemoryDB {
         Ok(rows_affected)
     }
 
+    /// Return memories with at least one `failed` enrichment step that hasn't
+    /// exceeded `max_attempts`, ordered oldest-first. Returns (source_id, step_name, content).
+    pub async fn get_failed_enrichment_memories(
+        &self,
+        max_attempts: usize,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT es.source_id, es.step_name, m.content
+                 FROM enrichment_steps es
+                 JOIN (SELECT source_id, content FROM memories WHERE chunk_index = 0 AND source = 'memory') m
+                    ON m.source_id = es.source_id
+                 WHERE es.status = 'failed' AND es.attempts < ?1
+                 ORDER BY es.updated_at ASC LIMIT ?2",
+                libsql::params![max_attempts as i64, limit as i64],
+            )
+            .await
+            .map_err(|e| {
+                OriginError::VectorDb(format!("get_failed_enrichment_memories: {e}"))
+            })?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            results.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+                row.get::<String>(2).unwrap_or_default(),
+            ));
+        }
+        Ok(results)
+    }
+
     pub async fn confirm_entity(
         &self,
         entity_id: &str,
@@ -10262,6 +10295,26 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| OriginError::VectorDb(format!("get_memory_type: {}", e)))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            Ok(row.get::<Option<String>>(0).unwrap_or(None))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_memory_domain(&self, source_id: &str) -> Result<Option<String>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT domain FROM memories WHERE source_id = ?1 AND source = 'memory' LIMIT 1",
+                libsql::params![source_id.to_string()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_memory_domain: {}", e)))?;
         if let Some(row) = rows
             .next()
             .await
