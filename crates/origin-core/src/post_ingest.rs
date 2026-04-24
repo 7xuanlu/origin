@@ -14,7 +14,7 @@
 //! 5. Title enrichment (LLM short title if current looks truncated)
 //! 6. (Removed — recaps now handled by event-driven scheduler)
 //! 7. Concept growth (update matching concept with new memory)
-//! 8. Mark enrichment_status = 'enriched'
+//! 8. (Removed -- enrichment status derived from per-step outcomes in enrichment_steps table)
 
 use crate::db::MemoryDB;
 use crate::error::OriginError;
@@ -48,19 +48,34 @@ pub async fn run_post_ingest_enrichment(
             log::warn!(
                 "[post_ingest] dedup safety net fired for {source_id}: {n} duplicate candidate(s) queued. \
                  This suggests a gap in topic matching or novelty gate."
-            )
+            );
+            db.record_enrichment_step(source_id, "dedup", "ok", None).await.ok();
         }
-        Ok(_) => {}
-        Err(e) => log::warn!("[post_ingest] dedup check failed: {e}"),
+        Ok(_) => {
+            db.record_enrichment_step(source_id, "dedup", "ok", None).await.ok();
+        }
+        Err(e) => {
+            log::warn!("[post_ingest] dedup check failed: {e}");
+            db.record_enrichment_step(source_id, "dedup", "failed", Some(&e.to_string())).await.ok();
+        }
     }
 
     // 2. Entity auto-linking (only if not already linked)
     if entity_id.is_none() {
         match auto_link_entity(db, source_id, content, tuning).await {
-            Ok(true) => {} // already logged inside auto_link_entity
-            Ok(false) => {}
-            Err(e) => log::warn!("[post_ingest] entity linking failed: {e}"),
+            Ok(true) => {
+                db.record_enrichment_step(source_id, "entity_link", "ok", None).await.ok();
+            }
+            Ok(false) => {
+                db.record_enrichment_step(source_id, "entity_link", "ok", None).await.ok();
+            }
+            Err(e) => {
+                log::warn!("[post_ingest] entity linking failed: {e}");
+                db.record_enrichment_step(source_id, "entity_link", "failed", Some(&e.to_string())).await.ok();
+            }
         }
+    } else {
+        db.record_enrichment_step(source_id, "entity_link", "skipped", None).await.ok();
     }
 
     // 2b. Store-time entity extraction with time-windowed batching
@@ -116,9 +131,15 @@ pub async fn run_post_ingest_enrichment(
                             "[post_ingest] batch extraction linked {} memories to entity",
                             batch.len()
                         );
+                        db.record_enrichment_step(source_id, "entity_extract", "ok", None).await.ok();
                     }
-                    Ok(None) => {}
-                    Err(e) => log::warn!("[post_ingest] batch entity extraction failed: {e}"),
+                    Ok(None) => {
+                        db.record_enrichment_step(source_id, "entity_extract", "ok", None).await.ok();
+                    }
+                    Err(e) => {
+                        log::warn!("[post_ingest] batch entity extraction failed: {e}");
+                        db.record_enrichment_step(source_id, "entity_extract", "failed", Some(&e.to_string())).await.ok();
+                    }
                 }
             } else {
                 // Single memory extraction (no batch or source_agent unknown)
@@ -130,46 +151,86 @@ pub async fn run_post_ingest_enrichment(
                     Ok(Some(eid)) => {
                         let eid_prefix: String = eid.chars().take(12).collect();
                         log::info!("[post_ingest] {source_id}: extracted entity {eid_prefix}");
+                        db.record_enrichment_step(source_id, "entity_extract", "ok", None).await.ok();
                     }
-                    Ok(None) => {}
-                    Err(e) => log::warn!("[post_ingest] store-time entity extraction failed: {e}"),
+                    Ok(None) => {
+                        db.record_enrichment_step(source_id, "entity_extract", "ok", None).await.ok();
+                    }
+                    Err(e) => {
+                        log::warn!("[post_ingest] store-time entity extraction failed: {e}");
+                        db.record_enrichment_step(source_id, "entity_extract", "failed", Some(&e.to_string())).await.ok();
+                    }
                 }
             }
+        } else {
+            db.record_enrichment_step(source_id, "entity_extract", "skipped", None).await.ok();
         }
+    } else {
+        db.record_enrichment_step(source_id, "entity_extract", "skipped", None).await.ok();
     }
 
     // 3. Semantic contradiction check (type+domain pre-filter)
     if let Some(mt) = memory_type {
         match check_contradiction(db, source_id, mt, domain, structured_fields, content).await {
             Ok(n) if n > 0 => {
-                log::info!("[post_ingest] {source_id}: {n} contradiction candidate(s) queued")
+                log::info!("[post_ingest] {source_id}: {n} contradiction candidate(s) queued");
+                db.record_enrichment_step(source_id, "contradiction", "ok", None).await.ok();
             }
-            Ok(_) => {}
-            Err(e) => log::warn!("[post_ingest] contradiction check failed: {e}"),
+            Ok(_) => {
+                db.record_enrichment_step(source_id, "contradiction", "ok", None).await.ok();
+            }
+            Err(e) => {
+                log::warn!("[post_ingest] contradiction check failed: {e}");
+                db.record_enrichment_step(source_id, "contradiction", "failed", Some(&e.to_string())).await.ok();
+            }
         }
+    } else {
+        db.record_enrichment_step(source_id, "contradiction", "skipped", None).await.ok();
     }
 
     // 3b. Concept contradiction check — flag related concepts for re-distill if new memory contradicts
     match check_concept_contradiction(db, source_id, content).await {
         Ok(n) if n > 0 => {
-            log::info!("[post_ingest] {source_id}: flagged {n} concept(s) for re-distill")
+            log::info!("[post_ingest] {source_id}: flagged {n} concept(s) for re-distill");
+            db.record_enrichment_step(source_id, "concept_contradiction", "ok", None).await.ok();
         }
-        Ok(_) => {}
-        Err(e) => log::warn!("[post_ingest] concept contradiction check failed: {e}"),
+        Ok(_) => {
+            db.record_enrichment_step(source_id, "concept_contradiction", "ok", None).await.ok();
+        }
+        Err(e) => {
+            log::warn!("[post_ingest] concept contradiction check failed: {e}");
+            db.record_enrichment_step(source_id, "concept_contradiction", "failed", Some(&e.to_string())).await.ok();
+        }
     }
 
     // 4. Entity creation suggestion (stub — full extraction runs in refinery steep)
-    if let Err(e) = suggest_entity_creation(db, content).await {
-        log::warn!("[post_ingest] entity suggestion failed: {e}");
+    match suggest_entity_creation(db, content).await {
+        Ok(()) => {
+            db.record_enrichment_step(source_id, "entity_suggestion", "ok", None).await.ok();
+        }
+        Err(e) => {
+            log::warn!("[post_ingest] entity suggestion failed: {e}");
+            db.record_enrichment_step(source_id, "entity_suggestion", "failed", Some(&e.to_string())).await.ok();
+        }
     }
 
     // 5. Title enrichment — generate short topic title if current title is a truncation
     if let Some(llm_ref) = llm {
         match enrich_title(db, source_id, content, llm_ref).await {
-            Ok(true) => log::info!("[post_ingest] {source_id}: title enriched"),
-            Ok(false) => {}
-            Err(e) => log::warn!("[post_ingest] title enrichment failed: {e}"),
+            Ok(true) => {
+                log::info!("[post_ingest] {source_id}: title enriched");
+                db.record_enrichment_step(source_id, "title_enrich", "ok", None).await.ok();
+            }
+            Ok(false) => {
+                db.record_enrichment_step(source_id, "title_enrich", "ok", None).await.ok();
+            }
+            Err(e) => {
+                log::warn!("[post_ingest] title enrichment failed: {e}");
+                db.record_enrichment_step(source_id, "title_enrich", "failed", Some(&e.to_string())).await.ok();
+            }
         }
+    } else {
+        db.record_enrichment_step(source_id, "title_enrich", "skipped", None).await.ok();
     }
 
     // 6. Recap trigger — REMOVED. Recaps are now generated by the event-driven
@@ -191,12 +252,23 @@ pub async fn run_post_ingest_enrichment(
     {
         Ok(true) => {
             log::info!("[post_ingest] {source_id}: updated matching concept");
+            db.record_enrichment_step(source_id, "concept_growth", "ok", None).await.ok();
             if let Some(kp) = knowledge_path {
                 write_grown_concept(db, source_id, kp).await;
             }
         }
-        Ok(false) => {}
-        Err(e) => log::warn!("[post_ingest] concept growth failed: {e}"),
+        Ok(false) => {
+            // grow_concept returns false when LLM is unavailable — treat as skipped
+            if llm.map(|l| l.is_available()).unwrap_or(false) {
+                db.record_enrichment_step(source_id, "concept_growth", "ok", None).await.ok();
+            } else {
+                db.record_enrichment_step(source_id, "concept_growth", "skipped", None).await.ok();
+            }
+        }
+        Err(e) => {
+            log::warn!("[post_ingest] concept growth failed: {e}");
+            db.record_enrichment_step(source_id, "concept_growth", "failed", Some(&e.to_string())).await.ok();
+        }
     }
 
     // 7b. KG quality verification — check entity self-retrieval after all linking/extraction
@@ -217,16 +289,11 @@ pub async fn run_post_ingest_enrichment(
         }
     }
 
-    // 8. Mark enriched (even on partial failure above)
-    if let Err(e) = db.mark_enriched(source_id).await {
-        log::warn!("[post_ingest] mark_enriched failed: {e}");
-    }
-
     Ok(())
 }
 
 /// Check for semantic contradictions against existing same-type memories.
-pub async fn check_contradiction(
+pub(crate) async fn check_contradiction(
     db: &MemoryDB,
     source_id: &str,
     memory_type: &str,
@@ -274,7 +341,7 @@ pub async fn check_contradiction(
 
 /// Check for near-duplicates via vector similarity (cosine > 0.92).
 /// Queues `dedup_merge` refinement proposals for matches.
-async fn check_dedup(
+pub(crate) async fn check_dedup(
     db: &MemoryDB,
     source_id: &str,
     content: &str,
@@ -312,7 +379,7 @@ async fn check_dedup(
 
 /// Auto-link memory to an existing entity via vector search.
 /// Links to the best matching entity with distance < 0.15 (cosine similarity > 0.85).
-async fn auto_link_entity(
+pub(crate) async fn auto_link_entity(
     db: &MemoryDB,
     source_id: &str,
     content: &str,
@@ -340,7 +407,7 @@ async fn auto_link_entity(
 /// Uses FTS5 search to find related concepts, then checks for negation signals
 /// with topic overlap. Flags contradicting concepts for re-distill by adding the
 /// new memory to their source list.
-async fn check_concept_contradiction(
+pub(crate) async fn check_concept_contradiction(
     db: &MemoryDB,
     source_id: &str,
     content: &str,
@@ -407,14 +474,14 @@ async fn check_concept_contradiction(
 }
 
 /// Stub for entity creation suggestion. Full implementation in Task 5 (refinery).
-async fn suggest_entity_creation(_db: &MemoryDB, _content: &str) -> Result<(), OriginError> {
+pub(crate) async fn suggest_entity_creation(_db: &MemoryDB, _content: &str) -> Result<(), OriginError> {
     // TODO: Detect entity-like proper nouns in content and queue
     // 'suggest_entity' refinement action if no matching entity exists.
     Ok(())
 }
 
 /// Generate a short topic title if the current title looks like a content truncation.
-async fn enrich_title(
+pub(crate) async fn enrich_title(
     db: &MemoryDB,
     source_id: &str,
     content: &str,
@@ -447,7 +514,7 @@ async fn enrich_title(
 }
 
 /// Check if new memory matches an existing concept; if so, update it.
-async fn grow_concept(
+pub(crate) async fn grow_concept(
     db: &MemoryDB,
     source_id: &str,
     content: &str,
@@ -661,9 +728,48 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify enrichment_status was updated
-        let status = db.get_enrichment_status("mem_enrich_test").await.unwrap();
-        assert_eq!(status, Some("enriched".to_string()));
+        // Verify enrichment_summary is derived from per-step outcomes
+        let summary = db.get_enrichment_summary("mem_enrich_test").await.unwrap();
+        assert_eq!(summary, "enriched");
+    }
+
+    #[tokio::test]
+    async fn test_enrichment_records_per_step_outcomes() {
+        let (db, _dir) = test_db().await;
+        let doc = make_doc("mem_step_record", "The capital of France is Paris");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        run_post_ingest_enrichment(
+            &db, "mem_step_record", "The capital of France is Paris",
+            None, Some("fact"), None, None, None,
+            &crate::prompts::PromptRegistry::default(),
+            &crate::tuning::RefineryConfig::default(),
+            &crate::tuning::DistillationConfig::default(),
+            None,
+        ).await.unwrap();
+
+        let steps = db.get_enrichment_steps("mem_step_record").await.unwrap();
+        assert!(!steps.is_empty(), "should have recorded enrichment steps");
+
+        // dedup should be ok (no duplicates)
+        let dedup = steps.iter().find(|s| s.step == "dedup").unwrap();
+        assert_eq!(dedup.status, "ok");
+
+        // entity_extract should be skipped (no LLM)
+        let extract = steps.iter().find(|s| s.step == "entity_extract").unwrap();
+        assert_eq!(extract.status, "skipped");
+
+        // title_enrich should be skipped (no LLM)
+        let title = steps.iter().find(|s| s.step == "title_enrich").unwrap();
+        assert_eq!(title.status, "skipped");
+
+        // concept_growth should be skipped (no LLM)
+        let growth = steps.iter().find(|s| s.step == "concept_growth").unwrap();
+        assert_eq!(growth.status, "skipped");
+
+        // Summary should be enriched (no failures)
+        let summary = db.get_enrichment_summary("mem_step_record").await.unwrap();
+        assert_eq!(summary, "enriched");
     }
 
     #[tokio::test]

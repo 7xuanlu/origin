@@ -4000,7 +4000,7 @@ impl MemoryDB {
 
                 if !table_exists {
                     conn.execute(
-                        "CREATE TABLE enrichment_steps (
+                        "CREATE TABLE IF NOT EXISTS enrichment_steps (
                             source_id TEXT NOT NULL,
                             step_name TEXT NOT NULL,
                             status TEXT NOT NULL,
@@ -4015,7 +4015,7 @@ impl MemoryDB {
                     .map_err(|e| OriginError::VectorDb(format!("m42 create table: {e}")))?;
 
                     conn.execute(
-                        "CREATE INDEX idx_enrichment_steps_failed ON enrichment_steps(status) WHERE status = 'failed'",
+                        "CREATE INDEX IF NOT EXISTS idx_enrichment_steps_failed ON enrichment_steps(status) WHERE status = 'failed'",
                         (),
                     )
                     .await
@@ -8532,37 +8532,15 @@ impl MemoryDB {
         Ok(results)
     }
 
-    /// Get enrichment status for a chunk (for testing and diagnostics).
+    /// Get enrichment status for a memory, derived from per-step outcomes.
+    /// Delegates to `get_enrichment_summary` so callers get a live view of
+    /// what actually ran rather than a stale flag.
     pub async fn get_enrichment_status(
         &self,
         source_id: &str,
     ) -> Result<Option<String>, OriginError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT enrichment_status FROM memories WHERE source_id = ?1 LIMIT 1",
-                libsql::params![source_id],
-            )
-            .await
-            .map_err(|e| OriginError::VectorDb(format!("get_enrichment_status: {}", e)))?;
-        if let Ok(Some(row)) = rows.next().await {
-            let status: String = row.get(0).unwrap();
-            Ok(Some(status))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Mark a chunk as enriched (post-ingest pipeline complete).
-    pub async fn mark_enriched(&self, source_id: &str) -> Result<(), OriginError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE memories SET enrichment_status = 'enriched' WHERE source_id = ?1",
-            libsql::params![source_id],
-        )
-        .await
-        .map_err(|e| OriginError::VectorDb(format!("mark_enriched: {}", e)))?;
-        Ok(())
+        let summary = self.get_enrichment_summary(source_id).await?;
+        Ok(Some(summary))
     }
 
     /// Record (or upsert) a single enrichment step outcome for a memory.
@@ -19595,53 +19573,6 @@ pub(crate) mod tests {
             needs_reembed, 1,
             "structured_fields update must set needs_reembed = 1 so re-embed picks it up"
         );
-    }
-
-    // ==================== mark_enriched ====================
-
-    #[tokio::test]
-    async fn test_mark_enriched() {
-        let (db, _dir) = test_db().await;
-        let doc = make_memory_doc("mem_enrich", "Some fact", "fact", "work", "claude");
-        db.upsert_documents(vec![doc]).await.unwrap();
-
-        // Initially "raw" (default from RawDocument)
-        let row = db
-            .conn
-            .lock()
-            .await
-            .query(
-                "SELECT enrichment_status FROM memories WHERE source_id = 'mem_enrich' LIMIT 1",
-                (),
-            )
-            .await
-            .unwrap()
-            .next()
-            .await
-            .unwrap()
-            .unwrap();
-        let status: String = row.get(0).unwrap();
-        assert_eq!(status, "raw");
-
-        // Mark enriched
-        db.mark_enriched("mem_enrich").await.unwrap();
-
-        let row = db
-            .conn
-            .lock()
-            .await
-            .query(
-                "SELECT enrichment_status FROM memories WHERE source_id = 'mem_enrich' LIMIT 1",
-                (),
-            )
-            .await
-            .unwrap()
-            .next()
-            .await
-            .unwrap()
-            .unwrap();
-        let status: String = row.get(0).unwrap();
-        assert_eq!(status, "enriched");
     }
 
     // ==================== Space CRUD ====================
