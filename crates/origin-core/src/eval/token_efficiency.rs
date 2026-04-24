@@ -4149,6 +4149,310 @@ pub async fn run_context_path_eval(
     })
 }
 
+// ===== E2E Answer Quality: flat vs structured context with LLM-as-judge =====
+
+/// Run E2E answer quality comparison: flat (search_memory) vs structured (search + concepts).
+///
+/// For each LoCoMo question:
+/// 1. Build flat context: search_memory top-K concatenated
+/// 2. Build structured context: search_memory + concept articles (like chat-context)
+/// 3. Generate answers from both contexts using on-device LLM
+/// 4. Return JudgmentTuples for offline Claude Haiku judging
+///
+/// Requires enrichment + distillation to be run first (concepts must exist).
+/// Call this after seeding + enriching a DB, or use the all-in-one wrapper.
+async fn generate_e2e_answers_for_question(
+    db: &MemoryDB,
+    question: &str,
+    ground_truth: &str,
+    category: &str,
+    search_limit: usize,
+    llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+) -> Result<Vec<JudgmentTuple>, OriginError> {
+    use crate::llm_provider::{LlmRequest, strip_think_tags};
+
+    let system_prompt = "Answer the question using only the provided context. \
+        Be specific and concise. Respond in 1-3 sentences.".to_string();
+
+    let mut tuples = Vec::new();
+
+    // --- Flat context: search_memory only ---
+    let flat_results = db
+        .search_memory(question, search_limit, None, Some("conversation"), None, None, None, None)
+        .await?;
+    let flat_context: String = flat_results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let flat_tokens = count_tokens(&flat_context);
+
+    let flat_request = LlmRequest {
+        system_prompt: Some(system_prompt.clone()),
+        user_prompt: format!("Context:\n{}\n\nQuestion: {}", flat_context, question),
+        max_tokens: 200,
+        temperature: 0.1,
+        label: Some("e2e_flat".to_string()),
+    };
+    if let Ok(raw) = llm.generate(flat_request).await {
+        let answer = strip_think_tags(&raw);
+        tuples.push(JudgmentTuple {
+            question: question.to_string(),
+            ground_truth: ground_truth.to_string(),
+            approach: format!("flat_{}", category),
+            answer,
+            context_tokens: flat_tokens,
+        });
+    }
+
+    // --- Structured context: search_memory + concept articles ---
+    let mut structured_parts: Vec<String> = Vec::new();
+
+    // Concept articles (like chat-context's "Compiled Knowledge" section)
+    let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
+    if !concepts.is_empty() {
+        structured_parts.push("## Compiled Knowledge".to_string());
+        for c in &concepts {
+            let summary = c.summary.as_deref().unwrap_or("");
+            structured_parts.push(format!("**{}**: {}\n{}", c.title, summary, c.content));
+        }
+    }
+
+    // Memory search results
+    if !flat_results.is_empty() {
+        structured_parts.push("## Relevant Memories".to_string());
+        for (i, r) in flat_results.iter().enumerate() {
+            structured_parts.push(format!("{}. {}", i + 1, r.content));
+        }
+    }
+
+    let structured_context = structured_parts.join("\n\n");
+    let structured_tokens = count_tokens(&structured_context);
+
+    let structured_request = LlmRequest {
+        system_prompt: Some(system_prompt),
+        user_prompt: format!("Context:\n{}\n\nQuestion: {}", structured_context, question),
+        max_tokens: 200,
+        temperature: 0.1,
+        label: Some("e2e_structured".to_string()),
+    };
+    if let Ok(raw) = llm.generate(structured_request).await {
+        let answer = strip_think_tags(&raw);
+        tuples.push(JudgmentTuple {
+            question: question.to_string(),
+            ground_truth: ground_truth.to_string(),
+            approach: format!("structured_{}", category),
+            answer,
+            context_tokens: structured_tokens,
+        });
+    }
+
+    Ok(tuples)
+}
+
+/// Run full E2E answer quality eval on LoCoMo: seed, enrich, distill, generate answers.
+///
+/// Returns JudgmentTuples for offline judging with `judge_with_claude`.
+/// Two approaches per question: "flat_{category}" and "structured_{category}".
+pub async fn run_e2e_context_eval(
+    locomo_path: &Path,
+    llm: Arc<dyn crate::llm_provider::LlmProvider>,
+    search_limit: usize,
+    max_conversations: usize,
+    max_questions_per_conv: usize,
+) -> Result<Vec<JudgmentTuple>, OriginError> {
+    use crate::eval::locomo::{category_name, extract_observations, load_locomo};
+    use crate::prompts::PromptRegistry;
+    use crate::tuning::DistillationConfig;
+
+    let samples = load_locomo(locomo_path)?;
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let tuning = DistillationConfig::default();
+
+    let mut all_tuples: Vec<JudgmentTuple> = Vec::new();
+    let conv_limit = max_conversations.min(samples.len());
+
+    for (conv_idx, sample) in samples.iter().take(max_conversations).enumerate() {
+        let memories = extract_observations(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        eprintln!(
+            "[e2e_context] Conv {}/{} ({}): {} observations",
+            conv_idx + 1, conv_limit, sample.sample_id, memories.len(),
+        );
+
+        // Seed DB
+        let tmp = tempfile::tempdir()
+            .map_err(|e| OriginError::Generic(format!("tempdir e2e_context: {e}")))?;
+        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+
+        let docs: Vec<RawDocument> = memories
+            .iter()
+            .enumerate()
+            .map(|(i, mem)| RawDocument {
+                content: mem.content.clone(),
+                source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+                source: "memory".to_string(),
+                title: format!("{} session {}", mem.speaker, mem.session_num),
+                memory_type: Some("fact".to_string()),
+                domain: Some("conversation".to_string()),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            })
+            .collect();
+        db.upsert_documents(docs).await?;
+
+        // Enrich + distill
+        eprintln!("  [enriching]...");
+        let entities = run_entity_extraction_for_eval(&db, &llm).await?;
+        let concepts = crate::refinery::distill_concepts(
+            &db, Some(&llm), &prompts, &tuning, None,
+        ).await?;
+        eprintln!("  [enriched] {} entities, {} concepts. generating answers...", entities, concepts);
+
+        // Generate answers for each question
+        let mut questions_done = 0usize;
+        for qa in &sample.qa {
+            if questions_done >= max_questions_per_conv {
+                break;
+            }
+            if qa.category == 5 {
+                continue;
+            }
+
+            let ground_truth = qa.answer
+                .as_ref()
+                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                .unwrap_or_default();
+            if ground_truth.is_empty() {
+                continue;
+            }
+
+            let category = category_name(qa.category);
+
+            match generate_e2e_answers_for_question(
+                &db, &qa.question, &ground_truth, category, search_limit, &llm,
+            ).await {
+                Ok(tuples) => {
+                    all_tuples.extend(tuples);
+                }
+                Err(e) => {
+                    log::warn!("[e2e_context] question failed: {e}");
+                }
+            }
+
+            questions_done += 1;
+            if questions_done % 10 == 0 {
+                eprintln!("  [progress] {}/{} questions", questions_done, max_questions_per_conv);
+            }
+        }
+
+        eprintln!(
+            "  Conv done: {} answers generated ({} tuples total)",
+            questions_done, all_tuples.len(),
+        );
+    }
+
+    eprintln!(
+        "[e2e_context] Total: {} judgment tuples ({} questions x 2 approaches)",
+        all_tuples.len(), all_tuples.len() / 2,
+    );
+
+    Ok(all_tuples)
+}
+
+/// Same as run_e2e_context_eval but for LongMemEval.
+pub async fn run_e2e_context_eval_longmemeval(
+    longmemeval_path: &Path,
+    llm: Arc<dyn crate::llm_provider::LlmProvider>,
+    search_limit: usize,
+    max_questions: usize,
+    _max_answers_per_question: usize,
+) -> Result<Vec<JudgmentTuple>, OriginError> {
+    use crate::eval::longmemeval::{category_name, extract_memories, load_longmemeval};
+    use crate::prompts::PromptRegistry;
+    use crate::tuning::DistillationConfig;
+
+    let samples = load_longmemeval(longmemeval_path)?;
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let tuning = DistillationConfig::default();
+
+    let mut all_tuples: Vec<JudgmentTuple> = Vec::new();
+    let sample_limit = max_questions.min(samples.len());
+
+    for (q_idx, sample) in samples.iter().take(max_questions).enumerate() {
+        let memories = extract_memories(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        if q_idx % 25 == 0 {
+            eprintln!(
+                "[e2e_context_lme] Q {}/{} ({}): {} memories",
+                q_idx + 1, sample_limit, sample.question_id, memories.len(),
+            );
+        }
+
+        // Seed DB
+        let tmp = tempfile::tempdir()
+            .map_err(|e| OriginError::Generic(format!("tempdir e2e_lme: {e}")))?;
+        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+
+        let docs: Vec<RawDocument> = memories
+            .iter()
+            .map(|mem| RawDocument {
+                content: mem.content.clone(),
+                source_id: format!("lme_{}_{}_t{}", sample.question_id, mem.session_idx, mem.turn_idx),
+                source: "memory".to_string(),
+                title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                memory_type: Some(
+                    if sample.question_type == "single-session-preference" { "preference" } else { "fact" }.to_string(),
+                ),
+                domain: Some("conversation".to_string()),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            })
+            .collect();
+        db.upsert_documents(docs).await?;
+
+        // Enrich + distill
+        let _entities = run_entity_extraction_for_eval(&db, &llm).await?;
+        let _concepts = crate::refinery::distill_concepts(
+            &db, Some(&llm), &prompts, &tuning, None,
+        ).await?;
+
+        // Generate answers
+        let ground_truth = sample.answer.as_str()
+            .unwrap_or(&sample.answer.to_string())
+            .to_string();
+        if ground_truth.is_empty() {
+            continue;
+        }
+
+        let category = category_name(&sample.question_type);
+
+        if let Ok(tuples) = generate_e2e_answers_for_question(
+            &db, &sample.question, &ground_truth, category, search_limit, &llm,
+        ).await {
+            all_tuples.extend(tuples);
+        }
+
+        if q_idx % 50 == 49 {
+            eprintln!("  [progress] {}/{} questions, {} tuples", q_idx + 1, sample_limit, all_tuples.len());
+        }
+    }
+
+    eprintln!(
+        "[e2e_context_lme] Total: {} judgment tuples",
+        all_tuples.len(),
+    );
+
+    Ok(all_tuples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

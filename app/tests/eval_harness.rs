@@ -1414,3 +1414,117 @@ async fn benchmark_context_path() {
 
     assert!(report.total_questions > 0);
 }
+
+// ---------------------------------------------------------------------------
+// E2E answer quality: flat vs structured context with LLM-as-judge
+// ---------------------------------------------------------------------------
+
+/// Generate E2E answers for LoCoMo (flat vs structured context).
+/// Saves judgment tuples for offline Claude Haiku judging.
+/// Requires Metal GPU for on-device LLM. Run with sandbox disabled.
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_locomo() {
+    use origin_lib::eval::token_efficiency::{run_e2e_context_eval, save_judgment_tuples};
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM"),
+    );
+
+    // 1 conversation, 20 questions for quick validation
+    let tuples = run_e2e_context_eval(&locomo_path, llm, 10, 1, 20)
+        .await
+        .expect("run_e2e_context_eval failed");
+
+    eprintln!("Generated {} judgment tuples", tuples.len());
+    assert!(!tuples.is_empty(), "should generate at least some tuples");
+
+    // Save for offline judging
+    let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_locomo.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Generate E2E answers for LongMemEval (flat vs structured context).
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_longmemeval() {
+    use origin_lib::eval::token_efficiency::{run_e2e_context_eval_longmemeval, save_judgment_tuples};
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM"),
+    );
+
+    // 50 questions for validation
+    let tuples = run_e2e_context_eval_longmemeval(&path, llm, 10, 50, 1)
+        .await
+        .expect("run_e2e_context_eval_longmemeval failed");
+
+    eprintln!("Generated {} judgment tuples", tuples.len());
+    assert!(!tuples.is_empty());
+
+    let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_longmemeval.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Judge saved LoCoMo E2E context tuples with Claude Haiku.
+/// Run after generate_e2e_context_tuples_locomo.
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_locomo() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_locomo.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples...", tuples.len());
+
+    let results = judge_with_claude(&tuples, 3).await.expect("judge failed");
+
+    let report = aggregate_judgments(&results, "haiku");
+    eprintln!("\n=== E2E Context Eval: LoCoMo (Claude Haiku Judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | {}",
+        "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+    );
+    eprintln!("{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
