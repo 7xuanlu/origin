@@ -237,7 +237,7 @@ jobs:
           fi
 
       - name: Publish origin-types to crates.io
-        if: steps.check-changed.outputs.changed == 'true' && secrets.CARGO_REGISTRY_TOKEN != ''
+        if: steps.check-changed.outputs.changed == 'true' && env.CARGO_REGISTRY_TOKEN != ''
         run: cargo publish -p origin-types
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
