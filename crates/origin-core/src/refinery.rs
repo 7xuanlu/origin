@@ -3057,28 +3057,26 @@ pub(crate) async fn retry_failed_enrichment(
             }
             Err(e) => {
                 log::warn!("[refinery] retry of '{step_name}' for {source_id} failed: {e}");
-                db.record_enrichment_step(
-                    source_id,
-                    step_name,
-                    "failed",
-                    Some(&e.to_string()),
-                )
-                .await
-                .ok();
-                // Check if we hit max retries
-                if let Ok(steps) = db.get_enrichment_steps(source_id).await {
-                    if let Some(step) = steps.iter().find(|s| s.step == *step_name) {
-                        if step.attempts as usize >= tuning.max_enrichment_retries {
-                            db.record_enrichment_step(
-                                source_id,
-                                step_name,
-                                "abandoned",
-                                Some(&e.to_string()),
-                            )
-                            .await
-                            .ok();
-                        }
-                    }
+                // Check current attempts BEFORE recording, so we can decide
+                // whether to mark failed (retryable) or abandoned (final).
+                let current_attempts = db
+                    .get_enrichment_steps(source_id)
+                    .await
+                    .ok()
+                    .and_then(|steps| steps.iter().find(|s| s.step == *step_name).map(|s| s.attempts))
+                    .unwrap_or(0);
+                // record_enrichment_step increments attempts via UPSERT, so
+                // after this call attempts = current_attempts + 1.
+                let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
+                    "abandoned"
+                } else {
+                    "failed"
+                };
+                db.record_enrichment_step(source_id, step_name, status, Some(&e.to_string()))
+                    .await
+                    .ok();
+                if status == "abandoned" {
+                    log::info!("[refinery] step '{step_name}' for {source_id} abandoned after {} attempts", current_attempts + 1);
                 }
                 retried += 1;
             }

@@ -4740,7 +4740,7 @@ impl MemoryDB {
         }
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE memories SET embedding = vector32(?1), enrichment_status = 'enriched', needs_reembed = 0 WHERE id = ?2",
+            "UPDATE memories SET embedding = vector32(?1), enrichment_status = 'legacy', needs_reembed = 0 WHERE id = ?2",
             libsql::params![Self::vec_to_sql(&embeddings[0]), chunk_id],
         )
         .await
@@ -6839,6 +6839,13 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("delete_by_source_id: {}", e)))?;
+        // Clean up orphaned enrichment_steps (no FK cascade)
+        conn.execute(
+            "DELETE FROM enrichment_steps WHERE source_id = ?1",
+            libsql::params![source_id.to_string()],
+        )
+        .await
+        .ok();
         Ok(())
     }
 
@@ -20011,14 +20018,14 @@ pub(crate) mod tests {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT enrichment_status FROM memories WHERE id = 're1'",
+                "SELECT needs_reembed FROM memories WHERE id = 're1'",
                 (),
             )
             .await
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
-        let status: String = row.get(0).unwrap();
-        assert_eq!(status, "enriched");
+        let needs_reembed: i64 = row.get(0).unwrap();
+        assert_eq!(needs_reembed, 0, "needs_reembed should be cleared after re-embedding");
     }
 
     #[tokio::test]
