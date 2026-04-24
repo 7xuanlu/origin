@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.0](https://github.com/7xuanlu/origin/compare/v0.1.1...v0.2.0) (2026-04-24)
+
+
+### Features
+
+* vector search for concepts (hybrid vector + FTS + RRF) ([#8](https://github.com/7xuanlu/origin/issues/8)) ([88142f5](https://github.com/7xuanlu/origin/commit/88142f5cc5e3fd13bdb20364336806358d83c09f))
+
+
+### Bug Fixes
+
+* **app:** spawn origin-server sidecar by bare name ([7d74900](https://github.com/7xuanlu/origin/commit/7d749003241a4082e37ef8d4a30487add697b987))
+* auto-format on commit and auto-activate git hooks ([15b6144](https://github.com/7xuanlu/origin/commit/15b6144a80e62a278f10fca3cc3457c665e5db4b))
+* cache FastEmbed ONNX model in CI to prevent flaky test failures ([5eef87f](https://github.com/7xuanlu/origin/commit/5eef87f814a6da8fc50b23d56d0d251f61af9ad1))
+* cargo fmt on db.rs test formatting ([b6a6f32](https://github.com/7xuanlu/origin/commit/b6a6f32349aee720be5ede7f1719cf46c441a7bb))
+* filter superseded source memories in concept re-distill ([30c90e5](https://github.com/7xuanlu/origin/commit/30c90e58fbd3850f01ce9acf0580e1abeabf4624))
+* force next release-please version to 0.1.2 via release-as ([da8b62a](https://github.com/7xuanlu/origin/commit/da8b62a88a62c18d5da6668d67780cea573c8c74))
+* make feat: bump patch (not minor) while pre-1.0 ([52b147e](https://github.com/7xuanlu/origin/commit/52b147ec34d6b9cd7bf6d8cb284ffa2c5bc7e664))
+* **quality-gate:** require 20+ token chars for bearer credential match ([bd51015](https://github.com/7xuanlu/origin/commit/bd510155b49513b5a64d20e2726d3a97b680497b))
+* remove empty APPLE_ID/PASSWORD/TEAM_ID from tauri-action env ([3bc4a9a](https://github.com/7xuanlu/origin/commit/3bc4a9a76fcd7126138db617ece98925ec859d0d))
+* skip crates.io publish when CARGO_REGISTRY_TOKEN not set ([1bb6ccc](https://github.com/7xuanlu/origin/commit/1bb6cccb7c4d170d590d49d92096dd39b757bacd))
+
 ## [0.2.0](https://github.com/7xuanlu/origin/compare/v0.1.0...v0.2.0) (2026-04-23)
 
 
