@@ -1560,3 +1560,138 @@ async fn judge_e2e_context_locomo() {
     }
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
+
+// ---------------------------------------------------------------------------
+// API-based E2E: Haiku as answer model, Sonnet as judge
+// ---------------------------------------------------------------------------
+
+/// Generate E2E answers using Claude Haiku (API) instead of Qwen 4B (on-device).
+/// Requires ANTHROPIC_API_KEY env var.
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_locomo_api() {
+    use origin_lib::eval::token_efficiency::{run_e2e_context_eval, save_judgment_tuples};
+    use std::sync::Arc;
+
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            eprintln!("SKIP: ANTHROPIC_API_KEY not set");
+            return;
+        }
+    };
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::ApiProvider::new(
+            api_key,
+            "claude-haiku-4-5-20251001".to_string(),
+        ),
+    );
+
+    // 1 conversation, 20 questions for quick validation
+    let tuples = run_e2e_context_eval(&locomo_path, llm, 10, 1, 20)
+        .await
+        .expect("run_e2e_context_eval with API failed");
+
+    eprintln!("Generated {} judgment tuples (Haiku API)", tuples.len());
+    assert!(!tuples.is_empty());
+
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_locomo_api.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Judge saved API-generated tuples with Claude Sonnet (stronger judge).
+/// Run after generate_e2e_context_tuples_locomo_api.
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_locomo_api_sonnet() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_locomo_api.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo_api first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples with Sonnet...", tuples.len());
+
+    let results = judge_with_claude_model(&tuples, 3, "sonnet")
+        .await
+        .expect("judge failed");
+
+    let report = aggregate_judgments(&results, "sonnet");
+    eprintln!("\n=== E2E Context Eval: LoCoMo (Haiku answers, Sonnet judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | {}",
+        "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+    );
+    eprintln!("{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
+
+/// Re-judge the on-device (Qwen 4B) tuples with Sonnet instead of Haiku.
+/// Compares judge quality: does a stronger judge change the ranking?
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_locomo_sonnet() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_locomo.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples with Sonnet...", tuples.len());
+
+    let results = judge_with_claude_model(&tuples, 3, "sonnet")
+        .await
+        .expect("judge failed");
+
+    let report = aggregate_judgments(&results, "sonnet");
+    eprintln!("\n=== E2E Context Eval: LoCoMo (Qwen answers, Sonnet judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | {}",
+        "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+    );
+    eprintln!("{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}", "", "", "", "", "");
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}

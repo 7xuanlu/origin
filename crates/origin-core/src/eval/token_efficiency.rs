@@ -2371,6 +2371,15 @@ pub async fn judge_with_claude(
     tuples: &[JudgmentTuple],
     concurrency: usize,
 ) -> Result<Vec<JudgmentResult>, OriginError> {
+    judge_with_claude_model(tuples, concurrency, "haiku").await
+}
+
+/// Judge tuples with a specific Claude model (e.g. "haiku", "sonnet").
+pub async fn judge_with_claude_model(
+    tuples: &[JudgmentTuple],
+    concurrency: usize,
+    model: &str,
+) -> Result<Vec<JudgmentResult>, OriginError> {
     use tokio::sync::Semaphore;
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -2379,10 +2388,11 @@ pub async fn judge_with_claude(
     for tuple in tuples {
         let sem = semaphore.clone();
         let tuple = tuple.clone();
+        let model = model.to_string();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            judge_single_tuple(&tuple).await
+            judge_single_tuple_model(&tuple, &model).await
         });
         handles.push(handle);
     }
@@ -2405,6 +2415,11 @@ pub async fn judge_with_claude(
 /// prevents Claude Code's agentic tool-calling loop and gets a direct text/JSON response.
 /// OAuth auth from the user's existing login is used (no API key required).
 pub async fn judge_single_tuple(tuple: &JudgmentTuple) -> Result<JudgmentResult, OriginError> {
+    judge_single_tuple_model(tuple, "haiku").await
+}
+
+/// Judge a single tuple with a specific Claude model.
+pub async fn judge_single_tuple_model(tuple: &JudgmentTuple, model: &str) -> Result<JudgmentResult, OriginError> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
@@ -2420,13 +2435,11 @@ pub async fn judge_single_tuple(tuple: &JudgmentTuple) -> Result<JudgmentResult,
         (even if worded differently). Score 0 if the candidate answer is wrong, missing key \
         information, or irrelevant. Think step by step before scoring.";
 
-    // Pipe the prompt via stdin. Use --allowedTools "" to disable all tool calls so the
-    // model responds directly without entering an agentic loop (which would fail at max-turns).
     let mut child = Command::new("claude")
         .args([
             "-p",
             "--model",
-            "haiku",
+            model,
             "--output-format",
             "json",
             "--json-schema",
