@@ -73,6 +73,63 @@ cargo test -p origin --test eval_harness save_longmemeval_expanded_baseline -- -
 
 Frontend tests use Vitest + React Testing Library. Git hooks enforce tests on commit (fast) and push (full + 90% coverage gate). Run `bash scripts/setup-hooks.sh` to activate.
 
+## Releasing (release-please)
+
+Releases are automated via [release-please](https://github.com/googleapis/release-please). The workflow runs on every push to `main`.
+
+**How it works:**
+1. Every push to `main`, release-please scans new commits and maintains an open "release PR" that accumulates changes and updates `CHANGELOG.md`.
+2. When you're ready to ship, merge the release PR. That triggers a GitHub release (draft) + git tag.
+3. The `v*` tag push triggers `.github/workflows/release.yml`, which builds the Tauri app, bundles sidecars, uploads DMG + standalone binaries to the release, and publishes it (draft -> public).
+4. The release-please workflow also syncs `Cargo.toml` + `package.json` + `tauri.conf.json` versions on the release branch (release-please can't handle Cargo workspaces or JSON extra-files reliably with `simple` release type).
+
+**Commit messages control version bumps.** Pre-1.0, with `bump-patch-for-minor-pre-major: true`:
+
+| Commit prefix | Version bump | Example |
+|---|---|---|
+| `fix:` | patch | 0.1.1 -> 0.1.2 |
+| `feat:` | **patch** (not minor) | 0.1.1 -> 0.1.2 |
+| `BREAKING CHANGE` | minor | 0.1.1 -> 0.2.0 |
+| `chore:`, `ci:`, `docs:`, `refactor:`, `test:` | no bump | (hidden in changelog) |
+
+After 1.0, standard semver: `feat:` bumps minor, `BREAKING CHANGE` bumps major.
+
+**Config files:**
+- `release-please-config.json` -- release type, version bump behavior, extra files
+- `.release-please-manifest.json` -- current version (0.1.1)
+- `.github/workflows/release-please.yml` -- creates/updates release PRs, syncs version files
+- `.github/workflows/release.yml` -- builds app + uploads artifacts on `v*` tag push
+
+```bash
+# To release: just merge the open release-please PR on GitHub.
+# To check what version is pending:
+cat .release-please-manifest.json
+```
+
+### Release pipeline gotchas (learned the hard way)
+
+**Version files that must stay in sync:** `version.txt`, `.release-please-manifest.json`, `package.json`, `app/tauri.conf.json`, and all four `Cargo.toml` files (`# x-release-please-version` marker). The release-please workflow syncs these automatically on the release branch, but manual version changes must update all of them.
+
+**release-please determines "last version" from merged PR commit messages**, not tags or manifest. It scans for commits matching `chore(main): release X.Y.Z`. Deleting a tag or GitHub Release is NOT enough to reset the version. You must also ensure no commit message in the history matches that pattern, or use `release-as` to force-override.
+
+**Never delete a release tag without also cleaning up the commit history.** If you need to undo a release version, you must rewrite the commit message that release-please created (`git filter-branch --msg-filter`), delete the tag, delete the GitHub Release, and rename the merged PR title via API. Otherwise release-please will keep bumping from the old version.
+
+**Code signing on CI.** The release workflow uses `APPLE_SIGNING_IDENTITY` with `"-"` fallback (ad-hoc signing) when no Apple Developer secrets are configured. The `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` env vars must be completely absent (not empty strings) when not configured, or Tauri attempts notarization and fails with "Team ID must be at least 3 characters".
+
+**The `release.yml` workflow builds everything.** It handles: origin-server (cargo build), origin-mcp (cargo install from separate repo), cloudflared (download from Cloudflare), Tauri app (tauri-action), standalone binary uploads, and crates.io publishing. Do not duplicate build logic in release-please.yml.
+
+**Draft releases.** `release-please-config.json` has `"draft": true`, so release-please creates draft releases. The `release.yml` tauri-action step sets `releaseDraft: false` to publish the release after artifacts are uploaded. This prevents users from seeing empty releases during the build window.
+
+### Branch protection
+
+Main branch has: required CI ("Test & Lint") before merge, no force pushes, no deletion. `enforce_admins: false` so the repo owner can push directly for hotfixes. Force push requires temporarily enabling it via API (remember to re-disable after).
+
+### Git hooks
+
+Pre-commit: `cargo fmt --check` + `cargo check` + vitest (fast).
+Pre-push: `cargo clippy -- -D warnings` + full test suite + coverage gate.
+Run `bash scripts/setup-hooks.sh` to activate.
+
 ## Architecture
 
 Origin is a **Personal Agent Memory Layer** — a local-first memory server on macOS where AI agents write what they learn and humans curate. Daemon-centric: a headless HTTP server owns all business logic and data, and a thin Tauri desktop app (plus external MCP clients) talk to it via HTTP.
