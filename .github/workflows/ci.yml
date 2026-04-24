@@ -32,6 +32,12 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Cache FastEmbed ONNX model
+        uses: actions/cache@v4
+        with:
+          path: ~/.fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q
+
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
