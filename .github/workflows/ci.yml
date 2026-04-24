@@ -63,6 +63,13 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Clippy skips [[bin]] targets whose required-features aren't
+      # enabled. fixture_gen is gated on the `fixture-gen` feature (see
+      # app/Cargo.toml) to keep it out of release bundles; lint it in a
+      # dedicated step so regressions can't hide behind --all-targets.
+      - name: Run Clippy (fixture_gen)
+        run: cargo clippy -p origin --features fixture-gen --bin fixture_gen -- -D warnings
+
       - name: Run Rust tests
         run: cargo test -p origin-types -p origin-core -p origin-server
 
