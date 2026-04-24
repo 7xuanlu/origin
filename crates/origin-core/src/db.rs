@@ -5347,7 +5347,7 @@ impl MemoryDB {
                     pending_revision_val,
                     row.word_count,
                     entity_id_val,
-                    row.enrichment_status,
+                    "legacy", // column retired; status derived from enrichment_steps
                     quality_val,
                     is_recap_val,
                     row.supersede_mode,
@@ -7223,7 +7223,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -7325,7 +7330,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -7411,7 +7421,12 @@ impl MemoryDB {
                 MAX(entity_id) as entity_id,
                 MAX(quality) as quality,
                 MAX(is_recap) as is_recap,
-                MAX(enrichment_status) as enrichment_status,
+                (SELECT CASE
+                    WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                    WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                    WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                    ELSE 'enrichment_partial'
+                END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                 MAX(supersede_mode) as supersede_mode,
                 MAX(structured_fields) as structured_fields,
                 MAX(retrieval_cue) as retrieval_cue,
@@ -7510,7 +7525,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -7608,7 +7628,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -9031,7 +9056,7 @@ impl MemoryDB {
         // Enrichment pending count
         let mut ep_rows = conn
             .query(
-                "SELECT COUNT(DISTINCT source_id) FROM memories WHERE source = 'memory' AND enrichment_status = 'raw'",
+                "SELECT COUNT(DISTINCT source_id) FROM memories WHERE source = 'memory' AND source_id NOT IN (SELECT DISTINCT source_id FROM enrichment_steps)",
                 libsql::params![],
             )
             .await
@@ -10331,7 +10356,12 @@ impl MemoryDB {
                     c.source_agent, c.confidence, c.confirmed, c.stability,
                     c.pinned, c.supersedes, c.last_modified,
                     c.entity_id, c.quality, COALESCE(c.is_recap, 0) as is_recap,
-                    c.enrichment_status, c.supersede_mode, c.structured_fields,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = c.source_id) AS enrichment_status, c.supersede_mode, c.structured_fields,
                     c.retrieval_cue, c.access_count, c.source_text
              FROM memories c
              WHERE c.source = 'memory'
@@ -12529,7 +12559,14 @@ impl MemoryDB {
             let mut rows = conn
                 .query(
                     "SELECT source_id, title, summary, content, \
-                            created_at, last_modified, enrichment_status, entity_id \
+                            created_at, last_modified, \
+                            (SELECT CASE \
+                                WHEN COUNT(es.source_id) = 0 THEN 'raw' \
+                                WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched' \
+                                WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed' \
+                                ELSE 'enrichment_partial' \
+                            END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status, \
+                            entity_id \
                      FROM memories \
                      WHERE source = 'memory' AND chunk_index = 0 \
                        AND (supersede_mode IS NULL OR supersede_mode != 'archive') \
@@ -12876,9 +12913,9 @@ impl MemoryDB {
     pub async fn pipeline_status(&self) -> Result<serde_json::Value, OriginError> {
         let conn = self.conn.lock().await;
 
-        // Enrichment status breakdown
+        // Enrichment status breakdown — derived from enrichment_steps table
         let mut rows = conn.query(
-            "SELECT enrichment_status, COUNT(*) FROM memories WHERE source = 'memory' GROUP BY enrichment_status",
+            "SELECT status, COUNT(*) FROM enrichment_steps GROUP BY status",
             (),
         ).await.map_err(|e| OriginError::VectorDb(format!("pipeline_status enrichment: {e}")))?;
         let mut enrichment = serde_json::Map::new();
@@ -12886,6 +12923,17 @@ impl MemoryDB {
             let status: String = row.get(0).unwrap_or_default();
             let count: i64 = row.get(1).unwrap_or(0);
             enrichment.insert(status, serde_json::Value::Number(count.into()));
+        }
+        // Count memories with no enrichment steps at all (raw)
+        let mut raw_rows = conn.query(
+            "SELECT COUNT(DISTINCT source_id) FROM memories WHERE source = 'memory' AND source_id NOT IN (SELECT DISTINCT source_id FROM enrichment_steps)",
+            (),
+        ).await.map_err(|e| OriginError::VectorDb(format!("pipeline_status raw count: {e}")))?;
+        if let Ok(Some(row)) = raw_rows.next().await {
+            let raw_count: i64 = row.get(0).unwrap_or(0);
+            if raw_count > 0 {
+                enrichment.insert("raw".to_string(), serde_json::Value::Number(raw_count.into()));
+            }
         }
 
         // Entity linking
@@ -14365,7 +14413,7 @@ impl MemoryDB {
                     saved.stability,
                     new_word_count,
                     saved.entity_id,
-                    saved.enrichment_status,
+                    "legacy", // column retired; status derived from enrichment_steps
                     saved.quality,
                     saved.is_recap,
                     saved.structured_fields,
@@ -21409,7 +21457,7 @@ pub(crate) mod tests {
 
         // created_at = 100_000 s (well before since_s = 400_000 s).
         // last_modified = 500_000 s (after since, and 400_000 s after created_at → >> 60 s grace).
-        // enrichment_status = 'enriched'.
+        // enrichment_status derived as 'enriched' from enrichment_steps.
         // since_ms = 400_000_000 ms  →  since_s = 400_000 s.
         insert_memory_at(
             &db,
@@ -21421,6 +21469,9 @@ pub(crate) mod tests {
             "enriched",
         )
         .await;
+        // Record enrichment steps so the derived status is 'enriched'
+        db.record_enrichment_step("mem_ref", "dedup", "ok", None).await.unwrap();
+        db.record_enrichment_step("mem_ref", "entity_link", "ok", None).await.unwrap();
 
         let items = db
             .list_recent_memories(10, Some(400_000_000))
@@ -23233,5 +23284,29 @@ pub(crate) mod tests {
         let extract = steps.iter().find(|s| s.step == "entity_extract").unwrap();
         assert_eq!(extract.status, "failed");
         assert_eq!(extract.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_memories_derives_enrichment_status_from_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_list_enrich", "Rust ownership model", "fact", "tech", "test");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Before any steps are recorded, status should be "raw"
+        let items = db.list_memories(None, None, None, None, 10).await.unwrap();
+        let item = items.iter().find(|i| i.source_id == "mem_list_enrich").unwrap();
+        assert_eq!(item.enrichment_status, "raw", "no steps => raw");
+
+        // Record one ok step and one failed step => partial
+        db.record_enrichment_step("mem_list_enrich", "dedup", "ok", None).await.unwrap();
+        db.record_enrichment_step("mem_list_enrich", "entity_link", "failed", Some("no entities")).await.unwrap();
+
+        let items = db.list_memories(None, None, None, None, 10).await.unwrap();
+        let item = items.iter().find(|i| i.source_id == "mem_list_enrich").unwrap();
+        assert_eq!(item.enrichment_status, "enrichment_partial", "mix of ok and failed => partial");
+
+        // Also verify get_memory_detail derives from steps
+        let detail = db.get_memory_detail("mem_list_enrich").await.unwrap().unwrap();
+        assert_eq!(detail.enrichment_status, "enrichment_partial", "detail also derives from steps");
     }
 }
