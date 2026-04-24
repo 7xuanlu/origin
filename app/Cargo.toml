@@ -12,6 +12,17 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [features]
 default = []
 closed-core-eval = []
+# Build the fixture_gen dev tool. Off by default so `pnpm tauri build`
+# doesn't bundle it into Origin.app/Contents/MacOS (Tauri copies every
+# crate binary). Enable with `--features fixture-gen` when running it.
+fixture-gen = []
+
+# Dev-only binary — gated behind `fixture-gen` so release builds skip
+# it and cargo produces no artifact for Tauri to bundle.
+[[bin]]
+name = "fixture_gen"
+path = "src/bin/fixture_gen.rs"
+required-features = ["fixture-gen"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
