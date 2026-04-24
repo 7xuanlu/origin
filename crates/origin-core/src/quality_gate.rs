@@ -77,8 +77,13 @@ static RE_GITHUB_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh[ps]_[A-Za-z0-9]{36,}").unwrap());
 static RE_GITLAB_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"glpat-[A-Za-z0-9\-]{20,}").unwrap());
+// Minimum 20 chars of token-alphabet after "Bearer " — stops false
+// positives on documentation prose like "no bearer field" or "bearer
+// token is required" while still catching real JWTs (~100+ chars) and
+// opaque tokens. Matches the length floor used by the other credential
+// regexes in this file.
 static RE_BEARER_TOKEN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]{20,}=*").unwrap());
 static RE_API_KEY_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)(?:api_key|apikey|api-key|secret_key|password)\s*[=:]\s*["']?[A-Za-z0-9\-_.]{16,}"#,
@@ -660,6 +665,27 @@ mod tests {
             &r.reason,
             Some(RejectionReason::CredentialLeak(k)) if k == "github_token"
         ));
+    }
+
+    #[test]
+    fn test_admits_bearer_in_prose_without_token() {
+        // Regression: documentation and discussion that mentions "bearer"
+        // (e.g. "no bearer field", "bearer token is required") must not
+        // be flagged as a credential leak when no actual token follows.
+        let g = gate();
+        let cases = [
+            "Claude.ai MCP connectors only accept OAuth, no bearer field.",
+            "The bearer token header is required but we omit it here for brevity.",
+            "This server uses Bearer auth for remote access.",
+        ];
+        for text in cases {
+            let r = g.check_content(text);
+            assert!(
+                !matches!(&r.reason, Some(RejectionReason::CredentialLeak(_))),
+                "should not flag bearer-in-prose as credential leak: {text:?} -> {:?}",
+                r.reason
+            );
+        }
     }
 
     #[test]
