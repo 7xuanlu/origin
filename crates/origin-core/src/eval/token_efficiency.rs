@@ -3580,6 +3580,10 @@ pub async fn run_longmemeval_pipeline_eval(
     let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
     let tuning = DistillationConfig::default();
 
+    // Pre-create shared embedder
+    eprintln!("[pipeline-lme] loading shared embedder...");
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     let mut per_conversation = Vec::new();
     let mut total_queries = 0usize;
     let mut total_observations = 0usize;
@@ -3597,14 +3601,16 @@ pub async fn run_longmemeval_pipeline_eval(
         let obs_count = memories.len();
         total_observations += obs_count;
 
-        eprintln!(
-            "[pipeline-lme] Q {}/{} ({}): {} memories, type={}",
-            q_idx + 1,
-            sample_count,
-            sample.question_id,
-            obs_count,
-            sample.question_type,
-        );
+        if q_idx % 25 == 0 {
+            eprintln!(
+                "[pipeline-lme] Q {}/{} ({}): {} memories, type={}",
+                q_idx + 1,
+                sample_count,
+                sample.question_id,
+                obs_count,
+                sample.question_type,
+            );
+        }
 
         // Build evidence: turns with has_answer=true
         let evidence_session_set: HashSet<&str> = sample
@@ -3639,10 +3645,12 @@ pub async fn run_longmemeval_pipeline_eval(
         let evidence_sets = vec![evidence_ids];
         total_queries += 1;
 
-        // Create DB, seed
+        // Create DB with shared embedder
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir lme: {e}")))?;
-        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(), Arc::new(NoopEmitter), shared_embedder.clone(),
+        ).await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
@@ -4380,6 +4388,10 @@ pub async fn run_e2e_context_eval_longmemeval(
     let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
     let tuning = DistillationConfig::default();
 
+    // Pre-create shared embedder
+    eprintln!("[e2e_context_lme] loading shared embedder...");
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     let mut all_tuples: Vec<JudgmentTuple> = Vec::new();
     let sample_limit = max_questions.min(samples.len());
 
@@ -4396,10 +4408,12 @@ pub async fn run_e2e_context_eval_longmemeval(
             );
         }
 
-        // Seed DB
+        // Seed DB with shared embedder
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir e2e_lme: {e}")))?;
-        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(), Arc::new(NoopEmitter), shared_embedder.clone(),
+        ).await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
@@ -4451,6 +4465,193 @@ pub async fn run_e2e_context_eval_longmemeval(
     );
 
     Ok(all_tuples)
+}
+
+// ===== Context Path Eval: LongMemEval =====
+
+/// Same as run_context_path_eval but for LongMemEval dataset.
+/// Each question has its own memory set. Evidence = memories from answer_session_ids.
+pub async fn run_context_path_eval_longmemeval(
+    longmemeval_path: &Path,
+    llm: Arc<dyn crate::llm_provider::LlmProvider>,
+    search_limit: usize,
+    max_questions: usize,
+) -> Result<ContextPathReport, OriginError> {
+    use crate::eval::longmemeval::{category_name, extract_memories, load_longmemeval};
+    use crate::prompts::PromptRegistry;
+    use crate::tuning::DistillationConfig;
+
+    let samples = load_longmemeval(longmemeval_path)?;
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let tuning = DistillationConfig::default();
+
+    // Pre-create shared embedder — loads 140MB ONNX model once instead of per-question
+    eprintln!("[context_path_lme] loading shared embedder...");
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    eprintln!("[context_path_lme] embedder ready, processing {} questions", samples.len().min(max_questions));
+
+    let mut all_results: Vec<ContextPathResult> = Vec::new();
+    let sample_limit = max_questions.min(samples.len());
+
+    for (q_idx, sample) in samples.iter().take(max_questions).enumerate() {
+        let memories = extract_memories(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        if q_idx % 25 == 0 {
+            eprintln!(
+                "[context_path_lme] Q {}/{} ({}): {} memories{}",
+                q_idx + 1, sample_limit, sample.question_id, memories.len(),
+                if memories.len() < 15 { " (skip distill)" } else { "" },
+            );
+        }
+
+        // Build evidence mapping: memories from answer sessions are evidence
+        let answer_session_set: HashSet<String> = sample
+            .answer_session_ids
+            .iter()
+            .cloned()
+            .collect();
+
+        let evidence_source_ids: HashSet<String> = memories
+            .iter()
+            .filter(|m| answer_session_set.contains(&m.session_id))
+            .map(|m| format!("lme_{}_{}_t{}", sample.question_id, m.session_idx, m.turn_idx))
+            .collect();
+
+        if evidence_source_ids.is_empty() {
+            continue;
+        }
+
+        // Seed DB with shared embedder (skip 10-30s model reload per question)
+        let tmp = tempfile::tempdir()
+            .map_err(|e| OriginError::Generic(format!("tempdir ctx_lme: {e}")))?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(), Arc::new(NoopEmitter), shared_embedder.clone(),
+        ).await?;
+
+        let docs: Vec<RawDocument> = memories
+            .iter()
+            .map(|mem| RawDocument {
+                content: mem.content.clone(),
+                source_id: format!("lme_{}_{}_t{}", sample.question_id, mem.session_idx, mem.turn_idx),
+                source: "memory".to_string(),
+                title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                memory_type: Some(
+                    if sample.question_type == "single-session-preference" { "preference" } else { "fact" }.to_string(),
+                ),
+                domain: Some("conversation".to_string()),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            })
+            .collect();
+        db.upsert_documents(docs).await?;
+
+        // Only distill if enough memories to form meaningful clusters (min 15).
+        // LME has avg 11 memories per question — most won't produce concepts.
+        // Each distillation call takes ~30s (LLM inference), so skipping saves hours.
+        if memories.len() >= 15 {
+            let _concepts = crate::refinery::distill_concepts(
+                &db, Some(&llm), &prompts, &tuning, None,
+            ).await?;
+        }
+
+        // --- Recall path ---
+        let recall_results = db
+            .search_memory(&sample.question, search_limit, None, Some("conversation"), None, None, None, None)
+            .await?;
+        let recall_ids: HashSet<String> = recall_results.iter()
+            .map(|r| r.source_id.clone()).collect();
+        let recall_tokens = count_results_tokens(&recall_results);
+        let recall_found = evidence_source_ids.intersection(&recall_ids).count();
+
+        // --- Context path ---
+        let mut context_ids = recall_ids.clone();
+        let mut context_tokens = recall_tokens;
+
+        let concept_results = db.search_concepts(&sample.question, 3).await.unwrap_or_default();
+        for concept in &concept_results {
+            context_tokens += count_tokens(&concept.content);
+            let sources = db.get_concept_sources(&concept.id).await.unwrap_or_default();
+            for src in &sources {
+                context_ids.insert(src.memory_source_id.clone());
+            }
+            for sid in &concept.source_memory_ids {
+                context_ids.insert(sid.clone());
+            }
+        }
+
+        let context_found = evidence_source_ids.intersection(&context_ids).count();
+        let recovered: Vec<String> = evidence_source_ids.iter()
+            .filter(|id| context_ids.contains(*id) && !recall_ids.contains(*id))
+            .cloned()
+            .collect();
+
+        let category = category_name(&sample.question_type);
+
+        all_results.push(ContextPathResult {
+            question: sample.question.clone(),
+            category: category.to_string(),
+            recall_found,
+            context_found,
+            total_evidence: evidence_source_ids.len(),
+            recall_coverage: recall_found as f64 / evidence_source_ids.len() as f64,
+            context_coverage: context_found as f64 / evidence_source_ids.len() as f64,
+            recovered_ids: recovered,
+            recall_tokens,
+            context_tokens,
+        });
+
+        if q_idx % 50 == 49 {
+            let improved = all_results.iter().filter(|r| r.context_found > r.recall_found).count();
+            eprintln!(
+                "  [progress] {}/{} questions, {} improved",
+                q_idx + 1, sample_limit, improved,
+            );
+        }
+    }
+
+    // Aggregate
+    let n = all_results.len().max(1) as f64;
+    let mean_recall_cov = all_results.iter().map(|r| r.recall_coverage).sum::<f64>() / n;
+    let mean_context_cov = all_results.iter().map(|r| r.context_coverage).sum::<f64>() / n;
+    let questions_improved = all_results.iter().filter(|r| r.context_found > r.recall_found).count();
+    let total_recovered: usize = all_results.iter().map(|r| r.recovered_ids.len()).sum();
+    let mean_recall_tok = all_results.iter().map(|r| r.recall_tokens as f64).sum::<f64>() / n;
+    let mean_context_tok = all_results.iter().map(|r| r.context_tokens as f64).sum::<f64>() / n;
+
+    // Per-category
+    let mut cat_map: HashMap<String, Vec<&ContextPathResult>> = HashMap::new();
+    for r in &all_results {
+        cat_map.entry(r.category.clone()).or_default().push(r);
+    }
+    let mut per_category: Vec<ContextPathCategoryResult> = cat_map.iter().map(|(cat, results)| {
+        let cn = results.len().max(1) as f64;
+        let rc = results.iter().map(|r| r.recall_coverage).sum::<f64>() / cn;
+        let cc = results.iter().map(|r| r.context_coverage).sum::<f64>() / cn;
+        ContextPathCategoryResult {
+            category: cat.clone(),
+            count: results.len(),
+            mean_recall_coverage: rc,
+            mean_context_coverage: cc,
+            delta: cc - rc,
+        }
+    }).collect();
+    per_category.sort_by(|a, b| b.delta.partial_cmp(&a.delta).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(ContextPathReport {
+        benchmark: "LongMemEval".to_string(),
+        total_questions: all_results.len(),
+        mean_recall_coverage: mean_recall_cov,
+        mean_context_coverage: mean_context_cov,
+        coverage_delta: mean_context_cov - mean_recall_cov,
+        questions_improved,
+        total_evidence_recovered: total_recovered,
+        mean_recall_tokens: mean_recall_tok,
+        mean_context_tokens: mean_context_tok,
+        per_category,
+    })
 }
 
 #[cfg(test)]

@@ -1415,6 +1415,36 @@ async fn benchmark_context_path() {
     assert!(report.total_questions > 0);
 }
 
+/// Context path eval for LongMemEval: recall vs context coverage.
+/// Requires Metal GPU. Run with sandbox disabled.
+#[tokio::test]
+#[ignore]
+async fn benchmark_context_path_longmemeval() {
+    use origin_lib::eval::token_efficiency::run_context_path_eval_longmemeval;
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    // Full benchmark: all 500 questions
+    let report = run_context_path_eval_longmemeval(&path, llm, 10, 500)
+        .await
+        .expect("run_context_path_eval_longmemeval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    assert!(report.total_questions > 0);
+}
+
 // ---------------------------------------------------------------------------
 // E2E answer quality: flat vs structured context with LLM-as-judge
 // ---------------------------------------------------------------------------

@@ -1061,6 +1061,87 @@ impl MemoryDB {
         Ok(instance)
     }
 
+    /// Fast constructor for eval loops: reuses a pre-loaded embedder.
+    /// Creates a fresh ephemeral DB with schema + migrations but skips the 10-30s
+    /// embedding model load. Use `create_shared_embedder()` to create the embedder once.
+    pub async fn new_with_shared_embedder(
+        db_path: &Path,
+        emitter: Arc<dyn EventEmitter>,
+        embedder: Arc<std::sync::Mutex<TextEmbedding>>,
+    ) -> Result<Self, OriginError> {
+        std::fs::create_dir_all(db_path)?;
+        let db_file = db_path.join("origin_memory.db");
+
+        let db = libsql::Builder::new_local(db_file.to_str().unwrap_or("origin_memory.db"))
+            .build()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("libsql open: {}", e)))?;
+
+        let conn = db
+            .connect()
+            .map_err(|e| OriginError::VectorDb(format!("libsql connect: {}", e)))?;
+
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("pragma: {}", e)))?;
+
+        conn.execute_batch(SCHEMA)
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("schema: {}", e)))?;
+
+        if let Err(e) = conn.execute_batch(FTS_SCHEMA).await {
+            log::warn!("[memory_db] FTS5 creation failed: {}", e);
+        }
+        if let Err(e) = conn.execute_batch(FTS_TRIGGERS).await {
+            log::warn!("[memory_db] FTS triggers failed: {}", e);
+        }
+
+        // Vector indexes for fresh DB
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS memories_vec_idx ON memories (
+                libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
+            )", (),
+        ).await;
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS entities_vec_idx ON entities (
+                libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
+            )", (),
+        ).await;
+
+        let instance = Self {
+            _db: db,
+            conn: tokio::sync::Mutex::new(conn),
+            embedder,
+            chunker: ChunkingEngine::new(),
+            embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+        };
+
+        instance.run_migrations(emitter.as_ref()).await?;
+        instance.bootstrap_profile().await?;
+
+        Ok(instance)
+    }
+
+    /// Create a shared embedder that can be passed to `new_with_shared_embedder`.
+    /// Loads the BGE-Base-EN-v1.5-Q model once (10-30s), then reuse across DB instances.
+    pub async fn create_shared_embedder() -> Result<Arc<std::sync::Mutex<TextEmbedding>>, OriginError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("embedder-init-shared".into())
+            .spawn(move || {
+                let opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
+                    .with_show_download_progress(true);
+                let result = TextEmbedding::try_new(opts);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| OriginError::Embedding(format!("spawn embedder: {}", e)))?;
+        let embedder = rx
+            .await
+            .map_err(|_| OriginError::Embedding("embedder thread panicked".into()))?
+            .map_err(|e| OriginError::Embedding(format!("init embedder: {}", e)))?;
+        Ok(Arc::new(std::sync::Mutex::new(embedder)))
+    }
+
     /// Lightweight constructor for eval ablation tests (model × prefix 2x2).
     /// Creates a fresh ephemeral DB with the given embedding model and dimension.
     /// Skips migrations (fresh DB only) and profile bootstrap.
