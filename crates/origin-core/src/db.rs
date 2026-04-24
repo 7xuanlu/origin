@@ -13087,7 +13087,10 @@ impl MemoryDB {
              WHERE c.status = 'active'",
             concept_select,
         );
-        match conn.query(&vec_sql, libsql::params![vec_str, fetch_limit]).await {
+        match conn
+            .query(&vec_sql, libsql::params![vec_str, fetch_limit])
+            .await
+        {
             Ok(mut rows) => {
                 while let Ok(Some(row)) = rows.next().await {
                     match Self::row_to_concept(&row) {
@@ -13096,7 +13099,9 @@ impl MemoryDB {
                             let id = concept.id.clone();
                             vector_results.push((id, distance, concept));
                         }
-                        Err(e) => log::warn!("[search_concepts] skipping malformed vector row: {e}"),
+                        Err(e) => {
+                            log::warn!("[search_concepts] skipping malformed vector row: {e}")
+                        }
                     }
                 }
             }
@@ -13117,7 +13122,10 @@ impl MemoryDB {
         );
         let fts_queries = vec![query.to_string(), Self::fts_or_query(query)];
         for fts_q in &fts_queries {
-            match conn.query(&fts_sql, libsql::params![fts_q.clone(), fetch_limit]).await {
+            match conn
+                .query(&fts_sql, libsql::params![fts_q.clone(), fetch_limit])
+                .await
+            {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
                         if let Ok(concept) = Self::row_to_concept(&row) {
