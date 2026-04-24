@@ -61,17 +61,54 @@ use tokio::sync::RwLock;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "warn,origin_lib::trigger=info,origin_lib::router=info,origin_lib::sensor=info",
-                )
-            }),
+    // Log sinks: stderr (for terminal launches, `pnpm tauri dev`) AND a
+    // daily-rotating file at ~/Library/Logs/com.origin.desktop/origin.log.
+    // GUI launches send stderr to /dev/null, so without the file sink any
+    // setup() error — e.g. a sidecar spawn ENOENT — is silent. That is
+    // exactly how the origin-server spawn regression hid for ~15 minutes
+    // of live debugging before the culprit was found. Keep both sinks.
+    use tracing_subscriber::prelude::*;
+
+    let log_dir = dirs::home_dir()
+        .map(|h| h.join("Library/Logs/com.origin.desktop"))
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "origin.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    // The guard flushes the background worker on drop. The app lives for
+    // the full process, so leaking it is correct — we never want the
+    // writer to stop flushing before exit.
+    std::mem::forget(guard);
+
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "warn,origin_lib::trigger=info,origin_lib::router=info,origin_lib::sensor=info",
+            )
+        })
+    };
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(true)
+                .with_writer(std::io::stderr)
+                .with_filter(env_filter()),
         )
-        .with_target(true)
-        .with_ansi(true)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(file_writer)
+                .with_filter(env_filter()),
+        )
         .init();
+
+    tracing::info!(
+        log_file = ?log_dir.join("origin.log"),
+        "origin app starting; logs tee'd to file"
+    );
 
     let app_state = AppState::new();
 

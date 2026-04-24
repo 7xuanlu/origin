@@ -69,6 +69,8 @@ regex = "1"
 log = "0.4"
 env_logger = "0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracing-log"] }
+tracing-appender = "0.2"
+tracing = "0.1"
 dirs = "6"
 async-trait = "0.1"
 futures = "0.3"
