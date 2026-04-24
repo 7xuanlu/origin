@@ -239,8 +239,15 @@ fn check_credentials(text: &str) -> Option<String> {
     if RE_GITLAB_TOKEN.is_match(text) {
         return Some("gitlab_token".to_string());
     }
-    if RE_BEARER_TOKEN.is_match(text) {
-        return Some("bearer_token".to_string());
+    if let Some(m) = RE_BEARER_TOKEN.find(text) {
+        // Require at least one non-alphabetic char in the token portion.
+        // The length floor alone still matches 20+ char all-alpha English
+        // words like "authenticationrequired". Real tokens (JWTs, opaque
+        // base64, hex) always contain digits, dashes, dots, or slashes.
+        let token = m.as_str().split_whitespace().nth(1).unwrap_or("");
+        if token.chars().any(|c| !c.is_ascii_alphabetic()) {
+            return Some("bearer_token".to_string());
+        }
     }
     if RE_API_KEY_ASSIGN.is_match(text) {
         return Some("api_key_assignment".to_string());
@@ -670,13 +677,18 @@ mod tests {
     #[test]
     fn test_admits_bearer_in_prose_without_token() {
         // Regression: documentation and discussion that mentions "bearer"
-        // (e.g. "no bearer field", "bearer token is required") must not
-        // be flagged as a credential leak when no actual token follows.
+        // (including long all-alpha follow-on words) must not be flagged
+        // as a credential leak when no actual token-shaped value follows.
         let g = gate();
         let cases = [
             "Claude.ai MCP connectors only accept OAuth, no bearer field.",
             "The bearer token header is required but we omit it here for brevity.",
             "This server uses Bearer auth for remote access.",
+            // 29-char all-alpha word after Bearer — defeats the bare length
+            // floor that the first version of this fix shipped with.
+            "Bearer authorizationheaderisrequired when hitting remote endpoints.",
+            // 20 chars, all letters, camelCase — still prose.
+            "Bearer HeaderAuthIsRequired is what the docs call it.",
         ];
         for text in cases {
             let r = g.check_content(text);
@@ -686,6 +698,20 @@ mod tests {
                 r.reason
             );
         }
+    }
+
+    #[test]
+    fn test_rejects_bearer_token_with_single_digit() {
+        // Boundary: a 20-char token that contains even one non-alpha char
+        // (here a digit) MUST still trip the credential detector. This
+        // proves the non-alpha post-check hasn't turned the detector off.
+        let g = gate();
+        let r = g.check_content("Authorization: Bearer abcdefghijklmnopqrs9 for the API call");
+        assert!(
+            matches!(&r.reason, Some(RejectionReason::CredentialLeak(k)) if k == "bearer_token"),
+            "20-char token with a digit must still be detected; got: {:?}",
+            r.reason
+        );
     }
 
     #[test]
