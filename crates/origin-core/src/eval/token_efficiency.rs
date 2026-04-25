@@ -385,6 +385,9 @@ pub async fn run_quality_cost_eval(
 
     let confidence_cfg = ConfidenceConfig::default();
 
+    // Pre-create shared embedder so each case reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for case in &cases {
         if case.empty_set {
             continue; // Skip empty-set cases — no relevant docs to measure quality against.
@@ -403,7 +406,12 @@ pub async fn run_quality_cost_eval(
         // Seed an ephemeral DB
         let case_tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir for eval case: {}", e)))?;
-        let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            case_tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let all_docs: Vec<RawDocument> = case
             .seeds
@@ -687,9 +695,15 @@ pub async fn run_multi_turn_eval(
 
     // Seed an ephemeral DB with the best case's memories.
     let confidence_cfg = crate::tuning::ConfidenceConfig::default();
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
     let case_tmp = tempfile::tempdir()
         .map_err(|e| OriginError::Generic(format!("tempdir for multi-turn eval: {}", e)))?;
-    let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+    let db = MemoryDB::new_with_shared_embedder(
+        case_tmp.path(),
+        Arc::new(NoopEmitter),
+        shared_embedder.clone(),
+    )
+    .await?;
 
     let all_docs: Vec<RawDocument> = best_case
         .seeds
@@ -782,6 +796,9 @@ pub async fn run_native_memory_augmentation(
     let mut origin_token_samples: Vec<usize> = Vec::new();
     let mut full_replay_samples: Vec<usize> = Vec::new();
 
+    // Pre-create shared embedder so each case reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for case in &cases {
         if case.empty_set || case.seeds.is_empty() {
             continue;
@@ -789,7 +806,12 @@ pub async fn run_native_memory_augmentation(
 
         let case_tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir for augmentation eval: {}", e)))?;
-        let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            case_tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let all_docs: Vec<RawDocument> = case
             .seeds
@@ -1015,6 +1037,9 @@ pub async fn run_pipeline_token_eval_simulated(
     let cases = load_fixtures(fixture_dir)?;
     let confidence_cfg = ConfidenceConfig::default();
 
+    // Pre-create shared embedder so each stage/case reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     // Per-stage accumulators: (total_corpus_tokens, total_memory_count, total_search_result_tokens, total_ndcg)
     let mut raw_corpus: Vec<usize> = Vec::new();
     let mut raw_counts: Vec<usize> = Vec::new();
@@ -1061,7 +1086,12 @@ pub async fn run_pipeline_token_eval_simulated(
 
             let tmp = tempfile::tempdir()
                 .map_err(|e| OriginError::Generic(format!("tempdir pipeline raw: {e}")))?;
-            let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+            let db = MemoryDB::new_with_shared_embedder(
+                tmp.path(),
+                Arc::new(NoopEmitter),
+                shared_embedder.clone(),
+            )
+            .await?;
             db.upsert_documents(all_docs.clone()).await?;
 
             let results = db
@@ -1145,7 +1175,12 @@ pub async fn run_pipeline_token_eval_simulated(
 
             let tmp = tempfile::tempdir()
                 .map_err(|e| OriginError::Generic(format!("tempdir pipeline distilled: {e}")))?;
-            let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+            let db = MemoryDB::new_with_shared_embedder(
+                tmp.path(),
+                Arc::new(NoopEmitter),
+                shared_embedder.clone(),
+            )
+            .await?;
             db.upsert_documents(distilled_docs).await?;
 
             let results = db
@@ -1231,7 +1266,12 @@ pub async fn run_pipeline_token_eval_simulated(
 
             let tmp = tempfile::tempdir()
                 .map_err(|e| OriginError::Generic(format!("tempdir pipeline concept: {e}")))?;
-            let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+            let db = MemoryDB::new_with_shared_embedder(
+                tmp.path(),
+                Arc::new(NoopEmitter),
+                shared_embedder.clone(),
+            )
+            .await?;
             db.upsert_documents(concept_docs).await?;
 
             let results = db
@@ -1457,6 +1497,9 @@ pub async fn run_quality_at_scale_eval(
     let confidence_cfg = ConfidenceConfig::default();
     let mut points: Vec<QualityAtScalePoint> = Vec::with_capacity(sizes.len());
 
+    // Pre-create shared embedder so each size/case iteration reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for &size in sizes {
         let mut origin_tokens_sum: f64 = 0.0;
         let mut origin_ndcg_sum: f64 = 0.0;
@@ -1483,7 +1526,12 @@ pub async fn run_quality_at_scale_eval(
             // Seed ephemeral DB
             let case_tmp = tempfile::tempdir()
                 .map_err(|e| OriginError::Generic(format!("tmpdir quality_at_scale: {e}")))?;
-            let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+            let db = MemoryDB::new_with_shared_embedder(
+                case_tmp.path(),
+                Arc::new(NoopEmitter),
+                shared_embedder.clone(),
+            )
+            .await?;
 
             let docs: Vec<RawDocument> = subset
                 .iter()
@@ -1601,6 +1649,9 @@ pub async fn run_scaling_eval(
     let confidence_cfg = ConfidenceConfig::default();
     let mut points = Vec::new();
 
+    // Pre-create shared embedder so each size/case iteration reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for &size in corpus_sizes {
         let mut origin_tokens_sum: f64 = 0.0;
         let mut replay_tokens_sum: f64 = 0.0;
@@ -1626,7 +1677,12 @@ pub async fn run_scaling_eval(
             // Seed ephemeral DB with subset
             let case_tmp =
                 tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tmpdir: {e}")))?;
-            let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+            let db = MemoryDB::new_with_shared_embedder(
+                case_tmp.path(),
+                Arc::new(NoopEmitter),
+                shared_embedder.clone(),
+            )
+            .await?;
 
             let docs: Vec<RawDocument> = subset
                 .iter()
@@ -1795,6 +1851,9 @@ pub async fn run_memory_layer_comparison(
 ) -> Result<MemoryLayerComparisonReport, OriginError> {
     let cases = load_fixtures(fixture_dir)?;
     let confidence_cfg = ConfidenceConfig::default();
+
+    // Pre-create shared embedder so each case reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
 
     // Accumulators: tokens, ndcg, accessible fraction per approach
     let mut tokens_acc: HashMap<MemoryLayerApproach, Vec<f64>> = HashMap::new();
@@ -1967,7 +2026,12 @@ pub async fn run_memory_layer_comparison(
         {
             let case_tmp = tempfile::tempdir()
                 .map_err(|e| OriginError::Generic(format!("tempdir memory_layer: {}", e)))?;
-            let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+            let db = MemoryDB::new_with_shared_embedder(
+                case_tmp.path(),
+                Arc::new(NoopEmitter),
+                shared_embedder.clone(),
+            )
+            .await?;
             let all_docs: Vec<RawDocument> = all_seeds
                 .iter()
                 .map(|seed| crate::eval::runner::seed_to_doc(seed, &confidence_cfg))
@@ -2218,6 +2282,9 @@ pub async fn run_e2e_answer_eval(
     let cases = load_fixtures(fixture_dir)?;
     let confidence_cfg = ConfidenceConfig::default();
 
+    // Pre-create shared embedder so each case reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     // Per-approach accumulators: answer_score, context_tokens, answer_tokens
     let approach_keys = ["flat_markdown", "origin", "no_context"];
     let mut scores: HashMap<&str, Vec<f64>> = HashMap::new();
@@ -2270,7 +2337,12 @@ pub async fn run_e2e_answer_eval(
         let origin_context = {
             let case_tmp = tempfile::tempdir()
                 .map_err(|e| OriginError::Generic(format!("tempdir e2e: {e}")))?;
-            let db = MemoryDB::new(case_tmp.path(), Arc::new(NoopEmitter)).await?;
+            let db = MemoryDB::new_with_shared_embedder(
+                case_tmp.path(),
+                Arc::new(NoopEmitter),
+                shared_embedder.clone(),
+            )
+            .await?;
             let docs: Vec<RawDocument> = all_seeds
                 .iter()
                 .map(|seed| crate::eval::runner::seed_to_doc(seed, &confidence_cfg))
@@ -2781,6 +2853,9 @@ pub async fn run_e2e_locomo_eval(
 
     let total_convs = samples.len();
 
+    // Pre-create shared embedder so each conversation reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for (conv_idx, sample) in samples.iter().enumerate() {
         let memories = extract_observations(sample);
         if memories.is_empty() {
@@ -2822,7 +2897,12 @@ pub async fn run_e2e_locomo_eval(
         // Seed ephemeral DB for Origin retrieval.
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir e2e_locomo: {e}")))?;
-        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let docs: Vec<crate::sources::RawDocument> = memories
             .iter()
@@ -3401,6 +3481,9 @@ pub async fn run_locomo_pipeline_eval(
 
     let conv_limit = max_conversations.min(samples.len());
 
+    // Pre-create shared embedder so each conversation reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for (conv_idx, sample) in samples.iter().take(max_conversations).enumerate() {
         let memories = extract_observations(sample);
         if memories.is_empty() {
@@ -3468,7 +3551,12 @@ pub async fn run_locomo_pipeline_eval(
         // ---- Create DB and seed flat ----
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir pipeline: {e}")))?;
-        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
@@ -4121,6 +4209,9 @@ pub async fn run_context_path_eval(
     let mut all_results: Vec<ContextPathResult> = Vec::new();
     let conv_limit = max_conversations.min(samples.len());
 
+    // Pre-create shared embedder so each conversation reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for (conv_idx, sample) in samples.iter().take(max_conversations).enumerate() {
         let memories = extract_observations(sample);
         if memories.is_empty() {
@@ -4150,7 +4241,12 @@ pub async fn run_context_path_eval(
         // Seed DB
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir context_eval: {e}")))?;
-        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
@@ -4467,6 +4563,9 @@ pub async fn run_e2e_context_eval(
     let mut all_tuples: Vec<JudgmentTuple> = Vec::new();
     let conv_limit = max_conversations.min(samples.len());
 
+    // Pre-create shared embedder so each conversation reuses the loaded model.
+    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+
     for (conv_idx, sample) in samples.iter().take(max_conversations).enumerate() {
         let memories = extract_observations(sample);
         if memories.is_empty() {
@@ -4484,7 +4583,12 @@ pub async fn run_e2e_context_eval(
         // Seed DB
         let tmp = tempfile::tempdir()
             .map_err(|e| OriginError::Generic(format!("tempdir e2e_context: {e}")))?;
-        let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter)).await?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
 
         let docs: Vec<RawDocument> = memories
             .iter()
@@ -5089,7 +5193,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Eval benchmark (~4 min on CI) — run locally with --ignored
     async fn test_run_quality_cost_eval_basic() {
         // Use the project's fixture directory if it exists; otherwise skip gracefully.
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5296,7 +5399,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Eval benchmark (~4 min on CI) — run locally with --ignored
     async fn test_scaling_eval_basic() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -5648,7 +5750,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Eval benchmark (~3 min on CI) — run locally with --ignored
     async fn test_pipeline_token_eval_simulated() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -5728,7 +5829,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Eval benchmark (~5 min on CI) — run locally with --ignored
     async fn test_native_memory_augmentation() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -6051,7 +6151,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Eval benchmark (~13 min on CI) — run locally with --ignored
     async fn test_quality_at_scale() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -6130,7 +6229,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Eval benchmark (~5 min on CI) — run locally with --ignored
     async fn test_memory_layer_comparison() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
