@@ -13,14 +13,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use std::sync::LazyLock;
+
+/// Shared BPE tokenizer instance (cl100k_base). Initialized once, intentionally
+/// leaked to avoid destructor conflicts with ONNX runtime at process exit.
+static BPE: LazyLock<&'static tiktoken_rs::CoreBPE> = LazyLock::new(|| {
+    let bpe = tiktoken_rs::cl100k_base().expect("failed to load cl100k_base tokenizer");
+    Box::leak(Box::new(bpe))
+});
+
 /// Count tokens in text using tiktoken cl100k_base encoding.
-/// Uses thread_local to avoid global static teardown conflicts with ONNX runtime.
 pub fn count_tokens(text: &str) -> usize {
-    thread_local! {
-        static BPE: tiktoken_rs::CoreBPE =
-            tiktoken_rs::cl100k_base().expect("failed to load cl100k_base tokenizer");
-    }
-    BPE.with(|bpe| bpe.encode_with_special_tokens(text).len())
+    BPE.encode_with_special_tokens(text).len()
 }
 
 // ===== Types =====
