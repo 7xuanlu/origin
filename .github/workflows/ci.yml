@@ -20,6 +20,8 @@ jobs:
   check:
     name: Test & Lint
     runs-on: macos-latest
+    if: >-
+      !startsWith(github.event.head_commit.message, 'chore(main): release')
 
     steps:
       - uses: actions/checkout@v4
