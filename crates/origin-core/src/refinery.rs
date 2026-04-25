@@ -28,6 +28,7 @@ pub const ALL_PHASES: &[&str] = &[
     "decision_backfill",
     "prune_rejections",
     "kg_rethink",
+    "retry_failed_enrichment",
 ];
 
 /// What triggered a refinery cycle. Different triggers run different subsets
@@ -57,7 +58,11 @@ impl TriggerKind {
             Self::BurstEnd => matches!(phase_name, "recaps" | "refinement_queue"),
             Self::Idle => matches!(
                 phase_name,
-                "community_detection" | "emergence" | "re-distill" | "decision_logs"
+                "community_detection"
+                    | "emergence"
+                    | "re-distill"
+                    | "decision_logs"
+                    | "retry_failed_enrichment"
             ),
             Self::Daily => matches!(
                 phase_name,
@@ -763,6 +768,22 @@ pub async fn run_periodic_steep_with_api(
             }
             phases.push(phase);
         }
+    }
+
+    // Phase 11: Retry failed enrichment — self-healing for non-LLM steps
+    if trigger.runs_phase("retry_failed_enrichment") {
+        let phase = run_phase("retry_failed_enrichment", || async {
+            let retried = retry_failed_enrichment(db_ref, tuning).await?;
+            log::info!("[refinery] retry_failed_enrichment: retried {retried} steps");
+            let (nudge, headline) = classify_backfill(retried);
+            Ok(PhaseOutput {
+                items_processed: retried,
+                nudge,
+                headline,
+            })
+        })
+        .await;
+        phases.push(phase);
     }
 
     let elapsed = steep_start.elapsed();
@@ -2966,6 +2987,108 @@ async fn apply_merge_by_tier(
     Ok(())
 }
 
+/// Retry enrichment steps that previously failed (status = "failed") but
+/// haven't exceeded `max_enrichment_retries`. Only non-LLM steps (dedup,
+/// entity_link, contradiction, concept_contradiction, entity_suggestion)
+/// can be retried here — LLM-requiring steps are skipped. On success the
+/// step is marked "ok"; on repeated failure and max retries reached the
+/// step is moved to "abandoned".
+pub(crate) async fn retry_failed_enrichment(
+    db: &MemoryDB,
+    tuning: &crate::tuning::RefineryConfig,
+) -> Result<usize, OriginError> {
+    let failed = db
+        .get_failed_enrichment_memories(tuning.max_enrichment_retries, 20)
+        .await?;
+    if failed.is_empty() {
+        return Ok(0);
+    }
+
+    let mut retried = 0usize;
+    for (source_id, step_name, content) in &failed {
+        log::info!("[refinery] retrying enrichment step '{step_name}' for {source_id}");
+        let result = match step_name.as_str() {
+            "dedup" => crate::post_ingest::check_dedup(db, source_id, content, tuning)
+                .await
+                .map(|_| ()),
+            "entity_link" => crate::post_ingest::auto_link_entity(db, source_id, content, tuning)
+                .await
+                .map(|_| ()),
+            "contradiction" => {
+                let mt = db.get_memory_type(source_id).await.unwrap_or(None);
+                let domain = db.get_memory_domain(source_id).await.unwrap_or(None);
+                if let Some(mt) = &mt {
+                    crate::post_ingest::check_contradiction(
+                        db,
+                        source_id,
+                        mt,
+                        domain.as_deref(),
+                        None,
+                        content,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            "concept_contradiction" => {
+                crate::post_ingest::check_concept_contradiction(db, source_id, content)
+                    .await
+                    .map(|_| ())
+            }
+            "entity_suggestion" => crate::post_ingest::suggest_entity_creation(db, content).await,
+            // LLM-requiring steps can't be retried without LLM
+            _ => {
+                log::info!("[refinery] step '{step_name}' requires LLM, skipping");
+                continue;
+            }
+        };
+        match result {
+            Ok(()) => {
+                db.record_enrichment_step(source_id, step_name, "ok", None)
+                    .await
+                    .ok();
+                retried += 1;
+            }
+            Err(e) => {
+                log::warn!("[refinery] retry of '{step_name}' for {source_id} failed: {e}");
+                // Check current attempts BEFORE recording, so we can decide
+                // whether to mark failed (retryable) or abandoned (final).
+                let current_attempts = db
+                    .get_enrichment_steps(source_id)
+                    .await
+                    .ok()
+                    .and_then(|steps| {
+                        steps
+                            .iter()
+                            .find(|s| s.step == *step_name)
+                            .map(|s| s.attempts)
+                    })
+                    .unwrap_or(0);
+                // record_enrichment_step increments attempts via UPSERT, so
+                // after this call attempts = current_attempts + 1.
+                let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
+                    "abandoned"
+                } else {
+                    "failed"
+                };
+                db.record_enrichment_step(source_id, step_name, status, Some(&e.to_string()))
+                    .await
+                    .ok();
+                if status == "abandoned" {
+                    log::info!(
+                        "[refinery] step '{step_name}' for {source_id} abandoned after {} attempts",
+                        current_attempts + 1
+                    );
+                }
+                retried += 1;
+            }
+        }
+    }
+    Ok(retried)
+}
+
 /// Trigger a refinery steep on demand — used by the chat import flow to
 /// process freshly-ingested memories without waiting for the scheduled
 /// 30-minute tick.
@@ -3287,6 +3410,7 @@ mod tests {
             "emergence",
             "re-distill",
             "decision_logs",
+            "retry_failed_enrichment",
         ];
         for &exp in expected {
             assert!(
@@ -3402,9 +3526,9 @@ mod tests {
 
         let phase_names: Vec<&str> = result.phases.iter().map(|p| p.name.as_str()).collect();
 
-        // All 15 phases must run with Backstop (14 prior + kg_rethink added
-        // in the KG quality work). `kg_rethink` is rate-limited, so on a
-        // fresh DB (last_kg_rethink_ts=0) it runs on the first steep.
+        // All 16 phases must run with Backstop. `kg_rethink` is
+        // rate-limited, so on a fresh DB (last_kg_rethink_ts=0) it runs
+        // on the first steep.
         let expected: &[&str] = &[
             "decay",
             "promote",
@@ -3421,6 +3545,7 @@ mod tests {
             "decision_backfill",
             "prune_rejections",
             "kg_rethink",
+            "retry_failed_enrichment",
         ];
         for &exp in expected {
             assert!(
@@ -4458,5 +4583,51 @@ mod tests {
             strip_source_prefix("[has spaces] content"),
             "[has spaces] content"
         );
+    }
+
+    // ── retry_failed_enrichment tests (Task 8) ─────────────────────────
+
+    #[tokio::test]
+    async fn test_retry_failed_enrichment_phase() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory(
+            "mem_retry_test",
+            "Python uses indentation for blocks",
+            "fact",
+            "tech",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_retry_test", "dedup", "failed", Some("transient error"))
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_retry_test", "entity_link", "ok", None)
+            .await
+            .unwrap();
+        let tuning = crate::tuning::RefineryConfig::default();
+        let count = retry_failed_enrichment(&db, &tuning).await.unwrap();
+        assert!(count > 0, "should have retried at least one memory");
+        let steps = db.get_enrichment_steps("mem_retry_test").await.unwrap();
+        let dedup = steps.iter().find(|s| s.step == "dedup").unwrap();
+        assert_eq!(dedup.status, "ok", "retry should have fixed the dedup step");
+    }
+
+    #[tokio::test]
+    async fn test_retry_skips_abandoned_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory("mem_abandon_skip", "test content", "fact", "tech");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step(
+            "mem_abandon_skip",
+            "entity_extract",
+            "abandoned",
+            Some("gave up"),
+        )
+        .await
+        .unwrap();
+        let tuning = crate::tuning::RefineryConfig::default();
+        let count = retry_failed_enrichment(&db, &tuning).await.unwrap();
+        assert_eq!(count, 0, "should not retry abandoned steps");
+        let steps = db.get_enrichment_steps("mem_abandon_skip").await.unwrap();
+        assert_eq!(steps[0].status, "abandoned");
     }
 }

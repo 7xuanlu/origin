@@ -101,6 +101,24 @@ fn default_version() -> i64 {
     1
 }
 
+/// Per-step enrichment outcome for diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentStepStatus {
+    pub step: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub attempts: u32,
+}
+
+/// Response for GET /api/memory/{id}/enrichment-status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentStatusResponse {
+    pub source_id: String,
+    pub summary: String,
+    pub steps: Vec<EnrichmentStepStatus>,
+}
+
 /// A single item in a version chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryVersionItem {

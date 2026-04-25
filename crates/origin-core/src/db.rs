@@ -554,6 +554,17 @@ pub struct PendingRevision {
     pub source_agent: Option<String>,
 }
 
+/// A memory chunk that needs its embedding refreshed.
+#[derive(Debug, Clone)]
+pub struct PendingReembed {
+    /// The `id` primary key of the chunk row (passed to `reembed_memory`).
+    pub chunk_id: String,
+    /// The `source_id` of the parent memory (used for look-ups and assertions).
+    pub source_id: String,
+    /// The text to embed (source_text when available, otherwise content).
+    pub embed_text: String,
+}
+
 /// An activity row from the consolidated activities table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityRow {
@@ -2072,7 +2083,8 @@ impl MemoryDB {
 
         // Migration 19: Flatten existing structured_fields into content, mark for re-embedding
         // Reads each memory with structured_fields, flattens to pipe-delimited string,
-        // moves original prose to source_text, and marks reembed_pending.
+        // moves original prose to source_text, and marks enrichment_status = 'reembed_pending'
+        // (migration 43 backfills this into needs_reembed later).
         if version < 19 {
             let conn = self.conn.lock().await;
             // Fetch all memories with structured_fields that haven't been flattened yet
@@ -3939,6 +3951,142 @@ impl MemoryDB {
             }
         }
 
+        // Migration 43: enrichment_steps table + needs_reembed column + summary view
+        {
+            let version: i64 = {
+                let conn = self.conn.lock().await;
+                let mut rows = conn
+                    .query("PRAGMA user_version", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("read version for m43: {e}")))?;
+                if let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| OriginError::VectorDb(e.to_string()))?
+                {
+                    row.get(0).unwrap_or(0)
+                } else {
+                    0
+                }
+            };
+
+            if version < 43 {
+                let conn = self.conn.lock().await;
+
+                // Create enrichment_steps table if not exists (idempotent)
+                let table_exists: bool = {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='enrichment_steps'",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("m43 table check: {e}")))?;
+                    if let Some(row) = rows
+                        .next()
+                        .await
+                        .map_err(|e| OriginError::VectorDb(e.to_string()))?
+                    {
+                        let count: i64 = row.get(0).unwrap_or(0);
+                        count > 0
+                    } else {
+                        false
+                    }
+                };
+
+                conn.execute("BEGIN", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m43 begin: {e}")))?;
+
+                if !table_exists {
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS enrichment_steps (
+                            source_id TEXT NOT NULL,
+                            step_name TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            error TEXT,
+                            attempts INTEGER NOT NULL DEFAULT 1,
+                            updated_at INTEGER NOT NULL,
+                            PRIMARY KEY (source_id, step_name)
+                        )",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m43 create table: {e}")))?;
+
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_enrichment_steps_failed ON enrichment_steps(status) WHERE status = 'failed'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m43 create index: {e}")))?;
+                }
+
+                // Add needs_reembed column if missing
+                let col_exists: bool = {
+                    let mut rows = conn
+                        .query("PRAGMA table_info(memories)", ())
+                        .await
+                        .map_err(|e| OriginError::VectorDb(format!("m43 pragma: {e}")))?;
+                    let mut found = false;
+                    while let Ok(Some(row)) = rows.next().await {
+                        let col_name: String = row.get(1).unwrap_or_default();
+                        if col_name == "needs_reembed" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                };
+
+                if !col_exists {
+                    conn.execute(
+                        "ALTER TABLE memories ADD COLUMN needs_reembed INTEGER NOT NULL DEFAULT 0",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m43 add column: {e}")))?;
+
+                    // Backfill: mark existing reembed_pending memories
+                    conn.execute(
+                        "UPDATE memories SET needs_reembed = 1 WHERE enrichment_status = 'reembed_pending'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m43 backfill: {e}")))?;
+                }
+
+                // Create summary view
+                conn.execute(
+                    "CREATE VIEW IF NOT EXISTS memory_enrichment_summary AS
+                     SELECT
+                         m.source_id,
+                         CASE
+                             WHEN COUNT(s.step_name) = 0 THEN 'raw'
+                             WHEN SUM(CASE WHEN s.status IN ('failed','abandoned') THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                             WHEN SUM(CASE WHEN s.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                             ELSE 'enrichment_partial'
+                         END AS summary
+                     FROM (SELECT DISTINCT source_id FROM memories) m
+                     LEFT JOIN enrichment_steps s ON s.source_id = m.source_id
+                     GROUP BY m.source_id",
+                    (),
+                )
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("m43 create view: {e}")))?;
+
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m43 commit: {e}")))?;
+
+                conn.execute("PRAGMA user_version = 43", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m43 bump: {e}")))?;
+
+                log::info!("[migration] Migration 43 applied: enrichment_steps table, needs_reembed column, memory_enrichment_summary view");
+            }
+        }
+
         Ok(())
     }
 
@@ -4534,7 +4682,7 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT id, content, source_text, structured_fields FROM memories
-                 WHERE enrichment_status = 'reembed_pending' AND source = 'memory'
+                 WHERE needs_reembed = 1 AND source = 'memory'
                  ORDER BY last_modified DESC LIMIT ?1",
                 libsql::params![limit as i64],
             )
@@ -4553,6 +4701,37 @@ impl MemoryDB {
         Ok(results)
     }
 
+    /// Get memories that need re-embedding, keyed by source_id (needs_reembed = 1).
+    pub async fn get_pending_reembeds(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingReembed>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, source_id, content, source_text FROM memories
+                 WHERE needs_reembed = 1 AND source = 'memory'
+                 ORDER BY last_modified DESC LIMIT ?1",
+                libsql::params![limit as i64],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_pending_reembeds: {}", e)))?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let chunk_id: String = row.get(0).unwrap_or_default();
+            let source_id: String = row.get(1).unwrap_or_default();
+            let content: String = row.get(2).unwrap_or_default();
+            let source_text: Option<String> = row.get::<Option<String>>(3).unwrap_or(None);
+            let embed_text = source_text.unwrap_or_else(|| content.clone());
+            results.push(PendingReembed {
+                chunk_id,
+                source_id,
+                embed_text,
+            });
+        }
+        Ok(results)
+    }
+
     /// Re-embed a single memory with fresh embedding from its current content.
     pub async fn reembed_memory(&self, chunk_id: &str, content: &str) -> Result<(), OriginError> {
         let embeddings = self.generate_embeddings(&[content.to_string()])?;
@@ -4561,7 +4740,7 @@ impl MemoryDB {
         }
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE memories SET embedding = vector32(?1), enrichment_status = 'enriched' WHERE id = ?2",
+            "UPDATE memories SET embedding = vector32(?1), enrichment_status = 'legacy', needs_reembed = 0 WHERE id = ?2",
             libsql::params![Self::vec_to_sql(&embeddings[0]), chunk_id],
         )
         .await
@@ -4927,6 +5106,10 @@ impl MemoryDB {
             pending_revision: bool,
             word_count: i64,
             entity_id: Option<String>,
+            // Retired column: kept in struct for compatibility with RawDocument
+            // but ignored on INSERT (always written as "legacy"). Status is now
+            // derived from the enrichment_steps table.
+            #[allow(dead_code)]
             enrichment_status: String,
             quality: Option<String>,
             is_recap: bool,
@@ -5168,7 +5351,7 @@ impl MemoryDB {
                     pending_revision_val,
                     row.word_count,
                     entity_id_val,
-                    row.enrichment_status,
+                    "legacy", // column retired; status derived from enrichment_steps
                     quality_val,
                     is_recap_val,
                     row.supersede_mode,
@@ -6660,6 +6843,13 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| OriginError::VectorDb(format!("delete_by_source_id: {}", e)))?;
+        // Clean up orphaned enrichment_steps (no FK cascade)
+        conn.execute(
+            "DELETE FROM enrichment_steps WHERE source_id = ?1",
+            libsql::params![source_id.to_string()],
+        )
+        .await
+        .ok();
         Ok(())
     }
 
@@ -7044,7 +7234,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -7146,7 +7341,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -7232,7 +7432,12 @@ impl MemoryDB {
                 MAX(entity_id) as entity_id,
                 MAX(quality) as quality,
                 MAX(is_recap) as is_recap,
-                MAX(enrichment_status) as enrichment_status,
+                (SELECT CASE
+                    WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                    WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                    WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                    ELSE 'enrichment_partial'
+                END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                 MAX(supersede_mode) as supersede_mode,
                 MAX(structured_fields) as structured_fields,
                 MAX(retrieval_cue) as retrieval_cue,
@@ -7331,7 +7536,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -7429,7 +7639,12 @@ impl MemoryDB {
                     MAX(entity_id) as entity_id,
                     MAX(quality) as quality,
                     MAX(is_recap) as is_recap,
-                    MAX(enrichment_status) as enrichment_status,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
                     MAX(supersede_mode) as supersede_mode,
                     MAX(structured_fields) as structured_fields,
                     MAX(retrieval_cue) as retrieval_cue,
@@ -8353,37 +8568,145 @@ impl MemoryDB {
         Ok(results)
     }
 
-    /// Get enrichment status for a chunk (for testing and diagnostics).
+    /// Get enrichment status for a memory, derived from per-step outcomes.
+    /// Delegates to `get_enrichment_summary` so callers get a live view of
+    /// what actually ran rather than a stale flag.
     pub async fn get_enrichment_status(
         &self,
         source_id: &str,
     ) -> Result<Option<String>, OriginError> {
+        let summary = self.get_enrichment_summary(source_id).await?;
+        Ok(Some(summary))
+    }
+
+    /// Record (or upsert) a single enrichment step outcome for a memory.
+    /// If a row for (source_id, step_name) already exists, increments attempts and updates status/error.
+    pub async fn record_enrichment_step(
+        &self,
+        source_id: &str,
+        step_name: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), OriginError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO enrichment_steps (source_id, step_name, status, error, attempts, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5)
+             ON CONFLICT(source_id, step_name) DO UPDATE SET
+                status = ?3, error = ?4, attempts = enrichment_steps.attempts + 1, updated_at = ?5",
+            libsql::params![source_id, step_name, status, error, now],
+        )
+        .await
+        .map_err(|e| OriginError::VectorDb(format!("record_enrichment_step: {e}")))?;
+        Ok(())
+    }
+
+    /// Return all enrichment step records for a memory, ordered by insertion.
+    pub async fn get_enrichment_steps(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<origin_types::EnrichmentStepStatus>, OriginError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT enrichment_status FROM memories WHERE source_id = ?1 LIMIT 1",
+                "SELECT step_name, status, error, attempts FROM enrichment_steps WHERE source_id = ?1 ORDER BY rowid",
                 libsql::params![source_id],
             )
             .await
-            .map_err(|e| OriginError::VectorDb(format!("get_enrichment_status: {}", e)))?;
+            .map_err(|e| OriginError::VectorDb(format!("get_enrichment_steps: {e}")))?;
+        let mut steps = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            steps.push(origin_types::EnrichmentStepStatus {
+                step: row.get::<String>(0).unwrap_or_default(),
+                status: row.get::<String>(1).unwrap_or_default(),
+                error: row.get::<Option<String>>(2).ok().flatten(),
+                attempts: row.get::<u32>(3).unwrap_or(0),
+            });
+        }
+        Ok(steps)
+    }
+
+    /// Derive a summary string from the enrichment_steps for a memory.
+    /// Returns: "raw" (no steps), "enriched" (all ok/skipped), "enrichment_failed" (all failed/abandoned),
+    /// or "enrichment_partial" (mixed).
+    pub async fn get_enrichment_summary(&self, source_id: &str) -> Result<String, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) as total,
+                        SUM(CASE WHEN status = 'failed' OR status = 'abandoned' THEN 1 ELSE 0 END) as failed_count,
+                        SUM(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) as ok_count
+                 FROM enrichment_steps WHERE source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_enrichment_summary: {e}")))?;
         if let Ok(Some(row)) = rows.next().await {
-            let status: String = row.get(0).unwrap();
-            Ok(Some(status))
+            let total: i64 = row.get(0).unwrap_or(0);
+            let failed: i64 = row.get(1).unwrap_or(0);
+            let ok: i64 = row.get(2).unwrap_or(0);
+            Ok(if total == 0 {
+                "raw".to_string()
+            } else if failed == 0 {
+                "enriched".to_string()
+            } else if ok == 0 {
+                "enrichment_failed".to_string()
+            } else {
+                "enrichment_partial".to_string()
+            })
         } else {
-            Ok(None)
+            Ok("raw".to_string())
         }
     }
 
-    /// Mark a chunk as enriched (post-ingest pipeline complete).
-    pub async fn mark_enriched(&self, source_id: &str) -> Result<(), OriginError> {
+    /// Reset any "abandoned" steps for a memory back to "failed" with attempts = 0.
+    /// Returns the number of rows updated.
+    pub async fn reset_abandoned_steps(&self, source_id: &str) -> Result<u64, OriginError> {
+        let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE memories SET enrichment_status = 'enriched' WHERE source_id = ?1",
-            libsql::params![source_id],
-        )
-        .await
-        .map_err(|e| OriginError::VectorDb(format!("mark_enriched: {}", e)))?;
-        Ok(())
+        let rows_affected = conn
+            .execute(
+                "UPDATE enrichment_steps SET status = 'failed', attempts = 0, updated_at = ?1
+                 WHERE source_id = ?2 AND status = 'abandoned'",
+                libsql::params![now, source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("reset_abandoned_steps: {e}")))?;
+        Ok(rows_affected)
+    }
+
+    /// Return memories with at least one `failed` enrichment step that hasn't
+    /// exceeded `max_attempts`, ordered oldest-first. Returns (source_id, step_name, content).
+    pub async fn get_failed_enrichment_memories(
+        &self,
+        max_attempts: usize,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT es.source_id, es.step_name, m.content
+                 FROM enrichment_steps es
+                 JOIN (SELECT source_id, content FROM memories WHERE chunk_index = 0 AND source = 'memory') m
+                    ON m.source_id = es.source_id
+                 WHERE es.status = 'failed' AND es.attempts < ?1
+                 ORDER BY es.updated_at ASC LIMIT ?2",
+                libsql::params![max_attempts as i64, limit as i64],
+            )
+            .await
+            .map_err(|e| {
+                OriginError::VectorDb(format!("get_failed_enrichment_memories: {e}"))
+            })?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            results.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+                row.get::<String>(2).unwrap_or_default(),
+            ));
+        }
+        Ok(results)
     }
 
     pub async fn confirm_entity(
@@ -8777,7 +9100,7 @@ impl MemoryDB {
         // Enrichment pending count
         let mut ep_rows = conn
             .query(
-                "SELECT COUNT(DISTINCT source_id) FROM memories WHERE source = 'memory' AND enrichment_status = 'raw'",
+                "SELECT COUNT(DISTINCT source_id) FROM memories WHERE source = 'memory' AND source_id NOT IN (SELECT DISTINCT source_id FROM enrichment_steps)",
                 libsql::params![],
             )
             .await
@@ -9994,6 +10317,26 @@ impl MemoryDB {
         }
     }
 
+    pub async fn get_memory_domain(&self, source_id: &str) -> Result<Option<String>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT domain FROM memories WHERE source_id = ?1 AND source = 'memory' LIMIT 1",
+                libsql::params![source_id.to_string()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("get_memory_domain: {}", e)))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            Ok(row.get::<Option<String>>(0).unwrap_or(None))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn source_id_exists(&self, source_id: &str) -> Result<bool, OriginError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
@@ -10077,7 +10420,12 @@ impl MemoryDB {
                     c.source_agent, c.confidence, c.confirmed, c.stability,
                     c.pinned, c.supersedes, c.last_modified,
                     c.entity_id, c.quality, COALESCE(c.is_recap, 0) as is_recap,
-                    c.enrichment_status, c.supersede_mode, c.structured_fields,
+                    (SELECT CASE
+                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                        ELSE 'enrichment_partial'
+                    END FROM enrichment_steps es WHERE es.source_id = c.source_id) AS enrichment_status, c.supersede_mode, c.structured_fields,
                     c.retrieval_cue, c.access_count, c.source_text
              FROM memories c
              WHERE c.source = 'memory'
@@ -11646,7 +11994,7 @@ impl MemoryDB {
     ) -> Result<(), OriginError> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE memories SET structured_fields = ?1, enrichment_status = 'reembed_pending' \
+            "UPDATE memories SET structured_fields = ?1, needs_reembed = 1 \
              WHERE source_id = ?2 AND chunk_index = 0",
             libsql::params![structured_fields_json, source_id],
         )
@@ -11698,10 +12046,7 @@ impl MemoryDB {
                 "UPDATE memories SET
                     structured_fields = COALESCE(?1, structured_fields),
                     retrieval_cue = COALESCE(?2, retrieval_cue),
-                    enrichment_status = CASE
-                        WHEN ?1 IS NOT NULL THEN 'reembed_pending'
-                        ELSE enrichment_status
-                    END
+                    needs_reembed = CASE WHEN ?1 IS NOT NULL THEN 1 ELSE needs_reembed END
                  WHERE source_id = ?3 AND chunk_index = 0",
                 libsql::params![structured_fields, retrieval_cue, source_id],
             )
@@ -12278,7 +12623,14 @@ impl MemoryDB {
             let mut rows = conn
                 .query(
                     "SELECT source_id, title, summary, content, \
-                            created_at, last_modified, enrichment_status, entity_id \
+                            created_at, last_modified, \
+                            (SELECT CASE \
+                                WHEN COUNT(es.source_id) = 0 THEN 'raw' \
+                                WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched' \
+                                WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed' \
+                                ELSE 'enrichment_partial' \
+                            END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status, \
+                            entity_id \
                      FROM memories \
                      WHERE source = 'memory' AND chunk_index = 0 \
                        AND (supersede_mode IS NULL OR supersede_mode != 'archive') \
@@ -12625,16 +12977,33 @@ impl MemoryDB {
     pub async fn pipeline_status(&self) -> Result<serde_json::Value, OriginError> {
         let conn = self.conn.lock().await;
 
-        // Enrichment status breakdown
-        let mut rows = conn.query(
-            "SELECT enrichment_status, COUNT(*) FROM memories WHERE source = 'memory' GROUP BY enrichment_status",
-            (),
-        ).await.map_err(|e| OriginError::VectorDb(format!("pipeline_status enrichment: {e}")))?;
+        // Enrichment status breakdown — derived from enrichment_steps table
+        let mut rows = conn
+            .query(
+                "SELECT status, COUNT(*) FROM enrichment_steps GROUP BY status",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("pipeline_status enrichment: {e}")))?;
         let mut enrichment = serde_json::Map::new();
         while let Ok(Some(row)) = rows.next().await {
             let status: String = row.get(0).unwrap_or_default();
             let count: i64 = row.get(1).unwrap_or(0);
             enrichment.insert(status, serde_json::Value::Number(count.into()));
+        }
+        // Count memories with no enrichment steps at all (raw)
+        let mut raw_rows = conn.query(
+            "SELECT COUNT(DISTINCT source_id) FROM memories WHERE source = 'memory' AND source_id NOT IN (SELECT DISTINCT source_id FROM enrichment_steps)",
+            (),
+        ).await.map_err(|e| OriginError::VectorDb(format!("pipeline_status raw count: {e}")))?;
+        if let Ok(Some(row)) = raw_rows.next().await {
+            let raw_count: i64 = row.get(0).unwrap_or(0);
+            if raw_count > 0 {
+                enrichment.insert(
+                    "raw".to_string(),
+                    serde_json::Value::Number(raw_count.into()),
+                );
+            }
         }
 
         // Entity linking
@@ -13949,6 +14318,8 @@ impl MemoryDB {
             confirmed: i64,
             stability: String,
             entity_id: Option<String>,
+            // Retired: see MemoryRow.enrichment_status above.
+            #[allow(dead_code)]
             enrichment_status: String,
             quality: Option<String>,
             is_recap: i64,
@@ -14114,7 +14485,7 @@ impl MemoryDB {
                     saved.stability,
                     new_word_count,
                     saved.entity_id,
-                    saved.enrichment_status,
+                    "legacy", // column retired; status derived from enrichment_steps
                     saved.quality,
                     saved.is_recap,
                     saved.structured_fields,
@@ -19257,8 +19628,8 @@ pub(crate) mod tests {
     ///     preserve the caller-supplied original, `Some` replaces.
     ///   * `structured_fields` / `retrieval_cue` only touch `chunk_index = 0`
     ///     (those fields live on the lead chunk only).
-    ///   * `enrichment_status` flips to `reembed_pending` iff structured
-    ///     fields were provided (so the re-embed pass picks it up).
+    ///   * `needs_reembed` flips to `1` iff structured fields were provided
+    ///     (so the re-embed pass picks it up).
     #[tokio::test]
     async fn test_apply_enrichment_writes_classification_and_extraction() {
         let (db, _dir) = test_db().await;
@@ -19292,7 +19663,7 @@ pub(crate) mod tests {
         let mut rows = conn
             .query(
                 "SELECT memory_type, domain, quality, supersede_mode,
-                        structured_fields, retrieval_cue, enrichment_status
+                        structured_fields, retrieval_cue, needs_reembed
                  FROM memories WHERE source_id = 'mem_apply' AND chunk_index = 0",
                 (),
             )
@@ -19305,7 +19676,7 @@ pub(crate) mod tests {
         let supersede_mode: String = row.get(3).unwrap();
         let sf: Option<String> = row.get(4).unwrap();
         let cue: Option<String> = row.get(5).unwrap();
-        let status: String = row.get(6).unwrap();
+        let needs_reembed: i64 = row.get(6).unwrap();
 
         assert_eq!(memory_type, "preference");
         assert_eq!(
@@ -19319,56 +19690,9 @@ pub(crate) mod tests {
         assert!(sf.unwrap().contains("dark mode"));
         assert_eq!(cue.as_deref(), Some("What editor theme does Alice use?"));
         assert_eq!(
-            status, "reembed_pending",
-            "structured_fields update must flip status so re-embed picks it up"
+            needs_reembed, 1,
+            "structured_fields update must set needs_reembed = 1 so re-embed picks it up"
         );
-    }
-
-    // ==================== mark_enriched ====================
-
-    #[tokio::test]
-    async fn test_mark_enriched() {
-        let (db, _dir) = test_db().await;
-        let doc = make_memory_doc("mem_enrich", "Some fact", "fact", "work", "claude");
-        db.upsert_documents(vec![doc]).await.unwrap();
-
-        // Initially "raw" (default from RawDocument)
-        let row = db
-            .conn
-            .lock()
-            .await
-            .query(
-                "SELECT enrichment_status FROM memories WHERE source_id = 'mem_enrich' LIMIT 1",
-                (),
-            )
-            .await
-            .unwrap()
-            .next()
-            .await
-            .unwrap()
-            .unwrap();
-        let status: String = row.get(0).unwrap();
-        assert_eq!(status, "raw");
-
-        // Mark enriched
-        db.mark_enriched("mem_enrich").await.unwrap();
-
-        let row = db
-            .conn
-            .lock()
-            .await
-            .query(
-                "SELECT enrichment_status FROM memories WHERE source_id = 'mem_enrich' LIMIT 1",
-                (),
-            )
-            .await
-            .unwrap()
-            .next()
-            .await
-            .unwrap()
-            .unwrap();
-        let status: String = row.get(0).unwrap();
-        assert_eq!(status, "enriched");
     }
 
     // ==================== Space CRUD ====================
@@ -19663,12 +19987,12 @@ pub(crate) mod tests {
     async fn test_get_reembed_candidates() {
         let (db, _dir) = test_db().await;
         let conn = db.conn.lock().await;
-        // Insert a memory with source_text and reembed_pending status
+        // Insert a memory with source_text and needs_reembed = 1
         conn.execute(
             "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified,
-             chunk_type, word_count, source_text, enrichment_status, structured_fields)
+             chunk_type, word_count, source_text, needs_reembed, structured_fields)
              VALUES ('rc1', 'preference: dark mode', 'memory', 'mem_rc1', 'test', 0, 0,
-             'text', 1, 'I prefer dark mode', 'reembed_pending', '{\"preference\":\"dark mode\"}')",
+             'text', 1, 'I prefer dark mode', 1, '{\"preference\":\"dark mode\"}')",
             (),
         ).await.unwrap();
         // Insert a normal enriched memory (should NOT be returned)
@@ -19689,12 +20013,12 @@ pub(crate) mod tests {
     async fn test_reembed_memory() {
         let (db, _dir) = test_db().await;
         let conn = db.conn.lock().await;
-        // Insert a reembed_pending memory
+        // Insert a memory that needs re-embedding (needs_reembed = 1)
         conn.execute(
             "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified,
-             chunk_type, word_count, enrichment_status, structured_fields)
+             chunk_type, word_count, needs_reembed, structured_fields)
              VALUES ('re1', 'preference: dark mode', 'memory', 'mem_re1', 'test', 0, 0,
-             'text', 1, 'reembed_pending', '{\"preference\":\"dark mode\"}')",
+             'text', 1, 1, '{\"preference\":\"dark mode\"}')",
             (),
         ).await.unwrap();
         drop(conn);
@@ -19705,15 +20029,47 @@ pub(crate) mod tests {
 
         let conn = db.conn.lock().await;
         let mut rows = conn
-            .query(
-                "SELECT enrichment_status FROM memories WHERE id = 're1'",
+            .query("SELECT needs_reembed FROM memories WHERE id = 're1'", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let needs_reembed: i64 = row.get(0).unwrap();
+        assert_eq!(
+            needs_reembed, 0,
+            "needs_reembed should be cleared after re-embedding"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_needs_reembed_replaces_reembed_pending() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_reembed_test",
+            "dark mode preference",
+            "preference",
+            "tools",
+            "test",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Memory starts with needs_reembed = 0
+        let pending = db.get_pending_reembeds(10).await.unwrap();
+        assert!(!pending.iter().any(|r| r.source_id == "mem_reembed_test"));
+
+        // Mark needs_reembed = 1 (simulating a structured_fields update)
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET needs_reembed = 1 WHERE source_id = 'mem_reembed_test'",
                 (),
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        let status: String = row.get(0).unwrap();
-        assert_eq!(status, "enriched");
+        }
+
+        // Should now appear in pending reembeds
+        let pending = db.get_pending_reembeds(10).await.unwrap();
+        assert!(pending.iter().any(|r| r.source_id == "mem_reembed_test"));
     }
 
     #[tokio::test]
@@ -21181,7 +21537,7 @@ pub(crate) mod tests {
 
         // created_at = 100_000 s (well before since_s = 400_000 s).
         // last_modified = 500_000 s (after since, and 400_000 s after created_at → >> 60 s grace).
-        // enrichment_status = 'enriched'.
+        // enrichment_status derived as 'enriched' from enrichment_steps.
         // since_ms = 400_000_000 ms  →  since_s = 400_000 s.
         insert_memory_at(
             &db,
@@ -21193,6 +21549,13 @@ pub(crate) mod tests {
             "enriched",
         )
         .await;
+        // Record enrichment steps so the derived status is 'enriched'
+        db.record_enrichment_step("mem_ref", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_ref", "entity_link", "ok", None)
+            .await
+            .unwrap();
 
         let items = db
             .list_recent_memories(10, Some(400_000_000))
@@ -22920,6 +23283,186 @@ pub(crate) mod tests {
         assert!(
             matched.is_empty(),
             "empty candidate set should yield empty result"
+        );
+    }
+
+    // ==================== Migration 43: enrichment_steps ====================
+
+    #[tokio::test]
+    async fn test_record_and_get_enrichment_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_step_test", "Rust is great", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_step_test", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_step_test", "entity_link", "failed", Some("timeout"))
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_step_test", "title_enrich", "skipped", None)
+            .await
+            .unwrap();
+        let steps = db.get_enrichment_steps("mem_step_test").await.unwrap();
+        assert_eq!(steps.len(), 3);
+        let dedup = steps.iter().find(|s| s.step == "dedup").unwrap();
+        assert_eq!(dedup.status, "ok");
+        assert!(dedup.error.is_none());
+        assert_eq!(dedup.attempts, 1);
+        let entity = steps.iter().find(|s| s.step == "entity_link").unwrap();
+        assert_eq!(entity.status, "failed");
+        assert_eq!(entity.error.as_deref(), Some("timeout"));
+        let title = steps.iter().find(|s| s.step == "title_enrich").unwrap();
+        assert_eq!(title.status, "skipped");
+    }
+
+    #[tokio::test]
+    async fn test_record_enrichment_step_upserts_on_retry() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_upsert_step", "test content", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step(
+            "mem_upsert_step",
+            "entity_extract",
+            "failed",
+            Some("LLM down"),
+        )
+        .await
+        .unwrap();
+        let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
+        assert_eq!(steps[0].attempts, 1);
+        db.record_enrichment_step(
+            "mem_upsert_step",
+            "entity_extract",
+            "failed",
+            Some("still down"),
+        )
+        .await
+        .unwrap();
+        let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
+        assert_eq!(steps[0].attempts, 2);
+        assert_eq!(steps[0].error.as_deref(), Some("still down"));
+        db.record_enrichment_step("mem_upsert_step", "entity_extract", "ok", None)
+            .await
+            .unwrap();
+        let steps = db.get_enrichment_steps("mem_upsert_step").await.unwrap();
+        assert_eq!(steps[0].status, "ok");
+        assert!(steps[0].error.is_none());
+        assert_eq!(steps[0].attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_enrichment_summary() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_summary_test", "test", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
+        assert_eq!(summary, "raw");
+        db.record_enrichment_step("mem_summary_test", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_summary_test", "entity_link", "skipped", None)
+            .await
+            .unwrap();
+        let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
+        assert_eq!(summary, "enriched");
+        db.record_enrichment_step("mem_summary_test", "title_enrich", "failed", Some("err"))
+            .await
+            .unwrap();
+        let summary = db.get_enrichment_summary("mem_summary_test").await.unwrap();
+        assert_eq!(summary, "enrichment_partial");
+    }
+
+    #[tokio::test]
+    async fn test_get_enrichment_summary_all_failed() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_all_fail", "test", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_all_fail", "dedup", "failed", Some("err1"))
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_all_fail", "entity_link", "failed", Some("err2"))
+            .await
+            .unwrap();
+        let summary = db.get_enrichment_summary("mem_all_fail").await.unwrap();
+        assert_eq!(summary, "enrichment_failed");
+    }
+
+    #[tokio::test]
+    async fn test_reset_abandoned_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_abandon_test", "test", "fact", "tech", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step(
+            "mem_abandon_test",
+            "entity_extract",
+            "abandoned",
+            Some("gave up"),
+        )
+        .await
+        .unwrap();
+        db.record_enrichment_step("mem_abandon_test", "dedup", "ok", None)
+            .await
+            .unwrap();
+        let reset = db.reset_abandoned_steps("mem_abandon_test").await.unwrap();
+        assert_eq!(reset, 1);
+        let steps = db.get_enrichment_steps("mem_abandon_test").await.unwrap();
+        let extract = steps.iter().find(|s| s.step == "entity_extract").unwrap();
+        assert_eq!(extract.status, "failed");
+        assert_eq!(extract.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_memories_derives_enrichment_status_from_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc(
+            "mem_list_enrich",
+            "Rust ownership model",
+            "fact",
+            "tech",
+            "test",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        // Before any steps are recorded, status should be "raw"
+        let items = db.list_memories(None, None, None, None, 10).await.unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.source_id == "mem_list_enrich")
+            .unwrap();
+        assert_eq!(item.enrichment_status, "raw", "no steps => raw");
+
+        // Record one ok step and one failed step => partial
+        db.record_enrichment_step("mem_list_enrich", "dedup", "ok", None)
+            .await
+            .unwrap();
+        db.record_enrichment_step(
+            "mem_list_enrich",
+            "entity_link",
+            "failed",
+            Some("no entities"),
+        )
+        .await
+        .unwrap();
+
+        let items = db.list_memories(None, None, None, None, 10).await.unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.source_id == "mem_list_enrich")
+            .unwrap();
+        assert_eq!(
+            item.enrichment_status, "enrichment_partial",
+            "mix of ok and failed => partial"
+        );
+
+        // Also verify get_memory_detail derives from steps
+        let detail = db
+            .get_memory_detail("mem_list_enrich")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.enrichment_status, "enrichment_partial",
+            "detail also derives from steps"
         );
     }
 }
