@@ -825,6 +825,11 @@ async fn reclassify_imports(
     if let Some(llm) = llm {
         let imports = db.get_unclassified_imports(10).await?;
         for (source_id, content) in &imports {
+            // Check which fields are actually missing so we only fill NULLs
+            let existing = db.get_memory_classification(source_id).await?;
+            let needs_type = existing.0.is_none();
+            let needs_domain = existing.1.is_none();
+
             let truncated: String = content.chars().take(1000).collect();
             let response = llm
                 .generate(LlmRequest {
@@ -843,24 +848,35 @@ async fn reclassify_imports(
                     {
                         let sid_prefix: String = source_id.chars().take(12).collect();
                         log::info!(
-                            "[refinery] reclassified import {} -> type={}, domain={:?}",
+                            "[refinery] reclassified {} -> type={}, domain={:?}",
                             sid_prefix,
                             classification.memory_type,
                             classification.domain,
                         );
-                        if let Err(e) = db
-                            .update_memory_type(source_id, &classification.memory_type)
-                            .await
-                        {
-                            log::warn!("[refinery] reclassify type update failed: {e}");
-                        }
-                        if let Some(ref domain) = classification.domain {
-                            if let Err(e) = db.update_domain(source_id, domain).await {
-                                log::warn!("[refinery] reclassify domain update failed: {e}");
+                        // Only update memory_type if it was NULL
+                        if needs_type {
+                            if let Err(e) = db
+                                .update_memory_type(source_id, &classification.memory_type)
+                                .await
+                            {
+                                log::warn!("[refinery] reclassify type update failed: {e}");
                             }
-                            // Auto-create space for newly classified domain
-                            if let Err(e) = db.auto_create_space_if_needed(domain).await {
-                                log::warn!("[refinery] auto-create space failed: {e}");
+                        }
+                        // Only update domain if it was NULL
+                        if needs_domain {
+                            if let Some(ref domain) = classification.domain {
+                                if let Err(e) = db.update_domain(source_id, domain).await {
+                                    log::warn!("[refinery] reclassify domain update failed: {e}");
+                                }
+                                // Auto-create space for newly classified domain
+                                if let Err(e) = db.auto_create_space_if_needed(domain).await {
+                                    log::warn!("[refinery] auto-create space failed: {e}");
+                                }
+                            } else {
+                                // LLM returned no domain — set fallback to prevent infinite retry
+                                if let Err(e) = db.update_domain(source_id, "general").await {
+                                    log::warn!("[refinery] reclassify fallback domain failed: {e}");
+                                }
                             }
                         }
                         if let Some(ref quality) = classification.quality {
