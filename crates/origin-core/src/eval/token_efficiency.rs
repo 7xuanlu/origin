@@ -22,6 +22,27 @@ static BPE: LazyLock<&'static tiktoken_rs::CoreBPE> = LazyLock::new(|| {
     Box::leak(Box::new(bpe))
 });
 
+/// Process-wide shared ONNX embedder for eval functions. Loaded once (1-2s),
+/// intentionally leaked to avoid SIGSEGV from ONNX runtime destructor at exit.
+/// We store a cloned Arc and `mem::forget` the original so the strong count never
+/// reaches zero — the TextEmbedding destructor never runs.
+static EVAL_EMBEDDER: LazyLock<Arc<std::sync::Mutex<fastembed::TextEmbedding>>> =
+    LazyLock::new(|| {
+        let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGEBaseENV15Q)
+            .with_show_download_progress(true);
+        let embedder = fastembed::TextEmbedding::try_new(opts)
+            .expect("failed to load BGE-Base-EN-v1.5-Q ONNX model");
+        let arc = Arc::new(std::sync::Mutex::new(embedder));
+        // Leak one strong ref so the Arc never reaches zero and the destructor never runs.
+        std::mem::forget(arc.clone());
+        arc
+    });
+
+/// Returns the process-wide shared embedder for eval use.
+fn eval_shared_embedder() -> Arc<std::sync::Mutex<fastembed::TextEmbedding>> {
+    EVAL_EMBEDDER.clone()
+}
+
 /// Count tokens in text using tiktoken cl100k_base encoding.
 pub fn count_tokens(text: &str) -> usize {
     BPE.encode_with_special_tokens(text).len()
@@ -386,7 +407,7 @@ pub async fn run_quality_cost_eval(
     let confidence_cfg = ConfidenceConfig::default();
 
     // Pre-create shared embedder so each case reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for case in &cases {
         if case.empty_set {
@@ -695,7 +716,7 @@ pub async fn run_multi_turn_eval(
 
     // Seed an ephemeral DB with the best case's memories.
     let confidence_cfg = crate::tuning::ConfidenceConfig::default();
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
     let case_tmp = tempfile::tempdir()
         .map_err(|e| OriginError::Generic(format!("tempdir for multi-turn eval: {}", e)))?;
     let db = MemoryDB::new_with_shared_embedder(
@@ -797,7 +818,7 @@ pub async fn run_native_memory_augmentation(
     let mut full_replay_samples: Vec<usize> = Vec::new();
 
     // Pre-create shared embedder so each case reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for case in &cases {
         if case.empty_set || case.seeds.is_empty() {
@@ -1038,7 +1059,7 @@ pub async fn run_pipeline_token_eval_simulated(
     let confidence_cfg = ConfidenceConfig::default();
 
     // Pre-create shared embedder so each stage/case reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     // Per-stage accumulators: (total_corpus_tokens, total_memory_count, total_search_result_tokens, total_ndcg)
     let mut raw_corpus: Vec<usize> = Vec::new();
@@ -1498,7 +1519,7 @@ pub async fn run_quality_at_scale_eval(
     let mut points: Vec<QualityAtScalePoint> = Vec::with_capacity(sizes.len());
 
     // Pre-create shared embedder so each size/case iteration reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for &size in sizes {
         let mut origin_tokens_sum: f64 = 0.0;
@@ -1650,7 +1671,7 @@ pub async fn run_scaling_eval(
     let mut points = Vec::new();
 
     // Pre-create shared embedder so each size/case iteration reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for &size in corpus_sizes {
         let mut origin_tokens_sum: f64 = 0.0;
@@ -1853,7 +1874,7 @@ pub async fn run_memory_layer_comparison(
     let confidence_cfg = ConfidenceConfig::default();
 
     // Pre-create shared embedder so each case reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     // Accumulators: tokens, ndcg, accessible fraction per approach
     let mut tokens_acc: HashMap<MemoryLayerApproach, Vec<f64>> = HashMap::new();
@@ -2283,7 +2304,7 @@ pub async fn run_e2e_answer_eval(
     let confidence_cfg = ConfidenceConfig::default();
 
     // Pre-create shared embedder so each case reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     // Per-approach accumulators: answer_score, context_tokens, answer_tokens
     let approach_keys = ["flat_markdown", "origin", "no_context"];
@@ -2854,7 +2875,7 @@ pub async fn run_e2e_locomo_eval(
     let total_convs = samples.len();
 
     // Pre-create shared embedder so each conversation reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for (conv_idx, sample) in samples.iter().enumerate() {
         let memories = extract_observations(sample);
@@ -3482,7 +3503,7 @@ pub async fn run_locomo_pipeline_eval(
     let conv_limit = max_conversations.min(samples.len());
 
     // Pre-create shared embedder so each conversation reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for (conv_idx, sample) in samples.iter().take(max_conversations).enumerate() {
         let memories = extract_observations(sample);
@@ -3788,7 +3809,7 @@ pub async fn run_longmemeval_pipeline_eval(
 
     // Pre-create shared embedder
     eprintln!("[pipeline-lme] loading shared embedder...");
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     let mut per_conversation = Vec::new();
     let mut total_queries = 0usize;
@@ -4210,7 +4231,7 @@ pub async fn run_context_path_eval(
     let conv_limit = max_conversations.min(samples.len());
 
     // Pre-create shared embedder so each conversation reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for (conv_idx, sample) in samples.iter().take(max_conversations).enumerate() {
         let memories = extract_observations(sample);
@@ -4564,7 +4585,7 @@ pub async fn run_e2e_context_eval(
     let conv_limit = max_conversations.min(samples.len());
 
     // Pre-create shared embedder so each conversation reuses the loaded model.
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     for (conv_idx, sample) in samples.iter().take(max_conversations).enumerate() {
         let memories = extract_observations(sample);
@@ -4698,7 +4719,7 @@ pub async fn run_e2e_context_eval_longmemeval(
 
     // Pre-create shared embedder
     eprintln!("[e2e_context_lme] loading shared embedder...");
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
 
     let mut all_tuples: Vec<JudgmentTuple> = Vec::new();
     let sample_limit = max_questions.min(samples.len());
@@ -4822,7 +4843,7 @@ pub async fn run_context_path_eval_longmemeval(
 
     // Pre-create shared embedder — loads 140MB ONNX model once instead of per-question
     eprintln!("[context_path_lme] loading shared embedder...");
-    let shared_embedder = MemoryDB::create_shared_embedder().await?;
+    let shared_embedder = eval_shared_embedder();
     eprintln!(
         "[context_path_lme] embedder ready, processing {} questions",
         samples.len().min(max_questions)
