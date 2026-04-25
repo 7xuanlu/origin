@@ -4748,8 +4748,8 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Get imported memories that have not yet been reclassified (memory_type IS NULL).
-    /// Returns (source_id, content) pairs grouped by source_id so each import is
+    /// Get memories that need classification (memory_type IS NULL or domain IS NULL).
+    /// Returns (source_id, content) pairs grouped by source_id so each memory is
     /// processed exactly once, even when chunked into multiple rows.
     pub async fn get_unclassified_imports(
         &self,
@@ -4761,8 +4761,7 @@ impl MemoryDB {
                 "SELECT source_id, GROUP_CONCAT(content, ' ') as combined_content
                  FROM memories
                  WHERE source = 'memory'
-                   AND source_id LIKE 'import_%'
-                   AND memory_type IS NULL
+                   AND (memory_type IS NULL OR domain IS NULL)
                  GROUP BY source_id
                  ORDER BY MAX(last_modified) DESC
                  LIMIT ?1",
@@ -14685,7 +14684,7 @@ impl MemoryDB {
     /// Store a single memory from a bulk chat import. Skips classification,
     /// extraction, and event emission — those happen later via the refinery
     /// steep cycle. Uses `source = 'memory'` and `memory_type = NULL` so the row
-    /// matches the existing `import_%` filter in `get_unclassified_imports`.
+    /// matches the `memory_type IS NULL OR domain IS NULL` filter in `get_unclassified_imports`.
     pub async fn store_raw_import_memory(
         &self,
         source_id: &str,

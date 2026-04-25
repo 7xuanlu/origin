@@ -815,7 +815,7 @@ pub async fn run_periodic_steep_with_api(
     })
 }
 
-/// Reclassify imported memories that lack proper memory_type classification.
+/// Reclassify memories that lack proper memory_type or domain classification.
 async fn reclassify_imports(
     db: &MemoryDB,
     llm: Option<&Arc<dyn LlmProvider>>,
@@ -823,7 +823,7 @@ async fn reclassify_imports(
 ) -> Result<usize, OriginError> {
     let mut reclassified = 0usize;
     if let Some(llm) = llm {
-        let imports = db.get_unclassified_imports(3).await?;
+        let imports = db.get_unclassified_imports(10).await?;
         for (source_id, content) in &imports {
             let truncated: String = content.chars().take(1000).collect();
             let response = llm
@@ -882,7 +882,7 @@ async fn reclassify_imports(
             }
         }
         if reclassified > 0 {
-            log::info!("[refinery] reclassified {} imported memories", reclassified);
+            log::info!("[refinery] reclassified {} memories", reclassified);
         }
     }
     Ok(reclassified)
