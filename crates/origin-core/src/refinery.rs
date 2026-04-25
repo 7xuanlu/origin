@@ -1112,7 +1112,7 @@ async fn refine_clusters_with_llm(
             .collect::<Vec<_>>()
             .join("\n");
 
-        let user_prompt = format!("Entity: {}\n\n{}\n/no_think", entity, summaries);
+        let user_prompt = format!("Entity: {}\n\n{}", entity, summaries);
 
         let response = llm
             .generate(LlmRequest {
@@ -1364,7 +1364,7 @@ pub async fn distill_concepts(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        let user_prompt = format!("Topic: {}\n\n{}\n/no_think", topic, memories_block);
+        let user_prompt = format!("Topic: {}\n\n{}", topic, memories_block);
 
         let response = llm
             .generate(LlmRequest {
@@ -1379,7 +1379,6 @@ pub async fn distill_concepts(
         match response {
             Ok(raw) if !raw.trim().is_empty() => {
                 let cleaned = crate::llm_provider::strip_think_tags(&raw);
-                let cleaned = cleaned.replace("/no_think", "");
                 let content = cleaned.trim().to_string();
 
                 if content.is_empty() {
@@ -1547,7 +1546,7 @@ async fn assign_orphan_memories(
         .join("\n");
 
     let user_prompt = format!(
-        "Unassigned memories:\n{}\n\nExisting concepts:\n{}\n/no_think",
+        "Unassigned memories:\n{}\n\nExisting concepts:\n{}",
         memories_text, concepts_text
     );
 
@@ -1823,7 +1822,7 @@ async fn recompile_single_concept(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let user_prompt = format!("Topic: {}\n\n{}\n/no_think", concept.title, memories_block);
+    let user_prompt = format!("Topic: {}\n\n{}", concept.title, memories_block);
 
     let response = llm
         .generate(LlmRequest {
@@ -1838,8 +1837,7 @@ async fn recompile_single_concept(
     match response {
         Ok(raw) if !raw.trim().is_empty() => {
             let content = crate::llm_provider::strip_think_tags(&raw)
-                .replace("/no_think", "")
-                .trim()
+                                .trim()
                 .to_string();
             if !content.is_empty() {
                 let source_refs: Vec<&str> = concept
@@ -1942,7 +1940,7 @@ pub(crate) async fn re_distill_stale_concepts(
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let user_prompt = format!("Topic: {}\n\n{}\n/no_think", concept.title, memories_block);
+        let user_prompt = format!("Topic: {}\n\n{}", concept.title, memories_block);
         let response = llm_ref
             .generate(crate::llm_provider::LlmRequest {
                 system_prompt: Some(prompts.distill_concept.clone()),
@@ -1956,8 +1954,7 @@ pub(crate) async fn re_distill_stale_concepts(
         match response {
             Ok(raw) if !raw.trim().is_empty() => {
                 let content = crate::llm_provider::strip_think_tags(&raw)
-                    .replace("/no_think", "")
-                    .trim()
+                                        .trim()
                     .to_string();
                 if !content.is_empty() {
                     db.update_concept_content(&concept.id, &content, &source_id_refs, "re_distill")
@@ -2004,7 +2001,7 @@ async fn global_concept_review(
     let response = llm
         .generate(LlmRequest {
             system_prompt: Some(prompts.global_concept_review.clone()),
-            user_prompt: format!("{}\n/no_think", concepts_text),
+            user_prompt: format!("{}", concepts_text),
             max_tokens: 1024,
             temperature: 0.3,
             label: Some("global_review".into()),
@@ -2125,7 +2122,7 @@ pub async fn deep_distill_single(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let user_prompt = format!("Topic: {}\n\n{}\n/no_think", concept.title, memories_block);
+    let user_prompt = format!("Topic: {}\n\n{}", concept.title, memories_block);
 
     let response = llm
         .generate(LlmRequest {
@@ -2139,8 +2136,7 @@ pub async fn deep_distill_single(
         .map_err(|e| OriginError::Llm(format!("re-distill LLM: {}", e)))?;
 
     let content = crate::llm_provider::strip_think_tags(&response)
-        .replace("/no_think", "")
-        .trim()
+                .trim()
         .to_string();
 
     if content.is_empty() {
@@ -2817,7 +2813,7 @@ pub(crate) async fn generate_short_title(
     let input: String = stripped.chars().take(300).collect();
     let response = llm.generate(LlmRequest {
         system_prompt: Some("Given a note, write a 3-5 word title. Output ONLY the title.\n\nExample: 'The system uses libsql for vector storage with DiskANN indexing' → libsql Vector Storage\nExample: 'Google Sign-In fails with developer_error status 10' → Google Sign-In SHA Fix".to_string()),
-        user_prompt: format!("{}\n/no_think", input),
+        user_prompt: format!("{}", input),
         max_tokens: 16,
         temperature: 0.3,
         label: None,
@@ -2825,7 +2821,7 @@ pub(crate) async fn generate_short_title(
 
     match response {
         Ok(output) => {
-            let cleaned = crate::llm_provider::strip_think_tags(&output).replace("/no_think", "");
+            let cleaned = crate::llm_provider::strip_think_tags(&output);
             // Strip noise the model echoes: "- ", "[domain] ", numbered prefixes
             let mut title = cleaned.trim().to_string();
             // Strip leading "- "

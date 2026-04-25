@@ -642,7 +642,7 @@ pub(crate) async fn grow_concept(
 
     // LLM: update concept with new memory
     let user_prompt = format!(
-        "## Current Concept\n{}\n\n## New Memory\n[{}] {}\n/no_think",
+        "## Current Concept\n{}\n\n## New Memory\n[{}] {}",
         concept.content, source_id, content
     );
 
@@ -657,7 +657,7 @@ pub(crate) async fn grow_concept(
         .await
         .map_err(|e| OriginError::Llm(format!("concept growth LLM: {e}")))?;
 
-    let updated = crate::llm_provider::strip_think_tags(&response).replace("/no_think", "");
+    let updated = crate::llm_provider::strip_think_tags(&response);
     let updated = updated.trim();
 
     if updated.is_empty() {
