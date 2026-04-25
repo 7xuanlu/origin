@@ -5214,6 +5214,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Eval benchmark — runs on main CI, skip on PR CI
     async fn test_run_quality_cost_eval_basic() {
         // Use the project's fixture directory if it exists; otherwise skip gracefully.
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5420,6 +5421,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Eval benchmark — runs on main CI, skip on PR CI
     async fn test_scaling_eval_basic() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -5771,6 +5773,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Eval benchmark — runs on main CI, skip on PR CI
     async fn test_pipeline_token_eval_simulated() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -5850,6 +5853,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Eval benchmark — runs on main CI, skip on PR CI
     async fn test_native_memory_augmentation() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -6172,6 +6176,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Eval benchmark — runs on main CI, skip on PR CI
     async fn test_quality_at_scale() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -6250,6 +6255,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Eval benchmark — runs on main CI, skip on PR CI
     async fn test_memory_layer_comparison() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
