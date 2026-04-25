@@ -4930,8 +4930,8 @@ impl MemoryDB {
     /// embedding cost across concurrent `/api/memory/store` calls.
     ///
     /// Returns a parallel `Vec` — `results[i]` is the novelty result for
-    /// `contents[i]`. `None` means no neighbor was found or the embedding
-    /// failed (we fail open, matching `check_novelty`'s behavior).
+    /// `contents[i]`. `None` means no neighbor was found in the DB.
+    /// Embedding failures return `Err` (fail closed).
     pub async fn check_novelty_batch(
         &self,
         contents: &[String],
@@ -4939,16 +4939,13 @@ impl MemoryDB {
         if contents.is_empty() {
             return Ok(vec![]);
         }
-        let embeddings = match self.generate_embeddings(contents) {
-            Ok(e) => e,
-            Err(e) => {
-                log::warn!(
-                    "[quality_gate] batch embedding failed, skipping novelty for {} docs: {e}",
-                    contents.len()
-                );
-                return Ok(vec![None; contents.len()]);
-            }
-        };
+        let embeddings = self.generate_embeddings(contents).map_err(|e| {
+            log::error!(
+                "[quality_gate] batch embedding failed for {} docs (fail closed): {e}",
+                contents.len()
+            );
+            e
+        })?;
         let conn = self.conn.lock().await;
         let mut results = Vec::with_capacity(contents.len());
         for embedding in embeddings {
@@ -4982,13 +4979,10 @@ impl MemoryDB {
     }
 
     pub async fn check_novelty(&self, content: &str) -> Result<Option<(String, f64)>, OriginError> {
-        let embedding = match self.get_or_compute_embedding(content) {
-            Ok(e) => e,
-            Err(e) => {
-                log::warn!("[quality_gate] embedding failed, skipping novelty check: {e}");
-                return Ok(None); // Fail open
-            }
-        };
+        let embedding = self.get_or_compute_embedding(content).map_err(|e| {
+            log::error!("[quality_gate] embedding failed (fail closed): {e}");
+            e
+        })?;
         let vec_str = Self::vec_to_sql(&embedding);
 
         let conn = self.conn.lock().await;

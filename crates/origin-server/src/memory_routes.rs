@@ -667,16 +667,20 @@ pub async fn handle_store_memory(
             .evaluate(&doc.content, &db)
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!("[quality_gate] evaluate failed, passing through: {e}");
+                tracing::error!("[quality_gate] evaluate failed (fail closed): {e}");
                 (
                     origin_core::quality_gate::GateResult {
-                        admitted: true,
-                        reason: None,
+                        admitted: false,
+                        reason: Some(
+                            origin_core::quality_gate::RejectionReason::EmbeddingUnavailable(
+                                e.to_string(),
+                            ),
+                        ),
                         scores: origin_core::quality_gate::GateScores {
                             content_type_pass: true,
                             novelty_score: None,
                             word_count: 0,
-                            pattern_matched: None,
+                            pattern_matched: Some("embedding_unavailable".to_string()),
                             latency_ms: 0,
                         },
                     },

@@ -31,6 +31,7 @@ pub enum RejectionReason {
     TooShort(usize),
     NotNovel(f64),
     CredentialLeak(String),
+    EmbeddingUnavailable(String),
 }
 
 impl RejectionReason {
@@ -41,6 +42,7 @@ impl RejectionReason {
             Self::TooShort(_) => "too_short",
             Self::NotNovel(_) => "not_novel",
             Self::CredentialLeak(_) => "credential_leak",
+            Self::EmbeddingUnavailable(_) => "embedding_unavailable",
         }
     }
 
@@ -53,6 +55,9 @@ impl RejectionReason {
                 format!("Similarity {score:.2} above threshold — too similar to existing memory")
             }
             Self::CredentialLeak(kind) => format!("Contains credential: {kind}"),
+            Self::EmbeddingUnavailable(reason) => {
+                format!("Embedding service unavailable (fail closed): {reason}")
+            }
         }
     }
 }

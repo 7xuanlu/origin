@@ -538,19 +538,23 @@ async fn ingest_batch_process(
     let gate_results = match gate.evaluate_batch(&contents, &db).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("[ingest_batch_process] gate batch evaluate failed, admitting all: {e}");
+            tracing::error!("[ingest_batch_process] gate batch evaluate failed (fail closed), rejecting all: {e}");
             contents
                 .iter()
                 .map(|c| {
                     (
                         GateResult {
-                            admitted: true,
-                            reason: None,
+                            admitted: false,
+                            reason: Some(
+                                origin_core::quality_gate::RejectionReason::EmbeddingUnavailable(
+                                    e.to_string(),
+                                ),
+                            ),
                             scores: GateScores {
                                 content_type_pass: true,
                                 novelty_score: None,
                                 word_count: c.split_whitespace().count(),
-                                pattern_matched: None,
+                                pattern_matched: Some("embedding_unavailable".to_string()),
                                 latency_ms: 0,
                             },
                         },
