@@ -262,15 +262,14 @@ impl QualityCostReport {
 
     /// Save report to disk as pretty-printed JSON.
     pub fn save_baseline(&self, path: &Path) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
     /// Load a previously saved report from disk.
     pub fn load_baseline(path: &Path) -> Result<QualityCostReport, std::io::Error> {
         let raw = std::fs::read_to_string(path)?;
-        serde_json::from_str(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&raw).map_err(std::io::Error::other)
     }
 }
 
@@ -533,7 +532,7 @@ pub async fn run_quality_cost_eval(
                 (0.0, 0.0, 0.0)
             } else {
                 let len = sorted.len();
-                let median = if len % 2 == 0 {
+                let median = if len.is_multiple_of(2) {
                     (sorted[len / 2 - 1] + sorted[len / 2]) as f64 / 2.0
                 } else {
                     sorted[len / 2] as f64
@@ -1101,7 +1100,7 @@ pub async fn run_pipeline_token_eval_simulated(
             let mut distilled_docs: Vec<RawDocument> = Vec::new();
             let mut merged_ids: HashSet<String> = HashSet::new();
 
-            for (_mtype, group) in &type_groups {
+            for group in type_groups.values() {
                 if group.len() >= 2 {
                     // Merge the group into one combined entry
                     let combined_content = group
@@ -1162,7 +1161,7 @@ pub async fn run_pipeline_token_eval_simulated(
             let search_tok = count_results_tokens(&results) as f64;
             // Build a modified grades map: merged IDs map to the best relevance in the group
             let mut distilled_grades: HashMap<String, u8> = HashMap::new();
-            for (_mtype, group) in &type_groups {
+            for group in type_groups.values() {
                 if group.len() >= 2 {
                     let best_seed = group.iter().max_by_key(|s| s.relevance).unwrap();
                     let merged_id = format!("distilled_{}", best_seed.id);
@@ -1759,8 +1758,6 @@ pub struct MemoryLayerComparisonReport {
 
 /// Run a fair head-to-head comparison of memory layer approaches on the same fixture data.
 ///
-/// Each approach is simulated faithfully against the same seeds and queries:
-/// - FlatMarkdown: all seeds concatenated as markdown, injected every turn
 /// Deterministic Fisher-Yates shuffle using the query string as a seed.
 /// Produces the same ordering for the same (items, seed_str) pair, ensuring
 /// reproducible NDCG measurements across runs while removing storage-order bias.
@@ -3197,6 +3194,7 @@ async fn run_strategy_search(
 ///
 /// `relevance_map` maps source_id -> relevance grade (0-3).
 /// `evidence_sets` maps question index -> set of relevant source_ids.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_condition<Q: AsRef<str>>(
     db: &MemoryDB,
     condition: PipelineCondition,
@@ -3394,6 +3392,7 @@ pub async fn run_locomo_pipeline_eval(
     let mut total_observations = 0usize;
 
     // Per-cell accumulators: (condition, strategy) -> Vec<(ndcg, mrr, recall, ctx_tokens)>
+    #[allow(clippy::type_complexity)]
     let mut accumulators: HashMap<(String, String), Vec<(f64, f64, f64, f64, usize, usize)>> =
         HashMap::new();
 
@@ -3704,6 +3703,7 @@ pub async fn run_longmemeval_pipeline_eval(
     let mut total_queries = 0usize;
     let mut total_observations = 0usize;
 
+    #[allow(clippy::type_complexity)]
     let mut accumulators: HashMap<(String, String), Vec<(f64, f64, f64, f64, usize, usize)>> =
         HashMap::new();
 
@@ -3738,7 +3738,7 @@ pub async fn run_longmemeval_pipeline_eval(
         let mut evidence_ids: HashSet<String> = HashSet::new();
         let mut relevance_map: HashMap<String, u8> = HashMap::new();
 
-        for (_i, mem) in memories.iter().enumerate() {
+        for mem in memories.iter() {
             let sid = format!(
                 "lme_{}_{}_t{}",
                 sample.question_id, mem.session_idx, mem.turn_idx
@@ -4257,7 +4257,7 @@ pub async fn run_context_path_eval(
         let conv_results: Vec<&ContextPathResult> = all_results
             .iter()
             .rev()
-            .take_while(|r| r.question.len() > 0) // all from this conv
+            .take_while(|r| !r.question.is_empty()) // all from this conv
             .collect();
         let improved = conv_results
             .iter()
@@ -4549,7 +4549,7 @@ pub async fn run_e2e_context_eval(
             }
 
             questions_done += 1;
-            if questions_done % 10 == 0 {
+            if questions_done.is_multiple_of(10) {
                 eprintln!(
                     "  [progress] {}/{} questions",
                     questions_done, max_questions_per_conv
@@ -5696,8 +5696,8 @@ mod tests {
         // Print results
         eprintln!("\n=== Pipeline Token Efficiency ===");
         eprintln!(
-            "{:<12} | {:<8} | {:<12} | {:<12} | {:<8} | {}",
-            "Stage", "Memories", "Corpus Tok", "Search Tok", "NDCG", "Density"
+            "{:<12} | {:<8} | {:<12} | {:<12} | {:<8} | Density",
+            "Stage", "Memories", "Corpus Tok", "Search Tok", "NDCG"
         );
         eprintln!(
             "{:-<12}-+-{:-<8}-+-{:-<12}-+-{:-<12}-+-{:-<8}-+-{:-<8}",
@@ -5789,8 +5789,8 @@ mod tests {
         eprintln!("\n=== Origin: Cost of Better Recall ===\n");
         eprintln!("When you need specific information from past sessions:\n");
         eprintln!(
-            "{:<28} | {:<19} | {}",
-            "Alternative", "Additional tokens", "Quality"
+            "{:<28} | {:<19} | Quality",
+            "Alternative", "Additional tokens"
         );
         eprintln!("{:-<28}-+-{:-<19}-+-{:-<50}", "", "", "");
         for alt in &report.alternatives {
@@ -5873,7 +5873,7 @@ mod tests {
         // Load the model on a blocking thread (LlmEngine is not Send/Sync).
         eprintln!("Loading {} ...", model_spec.display_name);
         let llm_provider: Arc<dyn crate::llm_provider::LlmProvider> =
-            match tokio::task::spawn_blocking(|| OnDeviceProvider::new()).await {
+            match tokio::task::spawn_blocking(OnDeviceProvider::new).await {
                 Ok(Ok(p)) => Arc::new(p),
                 Ok(Err(e)) => {
                     eprintln!("Skipping: LLM provider init failed: {}", e);
@@ -6221,8 +6221,8 @@ mod tests {
         // Print comparison table
         eprintln!("\n=== Memory Layer Comparison ===");
         eprintln!(
-            "{:<22} | {:<10} | {:<8} | {:<10} | {:<10} | {}",
-            "Approach", "Tok/query", "NDCG", "Q/1kT", "Accessible", "Description"
+            "{:<22} | {:<10} | {:<8} | {:<10} | {:<10} | Description",
+            "Approach", "Tok/query", "NDCG", "Q/1kT", "Accessible"
         );
         eprintln!(
             "{:-<22}-+-{:-<10}-+-{:-<8}-+-{:-<10}-+-{:-<10}-+-{:-<30}",
@@ -6327,8 +6327,8 @@ mod tests {
         eprintln!("\n=== End-to-End Answer Quality ===");
         eprintln!("Model: {}", report.model);
         eprintln!(
-            "{:<20} | {:<12} | {:<12} | {:<12} | {}",
-            "Approach", "Answer Score", "Context Tok", "Answer Tok", "Queries"
+            "{:<20} | {:<12} | {:<12} | {:<12} | Queries",
+            "Approach", "Answer Score", "Context Tok", "Answer Tok"
         );
         eprintln!(
             "{:-<20}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<8}",
@@ -6413,7 +6413,7 @@ mod tests {
         // Load provider on a blocking thread (LlmEngine is not Send/Sync).
         eprintln!("Loading {} ...", model_spec.display_name);
         let provider: Arc<dyn crate::llm_provider::LlmProvider> =
-            match tokio::task::spawn_blocking(|| OnDeviceProvider::new()).await {
+            match tokio::task::spawn_blocking(OnDeviceProvider::new).await {
                 Ok(Ok(p)) => Arc::new(p),
                 Ok(Err(e)) => {
                     eprintln!("Skipping: LLM provider init failed: {}", e);
@@ -6437,8 +6437,8 @@ mod tests {
             report.total_questions, report.questions_per_conv, report.conversations
         );
         eprintln!(
-            "{:<20} | {:<12} | {:<12} | {}",
-            "Approach", "Answer Score", "Context Tok", "Avg Answer Len"
+            "{:<20} | {:<12} | {:<12} | Avg Answer Len",
+            "Approach", "Answer Score", "Context Tok"
         );
         eprintln!("{:-<20}-+-{:-<12}-+-{:-<12}-+-{:-<12}", "", "", "", "");
         for r in &report.results {
@@ -6572,7 +6572,7 @@ mod tests {
         // Phase 1: run E2E eval to collect tuples.
         eprintln!("Loading {} ...", model_spec.display_name);
         let provider: Arc<dyn crate::llm_provider::LlmProvider> =
-            match tokio::task::spawn_blocking(|| OnDeviceProvider::new()).await {
+            match tokio::task::spawn_blocking(OnDeviceProvider::new).await {
                 Ok(Ok(p)) => Arc::new(p),
                 Ok(Err(e)) => {
                     eprintln!("Skipping: LLM provider init failed: {}", e);
@@ -6608,8 +6608,8 @@ mod tests {
         let report = aggregate_judgments(&results, "haiku");
         eprintln!("\n=== E2E Answer Quality: LoCoMo (Claude Haiku Judge) ===");
         eprintln!(
-            "{:<20} | {:<10} | {:<10} | {:<14} | {}",
-            "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+            "{:<20} | {:<10} | {:<10} | {:<14} | Total",
+            "Approach", "Accuracy", "Correct", "Context Tok"
         );
         eprintln!(
             "{:-<20}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",

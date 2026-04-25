@@ -1559,8 +1559,8 @@ async fn judge_e2e_context_locomo() {
     let report = aggregate_judgments(&results, "haiku");
     eprintln!("\n=== E2E Context Eval: LoCoMo (Claude Haiku Judge) ===");
     eprintln!(
-        "{:<25} | {:<10} | {:<10} | {:<14} | {}",
-        "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
     );
     eprintln!(
         "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
@@ -1642,8 +1642,8 @@ async fn judge_e2e_context_locomo_api_sonnet() {
     let report = aggregate_judgments(&results, "sonnet");
     eprintln!("\n=== E2E Context Eval: LoCoMo (Haiku answers, Sonnet judge) ===");
     eprintln!(
-        "{:<25} | {:<10} | {:<10} | {:<14} | {}",
-        "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
     );
     eprintln!(
         "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
@@ -1688,8 +1688,8 @@ async fn judge_e2e_context_locomo_sonnet() {
     let report = aggregate_judgments(&results, "sonnet");
     eprintln!("\n=== E2E Context Eval: LoCoMo (Qwen answers, Sonnet judge) ===");
     eprintln!(
-        "{:<25} | {:<10} | {:<10} | {:<14} | {}",
-        "Approach", "Accuracy", "Correct", "Context Tok", "Total"
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
     );
     eprintln!(
         "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
