@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.3](https://github.com/7xuanlu/origin/compare/v0.1.2...v0.1.3) (2026-04-25)
+
+
+### Bug Fixes
+
+* **ci:** add workflow_dispatch to release.yml for manual re-trigger ([85c2842](https://github.com/7xuanlu/origin/commit/85c28420587076da33786fdbf2061abe51b0251c))
+* **ci:** drop Origin prefix from release name, remove dead config ([aa25245](https://github.com/7xuanlu/origin/commit/aa25245dbe561df2d799f46664e277b4c4c3b953))
+* **ci:** single release per version, consistent titles, changelog in body ([d30930b](https://github.com/7xuanlu/origin/commit/d30930b1ff98024737ca837725a38a481bcea028))
+* **ci:** use env context for secrets check in workflow_dispatch ([cb84b95](https://github.com/7xuanlu/origin/commit/cb84b954a14af74b0f9184ebcf80bde3fb45c024))
+* **ci:** use PAT in release-please so tag push triggers release build ([928ce65](https://github.com/7xuanlu/origin/commit/928ce6508b57e8257e05d41ba5c413280b7872b1))
+* **eval:** token efficiency evaluation framework ([#3](https://github.com/7xuanlu/origin/issues/3)) ([311ceea](https://github.com/7xuanlu/origin/commit/311ceea4543f5c02864e03d9fe7d57fa3197ca61))
+
 ## [0.1.2](https://github.com/7xuanlu/origin/compare/v0.1.1...v0.1.2) (2026-04-24)
 
 
