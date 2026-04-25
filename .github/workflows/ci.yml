@@ -63,8 +63,11 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run Rust tests
-        run: cargo test -p origin-types -p origin-server -p origin-core
+      - name: Run Rust tests (types + server)
+        run: cargo test -p origin-types -p origin-server
+
+      - name: Run Rust tests (core)
+        run: cargo test -p origin-core
 
       # Eval benchmarks (#[ignore]) — slow embedding-heavy tests, run on main only.
       - name: Run eval benchmarks
