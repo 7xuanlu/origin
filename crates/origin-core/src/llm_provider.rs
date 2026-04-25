@@ -695,6 +695,106 @@ impl LlmProvider for OpenAICompatibleProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ClaudeCliProvider — uses `claude -p` CLI (Max plan, no API key)
+// ---------------------------------------------------------------------------
+
+/// LLM provider that shells out to `claude -p` for inference.
+/// Uses the user's Claude Max subscription via OAuth (no API key needed).
+/// Intended for eval benchmarks comparing on-device vs cloud quality.
+pub struct ClaudeCliProvider {
+    model: String,
+}
+
+impl ClaudeCliProvider {
+    pub fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+        }
+    }
+
+    /// Haiku via Max plan.
+    pub fn haiku() -> Self {
+        Self::new("haiku")
+    }
+
+    /// Sonnet via Max plan.
+    pub fn sonnet() -> Self {
+        Self::new("sonnet")
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ClaudeCliProvider {
+    async fn generate(&self, request: LlmRequest) -> Result<String, LlmError> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::process::Command;
+
+        let mut args = vec![
+            "-p".to_string(),
+            "--model".to_string(),
+            self.model.clone(),
+            "--no-session-persistence".to_string(),
+            "--allowedTools".to_string(),
+            "".to_string(),
+        ];
+        if let Some(ref sys) = request.system_prompt {
+            args.push("--system-prompt".to_string());
+            args.push(sys.clone());
+        }
+
+        let mut child = Command::new("claude")
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| LlmError::InferenceFailed(format!("claude -p spawn: {e}")))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(request.user_prompt.as_bytes())
+                .await
+                .map_err(|e| LlmError::InferenceFailed(format!("claude stdin write: {e}")))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| LlmError::InferenceFailed(format!("claude -p wait: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(LlmError::InferenceFailed(format!(
+                "claude -p exited {}: {}",
+                output.status, stderr
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &str {
+        &self.model
+    }
+
+    fn backend(&self) -> LlmBackend {
+        LlmBackend::Api
+    }
+
+    fn synthesis_token_limit(&self) -> usize {
+        32000
+    }
+
+    fn recommended_max_output(&self) -> u32 {
+        4096
+    }
+}
+
 /// Mock provider for testing -- returns a fixed response.
 #[cfg(test)]
 pub struct MockProvider {

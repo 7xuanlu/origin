@@ -1,0 +1,854 @@
+# Noisy context — 20 relevant + 80 filler across 4 cases.
+# Tests signal extraction when the corpus is dominated by plausible but irrelevant memories.
+# Each case: 5 relevant seeds (relevance >= 2) + 20 filler seeds (relevance = 0).
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# Query: how does the caching layer work
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "how does the caching layer work"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "noisy_cache_strategy"
+content = "Caching layer uses Redis via deadpool-redis. Two cache namespaces: session: prefix for auth tokens (24h TTL) and rate: prefix for rate-limit counters (60s TTL). No application-level query result caching — DB is fast enough at current scale."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "noisy_cache_invalidation"
+content = "Cache invalidation strategy: write-through for session tokens (write to Redis and DB simultaneously). Rate-limit counters are Redis-only (no DB backing). No cache-aside pattern used — complexity not justified."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "noisy_cache_pool"
+content = "Redis connection pool: max 10 connections, idle timeout 300s. deadpool-redis configured with exponential backoff on connection failure. If Redis is unreachable, session reads fall through to DB, rate limiting is disabled."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_cache_hit_rate"
+content = "Session cache hit rate measured at 94% in production. The 6% miss rate is cold starts (new logins) and expired tokens. DB fallback for misses adds approximately 8ms compared to a cache hit."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_cache_eviction"
+content = "Redis maxmemory policy: allkeys-lru. Redis instance is 256 MB on the managed plan. At current session volume (< 5k active sessions), eviction pressure is negligible. Monitor if sessions exceed 50k."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 2
+
+# 20 filler seeds (relevance = 0, diverse topics)
+
+[[cases.seeds]]
+id = "noisy1_f01"
+content = "Stripe webhook handler must return 200 within 30 seconds or Stripe will retry. Processing is done asynchronously by pushing the event to the job queue immediately on receipt."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f02"
+content = "Preferred IDE is Zed for Rust, VS Code for TypeScript. Vim keybindings enabled in both. JetBrains Mono 13pt font. Catppuccin Mocha theme."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f03"
+content = "Team retrospective held every 2 weeks after the sprint review. Format: Start/Stop/Continue. Action items tracked in Linear. Facilitator rotates through the team."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f04"
+content = "User table has 120k rows in production. Account table has 45k rows. Resource table has 1.8M rows. These are approximate as of March 15 — fast-growing."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f05"
+content = "Error monitoring: Sentry with 10% sample rate on 429 responses, 100% on 500. Source maps uploaded on every deploy. Slack integration posts new error types to #alerts channel."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f06"
+content = "Learning Rust ownership model via Rustlings exercises. Completed chapters 1-8 of The Book. Lifetimes chapter taking the longest. Plan to finish by end of month."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f07"
+content = "Marketing site SEO: Lighthouse SEO score 95. Meta descriptions and OG tags for all landing pages. Blog posts indexed in Google Search Console. Sitemap submitted."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f08"
+content = "Physical health: blood pressure 118/76, cholesterol 185. Annual physical on March 10. Doctor recommended increasing cardio frequency. Currently at 3x/week."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f09"
+content = "Competitor analysis: Notion AI adds memory-like features via Q&A on workspace content. Not a direct competitor — Origin focuses on cross-tool agent memory, not document Q&A."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f10"
+content = "Cargo workspace linting: clippy pedantic enabled for all crates. clippy::nursery denied. clippy::cargo enabled. CI fails on any new warning. Existing suppressions tracked in a Notion doc for cleanup."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f11"
+content = "Open source release plan: Apache-2.0 for origin-types and origin-core, AGPL-3.0 for the Tauri app. Rationale: allow downstream tools to use the library crates without AGPL contamination."
+memory_type = "decision"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f12"
+content = "Vacation policy: 20 days PTO plus company holidays. Unlimited PTO not offered — data shows it leads to people taking less time off. Minimum 5 consecutive days off required per year."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f13"
+content = "GraphQL considered and rejected for the public API. N+1 query risk, schema versioning overhead, and additional client complexity were the deciding factors. REST with OpenAPI spec chosen instead."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f14"
+content = "GitHub Copilot subscription active. Used for boilerplate and test generation. Disabled for security-sensitive code (auth, crypto). Code review always required regardless of source."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f15"
+content = "Interview process: 30-min phone screen, 60-min technical discussion (no LeetCode), 2-hour pair programming on a realistic problem, 30-min culture fit with CEO. Total: 4 hours."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f16"
+content = "Embedding model BGE-Base-EN-v1.5-Q produces 768-dimensional dense vectors. 512 token maximum per chunk. Quantized ONNX model runs on CoreML for Apple Silicon acceleration."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f17"
+content = "Morning routine: wake 6:30am, 10 minutes journaling, 30-minute run or gym, shower, deep work block 9am. No phone or email before 9am."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f18"
+content = "Software subscription audit: cancelled Notion (migrated to Obsidian), kept Linear, Vercel, GitHub Pro, Figma. Monthly software spend reduced from $240 to $115."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f19"
+content = "Code review process: all PRs require at least one approval. Draft PRs can be opened for early feedback. Review within 24 hours expected. Auto-assign reviewers based on CODEOWNERS file."
+memory_type = "fact"
+domain = "work"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy1_f20"
+content = "RustConf 2024 talk proposal submitted: 'Local-first AI memory with Rust and libSQL'. Notification expected in 6 weeks. Preparing a demo of the Origin hybrid search pipeline."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# Query: what CI/CD pipeline do we use
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what CI/CD pipeline do we use"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "noisy_ci_platform"
+content = "CI/CD platform is GitHub Actions. Workflows defined in .github/workflows/. Three main workflows: ci.yml (PR checks), deploy-staging.yml (main branch pushes), deploy-prod.yml (manual trigger with approval gate)."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "noisy_ci_jobs"
+content = "CI job structure: format check (cargo fmt --check, prettier), lint (clippy pedantic, eslint), test (unit + integration in matrix), security audit (cargo audit), and build (release binary). Jobs run in parallel where independent."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 3
+
+[[cases.seeds]]
+id = "noisy_ci_deploy"
+content = "Staging deploys automatically on main branch push. Production deploys require manual approval via GitHub Environments. Approval is gated on the 'prod-approvers' team (EM + CTO). One approval required."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_ci_time"
+content = "CI runtime target: < 8 minutes for PR checks. Achieved by: cargo-nextest for test parallelism, rust caching via Swatinem/rust-cache action, and splitting lint/test into parallel jobs. Current median is 6m 20s."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_ci_coverage"
+content = "Coverage gate in CI: cargo-tarpaulin for Rust (80% line coverage on service layer), vitest c8 for frontend (75% branch coverage). Gate runs on PR and blocks merge if not met. Coverage delta reported as a PR comment."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 2
+
+# 20 filler seeds (diverse topics)
+
+[[cases.seeds]]
+id = "noisy2_f01"
+content = "Product roadmap Q2: API v2 (April), SSO/SAML (May), mobile app MVP (June). Roadmap items have assigned DRIs (directly responsible individuals) and acceptance criteria in Linear."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f02"
+content = "Origin's refinery runs dedup proposals, entity extraction, and recap triggers in a fixed phase sequence every 30 minutes. Each phase is idempotent to handle restarts safely."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f03"
+content = "Dog (Turing, beagle, age 3) needs flea prevention treatment monthly. Brand: NexGard. Next treatment: April 15. Vet contact: Austin Animal Clinic, (512) 555-0142."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f04"
+content = "Authentication uses JWT (15min access, 30-day refresh) with httpOnly Secure cookies. No localStorage for tokens. Auth0 for OAuth2 social login. Own email/password flow for enterprise."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f05"
+content = "Budget cycle: annual in November. Headcount requests submitted by October 1. Software subscription renewals evaluated in Q4. Engineering budget is $1.2M total including salaries."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f06"
+content = "Qwen3-4B-Instruct-2507 running on Metal GPU via llama-cpp-2. Dedicated std::thread for inference. Bridge pattern: capture Tokio runtime Handle at thread spawn for async DB write-back."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f07"
+content = "Meal planning done Sunday afternoon. 5 dinners planned, 2 nights flex (takeout or leftovers). Grocery list generated from the plan. Instacart delivery scheduled for Sunday evening."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f08"
+content = "API documentation hosted at docs.company.io. Generated from OpenAPI 3.1 spec via Redoc. Updated on every release automatically by the deploy workflow. Feedback button links to Canny."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f09"
+content = "Standing desk height: 41 inches for standing, 28 inches for sitting. Alternating every 45-60 minutes. Reminder set via TimerBar app. Ergotron LX arm for the ultrawide monitor."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f10"
+content = "Competitor Mem0 raised Series A in February. Valuation estimated at $60M. Focus: API-first agent memory for enterprise. Origin differentiates on local-first and human curation layer."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f11"
+content = "Payment module known bugs: WEBAPP-412 (webhook swallows HMAC verification error), WEBAPP-389 (refund over-charge not validated), WEBAPP-401 (idempotency key tied to UUID not cart_id)."
+memory_type = "fact"
+domain = "project:webapp"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f12"
+content = "Podcast: Lex Fridman #421 with Andrej Karpathy on AI memory and cognition. Highly relevant to Origin's design. Key takeaway: external memory must be human-verifiable to build trust."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f13"
+content = "SQL safety rule: always use parameterized queries. Never interpolate user input into SQL strings. Reviewed in the OWASP secure coding training. This rule is non-negotiable in code review."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f14"
+content = "Company off-site in Austin, May 12-13. Engineering sessions: API v2 design (AM day 1), deployment automation (PM day 1), product roadmap review (AM day 2). Social dinner at Franklin BBQ on day 1."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f15"
+content = "Biometric data: Oura ring HRV average 62ms, readiness score average 78. Sleep score average 82. Readiness dips to < 65 on days after 2+ alcoholic drinks. Alcohol reduced to weekends only."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f16"
+content = "Rate limiting: 1000 requests/minute per API key. 100/minute for unauthenticated. Implemented with tower-governor. Header: X-RateLimit-Remaining and X-RateLimit-Reset returned on every response."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f17"
+content = "Side project: TIL (Today I Learned) blog. Built with Astro + MDX. Deployed to Cloudflare Pages. 47 posts published. Most popular: 'Rust ownership in 5 diagrams' (1.2k views)."
+memory_type = "fact"
+domain = "personal"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f18"
+content = "Dependency management rule: run cargo update monthly and review the diff. Security advisories checked weekly via cargo audit in CI. Deny crate used to enforce banned dependencies."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f19"
+content = "Home network upgrade: Upgraded to 2 Gbps fiber from 1 Gbps. ISP: AT&T. Router handles full 2 Gbps on the WAN side. Internal Wi-Fi 6E gives 1.8 Gbps on 6 GHz band in the office."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy2_f20"
+content = "TypeScript project convention: strict mode always on. No any types except in generated code. Zod for runtime validation of external data (API responses, env vars). Type assertions require a comment explaining why."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 0
+
+
+# ─── CASE 3 ──────────────────────────────────────────────────────────────────
+# Query: what are the API rate limits
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what are the API rate limits"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "noisy_ratelimit_values"
+content = "API rate limits: 1000 requests/minute per authenticated API key. 100 requests/minute per IP for unauthenticated endpoints. Burst allowance of 50 extra requests per minute for burst-friendly endpoints (/api/search, /api/context)."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "noisy_ratelimit_impl"
+content = "Rate limiting implemented via tower-governor middleware in the Axum stack. Keyed on API key for authenticated requests, on X-Forwarded-For IP for unauthenticated. Response headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 3
+
+[[cases.seeds]]
+id = "noisy_ratelimit_exceeded"
+content = "Rate limit exceeded response: 429 Too Many Requests with JSON body containing 'error.code': 'rate_limit.exceeded' and 'Retry-After' header with seconds until the window resets."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_ratelimit_tier"
+content = "Rate limit tiers by subscription: Starter — 1000 req/min, Growth — 5000 req/min, Enterprise — unlimited (fair-use policy). Enterprise customers can request dedicated rate limit configurations."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_ratelimit_storage"
+content = "Rate limit counters stored in Redis with 60-second TTL. Sliding window algorithm with atomic INCR + EXPIRE operations. If Redis is unavailable, rate limiting is disabled and a fallback IP-based limit of 500 req/min applies."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 2
+
+# 20 filler seeds
+
+[[cases.seeds]]
+id = "noisy3_f01"
+content = "RBAC system: viewer, editor, admin roles. Embedded in JWT claims. Permission checks in handlers using DB context for fine-grained resource ownership checks."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f02"
+content = "Hybrid search in Origin uses DiskANN vector search + FTS5 full-text search, combined via Reciprocal Rank Fusion. RRF k=60. Domain boost 1.5x when query mentions domain."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f03"
+content = "Grocery budget: $400/month. Tracking with YNAB. Eating out budget separate: $200/month. Current month at $380 grocery, $170 eating out. On track."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f04"
+content = "Linear setup: projects (not teams) for work isolation. Priorities: urgent, high, medium, low. SLA: urgent = same day, high = this sprint, medium = this quarter. Triage happens in Monday bug triage."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f05"
+content = "SQLx compile-time query checking enabled. All queries validated against a database schema snapshot (sqlx-data.json). Schema snapshot regenerated after each migration with cargo sqlx prepare."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f06"
+content = "English is primary language. Conversational Spanish. Learning Mandarin via Duolingo — 120-day streak. Goal: travel to Taiwan in 2025 and hold a basic conversation."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f07"
+content = "Documentation tooling: mdBook for internal developer docs, Redoc for external API docs, Confluence for company wiki. Each tool is the canonical source for its domain — no duplication."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f08"
+content = "Encryption at rest: RDS storage encrypted with AWS KMS. S3 bucket encryption with SSE-S3. Redis in-transit encryption enabled (TLS). No client-side encryption — data is plaintext in the application."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f09"
+content = "Tax-advantaged accounts: HSA ($3,850 annual contribution), 401k (10% + 4% employer match). HSA invested in the Fidelity HSA index fund options. Balance: $8,200 as of March."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f10"
+content = "Rust edition: 2024. Clippy pedantic on all crates. Deny unused_must_use, unused_variables, dead_code in CI. Zero unsafe blocks in origin-core — policy enforced via #![forbid(unsafe_code)]."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f11"
+content = "Feature flags: LaunchDarkly in production, local TOML file in dev. Flags used for gradual rollouts, kill switches, and A/B tests. Flag reads cached in memory with 60-second TTL to reduce API calls."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f12"
+content = "Coaching sessions: leadership coaching with external coach, bi-weekly. Focus: executive presence, difficult conversations, and scaling the team. Notes in a private Obsidian vault."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f13"
+content = "Pagination standard: cursor-based for list endpoints. Opaque cursor = base64(row_id + sort_key). Page size default 20, max 100. No offset pagination offered."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f14"
+content = "Travel preferences: direct flights only for trips > 4 hours. Aisle seat. Lounge access via Amex Platinum. Hotel preference: Marriott (Bonvoy member, Gold status)."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f15"
+content = "Knowledge graph in Origin stores entities, relations, and observations. FK cascades propagate deletes. 2-hop traversal used to augment retrieval results with entity context."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f16"
+content = "Postmark for transactional email: welcome, password reset, billing receipts, webhook failure alerts. Template IDs are constants in the mailer crate. Template changes require PR approval."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f17"
+content = "Weekly newsletter: sent every Tuesday. Open rate: 34%. Click-through rate: 8%. List size: 2,800 subscribers. Managed in Resend. Unsubscribe rate: < 0.5%."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f18"
+content = "Work anniversary: April 3, 4 years at current company. Stock cliff was at year 1 (25%), now in monthly vesting. Refresher grant vesting started Q3 last year."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f19"
+content = "Rust async runtime: Tokio. Using #[tokio::main] macro. Worker threads set to num_cpus. Blocking operations use tokio::task::spawn_blocking. No async-std or smol."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy3_f20"
+content = "Sprint planning: 2 weeks sprints. Story points via Fibonacci (1, 2, 3, 5, 8, 13). Velocity average: 42 points/sprint. No carry-over allowed — re-estimate and re-prioritize."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+
+# ─── CASE 4 ──────────────────────────────────────────────────────────────────
+# Query: how is user data encrypted
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "how is user data encrypted"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "noisy_enc_at_rest"
+content = "Data at rest: RDS storage encrypted with AWS KMS (AES-256). S3 buckets use SSE-S3 (AES-256). Redis Elasticache encrypted at rest with AES-256. Encryption keys managed by AWS — no customer-managed keys at this stage."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "noisy_enc_in_transit"
+content = "Data in transit: TLS 1.2 minimum, TLS 1.3 preferred. ALB terminates TLS. Redis in-transit encryption enabled. All inter-service communication is internal VPC — no clear-text paths. Certificate managed by ACM."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 3
+
+[[cases.seeds]]
+id = "noisy_enc_passwords"
+content = "Passwords hashed with Argon2id (argon2 crate), memory=65536, iterations=3, parallelism=4. Salt is randomly generated per password. Bcrypt not used — Argon2id is the current recommended standard."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_enc_pii"
+content = "PII handling: email addresses and names are stored in plaintext in Postgres. No application-level field encryption at this stage. GDPR compliance via access controls and the right-to-erasure flow (soft delete + anonymization)."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 2
+
+[[cases.seeds]]
+id = "noisy_enc_keys"
+content = "API keys stored as bcrypt hashes (cost factor 12) in the api_keys table. The plaintext key is shown to the user once on creation and never stored. Key prefix (first 8 chars) stored in plaintext for identification."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 2
+
+# 20 filler seeds
+
+[[cases.seeds]]
+id = "noisy4_f01"
+content = "Object storage: S3 us-east-1. Versioning enabled on user-uploads bucket. Lifecycle: Glacier after 90 days, delete after 365. Pre-signed URL expiry: 15 minutes."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f02"
+content = "Qwen3-4B-Instruct-2507 used for on-device classification, quality assessment, and reranking. Metal GPU on Apple Silicon. Fallback: degrade gracefully if Metal is unavailable."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f03"
+content = "Fitness goal check-in: weight 178 lbs (target 175). Body fat 17% (target 14%). Increasing protein intake to 180g/day. Adding a second strength session per week."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f04"
+content = "SAML 2.0 SSO for enterprise customers. SP metadata at /sso/saml/metadata. Session created on successful assertion validation. Using the samael crate for SAML XML parsing."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f05"
+content = "Sprint retrospective action items from March sprint: improve flaky test detection, add pre-commit hooks for formatting, and write runbook for payment webhook failure recovery."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f06"
+content = "Origin agent registry: x-agent-name header is the canonical agent identifier. Trust level (trusted, standard, untrusted) assigned per agent name. Trust gates write permissions and confidence ceilings."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f07"
+content = "Furniture: planning to replace the home office desk. Candidates: Uplift V2 Commercial (72x30), Flexispot E7 Pro (72x30). Budget: $800. Decision pending ergonomics review."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f08"
+content = "Multi-tenant architecture: all data partitioned by account_id. Row-level security not used — application layer enforces account scoping on all queries. Verified in integration tests."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f09"
+content = "Personal GitHub repository naming convention: kebab-case for all repos, no underscores. Public repos have a description and at least one topic tag. Stale repos archived, not deleted."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f10"
+content = "Data export for GDPR: /api/settings/export triggers async job, packages JSON + files into ZIP, emails presigned download link. Expires in 7 days. Only one pending export per user allowed."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f11"
+content = "DeepSeek-R1 evaluated as an alternative to Qwen3 for on-device inference. Rejected: 8B model exceeds the 4 GB memory budget for the origin-server daemon on base Mac configurations."
+memory_type = "decision"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f12"
+content = "Emergency contact: Jordan (spouse), mobile (512) 555-0188. Doctor: Austin Primary Care, (512) 555-0243. Pharmacy: CVS on Congress Ave."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f13"
+content = "WebSocket /ws/updates broadcasts memory store events, refinery completion, and quality gate rejections. Connected clients include the Tauri app and any MCP client subscribed to updates."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f14"
+content = "Q1 revenue: $28k ARR. Q2 target: $60k ARR. Primary growth lever: content marketing + word-of-mouth. Paid ads not yet evaluated. CAC from content is $0."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f15"
+content = "Book notes: The Pragmatic Programmer chapter 8 (Pragmatic Projects). Key insight: great teams have a project identity. Action: establish team name and associated rituals before the next offsite."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f16"
+content = "Database schema convention: all tables have id (UUID), created_at, and updated_at. updated_at managed by a trigger. No ON UPDATE CURRENT_TIMESTAMP in Postgres — trigger is more reliable."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f17"
+content = "Local dev environment: Docker Compose with Postgres 16, Redis 7, Localstack. Run docker compose up -d before cargo run. pg_admin available at localhost:5050 for DB inspection."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f18"
+content = "Reading: Raft consensus algorithm paper. Implementing a simplified Raft in Rust as a learning project. Not intended for production use — purely educational. Repository: github.com/lucian/raft-rs."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f19"
+content = "Origin's access tracker records memory access counts and applies time decay. High-access memories receive a retrieval score boost. Decay rate: 0.1 per day for memories not accessed in 7 days."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "noisy4_f20"
+content = "Board meeting scheduled for April 28. Deck needs to be sent 72 hours in advance. Topics: Q1 actuals, Q2 plan, headcount ask, competitive landscape update. Presenter: CEO with EM for engineering slides."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0

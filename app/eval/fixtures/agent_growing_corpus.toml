@@ -1,0 +1,1004 @@
+# Growing corpus scaling fixture — large seed sets allow subset testing at varying corpus sizes.
+# Each case has ~40 seeds (5-8 relevant + 30-35 filler) across diverse domains.
+# Use this fixture to measure NDCG@10 as corpus size scales from 10 to 120 seeds.
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# Query: what architecture decisions were made for the API layer
+# 6 relevant + 34 filler
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what architecture decisions were made for the API layer"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "gc_api_rest_decision"
+content = "Chose REST over GraphQL for the public API. GraphQL considered but rejected: adds client complexity, N+1 risks, and schema versioning overhead. REST with versioned URL prefixes (/v1/, /v2/) gives simpler evolution."
+memory_type = "decision"
+domain = "project:api"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "gc_api_versioning"
+content = "API versioning strategy: URL-path versioning (/v1/, /v2/). Header-based versioning considered and rejected — too invisible and harder to cache. Breaking changes get a new version; additive changes can land in the current version."
+memory_type = "decision"
+domain = "project:api"
+source_agent = "claude-desktop"
+relevance = 3
+
+[[cases.seeds]]
+id = "gc_api_gateway"
+content = "No API gateway in front of the service for now. AWS API Gateway adds latency and cost at current scale. Plan to add a gateway when multi-tenant rate limiting or external partner access is required."
+memory_type = "decision"
+domain = "project:api"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "gc_api_pagination"
+content = "Pagination standard: cursor-based for all list endpoints using an opaque `cursor` field (base64-encoded row ID + sort key). Offset pagination not offered because it causes inconsistent results on concurrent writes."
+memory_type = "decision"
+domain = "project:api"
+source_agent = "claude-code"
+relevance = 2
+
+[[cases.seeds]]
+id = "gc_api_rate_limit"
+content = "Rate limiting: 1000 requests/minute per API key, 100/minute per IP for unauthenticated endpoints. Implemented with tower-governor in the Axum middleware stack. Exceeded limits return 429 with Retry-After header."
+memory_type = "fact"
+domain = "project:api"
+source_agent = "cursor"
+relevance = 2
+
+[[cases.seeds]]
+id = "gc_api_openapi"
+content = "OpenAPI 3.1 spec generated from code using utoipa macros on each handler. Spec is served at /openapi.json and /swagger-ui in development. Spec is linted with spectral in CI for breaking-change detection."
+memory_type = "fact"
+domain = "project:api"
+source_agent = "claude-code"
+relevance = 2
+
+# Filler — diverse domains and types, relevance 0
+
+[[cases.seeds]]
+id = "gc_f01"
+content = "Prefers espresso over drip coffee in the morning. Afternoon cutoff is 2pm to avoid disrupting sleep."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f02"
+content = "Weekly 1:1 with manager moved from Tuesday to Thursday. Duration is 30 minutes. Format is walking-meeting when weather permits."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f03"
+content = "Currently reading: The Pragmatic Programmer (re-read). Taking notes in Obsidian under /books/pragmatic-programmer."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f04"
+content = "Running 5K three times per week. Goal is a sub-25 minute 5K by June. Current PB is 27:42."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f05"
+content = "Switched to Zed editor for Rust development after VS Code became sluggish on large codebases. Vim bindings enabled. Still using VS Code for TypeScript."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f06"
+content = "Grocery shopping on Saturday mornings. Using Instacart for heavy items, local store for fresh produce. Monthly grocery budget: $400."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f07"
+content = "Obsidian vault structure: daily notes in /journal, project notes in /projects, book notes in /books. Templates for each note type. Synced via iCloud."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f08"
+content = "Home lab setup: Mac mini M4 running as a home server, TrueNAS Scale on a Beelink SER7, Ubiquiti UniFi network. Proxied via Cloudflare Tunnel for external access."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f09"
+content = "Frontend framework preference for side projects: SvelteKit. Lighter bundle than Next.js and simpler mental model. Avoid React for solo projects due to boilerplate overhead."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f10"
+content = "Dentist appointment reminder: checkup due in March. Last visit was September. Insurance covers 2 cleanings per year."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f11"
+content = "Team offsite scheduled for May 12-13 in Austin. Hotel booked at the Marriott downtown. Agenda planning starts April 28."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f12"
+content = "Q2 OKRs finalized: Ship v2 API with full OpenAPI spec, reach 50 paying customers, reduce p99 API latency below 300ms. OKRs approved by VP on March 1."
+memory_type = "goal"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f13"
+content = "Product roadmap for H1: authentication overhaul (March), API v2 (April), mobile app MVP (June). Roadmap presented to board on February 20."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f14"
+content = "New hire starting March 15: Sarah Chen, senior frontend engineer. Onboarding buddy is Marcus. First task: take over the dashboard rebuild."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f15"
+content = "Company all-hands is the first Friday of every month. Notes posted to Notion. Action items tracked in Linear with owner and due date."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f16"
+content = "Vendor evaluation for email delivery: Postmark vs Resend vs SendGrid. Resend won on developer experience and pricing. Monthly volume is < 50k emails, well within the Resend free tier."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f17"
+content = "Feature flag system: LaunchDarkly for production. Local development uses a TOML file in config/flags.toml that overrides server-side flag values. Flag reads are cached in memory with 60s TTL."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f18"
+content = "Logging library for the Node.js backend services: Pino. Structured JSON output, low overhead. Log correlation via x-request-id header propagated through the service mesh."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f19"
+content = "Onboarding flow split into 5 steps: account creation, workspace setup, invite teammates, connect integrations, first resource. Drop-off analysis shows step 4 (integrations) has 35% abandonment."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f20"
+content = "Customer support stack: Intercom for live chat, Linear for bug reports triaged from support. Support SLA: P1 (outage) 1 hour, P2 (degraded) 4 hours, P3 (feature request) 5 business days."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f21"
+content = "Billing handled by Stripe Billing. Subscription tiers: Starter ($49/mo), Growth ($149/mo), Enterprise (custom). Annual plans at 20% discount. Prorated upgrades handled automatically by Stripe."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f22"
+content = "Design system based on Radix UI primitives with Tailwind CSS utility classes. No CSS-in-JS. Design tokens (colors, spacing, typography) defined in tailwind.config.ts. Figma component library kept in sync manually."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f23"
+content = "Localization: English only at launch. i18n infrastructure (react-i18next) added proactively so copy is not hardcoded. Translation keys in en.json. Spanish and French planned for Q3."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f24"
+content = "Analytics: Posthog for product analytics (self-hosted on the home lab). No third-party analytics in production for GDPR compliance. Events: page_view, feature_used, subscription_upgraded, churn."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f25"
+content = "Side project: Rust CLI tool for batch image resizing. Used image crate and rayon for parallelism. Published on crates.io as imgbatch v0.1.0. Not maintained actively."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f26"
+content = "Podcast listening: Acquired, Hardcore History, Darknet Diaries, and the Rustacean Station. Listen during commute and runs. Prefer 1.25x speed for most shows."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f27"
+content = "Mechanical keyboard: Keychron Q3 with Gateron Blue switches. Profile: MT3. Noise complaints from family acknowledged. Switch to browns pending."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f28"
+content = "Sleep goal: 7.5 hours minimum. Wake time 6:30am fixed. Oura ring tracks HRV and readiness score. Low readiness (<70) means no hard workouts."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f29"
+content = "Vacation planned: 10 days in Japan, late September. Itinerary: Tokyo (4 days), Kyoto (3 days), Osaka (3 days). Flights booked, hotels not yet."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f30"
+content = "Home renovation: kitchen backsplash replacement approved. Contractor quote: $1,800 for labor, $400 for materials. Scheduled for the week of April 7."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f31"
+content = "Tax prep: documents gathered, waiting for brokerage 1099. CPA appointment on March 22. Expecting a refund based on Q4 estimated payments."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f32"
+content = "AWS cost optimization: Reserved instances for RDS (1-year term) saves $82/month vs on-demand. Committed April 10. Fargate Savings Plan under evaluation — need 3 more months of usage data."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f33"
+content = "Dependency audit run March 15: 2 moderate advisories (hyper 0.14.x), 0 high or critical. hyper upgrade to 0.14.28 resolves both. Scheduled for next PR sprint."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc_f34"
+content = "Legal: privacy policy and ToS reviewed by counsel on February 28. GDPR addendum added for EU customers. Cookie consent banner added to the marketing site. CCPA compliance verified."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# Query: what user preferences were captured
+# 5 relevant + 35 filler (distinct filler IDs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what user preferences were captured"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "gc_pref_dark_mode"
+content = "Prefers dark mode across all applications. Light mode tolerated only in browser-based tools that don't support dark mode. System-level dark mode toggle is always on."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "gc_pref_lang"
+content = "Preferred programming language for new projects: Rust for performance-critical backend work, TypeScript for frontend and tooling. Avoid Python except for data science or ML scripts."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 3
+
+[[cases.seeds]]
+id = "gc_pref_meeting"
+content = "Prefer async communication over meetings. If a meeting is necessary, keep it under 30 minutes with a written agenda. No recurring meetings without an explicit goal and owner."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "gc_pref_work_hours"
+content = "Deep work block: 9am-12pm, no interruptions. Slack notifications muted during this block. Available for urgent issues via phone call only. Email and Slack checked at 1pm and 5pm."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 2
+
+[[cases.seeds]]
+id = "gc_pref_deploy"
+content = "Prefer weekly release cadence, Tuesdays only. No Friday deploys. Every release requires a rollback plan in the release doc. Post-deploy monitoring for 30 minutes before declaring the release stable."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 2
+
+# Filler — distinct IDs from case 1 filler
+
+[[cases.seeds]]
+id = "gc2_f01"
+content = "Migrated primary Postgres instance from 14 to 16 in the staging environment. No schema changes required. EXPLAIN ANALYZE on critical queries shows no regressions."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f02"
+content = "API key rotation policy: keys expire after 1 year. Users notified at 30 days, 7 days, and 1 day before expiry. Expired keys return 401 with a specific error code (api_key.expired)."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f03"
+content = "Webhook delivery retry policy: immediate first attempt, then 1min, 5min, 30min, 2h, 12h backoff. After 6 failed attempts the webhook subscription is marked inactive and the user is emailed."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f04"
+content = "Object storage: AWS S3 in us-east-1. Versioning enabled on the user-uploads bucket. Lifecycle policy: move to Glacier after 90 days, delete after 365 days. Pre-signed URLs expire after 15 minutes."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f05"
+content = "Email templates managed in Postmark template editor. Versioned by Postmark internally. Template IDs stored as constants in the mailer service. Approval required for production template changes."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f06"
+content = "Subscription upgrade path: user selects new tier, preview shows prorated charge, confirm triggers Stripe subscription update, webhook confirms and updates local DB. Downgrade queued for next billing cycle."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f07"
+content = "Search feature powered by Meilisearch. Full re-index on schema changes takes 2 minutes for 50k documents. Incremental indexing via change data capture from Postgres using Debezium."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f08"
+content = "Audit log retention: 2 years for compliance. Stored in a read-only Postgres schema (audit schema). Application role does not have DELETE privilege on audit schema tables."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f09"
+content = "SSO via SAML 2.0 supported for Enterprise tier customers. Using the samael crate for SAML parsing. SP metadata served at /sso/saml/metadata. Session created on successful assertion."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f10"
+content = "Data export: users can export all their data as a ZIP archive from the settings page. Export includes JSON for structured data and original files for uploads. Export job runs async, user emailed when ready."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f11"
+content = "Worked through Advent of Code 2024 in Rust, reaching day 21. Solutions published on GitHub. Used this to explore rayon for parallelism and pest for parsing. Stopped due to work deadline pressure."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f12"
+content = "Learning goal: complete the Stanford CS229 ML course on YouTube by end of Q2. Currently on week 4 (logistic regression). Taking notes in Obsidian, implementing exercises in Python."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f13"
+content = "Car: 2019 Honda CR-V. Scheduled maintenance due at 75k miles (current: 68k). Oil change done March 5. Tire rotation due same time as next oil change."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f14"
+content = "Mortgage refinanced in January. New rate: 6.1% (down from 6.8%). 30-year fixed. Monthly payment reduced by $130. Break-even on closing costs in 22 months."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f15"
+content = "Spotify playlists for coding: lo-fi beats for deep work, 80s synth for debugging, metal for deployments. Playlist links saved in Notion."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f16"
+content = "Flight booked: San Francisco to New York, April 22-26. Conference attendance (RustConf). Hotel: Marriott Times Square. Expensed via Concur, confirmation #RUS2024-4421."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f17"
+content = "Expense report for Q1 travel: $1,247. Submitted March 31. Approved by manager April 2. Reimbursement expected in the April 15 payroll."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f18"
+content = "401k contribution: 10% of gross salary, company matches 4%. Contribution increased from 8% in January after the raise. Target: max annual contribution ($23,000) by November."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f19"
+content = "Security training completed: OWASP Top 10, secure coding in Rust (internal course). Certificate valid until December 2025. Next required training: HIPAA compliance (not required unless healthcare customers signed)."
+memory_type = "fact"
+domain = "work"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f20"
+content = "Mentor session notes: mentoring two junior engineers. Monthly 1:1 format. Focus areas: career growth, system design thinking, and navigating ambiguity. Progress tracked in a shared Notion page."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f21"
+content = "Team size: 6 engineers (3 backend, 2 frontend, 1 full-stack). Two backend engineers are contractors on 6-month engagements. Planning to hire a DevOps engineer in Q2."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f22"
+content = "Performance review cycle: twice yearly, February and August. Last review rating: Exceeds Expectations. Feedback themes: strong system design, needs to improve documentation output."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f23"
+content = "Architecture review board (ARB) meets bi-weekly on Wednesdays at 2pm. Any change with cross-service impact requires ARB approval before implementation. Decision records stored in Confluence."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f24"
+content = "Bug triage happens every Monday at 10am. P1 bugs assigned immediately. P2 assigned to current sprint. P3 goes to the backlog. Triage attendees: EM, on-call engineer, and PM."
+memory_type = "fact"
+domain = "work"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f25"
+content = "Documentation: API reference auto-generated from OpenAPI spec and published to docs.company.io on every release. Internal architecture docs in Confluence. ADRs (Architecture Decision Records) in the repo under docs/adrs/."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f26"
+content = "CLI tool: origin-mcp (MIT licensed, separate repo). Provides MCP server protocol for AI agent integration. Talks to the origin-server daemon over HTTP. Published on npm and crates.io."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f27"
+content = "Libsql chosen for the memory database. Turso's SQLite fork with vector search (DiskANN), FTS5, and local-first design. Evaluated ChromaDB and Qdrant — libsql won for its SQLite compatibility and single-file deployment."
+memory_type = "decision"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f28"
+content = "FastEmbed model: BGE-Base-EN-v1.5-Q (768 dimensions). 512 token maximum. ONNX runtime via CoreML on Apple Silicon. Model weights downloaded on first launch from Hugging Face. Cached in .fastembed_cache/."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f29"
+content = "LLM for on-device inference: Qwen3-4B-Instruct-2507 via llama-cpp-2 with Metal GPU acceleration. Token generation rate: approximately 35 tokens/second on M3 Pro. Used for classification and quality assessment."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f30"
+content = "Tauri 2 desktop app wraps the daemon. App is a thin HTTP client — no business logic. All data operations go through the origin-server on port 7878. Sidecar mechanism for production builds only."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f31"
+content = "Dedup threshold set at 0.85 cosine similarity. Values below 0.80 cause false merges. Values above 0.90 miss near-duplicates. Threshold validated empirically on 500 memory pairs."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f32"
+content = "Refinery runs background enrichment every 30 minutes: entity extraction, dedup proposals, recap triggers, concept clustering. Each phase is idempotent and can be run independently."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f33"
+content = "MCP server provides 4 tools to AI agents: remember, recall, context, forget. Agent authentication via x-agent-name header. Trust level assigned per agent name in the agent registry."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f34"
+content = "Privacy model: all data stays local on the user's machine. No cloud sync by default. Cloudflare Tunnel is opt-in for remote access. No telemetry or analytics without explicit opt-in."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc2_f35"
+content = "Hybrid search: vector similarity (DiskANN) + FTS5 full-text search combined via Reciprocal Rank Fusion. RRF k parameter is 60. Domain boost multiplier is 1.5x when query mentions domain name."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+
+# ─── CASE 3 ──────────────────────────────────────────────────────────────────
+# Query: what project goals and milestones exist
+# 7 relevant + 33 filler (mix of gc3_ and reused gc_/gc2_ IDs not already used)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what project goals and milestones exist"
+
+# Relevant seeds
+
+[[cases.seeds]]
+id = "gc_goal_launch"
+content = "Primary goal: public launch by April 30. Success criteria: Origin MCP listed on npm, README live on GitHub, first 50 external users onboarded via waitlist. Karpathy gist comment as primary acquisition channel."
+memory_type = "goal"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "gc_goal_q2_saas"
+content = "Q2 goals for the SaaS project: ship v2 API with OpenAPI spec (April), reach 50 paying customers (May), reduce p99 latency below 300ms (June). Reviewed with VP of Engineering March 1."
+memory_type = "goal"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "gc_goal_personal_learn"
+content = "Learning goals for 2024: complete CS229 ML course (Q2), build and publish one Rust crate (Q3), read 12 technical books (1/month). Progress tracked in Obsidian journal weekly."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 3
+
+[[cases.seeds]]
+id = "gc_goal_milestone_v1"
+content = "v0.1.0 milestone: basic memory store, hybrid search, MCP server, Tauri app. All items shipped by April 15 hardening commits. Next milestone is v0.2.0: Homebrew tap, release-please CI, public changelog."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 3
+
+[[cases.seeds]]
+id = "gc_goal_fitness"
+content = "Fitness goal: sub-25 minute 5K by June 30. Current PB is 27:42. Running plan: 3x/week with one tempo run. Supplementing with strength training 2x/week."
+memory_type = "goal"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 2
+
+[[cases.seeds]]
+id = "gc_goal_eval"
+content = "Eval milestone: NDCG@10 above 0.80 on the LoCoMo benchmark for the base retrieval pipeline. Reranked pipeline target is 0.87. Baselines must be set before any retrieval changes merge to main."
+memory_type = "goal"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 2
+
+[[cases.seeds]]
+id = "gc_goal_saas_customers"
+content = "Customer acquisition milestone: 10 paying customers by end of March, 50 by end of Q2, 200 by end of year. Current CAC target is $200. LTV:CAC target ratio is 3:1."
+memory_type = "goal"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 2
+
+# Filler
+
+[[cases.seeds]]
+id = "gc3_f01"
+content = "Request ID middleware injects x-request-id header (UUID v4) on every incoming request and propagates it through all log entries and downstream service calls via tracing spans."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f02"
+content = "Health check endpoint /healthz returns 200 with JSON body including DB ping latency and Redis ping latency. Used by ECS task health check configuration. Timeout is 5 seconds."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f03"
+content = "Graceful shutdown: Axum server drains in-flight requests on SIGTERM with a 30-second deadline. Background jobs get a 60-second window before being force-killed."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f04"
+content = "Content Security Policy header configured to disallow inline scripts and restrict media-src to self. Report-only mode for 2 weeks before enforcement to catch violations before they break the UI."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f05"
+content = "CORS configured to allow credentials, restrict origins to the allowlist, and expose x-request-id in response headers. Preflight cache duration: 600 seconds."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f06"
+content = "New feature: bulk import endpoint /api/import accepts a ZIP file of JSON records. Processes async via the job queue. Progress reported via WebSocket. Batch size: 100 records per transaction."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f07"
+content = "Test environment refresh: weekly on Sunday midnight. Anonymizes production data clone. Personal data replaced with Faker-generated values. Email domain changed to example.com."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f08"
+content = "Security review scheduled for May 15 with external vendor (Cure53). Scope: authentication flows, API endpoints, and data encryption. Pre-engagement questionnaire due April 25."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f09"
+content = "Penetration testing budget: $15,000 for the initial engagement. Findings from the pentest will be triaged in a dedicated security sprint. P0/P1 findings block the launch."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f10"
+content = "ISO 27001 certification exploration: deferred to post-Series A. SOC 2 Type II is the nearer-term target. Readiness assessment scheduled for Q3. Internal audit first, then external auditor."
+memory_type = "fact"
+domain = "work"
+source_agent = "cursor"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f11"
+content = "Company values: ship fast and learn faster, default to transparency, own outcomes not just tasks, disagree and commit. Values refreshed at the February all-hands."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f12"
+content = "Office layout changed: engineering team now sits together on the second floor. Standing desks for all engineers. Quiet room on each floor for focus work. No assigned desks."
+memory_type = "fact"
+domain = "work"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f13"
+content = "Intern program: 2 summer interns starting June 3. Both are rising juniors from CMU. Assigned mentors: one to backend, one to frontend. Projects TBD but scoped to 10-week deliverables."
+memory_type = "fact"
+domain = "work"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f14"
+content = "Competing with Mem0, Zep, and Letta in the agent memory space. Origin differentiation: local-first, no cloud dependency, AGPL licensed, Tauri app for human curation. Mem0 is API-only SaaS."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f15"
+content = "Origin MCP npm package published under the @origin-ai org. Package name: @origin-ai/mcp. Initial release: 0.1.0. Listed on the MCP server directory maintained by Anthropic."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f16"
+content = "Entity extraction prompt uses few-shot examples with 5 entity/relation pairs. Extraction runs asynchronously post-ingest. Results written back to the knowledge graph entities and relations tables."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f17"
+content = "Concept clustering groups related memories into wiki-style prose entries using community detection on the knowledge graph. Orphan memories that don't cluster are grouped globally."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f18"
+content = "Profile narrative assembled from identity and preference memories. Editorial prose format, not bullet points. Regenerated by the refinery when source memories are updated. Served via /api/profile."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f19"
+content = "Working memory builder selects the most recently accessed and highest-confidence memories for the active session. Injected into agent context bundles. Window size: 20 memories maximum."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f20"
+content = "Tauri app identifier: com.origin.desktop. Main window starts invisible to prevent white flash. React calls show() + center() after mount. Traffic light position customized at (8, 16)."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f21"
+content = "Childhood in Portland, OR. Moved to San Francisco for first job after college. Currently in Austin, TX. Strong preference for mountain hiking over beach vacations."
+memory_type = "identity"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f22"
+content = "Undergraduate degree in Computer Science from University of Washington. Graduated 2017. Capstone project was a distributed key-value store in Go."
+memory_type = "identity"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f23"
+content = "First job: software engineer at a fintech startup (Plaid competitor). Worked on the bank data ingestion pipeline. Left after 2 years to join a series-A startup."
+memory_type = "identity"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f24"
+content = "Current role: Staff Software Engineer at a B2B SaaS company. Tech lead for the API platform team. Reports to VP of Engineering. 5 direct reports."
+memory_type = "identity"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f25"
+content = "Family: married to Jordan, two kids (ages 4 and 7). Dog named Turing (a beagle). Living in a 3BR house in South Austin since 2021."
+memory_type = "identity"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f26"
+content = "Open source contributions: rust-analyzer (2 minor PRs), tokio (1 doc fix), axum (1 middleware example). Contributor badge on the tokio GitHub organization."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f27"
+content = "Conference talks given: RustConf 2023 (15-minute lightning talk on error handling patterns), Austin DevFest 2024 (30-minute talk on building local-first apps)."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f28"
+content = "Side project income: $240/month from imgbatch CLI tool (sponsorship via GitHub Sponsors). Not tracking hours spent — it's hobby income."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f29"
+content = "Homelab network: UniFi Dream Machine as the router, 4 UniFi access points (U6 Lite). VLANs for IoT, trusted devices, and the NAS. Tailscale for remote access as a Cloudflare Tunnel fallback."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f30"
+content = "Investment strategy: passive index funds (VTI, VXUS, BND) in a 70/20/10 split. No individual stocks except RSU grants from employer. Rebalanced annually in January."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f31"
+content = "Reading list for Q2: Project Hail Mary (Weir), The Staff Engineer's Path (Reilly), Programming Rust (3rd ed). One technical, one career, one fiction per quarter rule."
+memory_type = "fact"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f32"
+content = "Weekly newsletter subscriptions: Bytes.dev (JS), This Week in Rust, The Pragmatic Engineer, TLDR Tech. Read on Sunday mornings. Archive older than 4 weeks without reading."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 0
+
+[[cases.seeds]]
+id = "gc3_f33"
+content = "GitHub account: @lucian. 147 public repos. Most-starred: imgbatch (312 stars), rust-error-patterns (88 stars). Pinned repos maintained. Profile README updated quarterly."
+memory_type = "fact"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 0

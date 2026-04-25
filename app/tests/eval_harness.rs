@@ -951,6 +951,144 @@ async fn test_concept_retrieval_eval() {
     println!("{}", report.to_terminal());
 }
 
+// ---------------------------------------------------------------------------
+// Token efficiency / quality-cost tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_quality_cost_fixtures() {
+    use origin_lib::eval::token_efficiency::{run_quality_cost_eval, SearchStrategy};
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+
+    let strategies = vec![
+        SearchStrategy::Origin,
+        SearchStrategy::NaiveRag,
+        SearchStrategy::FullReplay,
+        SearchStrategy::NoMemory,
+    ];
+
+    let report = run_quality_cost_eval(&fixture_dir, &strategies, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(report.strategies.len(), 4);
+    assert!(
+        report.headline.savings_pct > 0.0,
+        "should show token savings"
+    );
+
+    // Origin should have better quality than NaiveRag
+    let origin = report
+        .strategies
+        .iter()
+        .find(|s| s.strategy == "origin")
+        .unwrap();
+    let naive = report
+        .strategies
+        .iter()
+        .find(|s| s.strategy == "naive_rag")
+        .unwrap();
+    assert!(
+        origin.ndcg_at_10 >= naive.ndcg_at_10,
+        "Origin NDCG ({:.3}) should be >= NaiveRag ({:.3})",
+        origin.ndcg_at_10,
+        naive.ndcg_at_10
+    );
+
+    println!("{}", report.to_terminal());
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_quality_cost_agent_workload() {
+    use origin_lib::eval::token_efficiency::{run_quality_cost_eval, SearchStrategy};
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+    if !fixture_dir.join("agent_coding_session.toml").exists() {
+        println!("SKIP: agent fixtures not found");
+        return;
+    }
+
+    let strategies = vec![
+        SearchStrategy::Origin,
+        SearchStrategy::NaiveRag,
+        SearchStrategy::FullReplay,
+        SearchStrategy::NoMemory,
+    ];
+
+    let report = run_quality_cost_eval(&fixture_dir, &strategies, 10)
+        .await
+        .unwrap();
+
+    assert!(report.headline.savings_pct > 0.0);
+    println!("{}", report.to_terminal());
+}
+
+#[tokio::test]
+#[ignore]
+async fn save_quality_cost_fixtures_baseline() {
+    use origin_lib::eval::token_efficiency::{run_quality_cost_eval, SearchStrategy};
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+    let baseline_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/quality_cost_fixtures_baseline.json");
+
+    let strategies = vec![
+        SearchStrategy::Origin,
+        SearchStrategy::NaiveRag,
+        SearchStrategy::FullReplay,
+        SearchStrategy::NoMemory,
+    ];
+
+    let report = run_quality_cost_eval(&fixture_dir, &strategies, 10)
+        .await
+        .unwrap();
+
+    println!("{}", report.to_terminal());
+    report.save_baseline(&baseline_path).unwrap();
+    println!("\nBaseline saved to {:?}", baseline_path);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_scaling_curve() {
+    use origin_lib::eval::token_efficiency::run_scaling_eval;
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures");
+
+    let sizes = vec![5, 10, 20, 50];
+    let points = run_scaling_eval(&fixture_dir, &sizes, 10).await.unwrap();
+
+    assert!(!points.is_empty(), "should produce scaling points");
+
+    println!("\n=== Scaling Curve ===");
+    println!(
+        "{:<12} | {:<15} | {:<15}",
+        "Corpus Size", "Origin Tokens", "Replay Tokens"
+    );
+    println!("{:-<12}-+-{:-<15}-+-{:-<15}", "", "", "");
+    for p in &points {
+        println!(
+            "{:<12} | {:<15.0} | {:<15.0}",
+            p.corpus_size, p.origin_tokens, p.replay_tokens
+        );
+    }
+
+    // FullReplay should grow with corpus size
+    if points.len() >= 2 {
+        let first = &points[0];
+        let last = points.last().unwrap();
+        assert!(
+            last.replay_tokens > first.replay_tokens,
+            "FullReplay tokens should grow: {} -> {}",
+            first.replay_tokens,
+            last.replay_tokens
+        );
+    }
+}
+
 /// Concept impact across ALL fixture cases — single shared DB, no per-case ephemeral DBs.
 ///
 /// Seeds all fixture memories into one DB, creates concepts from seed clusters (grouped by
@@ -1148,4 +1286,424 @@ async fn test_concept_before_after_comparison() {
         avg_combined_recall,
         avg_recall_before
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline eval: LoCoMo + LongMemEval through Origin's full pipeline
+// ---------------------------------------------------------------------------
+
+/// Run LoCoMo through Origin's full pipeline: flat → enriched → distilled.
+/// Requires Metal GPU (run with sandbox disabled).
+#[tokio::test]
+#[ignore]
+async fn benchmark_locomo_pipeline() {
+    use origin_lib::eval::token_efficiency::run_locomo_pipeline_eval;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found at {:?}", locomo_path);
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    let report = run_locomo_pipeline_eval(&locomo_path, llm, 10, 10)
+        .await
+        .expect("run_locomo_pipeline_eval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    // Sanity checks
+    assert!(
+        report.total_queries > 0,
+        "Expected >0 queries, got {}",
+        report.total_queries
+    );
+    assert!(
+        !report.aggregate.is_empty(),
+        "Should have aggregate metrics"
+    );
+
+    // Flat/Origin should have non-zero NDCG
+    let flat_origin = report
+        .aggregate
+        .iter()
+        .find(|c| c.condition == "flat" && c.strategy == "origin");
+    assert!(
+        flat_origin.is_some(),
+        "Should have flat/origin aggregate cell"
+    );
+    assert!(
+        flat_origin.unwrap().ndcg_at_10 > 0.0,
+        "Flat/Origin NDCG should be > 0"
+    );
+}
+
+/// Run LongMemEval through Origin's full pipeline: flat → enriched → distilled.
+/// Requires Metal GPU (run with sandbox disabled).
+/// Caps at 100 questions for reasonable runtime.
+#[tokio::test]
+#[ignore]
+async fn benchmark_longmemeval_pipeline() {
+    use origin_lib::eval::token_efficiency::run_longmemeval_pipeline_eval;
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found at {:?}", path);
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    let report = run_longmemeval_pipeline_eval(&path, llm, 10, 500)
+        .await
+        .expect("run_longmemeval_pipeline_eval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    // Sanity checks
+    assert!(
+        report.total_queries > 0,
+        "Expected >0 queries, got {}",
+        report.total_queries
+    );
+    assert!(
+        !report.aggregate.is_empty(),
+        "Should have aggregate metrics"
+    );
+
+    let flat_origin = report
+        .aggregate
+        .iter()
+        .find(|c| c.condition == "flat" && c.strategy == "origin");
+    assert!(
+        flat_origin.is_some(),
+        "Should have flat/origin aggregate cell"
+    );
+    assert!(
+        flat_origin.unwrap().ndcg_at_10 > 0.0,
+        "Flat/Origin NDCG should be > 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Context path eval: recall vs context coverage comparison
+// ---------------------------------------------------------------------------
+
+/// Compare recall (search_memory only) vs context (search + concepts + graph).
+/// Requires Metal GPU for enrichment/distillation. Run with sandbox disabled.
+#[tokio::test]
+#[ignore]
+async fn benchmark_context_path() {
+    use origin_lib::eval::token_efficiency::run_context_path_eval;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    // 1 conversation for quick validation, 10 for full benchmark
+    let report = run_context_path_eval(&locomo_path, llm, 10, 1)
+        .await
+        .expect("run_context_path_eval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    assert!(report.total_questions > 0);
+}
+
+/// Context path eval for LongMemEval: recall vs context coverage.
+/// Requires Metal GPU. Run with sandbox disabled.
+#[tokio::test]
+#[ignore]
+async fn benchmark_context_path_longmemeval() {
+    use origin_lib::eval::token_efficiency::run_context_path_eval_longmemeval;
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new()
+            .expect("Failed to init on-device LLM. Run with sandbox disabled for Metal GPU."),
+    );
+
+    // Full benchmark: all 500 questions
+    let report = run_context_path_eval_longmemeval(&path, llm, 10, 500)
+        .await
+        .expect("run_context_path_eval_longmemeval failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    assert!(report.total_questions > 0);
+}
+
+// ---------------------------------------------------------------------------
+// E2E answer quality: flat vs structured context with LLM-as-judge
+// ---------------------------------------------------------------------------
+
+/// Generate E2E answers for LoCoMo (flat vs structured context).
+/// Saves judgment tuples for offline Claude Haiku judging.
+/// Requires Metal GPU for on-device LLM. Run with sandbox disabled.
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_locomo() {
+    use origin_lib::eval::token_efficiency::{run_e2e_context_eval, save_judgment_tuples};
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new().expect("Failed to init on-device LLM"),
+    );
+
+    // 1 conversation, 20 questions for quick validation
+    let tuples = run_e2e_context_eval(&locomo_path, llm, 10, 1, 20)
+        .await
+        .expect("run_e2e_context_eval failed");
+
+    eprintln!("Generated {} judgment tuples", tuples.len());
+    assert!(!tuples.is_empty(), "should generate at least some tuples");
+
+    // Save for offline judging (try baselines dir, fallback to tmpdir)
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_locomo.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Generate E2E answers for LongMemEval (flat vs structured context).
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_longmemeval() {
+    use origin_lib::eval::token_efficiency::{
+        run_e2e_context_eval_longmemeval, save_judgment_tuples,
+    };
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new().expect("Failed to init on-device LLM"),
+    );
+
+    // 50 questions for validation
+    let tuples = run_e2e_context_eval_longmemeval(&path, llm, 10, 50, 1)
+        .await
+        .expect("run_e2e_context_eval_longmemeval failed");
+
+    eprintln!("Generated {} judgment tuples", tuples.len());
+    assert!(!tuples.is_empty());
+
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_longmemeval.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Judge saved LoCoMo E2E context tuples with Claude Haiku.
+/// Run after generate_e2e_context_tuples_locomo.
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_locomo() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_locomo.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples...", tuples.len());
+
+    let results = judge_with_claude(&tuples, 3).await.expect("judge failed");
+
+    let report = aggregate_judgments(&results, "haiku");
+    eprintln!("\n=== E2E Context Eval: LoCoMo (Claude Haiku Judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
+    );
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
+
+// ---------------------------------------------------------------------------
+// API-based E2E: Haiku as answer model, Sonnet as judge
+// ---------------------------------------------------------------------------
+
+/// Generate E2E answers using Claude Haiku (Max plan via CLI) instead of Qwen 4B.
+/// No API key needed -- uses `claude -p` with OAuth.
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_locomo_api() {
+    use origin_lib::eval::token_efficiency::{run_e2e_context_eval, save_judgment_tuples};
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> =
+        Arc::new(origin_lib::llm_provider::ClaudeCliProvider::haiku());
+
+    // 1 conversation, 20 questions for quick validation
+    let tuples = run_e2e_context_eval(&locomo_path, llm, 10, 1, 20)
+        .await
+        .expect("run_e2e_context_eval with Haiku CLI failed");
+
+    eprintln!("Generated {} judgment tuples (Haiku CLI)", tuples.len());
+    assert!(!tuples.is_empty());
+
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_locomo_api.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Judge saved API-generated tuples with Claude Sonnet (stronger judge).
+/// Run after generate_e2e_context_tuples_locomo_api.
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_locomo_api_sonnet() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_locomo_api.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo_api first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples with Sonnet...", tuples.len());
+
+    let results = judge_with_claude_model(&tuples, 3, "sonnet")
+        .await
+        .expect("judge failed");
+
+    let report = aggregate_judgments(&results, "sonnet");
+    eprintln!("\n=== E2E Context Eval: LoCoMo (Haiku answers, Sonnet judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
+    );
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
+
+/// Re-judge the on-device (Qwen 4B) tuples with Sonnet instead of Haiku.
+/// Compares judge quality: does a stronger judge change the ranking?
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_locomo_sonnet() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_locomo.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples with Sonnet...", tuples.len());
+
+    let results = judge_with_claude_model(&tuples, 3, "sonnet")
+        .await
+        .expect("judge failed");
+
+    let report = aggregate_judgments(&results, "sonnet");
+    eprintln!("\n=== E2E Context Eval: LoCoMo (Qwen answers, Sonnet judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
+    );
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
 }

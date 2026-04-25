@@ -1,0 +1,271 @@
+# Temporal updates — preferences and decisions that evolve via supersedes chains.
+# Tests whether recency scoring correctly ranks the newest decision above older ones.
+# Relevance grades favor the newest decision (3) over intermediate (2) over oldest (1).
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# Query: what frontend framework do I prefer
+# React -> Vue -> Svelte evolution over 18 months
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what frontend framework do I prefer"
+
+[[cases.seeds]]
+id = "atemporal_fe_react"
+content = "Preferred frontend framework is React 16 with Redux for state management. Chosen for ecosystem maturity and hiring pool size. All new projects start from a custom CRA template."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 1
+age_days = 540
+confirmed = true
+
+[[cases.seeds]]
+id = "atemporal_fe_vue"
+content = "Switched preferred framework to Vue 3 with Composition API. React's boilerplate overhead was slowing solo projects. Vue's SFC format and built-in reactivity feel more productive. Using Vite instead of webpack."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 2
+age_days = 210
+supersedes = "atemporal_fe_react"
+confirmed = true
+
+[[cases.seeds]]
+id = "atemporal_fe_svelte"
+content = "Current preferred frontend framework is Svelte with SvelteKit for routing. Tried Vue for a year — preferred the compiler-based approach of Svelte. Zero-runtime overhead, ships less JavaScript. TypeScript support is excellent."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 3
+age_days = 14
+supersedes = "atemporal_fe_vue"
+
+[[cases.seeds]]
+id = "atemporal_fe_svelte_perf"
+content = "SvelteKit chosen for the new marketing site. Lighthouse score 98 on mobile vs 82 with the previous React SSR setup. Bundle size reduced from 380 KB to 42 KB gzipped."
+memory_type = "fact"
+domain = "personal"
+source_agent = "cursor"
+relevance = 2
+age_days = 10
+
+# Hard negatives — frontend vocabulary but not framework preference
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_fe_react_perf"
+content = "React 19 concurrent mode reduced jank on the dashboard page from 120ms frame drops to under 16ms. The useTransition hook on the search input was the key fix. Upgrading React was the right call for this specific project."
+memory_type = "fact"
+domain = "project:webapp"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_fe_css"
+content = "CSS framework preference: Tailwind CSS v4 for all new projects. Avoided CSS-in-JS solutions after team velocity suffered with styled-components in 2022. Tailwind intellisense plugin is mandatory."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_fe_state"
+content = "State management decision for current project: Zustand over Redux Toolkit. Zustand's API surface is smaller and the devtools experience is good enough for current complexity. Redux reserved for truly global complex state."
+memory_type = "decision"
+domain = "project:webapp"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_fe_testing"
+content = "Frontend testing preference: component tests with Vitest and React Testing Library. Storybook interaction tests for design system components. Playwright for E2E on critical paths only."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_fe_build"
+content = "Build tooling preference: Vite for all new projects. Parcel tried and abandoned — plugin ecosystem is thin. Webpack only for projects that predate Vite adoption. esbuild for CLI tooling."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# Query: what deployment target are we using
+# Heroku -> AWS -> self-hosted evolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what deployment target are we using"
+
+[[cases.seeds]]
+id = "atemporal_deploy_heroku"
+content = "Deployed to Heroku using the standard web dyno. Postgres add-on for the database, Redis add-on for caching. Automatic deploys from the main branch. Heroku Pipelines for staging promotion."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 1
+age_days = 730
+confirmed = true
+
+[[cases.seeds]]
+id = "atemporal_deploy_aws"
+content = "Migrated from Heroku to AWS ECS Fargate after Heroku removed the free tier and quoted $240/month for equivalent capacity. AWS costs $85/month for the same workload. GitHub Actions handles the deploy workflow."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 2
+age_days = 300
+supersedes = "atemporal_deploy_heroku"
+confirmed = true
+
+[[cases.seeds]]
+id = "atemporal_deploy_selfhosted"
+content = "Moved production to self-hosted Hetzner bare metal (CX51, 16-core, 32 GB RAM). Monthly cost dropped from $85 to $22. Using Nomad for container orchestration. Decision driven by the need for local LLM inference on GPU."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+age_days = 7
+supersedes = "atemporal_deploy_aws"
+
+[[cases.seeds]]
+id = "atemporal_deploy_selfhosted_detail"
+content = "Self-hosted setup: Hetzner CX51 primary, CX21 secondary for failover. Nomad for scheduling, Consul for service discovery, Traefik as the ingress reverse proxy. All config in Terraform and Nomad job specs."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 2
+age_days = 5
+
+[[cases.seeds]]
+id = "atemporal_deploy_aws_intermediate"
+content = "AWS deployment was on ECS Fargate with a db.t3.medium RDS Postgres instance. Blue-green deployment with ECS deployment circuit breaker. Auto-scaling based on CPU utilization threshold of 70%."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 1
+age_days = 280
+
+# Hard negatives — deployment vocabulary but wrong topic
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_deploy_ci"
+content = "CI pipeline: GitHub Actions with matrix builds for Rust stable and beta. Test job, lint job, and security audit (cargo audit) in parallel. Deploy job runs only on main branch pushes and has an approval gate."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_deploy_secrets"
+content = "Secret management: Vault by HashiCorp for all production secrets. Application fetches secrets at startup via Vault Agent sidecar. Automatic secret rotation configured for database credentials."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_deploy_monitoring"
+content = "Monitoring: Prometheus scraping all services every 15 seconds. Grafana dashboards for API latency, DB connection pool usage, and queue depth. PagerDuty alerts on p99 > 500ms for 5 consecutive minutes."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_deploy_cdn"
+content = "Frontend static assets served from Cloudflare CDN. Cache-Control: max-age=31536000 on hashed filenames. index.html is always cache-busted via Cloudflare cache purge on deploy. Edge functions not yet used."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+
+
+# ─── CASE 3 ──────────────────────────────────────────────────────────────────
+# Query: what logging approach was decided
+# Structured logging evolution: println -> env_logger -> tracing with structured fields
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what logging approach was decided"
+
+[[cases.seeds]]
+id = "atemporal_log_println"
+content = "Logging initially done with println! macros. No structured format, no log levels. Log output goes to stdout and is captured by the process supervisor. Acceptable for early prototype stage."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 1
+age_days = 600
+
+[[cases.seeds]]
+id = "atemporal_log_env_logger"
+content = "Replaced println! with env_logger. Added RUST_LOG environment variable support. Log levels (trace/debug/info/warn/error) now consistent. Filter default set to warn to reduce noise. Still not structured (text lines)."
+memory_type = "decision"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 2
+age_days = 320
+supersedes = "atemporal_log_println"
+confirmed = true
+
+[[cases.seeds]]
+id = "atemporal_log_tracing"
+content = "Migrated from env_logger to the tracing crate with tracing-subscriber. All logs now structured with span fields (request_id, module). JSON output format in production, pretty format in dev. Spans propagate through async boundaries correctly."
+memory_type = "decision"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 3
+age_days = 45
+supersedes = "atemporal_log_env_logger"
+confirmed = true
+
+[[cases.seeds]]
+id = "atemporal_log_tracing_filter"
+content = "Default log filter: warn. Enable info-level for specific modules by adding 'origin_core::db=info,origin_server=info' to the RUST_LOG value. Avoid global info in production — it generates 2 MB/minute under load."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"
+relevance = 2
+age_days = 30
+
+[[cases.seeds]]
+id = "atemporal_log_tracing_opentelemetry"
+content = "OpenTelemetry integration planned for v0.3.0. Will export traces to a self-hosted Tempo instance via OTLP gRPC. tracing-opentelemetry bridge crate will be used. Deferred because it requires the Hetzner server setup first."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-desktop"
+relevance = 1
+age_days = 15
+
+# Hard negatives — logging vocabulary but wrong topic
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_log_audit"
+content = "Audit trail for user actions: written to a dedicated audit_events table in Postgres. Not in the application log files. Audit events include user_id, action, resource_id, and timestamp. Append-only by DB policy."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_log_cloudwatch"
+content = "Application logs shipped to CloudWatch Logs via the Fluentd sidecar in the ECS task definition. Log group per service, 30-day retention. Metric filters on ERROR log events trigger CloudWatch alarms."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_log_sentry"
+content = "Sentry configured for error tracking. Only 5xx errors and panics forwarded. Sample rate 10% on 429 responses. Source maps uploaded from the frontend build. Alert on new error types in production."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_log_access"
+content = "HTTP access logs in Combined Log Format written to /var/log/nginx/access.log. Logrotate configured: daily rotation, 30-day retention, compressed with gzip. Access logs parsed by GoAccess for real-time dashboards."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "atemporal_neg_log_debug"
+content = "Debug builds include full backtraces via RUST_BACKTRACE=1. In production, backtraces are captured only for panics and written to the panic log file. Production does not expose backtraces in HTTP error responses."
+memory_type = "fact"
+domain = "project:origin"
+source_agent = "claude-code"

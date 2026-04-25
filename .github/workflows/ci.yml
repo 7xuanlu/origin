@@ -63,8 +63,16 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run Rust tests
-        run: cargo test -p origin-types -p origin-core -p origin-server
+      - name: Run Rust tests (types + server)
+        run: cargo test -p origin-types -p origin-server
+
+      - name: Run Rust tests (core)
+        run: cargo test -p origin-core
+
+      # Eval benchmarks (#[ignore]) — slow embedding-heavy tests, run on main only.
+      - name: Run eval benchmarks
+        if: github.ref == 'refs/heads/main'
+        run: cargo test -p origin-core --lib eval::token_efficiency -- --ignored
 
       # Eval harness integration tests (app/tests/eval_harness.rs) need the
       # FastEmbed BGE-Base-EN-v1.5-Q model (~200MB ONNX) which auto-downloads

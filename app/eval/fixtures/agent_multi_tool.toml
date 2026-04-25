@@ -1,0 +1,449 @@
+# Multi-tool agent memories — tests cross-agent retrieval.
+# Memories arrive from claude-code, chatgpt, cursor, and claude-desktop across
+# coding sessions, design docs, and architectural discussions.
+
+# ─── CASE 1 ──────────────────────────────────────────────────────────────────
+# Query: what did I decide about the database schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what did I decide about the database schema"
+
+[[cases.seeds]]
+id = "agent_multi_db_schema_claude"
+content = "Decided to normalize users and accounts into separate tables with a one-to-many relationship. Users hold identity (email, name, auth); accounts hold billing context. This supports future multi-account per user without schema migration."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "agent_multi_db_schema_chatgpt"
+content = "Schema decision: use soft deletes (deleted_at timestamp) rather than hard deletes on the users, accounts, and resources tables. Hard deletes cause FK cascade issues in audit trails. Confirmed this approach matches GDPR right-to-erasure — soft delete + periodic anonymization job."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "agent_multi_db_schema_cursor"
+content = "Added a jsonb 'settings' column to the accounts table instead of a separate account_settings table. Settings volume is low (< 30 keys), schema is user-defined, and embedding it avoids an extra join on every request."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 3
+
+[[cases.seeds]]
+id = "agent_multi_db_schema_desktop"
+content = "Enum types in Postgres for status fields (resource_status, subscription_status). Rationale: DB-level constraint catches invalid states that application code might miss. Enum extension requires a migration, but status values rarely change."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+relevance = 2
+
+[[cases.seeds]]
+id = "agent_multi_db_schema_index"
+content = "Composite index on (account_id, created_at DESC) on the resources table. Query patterns are always scoped to one account and sorted by recency. Partial index on soft-deleted rows excluded to keep index size small."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 2
+
+# Hard negatives — database vocabulary but not schema decisions
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_pool"
+content = "SQLx pool configured with max_connections=15 and acquire_timeout=3s. Idle connections pruned after 600s. Pool size was reduced from 25 after profiling showed fewer than 8 concurrent DB operations at peak load."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_perf"
+content = "Slow query log shows the resource search endpoint hitting 350ms p99. The culprit is a sequential scan on the tags JSONB column. Need to add a GIN index on tags before launch."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_backup"
+content = "Automated backups via RDS point-in-time recovery, 7-day retention window. Manual pg_dump to S3 nightly as an additional layer. Restoration drill planned for the week before launch."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_migration"
+content = "Migration tooling: sqlx-cli with sqlx migrate run in CI before tests. Down migrations are written but not run in CI — they exist as a manual recovery option only. Each migration is reviewed in PRs."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_test"
+content = "Integration tests use testcontainers to spin up a real Postgres 16 instance per test run. Each test runs inside a transaction that is rolled back on teardown to maintain isolation."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_cache"
+content = "Redis used only for session tokens and short-term rate-limit counters. No DB query results are cached in Redis. The team agreed that cache invalidation complexity is not worth the latency gains at current scale."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_read"
+content = "Read replica added to staging environment. Analytics queries routed via DATABASE_REPLICA_URL env var. Primary handles all writes. Replica lag is acceptable for reporting use cases (< 1s observed)."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_audit"
+content = "Audit log table (audit_events) is append-only. Uses Postgres row-level security to block UPDATE and DELETE on the table. Populated by the application layer on every write to user, account, and resource tables."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_search"
+content = "Full-text search over resource names uses pg_trgm with a GIN index. Evaluated tsvector but trigram matching handles partial-word queries better for the short resource name field."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_db_partitioning"
+content = "No table partitioning at launch. Events table is the only candidate (expected 50M rows/year). Plan is to add range partitioning by month at 6 months post-launch if query times degrade."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+
+
+# ─── CASE 2 ──────────────────────────────────────────────────────────────────
+# Query: what are my coding style preferences
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what are my coding style preferences"
+
+[[cases.seeds]]
+id = "agent_multi_style_rust_claude"
+content = "Prefer explicit error propagation over unwrap() in production code. Only use unwrap() in tests or for truly impossible states. Always use the ? operator and map_err() to add context to errors at boundaries."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "agent_multi_style_fn_size"
+content = "Functions should fit on a screen (< 40 lines). If a function needs more than 3 levels of nesting, extract a helper. Prefer flat code over clever abstractions — readability beats cleverness."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "agent_multi_style_naming"
+content = "Naming conventions: use_snake_case for variables and functions, PascalCase for types and traits, SCREAMING_SNAKE_CASE for constants. Prefer descriptive names over short abbreviations. Never use single-letter variables outside of iterators."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+relevance = 3
+
+[[cases.seeds]]
+id = "agent_multi_style_comments"
+content = "Comments explain why, not what. Function doc comments required on public API items. Avoid commented-out code in committed files — use git stash or a feature flag instead."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+relevance = 2
+
+# Hard negatives — personal preferences but not coding style
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_editor"
+content = "Using VS Code with rust-analyzer and the GitLens extension. Vim keybindings enabled. Theme: Catppuccin Mocha. Font: JetBrains Mono 13pt. Line height 1.5. All editor settings stored in .vscode/settings.json in the repo."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_review"
+content = "Code review preference: always request changes rather than approving with comments if there are blocking issues. Leave nitpick comments prefixed with 'nit:' so the author knows they are not blocking. Review within 24 hours of request."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_meetings"
+content = "Prefer async written updates over synchronous meetings. If a meeting is necessary, require an agenda sent 24 hours in advance. No recurring meetings without an owner and explicit value statement."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_git"
+content = "Git commit style: imperative mood, under 72 chars subject line, blank line separator, body explains why not what. Conventional commits format required: feat, fix, refactor, docs, test, chore."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_work"
+content = "Deep work blocks from 9am-12pm, no meetings or Slack. Email checked twice: 1pm and 5pm. Async-first, response within 4 hours during business hours is the expected SLA."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_deploy"
+content = "Deploy preference: weekly release cadence on Tuesdays. No Friday deploys. All releases go through staging for 24h before production promotion. Rollback plan required in the release doc before promotion."
+memory_type = "preference"
+domain = "personal"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_infra"
+content = "Infrastructure as code preference: Terraform for all cloud resources. No click-ops in production AWS account. Resources not in Terraform are considered unmanaged and eligible for deletion."
+memory_type = "preference"
+domain = "personal"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_style_lib"
+content = "Library selection preference: prefer actively maintained libs with > 1000 GitHub stars and a recent release within 12 months. Avoid dependencies that haven't been updated in 2+ years. Check crates.io download rank for Rust."
+memory_type = "preference"
+domain = "personal"
+source_agent = "claude-code"
+
+
+# ─── CASE 3 ──────────────────────────────────────────────────────────────────
+# Query: what's the deployment strategy
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what's the deployment strategy"
+
+[[cases.seeds]]
+id = "agent_multi_deploy_strategy"
+content = "Deploying to AWS ECS Fargate. Docker image built in CI and pushed to ECR. ECS service updated via GitHub Actions deploy workflow. No EKS — Kubernetes overhead not justified at current scale."
+memory_type = "decision"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "agent_multi_deploy_blue_green"
+content = "Blue-green deployments configured via ECS deployment circuit breaker. New task definition spun up alongside existing; traffic shifted after health checks pass. Automatic rollback if error rate exceeds 5% in first 5 minutes."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "agent_multi_deploy_env"
+content = "Three environments: dev (auto-deployed on every main push), staging (manual promote from dev), production (manual promote from staging with release doc). Each environment has its own ECS cluster and RDS instance."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 2
+
+[[cases.seeds]]
+id = "agent_multi_deploy_secrets"
+content = "Secrets injected at runtime via AWS Secrets Manager, not environment variables in task definitions. Application uses the AWS SDK to fetch secrets on startup. Rotation handled by Secrets Manager — no manual secret updates needed."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+relevance = 2
+
+# Hard negatives — infrastructure vocabulary but not deployment strategy
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_cdn"
+content = "Static assets served via CloudFront. Cache-Control: max-age=31536000 on hashed asset filenames. index.html gets no-cache. Invalidation triggered automatically by the frontend deploy job."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_dns"
+content = "DNS managed in Route 53. A records point to CloudFront (frontend) and ALB (API). Failover routing configured: secondary region (us-west-2) serves traffic if primary (us-east-1) health check fails."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_monitoring"
+content = "Monitoring stack: CloudWatch for infrastructure metrics, Datadog for APM traces. Alerts on p99 latency > 500ms, error rate > 1%, and ECS task count below 2. On-call rotation via PagerDuty."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_scaling"
+content = "ECS auto-scaling based on CPU utilization. Scale out at 70% average CPU across tasks, scale in at 30%. Min 2 tasks, max 10 tasks. Cooldown period 120s to prevent thrashing."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_cost"
+content = "Current AWS bill at $340/month. Fargate is 60% of cost. RDS is 30%. CloudFront + S3 is 10%. Cost optimization planned post-launch: reserved instances for RDS, Savings Plans for Fargate."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_local"
+content = "Local dev environment uses Docker Compose with Postgres, Redis, and localstack (for S3 and Secrets Manager emulation). Run docker compose up -d to start dependencies before cargo run."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_ci"
+content = "GitHub Actions CI pipeline: lint, format check, test, security audit (cargo audit), and build steps in parallel where independent. Total run time target < 8 minutes for PR feedback."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_region"
+content = "Primary region is us-east-1 (lowest latency for the majority of customers based on analytics). Disaster recovery region is us-west-2. RDS replication configured but failover is not yet automated."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_deploy_logging"
+content = "Application logs go to CloudWatch Logs. Log groups per service with 30-day retention. Structured JSON logging via the tracing crate with tracing-subscriber. Log level controlled by LOG_LEVEL env var."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+
+# ─── CASE 4 ──────────────────────────────────────────────────────────────────
+# Query: what performance issues have been found
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cases]]
+query = "what performance issues have been found"
+
+[[cases.seeds]]
+id = "agent_multi_perf_search_scan"
+content = "Profiled: resource search endpoint at 350ms p99 due to sequential scan on the JSONB tags column. No GIN index on tags. Needs index before launch. Estimated fix: add migration 0019 with CREATE INDEX CONCURRENTLY."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 3
+confirmed = true
+
+[[cases.seeds]]
+id = "agent_multi_perf_n_plus_one"
+content = "N+1 query detected on the dashboard endpoint. For each account in the list, a separate query fetches resource count. Fix: change to a single query with COUNT(*) GROUP BY account_id and join result. Tracked as SAAS-287."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+relevance = 3
+
+[[cases.seeds]]
+id = "agent_multi_perf_cold_start"
+content = "ECS task cold start adds 8-12 seconds to initial request latency after a scale-out event. Root cause: SQLx connection pool does 15 health-check pings on startup. Mitigation: reduce min_connections from 15 to 3."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+relevance = 3
+
+[[cases.seeds]]
+id = "agent_multi_perf_memory"
+content = "Memory leak identified in the file upload handler. The multipart stream buffer is not dropped until the request is fully processed, holding the file in memory even after it is written to S3. Fix is to use a streaming upload instead of buffering."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+relevance = 2
+
+[[cases.seeds]]
+id = "agent_multi_perf_cache_miss"
+content = "Permission check for each API request hits the DB to load the user's role. With 500 concurrent users, this is 500 DB queries per second just for auth. Fix: cache role in the JWT claims (already planned) or add a Redis read-through cache."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+relevance = 2
+
+# Hard negatives — performance vocabulary but wrong topic
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_target"
+content = "Performance targets for launch: p50 < 50ms, p95 < 200ms, p99 < 500ms for API endpoints. Measured at the ALB level, excluding CDN cached responses. Targets are SLOs, not SLAs at this stage."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_load_test"
+content = "Load test with k6: 500 virtual users, 10-minute ramp-up, steady state for 30 minutes. All endpoints held p99 below 500ms except /api/export (1.2s p99). Export endpoint excluded from SLO."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_frontend"
+content = "Frontend Lighthouse score: 92 performance on desktop, 78 on mobile. Main drag is the initial JS bundle (420 KB gzipped). Need to code-split the settings page and the billing modal to reduce initial load."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_embedding"
+content = "BGE-Base-EN-v1.5-Q embedding model takes 8ms per 512-token input on Apple M3. FastEmbed batching reduces amortized cost to 2ms per document for batch sizes >= 16. Batch size 32 used in the ingest pipeline."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_build"
+content = "Rust release build takes 4m 30s on GitHub Actions runners (2-core, 7 GB RAM). Switched to cargo-nextest and split unit and integration tests into parallel jobs. Total CI time reduced from 14m to 8m."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_infra"
+content = "CPU utilization sits at 12% average across the 2-task ECS service under normal traffic. Headroom is comfortable. Auto-scaling threshold of 70% CPU gives ample time to provision new tasks before saturation."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_db_sizing"
+content = "RDS instance is db.t3.medium (2 vCPU, 4 GB RAM). At 40% CPU under load test with 500 users. Plan to upgrade to db.m5.large if the N+1 fix alone does not bring load down sufficiently."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "cursor"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_websocket"
+content = "WebSocket connections sit idle most of the time. Memory per connection is 64 KB overhead in the Axum WS handler. With 1000 concurrent WS connections that is 64 MB — well within available memory."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-desktop"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_serialization"
+content = "JSON serialization benchmarked with criterion. serde_json is the baseline. simd-json is 2.3x faster for large payloads (> 100 KB). Switched to simd-json for the /api/export endpoint only."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "claude-code"
+
+[[cases.negative_seeds]]
+id = "agent_multi_neg_perf_profiling"
+content = "Profiling setup: cargo-flamegraph for CPU profiling, heaptrack for allocation profiling. Flamegraph showed 40% of CPU in the auth middleware on the JWKS validation path — caching the validated key set cut this to 3%."
+memory_type = "fact"
+domain = "project:saas"
+source_agent = "chatgpt"

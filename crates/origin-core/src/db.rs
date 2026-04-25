@@ -1061,6 +1061,88 @@ impl MemoryDB {
         Ok(instance)
     }
 
+    /// Fast constructor for eval loops: reuses a pre-loaded embedder.
+    /// Creates a fresh ephemeral DB with schema + migrations but skips the 10-30s
+    /// embedding model load. Use `create_shared_embedder()` to create the embedder once.
+    pub async fn new_with_shared_embedder(
+        db_path: &Path,
+        emitter: Arc<dyn EventEmitter>,
+        embedder: Arc<std::sync::Mutex<TextEmbedding>>,
+    ) -> Result<Self, OriginError> {
+        std::fs::create_dir_all(db_path)?;
+        let db_file = db_path.join("origin_memory.db");
+
+        let db = libsql::Builder::new_local(db_file.to_str().unwrap_or("origin_memory.db"))
+            .build()
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("libsql open: {}", e)))?;
+
+        let conn = db
+            .connect()
+            .map_err(|e| OriginError::VectorDb(format!("libsql connect: {}", e)))?;
+
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("pragma: {}", e)))?;
+
+        conn.execute_batch(SCHEMA)
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("schema: {}", e)))?;
+
+        if let Err(e) = conn.execute_batch(FTS_SCHEMA).await {
+            log::warn!("[memory_db] FTS5 creation failed: {}", e);
+        }
+        if let Err(e) = conn.execute_batch(FTS_TRIGGERS).await {
+            log::warn!("[memory_db] FTS triggers failed: {}", e);
+        }
+
+        // Vector indexes for fresh DB
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS memories_vec_idx ON memories (
+                libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
+            )", (),
+        ).await;
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS entities_vec_idx ON entities (
+                libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
+            )", (),
+        ).await;
+
+        let instance = Self {
+            _db: db,
+            conn: tokio::sync::Mutex::new(conn),
+            embedder,
+            chunker: ChunkingEngine::new(),
+            embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+        };
+
+        instance.run_migrations(emitter.as_ref()).await?;
+        instance.bootstrap_profile().await?;
+
+        Ok(instance)
+    }
+
+    /// Create a shared embedder that can be passed to `new_with_shared_embedder`.
+    /// Loads the BGE-Base-EN-v1.5-Q model once (10-30s), then reuse across DB instances.
+    pub async fn create_shared_embedder(
+    ) -> Result<Arc<std::sync::Mutex<TextEmbedding>>, OriginError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("embedder-init-shared".into())
+            .spawn(move || {
+                let opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
+                    .with_show_download_progress(true);
+                let result = TextEmbedding::try_new(opts);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| OriginError::Embedding(format!("spawn embedder: {}", e)))?;
+        let embedder = rx
+            .await
+            .map_err(|_| OriginError::Embedding("embedder thread panicked".into()))?
+            .map_err(|e| OriginError::Embedding(format!("init embedder: {}", e)))?;
+        Ok(Arc::new(std::sync::Mutex::new(embedder)))
+    }
+
     /// Lightweight constructor for eval ablation tests (model × prefix 2x2).
     /// Creates a fresh ephemeral DB with the given embedding model and dimension.
     /// Skips migrations (fresh DB only) and profile bootstrap.
@@ -6132,6 +6214,242 @@ impl MemoryDB {
                 .then_with(|| a.source_id.cmp(&b.source_id))
         });
         Ok(merged)
+    }
+
+    /// Vector-only search bypassing hybrid FTS+RRF pipeline — used as NaiveRag baseline.
+    /// Embeds the query, queries the DiskANN index, and returns results scored by
+    /// cosine similarity (1.0 - distance). No FTS, no RRF, no scoring adjustments.
+    #[allow(dead_code)] // Used by eval module (token_efficiency.rs)
+    pub(crate) async fn naive_vector_search(
+        &self,
+        query: &str,
+        limit: usize,
+        domain: Option<&str>,
+    ) -> Result<Vec<SearchResult>, OriginError> {
+        let embedding = self.get_or_compute_embedding(query)?;
+        let vec_str = Self::vec_to_sql(&embedding);
+        // Fetch more candidates when domain filtering (some will be filtered out)
+        let fetch_limit = if domain.is_some() {
+            (limit * 3) as i64
+        } else {
+            limit as i64
+        };
+
+        let conn = self.conn.lock().await;
+
+        let (sql, params): (String, Vec<libsql::Value>) = if let Some(d) = domain {
+            (
+                "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
+                        c.chunk_index, c.last_modified, c.chunk_type, c.language, c.byte_start,
+                        c.byte_end, c.semantic_unit, c.memory_type, c.domain, c.source_agent,
+                        c.confidence, c.confirmed, c.stability, c.supersedes,
+                        c.entity_id, c.quality, c.is_recap, c.supersede_mode,
+                        c.structured_fields, c.retrieval_cue, c.source_text,
+                        vector_distance_cos(c.embedding, vector32(?1))
+                 FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
+                 JOIN memories c ON c.rowid = vt.id
+                 WHERE c.pending_revision = 0 AND c.domain = ?3"
+                    .to_string(),
+                vec![
+                    libsql::Value::Text(vec_str.clone()),
+                    libsql::Value::Integer(fetch_limit),
+                    libsql::Value::Text(d.to_string()),
+                ],
+            )
+        } else {
+            (
+                "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
+                        c.chunk_index, c.last_modified, c.chunk_type, c.language, c.byte_start,
+                        c.byte_end, c.semantic_unit, c.memory_type, c.domain, c.source_agent,
+                        c.confidence, c.confirmed, c.stability, c.supersedes,
+                        c.entity_id, c.quality, c.is_recap, c.supersede_mode,
+                        c.structured_fields, c.retrieval_cue, c.source_text,
+                        vector_distance_cos(c.embedding, vector32(?1))
+                 FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
+                 JOIN memories c ON c.rowid = vt.id
+                 WHERE c.pending_revision = 0"
+                    .to_string(),
+                vec![
+                    libsql::Value::Text(vec_str.clone()),
+                    libsql::Value::Integer(fetch_limit),
+                ],
+            )
+        };
+
+        let mut results = Vec::new();
+        match conn.query(&sql, params).await {
+            Ok(mut rows) => {
+                while let Ok(Some(row)) = rows.next().await {
+                    let distance: f64 = row.get(28).unwrap_or(1.0);
+                    let score = (1.0 - distance).max(0.0) as f32;
+                    if let Ok(result) = Self::row_to_search_result(&row, score) {
+                        results.push(result);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("[naive_vector_search] vector index query failed: {}", e);
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    /// FTS-only search (no vector, no RRF) — used as ablation baseline.
+    /// Runs BM25 FTS5 matching with AND-then-OR fallback; score = negated rank.
+    /// Eval-only: not used in production search paths.
+    #[allow(dead_code)] // Used by eval module (token_efficiency.rs)
+    pub(crate) async fn fts_only_search(
+        &self,
+        query: &str,
+        limit: usize,
+        domain: Option<&str>,
+    ) -> Result<Vec<SearchResult>, OriginError> {
+        let fetch_limit = if domain.is_some() {
+            (limit * 3) as i64
+        } else {
+            limit as i64
+        };
+
+        let conn = self.conn.lock().await;
+
+        let (domain_clause, domain_param): (String, Option<libsql::Value>) = if let Some(d) = domain
+        {
+            (
+                "AND c.domain = ?3".to_string(),
+                Some(libsql::Value::Text(d.to_string())),
+            )
+        } else {
+            (String::new(), None)
+        };
+
+        let fts_sql = format!(
+            "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
+                    c.chunk_index, c.last_modified, c.chunk_type, c.language, c.byte_start,
+                    c.byte_end, c.semantic_unit, c.memory_type, c.domain, c.source_agent,
+                    c.confidence, c.confirmed, c.stability, c.supersedes,
+                    c.entity_id, c.quality, c.is_recap, c.supersede_mode,
+                    c.structured_fields, c.retrieval_cue, c.source_text,
+                    fts.rank
+             FROM memories_fts fts
+             JOIN memories c ON fts.rowid = c.rowid
+             WHERE memories_fts MATCH ?1
+               AND c.pending_revision = 0 {}
+             ORDER BY fts.rank
+             LIMIT ?2",
+            domain_clause
+        );
+
+        // AND match first, fall back to OR for multi-word queries
+        let fts_queries = vec![query.to_string(), Self::fts_or_query(query)];
+        let mut results: Vec<SearchResult> = Vec::new();
+
+        for fts_query in &fts_queries {
+            let mut params: Vec<libsql::Value> = vec![
+                libsql::Value::Text(fts_query.clone()),
+                libsql::Value::Integer(fetch_limit),
+            ];
+            if let Some(ref dp) = domain_param {
+                params.push(dp.clone());
+            }
+
+            match conn.query(&fts_sql, params).await {
+                Ok(mut rows) => {
+                    while let Ok(Some(row)) = rows.next().await {
+                        // FTS5 rank is negative BM25; negate so higher = better
+                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let score = (-rank) as f32;
+                        if let Ok(result) = Self::row_to_search_result(&row, score) {
+                            results.push(result);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[fts_only_search] FTS search failed: {}", e);
+                }
+            }
+            if !results.is_empty() {
+                break;
+            }
+        }
+
+        // Dedup by id (AND and OR passes shouldn't overlap, but guard anyway)
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|r| seen.insert(r.id.clone()));
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    /// Vector + FTS merged by max score per document (no RRF) — ablation baseline.
+    /// Merges both signal lists by taking the max score for any document appearing
+    /// in both, then sorts descending and truncates to limit.
+    /// Eval-only: not used in production search paths.
+    #[allow(dead_code)] // Used by eval module (token_efficiency.rs)
+    pub(crate) async fn vector_plus_fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+        domain: Option<&str>,
+    ) -> Result<Vec<SearchResult>, OriginError> {
+        // Run both searches independently; score normalization is done after merge.
+        let vec_results = self.naive_vector_search(query, limit, domain).await?;
+        let fts_results = self.fts_only_search(query, limit, domain).await?;
+
+        // Normalise vector scores (already in [0,1] as cosine similarity).
+        // Normalise FTS scores to [0,1] range so both signals are comparable.
+        let fts_max = fts_results
+            .iter()
+            .map(|r| r.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let fts_norm = if fts_max > 0.0 { fts_max } else { 1.0 };
+
+        let mut merged: std::collections::HashMap<String, SearchResult> =
+            std::collections::HashMap::new();
+
+        for r in vec_results {
+            // Vector scores are already cosine similarity in [0,1]
+            let prev_score = merged
+                .get(&r.id)
+                .map(|e| e.score)
+                .unwrap_or(f32::NEG_INFINITY);
+            if r.score > prev_score {
+                merged.insert(r.id.clone(), r);
+            }
+        }
+
+        for mut r in fts_results {
+            let normalised = r.score / fts_norm;
+            let prev_score = merged
+                .get(&r.id)
+                .map(|e| e.score)
+                .unwrap_or(f32::NEG_INFINITY);
+            if normalised > prev_score {
+                r.score = normalised;
+                merged.insert(r.id.clone(), r);
+            }
+        }
+
+        let mut results: Vec<SearchResult> = merged.into_values().collect();
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source_id.cmp(&b.source_id))
+        });
+        results.truncate(limit);
+        Ok(results)
     }
 
     /// Search entities by vector similarity. Returns EntitySearchResult with full Entity data.
