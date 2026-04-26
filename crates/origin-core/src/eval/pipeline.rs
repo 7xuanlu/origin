@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Pipeline evaluation: compare Flat vs Enriched vs Distilled conditions.
 
-use super::token_efficiency::SearchStrategy;
+use super::retrieval::SearchStrategy;
 use crate::db::MemoryDB;
 use crate::error::OriginError;
 use crate::eval::metrics;

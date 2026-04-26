@@ -3066,7 +3066,7 @@ mod tests {
     /// counts, runs real LLM distillation (`distill_concepts`), then re-measures.
     ///
     /// Requires the Qwen3-4B model to be present in the hf-hub cache.
-    /// Run with: cargo test -p origin-core --lib eval::token_efficiency::tests::benchmark_pipeline_token_real_llm -- --ignored --nocapture
+    /// Run with: cargo test -p origin-core --lib eval::retrieval::tests::benchmark_pipeline_token_real_llm -- --ignored --nocapture
     #[tokio::test]
     #[ignore] // Requires on-device LLM (Qwen3-4B) — use --ignored to run
     async fn benchmark_pipeline_token_real_llm() {
@@ -3613,7 +3613,7 @@ mod tests {
     /// Takes ~10 minutes for 5 questions/conv x 10 convs = 150 LLM calls.
     ///
     /// Run with:
-    /// cargo test -p origin-core --lib eval::token_efficiency::tests::benchmark_e2e_locomo_on_device -- --ignored --nocapture
+    /// cargo test -p origin-core --lib eval::retrieval::tests::benchmark_e2e_locomo_on_device -- --ignored --nocapture
     #[tokio::test]
     #[ignore] // Requires on-device Qwen3-4B model (~10 min)
     async fn benchmark_e2e_locomo_on_device() {
@@ -3707,7 +3707,7 @@ mod tests {
     /// Judge a single hardcoded tuple via `claude -p` CLI.
     ///
     /// Run with:
-    /// cargo test -p origin-core --lib eval::token_efficiency::tests::test_judge_single_tuple -- --ignored --nocapture
+    /// cargo test -p origin-core --lib eval::retrieval::tests::test_judge_single_tuple -- --ignored --nocapture
     #[tokio::test]
     #[ignore] // Requires claude CLI with active Max subscription
     async fn test_judge_single_tuple() {
@@ -3751,7 +3751,7 @@ mod tests {
     /// Phase 2: feed tuples to `claude -p haiku` as binary judge.
     ///
     /// Run with:
-    /// cargo test -p origin-core --lib eval::token_efficiency::tests::benchmark_e2e_locomo_judged -- --ignored --nocapture
+    /// cargo test -p origin-core --lib eval::retrieval::tests::benchmark_e2e_locomo_judged -- --ignored --nocapture
     #[tokio::test]
     #[ignore] // Requires on-device Qwen3-4B model AND claude CLI with Max subscription (~15 min)
     async fn benchmark_e2e_locomo_judged() {

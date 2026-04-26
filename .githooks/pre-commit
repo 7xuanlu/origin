@@ -12,7 +12,7 @@ if [ "$HAS_RUST" = "yes" ]; then
     echo "  Auto-formatting Rust..."
     cargo fmt --all 2>&1
     # Re-stage any files that cargo fmt modified
-    git diff --name-only | grep '\.rs$' | xargs -r git add
+    git diff --name-only | grep '\.rs$' | xargs git add 2>/dev/null || true
 
     echo "  Checking Rust compilation..."
     (cd app && cargo check --lib 2>&1) || {
