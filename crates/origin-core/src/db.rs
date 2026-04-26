@@ -23849,4 +23849,34 @@ pub(crate) mod tests {
         assert!(!ids.contains(&"c_active".to_string()), "active should not qualify");
         assert_eq!(ids.len(), 1, "only c_stale should match: {:?}", ids);
     }
+
+    #[tokio::test]
+    async fn delete_concept_cascades_to_concept_sources() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_concept(
+            "c_cascade", "Cascade Test", None, "content", None, None, &["mem_x"], &now,
+        )
+        .await
+        .unwrap();
+
+        // Link a source row.
+        db.link_concept_source("c_cascade", "mem_x", "test")
+            .await
+            .unwrap();
+
+        // Verify the link exists.
+        let sources_before = db.get_concept_sources("c_cascade").await.unwrap();
+        assert_eq!(sources_before.len(), 1, "concept_sources row should exist");
+
+        // Delete the concept; cascade should drop the join row.
+        db.delete_concept("c_cascade").await.unwrap();
+
+        let sources_after = db.get_concept_sources("c_cascade").await.unwrap();
+        assert!(
+            sources_after.is_empty(),
+            "concept_sources should be empty after concept delete (FK cascade): {:?}",
+            sources_after
+        );
+    }
 }

@@ -15,11 +15,10 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-const DAEMON_PROBE_URL: &str = "http://127.0.0.1:7878/api/health";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub async fn run(dry_run: bool) -> anyhow::Result<()> {
-    // Step 1: refuse if daemon is running on :7878.
+    // Step 1: refuse if daemon is running (reads ORIGIN_PORT, matching cmd_status).
     check_daemon_not_running().await?;
 
     // Step 2: open the DB directly (not via daemon).
@@ -106,17 +105,34 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
 }
 
 async fn check_daemon_not_running() -> Result<()> {
+    // Mirror the port-reading logic from cmd_status in main.rs.
+    let port: u16 = std::env::var("ORIGIN_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7878);
+    let probe_url = format!("http://127.0.0.1:{}/api/health", port);
+
     let client = reqwest::Client::builder()
         .timeout(DAEMON_PROBE_TIMEOUT)
         .build()
         .context("building reqwest client")?;
-    match client.get(DAEMON_PROBE_URL).send().await {
+    match client.get(&probe_url).send().await {
         Ok(_) => Err(anyhow!(
-            "Daemon is running on :7878. Stop it before running backfill:\n  \
+            "Daemon is running on :{port}. Stop it before running backfill:\n  \
              launchctl unload ~/Library/LaunchAgents/com.origin.server.plist\n  \
-             # or: kill -9 $(lsof -ti :7878)"
+             # or: kill -9 $(lsof -ti :{port})"
         )),
-        // Connection refused / timeout / etc — daemon is not running, proceed.
-        Err(_) => Ok(()),
+        // Truly refused (nothing listening): safe to proceed.
+        Err(e) if e.is_connect() => Ok(()),
+        // Timeout: daemon may be alive but wedged (e.g. GPU inference). Refuse.
+        Err(e) if e.is_timeout() => Err(anyhow!(
+            "Daemon probe to :{port} timed out after {}ms. \
+             Daemon may be busy. Stop it explicitly and retry:\n  \
+             launchctl unload ~/Library/LaunchAgents/com.origin.server.plist\n  \
+             # or: kill -9 $(lsof -ti :{port})",
+            DAEMON_PROBE_TIMEOUT.as_millis()
+        )),
+        // Any other network error: surface it.
+        Err(e) => Err(anyhow!("Daemon probe to :{port} failed unexpectedly: {e}")),
     }
 }
