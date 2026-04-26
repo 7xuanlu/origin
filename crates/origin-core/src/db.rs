@@ -14375,6 +14375,39 @@ impl MemoryDB {
         Ok(result)
     }
 
+    /// Find archived concepts that look like Mode B failures: large
+    /// source_memory_ids count, no entity, no domain, not user-edited.
+    /// Used by the `backfill-stale-concepts` CLI subcommand.
+    pub async fn find_stale_archived_concepts(
+        &self,
+    ) -> Result<Vec<crate::concepts::Concept>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
+                 FROM concepts
+                 WHERE status = 'archived'
+                   AND entity_id IS NULL
+                   AND domain IS NULL
+                   AND COALESCE(user_edited, 0) = 0
+                   AND json_array_length(source_memory_ids) > 50
+                 ORDER BY created_at DESC",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("find_stale_archived_concepts: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            out.push(Self::row_to_concept(&row)?);
+        }
+        Ok(out)
+    }
+
     /// Clear staleness fields after successful re-distillation.
     pub async fn clear_concept_staleness(&self, concept_id: &str) -> Result<(), OriginError> {
         let conn = self.conn.lock().await;
@@ -23753,5 +23786,67 @@ pub(crate) mod tests {
         assert!(ids.contains(&"mem_trunc_ellipsis"), "should include ellipsis title");
         assert!(ids.contains(&"mem_long_title"), "should include long title");
         assert!(!ids.contains(&"mem_good_title"), "should not include good title");
+    }
+
+    #[tokio::test]
+    async fn find_stale_archived_concepts_returns_only_qualifying_rows() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Build source_memory_ids of length 60 (above the > 50 threshold)
+        let big_sources: Vec<String> = (0..60).map(|i| format!("mem_{}", i)).collect();
+        let big_refs: Vec<&str> = big_sources.iter().map(|s| s.as_str()).collect();
+
+        // Build small source_memory_ids (below threshold)
+        let small_sources: Vec<String> = (0..10).map(|i| format!("mem_s{}", i)).collect();
+        let small_refs: Vec<&str> = small_sources.iter().map(|s| s.as_str()).collect();
+
+        // Qualifying: archived, big, no domain, no entity, not user_edited
+        db.insert_concept(
+            "c_stale", "Stale One", None, "content body", None, None, &big_refs, &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_stale").await.unwrap();
+
+        // Disqualifying: small (size <= 50)
+        db.insert_concept(
+            "c_small", "Small One", None, "content", None, None, &small_refs, &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_small").await.unwrap();
+
+        // Disqualifying: has entity
+        db.insert_concept(
+            "c_entity", "With Entity", None, "content", Some("ent_X"), None, &big_refs, &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_entity").await.unwrap();
+
+        // Disqualifying: has domain
+        db.insert_concept(
+            "c_domain", "With Domain", None, "content", None, Some("work"), &big_refs, &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_domain").await.unwrap();
+
+        // Disqualifying: still active (not archived)
+        db.insert_concept(
+            "c_active", "Active", None, "content", None, None, &big_refs, &now,
+        )
+        .await
+        .unwrap();
+
+        let candidates = db.find_stale_archived_concepts().await.unwrap();
+        let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&"c_stale".to_string()), "missing c_stale");
+        assert!(!ids.contains(&"c_small".to_string()), "small should not qualify");
+        assert!(!ids.contains(&"c_entity".to_string()), "entity-linked should not qualify");
+        assert!(!ids.contains(&"c_domain".to_string()), "domain-linked should not qualify");
+        assert!(!ids.contains(&"c_active".to_string()), "active should not qualify");
+        assert_eq!(ids.len(), 1, "only c_stale should match: {:?}", ids);
     }
 }
