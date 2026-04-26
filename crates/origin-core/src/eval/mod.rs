@@ -2,6 +2,7 @@
 //! Memory eval system — quality measurement and feedback capture.
 
 pub mod anthropic;
+pub mod judge;
 pub mod shared;
 
 pub mod distillation_quality;
@@ -22,5 +23,3 @@ pub mod token_efficiency;
 // Closed-core modules (proprietary, feature-gated)
 #[cfg(feature = "closed-core-eval")]
 pub mod auto_tune;
-#[cfg(feature = "closed-core-eval")]
-pub mod eval_judge;
