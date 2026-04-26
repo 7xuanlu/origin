@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Memory eval system — quality measurement and feedback capture.
 
+pub mod anthropic;
+pub mod shared;
+
 pub mod distillation_quality;
 pub mod fixtures;
 pub mod gen;
