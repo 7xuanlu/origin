@@ -14,6 +14,10 @@ pub struct SearchResult {
     pub url: Option<String>,
     pub chunk_index: i32,
     pub last_modified: i64,
+    /// Unix seconds timestamp when the chunk was first inserted.
+    /// Equal to `last_modified` for benchmark/eval seeds; diverges in real use as memories get re-enriched.
+    #[serde(default)]
+    pub created_at: i64,
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_type: Option<String>,
