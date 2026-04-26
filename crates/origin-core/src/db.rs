@@ -11766,6 +11766,7 @@ impl MemoryDB {
                AND m.source_id NOT LIKE 'recap_%' \
                AND m.is_recap = 0 \
                AND m.embedding IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM enrichment_steps es WHERE es.source_id = m.source_id) \
              ORDER BY m.entity_id, m.domain, m.last_modified DESC",
             (),
         ).await.map_err(|e| OriginError::VectorDb(format!("distillation fetch: {}", e)))?;
@@ -11808,7 +11809,7 @@ impl MemoryDB {
         drop(conn);
 
         log::info!(
-            "[distill] found {} eligible memories for clustering",
+            "[distill] found {} eligible memories for clustering (raw excluded)",
             memories.len()
         );
         if memories.is_empty() {
@@ -19078,6 +19079,10 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             db.upsert_documents(vec![doc]).await.unwrap();
+            // Record an enrichment step so the memory passes the EXISTS gate.
+            db.record_enrichment_step(&format!("cluster_{}", i), "dedup", "ok", None)
+                .await
+                .unwrap();
         }
 
         let clusters = db
@@ -19094,6 +19099,59 @@ pub(crate) mod tests {
                 cluster.source_ids
             );
         }
+    }
+
+    #[tokio::test]
+    async fn find_distillation_clusters_excludes_memories_without_enrichment_steps() {
+        let (db, _dir) = test_db().await;
+
+        // Insert 4 memories with same entity, all eligible by other criteria.
+        // 2 will have enrichment_steps (eligible after gate), 2 will not (raw).
+        let now = chrono::Utc::now().timestamp_millis();
+        for (i, sid) in ["mem_e1", "mem_e2", "mem_r1", "mem_r2"].iter().enumerate() {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: sid.to_string(),
+                content: format!("Test content about Origin item {}", i),
+                title: format!("Test mem {}", i),
+                url: None,
+                last_modified: now,
+                memory_type: Some("fact".to_string()),
+                domain: Some("test".to_string()),
+                entity_id: Some("ent_test".to_string()),
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
+
+        // Record enrichment steps for the first 2 only.
+        for sid in ["mem_e1", "mem_e2"].iter() {
+            db.record_enrichment_step(sid, "dedup", "ok", None)
+                .await
+                .unwrap();
+        }
+
+        // Run cluster discovery with min_size=2 so the eligible 2 form a cluster.
+        let clusters = db
+            .find_distillation_clusters(0.3, 2, 20, 3500)
+            .await
+            .unwrap();
+
+        // The 2 raw memories must not appear in any cluster.
+        let all_source_ids: Vec<String> = clusters
+            .iter()
+            .flat_map(|c| c.source_ids.iter().cloned())
+            .collect();
+        assert!(
+            !all_source_ids.contains(&"mem_r1".to_string()),
+            "raw memory mem_r1 leaked into clusters: {:?}",
+            all_source_ids
+        );
+        assert!(
+            !all_source_ids.contains(&"mem_r2".to_string()),
+            "raw memory mem_r2 leaked into clusters: {:?}",
+            all_source_ids
+        );
     }
 
     // ==================== Recap Integration ====================
