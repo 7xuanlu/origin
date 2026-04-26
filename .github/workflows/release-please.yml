@@ -23,13 +23,20 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN }}
 
       # When a release PR is open, also bump Cargo.toml versions
-      # (release-please can't handle Cargo workspace manifests)
+      # (release-please can't handle Cargo workspace manifests).
+      #
+      # IMPORTANT: use the same RELEASE_TOKEN PAT that release-please-action
+      # used to create the PR. The subsequent `git push` of synced version
+      # files needs to fire a `pull_request synchronize` event so CI runs
+      # against the new HEAD — GITHUB_TOKEN-driven pushes never trigger
+      # downstream workflows (GitHub security policy), which would leave the
+      # PR head with empty `statusCheckRollup` and block branch protection.
       - name: Checkout (for Cargo version sync)
         if: steps.release.outputs.pr != ''
         uses: actions/checkout@v4
         with:
           ref: release-please--branches--main
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Sync all version files to match release
         if: steps.release.outputs.pr != ''

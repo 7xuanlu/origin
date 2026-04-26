@@ -14,11 +14,26 @@ if [ "$HAS_RUST" = "yes" ]; then
     # Re-stage any files that cargo fmt modified
     git diff --name-only | grep '\.rs$' | xargs git add 2>/dev/null || true
 
-    echo "  Checking Rust compilation..."
-    (cd app && cargo check --lib 2>&1) || {
-        echo "FAIL: Rust compilation errors. Fix before committing."
-        exit 1
-    }
+    # Detect which crates were touched so we can run targeted clippy
+    TOUCHED_CRATES=""
+    if echo "$STAGED_FILES" | grep -q '^crates/origin-types/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p origin-types"; fi
+    if echo "$STAGED_FILES" | grep -q '^crates/origin-core/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p origin-core"; fi
+    if echo "$STAGED_FILES" | grep -q '^crates/origin-server/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p origin-server"; fi
+    if echo "$STAGED_FILES" | grep -q '^app/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p origin"; fi
+
+    if [ -n "$TOUCHED_CRATES" ]; then
+        echo "  Running Clippy on changed crates..."
+        cargo clippy $TOUCHED_CRATES -- -D warnings 2>&1 || {
+            echo "FAIL: Clippy warnings found. Fix before committing."
+            exit 1
+        }
+    else
+        echo "  Checking Rust compilation..."
+        cargo check --workspace 2>&1 || {
+            echo "FAIL: Rust compilation errors. Fix before committing."
+            exit 1
+        }
+    fi
 fi
 
 if [ "$HAS_FRONTEND" = "yes" ]; then

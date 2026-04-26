@@ -101,6 +101,15 @@ pub fn build_router(state: SharedState) -> Router {
             "/api/memory/reclassify/{source_id}",
             post(memory_routes::handle_reclassify_memory),
         )
+        // Enrichment status
+        .route(
+            "/api/memory/{source_id}/enrichment-status",
+            get(memory_routes::handle_get_enrichment_status),
+        )
+        .route(
+            "/api/memory/{source_id}/enrichment-status/retry",
+            post(memory_routes::handle_retry_enrichment),
+        )
         // Pending revisions
         .route(
             "/api/memory/revision/{id}/accept",

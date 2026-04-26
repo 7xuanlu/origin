@@ -147,7 +147,8 @@ pub struct RawDocument {
     /// Whether this memory is a recap/summary of other memories
     #[serde(default)]
     pub is_recap: bool,
-    /// Enrichment pipeline status: "raw", "pending", "enriched", "failed"
+    /// Deprecated: enrichment status is now derived from the `enrichment_steps` table.
+    /// This field is ignored on INSERT. Kept for API compatibility with downstream consumers.
     #[serde(default = "default_enrichment_status")]
     pub enrichment_status: String,
     /// How superseded content is handled: "hide" (default) or "archive" (visible but muted)

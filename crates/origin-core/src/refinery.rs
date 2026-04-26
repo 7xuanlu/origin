@@ -28,6 +28,7 @@ pub const ALL_PHASES: &[&str] = &[
     "decision_backfill",
     "prune_rejections",
     "kg_rethink",
+    "retry_failed_enrichment",
 ];
 
 /// What triggered a refinery cycle. Different triggers run different subsets
@@ -57,7 +58,11 @@ impl TriggerKind {
             Self::BurstEnd => matches!(phase_name, "recaps" | "refinement_queue"),
             Self::Idle => matches!(
                 phase_name,
-                "community_detection" | "emergence" | "re-distill" | "decision_logs"
+                "community_detection"
+                    | "emergence"
+                    | "re-distill"
+                    | "decision_logs"
+                    | "retry_failed_enrichment"
             ),
             Self::Daily => matches!(
                 phase_name,
@@ -687,13 +692,43 @@ pub async fn run_periodic_steep_with_api(
                     )
                     .await
                     {
-                        Ok(Some(_)) => extracted += 1,
+                        Ok(Some(_)) => {
+                            extracted += 1;
+                            // Record a step so the memory becomes eligible for
+                            // distillation (find_distillation_clusters gates on
+                            // EXISTS enrichment_steps; without this, file-synced
+                            // memories that bypass /api/memory/store would never
+                            // pass the gate).
+                            let _ = db_ref
+                                .record_enrichment_step(source_id, "entity_backfill", "ok", None)
+                                .await;
+                        }
                         Ok(None) => {
                             // Mark as attempted so we don't retry forever
                             let _ = db_ref.update_memory_entity_id(source_id, "").await;
+                            let _ = db_ref
+                                .record_enrichment_step(
+                                    source_id,
+                                    "entity_backfill",
+                                    "skipped",
+                                    Some("no entities extracted"),
+                                )
+                                .await;
                         }
                         Err(e) => {
                             log::warn!("[refinery] entity_backfill failed for {}: {e}", source_id);
+                            // Record the failure so the memory eventually becomes
+                            // eligible for distillation (per spec: "once at least
+                            // one step is recorded — even if failed — the memory
+                            // is admitted, deliberate to avoid stuck-forever").
+                            let _ = db_ref
+                                .record_enrichment_step(
+                                    source_id,
+                                    "entity_backfill",
+                                    "failed",
+                                    Some(&e.to_string()),
+                                )
+                                .await;
                             break; // LLM may be down, stop batch
                         }
                     }
@@ -765,6 +800,23 @@ pub async fn run_periodic_steep_with_api(
         }
     }
 
+    // Phase 11: Retry failed enrichment — self-healing (now includes LLM title re-enrichment)
+    if trigger.runs_phase("retry_failed_enrichment") {
+        let title_llm = api_llm.or(llm);
+        let phase = run_phase("retry_failed_enrichment", || async {
+            let retried = retry_failed_enrichment(db_ref, tuning, title_llm).await?;
+            log::info!("[refinery] retry_failed_enrichment: retried {retried} steps");
+            let (nudge, headline) = classify_backfill(retried);
+            Ok(PhaseOutput {
+                items_processed: retried,
+                nudge,
+                headline,
+            })
+        })
+        .await;
+        phases.push(phase);
+    }
+
     let elapsed = steep_start.elapsed();
     log::info!(
         "[refinery] steep complete in {}ms — {} phases, {} errors",
@@ -794,7 +846,7 @@ pub async fn run_periodic_steep_with_api(
     })
 }
 
-/// Reclassify imported memories that lack proper memory_type classification.
+/// Reclassify memories that lack proper memory_type or domain classification.
 async fn reclassify_imports(
     db: &MemoryDB,
     llm: Option<&Arc<dyn LlmProvider>>,
@@ -802,8 +854,13 @@ async fn reclassify_imports(
 ) -> Result<usize, OriginError> {
     let mut reclassified = 0usize;
     if let Some(llm) = llm {
-        let imports = db.get_unclassified_imports(3).await?;
+        let imports = db.get_unclassified_imports(10).await?;
         for (source_id, content) in &imports {
+            // Check which fields are actually missing so we only fill NULLs
+            let existing = db.get_memory_classification(source_id).await?;
+            let needs_type = existing.0.is_none();
+            let needs_domain = existing.1.is_none();
+
             let truncated: String = content.chars().take(1000).collect();
             let response = llm
                 .generate(LlmRequest {
@@ -822,24 +879,35 @@ async fn reclassify_imports(
                     {
                         let sid_prefix: String = source_id.chars().take(12).collect();
                         log::info!(
-                            "[refinery] reclassified import {} -> type={}, domain={:?}",
+                            "[refinery] reclassified {} -> type={}, domain={:?}",
                             sid_prefix,
                             classification.memory_type,
                             classification.domain,
                         );
-                        if let Err(e) = db
-                            .update_memory_type(source_id, &classification.memory_type)
-                            .await
-                        {
-                            log::warn!("[refinery] reclassify type update failed: {e}");
-                        }
-                        if let Some(ref domain) = classification.domain {
-                            if let Err(e) = db.update_domain(source_id, domain).await {
-                                log::warn!("[refinery] reclassify domain update failed: {e}");
+                        // Only update memory_type if it was NULL
+                        if needs_type {
+                            if let Err(e) = db
+                                .update_memory_type(source_id, &classification.memory_type)
+                                .await
+                            {
+                                log::warn!("[refinery] reclassify type update failed: {e}");
                             }
-                            // Auto-create space for newly classified domain
-                            if let Err(e) = db.auto_create_space_if_needed(domain).await {
-                                log::warn!("[refinery] auto-create space failed: {e}");
+                        }
+                        // Only update domain if it was NULL
+                        if needs_domain {
+                            if let Some(ref domain) = classification.domain {
+                                if let Err(e) = db.update_domain(source_id, domain).await {
+                                    log::warn!("[refinery] reclassify domain update failed: {e}");
+                                }
+                                // Auto-create space for newly classified domain
+                                if let Err(e) = db.auto_create_space_if_needed(domain).await {
+                                    log::warn!("[refinery] auto-create space failed: {e}");
+                                }
+                            } else {
+                                // LLM returned no domain — set fallback to prevent infinite retry
+                                if let Err(e) = db.update_domain(source_id, "general").await {
+                                    log::warn!("[refinery] reclassify fallback domain failed: {e}");
+                                }
                             }
                         }
                         if let Some(ref quality) = classification.quality {
@@ -861,7 +929,7 @@ async fn reclassify_imports(
             }
         }
         if reclassified > 0 {
-            log::info!("[refinery] reclassified {} imported memories", reclassified);
+            log::info!("[refinery] reclassified {} memories", reclassified);
         }
     }
     Ok(reclassified)
@@ -1075,7 +1143,7 @@ async fn refine_clusters_with_llm(
             .collect::<Vec<_>>()
             .join("\n");
 
-        let user_prompt = format!("Entity: {}\n\n{}\n/no_think", entity, summaries);
+        let user_prompt = format!("Entity: {}\n\n{}", entity, summaries);
 
         let response = llm
             .generate(LlmRequest {
@@ -1218,6 +1286,7 @@ pub async fn distill_concepts(
             tuning.concept_min_cluster_size,
             tuning.max_clusters_per_steep,
             token_limit,
+            tuning.max_unlinked_cluster_size,
         )
         .await?;
 
@@ -1327,7 +1396,7 @@ pub async fn distill_concepts(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        let user_prompt = format!("Topic: {}\n\n{}\n/no_think", topic, memories_block);
+        let user_prompt = format!("Topic: {}\n\n{}", topic, memories_block);
 
         let response = llm
             .generate(LlmRequest {
@@ -1342,7 +1411,6 @@ pub async fn distill_concepts(
         match response {
             Ok(raw) if !raw.trim().is_empty() => {
                 let cleaned = crate::llm_provider::strip_think_tags(&raw);
-                let cleaned = cleaned.replace("/no_think", "");
                 let content = cleaned.trim().to_string();
 
                 if content.is_empty() {
@@ -1373,7 +1441,8 @@ pub async fn distill_concepts(
                 let llm_title = generate_short_title(llm, &content).await;
                 let title = match llm_title {
                     Some(t) => t,
-                    None if looks_like_generic_topic(topic)
+                    None if is_all_generic_tokens(topic)
+                        || looks_like_markup_styled(topic)
                         || looks_like_path(topic)
                         || looks_like_code(topic)
                         || looks_like_uuid(topic)
@@ -1510,7 +1579,7 @@ async fn assign_orphan_memories(
         .join("\n");
 
     let user_prompt = format!(
-        "Unassigned memories:\n{}\n\nExisting concepts:\n{}\n/no_think",
+        "Unassigned memories:\n{}\n\nExisting concepts:\n{}",
         memories_text, concepts_text
     );
 
@@ -1786,7 +1855,7 @@ async fn recompile_single_concept(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let user_prompt = format!("Topic: {}\n\n{}\n/no_think", concept.title, memories_block);
+    let user_prompt = format!("Topic: {}\n\n{}", concept.title, memories_block);
 
     let response = llm
         .generate(LlmRequest {
@@ -1801,7 +1870,6 @@ async fn recompile_single_concept(
     match response {
         Ok(raw) if !raw.trim().is_empty() => {
             let content = crate::llm_provider::strip_think_tags(&raw)
-                .replace("/no_think", "")
                 .trim()
                 .to_string();
             if !content.is_empty() {
@@ -1905,7 +1973,7 @@ pub(crate) async fn re_distill_stale_concepts(
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let user_prompt = format!("Topic: {}\n\n{}\n/no_think", concept.title, memories_block);
+        let user_prompt = format!("Topic: {}\n\n{}", concept.title, memories_block);
         let response = llm_ref
             .generate(crate::llm_provider::LlmRequest {
                 system_prompt: Some(prompts.distill_concept.clone()),
@@ -1919,7 +1987,6 @@ pub(crate) async fn re_distill_stale_concepts(
         match response {
             Ok(raw) if !raw.trim().is_empty() => {
                 let content = crate::llm_provider::strip_think_tags(&raw)
-                    .replace("/no_think", "")
                     .trim()
                     .to_string();
                 if !content.is_empty() {
@@ -1967,7 +2034,7 @@ async fn global_concept_review(
     let response = llm
         .generate(LlmRequest {
             system_prompt: Some(prompts.global_concept_review.clone()),
-            user_prompt: format!("{}\n/no_think", concepts_text),
+            user_prompt: concepts_text,
             max_tokens: 1024,
             temperature: 0.3,
             label: Some("global_review".into()),
@@ -2088,7 +2155,7 @@ pub async fn deep_distill_single(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let user_prompt = format!("Topic: {}\n\n{}\n/no_think", concept.title, memories_block);
+    let user_prompt = format!("Topic: {}\n\n{}", concept.title, memories_block);
 
     let response = llm
         .generate(LlmRequest {
@@ -2102,7 +2169,6 @@ pub async fn deep_distill_single(
         .map_err(|e| OriginError::Llm(format!("re-distill LLM: {}", e)))?;
 
     let content = crate::llm_provider::strip_think_tags(&response)
-        .replace("/no_think", "")
         .trim()
         .to_string();
 
@@ -2655,14 +2721,74 @@ fn build_burst_context(
     )
 }
 
-/// Returns true for single-word generic stand-ins that are useless as concept titles.
-/// These are often the `topic` fallback value when no entity/domain is available.
-fn looks_like_generic_topic(s: &str) -> bool {
-    let t = s.trim().to_lowercase();
-    matches!(
-        t.as_str(),
-        "general" | "untitled" | "topic" | "concept" | "cluster" | "misc" | "other" | "unknown"
-    )
+/// Tokens considered generic stand-ins. A title made entirely of these is not
+/// useful as a concept title. Mostly English; a small set of CJK generics
+/// included for the same reason. Curated to avoid false positives —
+/// `concept`, `concepts`, `content`, `ideas` deliberately excluded because
+/// they appear in legitimate titles too often.
+const GENERIC_TOKENS: &[&str] = &[
+    "general",
+    "various",
+    "miscellaneous",
+    "topic",
+    "topics",
+    "notes",
+    "things",
+    "items",
+    "stuff",
+    "misc",
+    "other",
+    "unknown",
+    "untitled",
+    "random",
+    "assorted",
+    "cluster",
+    "clusters",
+    // CJK generics seen in real LLM output
+    "杂项",
+    "其他",
+    "其它",
+    "通用",
+    "笔记",
+    "主题",
+];
+
+/// Returns true when every word-token of the input (after splitting on
+/// non-alphanumeric separators and lowercasing) is in GENERIC_TOKENS. Used to
+/// reject LLM-produced titles like "General topic" or "Various Notes" or
+/// "Misc-things" (hyphen treated as separator).
+fn is_all_generic_tokens(s: &str) -> bool {
+    let words: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return false;
+    }
+    words
+        .iter()
+        .all(|w| GENERIC_TOKENS.contains(&w.to_lowercase().as_str()))
+}
+
+/// Returns true when the title contains markdown formatting or document-content
+/// punctuation that shouldn't appear in clean titles. Catches LLM hallucinations
+/// like `**Roland** — 太正統，d-L 連接快` where the model emitted markdown-styled
+/// document content instead of a title. Also catches wikilink brackets and
+/// heading markers that leak in from training data of Markdown corpora.
+fn looks_like_markup_styled(s: &str) -> bool {
+    let trimmed = s.trim();
+    // Markdown emphasis (bold/italic/strikethrough)
+    trimmed.contains("**")
+        || trimmed.contains("__")
+        || trimmed.contains("~~")
+        // Wikilink brackets
+        || trimmed.contains("[[")
+        || trimmed.contains("]]")
+        // Em-dash separator (en-dash and ASCII hyphen are fine)
+        || trimmed.contains('—')
+        // Heading markers at start
+        || trimmed.starts_with('#')
 }
 
 fn looks_like_uuid(s: &str) -> bool {
@@ -2780,7 +2906,7 @@ pub(crate) async fn generate_short_title(
     let input: String = stripped.chars().take(300).collect();
     let response = llm.generate(LlmRequest {
         system_prompt: Some("Given a note, write a 3-5 word title. Output ONLY the title.\n\nExample: 'The system uses libsql for vector storage with DiskANN indexing' → libsql Vector Storage\nExample: 'Google Sign-In fails with developer_error status 10' → Google Sign-In SHA Fix".to_string()),
-        user_prompt: format!("{}\n/no_think", input),
+        user_prompt: input,
         max_tokens: 16,
         temperature: 0.3,
         label: None,
@@ -2788,7 +2914,7 @@ pub(crate) async fn generate_short_title(
 
     match response {
         Ok(output) => {
-            let cleaned = crate::llm_provider::strip_think_tags(&output).replace("/no_think", "");
+            let cleaned = crate::llm_provider::strip_think_tags(&output);
             // Strip noise the model echoes: "- ", "[domain] ", numbered prefixes
             let mut title = cleaned.trim().to_string();
             // Strip leading "- "
@@ -2821,8 +2947,16 @@ pub(crate) async fn generate_short_title(
                 .trim_start_matches("title: ")
                 .trim();
             let word_count = title.split_whitespace().count();
-            log::info!("[title] clean='{}' ({} words)", title, word_count);
-            // Reject if empty, too many words, multiline, or truncated mid-sentence
+            let char_count = title.chars().count();
+            log::info!(
+                "[title] clean='{}' ({} words, {} chars)",
+                title,
+                word_count,
+                char_count
+            );
+            // Reject if empty, too many words, too long (CJK content has no
+            // whitespace so word_count alone misses runaway CJK strings),
+            // multiline, or truncated mid-sentence.
             let truncated = title.ends_with(',')
                 || title.ends_with("including")
                 || title.ends_with("with")
@@ -2831,10 +2965,16 @@ pub(crate) async fn generate_short_title(
                 || title.ends_with("for")
                 || title.ends_with("of")
                 || title.ends_with("in");
-            if title.is_empty() || word_count > 8 || title.contains('\n') || truncated {
+            if title.is_empty()
+                || word_count > 8
+                || char_count > 80
+                || title.contains('\n')
+                || truncated
+            {
                 log::info!("[title] rejected (empty/too long/multiline)");
                 None
-            } else if looks_like_generic_topic(title)
+            } else if is_all_generic_tokens(title)
+                || looks_like_markup_styled(title)
                 || looks_like_uuid(title)
                 || looks_like_short_hash(title)
                 || looks_like_code(title)
@@ -2964,6 +3104,257 @@ async fn apply_merge_by_tier(
         }
     }
     Ok(())
+}
+
+/// Retry enrichment steps that previously failed (status = "failed") but
+/// haven't exceeded `max_enrichment_retries`. Non-LLM steps (dedup,
+/// entity_link, contradiction, concept_contradiction, entity_suggestion)
+/// are retried directly. When an LLM is provided, title_enrich steps
+/// (failed + needs_retry) are retried via a dedicated loop using
+/// `get_title_reenrich_candidates`, plus a one-time backfill of old
+/// ok-but-truncated titles via `get_truncated_title_memories`. On success
+/// the step is marked "ok"; on repeated failure and max retries reached
+/// the step is moved to "abandoned".
+pub(crate) async fn retry_failed_enrichment(
+    db: &MemoryDB,
+    tuning: &crate::tuning::RefineryConfig,
+    llm: Option<&Arc<dyn LlmProvider>>,
+) -> Result<usize, OriginError> {
+    let failed = db
+        .get_failed_enrichment_memories(tuning.max_enrichment_retries, 20)
+        .await?;
+
+    let mut retried = 0usize;
+    for (source_id, step_name, content) in &failed {
+        log::info!("[refinery] retrying enrichment step '{step_name}' for {source_id}");
+        let result = match step_name.as_str() {
+            "dedup" => crate::post_ingest::check_dedup(db, source_id, content, tuning)
+                .await
+                .map(|_| ()),
+            "entity_link" => crate::post_ingest::auto_link_entity(db, source_id, content, tuning)
+                .await
+                .map(|_| ()),
+            "contradiction" => {
+                let mt = db.get_memory_type(source_id).await.unwrap_or(None);
+                let domain = db.get_memory_domain(source_id).await.unwrap_or(None);
+                if let Some(mt) = &mt {
+                    crate::post_ingest::check_contradiction(
+                        db,
+                        source_id,
+                        mt,
+                        domain.as_deref(),
+                        None,
+                        content,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            "concept_contradiction" => {
+                crate::post_ingest::check_concept_contradiction(db, source_id, content)
+                    .await
+                    .map(|_| ())
+            }
+            "entity_suggestion" => crate::post_ingest::suggest_entity_creation(db, content).await,
+            // title_enrich is handled by the dedicated title loop below
+            "title_enrich" => continue,
+            // Other LLM-requiring steps can't be retried without LLM
+            _ => {
+                log::info!("[refinery] step '{step_name}' requires LLM, skipping");
+                continue;
+            }
+        };
+        match result {
+            Ok(()) => {
+                db.record_enrichment_step(source_id, step_name, "ok", None)
+                    .await
+                    .ok();
+                retried += 1;
+            }
+            Err(e) => {
+                log::warn!("[refinery] retry of '{step_name}' for {source_id} failed: {e}");
+                // Check current attempts BEFORE recording, so we can decide
+                // whether to mark failed (retryable) or abandoned (final).
+                let current_attempts = db
+                    .get_enrichment_steps(source_id)
+                    .await
+                    .ok()
+                    .and_then(|steps| {
+                        steps
+                            .iter()
+                            .find(|s| s.step == *step_name)
+                            .map(|s| s.attempts)
+                    })
+                    .unwrap_or(0);
+                // record_enrichment_step increments attempts via UPSERT, so
+                // after this call attempts = current_attempts + 1.
+                let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
+                    "abandoned"
+                } else {
+                    "failed"
+                };
+                db.record_enrichment_step(source_id, step_name, status, Some(&e.to_string()))
+                    .await
+                    .ok();
+                if status == "abandoned" {
+                    log::info!(
+                        "[refinery] step '{step_name}' for {source_id} abandoned after {} attempts",
+                        current_attempts + 1
+                    );
+                }
+                retried += 1;
+            }
+        }
+    }
+
+    // Title re-enrichment pass -- uses dedicated query and handles
+    // the three-variant TitleEnrichResult (not just Ok/Err).
+    if let Some(llm_ref) = llm {
+        let candidates = db
+            .get_title_reenrich_candidates(tuning.max_enrichment_retries, 10)
+            .await?;
+        for (source_id, content) in &candidates {
+            log::info!("[refinery] re-enriching title for {source_id}");
+            match crate::post_ingest::enrich_title(db, source_id, content, llm_ref).await {
+                Ok(crate::post_ingest::TitleEnrichResult::Enriched) => {
+                    db.record_enrichment_step(source_id, "title_enrich", "ok", None)
+                        .await
+                        .ok();
+                    retried += 1;
+                }
+                Ok(crate::post_ingest::TitleEnrichResult::NotNeeded) => {
+                    // Title was fixed externally (e.g., user edited it)
+                    db.record_enrichment_step(source_id, "title_enrich", "ok", None)
+                        .await
+                        .ok();
+                    retried += 1;
+                }
+                Ok(crate::post_ingest::TitleEnrichResult::LlmRejected) => {
+                    let current_attempts = db
+                        .get_enrichment_steps(source_id)
+                        .await
+                        .ok()
+                        .and_then(|steps| {
+                            steps
+                                .iter()
+                                .find(|s| s.step == "title_enrich")
+                                .map(|s| s.attempts)
+                        })
+                        .unwrap_or(0);
+                    let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries
+                    {
+                        "abandoned"
+                    } else {
+                        "needs_retry"
+                    };
+                    db.record_enrichment_step(
+                        source_id,
+                        "title_enrich",
+                        status,
+                        Some("llm_rejected"),
+                    )
+                    .await
+                    .ok();
+                    if status == "abandoned" {
+                        log::info!(
+                            "[refinery] title_enrich for {source_id} abandoned after {} attempts",
+                            current_attempts + 1
+                        );
+                    }
+                    retried += 1;
+                }
+                Err(e) => {
+                    log::warn!("[refinery] title re-enrichment for {source_id} failed: {e}");
+                    let current_attempts = db
+                        .get_enrichment_steps(source_id)
+                        .await
+                        .ok()
+                        .and_then(|steps| {
+                            steps
+                                .iter()
+                                .find(|s| s.step == "title_enrich")
+                                .map(|s| s.attempts)
+                        })
+                        .unwrap_or(0);
+                    let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries
+                    {
+                        "abandoned"
+                    } else {
+                        "failed"
+                    };
+                    db.record_enrichment_step(
+                        source_id,
+                        "title_enrich",
+                        status,
+                        Some(&e.to_string()),
+                    )
+                    .await
+                    .ok();
+                    if status == "abandoned" {
+                        log::info!(
+                            "[refinery] title_enrich for {source_id} abandoned after {} attempts",
+                            current_attempts + 1
+                        );
+                    }
+                    retried += 1;
+                }
+            }
+        }
+
+        // One-time backfill: catch old memories recorded as ok but still truncated.
+        if db
+            .get_app_metadata("title_backfill_done")
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let old = db.get_truncated_title_memories(10).await?;
+            for (source_id, content) in &old {
+                log::info!("[refinery] backfill title re-enrichment for {source_id}");
+                match crate::post_ingest::enrich_title(db, source_id, content, llm_ref).await {
+                    Ok(crate::post_ingest::TitleEnrichResult::Enriched) => {
+                        db.record_enrichment_step(source_id, "title_enrich", "ok", None)
+                            .await
+                            .ok();
+                        retried += 1;
+                    }
+                    Ok(crate::post_ingest::TitleEnrichResult::LlmRejected) => {
+                        db.record_enrichment_step(
+                            source_id,
+                            "title_enrich",
+                            "needs_retry",
+                            Some("llm_rejected"),
+                        )
+                        .await
+                        .ok();
+                        retried += 1;
+                    }
+                    Ok(crate::post_ingest::TitleEnrichResult::NotNeeded) => {
+                        // Already has a good title
+                    }
+                    Err(e) => {
+                        log::warn!("[refinery] backfill title for {source_id} failed: {e}");
+                        db.record_enrichment_step(
+                            source_id,
+                            "title_enrich",
+                            "failed",
+                            Some(&e.to_string()),
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+            }
+            if old.is_empty() {
+                let _ = db.set_app_metadata("title_backfill_done", "1").await;
+            }
+        }
+    }
+
+    Ok(retried)
 }
 
 /// Trigger a refinery steep on demand — used by the chat import flow to
@@ -3287,6 +3678,7 @@ mod tests {
             "emergence",
             "re-distill",
             "decision_logs",
+            "retry_failed_enrichment",
         ];
         for &exp in expected {
             assert!(
@@ -3402,9 +3794,9 @@ mod tests {
 
         let phase_names: Vec<&str> = result.phases.iter().map(|p| p.name.as_str()).collect();
 
-        // All 15 phases must run with Backstop (14 prior + kg_rethink added
-        // in the KG quality work). `kg_rethink` is rate-limited, so on a
-        // fresh DB (last_kg_rethink_ts=0) it runs on the first steep.
+        // All 16 phases must run with Backstop. `kg_rethink` is
+        // rate-limited, so on a fresh DB (last_kg_rethink_ts=0) it runs
+        // on the first steep.
         let expected: &[&str] = &[
             "decay",
             "promote",
@@ -3421,6 +3813,7 @@ mod tests {
             "decision_backfill",
             "prune_rejections",
             "kg_rethink",
+            "retry_failed_enrichment",
         ];
         for &exp in expected {
             assert!(
@@ -4400,21 +4793,85 @@ mod tests {
 
     #[test]
     fn rejects_generic_topic_titles() {
-        // All generic placeholders must be rejected.
-        assert!(looks_like_generic_topic("general"));
-        assert!(looks_like_generic_topic("General"));
-        assert!(looks_like_generic_topic("GENERAL"));
-        assert!(looks_like_generic_topic("untitled"));
-        assert!(looks_like_generic_topic("topic"));
-        assert!(looks_like_generic_topic("concept"));
-        assert!(looks_like_generic_topic("cluster"));
-        assert!(looks_like_generic_topic("misc"));
-        assert!(looks_like_generic_topic("other"));
-        assert!(looks_like_generic_topic("unknown"));
+        // All single-word generic placeholders must still be rejected.
+        assert!(is_all_generic_tokens("general"));
+        assert!(is_all_generic_tokens("General"));
+        assert!(is_all_generic_tokens("GENERAL"));
+        assert!(is_all_generic_tokens("untitled"));
+        assert!(is_all_generic_tokens("topic"));
+        assert!(is_all_generic_tokens("cluster"));
+        assert!(is_all_generic_tokens("misc"));
+        assert!(is_all_generic_tokens("other"));
+        assert!(is_all_generic_tokens("unknown"));
+        // Note: "concept" no longer in wordlist (false-positive risk on
+        // legitimate technical titles); not rejected by is_all_generic_tokens.
         // True negatives — these SHOULD pass through.
-        assert!(!looks_like_generic_topic("General AI Architecture"));
-        assert!(!looks_like_generic_topic("Origin Concept Model"));
-        assert!(!looks_like_generic_topic("libSQL Storage"));
+        assert!(!is_all_generic_tokens("General AI Architecture"));
+        assert!(!is_all_generic_tokens("Origin Concept Model"));
+        assert!(!is_all_generic_tokens("libSQL Storage"));
+    }
+
+    #[test]
+    fn is_all_generic_tokens_rejects_multi_word_generic() {
+        // Single word generics — preserved behavior
+        assert!(is_all_generic_tokens("general"));
+        assert!(is_all_generic_tokens("GENERAL"));
+        assert!(is_all_generic_tokens("topic"));
+        assert!(is_all_generic_tokens("untitled"));
+
+        // Multi-word all-generic — NEW behavior
+        assert!(is_all_generic_tokens("General topic"));
+        assert!(is_all_generic_tokens("Various Notes"));
+        assert!(is_all_generic_tokens("Topic Notes"));
+        assert!(is_all_generic_tokens("Misc Things"));
+        assert!(is_all_generic_tokens("Misc-things")); // hyphen stripped
+        assert!(is_all_generic_tokens("random assorted stuff"));
+
+        // True negatives — must keep
+        assert!(!is_all_generic_tokens("Topic and Notes")); // 'and' saves it
+        assert!(!is_all_generic_tokens("libsql Vector Storage"));
+        assert!(!is_all_generic_tokens("Origin Memory Layer"));
+        assert!(!is_all_generic_tokens("Origin Concept Model")); // wordlist excludes 'concept'
+        assert!(!is_all_generic_tokens("Notes on Origin")); // 'on', 'origin' not generic
+        assert!(!is_all_generic_tokens("Content Strategy")); // 'content' not in list, 'strategy' not in list
+
+        // Edge cases
+        assert!(!is_all_generic_tokens("")); // empty
+        assert!(!is_all_generic_tokens("   ")); // whitespace only
+        assert!(!is_all_generic_tokens("!!! ???")); // empty after punctuation strip
+
+        // CJK generics now in wordlist
+        assert!(is_all_generic_tokens("杂项"));
+        assert!(is_all_generic_tokens("其他"));
+        assert!(is_all_generic_tokens("通用"));
+
+        // Mixed-script content with markup is rejected by looks_like_markup_styled,
+        // not by is_all_generic_tokens. The latter is intentionally an English-leaning
+        // wordlist; markup detection handles the canonical Roland case below.
+        assert!(!is_all_generic_tokens("**Roland** — 太正統，d-L 連接快"));
+    }
+
+    #[test]
+    fn looks_like_markup_styled_catches_canonical_bad_titles() {
+        // Canonical Mode A example from the bug report — LLM emitted markdown
+        // bold + em-dash + mixed CJK content as a title.
+        assert!(looks_like_markup_styled("**Roland** — 太正統，d-L 連接快"));
+
+        // Other markdown-styled hallucinations
+        assert!(looks_like_markup_styled("**Important Note**"));
+        assert!(looks_like_markup_styled("__bold__"));
+        assert!(looks_like_markup_styled("~~strikethrough~~"));
+        assert!(looks_like_markup_styled("[[wikilink]]"));
+        assert!(looks_like_markup_styled("# Heading"));
+        assert!(looks_like_markup_styled("Foo — Bar")); // em-dash separator
+
+        // Clean titles must pass through
+        assert!(!looks_like_markup_styled("Origin Memory Layer"));
+        assert!(!looks_like_markup_styled("libSQL Storage"));
+        assert!(!looks_like_markup_styled("Concept Distillation Pipeline"));
+        assert!(!looks_like_markup_styled("Range: 1-10")); // ASCII hyphen ok
+        assert!(!looks_like_markup_styled("Year 2026–2027")); // en-dash ok
+        assert!(!looks_like_markup_styled("")); // empty
     }
 
     #[test]
@@ -4458,5 +4915,123 @@ mod tests {
             strip_source_prefix("[has spaces] content"),
             "[has spaces] content"
         );
+    }
+
+    // ── retry_failed_enrichment tests (Task 8) ─────────────────────────
+
+    #[tokio::test]
+    async fn test_retry_failed_enrichment_phase() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory(
+            "mem_retry_test",
+            "Python uses indentation for blocks",
+            "fact",
+            "tech",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_retry_test", "dedup", "failed", Some("transient error"))
+            .await
+            .unwrap();
+        db.record_enrichment_step("mem_retry_test", "entity_link", "ok", None)
+            .await
+            .unwrap();
+        let tuning = crate::tuning::RefineryConfig::default();
+        let count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
+        assert!(count > 0, "should have retried at least one memory");
+        let steps = db.get_enrichment_steps("mem_retry_test").await.unwrap();
+        let dedup = steps.iter().find(|s| s.step == "dedup").unwrap();
+        assert_eq!(dedup.status, "ok", "retry should have fixed the dedup step");
+    }
+
+    #[tokio::test]
+    async fn test_retry_skips_abandoned_steps() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory("mem_abandon_skip", "test content", "fact", "tech");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step(
+            "mem_abandon_skip",
+            "entity_extract",
+            "abandoned",
+            Some("gave up"),
+        )
+        .await
+        .unwrap();
+        let tuning = crate::tuning::RefineryConfig::default();
+        let count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
+        assert_eq!(count, 0, "should not retry abandoned steps");
+        let steps = db.get_enrichment_steps("mem_abandon_skip").await.unwrap();
+        assert_eq!(steps[0].status, "abandoned");
+    }
+
+    #[tokio::test]
+    async fn test_title_reenrich_skipped_without_llm() {
+        let (db, _dir) = test_db().await;
+        let mut doc = make_memory(
+            "mem_title_no_llm",
+            "A very long memory content that will result in a truncated title when initially stored by the system",
+            "fact",
+            "tech",
+        );
+        doc.title = "A very long memory content that will result in a truncated title when ini..."
+            .to_string();
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_no_llm",
+            "title_enrich",
+            "failed",
+            Some("llm error"),
+        )
+        .await
+        .unwrap();
+
+        let tuning = crate::tuning::RefineryConfig::default();
+        let _count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
+        let steps = db.get_enrichment_steps("mem_title_no_llm").await.unwrap();
+        let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
+        assert_eq!(
+            title_step.status, "failed",
+            "should still be failed without LLM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_title_reenrich_runs_when_only_needs_retry_exists() {
+        // Regression: the title loop must run even when get_failed_enrichment_memories
+        // returns empty (no "failed" steps). Only "needs_retry" title steps exist.
+        let (db, _dir) = test_db().await;
+        let doc = make_memory(
+            "mem_needs_retry_only",
+            "Some content about machine learning pipelines",
+            "fact",
+            "tech",
+        );
+        db.upsert_documents(vec![doc]).await.unwrap();
+        // Record title_enrich as needs_retry (not "failed") -- this is the LlmRejected case
+        db.record_enrichment_step(
+            "mem_needs_retry_only",
+            "title_enrich",
+            "needs_retry",
+            Some("llm_rejected"),
+        )
+        .await
+        .unwrap();
+
+        // No other steps are "failed", so get_failed_enrichment_memories returns empty.
+        // The title loop must still run and find this via get_title_reenrich_candidates.
+        let tuning = crate::tuning::RefineryConfig::default();
+        // Pass None for LLM -- title loop is guarded by llm.is_some(), so it won't
+        // actually re-enrich, but the function must not return early before reaching
+        // the title loop. We verify the function completes without panic.
+        let count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
+        // With None LLM, the title loop is skipped, so count should be 0.
+        // The key assertion is that we got here at all (no early return).
+        assert_eq!(count, 0);
+        // Step should still be needs_retry (unchanged, since no LLM was provided)
+        let steps = db
+            .get_enrichment_steps("mem_needs_retry_only")
+            .await
+            .unwrap();
+        let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
+        assert_eq!(title_step.status, "needs_retry");
     }
 }

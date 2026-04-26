@@ -693,6 +693,7 @@ async fn run_lifecycle_phases(
                 distillation_cfg.min_cluster_size,
                 distillation_cfg.max_clusters_per_steep,
                 3500,
+                distillation_cfg.max_unlinked_cluster_size,
             )
             .await?;
         let pre_cluster_ids: Vec<Vec<String>> =

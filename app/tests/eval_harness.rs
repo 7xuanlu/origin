@@ -1758,9 +1758,3 @@ async fn judge_e2e_batch() {
     }
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
-
-// Deleted: lme_phase1_retrieve, lme_phase2_answer, lme_phase3_judge (3-phase accuracy pipeline)
-// Deleted: locomo_phase1_retrieve, locomo_phase2_answer, locomo_phase3_judge
-// Deleted: lme_batch_answer, lme_batch_judge, locomo_batch_answer, locomo_batch_judge
-// These used types from the deleted accuracy pipeline in locomo.rs/longmemeval.rs.
-// Use judge_e2e_batch above for batch API judging of E2E context tuples.

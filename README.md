@@ -1,8 +1,13 @@
 # Origin. Where Understanding Compounds.
 
+[![CI](https://github.com/7xuanlu/origin/actions/workflows/ci.yml/badge.svg)](https://github.com/7xuanlu/origin/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/7xuanlu/origin)](https://github.com/7xuanlu/origin/releases/latest)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/7xuanlu/origin?style=social)](https://github.com/7xuanlu/origin/stargazers)
+
 > *"A large fraction of my recent token throughput is going less into manipulating code, and more into manipulating knowledge. The LLM is rediscovering knowledge from scratch on every question. There's no accumulation."* -- [Andrej Karpathy](https://x.com/karpathy/status/2039805659525644595), April 2026
 
-Origin is a local-first memory app that captures knowledge, decisions, and insights from every AI conversation. Everything you've figured out across Claude, ChatGPT, Cursor, and other tools, compounding instead of disappearing. It distills what matters, makes every memory visible and editable, and gets sharper the longer you use it.
+Origin is a [local-first AI memory app](https://useorigin.app) that captures knowledge, decisions, and insights from every AI conversation. Everything you've figured out across Claude, ChatGPT, Cursor, and other tools, compounding instead of disappearing. It distills what matters, makes every memory visible and editable, and gets sharper the longer you use it.
 
 ![Origin demo](https://github.com/user-attachments/assets/d77806a4-69c2-4580-b95d-f8152323d122)
 

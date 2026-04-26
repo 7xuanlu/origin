@@ -667,16 +667,20 @@ pub async fn handle_store_memory(
             .evaluate(&doc.content, &db)
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!("[quality_gate] evaluate failed, passing through: {e}");
+                tracing::error!("[quality_gate] evaluate failed (fail closed): {e}");
                 (
                     origin_core::quality_gate::GateResult {
-                        admitted: true,
-                        reason: None,
+                        admitted: false,
+                        reason: Some(
+                            origin_core::quality_gate::RejectionReason::EmbeddingUnavailable(
+                                e.to_string(),
+                            ),
+                        ),
                         scores: origin_core::quality_gate::GateScores {
                             content_type_pass: true,
                             novelty_score: None,
                             word_count: 0,
-                            pattern_matched: None,
+                            pattern_matched: Some("embedding_unavailable".to_string()),
                             latency_ms: 0,
                         },
                     },
@@ -1623,6 +1627,55 @@ pub async fn handle_dismiss_contradiction(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(StatusCode::OK)
+}
+
+// ===== Enrichment Status =====
+
+/// GET /api/memory/{source_id}/enrichment-status
+///
+/// Returns the enrichment step history and summary for a given memory.
+pub async fn handle_get_enrichment_status(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(source_id): Path<String>,
+) -> Result<Json<origin_types::EnrichmentStatusResponse>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let steps = db
+        .get_enrichment_steps(&source_id)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let summary = db
+        .get_enrichment_summary(&source_id)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    Ok(Json(origin_types::EnrichmentStatusResponse {
+        source_id,
+        summary,
+        steps,
+    }))
+}
+
+/// POST /api/memory/{source_id}/enrichment-status/retry
+///
+/// Resets any abandoned enrichment steps so they will be retried.
+/// Returns the number of steps reset. Idempotent: returns 0 if nothing was abandoned.
+pub async fn handle_retry_enrichment(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(source_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let reset = db
+        .reset_abandoned_steps(&source_id)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    Ok(Json(
+        serde_json::json!({ "source_id": source_id, "steps_reset": reset }),
+    ))
 }
 
 // ===== Entity Suggestions =====

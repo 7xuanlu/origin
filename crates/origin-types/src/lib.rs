@@ -19,9 +19,10 @@ pub use entities::{
 };
 pub use memory::{
     ActivityBadge, ActivityKind, AgentActivityRow, AgentConnection, ConceptChange,
-    ConceptChangeKind, DomainInfo, HomeStats, IndexedFileInfo, MemoryItem, MemoryStats,
-    MemoryVersionItem, Profile, RecentActivityItem, RejectionRecord, RetrievalEvent, SearchResult,
-    SessionSnapshot, SnapshotCapture, SnapshotCaptureWithContent, Space, TopMemory, TypeBreakdown,
+    ConceptChangeKind, DomainInfo, EnrichmentStatusResponse, EnrichmentStepStatus, HomeStats,
+    IndexedFileInfo, MemoryItem, MemoryStats, MemoryVersionItem, Profile, RecentActivityItem,
+    RejectionRecord, RetrievalEvent, SearchResult, SessionSnapshot, SnapshotCapture,
+    SnapshotCaptureWithContent, Space, TopMemory, TypeBreakdown,
 };
 pub use sources::{MemoryType, RawDocument, SourceType, StabilityTier, SyncStatus};
 

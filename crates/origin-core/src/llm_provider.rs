@@ -246,17 +246,21 @@ impl OnDeviceProvider {
                 while let Ok(req) = rx.recv() {
                     // Wrap in Qwen chat template so the model sees
                     // system/user/assistant turns instead of a raw blob.
+                    // The empty <think></think> block disables thinking mode
+                    // for Qwen3.5 (which defaults to thinking-on). Without it,
+                    // all output tokens go to reasoning and strip_think_tags
+                    // removes them, leaving empty output. Harmless for Qwen3.
                     let full_prompt = match &req.system_prompt {
                         Some(sys) => format!(
                             "<|im_start|>system\n{sys}\n<|im_end|>\n\
                              <|im_start|>user\n{user}\n<|im_end|>\n\
-                             <|im_start|>assistant\n",
+                             <|im_start|>assistant\n<think>\n\n</think>\n\n",
                             sys = sys,
                             user = req.prompt,
                         ),
                         None => format!(
                             "<|im_start|>user\n{user}\n<|im_end|>\n\
-                             <|im_start|>assistant\n",
+                             <|im_start|>assistant\n<think>\n\n</think>\n\n",
                             user = req.prompt,
                         ),
                     };

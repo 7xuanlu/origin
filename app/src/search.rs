@@ -1189,7 +1189,7 @@ pub async fn list_memories_cmd(
             entity_id: None,
             quality: None,
             is_recap: info.source_id.starts_with("recap_"),
-            enrichment_status: String::from("enriched"),
+            enrichment_status: String::from("raw"),
             supersede_mode: String::from("hide"),
             structured_fields: None,
             retrieval_cue: None,

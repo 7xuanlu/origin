@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.4](https://github.com/7xuanlu/origin/compare/v0.1.3...v0.1.4) (2026-04-26)
+
+
+### Bug Fixes
+
+* **ci:** skip CI on release-please merge commits ([7c74be7](https://github.com/7xuanlu/origin/commit/7c74be78ddbe56676a71eb0d4052f0234a8a1c84))
+* **distill:** prevent generic-title and runaway-cluster concepts ([#23](https://github.com/7xuanlu/origin/issues/23)) ([c3ff292](https://github.com/7xuanlu/origin/commit/c3ff292859d25a7d877afade9be322128cf2d04d))
+* enrichment status honesty -- per-step tracking + self-healing ([#9](https://github.com/7xuanlu/origin/issues/9)) ([1f18813](https://github.com/7xuanlu/origin/commit/1f1881392c08018e7c99579b1b7bbd8d4411894d))
+* **hooks:** run targeted clippy in pre-commit, not just cargo check ([a99681c](https://github.com/7xuanlu/origin/commit/a99681c753a4f68ba3cb5785d50d2923f1b2c694))
+* **quality-gate:** fail closed when embedding fails, not open ([8661a80](https://github.com/7xuanlu/origin/commit/8661a803cf0c4f269f1fe2366b961411ac088f42))
+* remove useless format\! in refinery.rs ([4ae9195](https://github.com/7xuanlu/origin/commit/4ae9195a1f0b24d31317617230813a944f55c6a0))
+* self-healing title re-enrichment for truncated titles ([#22](https://github.com/7xuanlu/origin/issues/22)) ([28b731c](https://github.com/7xuanlu/origin/commit/28b731cbbba0702cf9c55dc2caf562ea8deb6823))
+
+## [0.1.3](https://github.com/7xuanlu/origin/compare/v0.1.2...v0.1.3) (2026-04-25)
+
+
+### Bug Fixes
+
+* **ci:** add workflow_dispatch to release.yml for manual re-trigger ([85c2842](https://github.com/7xuanlu/origin/commit/85c28420587076da33786fdbf2061abe51b0251c))
+* **ci:** drop Origin prefix from release name, remove dead config ([aa25245](https://github.com/7xuanlu/origin/commit/aa25245dbe561df2d799f46664e277b4c4c3b953))
+* **ci:** single release per version, consistent titles, changelog in body ([d30930b](https://github.com/7xuanlu/origin/commit/d30930b1ff98024737ca837725a38a481bcea028))
+* **ci:** use env context for secrets check in workflow_dispatch ([cb84b95](https://github.com/7xuanlu/origin/commit/cb84b954a14af74b0f9184ebcf80bde3fb45c024))
+* **ci:** use PAT in release-please so tag push triggers release build ([928ce65](https://github.com/7xuanlu/origin/commit/928ce6508b57e8257e05d41ba5c413280b7872b1))
+* **eval:** token efficiency evaluation framework ([#3](https://github.com/7xuanlu/origin/issues/3)) ([311ceea](https://github.com/7xuanlu/origin/commit/311ceea4543f5c02864e03d9fe7d57fa3197ca61))
+
 ## [0.1.2](https://github.com/7xuanlu/origin/compare/v0.1.1...v0.1.2) (2026-04-24)
 
 

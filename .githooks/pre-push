@@ -1,16 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Skip the heavy workspace clippy + test + coverage gate when the push
+# touches only docs/markdown. The gate exists to catch broken Rust code;
+# docs-only changes can't trigger that, so the gate adds friction without
+# protection here.
+ZERO_SHA="0000000000000000000000000000000000000000"
+DOCS_RE='^(README\.md|CHANGELOG\.md|RELEASING\.md|LICENSE|CODE_OF_CONDUCT\.md|CONTRIBUTING\.md|SECURITY\.md|CLAUDE\.md|docs/.*|\.github/.*\.md)$'
+
+all_changed=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "${local_ref:-}" ] && continue
+    [ "$local_sha" = "$ZERO_SHA" ] && continue
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+        base=$(git merge-base "$local_sha" origin/main 2>/dev/null \
+            || git rev-list --max-parents=0 "$local_sha" | head -n 1)
+    else
+        base="$remote_sha"
+    fi
+    changed=$(git diff --name-only "$base" "$local_sha" 2>/dev/null || true)
+    [ -n "$changed" ] && all_changed=$(printf '%s\n%s' "$all_changed" "$changed")
+done
+
+all_changed=$(printf '%s' "$all_changed" | sed '/^$/d')
+
+if [ -n "$all_changed" ]; then
+    non_docs=$(printf '%s\n' "$all_changed" | grep -vE "$DOCS_RE" || true)
+    if [ -z "$non_docs" ]; then
+        count=$(printf '%s\n' "$all_changed" | wc -l | tr -d ' ')
+        echo "Pre-push: docs-only push ($count file(s)), skipping clippy + tests + coverage."
+        exit 0
+    fi
+fi
+
 echo "Pre-push: running clippy + full test suite with coverage..."
 
-# Clippy lint check (catches errors that only show up in CI)
 echo "  Running Clippy..."
 cargo clippy --workspace --all-targets -- -D warnings 2>&1 || {
     echo "FAIL: Clippy warnings found. Fix before pushing."
     exit 1
 }
 
-# Check for cargo-llvm-cov
 if ! command -v cargo-llvm-cov &> /dev/null && ! cargo llvm-cov --version &> /dev/null 2>&1; then
     echo "WARNING: cargo-llvm-cov not installed. Running tests without coverage gate."
     echo "Install with: cargo install cargo-llvm-cov"
@@ -19,16 +49,14 @@ if ! command -v cargo-llvm-cov &> /dev/null && ! cargo llvm-cov --version &> /de
         exit 1
     }
 else
-    # Rust tests with coverage gate
     echo "  Running Rust tests with coverage..."
     (cd app && cargo llvm-cov --fail-under-lines 90 2>&1) || {
-    echo "FAIL: Rust tests failed or coverage below 90%."
-    echo "Run 'cargo llvm-cov --html && open target/llvm-cov/html/index.html' to see report."
-    exit 1
+        echo "FAIL: Rust tests failed or coverage below 90%."
+        echo "Run 'cargo llvm-cov --html && open target/llvm-cov/html/index.html' to see report."
+        exit 1
     }
 fi
 
-# Frontend tests with coverage
 echo "  Running frontend tests with coverage..."
 pnpm vitest run --coverage 2>&1 || {
     echo "FAIL: Frontend tests failed or coverage below threshold."

@@ -20,6 +20,8 @@ jobs:
   check:
     name: Test & Lint
     runs-on: macos-latest
+    if: >-
+      !startsWith(github.event.head_commit.message, 'chore(main): release')
 
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +38,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.fastembed_cache
-          key: fastembed-bge-base-en-v1.5-q
+          key: fastembed-bge-base-en-v1.5-q-v2
+          restore-keys: |
+            fastembed-bge-base-en-v1.5-q-
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4

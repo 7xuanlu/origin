@@ -280,6 +280,8 @@ pub struct RefineryConfig {
     pub kg_rethink_interval_hours: u64,
     #[serde(default = "d_5_usize")]
     pub entity_backfill_batch_size: usize,
+    #[serde(default = "d_3_usize")]
+    pub max_enrichment_retries: usize,
     #[serde(default)]
     pub topic_match: TopicMatchConfig,
 }
@@ -311,6 +313,11 @@ pub struct DistillationConfig {
     /// Currently concepts are searched via separate search_concepts endpoint.
     #[serde(default = "d_13_f32")]
     pub concept_boost: f32,
+    /// Hard cap on size of unlinked-memory clusters (no entity_id, no domain).
+    /// Clusters above this size are skipped during distillation. Safety valve
+    /// for the runaway-cluster failure mode (see spec 2026-04-25).
+    #[serde(default = "d_50_usize")]
+    pub max_unlinked_cluster_size: usize,
     #[serde(default)]
     pub export_vault_path: Option<String>,
 }
@@ -475,6 +482,7 @@ impl Default for RefineryConfig {
             batch_window_secs: d_30_i64(),
             kg_rethink_interval_hours: d_168_u64(),
             entity_backfill_batch_size: d_5_usize(),
+            max_enrichment_retries: d_3_usize(),
             topic_match: TopicMatchConfig::default(),
         }
     }
@@ -560,6 +568,7 @@ impl Default for DistillationConfig {
             concept_min_cluster_size: d_3_usize(),
             concept_growth_threshold: d_075(),
             concept_boost: d_13_f32(),
+            max_unlinked_cluster_size: d_50_usize(),
             export_vault_path: None,
         }
     }
@@ -732,5 +741,11 @@ score_threshold = 0.25
         assert_eq!(cfg.concept_min_cluster_size, 3);
         assert!((cfg.concept_growth_threshold - 0.75).abs() < 0.01);
         assert!((cfg.concept_boost - 1.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn distillation_config_default_has_unlinked_cluster_cap() {
+        let cfg = DistillationConfig::default();
+        assert_eq!(cfg.max_unlinked_cluster_size, 50);
     }
 }

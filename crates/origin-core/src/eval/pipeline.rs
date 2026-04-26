@@ -530,6 +530,7 @@ pub async fn run_locomo_pipeline_eval(
                 tuning.concept_min_cluster_size,
                 tuning.max_clusters_per_steep,
                 llm.synthesis_token_limit(),
+                tuning.concept_min_cluster_size,
             )
             .await
             .unwrap_or_default();
@@ -834,6 +835,7 @@ pub async fn run_longmemeval_pipeline_eval(
                 tuning.concept_min_cluster_size,
                 tuning.max_clusters_per_steep,
                 llm.synthesis_token_limit(),
+                tuning.concept_min_cluster_size,
             )
             .await
             .unwrap_or_default();
