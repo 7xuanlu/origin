@@ -4748,8 +4748,8 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Get imported memories that have not yet been reclassified (memory_type IS NULL).
-    /// Returns (source_id, content) pairs grouped by source_id so each import is
+    /// Get memories that need classification (memory_type IS NULL or domain IS NULL).
+    /// Returns (source_id, content) pairs grouped by source_id so each memory is
     /// processed exactly once, even when chunked into multiple rows.
     pub async fn get_unclassified_imports(
         &self,
@@ -4761,8 +4761,7 @@ impl MemoryDB {
                 "SELECT source_id, GROUP_CONCAT(content, ' ') as combined_content
                  FROM memories
                  WHERE source = 'memory'
-                   AND source_id LIKE 'import_%'
-                   AND memory_type IS NULL
+                   AND (memory_type IS NULL OR domain IS NULL)
                  GROUP BY source_id
                  ORDER BY MAX(last_modified) DESC
                  LIMIT ?1",
@@ -4788,15 +4787,14 @@ impl MemoryDB {
         Ok(results)
     }
 
-    /// Count import memories that still need classification.
+    /// Count memories that still need classification (memory_type or domain is NULL).
     pub async fn count_unclassified_imports(&self) -> Result<usize, OriginError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM memories
+                "SELECT COUNT(DISTINCT source_id) FROM memories
                  WHERE source = 'memory'
-                   AND source_id LIKE 'import_%'
-                   AND memory_type IS NULL",
+                   AND (memory_type IS NULL OR domain IS NULL)",
                 libsql::params![],
             )
             .await
@@ -4810,6 +4808,32 @@ impl MemoryDB {
             Ok(count as usize)
         } else {
             Ok(0)
+        }
+    }
+
+    /// Get the current memory_type and domain for a source_id (first chunk).
+    pub async fn get_memory_classification(
+        &self,
+        source_id: &str,
+    ) -> Result<(Option<String>, Option<String>), OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT memory_type, domain FROM memories WHERE source_id = ?1 LIMIT 1",
+                libsql::params![source_id],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let memory_type: Option<String> = row.get(0).ok();
+            let domain: Option<String> = row.get(1).ok();
+            Ok((memory_type, domain))
+        } else {
+            Ok((None, None))
         }
     }
 
@@ -14685,7 +14709,7 @@ impl MemoryDB {
     /// Store a single memory from a bulk chat import. Skips classification,
     /// extraction, and event emission — those happen later via the refinery
     /// steep cycle. Uses `source = 'memory'` and `memory_type = NULL` so the row
-    /// matches the existing `import_%` filter in `get_unclassified_imports`.
+    /// matches the `memory_type IS NULL OR domain IS NULL` filter in `get_unclassified_imports`.
     pub async fn store_raw_import_memory(
         &self,
         source_id: &str,
