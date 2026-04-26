@@ -1065,6 +1065,327 @@ pub async fn call_anthropic_api(
     Ok(answer)
 }
 
+// ---------------------------------------------------------------------------
+// Anthropic Batch API (50% cheaper, no rate limits)
+// ---------------------------------------------------------------------------
+
+/// Submit a batch of prompts to the Anthropic Batch API.
+/// Returns the batch ID for polling.
+pub async fn submit_batch(
+    client: &reqwest::Client,
+    api_key: &str,
+    requests: Vec<(String, String, Option<String>, usize)>, // (custom_id, prompt, system, max_tokens)
+    model: &str,
+) -> Result<String, String> {
+    let batch_requests: Vec<serde_json::Value> = requests
+        .into_iter()
+        .map(|(id, prompt, system, max_tokens)| {
+            let mut params = serde_json::json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": prompt}]
+            });
+            if let Some(sys) = system {
+                params["system"] = serde_json::json!(sys);
+            }
+            serde_json::json!({
+                "custom_id": id,
+                "params": params
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({ "requests": batch_requests });
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages/batches")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("batch submit failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("batch API error {status}: {text}"));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+    json["id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "no batch id in response".to_string())
+}
+
+/// Poll a batch until it reaches "ended" status. Returns the results_url.
+pub async fn poll_batch(
+    client: &reqwest::Client,
+    api_key: &str,
+    batch_id: &str,
+) -> Result<String, String> {
+    let url = format!("https://api.anthropic.com/v1/messages/batches/{}", batch_id);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        let resp = client
+            .get(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| format!("poll failed: {e}"))?;
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        let status = json["processing_status"].as_str().unwrap_or("unknown");
+
+        let succeeded = json["request_counts"]["succeeded"].as_u64().unwrap_or(0);
+        let processing = json["request_counts"]["processing"].as_u64().unwrap_or(0);
+        let errored = json["request_counts"]["errored"].as_u64().unwrap_or(0);
+        eprintln!(
+            "[batch] status={}, succeeded={}, processing={}, errored={}",
+            status, succeeded, processing, errored
+        );
+
+        if status == "ended" {
+            return json["results_url"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| "batch ended but no results_url".to_string());
+        }
+    }
+}
+
+/// Download batch results and return a map of custom_id -> response text.
+pub async fn download_batch_results(
+    client: &reqwest::Client,
+    api_key: &str,
+    results_url: &str,
+) -> Result<HashMap<String, String>, String> {
+    let resp = client
+        .get(results_url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+
+    let text = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    let mut results = HashMap::new();
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("parse result line: {e}"))?;
+
+        let custom_id = json["custom_id"].as_str().unwrap_or("").to_string();
+        let result_type = json["result"]["type"].as_str().unwrap_or("");
+
+        if result_type == "succeeded" {
+            let answer = json["result"]["message"]["content"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|block| block["text"].as_str())
+                .unwrap_or("")
+                .to_string();
+            results.insert(custom_id, answer);
+        } else {
+            eprintln!("[batch] {} result: {}", custom_id, result_type);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Generate answers for LME questions via Batch API (50% cheaper, no rate limits).
+pub async fn generate_answers_batch(
+    retrieved: &[RetrievedQuestion],
+    answer_model: &str,
+    existing: Vec<AnsweredQuestion>,
+) -> Result<Vec<AnsweredQuestion>, OriginError> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| OriginError::Generic("ANTHROPIC_API_KEY not set".into()))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("reqwest: {e}")))?;
+
+    let answered_ids: std::collections::HashSet<String> =
+        existing.iter().map(|a| a.question_id.clone()).collect();
+    let todo: Vec<&RetrievedQuestion> = retrieved
+        .iter()
+        .filter(|rq| !answered_ids.contains(&rq.question_id))
+        .collect();
+
+    eprintln!(
+        "[lme_batch] {} already answered, {} remaining",
+        existing.len(),
+        todo.len()
+    );
+    if todo.is_empty() {
+        return Ok(existing);
+    }
+
+    // Build batch requests
+    let requests: Vec<(String, String, Option<String>, usize)> = todo
+        .iter()
+        .map(|rq| {
+            let (prompt, sys) = build_answer_prompt(&rq.question, &rq.context, &rq.question_type);
+            (rq.question_id.clone(), prompt, Some(sys), 300)
+        })
+        .collect();
+
+    eprintln!("[lme_batch] Submitting {} requests...", requests.len());
+    let batch_id = submit_batch(&client, &api_key, requests, answer_model)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+    eprintln!("[lme_batch] Batch created: {}", batch_id);
+
+    let results_url = poll_batch(&client, &api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+    eprintln!("[lme_batch] Downloading results...");
+
+    let results = download_batch_results(&client, &api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+
+    // Merge with existing
+    let mut all = existing;
+    for rq in &todo {
+        if let Some(answer) = results.get(&rq.question_id) {
+            all.push(AnsweredQuestion {
+                question_id: rq.question_id.clone(),
+                question_type: rq.question_type.clone(),
+                question: rq.question.clone(),
+                ground_truth: rq.ground_truth.clone(),
+                model_answer: answer.clone(),
+                answer_model: answer_model.to_string(),
+                context_tokens: rq.context_tokens,
+            });
+        }
+    }
+    eprintln!("[lme_batch] Total: {} answers", all.len());
+    Ok(all)
+}
+
+/// Judge LME answers via Batch API.
+pub async fn score_answers_batch(
+    answered: &[AnsweredQuestion],
+    judge_model: &str,
+) -> Result<LongMemEvalAccuracyReport, OriginError> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| OriginError::Generic("ANTHROPIC_API_KEY not set".into()))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("reqwest: {e}")))?;
+
+    let requests: Vec<(String, String, Option<String>, usize)> = answered
+        .iter()
+        .map(|aq| {
+            let prompt = get_anscheck_prompt(
+                &aq.question_type,
+                &aq.question,
+                &aq.ground_truth,
+                &aq.model_answer,
+            );
+            (aq.question_id.clone(), prompt, None, 10)
+        })
+        .collect();
+
+    eprintln!(
+        "[lme_judge_batch] Submitting {} judge requests...",
+        requests.len()
+    );
+    let batch_id = submit_batch(&client, &api_key, requests, judge_model)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+    eprintln!("[lme_judge_batch] Batch created: {}", batch_id);
+
+    let results_url = poll_batch(&client, &api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+
+    let judge_results = download_batch_results(&client, &api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+
+    // Build accuracy results
+    let mut results: Vec<AccuracyResult> = Vec::new();
+    for aq in answered {
+        let (judge_response, correct) = match judge_results.get(&aq.question_id) {
+            Some(resp) => (resp.clone(), Some(resp.to_lowercase().contains("yes"))),
+            None => ("BATCH_MISSING".to_string(), None),
+        };
+        results.push(AccuracyResult {
+            question_id: aq.question_id.clone(),
+            question_type: aq.question_type.clone(),
+            question: aq.question.clone(),
+            ground_truth: aq.ground_truth.clone(),
+            model_answer: aq.model_answer.clone(),
+            judge_response,
+            correct,
+            context_tokens: aq.context_tokens,
+        });
+    }
+
+    // Aggregate
+    let judged: Vec<&AccuracyResult> = results.iter().filter(|r| r.correct.is_some()).collect();
+    let errors = results.len() - judged.len();
+    if errors > 0 {
+        eprintln!("[lme_judge_batch] {} errors excluded", errors);
+    }
+
+    let total = judged.len();
+    let total_correct = judged.iter().filter(|r| r.correct == Some(true)).count();
+    let overall = if total > 0 {
+        total_correct as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    let mut per_category: Vec<CategoryAccuracy> = Vec::new();
+    for &cat in CATEGORY_ORDER {
+        let cr: Vec<&&AccuracyResult> = judged.iter().filter(|r| r.question_type == cat).collect();
+        if cr.is_empty() {
+            continue;
+        }
+        let cc = cr.iter().filter(|r| r.correct == Some(true)).count();
+        per_category.push(CategoryAccuracy {
+            question_type: cat.to_string(),
+            code: category_code(cat).to_string(),
+            total: cr.len(),
+            correct: cc,
+            accuracy: cc as f64 / cr.len() as f64,
+        });
+    }
+    let task_avg = if per_category.is_empty() {
+        0.0
+    } else {
+        per_category.iter().map(|c| c.accuracy).sum::<f64>() / per_category.len() as f64
+    };
+
+    Ok(LongMemEvalAccuracyReport {
+        overall_accuracy: overall,
+        task_averaged_accuracy: task_avg,
+        total_questions: total,
+        total_correct,
+        answer_model: answered
+            .first()
+            .map(|a| a.answer_model.clone())
+            .unwrap_or_default(),
+        judge_model: judge_model.to_string(),
+        per_category,
+        per_question: results,
+    })
+}
+
 /// Build the canonical LongMemEval answer-check prompt for a given task type.
 /// Matches the official evaluation code exactly.
 pub fn get_anscheck_prompt(task: &str, question: &str, answer: &str, response: &str) -> String {

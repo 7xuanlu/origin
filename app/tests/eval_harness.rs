@@ -1938,3 +1938,86 @@ async fn locomo_phase3_judge() {
         "task_averaged_accuracy out of [0,1]"
     );
 }
+
+// ===== Batch API Eval (50% cheaper, no rate limits) =====
+
+/// LME: generate answers via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness lme_batch_answer -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn lme_batch_answer() {
+    use origin_lib::eval::longmemeval::{
+        generate_answers_batch, load_answered, load_retrieved, save_answered,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let retrieved_path = baselines.join("lme_retrieved.json");
+    if !retrieved_path.exists() {
+        println!("SKIP: lme_retrieved.json not found. Run lme_phase1_retrieve first.");
+        return;
+    }
+
+    let answer_model = std::env::var("LME_ANSWER_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+    let out_path = baselines.join("lme_answered.json");
+
+    let retrieved = load_retrieved(&retrieved_path).expect("load failed");
+    let existing = if out_path.exists() {
+        load_answered(&out_path).unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    eprintln!(
+        "=== LME Batch Answer ({} Qs, model={}) ===",
+        retrieved.len(),
+        answer_model
+    );
+
+    let answered = generate_answers_batch(&retrieved, &answer_model, existing)
+        .await
+        .expect("batch answer failed");
+
+    save_answered(&answered, &out_path).unwrap();
+    eprintln!("Saved {} answers to {:?}", answered.len(), out_path);
+    assert!(!answered.is_empty());
+}
+
+/// LME: judge answers via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness lme_batch_judge -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn lme_batch_judge() {
+    use origin_lib::eval::longmemeval::{load_answered, score_answers_batch};
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let answered_path = baselines.join("lme_answered.json");
+    if !answered_path.exists() {
+        println!("SKIP: lme_answered.json not found. Run lme_batch_answer first.");
+        return;
+    }
+
+    let judge_model = std::env::var("LME_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    let answered = load_answered(&answered_path).expect("load failed");
+    eprintln!(
+        "=== LME Batch Judge ({} answers, judge={}) ===",
+        answered.len(),
+        judge_model
+    );
+
+    let report = score_answers_batch(&answered, &judge_model)
+        .await
+        .expect("batch judge failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    report.save(&baselines.join("lme_accuracy.json")).unwrap();
+}
