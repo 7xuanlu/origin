@@ -1410,7 +1410,7 @@ pub async fn distill_concepts(
                 let llm_title = generate_short_title(llm, &content).await;
                 let title = match llm_title {
                     Some(t) => t,
-                    None if looks_like_generic_topic(topic)
+                    None if is_all_generic_tokens(topic)
                         || looks_like_path(topic)
                         || looks_like_code(topic)
                         || looks_like_uuid(topic)
@@ -2731,16 +2731,6 @@ fn is_all_generic_tokens(s: &str) -> bool {
         .all(|w| GENERIC_TOKENS.contains(&w.to_lowercase().as_str()))
 }
 
-/// Returns true for single-word generic stand-ins that are useless as concept titles.
-/// These are often the `topic` fallback value when no entity/domain is available.
-fn looks_like_generic_topic(s: &str) -> bool {
-    let t = s.trim().to_lowercase();
-    matches!(
-        t.as_str(),
-        "general" | "untitled" | "topic" | "concept" | "cluster" | "misc" | "other" | "unknown"
-    )
-}
-
 fn looks_like_uuid(s: &str) -> bool {
     // e.g. 5b064ab2-8919-48b2-8220-8f7680b426dd
     let trimmed = s.trim();
@@ -2910,7 +2900,7 @@ pub(crate) async fn generate_short_title(
             if title.is_empty() || word_count > 8 || title.contains('\n') || truncated {
                 log::info!("[title] rejected (empty/too long/multiline)");
                 None
-            } else if looks_like_generic_topic(title)
+            } else if is_all_generic_tokens(title)
                 || looks_like_uuid(title)
                 || looks_like_short_hash(title)
                 || looks_like_code(title)
@@ -4729,21 +4719,22 @@ mod tests {
 
     #[test]
     fn rejects_generic_topic_titles() {
-        // All generic placeholders must be rejected.
-        assert!(looks_like_generic_topic("general"));
-        assert!(looks_like_generic_topic("General"));
-        assert!(looks_like_generic_topic("GENERAL"));
-        assert!(looks_like_generic_topic("untitled"));
-        assert!(looks_like_generic_topic("topic"));
-        assert!(looks_like_generic_topic("concept"));
-        assert!(looks_like_generic_topic("cluster"));
-        assert!(looks_like_generic_topic("misc"));
-        assert!(looks_like_generic_topic("other"));
-        assert!(looks_like_generic_topic("unknown"));
+        // All single-word generic placeholders must still be rejected.
+        assert!(is_all_generic_tokens("general"));
+        assert!(is_all_generic_tokens("General"));
+        assert!(is_all_generic_tokens("GENERAL"));
+        assert!(is_all_generic_tokens("untitled"));
+        assert!(is_all_generic_tokens("topic"));
+        assert!(is_all_generic_tokens("cluster"));
+        assert!(is_all_generic_tokens("misc"));
+        assert!(is_all_generic_tokens("other"));
+        assert!(is_all_generic_tokens("unknown"));
+        // Note: "concept" no longer in wordlist (false-positive risk on
+        // legitimate technical titles); not rejected by is_all_generic_tokens.
         // True negatives — these SHOULD pass through.
-        assert!(!looks_like_generic_topic("General AI Architecture"));
-        assert!(!looks_like_generic_topic("Origin Concept Model"));
-        assert!(!looks_like_generic_topic("libSQL Storage"));
+        assert!(!is_all_generic_tokens("General AI Architecture"));
+        assert!(!is_all_generic_tokens("Origin Concept Model"));
+        assert!(!is_all_generic_tokens("libSQL Storage"));
     }
 
     #[test]
