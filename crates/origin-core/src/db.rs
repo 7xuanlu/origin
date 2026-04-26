@@ -25,6 +25,18 @@ pub struct MigrationProgress {
 /// Embedding dimension — must match the model (GTE-Base-EN-v1.5-Q = 768).
 pub const EMBEDDING_DIM: usize = 768;
 
+/// Process-wide lock that serializes FastEmbed (BGE) embedder initialization.
+///
+/// `TextEmbedding::try_new()` performs filesystem I/O against `~/.fastembed_cache`
+/// via the `hf-hub` crate. Concurrent first-time inits race on that cache and
+/// one of them fails with `Failed to retrieve model_optimized.onnx` (verified
+/// against PR #23 CI: same process, same module, two parallel `MemoryDB::new`
+/// calls — one fails, the next succeeds 1.4 s later). Holding this mutex
+/// during `try_new` makes inits sequential within a process. Once the model
+/// is on disk, subsequent inits are fast (model load, no download), so the
+/// serialization cost is bounded.
+static EMBEDDER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Known-client registry — maps canonical technical IDs (what clients send in
 /// `x-agent-name`) to human-friendly display names (what users see in UI).
 ///
@@ -1038,6 +1050,10 @@ impl MemoryDB {
         std::thread::Builder::new()
             .name("embedder-init".into())
             .spawn(move || {
+                // Serialize FastEmbed inits process-wide — see EMBEDDER_INIT_LOCK comment.
+                let _guard = EMBEDDER_INIT_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 log::info!("[memory_db] embedder thread: loading ONNX model...");
                 let mut opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
@@ -1141,6 +1157,10 @@ impl MemoryDB {
         std::thread::Builder::new()
             .name("embedder-init-shared".into())
             .spawn(move || {
+                // Serialize FastEmbed inits process-wide — see EMBEDDER_INIT_LOCK comment.
+                let _guard = EMBEDDER_INIT_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 let opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
                 let result = TextEmbedding::try_new(opts);
