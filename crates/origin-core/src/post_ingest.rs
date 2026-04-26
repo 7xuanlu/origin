@@ -22,6 +22,17 @@ use crate::llm_provider::LlmProvider;
 use crate::prompts::PromptRegistry;
 use std::sync::Arc;
 
+/// Result of the title enrichment step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TitleEnrichResult {
+    /// Title was replaced with an LLM-generated short title.
+    Enriched,
+    /// Title was not truncated (or memory is recap/merged) -- no action needed.
+    NotNeeded,
+    /// Title IS truncated but LLM output was rejected (too long, generic, etc.).
+    LlmRejected,
+}
+
 /// Run post-ingest enrichment (async, non-blocking).
 /// Called after store_memory fast track returns.
 #[allow(clippy::too_many_arguments)]
@@ -290,16 +301,27 @@ pub async fn run_post_ingest_enrichment(
     // 5. Title enrichment — generate short topic title if current title is a truncation
     if let Some(llm_ref) = llm {
         match enrich_title(db, source_id, content, llm_ref).await {
-            Ok(true) => {
+            Ok(TitleEnrichResult::Enriched) => {
                 log::info!("[post_ingest] {source_id}: title enriched");
                 db.record_enrichment_step(source_id, "title_enrich", "ok", None)
                     .await
                     .ok();
             }
-            Ok(false) => {
+            Ok(TitleEnrichResult::NotNeeded) => {
                 db.record_enrichment_step(source_id, "title_enrich", "ok", None)
                     .await
                     .ok();
+            }
+            Ok(TitleEnrichResult::LlmRejected) => {
+                log::info!("[post_ingest] {source_id}: title LLM-rejected, queuing for retry");
+                db.record_enrichment_step(
+                    source_id,
+                    "title_enrich",
+                    "needs_retry",
+                    Some("llm_rejected"),
+                )
+                .await
+                .ok();
             }
             Err(e) => {
                 log::warn!("[post_ingest] title enrichment failed: {e}");
@@ -583,30 +605,30 @@ pub(crate) async fn enrich_title(
     source_id: &str,
     content: &str,
     llm: &Arc<dyn LlmProvider>,
-) -> Result<bool, OriginError> {
+) -> Result<TitleEnrichResult, OriginError> {
     // Skip recaps and merged memories — they get titles during generation
     if source_id.starts_with("recap_") || source_id.starts_with("merged_") {
-        return Ok(false);
+        return Ok(TitleEnrichResult::NotNeeded);
     }
 
     // Check if current title is a truncation (ends with "..." or matches first line)
     let detail = db.get_memory_detail(source_id).await?;
     let current_title = match &detail {
         Some(d) => &d.title,
-        None => return Ok(false),
+        None => return Ok(TitleEnrichResult::NotNeeded),
     };
     let first_line = content.lines().next().unwrap_or(content);
     let is_truncated =
         current_title.ends_with("...") || current_title == first_line || current_title.len() >= 75;
     if !is_truncated {
-        return Ok(false);
+        return Ok(TitleEnrichResult::NotNeeded);
     }
 
     if let Some(short_title) = crate::refinery::generate_short_title(llm, content).await {
         db.update_title(source_id, &short_title).await?;
-        Ok(true)
+        Ok(TitleEnrichResult::Enriched)
     } else {
-        Ok(false)
+        Ok(TitleEnrichResult::LlmRejected)
     }
 }
 
