@@ -2002,7 +2002,7 @@ async fn global_concept_review(
     let response = llm
         .generate(LlmRequest {
             system_prompt: Some(prompts.global_concept_review.clone()),
-            user_prompt: format!("{}", concepts_text),
+            user_prompt: concepts_text,
             max_tokens: 1024,
             temperature: 0.3,
             label: Some("global_review".into()),
@@ -2814,7 +2814,7 @@ pub(crate) async fn generate_short_title(
     let input: String = stripped.chars().take(300).collect();
     let response = llm.generate(LlmRequest {
         system_prompt: Some("Given a note, write a 3-5 word title. Output ONLY the title.\n\nExample: 'The system uses libsql for vector storage with DiskANN indexing' → libsql Vector Storage\nExample: 'Google Sign-In fails with developer_error status 10' → Google Sign-In SHA Fix".to_string()),
-        user_prompt: format!("{}", input),
+        user_prompt: input,
         max_tokens: 16,
         temperature: 0.3,
         label: None,
