@@ -4058,6 +4058,9 @@ impl MemoryDB {
 
                 // Create summary view
                 conn.execute(
+                    // NOTE: This view does not include 'needs_retry' in its failure
+                    // count. The get_enrichment_summary() function does. The view has
+                    // no active consumers, but if one is added, update it to match.
                     "CREATE VIEW IF NOT EXISTS memory_enrichment_summary AS
                      SELECT
                          m.source_id,
@@ -8653,7 +8656,7 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) as total,
-                        SUM(CASE WHEN status = 'failed' OR status = 'abandoned' THEN 1 ELSE 0 END) as failed_count,
+                        SUM(CASE WHEN status IN ('failed', 'abandoned', 'needs_retry') THEN 1 ELSE 0 END) as failed_count,
                         SUM(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) as ok_count
                  FROM enrichment_steps WHERE source_id = ?1",
                 libsql::params![source_id],
@@ -8708,7 +8711,8 @@ impl MemoryDB {
                  FROM enrichment_steps es
                  JOIN (SELECT source_id, content FROM memories WHERE chunk_index = 0 AND source = 'memory') m
                     ON m.source_id = es.source_id
-                 WHERE es.status = 'failed' AND es.attempts < ?1
+                 WHERE es.status = 'failed' AND es.step_name != 'title_enrich'
+                   AND es.attempts < ?1
                  ORDER BY es.updated_at ASC LIMIT ?2",
                 libsql::params![max_attempts as i64, limit as i64],
             )
@@ -8722,6 +8726,75 @@ impl MemoryDB {
                 row.get::<String>(0).unwrap_or_default(),
                 row.get::<String>(1).unwrap_or_default(),
                 row.get::<String>(2).unwrap_or_default(),
+            ));
+        }
+        Ok(results)
+    }
+
+    /// Return memories needing title re-enrichment: those with `title_enrich`
+    /// step in `failed` or `needs_retry` status, under the attempt limit.
+    /// Returns (source_id, content) pairs, oldest-first.
+    pub async fn get_title_reenrich_candidates(
+        &self,
+        max_attempts: usize,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT es.source_id, m.content
+                 FROM enrichment_steps es
+                 JOIN memories m ON m.source_id = es.source_id
+                    AND m.chunk_index = 0 AND m.source = 'memory'
+                 WHERE es.step_name = 'title_enrich'
+                   AND es.status IN ('failed', 'needs_retry')
+                   AND es.attempts < ?1
+                 ORDER BY es.updated_at ASC LIMIT ?2",
+                libsql::params![max_attempts as i64, limit as i64],
+            )
+            .await
+            .map_err(|e| {
+                OriginError::VectorDb(format!("get_title_reenrich_candidates: {e}"))
+            })?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            results.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+            ));
+        }
+        Ok(results)
+    }
+
+    /// Return memories where `title_enrich` is recorded as `ok` but the title
+    /// still looks truncated (ends with "..." or length >= 75). Used for
+    /// one-time backfill of pre-fix memories.
+    pub async fn get_truncated_title_memories(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT m.source_id, m.content
+                 FROM memories m
+                 JOIN enrichment_steps es
+                    ON es.source_id = m.source_id AND es.step_name = 'title_enrich'
+                 WHERE m.chunk_index = 0 AND m.source = 'memory'
+                   AND (m.title LIKE '%...' OR LENGTH(m.title) >= 75)
+                   AND es.status = 'ok'
+                 LIMIT ?1",
+                libsql::params![limit as i64],
+            )
+            .await
+            .map_err(|e| {
+                OriginError::VectorDb(format!("get_truncated_title_memories: {e}"))
+            })?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            results.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
             ));
         }
         Ok(results)
@@ -23482,5 +23555,84 @@ pub(crate) mod tests {
             detail.enrichment_status, "enrichment_partial",
             "detail also derives from steps"
         );
+    }
+
+    #[tokio::test]
+    async fn test_enrichment_summary_counts_needs_retry_as_incomplete() {
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("mem_needs_retry_summary", "test content for summary", "fact", "tech", "test");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_needs_retry_summary", "dedup", "ok", None)
+            .await.unwrap();
+        db.record_enrichment_step("mem_needs_retry_summary", "title_enrich", "needs_retry", Some("llm_rejected"))
+            .await.unwrap();
+        let summary = db.get_enrichment_summary("mem_needs_retry_summary").await.unwrap();
+        assert_eq!(summary, "enrichment_partial", "needs_retry should make summary partial, not enriched");
+    }
+
+    #[tokio::test]
+    async fn test_get_title_reenrich_candidates() {
+        let (db, _dir) = test_db().await;
+
+        let doc1 = make_memory_doc("mem_title_failed", "A very long content that needs title enrichment and will be truncated because it exceeds the limit", "fact", "tech", "test");
+        db.upsert_documents(vec![doc1]).await.unwrap();
+        db.record_enrichment_step("mem_title_failed", "title_enrich", "failed", Some("llm error"))
+            .await.unwrap();
+
+        let doc2 = make_memory_doc("mem_title_needs_retry", "Another memory with rejected LLM title output", "fact", "tech", "test");
+        db.upsert_documents(vec![doc2]).await.unwrap();
+        db.record_enrichment_step("mem_title_needs_retry", "title_enrich", "needs_retry", Some("llm_rejected"))
+            .await.unwrap();
+
+        let doc3 = make_memory_doc("mem_title_ok", "This memory has a good title", "fact", "tech", "test");
+        db.upsert_documents(vec![doc3]).await.unwrap();
+        db.record_enrichment_step("mem_title_ok", "title_enrich", "ok", None)
+            .await.unwrap();
+
+        let doc4 = make_memory_doc("mem_title_abandoned", "Abandoned after max retries", "fact", "tech", "test");
+        db.upsert_documents(vec![doc4]).await.unwrap();
+        db.record_enrichment_step("mem_title_abandoned", "title_enrich", "abandoned", Some("gave up"))
+            .await.unwrap();
+
+        let candidates = db.get_title_reenrich_candidates(3, 10).await.unwrap();
+        let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"mem_title_failed"), "should include failed");
+        assert!(ids.contains(&"mem_title_needs_retry"), "should include needs_retry");
+        assert!(!ids.contains(&"mem_title_ok"), "should not include ok");
+        assert!(!ids.contains(&"mem_title_abandoned"), "should not include abandoned");
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_truncated_title_memories() {
+        let (db, _dir) = test_db().await;
+
+        let mut doc1 = make_memory_doc(
+            "mem_trunc_ellipsis",
+            "This is a very long piece of content that got its title truncated during initial storage",
+            "fact", "tech", "test",
+        );
+        doc1.title = "This is a very long piece of content that got its title truncat...".to_string();
+        db.upsert_documents(vec![doc1]).await.unwrap();
+        db.record_enrichment_step("mem_trunc_ellipsis", "title_enrich", "ok", None)
+            .await.unwrap();
+
+        let mut doc2 = make_memory_doc("mem_good_title", "Some content here", "fact", "tech", "test");
+        doc2.title = "Good Short Title".to_string();
+        db.upsert_documents(vec![doc2]).await.unwrap();
+        db.record_enrichment_step("mem_good_title", "title_enrich", "ok", None)
+            .await.unwrap();
+
+        let mut doc3 = make_memory_doc("mem_long_title", "Content for the long titled memory", "fact", "tech", "test");
+        doc3.title = "a".repeat(80);
+        db.upsert_documents(vec![doc3]).await.unwrap();
+        db.record_enrichment_step("mem_long_title", "title_enrich", "ok", None)
+            .await.unwrap();
+
+        let candidates = db.get_truncated_title_memories(10).await.unwrap();
+        let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"mem_trunc_ellipsis"), "should include ellipsis title");
+        assert!(ids.contains(&"mem_long_title"), "should include long title");
+        assert!(!ids.contains(&"mem_good_title"), "should not include good title");
     }
 }
