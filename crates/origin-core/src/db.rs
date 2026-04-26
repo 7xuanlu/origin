@@ -4058,6 +4058,9 @@ impl MemoryDB {
 
                 // Create summary view
                 conn.execute(
+                    // NOTE: This view does not include 'needs_retry' in its failure
+                    // count. The get_enrichment_summary() function does. The view has
+                    // no active consumers, but if one is added, update it to match.
                     "CREATE VIEW IF NOT EXISTS memory_enrichment_summary AS
                      SELECT
                          m.source_id,
@@ -8708,7 +8711,8 @@ impl MemoryDB {
                  FROM enrichment_steps es
                  JOIN (SELECT source_id, content FROM memories WHERE chunk_index = 0 AND source = 'memory') m
                     ON m.source_id = es.source_id
-                 WHERE es.status = 'failed' AND es.attempts < ?1
+                 WHERE es.status = 'failed' AND es.step_name != 'title_enrich'
+                   AND es.attempts < ?1
                  ORDER BY es.updated_at ASC LIMIT ?2",
                 libsql::params![max_attempts as i64, limit as i64],
             )
