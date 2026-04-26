@@ -705,12 +705,22 @@ async fn generate_e2e_answers_for_question(
     category: &str,
     search_limit: usize,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+    question_date: Option<&str>,
 ) -> Result<Vec<JudgmentTuple>, OriginError> {
     use crate::llm_provider::{strip_think_tags, LlmRequest};
 
-    let system_prompt = "Answer the question using only the provided context. \
-        Be specific and concise. Respond in 1-3 sentences."
-        .to_string();
+    // If we have a question_date (LongMemEval), prepend it to the system prompt
+    // so the LLM has a "today" anchor for relative time references in the question.
+    let system_prompt = match question_date {
+        Some(d) => format!(
+            "The question was asked on {}. Answer the question using only the provided context. \
+             Be specific and concise. Respond in 1-3 sentences.",
+            d
+        ),
+        None => "Answer the question using only the provided context. \
+            Be specific and concise. Respond in 1-3 sentences."
+            .to_string(),
+    };
 
     let mut tuples = Vec::new();
 
@@ -919,6 +929,7 @@ pub async fn run_e2e_context_eval(
                 category,
                 search_limit,
                 &llm,
+                None,
             )
             .await
             {
@@ -1056,6 +1067,7 @@ pub async fn run_e2e_context_eval_longmemeval(
             category,
             search_limit,
             &llm,
+            Some(&sample.question_date),
         )
         .await
         {
@@ -1764,5 +1776,39 @@ mod tests {
         // away or changes the format string.
         assert_eq!(crate::eval::shared::format_ymd(1_681_168_020), "2023-04-10");
         assert_eq!(crate::eval::shared::format_ymd(1_683_554_160), "2023-05-08");
+    }
+
+    #[test]
+    fn test_system_prompt_includes_question_date_when_provided() {
+        // Mirror the system_prompt construction from generate_e2e_answers_for_question
+        // to lock in the format. If the function changes, this test should reflect.
+        let with_date = match Some("2023/04/10 (Mon) 23:07") {
+            Some(d) => format!(
+                "The question was asked on {}. Answer the question using only the provided context. \
+                 Be specific and concise. Respond in 1-3 sentences.",
+                d
+            ),
+            None => "Answer the question using only the provided context. \
+                Be specific and concise. Respond in 1-3 sentences."
+                .to_string(),
+        };
+        assert!(with_date.contains("The question was asked on 2023/04/10"));
+        assert!(with_date.contains("only the provided context"));
+    }
+
+    #[test]
+    fn test_system_prompt_omits_when_no_question_date() {
+        let without_date: String = match None::<&str> {
+            Some(d) => format!(
+                "The question was asked on {}. Answer the question using only the provided context. \
+                 Be specific and concise. Respond in 1-3 sentences.",
+                d
+            ),
+            None => "Answer the question using only the provided context. \
+                Be specific and concise. Respond in 1-3 sentences."
+                .to_string(),
+        };
+        assert!(!without_date.contains("question was asked on"));
+        assert!(without_date.contains("only the provided context"));
     }
 }
