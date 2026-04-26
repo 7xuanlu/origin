@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Origin headless daemon — runs the memory server without Tauri.
 
+mod cmd_backfill;
 mod config_routes;
 mod error;
 mod import_routes;
@@ -49,9 +50,16 @@ enum Command {
     Uninstall,
     /// Show daemon status (launchd + health check).
     Status,
+    /// Delete archived stale concepts (Mode B cleanup). See spec
+    /// 2026-04-25-bad-concept-distill-fix-design.md. Daemon must be stopped first.
+    BackfillStaleConcepts {
+        /// Print candidates without modifying the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
-const PLIST_LABEL: &str = "com.origin.server";
+pub(crate) const PLIST_LABEL: &str = "com.origin.server";
 const PLIST_TEMPLATE: &str = include_str!("../resources/com.origin.server.plist");
 
 fn plist_path() -> std::path::PathBuf {
@@ -635,6 +643,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Install) => cmd_install(),
         Some(Command::Uninstall) => cmd_uninstall(),
         Some(Command::Status) => cmd_status().await,
+        Some(Command::BackfillStaleConcepts { dry_run }) => cmd_backfill::run(dry_run).await,
         None => run_daemon().await,
     }
 }

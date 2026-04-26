@@ -22,9 +22,9 @@ else
     # Rust tests with coverage gate
     echo "  Running Rust tests with coverage..."
     (cd app && cargo llvm-cov --fail-under-lines 90 2>&1) || {
-    echo "FAIL: Rust tests failed or coverage below 90%."
-    echo "Run 'cargo llvm-cov --html && open target/llvm-cov/html/index.html' to see report."
-    exit 1
+        echo "FAIL: Rust tests failed or coverage below 90%."
+        echo "Run 'cargo llvm-cov --html && open target/llvm-cov/html/index.html' to see report."
+        exit 1
     }
 fi
 

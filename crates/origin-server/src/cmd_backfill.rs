@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: Apache-2.0
+//! `backfill-stale-concepts` CLI subcommand.
+//!
+//! Deletes archived concepts that look like Mode B failures (large
+//! source_memory_ids, no entity, no domain, not user-edited). Source memories
+//! are NOT modified — see spec 2026-04-25-bad-concept-distill-fix-design.md
+//! for the rationale and follow-up steps required to re-distill them.
+//!
+//! `concept_sources` rows are deleted automatically via ON DELETE CASCADE.
+
+use anyhow::{anyhow, Context, Result};
+use origin_core::db::MemoryDB;
+use origin_core::events::NoopEmitter;
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::time::Duration;
+
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+// Re-exported from main.rs to avoid hard-coding the same launchd label twice.
+use crate::PLIST_LABEL;
+
+pub async fn run(dry_run: bool) -> anyhow::Result<()> {
+    // Step 1a: refuse if launchd has the daemon registered. With KeepAlive on
+    // SuccessfulExit=false, killing the daemon manually wouldn't be enough —
+    // launchd respawns it after ThrottleInterval (~5s), creating a race where
+    // the daemon could start writing between our probe and our SQLite writes.
+    check_launchd_unloaded()?;
+
+    // Step 1b: refuse if a daemon is currently running (covers manually-started
+    // instances and the brief window between launchd unload and respawn).
+    check_daemon_not_running().await?;
+
+    // Step 2: open the DB directly (not via daemon).
+    // Mirrors the path computation in `run_daemon()` in main.rs.
+    let origin_root = std::env::var_os("ORIGIN_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("origin")
+        });
+    let data_dir = origin_root.join("memorydb");
+
+    let db = MemoryDB::new(&data_dir, Arc::new(NoopEmitter))
+        .await
+        .with_context(|| format!("opening MemoryDB at {}", data_dir.display()))?;
+
+    // Step 3: query candidates.
+    let candidates = db
+        .find_stale_archived_concepts()
+        .await
+        .context("querying stale concepts")?;
+
+    if candidates.is_empty() {
+        println!("No stale archived concepts found. Nothing to do.");
+        return Ok(());
+    }
+
+    println!("Found {} candidate concept(s):\n", candidates.len());
+    for c in &candidates {
+        println!(
+            "  {} \"{}\" — {} sources — created {}",
+            c.id,
+            c.title,
+            c.source_memory_ids.len(),
+            c.created_at,
+        );
+    }
+    println!();
+
+    if dry_run {
+        println!("--dry-run: no changes made.");
+        return Ok(());
+    }
+
+    // Step 4: confirm.
+    print!(
+        "Delete {} concept(s) and their concept_sources rows? (y/N): ",
+        candidates.len()
+    );
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("reading confirmation")?;
+    let answer = answer.trim().to_lowercase();
+    if answer != "y" && answer != "yes" {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // Step 5: delete.
+    // concept_sources rows cascade automatically (ON DELETE CASCADE FK).
+    let mut deleted = 0usize;
+    for c in &candidates {
+        db.delete_concept(&c.id)
+            .await
+            .with_context(|| format!("deleting concept {}", c.id))?;
+        deleted += 1;
+    }
+
+    println!(
+        "Deleted {} concept(s). Source memories were NOT modified.",
+        deleted
+    );
+    println!();
+    println!("Next steps to re-distill the freed sources:");
+    println!("  - Sources with enrichment_steps rows will be eligible on next refinery tick.");
+    println!("  - Raw sources need re-enrichment first. Either:");
+    println!("    (a) Re-import: touch the original source files (e.g., `touch ~/second-brain/inbox/*.md`)");
+    println!("    (b) Wait for entity_backfill to gradually backfill entity_ids");
+
+    Ok(())
+}
+
+/// Returns Ok if launchd does not have the origin daemon registered.
+/// Returns Err with instructions if it does.
+///
+/// On non-macOS hosts launchctl is absent — treat that as "not loaded".
+fn check_launchd_unloaded() -> Result<()> {
+    let output = match std::process::Command::new("launchctl")
+        .args(["list", PLIST_LABEL])
+        .output()
+    {
+        Ok(o) => o,
+        // launchctl missing (non-macOS, sandboxed env) — nothing for launchd
+        // to revive, proceed to the live-daemon probe.
+        Err(_) => return Ok(()),
+    };
+    if output.status.success() {
+        Err(anyhow!(
+            "launchd has the daemon registered. Unload it first to prevent auto-restart:\n  \
+             launchctl unload ~/Library/LaunchAgents/{PLIST_LABEL}.plist\n\
+             Then re-run this command. (Reload after with `launchctl load`.)"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn check_daemon_not_running() -> Result<()> {
+    // Mirror the port-reading logic from cmd_status in main.rs.
+    let port: u16 = std::env::var("ORIGIN_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7878);
+    let probe_url = format!("http://127.0.0.1:{}/api/health", port);
+
+    let client = reqwest::Client::builder()
+        .timeout(DAEMON_PROBE_TIMEOUT)
+        .build()
+        .context("building reqwest client")?;
+    match client.get(&probe_url).send().await {
+        Ok(_) => Err(anyhow!(
+            "Daemon is running on :{port}. Stop it before running backfill:\n  \
+             launchctl unload ~/Library/LaunchAgents/com.origin.server.plist\n  \
+             # or: kill -9 $(lsof -ti :{port})"
+        )),
+        // Truly refused (nothing listening): safe to proceed.
+        Err(e) if e.is_connect() => Ok(()),
+        // Timeout: daemon may be alive but wedged (e.g. GPU inference). Refuse.
+        Err(e) if e.is_timeout() => Err(anyhow!(
+            "Daemon probe to :{port} timed out after {}ms. \
+             Daemon may be busy. Stop it explicitly and retry:\n  \
+             launchctl unload ~/Library/LaunchAgents/com.origin.server.plist\n  \
+             # or: kill -9 $(lsof -ti :{port})",
+            DAEMON_PROBE_TIMEOUT.as_millis()
+        )),
+        // Any other network error: surface it.
+        Err(e) => Err(anyhow!("Daemon probe to :{port} failed unexpectedly: {e}")),
+    }
+}

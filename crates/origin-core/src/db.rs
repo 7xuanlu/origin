@@ -25,6 +25,24 @@ pub struct MigrationProgress {
 /// Embedding dimension — must match the model (GTE-Base-EN-v1.5-Q = 768).
 pub const EMBEDDING_DIM: usize = 768;
 
+/// Shared embedder reference. Pass to [`MemoryDB::new_with_shared_embedder`] to
+/// reuse a single embedder across many `MemoryDB` instances. Created via
+/// [`MemoryDB::create_shared_embedder`]. Letting downstream callers spell out
+/// this type without depending on `fastembed` directly.
+pub type SharedEmbedder = Arc<std::sync::Mutex<TextEmbedding>>;
+
+/// Process-wide lock that serializes FastEmbed (BGE) embedder initialization.
+///
+/// `TextEmbedding::try_new()` performs filesystem I/O against `~/.fastembed_cache`
+/// via the `hf-hub` crate. Concurrent first-time inits race on that cache and
+/// one of them fails with `Failed to retrieve model_optimized.onnx` (verified
+/// against PR #23 CI: same process, same module, two parallel `MemoryDB::new`
+/// calls — one fails, the next succeeds 1.4 s later). Holding this mutex
+/// during `try_new` makes inits sequential within a process. Once the model
+/// is on disk, subsequent inits are fast (model load, no download), so the
+/// serialization cost is bounded.
+static EMBEDDER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Known-client registry — maps canonical technical IDs (what clients send in
 /// `x-agent-name`) to human-friendly display names (what users see in UI).
 ///
@@ -1038,6 +1056,8 @@ impl MemoryDB {
         std::thread::Builder::new()
             .name("embedder-init".into())
             .spawn(move || {
+                // Serialize FastEmbed inits process-wide — see EMBEDDER_INIT_LOCK comment.
+                let _guard = EMBEDDER_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                 log::info!("[memory_db] embedder thread: loading ONNX model...");
                 let mut opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
@@ -1141,6 +1161,8 @@ impl MemoryDB {
         std::thread::Builder::new()
             .name("embedder-init-shared".into())
             .spawn(move || {
+                // Serialize FastEmbed inits process-wide — see EMBEDDER_INIT_LOCK comment.
+                let _guard = EMBEDDER_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                 let opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
                 let result = TextEmbedding::try_new(opts);
@@ -8753,9 +8775,7 @@ impl MemoryDB {
                 libsql::params![max_attempts as i64, limit as i64],
             )
             .await
-            .map_err(|e| {
-                OriginError::VectorDb(format!("get_title_reenrich_candidates: {e}"))
-            })?;
+            .map_err(|e| OriginError::VectorDb(format!("get_title_reenrich_candidates: {e}")))?;
         let mut results = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             results.push((
@@ -8787,9 +8807,7 @@ impl MemoryDB {
                 libsql::params![limit as i64],
             )
             .await
-            .map_err(|e| {
-                OriginError::VectorDb(format!("get_truncated_title_memories: {e}"))
-            })?;
+            .map_err(|e| OriginError::VectorDb(format!("get_truncated_title_memories: {e}")))?;
         let mut results = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             results.push((
@@ -11748,6 +11766,7 @@ impl MemoryDB {
         min_size: usize,
         max_clusters: usize,
         token_limit: usize,
+        max_unlinked_cluster_size: usize,
     ) -> Result<Vec<DistillationCluster>, OriginError> {
         let conn = self.conn.lock().await;
 
@@ -11766,6 +11785,7 @@ impl MemoryDB {
                AND m.source_id NOT LIKE 'recap_%' \
                AND m.is_recap = 0 \
                AND m.embedding IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM enrichment_steps es WHERE es.source_id = m.source_id) \
              ORDER BY m.entity_id, m.domain, m.last_modified DESC",
             (),
         ).await.map_err(|e| OriginError::VectorDb(format!("distillation fetch: {}", e)))?;
@@ -11808,7 +11828,7 @@ impl MemoryDB {
         drop(conn);
 
         log::info!(
-            "[distill] found {} eligible memories for clustering",
+            "[distill] found {} eligible memories for clustering (raw excluded)",
             memories.len()
         );
         if memories.is_empty() {
@@ -11827,8 +11847,16 @@ impl MemoryDB {
                 // Group by community_id (preferred — graph-aware grouping)
                 community_groups.entry(cid).or_default().push(i);
             } else if let Some(ref eid) = mem.entity_id {
-                // Fallback: group by entity_id
-                entity_groups.entry(eid.clone()).or_default().push(i);
+                // Fallback: group by entity_id. Treat empty string as unlinked:
+                // entity_backfill writes "" as a "tried, no entities found"
+                // marker so the memory isn't re-extracted forever, but
+                // bucketing under "" would group all such memories as if they
+                // shared an entity — exactly the runaway-cluster failure mode.
+                if eid.is_empty() {
+                    unlinked.push(i);
+                } else {
+                    entity_groups.entry(eid.clone()).or_default().push(i);
+                }
             } else {
                 unlinked.push(i);
             }
@@ -11860,15 +11888,55 @@ impl MemoryDB {
             }
         }
 
-        // Cluster unlinked memories by vector similarity
+        // Cluster unlinked memories by vector similarity. Apply hard size cap
+        // to prevent runaway clusters of unlabeled memories (safety valve for
+        // the Mode B failure mode — see spec 2026-04-25). Oversized clusters
+        // are re-clustered once with a tighter threshold instead of dropped:
+        // a 200-memory pile usually contains coherent sub-topics that deserve
+        // their own concepts, while truly noisy piles produce tighter groups
+        // that still exceed the cap and are then logged + skipped.
         if unlinked.len() >= min_size {
             let sub = cluster_by_similarity(&memories, &unlinked, similarity_threshold);
             for group in sub {
-                if group.len() >= min_size {
-                    let cluster = build_distillation_cluster(&memories, &group);
-                    let split = sub_cluster_by_tokens(&memories, cluster, token_limit);
-                    clusters.extend(split);
+                if group.len() < min_size {
+                    continue;
                 }
+                if group.len() > max_unlinked_cluster_size {
+                    // Tighten by +0.05 (cosine similarity is logarithmic in
+                    // semantic distance — +0.1 from a default 0.85 jumps to
+                    // 0.95 which is near-duplicate territory and drops most
+                    // legitimate sub-topics at min_size). Cap at 0.92.
+                    let tighter = (similarity_threshold + 0.05).min(0.92);
+                    log::info!(
+                        "[distill] re-splitting oversized unlinked cluster: \
+                         {} memories at threshold {:.2} (cap = {})",
+                        group.len(),
+                        tighter,
+                        max_unlinked_cluster_size,
+                    );
+                    let resplit = cluster_by_similarity(&memories, &group, tighter);
+                    for sub_group in resplit {
+                        if sub_group.len() < min_size {
+                            continue;
+                        }
+                        if sub_group.len() > max_unlinked_cluster_size {
+                            log::info!(
+                                "[distill] dropping unlinked sub-cluster after re-split: \
+                                 {} memories still > cap {}",
+                                sub_group.len(),
+                                max_unlinked_cluster_size,
+                            );
+                            continue;
+                        }
+                        let cluster = build_distillation_cluster(&memories, &sub_group);
+                        let split = sub_cluster_by_tokens(&memories, cluster, token_limit);
+                        clusters.extend(split);
+                    }
+                    continue;
+                }
+                let cluster = build_distillation_cluster(&memories, &group);
+                let split = sub_cluster_by_tokens(&memories, cluster, token_limit);
+                clusters.extend(split);
             }
         }
 
@@ -14361,6 +14429,39 @@ impl MemoryDB {
             result.push(Self::row_to_concept(&row)?);
         }
         Ok(result)
+    }
+
+    /// Find archived concepts that look like Mode B failures: large
+    /// source_memory_ids count, no entity, no domain, not user-edited.
+    /// Used by the `backfill-stale-concepts` CLI subcommand.
+    pub async fn find_stale_archived_concepts(
+        &self,
+    ) -> Result<Vec<crate::concepts::Concept>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0)
+                 FROM concepts
+                 WHERE status = 'archived'
+                   AND entity_id IS NULL
+                   AND domain IS NULL
+                   AND COALESCE(user_edited, 0) = 0
+                   AND json_array_length(source_memory_ids) > 50
+                 ORDER BY created_at DESC",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("find_stale_archived_concepts: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            out.push(Self::row_to_concept(&row)?);
+        }
+        Ok(out)
     }
 
     /// Clear staleness fields after successful re-distillation.
@@ -19078,10 +19179,14 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             db.upsert_documents(vec![doc]).await.unwrap();
+            // Record an enrichment step so the memory passes the EXISTS gate.
+            db.record_enrichment_step(&format!("cluster_{}", i), "dedup", "ok", None)
+                .await
+                .unwrap();
         }
 
         let clusters = db
-            .find_distillation_clusters(0.5, 2, 20, 3500)
+            .find_distillation_clusters(0.5, 2, 20, 3500, 50)
             .await
             .unwrap();
         // Should find at least 1 cluster (entity groups with 2+ members)
@@ -19092,6 +19197,158 @@ pub(crate) mod tests {
                 cluster.source_ids.len() >= 2,
                 "cluster too small: {:?}",
                 cluster.source_ids
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_distillation_clusters_excludes_memories_without_enrichment_steps() {
+        let (db, _dir) = test_db().await;
+
+        // Insert 4 memories with same entity, all eligible by other criteria.
+        // 2 will have enrichment_steps (eligible after gate), 2 will not (raw).
+        let now = chrono::Utc::now().timestamp_millis();
+        for (i, sid) in ["mem_e1", "mem_e2", "mem_r1", "mem_r2"].iter().enumerate() {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: sid.to_string(),
+                content: format!("Test content about Origin item {}", i),
+                title: format!("Test mem {}", i),
+                url: None,
+                last_modified: now,
+                memory_type: Some("fact".to_string()),
+                domain: Some("test".to_string()),
+                entity_id: Some("ent_test".to_string()),
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
+
+        // Record enrichment steps for the first 2 only.
+        for sid in ["mem_e1", "mem_e2"].iter() {
+            db.record_enrichment_step(sid, "dedup", "ok", None)
+                .await
+                .unwrap();
+        }
+
+        // Run cluster discovery with min_size=2 so the eligible 2 form a cluster.
+        let clusters = db
+            .find_distillation_clusters(0.3, 2, 20, 3500, 50)
+            .await
+            .unwrap();
+
+        // The 2 raw memories must not appear in any cluster.
+        let all_source_ids: Vec<String> = clusters
+            .iter()
+            .flat_map(|c| c.source_ids.iter().cloned())
+            .collect();
+        assert!(
+            !all_source_ids.contains(&"mem_r1".to_string()),
+            "raw memory mem_r1 leaked into clusters: {:?}",
+            all_source_ids
+        );
+        assert!(
+            !all_source_ids.contains(&"mem_r2".to_string()),
+            "raw memory mem_r2 leaked into clusters: {:?}",
+            all_source_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn find_distillation_clusters_treats_empty_entity_id_as_unlinked() {
+        // entity_backfill writes entity_id = "" as a "tried, no entities found"
+        // marker so the memory isn't re-extracted forever. Bucketing under ""
+        // would group all such memories as if they shared an entity — exactly
+        // the runaway-cluster failure mode (Mode B). They must fall into the
+        // unlinked bucket where the size cap protects against that.
+        //
+        // Setup: 8 highly-similar memories with empty-string entity_id, with
+        // max_unlinked_cluster_size = 5. If the bucketing bug is present, all
+        // 8 group under entity_groups[""] which has no size cap → returned as
+        // one 8-cluster, failing the <=5 assertion. With the fix, they fall
+        // into unlinked → cap kicks in → returned cluster sizes <= 5.
+        let (db, _dir) = test_db().await;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        for i in 0..8 {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("mem_empty_eid_{}", i),
+                content: format!("origin notes about distillation iteration {}", i),
+                title: format!("Note {}", i),
+                last_modified: now + i as i64,
+                memory_type: None,
+                domain: None,
+                entity_id: Some(String::new()), // <-- the marker
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+            db.record_enrichment_step(
+                &format!("mem_empty_eid_{}", i),
+                "entity_backfill",
+                "skipped",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let clusters = db
+            .find_distillation_clusters(0.3, 2, 20, 3500, 5)
+            .await
+            .unwrap();
+
+        for cluster in &clusters {
+            assert!(
+                cluster.source_ids.len() <= 5,
+                "cluster of {} memories with empty entity_id exceeded cap 5 — \
+                 bucketing bug?",
+                cluster.source_ids.len(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_distillation_clusters_caps_oversized_unlinked() {
+        let (db, _dir) = test_db().await;
+
+        // Insert 60 unlinked memories (no entity_id, no domain) with similar
+        // content — should form ONE big unlinked cluster.
+        let now = chrono::Utc::now().timestamp_millis();
+        for i in 0..60 {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("mem_unlinked_{}", i),
+                // Highly similar content — all about same topic
+                content: format!("notes on origin distillation pipeline iteration {}", i),
+                title: format!("Note {}", i),
+                url: None,
+                last_modified: now + i as i64,
+                memory_type: None,
+                domain: None,
+                entity_id: None,
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+            // Mark enriched (must satisfy Task 4 gate)
+            db.record_enrichment_step(&format!("mem_unlinked_{}", i), "dedup", "ok", None)
+                .await
+                .unwrap();
+        }
+
+        // Run with cap = 30. The single 60-memory unlinked cluster should be
+        // skipped entirely. No clusters > 30 should be returned.
+        let clusters = db
+            .find_distillation_clusters(0.3, 2, 20, 3500, 30)
+            .await
+            .unwrap();
+
+        for cluster in &clusters {
+            assert!(
+                cluster.source_ids.len() <= 30,
+                "cluster of {} memories exceeded cap of 30: {:?}",
+                cluster.source_ids.len(),
+                cluster.source_ids.first()
             );
         }
     }
@@ -23560,14 +23817,33 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_enrichment_summary_counts_needs_retry_as_incomplete() {
         let (db, _dir) = test_db().await;
-        let doc = make_memory_doc("mem_needs_retry_summary", "test content for summary", "fact", "tech", "test");
+        let doc = make_memory_doc(
+            "mem_needs_retry_summary",
+            "test content for summary",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc]).await.unwrap();
         db.record_enrichment_step("mem_needs_retry_summary", "dedup", "ok", None)
-            .await.unwrap();
-        db.record_enrichment_step("mem_needs_retry_summary", "title_enrich", "needs_retry", Some("llm_rejected"))
-            .await.unwrap();
-        let summary = db.get_enrichment_summary("mem_needs_retry_summary").await.unwrap();
-        assert_eq!(summary, "enrichment_partial", "needs_retry should make summary partial, not enriched");
+            .await
+            .unwrap();
+        db.record_enrichment_step(
+            "mem_needs_retry_summary",
+            "title_enrich",
+            "needs_retry",
+            Some("llm_rejected"),
+        )
+        .await
+        .unwrap();
+        let summary = db
+            .get_enrichment_summary("mem_needs_retry_summary")
+            .await
+            .unwrap();
+        assert_eq!(
+            summary, "enrichment_partial",
+            "needs_retry should make summary partial, not enriched"
+        );
     }
 
     #[tokio::test]
@@ -23576,30 +23852,73 @@ pub(crate) mod tests {
 
         let doc1 = make_memory_doc("mem_title_failed", "A very long content that needs title enrichment and will be truncated because it exceeds the limit", "fact", "tech", "test");
         db.upsert_documents(vec![doc1]).await.unwrap();
-        db.record_enrichment_step("mem_title_failed", "title_enrich", "failed", Some("llm error"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_failed",
+            "title_enrich",
+            "failed",
+            Some("llm error"),
+        )
+        .await
+        .unwrap();
 
-        let doc2 = make_memory_doc("mem_title_needs_retry", "Another memory with rejected LLM title output", "fact", "tech", "test");
+        let doc2 = make_memory_doc(
+            "mem_title_needs_retry",
+            "Another memory with rejected LLM title output",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc2]).await.unwrap();
-        db.record_enrichment_step("mem_title_needs_retry", "title_enrich", "needs_retry", Some("llm_rejected"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_needs_retry",
+            "title_enrich",
+            "needs_retry",
+            Some("llm_rejected"),
+        )
+        .await
+        .unwrap();
 
-        let doc3 = make_memory_doc("mem_title_ok", "This memory has a good title", "fact", "tech", "test");
+        let doc3 = make_memory_doc(
+            "mem_title_ok",
+            "This memory has a good title",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc3]).await.unwrap();
         db.record_enrichment_step("mem_title_ok", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let doc4 = make_memory_doc("mem_title_abandoned", "Abandoned after max retries", "fact", "tech", "test");
+        let doc4 = make_memory_doc(
+            "mem_title_abandoned",
+            "Abandoned after max retries",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc4]).await.unwrap();
-        db.record_enrichment_step("mem_title_abandoned", "title_enrich", "abandoned", Some("gave up"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_abandoned",
+            "title_enrich",
+            "abandoned",
+            Some("gave up"),
+        )
+        .await
+        .unwrap();
 
         let candidates = db.get_title_reenrich_candidates(3, 10).await.unwrap();
         let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
         assert!(ids.contains(&"mem_title_failed"), "should include failed");
-        assert!(ids.contains(&"mem_title_needs_retry"), "should include needs_retry");
+        assert!(
+            ids.contains(&"mem_title_needs_retry"),
+            "should include needs_retry"
+        );
         assert!(!ids.contains(&"mem_title_ok"), "should not include ok");
-        assert!(!ids.contains(&"mem_title_abandoned"), "should not include abandoned");
+        assert!(
+            !ids.contains(&"mem_title_abandoned"),
+            "should not include abandoned"
+        );
         assert_eq!(candidates.len(), 2);
     }
 
@@ -23612,27 +23931,188 @@ pub(crate) mod tests {
             "This is a very long piece of content that got its title truncated during initial storage",
             "fact", "tech", "test",
         );
-        doc1.title = "This is a very long piece of content that got its title truncat...".to_string();
+        doc1.title =
+            "This is a very long piece of content that got its title truncat...".to_string();
         db.upsert_documents(vec![doc1]).await.unwrap();
         db.record_enrichment_step("mem_trunc_ellipsis", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let mut doc2 = make_memory_doc("mem_good_title", "Some content here", "fact", "tech", "test");
+        let mut doc2 = make_memory_doc(
+            "mem_good_title",
+            "Some content here",
+            "fact",
+            "tech",
+            "test",
+        );
         doc2.title = "Good Short Title".to_string();
         db.upsert_documents(vec![doc2]).await.unwrap();
         db.record_enrichment_step("mem_good_title", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let mut doc3 = make_memory_doc("mem_long_title", "Content for the long titled memory", "fact", "tech", "test");
+        let mut doc3 = make_memory_doc(
+            "mem_long_title",
+            "Content for the long titled memory",
+            "fact",
+            "tech",
+            "test",
+        );
         doc3.title = "a".repeat(80);
         db.upsert_documents(vec![doc3]).await.unwrap();
         db.record_enrichment_step("mem_long_title", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let candidates = db.get_truncated_title_memories(10).await.unwrap();
         let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(ids.contains(&"mem_trunc_ellipsis"), "should include ellipsis title");
+        assert!(
+            ids.contains(&"mem_trunc_ellipsis"),
+            "should include ellipsis title"
+        );
         assert!(ids.contains(&"mem_long_title"), "should include long title");
-        assert!(!ids.contains(&"mem_good_title"), "should not include good title");
+        assert!(
+            !ids.contains(&"mem_good_title"),
+            "should not include good title"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_stale_archived_concepts_returns_only_qualifying_rows() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Build source_memory_ids of length 60 (above the > 50 threshold)
+        let big_sources: Vec<String> = (0..60).map(|i| format!("mem_{}", i)).collect();
+        let big_refs: Vec<&str> = big_sources.iter().map(|s| s.as_str()).collect();
+
+        // Build small source_memory_ids (below threshold)
+        let small_sources: Vec<String> = (0..10).map(|i| format!("mem_s{}", i)).collect();
+        let small_refs: Vec<&str> = small_sources.iter().map(|s| s.as_str()).collect();
+
+        // Qualifying: archived, big, no domain, no entity, not user_edited
+        db.insert_concept(
+            "c_stale",
+            "Stale One",
+            None,
+            "content body",
+            None,
+            None,
+            &big_refs,
+            &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_stale").await.unwrap();
+
+        // Disqualifying: small (size <= 50)
+        db.insert_concept(
+            "c_small",
+            "Small One",
+            None,
+            "content",
+            None,
+            None,
+            &small_refs,
+            &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_small").await.unwrap();
+
+        // Disqualifying: has entity
+        db.insert_concept(
+            "c_entity",
+            "With Entity",
+            None,
+            "content",
+            Some("ent_X"),
+            None,
+            &big_refs,
+            &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_entity").await.unwrap();
+
+        // Disqualifying: has domain
+        db.insert_concept(
+            "c_domain",
+            "With Domain",
+            None,
+            "content",
+            None,
+            Some("work"),
+            &big_refs,
+            &now,
+        )
+        .await
+        .unwrap();
+        db.archive_concept("c_domain").await.unwrap();
+
+        // Disqualifying: still active (not archived)
+        db.insert_concept(
+            "c_active", "Active", None, "content", None, None, &big_refs, &now,
+        )
+        .await
+        .unwrap();
+
+        let candidates = db.find_stale_archived_concepts().await.unwrap();
+        let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&"c_stale".to_string()), "missing c_stale");
+        assert!(
+            !ids.contains(&"c_small".to_string()),
+            "small should not qualify"
+        );
+        assert!(
+            !ids.contains(&"c_entity".to_string()),
+            "entity-linked should not qualify"
+        );
+        assert!(
+            !ids.contains(&"c_domain".to_string()),
+            "domain-linked should not qualify"
+        );
+        assert!(
+            !ids.contains(&"c_active".to_string()),
+            "active should not qualify"
+        );
+        assert_eq!(ids.len(), 1, "only c_stale should match: {:?}", ids);
+    }
+
+    #[tokio::test]
+    async fn delete_concept_cascades_to_concept_sources() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_concept(
+            "c_cascade",
+            "Cascade Test",
+            None,
+            "content",
+            None,
+            None,
+            &["mem_x"],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // Link a source row.
+        db.link_concept_source("c_cascade", "mem_x", "test")
+            .await
+            .unwrap();
+
+        // Verify the link exists.
+        let sources_before = db.get_concept_sources("c_cascade").await.unwrap();
+        assert_eq!(sources_before.len(), 1, "concept_sources row should exist");
+
+        // Delete the concept; cascade should drop the join row.
+        db.delete_concept("c_cascade").await.unwrap();
+
+        let sources_after = db.get_concept_sources("c_cascade").await.unwrap();
+        assert!(
+            sources_after.is_empty(),
+            "concept_sources should be empty after concept delete (FK cascade): {:?}",
+            sources_after
+        );
     }
 }

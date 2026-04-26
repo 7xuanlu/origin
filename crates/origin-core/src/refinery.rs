@@ -692,13 +692,43 @@ pub async fn run_periodic_steep_with_api(
                     )
                     .await
                     {
-                        Ok(Some(_)) => extracted += 1,
+                        Ok(Some(_)) => {
+                            extracted += 1;
+                            // Record a step so the memory becomes eligible for
+                            // distillation (find_distillation_clusters gates on
+                            // EXISTS enrichment_steps; without this, file-synced
+                            // memories that bypass /api/memory/store would never
+                            // pass the gate).
+                            let _ = db_ref
+                                .record_enrichment_step(source_id, "entity_backfill", "ok", None)
+                                .await;
+                        }
                         Ok(None) => {
                             // Mark as attempted so we don't retry forever
                             let _ = db_ref.update_memory_entity_id(source_id, "").await;
+                            let _ = db_ref
+                                .record_enrichment_step(
+                                    source_id,
+                                    "entity_backfill",
+                                    "skipped",
+                                    Some("no entities extracted"),
+                                )
+                                .await;
                         }
                         Err(e) => {
                             log::warn!("[refinery] entity_backfill failed for {}: {e}", source_id);
+                            // Record the failure so the memory eventually becomes
+                            // eligible for distillation (per spec: "once at least
+                            // one step is recorded — even if failed — the memory
+                            // is admitted, deliberate to avoid stuck-forever").
+                            let _ = db_ref
+                                .record_enrichment_step(
+                                    source_id,
+                                    "entity_backfill",
+                                    "failed",
+                                    Some(&e.to_string()),
+                                )
+                                .await;
                             break; // LLM may be down, stop batch
                         }
                     }
@@ -1256,6 +1286,7 @@ pub async fn distill_concepts(
             tuning.concept_min_cluster_size,
             tuning.max_clusters_per_steep,
             token_limit,
+            tuning.max_unlinked_cluster_size,
         )
         .await?;
 
@@ -1410,7 +1441,8 @@ pub async fn distill_concepts(
                 let llm_title = generate_short_title(llm, &content).await;
                 let title = match llm_title {
                     Some(t) => t,
-                    None if looks_like_generic_topic(topic)
+                    None if is_all_generic_tokens(topic)
+                        || looks_like_markup_styled(topic)
                         || looks_like_path(topic)
                         || looks_like_code(topic)
                         || looks_like_uuid(topic)
@@ -1838,7 +1870,7 @@ async fn recompile_single_concept(
     match response {
         Ok(raw) if !raw.trim().is_empty() => {
             let content = crate::llm_provider::strip_think_tags(&raw)
-                                .trim()
+                .trim()
                 .to_string();
             if !content.is_empty() {
                 let source_refs: Vec<&str> = concept
@@ -1955,7 +1987,7 @@ pub(crate) async fn re_distill_stale_concepts(
         match response {
             Ok(raw) if !raw.trim().is_empty() => {
                 let content = crate::llm_provider::strip_think_tags(&raw)
-                                        .trim()
+                    .trim()
                     .to_string();
                 if !content.is_empty() {
                     db.update_concept_content(&concept.id, &content, &source_id_refs, "re_distill")
@@ -2137,7 +2169,7 @@ pub async fn deep_distill_single(
         .map_err(|e| OriginError::Llm(format!("re-distill LLM: {}", e)))?;
 
     let content = crate::llm_provider::strip_think_tags(&response)
-                .trim()
+        .trim()
         .to_string();
 
     if content.is_empty() {
@@ -2689,14 +2721,74 @@ fn build_burst_context(
     )
 }
 
-/// Returns true for single-word generic stand-ins that are useless as concept titles.
-/// These are often the `topic` fallback value when no entity/domain is available.
-fn looks_like_generic_topic(s: &str) -> bool {
-    let t = s.trim().to_lowercase();
-    matches!(
-        t.as_str(),
-        "general" | "untitled" | "topic" | "concept" | "cluster" | "misc" | "other" | "unknown"
-    )
+/// Tokens considered generic stand-ins. A title made entirely of these is not
+/// useful as a concept title. Mostly English; a small set of CJK generics
+/// included for the same reason. Curated to avoid false positives —
+/// `concept`, `concepts`, `content`, `ideas` deliberately excluded because
+/// they appear in legitimate titles too often.
+const GENERIC_TOKENS: &[&str] = &[
+    "general",
+    "various",
+    "miscellaneous",
+    "topic",
+    "topics",
+    "notes",
+    "things",
+    "items",
+    "stuff",
+    "misc",
+    "other",
+    "unknown",
+    "untitled",
+    "random",
+    "assorted",
+    "cluster",
+    "clusters",
+    // CJK generics seen in real LLM output
+    "杂项",
+    "其他",
+    "其它",
+    "通用",
+    "笔记",
+    "主题",
+];
+
+/// Returns true when every word-token of the input (after splitting on
+/// non-alphanumeric separators and lowercasing) is in GENERIC_TOKENS. Used to
+/// reject LLM-produced titles like "General topic" or "Various Notes" or
+/// "Misc-things" (hyphen treated as separator).
+fn is_all_generic_tokens(s: &str) -> bool {
+    let words: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return false;
+    }
+    words
+        .iter()
+        .all(|w| GENERIC_TOKENS.contains(&w.to_lowercase().as_str()))
+}
+
+/// Returns true when the title contains markdown formatting or document-content
+/// punctuation that shouldn't appear in clean titles. Catches LLM hallucinations
+/// like `**Roland** — 太正統，d-L 連接快` where the model emitted markdown-styled
+/// document content instead of a title. Also catches wikilink brackets and
+/// heading markers that leak in from training data of Markdown corpora.
+fn looks_like_markup_styled(s: &str) -> bool {
+    let trimmed = s.trim();
+    // Markdown emphasis (bold/italic/strikethrough)
+    trimmed.contains("**")
+        || trimmed.contains("__")
+        || trimmed.contains("~~")
+        // Wikilink brackets
+        || trimmed.contains("[[")
+        || trimmed.contains("]]")
+        // Em-dash separator (en-dash and ASCII hyphen are fine)
+        || trimmed.contains('—')
+        // Heading markers at start
+        || trimmed.starts_with('#')
 }
 
 fn looks_like_uuid(s: &str) -> bool {
@@ -2855,8 +2947,16 @@ pub(crate) async fn generate_short_title(
                 .trim_start_matches("title: ")
                 .trim();
             let word_count = title.split_whitespace().count();
-            log::info!("[title] clean='{}' ({} words)", title, word_count);
-            // Reject if empty, too many words, multiline, or truncated mid-sentence
+            let char_count = title.chars().count();
+            log::info!(
+                "[title] clean='{}' ({} words, {} chars)",
+                title,
+                word_count,
+                char_count
+            );
+            // Reject if empty, too many words, too long (CJK content has no
+            // whitespace so word_count alone misses runaway CJK strings),
+            // multiline, or truncated mid-sentence.
             let truncated = title.ends_with(',')
                 || title.ends_with("including")
                 || title.ends_with("with")
@@ -2865,10 +2965,16 @@ pub(crate) async fn generate_short_title(
                 || title.ends_with("for")
                 || title.ends_with("of")
                 || title.ends_with("in");
-            if title.is_empty() || word_count > 8 || title.contains('\n') || truncated {
+            if title.is_empty()
+                || word_count > 8
+                || char_count > 80
+                || title.contains('\n')
+                || truncated
+            {
                 log::info!("[title] rejected (empty/too long/multiline)");
                 None
-            } else if looks_like_generic_topic(title)
+            } else if is_all_generic_tokens(title)
+                || looks_like_markup_styled(title)
                 || looks_like_uuid(title)
                 || looks_like_short_hash(title)
                 || looks_like_code(title)
@@ -3137,12 +3243,12 @@ pub(crate) async fn retry_failed_enrichment(
                                 .map(|s| s.attempts)
                         })
                         .unwrap_or(0);
-                    let status =
-                        if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
-                            "abandoned"
-                        } else {
-                            "needs_retry"
-                        };
+                    let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries
+                    {
+                        "abandoned"
+                    } else {
+                        "needs_retry"
+                    };
                     db.record_enrichment_step(
                         source_id,
                         "title_enrich",
@@ -3172,12 +3278,12 @@ pub(crate) async fn retry_failed_enrichment(
                                 .map(|s| s.attempts)
                         })
                         .unwrap_or(0);
-                    let status =
-                        if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
-                            "abandoned"
-                        } else {
-                            "failed"
-                        };
+                    let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries
+                    {
+                        "abandoned"
+                    } else {
+                        "failed"
+                    };
                     db.record_enrichment_step(
                         source_id,
                         "title_enrich",
@@ -4687,21 +4793,85 @@ mod tests {
 
     #[test]
     fn rejects_generic_topic_titles() {
-        // All generic placeholders must be rejected.
-        assert!(looks_like_generic_topic("general"));
-        assert!(looks_like_generic_topic("General"));
-        assert!(looks_like_generic_topic("GENERAL"));
-        assert!(looks_like_generic_topic("untitled"));
-        assert!(looks_like_generic_topic("topic"));
-        assert!(looks_like_generic_topic("concept"));
-        assert!(looks_like_generic_topic("cluster"));
-        assert!(looks_like_generic_topic("misc"));
-        assert!(looks_like_generic_topic("other"));
-        assert!(looks_like_generic_topic("unknown"));
+        // All single-word generic placeholders must still be rejected.
+        assert!(is_all_generic_tokens("general"));
+        assert!(is_all_generic_tokens("General"));
+        assert!(is_all_generic_tokens("GENERAL"));
+        assert!(is_all_generic_tokens("untitled"));
+        assert!(is_all_generic_tokens("topic"));
+        assert!(is_all_generic_tokens("cluster"));
+        assert!(is_all_generic_tokens("misc"));
+        assert!(is_all_generic_tokens("other"));
+        assert!(is_all_generic_tokens("unknown"));
+        // Note: "concept" no longer in wordlist (false-positive risk on
+        // legitimate technical titles); not rejected by is_all_generic_tokens.
         // True negatives — these SHOULD pass through.
-        assert!(!looks_like_generic_topic("General AI Architecture"));
-        assert!(!looks_like_generic_topic("Origin Concept Model"));
-        assert!(!looks_like_generic_topic("libSQL Storage"));
+        assert!(!is_all_generic_tokens("General AI Architecture"));
+        assert!(!is_all_generic_tokens("Origin Concept Model"));
+        assert!(!is_all_generic_tokens("libSQL Storage"));
+    }
+
+    #[test]
+    fn is_all_generic_tokens_rejects_multi_word_generic() {
+        // Single word generics — preserved behavior
+        assert!(is_all_generic_tokens("general"));
+        assert!(is_all_generic_tokens("GENERAL"));
+        assert!(is_all_generic_tokens("topic"));
+        assert!(is_all_generic_tokens("untitled"));
+
+        // Multi-word all-generic — NEW behavior
+        assert!(is_all_generic_tokens("General topic"));
+        assert!(is_all_generic_tokens("Various Notes"));
+        assert!(is_all_generic_tokens("Topic Notes"));
+        assert!(is_all_generic_tokens("Misc Things"));
+        assert!(is_all_generic_tokens("Misc-things")); // hyphen stripped
+        assert!(is_all_generic_tokens("random assorted stuff"));
+
+        // True negatives — must keep
+        assert!(!is_all_generic_tokens("Topic and Notes")); // 'and' saves it
+        assert!(!is_all_generic_tokens("libsql Vector Storage"));
+        assert!(!is_all_generic_tokens("Origin Memory Layer"));
+        assert!(!is_all_generic_tokens("Origin Concept Model")); // wordlist excludes 'concept'
+        assert!(!is_all_generic_tokens("Notes on Origin")); // 'on', 'origin' not generic
+        assert!(!is_all_generic_tokens("Content Strategy")); // 'content' not in list, 'strategy' not in list
+
+        // Edge cases
+        assert!(!is_all_generic_tokens("")); // empty
+        assert!(!is_all_generic_tokens("   ")); // whitespace only
+        assert!(!is_all_generic_tokens("!!! ???")); // empty after punctuation strip
+
+        // CJK generics now in wordlist
+        assert!(is_all_generic_tokens("杂项"));
+        assert!(is_all_generic_tokens("其他"));
+        assert!(is_all_generic_tokens("通用"));
+
+        // Mixed-script content with markup is rejected by looks_like_markup_styled,
+        // not by is_all_generic_tokens. The latter is intentionally an English-leaning
+        // wordlist; markup detection handles the canonical Roland case below.
+        assert!(!is_all_generic_tokens("**Roland** — 太正統，d-L 連接快"));
+    }
+
+    #[test]
+    fn looks_like_markup_styled_catches_canonical_bad_titles() {
+        // Canonical Mode A example from the bug report — LLM emitted markdown
+        // bold + em-dash + mixed CJK content as a title.
+        assert!(looks_like_markup_styled("**Roland** — 太正統，d-L 連接快"));
+
+        // Other markdown-styled hallucinations
+        assert!(looks_like_markup_styled("**Important Note**"));
+        assert!(looks_like_markup_styled("__bold__"));
+        assert!(looks_like_markup_styled("~~strikethrough~~"));
+        assert!(looks_like_markup_styled("[[wikilink]]"));
+        assert!(looks_like_markup_styled("# Heading"));
+        assert!(looks_like_markup_styled("Foo — Bar")); // em-dash separator
+
+        // Clean titles must pass through
+        assert!(!looks_like_markup_styled("Origin Memory Layer"));
+        assert!(!looks_like_markup_styled("libSQL Storage"));
+        assert!(!looks_like_markup_styled("Concept Distillation Pipeline"));
+        assert!(!looks_like_markup_styled("Range: 1-10")); // ASCII hyphen ok
+        assert!(!looks_like_markup_styled("Year 2026–2027")); // en-dash ok
+        assert!(!looks_like_markup_styled("")); // empty
     }
 
     #[test]
@@ -4802,16 +4972,26 @@ mod tests {
             "fact",
             "tech",
         );
-        doc.title = "A very long memory content that will result in a truncated title when ini...".to_string();
+        doc.title = "A very long memory content that will result in a truncated title when ini..."
+            .to_string();
         db.upsert_documents(vec![doc]).await.unwrap();
-        db.record_enrichment_step("mem_title_no_llm", "title_enrich", "failed", Some("llm error"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_no_llm",
+            "title_enrich",
+            "failed",
+            Some("llm error"),
+        )
+        .await
+        .unwrap();
 
         let tuning = crate::tuning::RefineryConfig::default();
         let _count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
         let steps = db.get_enrichment_steps("mem_title_no_llm").await.unwrap();
         let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
-        assert_eq!(title_step.status, "failed", "should still be failed without LLM");
+        assert_eq!(
+            title_step.status, "failed",
+            "should still be failed without LLM"
+        );
     }
 
     #[tokio::test]
@@ -4847,7 +5027,10 @@ mod tests {
         // The key assertion is that we got here at all (no early return).
         assert_eq!(count, 0);
         // Step should still be needs_retry (unchanged, since no LLM was provided)
-        let steps = db.get_enrichment_steps("mem_needs_retry_only").await.unwrap();
+        let steps = db
+            .get_enrichment_steps("mem_needs_retry_only")
+            .await
+            .unwrap();
         let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
         assert_eq!(title_step.status, "needs_retry");
     }
