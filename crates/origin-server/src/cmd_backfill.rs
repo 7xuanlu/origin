@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const PLIST_LABEL: &str = "com.origin.server";
+// Re-exported from main.rs to avoid hard-coding the same launchd label twice.
+use crate::PLIST_LABEL;
 
 pub async fn run(dry_run: bool) -> anyhow::Result<()> {
     // Step 1a: refuse if launchd has the daemon registered. With KeepAlive on

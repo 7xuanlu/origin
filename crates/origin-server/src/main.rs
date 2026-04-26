@@ -59,7 +59,7 @@ enum Command {
     },
 }
 
-const PLIST_LABEL: &str = "com.origin.server";
+pub(crate) const PLIST_LABEL: &str = "com.origin.server";
 const PLIST_TEMPLATE: &str = include_str!("../resources/com.origin.server.plist");
 
 fn plist_path() -> std::path::PathBuf {

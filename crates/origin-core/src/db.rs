@@ -11847,8 +11847,16 @@ impl MemoryDB {
                 // Group by community_id (preferred — graph-aware grouping)
                 community_groups.entry(cid).or_default().push(i);
             } else if let Some(ref eid) = mem.entity_id {
-                // Fallback: group by entity_id
-                entity_groups.entry(eid.clone()).or_default().push(i);
+                // Fallback: group by entity_id. Treat empty string as unlinked:
+                // entity_backfill writes "" as a "tried, no entities found"
+                // marker so the memory isn't re-extracted forever, but
+                // bucketing under "" would group all such memories as if they
+                // shared an entity — exactly the runaway-cluster failure mode.
+                if eid.is_empty() {
+                    unlinked.push(i);
+                } else {
+                    entity_groups.entry(eid.clone()).or_default().push(i);
+                }
             } else {
                 unlinked.push(i);
             }
@@ -11894,7 +11902,11 @@ impl MemoryDB {
                     continue;
                 }
                 if group.len() > max_unlinked_cluster_size {
-                    let tighter = (similarity_threshold + 0.1).min(0.95);
+                    // Tighten by +0.05 (cosine similarity is logarithmic in
+                    // semantic distance — +0.1 from a default 0.85 jumps to
+                    // 0.95 which is near-duplicate territory and drops most
+                    // legitimate sub-topics at min_size). Cap at 0.92.
+                    let tighter = (similarity_threshold + 0.05).min(0.92);
                     log::info!(
                         "[distill] re-splitting oversized unlinked cluster: \
                          {} memories at threshold {:.2} (cap = {})",
@@ -19240,6 +19252,59 @@ pub(crate) mod tests {
             "raw memory mem_r2 leaked into clusters: {:?}",
             all_source_ids
         );
+    }
+
+    #[tokio::test]
+    async fn find_distillation_clusters_treats_empty_entity_id_as_unlinked() {
+        // entity_backfill writes entity_id = "" as a "tried, no entities found"
+        // marker so the memory isn't re-extracted forever. Bucketing under ""
+        // would group all such memories as if they shared an entity, which is
+        // exactly the runaway-cluster failure mode (Mode B). They must fall
+        // into the unlinked bucket where the size cap protects against that.
+        let (db, _dir) = test_db().await;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        // 80 memories with empty-string entity_id and similar content
+        for i in 0..80 {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("mem_empty_eid_{}", i),
+                content: format!("origin notes about distillation iteration {}", i),
+                title: format!("Note {}", i),
+                last_modified: now + i as i64,
+                memory_type: None,
+                domain: None,
+                entity_id: Some(String::new()), // <-- the marker
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+            db.record_enrichment_step(
+                &format!("mem_empty_eid_{}", i),
+                "entity_backfill",
+                "skipped",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Cap at 50. If empty-string ids were entity-grouped together, the
+        // 80-member cluster would either:
+        //  (a) be returned as one entity_groups cluster (no cap on entity_groups), or
+        //  (b) leak past the unlinked cap entirely.
+        // After the fix, all 80 land in unlinked → re-split or skipped under cap.
+        let clusters = db
+            .find_distillation_clusters(0.3, 2, 20, 3500, 50)
+            .await
+            .unwrap();
+
+        for cluster in &clusters {
+            assert!(
+                cluster.source_ids.len() <= 50,
+                "cluster of {} memories with empty entity_id exceeded cap 50",
+                cluster.source_ids.len(),
+            );
+        }
     }
 
     #[tokio::test]
