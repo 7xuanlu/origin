@@ -71,7 +71,37 @@ cargo test -p origin --test eval_harness save_longmemeval_expanded_baseline -- -
 # Baselines saved to app/eval/baselines/*.json (gitignored)
 ```
 
-Frontend tests use Vitest + React Testing Library. Git hooks auto-activate on `pnpm install` -- pre-commit auto-formats and checks compilation, pre-push runs clippy + full tests with 90% coverage gate.
+Frontend tests use Vitest + React Testing Library. Git hooks auto-activate on `pnpm install` -- pre-commit auto-formats and checks compilation, pre-push runs clippy + workspace tests (no coverage gate, see below).
+
+## Local vs CI test responsibilities
+
+Origin runs across several layers. The split is driven by three questions: **(1) Can a hosted runner do this?** (no GPU, no API keys, no cost). **(2) Is it under 60s on cold cache?** **(3) Does it gate correctness or measure quality?** Quality measures never gate.
+
+| Layer | What runs | Where | When | Time | Blocks? |
+|---|---|---|---|---|---|
+| **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
+| **L2 pre-commit** | `cargo fmt --all`, clippy on staged crates, vitest if FE staged | Local | `git commit` | ~5s | Yes |
+| **L3 pre-push** | `cargo clippy --workspace --all-targets`, `cargo test --workspace`, `pnpm vitest run --bail 1` | Local | `git push` | ~60-90s | Yes |
+| **L4 CI on PR** | Same checks workspace-wide, plus `cargo test -p origin --lib`, `pnpm test` | GitHub (`ci.yml`) | Every PR | ~10min | Yes (required) |
+| **L5 coverage on PR** | `cargo llvm-cov` on origin-core + origin-server only; vitest --coverage | GitHub (`coverage.yml`) | Every PR | ~10min | **No (informational)** |
+| **L6 main canary** | Embedding-only eval (`cargo test -p origin-core --lib eval::token_efficiency -- --ignored`) | GitHub (`ci.yml`) | Push to `main` | ~10min | No (post-merge) |
+| **L7 manual local** | `bash scripts/coverage.sh` (HTML coverage), GPU eval suite (`cargo test -- --ignored`), Anthropic batch judge (`ANTHROPIC_API_KEY=... cargo test ...`) | Your laptop | On demand | minutes-hours | No |
+| **L8 pre-release** | Full eval suite vs saved baseline. Record deltas in vault/memory **never git** (AGPL public-repo rule) | Your laptop | Per release | hours | Soft gate |
+
+### What does NOT run in CI and why
+
+- **GPU evals (LongMemEval / LoCoMo runner functions, Qwen3.5-9B inference)** — GitHub macOS runners have no Metal acceleration. The tests are `#[ignore]`d so they don't accidentally run.
+- **Anthropic API batch judge** — costs $0.35/run and requires `ANTHROPIC_API_KEY` which we don't expose to PR runs from forks.
+- **Tauri app coverage** — `--package origin` (the Tauri app crate) is mostly command proxies that can't be exercised without a GUI runtime, and instrumented compilation peaks at 8-16GB RSS. Coverage is scoped to `origin-core + origin-server`.
+
+### Why pre-push doesn't run coverage
+
+Earlier versions of `.githooks/pre-push` enforced a 90% `cargo llvm-cov` gate. That violated the principles above:
+- **Slow:** instrumented rebuild of the Tauri-app-pulling workspace took 5-15min and overloaded memory.
+- **Not mirrored in CI:** the main `ci.yml` lane doesn't run coverage at all, so the gate added local friction without upstream protection.
+- **Percentage gates rot:** any new untestable surface (Tauri commands, GPU-only eval) drops the percentage and forces busywork.
+
+The current pre-push runs only clippy + non-instrumented tests. Coverage is L5 (informational on PR) or L7 (manual command on laptop).
 
 ## Releasing (release-please)
 
