@@ -1256,6 +1256,7 @@ pub async fn distill_concepts(
             tuning.concept_min_cluster_size,
             tuning.max_clusters_per_steep,
             token_limit,
+            tuning.max_unlinked_cluster_size,
         )
         .await?;
 

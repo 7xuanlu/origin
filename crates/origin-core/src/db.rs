@@ -11748,6 +11748,7 @@ impl MemoryDB {
         min_size: usize,
         max_clusters: usize,
         token_limit: usize,
+        max_unlinked_cluster_size: usize,
     ) -> Result<Vec<DistillationCluster>, OriginError> {
         let conn = self.conn.lock().await;
 
@@ -11861,11 +11862,21 @@ impl MemoryDB {
             }
         }
 
-        // Cluster unlinked memories by vector similarity
+        // Cluster unlinked memories by vector similarity. Apply hard size cap
+        // to prevent runaway clusters of unlabeled memories (safety valve for
+        // the Mode B failure mode — see spec 2026-04-25).
         if unlinked.len() >= min_size {
             let sub = cluster_by_similarity(&memories, &unlinked, similarity_threshold);
             for group in sub {
                 if group.len() >= min_size {
+                    if group.len() > max_unlinked_cluster_size {
+                        log::info!(
+                            "[distill] skipping oversized unlinked cluster: {} memories (cap = {})",
+                            group.len(),
+                            max_unlinked_cluster_size,
+                        );
+                        continue;
+                    }
                     let cluster = build_distillation_cluster(&memories, &group);
                     let split = sub_cluster_by_tokens(&memories, cluster, token_limit);
                     clusters.extend(split);
@@ -19086,7 +19097,7 @@ pub(crate) mod tests {
         }
 
         let clusters = db
-            .find_distillation_clusters(0.5, 2, 20, 3500)
+            .find_distillation_clusters(0.5, 2, 20, 3500, 50)
             .await
             .unwrap();
         // Should find at least 1 cluster (entity groups with 2+ members)
@@ -19133,7 +19144,7 @@ pub(crate) mod tests {
 
         // Run cluster discovery with min_size=2 so the eligible 2 form a cluster.
         let clusters = db
-            .find_distillation_clusters(0.3, 2, 20, 3500)
+            .find_distillation_clusters(0.3, 2, 20, 3500, 50)
             .await
             .unwrap();
 
@@ -19152,6 +19163,56 @@ pub(crate) mod tests {
             "raw memory mem_r2 leaked into clusters: {:?}",
             all_source_ids
         );
+    }
+
+    #[tokio::test]
+    async fn find_distillation_clusters_caps_oversized_unlinked() {
+        let (db, _dir) = test_db().await;
+
+        // Insert 60 unlinked memories (no entity_id, no domain) with similar
+        // content — should form ONE big unlinked cluster.
+        let now = chrono::Utc::now().timestamp_millis();
+        for i in 0..60 {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("mem_unlinked_{}", i),
+                // Highly similar content — all about same topic
+                content: format!("notes on origin distillation pipeline iteration {}", i),
+                title: format!("Note {}", i),
+                url: None,
+                last_modified: now + i as i64,
+                memory_type: None,
+                domain: None,
+                entity_id: None,
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+            // Mark enriched (must satisfy Task 4 gate)
+            db.record_enrichment_step(
+                &format!("mem_unlinked_{}", i),
+                "dedup",
+                "ok",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Run with cap = 30. The single 60-memory unlinked cluster should be
+        // skipped entirely. No clusters > 30 should be returned.
+        let clusters = db
+            .find_distillation_clusters(0.3, 2, 20, 3500, 30)
+            .await
+            .unwrap();
+
+        for cluster in &clusters {
+            assert!(
+                cluster.source_ids.len() <= 30,
+                "cluster of {} memories exceeded cap of 30: {:?}",
+                cluster.source_ids.len(),
+                cluster.source_ids.first()
+            );
+        }
     }
 
     // ==================== Recap Integration ====================
