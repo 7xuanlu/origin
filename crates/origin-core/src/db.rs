@@ -25,6 +25,12 @@ pub struct MigrationProgress {
 /// Embedding dimension — must match the model (GTE-Base-EN-v1.5-Q = 768).
 pub const EMBEDDING_DIM: usize = 768;
 
+/// Shared embedder reference. Pass to [`MemoryDB::new_with_shared_embedder`] to
+/// reuse a single embedder across many `MemoryDB` instances. Created via
+/// [`MemoryDB::create_shared_embedder`]. Letting downstream callers spell out
+/// this type without depending on `fastembed` directly.
+pub type SharedEmbedder = Arc<std::sync::Mutex<TextEmbedding>>;
+
 /// Process-wide lock that serializes FastEmbed (BGE) embedder initialization.
 ///
 /// `TextEmbedding::try_new()` performs filesystem I/O against `~/.fastembed_cache`
@@ -1051,9 +1057,7 @@ impl MemoryDB {
             .name("embedder-init".into())
             .spawn(move || {
                 // Serialize FastEmbed inits process-wide — see EMBEDDER_INIT_LOCK comment.
-                let _guard = EMBEDDER_INIT_LOCK
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                let _guard = EMBEDDER_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                 log::info!("[memory_db] embedder thread: loading ONNX model...");
                 let mut opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
@@ -1158,9 +1162,7 @@ impl MemoryDB {
             .name("embedder-init-shared".into())
             .spawn(move || {
                 // Serialize FastEmbed inits process-wide — see EMBEDDER_INIT_LOCK comment.
-                let _guard = EMBEDDER_INIT_LOCK
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                let _guard = EMBEDDER_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                 let opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
                 let result = TextEmbedding::try_new(opts);
