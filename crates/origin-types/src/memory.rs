@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A search result from hybrid (vector + FTS) search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchResult {
     pub id: String,
     pub content: String,
