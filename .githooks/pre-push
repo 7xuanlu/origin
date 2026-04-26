@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Pre-push: running clippy + full test suite with coverage..."
+echo "Pre-push: running fast checks..."
 
 # Clippy lint check (catches errors that only show up in CI)
 echo "  Running Clippy..."
@@ -10,30 +10,12 @@ cargo clippy --workspace --all-targets -- -D warnings 2>&1 || {
     exit 1
 }
 
-# Check for cargo-llvm-cov
-if ! command -v cargo-llvm-cov &> /dev/null && ! cargo llvm-cov --version &> /dev/null 2>&1; then
-    echo "WARNING: cargo-llvm-cov not installed. Running tests without coverage gate."
-    echo "Install with: cargo install cargo-llvm-cov"
-    (cd app && cargo test 2>&1) || {
-        echo "FAIL: Rust tests failed."
-        exit 1
-    }
-else
-    # Rust tests with coverage gate
-    echo "  Running Rust tests with coverage..."
-    (cd app && cargo llvm-cov --fail-under-lines 90 2>&1) || {
-    echo "FAIL: Rust tests failed or coverage below 90%."
-    echo "Run 'cargo llvm-cov --html && open target/llvm-cov/html/index.html' to see report."
-    exit 1
-    }
-fi
-
-# Frontend tests with coverage
-echo "  Running frontend tests with coverage..."
-pnpm vitest run --coverage 2>&1 || {
-    echo "FAIL: Frontend tests failed or coverage below threshold."
-    echo "Run 'pnpm vitest run --coverage' to see report."
+# Library tests only (no integration, no coverage gate). Fast smoke test —
+# CI runs the full suite + coverage gates. See .github/workflows/ci.yml.
+echo "  Running library tests..."
+cargo test --workspace --lib --quiet 2>&1 || {
+    echo "FAIL: Library tests failed. Fix before pushing."
     exit 1
 }
 
-echo "Pre-push: all checks passed. Safe to push."
+echo "Pre-push: all fast checks passed. Safe to push (CI runs full suite + coverage)."
