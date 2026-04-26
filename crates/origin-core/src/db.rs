@@ -11882,23 +11882,49 @@ impl MemoryDB {
 
         // Cluster unlinked memories by vector similarity. Apply hard size cap
         // to prevent runaway clusters of unlabeled memories (safety valve for
-        // the Mode B failure mode — see spec 2026-04-25).
+        // the Mode B failure mode — see spec 2026-04-25). Oversized clusters
+        // are re-clustered once with a tighter threshold instead of dropped:
+        // a 200-memory pile usually contains coherent sub-topics that deserve
+        // their own concepts, while truly noisy piles produce tighter groups
+        // that still exceed the cap and are then logged + skipped.
         if unlinked.len() >= min_size {
             let sub = cluster_by_similarity(&memories, &unlinked, similarity_threshold);
             for group in sub {
-                if group.len() >= min_size {
-                    if group.len() > max_unlinked_cluster_size {
-                        log::info!(
-                            "[distill] skipping oversized unlinked cluster: {} memories (cap = {})",
-                            group.len(),
-                            max_unlinked_cluster_size,
-                        );
-                        continue;
-                    }
-                    let cluster = build_distillation_cluster(&memories, &group);
-                    let split = sub_cluster_by_tokens(&memories, cluster, token_limit);
-                    clusters.extend(split);
+                if group.len() < min_size {
+                    continue;
                 }
+                if group.len() > max_unlinked_cluster_size {
+                    let tighter = (similarity_threshold + 0.1).min(0.95);
+                    log::info!(
+                        "[distill] re-splitting oversized unlinked cluster: \
+                         {} memories at threshold {:.2} (cap = {})",
+                        group.len(),
+                        tighter,
+                        max_unlinked_cluster_size,
+                    );
+                    let resplit = cluster_by_similarity(&memories, &group, tighter);
+                    for sub_group in resplit {
+                        if sub_group.len() < min_size {
+                            continue;
+                        }
+                        if sub_group.len() > max_unlinked_cluster_size {
+                            log::info!(
+                                "[distill] dropping unlinked sub-cluster after re-split: \
+                                 {} memories still > cap {}",
+                                sub_group.len(),
+                                max_unlinked_cluster_size,
+                            );
+                            continue;
+                        }
+                        let cluster = build_distillation_cluster(&memories, &sub_group);
+                        let split = sub_cluster_by_tokens(&memories, cluster, token_limit);
+                        clusters.extend(split);
+                    }
+                    continue;
+                }
+                let cluster = build_distillation_cluster(&memories, &group);
+                let split = sub_cluster_by_tokens(&memories, cluster, token_limit);
+                clusters.extend(split);
             }
         }
 

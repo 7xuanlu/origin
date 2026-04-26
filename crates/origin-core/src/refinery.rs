@@ -692,13 +692,43 @@ pub async fn run_periodic_steep_with_api(
                     )
                     .await
                     {
-                        Ok(Some(_)) => extracted += 1,
+                        Ok(Some(_)) => {
+                            extracted += 1;
+                            // Record a step so the memory becomes eligible for
+                            // distillation (find_distillation_clusters gates on
+                            // EXISTS enrichment_steps; without this, file-synced
+                            // memories that bypass /api/memory/store would never
+                            // pass the gate).
+                            let _ = db_ref
+                                .record_enrichment_step(source_id, "entity_backfill", "ok", None)
+                                .await;
+                        }
                         Ok(None) => {
                             // Mark as attempted so we don't retry forever
                             let _ = db_ref.update_memory_entity_id(source_id, "").await;
+                            let _ = db_ref
+                                .record_enrichment_step(
+                                    source_id,
+                                    "entity_backfill",
+                                    "skipped",
+                                    Some("no entities extracted"),
+                                )
+                                .await;
                         }
                         Err(e) => {
                             log::warn!("[refinery] entity_backfill failed for {}: {e}", source_id);
+                            // Record the failure so the memory eventually becomes
+                            // eligible for distillation (per spec: "once at least
+                            // one step is recorded — even if failed — the memory
+                            // is admitted, deliberate to avoid stuck-forever").
+                            let _ = db_ref
+                                .record_enrichment_step(
+                                    source_id,
+                                    "entity_backfill",
+                                    "failed",
+                                    Some(&e.to_string()),
+                                )
+                                .await;
                             break; // LLM may be down, stop batch
                         }
                     }
@@ -1412,6 +1442,7 @@ pub async fn distill_concepts(
                 let title = match llm_title {
                     Some(t) => t,
                     None if is_all_generic_tokens(topic)
+                        || looks_like_markup_styled(topic)
                         || looks_like_path(topic)
                         || looks_like_code(topic)
                         || looks_like_uuid(topic)
@@ -2690,10 +2721,11 @@ fn build_burst_context(
     )
 }
 
-/// Tokens considered generic stand-ins (English only). A title made entirely
-/// of these is not useful as a concept title. Curated to avoid false
-/// positives — `concept`, `concepts`, `content`, `ideas` deliberately
-/// excluded because they appear in legitimate titles too often.
+/// Tokens considered generic stand-ins. A title made entirely of these is not
+/// useful as a concept title. Mostly English; a small set of CJK generics
+/// included for the same reason. Curated to avoid false positives —
+/// `concept`, `concepts`, `content`, `ideas` deliberately excluded because
+/// they appear in legitimate titles too often.
 const GENERIC_TOKENS: &[&str] = &[
     "general",
     "various",
@@ -2712,6 +2744,13 @@ const GENERIC_TOKENS: &[&str] = &[
     "assorted",
     "cluster",
     "clusters",
+    // CJK generics seen in real LLM output
+    "杂项",
+    "其他",
+    "其它",
+    "通用",
+    "笔记",
+    "主题",
 ];
 
 /// Returns true when every word-token of the input (after splitting on
@@ -2730,6 +2769,26 @@ fn is_all_generic_tokens(s: &str) -> bool {
     words
         .iter()
         .all(|w| GENERIC_TOKENS.contains(&w.to_lowercase().as_str()))
+}
+
+/// Returns true when the title contains markdown formatting or document-content
+/// punctuation that shouldn't appear in clean titles. Catches LLM hallucinations
+/// like `**Roland** — 太正統，d-L 連接快` where the model emitted markdown-styled
+/// document content instead of a title. Also catches wikilink brackets and
+/// heading markers that leak in from training data of Markdown corpora.
+fn looks_like_markup_styled(s: &str) -> bool {
+    let trimmed = s.trim();
+    // Markdown emphasis (bold/italic/strikethrough)
+    trimmed.contains("**")
+        || trimmed.contains("__")
+        || trimmed.contains("~~")
+        // Wikilink brackets
+        || trimmed.contains("[[")
+        || trimmed.contains("]]")
+        // Em-dash separator (en-dash and ASCII hyphen are fine)
+        || trimmed.contains('—')
+        // Heading markers at start
+        || trimmed.starts_with('#')
 }
 
 fn looks_like_uuid(s: &str) -> bool {
@@ -2888,8 +2947,16 @@ pub(crate) async fn generate_short_title(
                 .trim_start_matches("title: ")
                 .trim();
             let word_count = title.split_whitespace().count();
-            log::info!("[title] clean='{}' ({} words)", title, word_count);
-            // Reject if empty, too many words, multiline, or truncated mid-sentence
+            let char_count = title.chars().count();
+            log::info!(
+                "[title] clean='{}' ({} words, {} chars)",
+                title,
+                word_count,
+                char_count
+            );
+            // Reject if empty, too many words, too long (CJK content has no
+            // whitespace so word_count alone misses runaway CJK strings),
+            // multiline, or truncated mid-sentence.
             let truncated = title.ends_with(',')
                 || title.ends_with("including")
                 || title.ends_with("with")
@@ -2898,10 +2965,16 @@ pub(crate) async fn generate_short_title(
                 || title.ends_with("for")
                 || title.ends_with("of")
                 || title.ends_with("in");
-            if title.is_empty() || word_count > 8 || title.contains('\n') || truncated {
+            if title.is_empty()
+                || word_count > 8
+                || char_count > 80
+                || title.contains('\n')
+                || truncated
+            {
                 log::info!("[title] rejected (empty/too long/multiline)");
                 None
             } else if is_all_generic_tokens(title)
+                || looks_like_markup_styled(title)
                 || looks_like_uuid(title)
                 || looks_like_short_hash(title)
                 || looks_like_code(title)
@@ -4767,9 +4840,38 @@ mod tests {
         assert!(!is_all_generic_tokens("   ")); // whitespace only
         assert!(!is_all_generic_tokens("!!! ???")); // empty after punctuation strip
 
-        // Chinese — out of scope (English-only wordlist by design)
-        assert!(!is_all_generic_tokens("杂项"));
+        // CJK generics now in wordlist
+        assert!(is_all_generic_tokens("杂项"));
+        assert!(is_all_generic_tokens("其他"));
+        assert!(is_all_generic_tokens("通用"));
+
+        // Mixed-script content with markup is rejected by looks_like_markup_styled,
+        // not by is_all_generic_tokens. The latter is intentionally an English-leaning
+        // wordlist; markup detection handles the canonical Roland case below.
         assert!(!is_all_generic_tokens("**Roland** — 太正統，d-L 連接快"));
+    }
+
+    #[test]
+    fn looks_like_markup_styled_catches_canonical_bad_titles() {
+        // Canonical Mode A example from the bug report — LLM emitted markdown
+        // bold + em-dash + mixed CJK content as a title.
+        assert!(looks_like_markup_styled("**Roland** — 太正統，d-L 連接快"));
+
+        // Other markdown-styled hallucinations
+        assert!(looks_like_markup_styled("**Important Note**"));
+        assert!(looks_like_markup_styled("__bold__"));
+        assert!(looks_like_markup_styled("~~strikethrough~~"));
+        assert!(looks_like_markup_styled("[[wikilink]]"));
+        assert!(looks_like_markup_styled("# Heading"));
+        assert!(looks_like_markup_styled("Foo — Bar")); // em-dash separator
+
+        // Clean titles must pass through
+        assert!(!looks_like_markup_styled("Origin Memory Layer"));
+        assert!(!looks_like_markup_styled("libSQL Storage"));
+        assert!(!looks_like_markup_styled("Concept Distillation Pipeline"));
+        assert!(!looks_like_markup_styled("Range: 1-10")); // ASCII hyphen ok
+        assert!(!looks_like_markup_styled("Year 2026–2027")); // en-dash ok
+        assert!(!looks_like_markup_styled("")); // empty
     }
 
     #[test]

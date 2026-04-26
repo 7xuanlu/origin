@@ -16,9 +16,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const PLIST_LABEL: &str = "com.origin.server";
 
 pub async fn run(dry_run: bool) -> anyhow::Result<()> {
-    // Step 1: refuse if daemon is running (reads ORIGIN_PORT, matching cmd_status).
+    // Step 1a: refuse if launchd has the daemon registered. With KeepAlive on
+    // SuccessfulExit=false, killing the daemon manually wouldn't be enough —
+    // launchd respawns it after ThrottleInterval (~5s), creating a race where
+    // the daemon could start writing between our probe and our SQLite writes.
+    check_launchd_unloaded()?;
+
+    // Step 1b: refuse if a daemon is currently running (covers manually-started
+    // instances and the brief window between launchd unload and respawn).
     check_daemon_not_running().await?;
 
     // Step 2: open the DB directly (not via daemon).
@@ -102,6 +110,31 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
     println!("    (b) Wait for entity_backfill to gradually backfill entity_ids");
 
     Ok(())
+}
+
+/// Returns Ok if launchd does not have the origin daemon registered.
+/// Returns Err with instructions if it does.
+///
+/// On non-macOS hosts launchctl is absent — treat that as "not loaded".
+fn check_launchd_unloaded() -> Result<()> {
+    let output = match std::process::Command::new("launchctl")
+        .args(["list", PLIST_LABEL])
+        .output()
+    {
+        Ok(o) => o,
+        // launchctl missing (non-macOS, sandboxed env) — nothing for launchd
+        // to revive, proceed to the live-daemon probe.
+        Err(_) => return Ok(()),
+    };
+    if output.status.success() {
+        Err(anyhow!(
+            "launchd has the daemon registered. Unload it first to prevent auto-restart:\n  \
+             launchctl unload ~/Library/LaunchAgents/{PLIST_LABEL}.plist\n\
+             Then re-run this command. (Reload after with `launchctl load`.)"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 async fn check_daemon_not_running() -> Result<()> {
