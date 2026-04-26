@@ -5067,7 +5067,8 @@ impl MemoryDB {
     /// 11=byte_start, 12=byte_end, 13=semantic_unit, 14=memory_type, 15=domain,
     /// 16=source_agent, 17=confidence, 18=confirmed, 19=stability, 20=supersedes,
     /// 21=entity_id, 22=quality, 23=is_recap, 24=supersede_mode,
-    /// 25=structured_fields, 26=retrieval_cue, 27=source_text, 28=score/distance/rank
+    /// 25=structured_fields, 26=retrieval_cue, 27=source_text, 28=created_at,
+    /// 29=score/distance/rank
     fn row_to_search_result(row: &libsql::Row, score: f32) -> Result<SearchResult, OriginError> {
         Ok(SearchResult {
             id: row
@@ -5111,6 +5112,7 @@ impl MemoryDB {
             structured_fields: row.get::<Option<String>>(25).unwrap_or(None),
             retrieval_cue: row.get::<Option<String>>(26).unwrap_or(None),
             source_text: row.get::<Option<String>>(27).unwrap_or(None),
+            created_at: row.get::<i64>(28).unwrap_or(0),
             raw_score: 0.0, // Set later during normalization
         })
     }
@@ -5454,6 +5456,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5465,6 +5468,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5484,7 +5488,7 @@ impl MemoryDB {
             match rows_result {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(28).unwrap_or(1.0);
+                        let distance: f64 = row.get(29).unwrap_or(1.0);
                         if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
                             vector_results.push(result);
                         }
@@ -5510,6 +5514,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5523,6 +5528,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5545,7 +5551,7 @@ impl MemoryDB {
             match fts_result {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let rank: f64 = row.get(29).unwrap_or(0.0);
                         if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
                             fts_results.push(result);
                         }
@@ -5718,6 +5724,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5734,7 +5741,7 @@ impl MemoryDB {
             match conn.query(&sql, params).await {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(28).unwrap_or(1.0);
+                        let distance: f64 = row.get(29).unwrap_or(1.0);
                         if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
                             vector_results.push(result);
                         }
@@ -5777,6 +5784,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5801,7 +5809,7 @@ impl MemoryDB {
                 match conn.query(&fts_sql, params).await {
                     Ok(mut rows) => {
                         while let Ok(Some(row)) = rows.next().await {
-                            let rank: f64 = row.get(28).unwrap_or(0.0);
+                            let rank: f64 = row.get(29).unwrap_or(0.0);
                             if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
                                 fts_results.push(result);
                             }
@@ -6471,6 +6479,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -6490,6 +6499,7 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -6506,7 +6516,7 @@ impl MemoryDB {
         match conn.query(&sql, params).await {
             Ok(mut rows) => {
                 while let Ok(Some(row)) = rows.next().await {
-                    let distance: f64 = row.get(28).unwrap_or(1.0);
+                    let distance: f64 = row.get(29).unwrap_or(1.0);
                     let score = (1.0 - distance).max(0.0) as f32;
                     if let Ok(result) = Self::row_to_search_result(&row, score) {
                         results.push(result);
@@ -6562,6 +6572,7 @@ impl MemoryDB {
                     c.confidence, c.confirmed, c.stability, c.supersedes,
                     c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                     c.structured_fields, c.retrieval_cue, c.source_text,
+                    c.created_at,
                     fts.rank
              FROM memories_fts fts
              JOIN memories c ON fts.rowid = c.rowid
@@ -6589,7 +6600,7 @@ impl MemoryDB {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
                         // FTS5 rank is negative BM25; negate so higher = better
-                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let rank: f64 = row.get(29).unwrap_or(0.0);
                         let score = (-rank) as f32;
                         if let Ok(result) = Self::row_to_search_result(&row, score) {
                             results.push(result);
@@ -6845,6 +6856,7 @@ impl MemoryDB {
                 structured_fields: None,
                 retrieval_cue: None,
                 source_text: None,
+                created_at,
                 raw_score: 0.0,
             });
         }
@@ -24268,6 +24280,46 @@ pub(crate) mod tests {
             sources_after.is_empty(),
             "concept_sources should be empty after concept delete (FK cascade): {:?}",
             sources_after
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_result_exposes_created_at() {
+        let (db, _dir) = test_db().await;
+
+        // Seed a chunk with a known historical timestamp (2023-01-01 00:00:00 UTC = 1672531200).
+        let known_ts: i64 = 1_672_531_200;
+        let docs = vec![crate::sources::RawDocument {
+            content: "Alice met Bob in Tokyo".to_string(),
+            source_id: "doc1".to_string(),
+            source: "memory".to_string(),
+            title: "test".to_string(),
+            last_modified: known_ts,
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            ..Default::default()
+        }];
+        db.upsert_documents(docs).await.unwrap();
+
+        let results = db
+            .search_memory(
+                "Tokyo",
+                5,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "search returned no results");
+        let r = &results[0];
+        assert_eq!(r.last_modified, known_ts, "last_modified mismatch");
+        assert_eq!(
+            r.created_at, known_ts,
+            "created_at mismatch (upsert_documents mirrors last_modified -> created_at on INSERT)"
         );
     }
 }
