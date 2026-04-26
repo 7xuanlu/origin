@@ -1579,6 +1579,207 @@ pub async fn score_locomo_answers(
 }
 
 // ---------------------------------------------------------------------------
+// Batch API variants (50% cheaper, no rate limits)
+// ---------------------------------------------------------------------------
+
+/// Generate LoCoMo answers via Batch API.
+pub async fn generate_locomo_answers_batch(
+    retrieved: &[LocomoRetrievedQuestion],
+    answer_model: &str,
+    existing: Vec<LocomoAnsweredQuestion>,
+) -> Result<Vec<LocomoAnsweredQuestion>, OriginError> {
+    use crate::eval::longmemeval::{download_batch_results, poll_batch, submit_batch};
+    use std::collections::HashSet;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| OriginError::Generic("ANTHROPIC_API_KEY not set".into()))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("reqwest: {e}")))?;
+
+    let answered_keys: HashSet<(String, String)> = existing
+        .iter()
+        .map(|a| (a.conversation_id.clone(), a.question.clone()))
+        .collect();
+    let todo: Vec<&LocomoRetrievedQuestion> = retrieved
+        .iter()
+        .filter(|rq| !answered_keys.contains(&(rq.conversation_id.clone(), rq.question.clone())))
+        .collect();
+
+    eprintln!(
+        "[locomo_batch] {} existing, {} remaining",
+        existing.len(),
+        todo.len()
+    );
+    if todo.is_empty() {
+        return Ok(existing);
+    }
+
+    let requests: Vec<(String, String, Option<String>, usize)> = todo
+        .iter()
+        .enumerate()
+        .map(|(i, rq)| {
+            let id = format!("locomo_{}", i);
+            let prompt = format!(
+                "Context:\n{}\n\nQuestion: {}\n\nAnswer the question based on the context. Be specific and concise.",
+                rq.context, rq.question
+            );
+            let sys = "Answer based on the provided context. Be specific and concise. Respond in 1-3 sentences.".to_string();
+            (id, prompt, Some(sys), 300)
+        })
+        .collect();
+
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.0);
+
+    eprintln!("[locomo_batch] Submitting {} requests...", requests.len());
+    let batch_id = submit_batch(&client, &api_key, requests, answer_model, cost_cap)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+    eprintln!("[locomo_batch] Batch: {}", batch_id);
+
+    let results_url = poll_batch(&client, &api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+    let results = download_batch_results(&client, &api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+
+    let mut all = existing;
+    for (i, rq) in todo.iter().enumerate() {
+        let id = format!("locomo_{}", i);
+        if let Some(answer) = results.get(&id) {
+            all.push(LocomoAnsweredQuestion {
+                conversation_id: rq.conversation_id.clone(),
+                question: rq.question.clone(),
+                ground_truth: rq.ground_truth.clone(),
+                category: rq.category,
+                category_name: rq.category_name.clone(),
+                model_answer: answer.clone(),
+                answer_model: answer_model.to_string(),
+                context_tokens: rq.context_tokens,
+            });
+        }
+    }
+    eprintln!("[locomo_batch] Total: {} answers", all.len());
+    Ok(all)
+}
+
+/// Judge LoCoMo answers via Batch API.
+pub async fn score_locomo_answers_batch(
+    answered: &[LocomoAnsweredQuestion],
+    judge_model: &str,
+) -> Result<LocomoAccuracyReport, OriginError> {
+    use crate::eval::longmemeval::{download_batch_results, poll_batch, submit_batch};
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| OriginError::Generic("ANTHROPIC_API_KEY not set".into()))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("reqwest: {e}")))?;
+
+    let requests: Vec<(String, String, Option<String>, usize)> = answered
+        .iter()
+        .enumerate()
+        .map(|(i, aq)| {
+            let prompt = locomo_judge_prompt(&aq.question, &aq.ground_truth, &aq.model_answer);
+            (format!("judge_{}", i), prompt, None, 10)
+        })
+        .collect();
+
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.0);
+
+    eprintln!(
+        "[locomo_judge_batch] Submitting {} requests...",
+        requests.len()
+    );
+    let batch_id = submit_batch(&client, &api_key, requests, judge_model, cost_cap)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+
+    let results_url = poll_batch(&client, &api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+    let judge_results = download_batch_results(&client, &api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(e))?;
+
+    let mut results: Vec<LocomoAccuracyResult> = Vec::new();
+    for (i, aq) in answered.iter().enumerate() {
+        let id = format!("judge_{}", i);
+        let (resp, correct) = match judge_results.get(&id) {
+            Some(r) => (r.clone(), Some(r.to_lowercase().contains("yes"))),
+            None => ("BATCH_MISSING".to_string(), None),
+        };
+        results.push(LocomoAccuracyResult {
+            conversation_id: aq.conversation_id.clone(),
+            question: aq.question.clone(),
+            ground_truth: aq.ground_truth.clone(),
+            category: aq.category,
+            category_name: aq.category_name.clone(),
+            model_answer: aq.model_answer.clone(),
+            judge_response: resp,
+            correct,
+            context_tokens: aq.context_tokens,
+        });
+    }
+
+    // Aggregate
+    let judged: Vec<&LocomoAccuracyResult> =
+        results.iter().filter(|r| r.correct.is_some()).collect();
+    let total = judged.len();
+    let total_correct = judged.iter().filter(|r| r.correct == Some(true)).count();
+    let overall = if total > 0 {
+        total_correct as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    let cat_order: &[u8] = &[1, 2, 3, 4];
+    let mut per_category: Vec<LocomoCategoryAccuracy> = Vec::new();
+    for &cat in cat_order {
+        let cr: Vec<&&LocomoAccuracyResult> = judged.iter().filter(|r| r.category == cat).collect();
+        if cr.is_empty() {
+            continue;
+        }
+        let cc = cr.iter().filter(|r| r.correct == Some(true)).count();
+        per_category.push(LocomoCategoryAccuracy {
+            category: cat,
+            category_name: category_name(cat).to_string(),
+            total: cr.len(),
+            correct: cc,
+            accuracy: cc as f64 / cr.len() as f64,
+        });
+    }
+    let task_avg = if per_category.is_empty() {
+        0.0
+    } else {
+        per_category.iter().map(|c| c.accuracy).sum::<f64>() / per_category.len() as f64
+    };
+
+    Ok(LocomoAccuracyReport {
+        overall_accuracy: overall,
+        task_averaged_accuracy: task_avg,
+        total_questions: total,
+        total_correct,
+        answer_model: answered
+            .first()
+            .map(|a| a.answer_model.clone())
+            .unwrap_or_default(),
+        judge_model: judge_model.to_string(),
+        per_category,
+        per_question: results,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

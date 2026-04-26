@@ -2021,3 +2021,86 @@ async fn lme_batch_judge() {
 
     report.save(&baselines.join("lme_accuracy.json")).unwrap();
 }
+
+/// LoCoMo: generate answers via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness locomo_batch_answer -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn locomo_batch_answer() {
+    use origin_lib::eval::locomo::{
+        generate_locomo_answers_batch, load_locomo_answered, load_locomo_retrieved,
+        save_locomo_answered,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let retrieved_path = baselines.join("locomo_retrieved.json");
+    if !retrieved_path.exists() {
+        println!("SKIP: locomo_retrieved.json not found");
+        return;
+    }
+
+    let answer_model = std::env::var("LME_ANSWER_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+    let out_path = baselines.join("locomo_answered.json");
+
+    let retrieved = load_locomo_retrieved(&retrieved_path).expect("load failed");
+    let existing = if out_path.exists() {
+        load_locomo_answered(&out_path).unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    eprintln!(
+        "=== LoCoMo Batch Answer ({} Qs, model={}) ===",
+        retrieved.len(),
+        answer_model
+    );
+
+    let answered = generate_locomo_answers_batch(&retrieved, &answer_model, existing)
+        .await
+        .expect("batch failed");
+
+    save_locomo_answered(&answered, &out_path).unwrap();
+    eprintln!("Saved {} answers to {:?}", answered.len(), out_path);
+    assert!(!answered.is_empty());
+}
+
+/// LoCoMo: judge answers via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness locomo_batch_judge -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn locomo_batch_judge() {
+    use origin_lib::eval::locomo::{load_locomo_answered, score_locomo_answers_batch};
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let answered_path = baselines.join("locomo_answered.json");
+    if !answered_path.exists() {
+        println!("SKIP: locomo_answered.json not found");
+        return;
+    }
+
+    let judge_model = std::env::var("LME_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    let answered = load_locomo_answered(&answered_path).expect("load failed");
+    eprintln!(
+        "=== LoCoMo Batch Judge ({} answers, judge={}) ===",
+        answered.len(),
+        judge_model
+    );
+
+    let report = score_locomo_answers_batch(&answered, &judge_model)
+        .await
+        .expect("batch judge failed");
+
+    eprintln!("\n{}", report.to_terminal());
+    report
+        .save(&baselines.join("locomo_accuracy.json"))
+        .unwrap();
+}
