@@ -770,10 +770,11 @@ pub async fn run_periodic_steep_with_api(
         }
     }
 
-    // Phase 11: Retry failed enrichment — self-healing for non-LLM steps
+    // Phase 11: Retry failed enrichment — self-healing (now includes LLM title re-enrichment)
     if trigger.runs_phase("retry_failed_enrichment") {
+        let title_llm = api_llm.or(llm);
         let phase = run_phase("retry_failed_enrichment", || async {
-            let retried = retry_failed_enrichment(db_ref, tuning).await?;
+            let retried = retry_failed_enrichment(db_ref, tuning, title_llm).await?;
             log::info!("[refinery] retry_failed_enrichment: retried {retried} steps");
             let (nudge, headline) = classify_backfill(retried);
             Ok(PhaseOutput {
@@ -3000,14 +3001,18 @@ async fn apply_merge_by_tier(
 }
 
 /// Retry enrichment steps that previously failed (status = "failed") but
-/// haven't exceeded `max_enrichment_retries`. Only non-LLM steps (dedup,
+/// haven't exceeded `max_enrichment_retries`. Non-LLM steps (dedup,
 /// entity_link, contradiction, concept_contradiction, entity_suggestion)
-/// can be retried here — LLM-requiring steps are skipped. On success the
-/// step is marked "ok"; on repeated failure and max retries reached the
-/// step is moved to "abandoned".
+/// are retried directly. When an LLM is provided, title_enrich steps
+/// (failed + needs_retry) are retried via a dedicated loop using
+/// `get_title_reenrich_candidates`, plus a one-time backfill of old
+/// ok-but-truncated titles via `get_truncated_title_memories`. On success
+/// the step is marked "ok"; on repeated failure and max retries reached
+/// the step is moved to "abandoned".
 pub(crate) async fn retry_failed_enrichment(
     db: &MemoryDB,
     tuning: &crate::tuning::RefineryConfig,
+    llm: Option<&Arc<dyn LlmProvider>>,
 ) -> Result<usize, OriginError> {
     let failed = db
         .get_failed_enrichment_memories(tuning.max_enrichment_retries, 20)
@@ -3050,7 +3055,9 @@ pub(crate) async fn retry_failed_enrichment(
                     .map(|_| ())
             }
             "entity_suggestion" => crate::post_ingest::suggest_entity_creation(db, content).await,
-            // LLM-requiring steps can't be retried without LLM
+            // title_enrich is handled by the dedicated title loop below
+            "title_enrich" => continue,
+            // Other LLM-requiring steps can't be retried without LLM
             _ => {
                 log::info!("[refinery] step '{step_name}' requires LLM, skipping");
                 continue;
@@ -3098,6 +3105,152 @@ pub(crate) async fn retry_failed_enrichment(
             }
         }
     }
+
+    // Title re-enrichment pass -- uses dedicated query and handles
+    // the three-variant TitleEnrichResult (not just Ok/Err).
+    if let Some(llm_ref) = llm {
+        let candidates = db
+            .get_title_reenrich_candidates(tuning.max_enrichment_retries, 10)
+            .await?;
+        for (source_id, content) in &candidates {
+            log::info!("[refinery] re-enriching title for {source_id}");
+            match crate::post_ingest::enrich_title(db, source_id, content, llm_ref).await {
+                Ok(crate::post_ingest::TitleEnrichResult::Enriched) => {
+                    db.record_enrichment_step(source_id, "title_enrich", "ok", None)
+                        .await
+                        .ok();
+                    retried += 1;
+                }
+                Ok(crate::post_ingest::TitleEnrichResult::NotNeeded) => {
+                    // Title was fixed externally (e.g., user edited it)
+                    db.record_enrichment_step(source_id, "title_enrich", "ok", None)
+                        .await
+                        .ok();
+                    retried += 1;
+                }
+                Ok(crate::post_ingest::TitleEnrichResult::LlmRejected) => {
+                    let current_attempts = db
+                        .get_enrichment_steps(source_id)
+                        .await
+                        .ok()
+                        .and_then(|steps| {
+                            steps
+                                .iter()
+                                .find(|s| s.step == "title_enrich")
+                                .map(|s| s.attempts)
+                        })
+                        .unwrap_or(0);
+                    let status =
+                        if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
+                            "abandoned"
+                        } else {
+                            "needs_retry"
+                        };
+                    db.record_enrichment_step(
+                        source_id,
+                        "title_enrich",
+                        status,
+                        Some("llm_rejected"),
+                    )
+                    .await
+                    .ok();
+                    if status == "abandoned" {
+                        log::info!(
+                            "[refinery] title_enrich for {source_id} abandoned after {} attempts",
+                            current_attempts + 1
+                        );
+                    }
+                    retried += 1;
+                }
+                Err(e) => {
+                    log::warn!("[refinery] title re-enrichment for {source_id} failed: {e}");
+                    let current_attempts = db
+                        .get_enrichment_steps(source_id)
+                        .await
+                        .ok()
+                        .and_then(|steps| {
+                            steps
+                                .iter()
+                                .find(|s| s.step == "title_enrich")
+                                .map(|s| s.attempts)
+                        })
+                        .unwrap_or(0);
+                    let status =
+                        if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
+                            "abandoned"
+                        } else {
+                            "failed"
+                        };
+                    db.record_enrichment_step(
+                        source_id,
+                        "title_enrich",
+                        status,
+                        Some(&e.to_string()),
+                    )
+                    .await
+                    .ok();
+                    if status == "abandoned" {
+                        log::info!(
+                            "[refinery] title_enrich for {source_id} abandoned after {} attempts",
+                            current_attempts + 1
+                        );
+                    }
+                    retried += 1;
+                }
+            }
+        }
+
+        // One-time backfill: catch old memories recorded as ok but still truncated.
+        if db
+            .get_app_metadata("title_backfill_done")
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let old = db.get_truncated_title_memories(10).await?;
+            for (source_id, content) in &old {
+                log::info!("[refinery] backfill title re-enrichment for {source_id}");
+                match crate::post_ingest::enrich_title(db, source_id, content, llm_ref).await {
+                    Ok(crate::post_ingest::TitleEnrichResult::Enriched) => {
+                        db.record_enrichment_step(source_id, "title_enrich", "ok", None)
+                            .await
+                            .ok();
+                        retried += 1;
+                    }
+                    Ok(crate::post_ingest::TitleEnrichResult::LlmRejected) => {
+                        db.record_enrichment_step(
+                            source_id,
+                            "title_enrich",
+                            "needs_retry",
+                            Some("llm_rejected"),
+                        )
+                        .await
+                        .ok();
+                        retried += 1;
+                    }
+                    Ok(crate::post_ingest::TitleEnrichResult::NotNeeded) => {
+                        // Already has a good title
+                    }
+                    Err(e) => {
+                        log::warn!("[refinery] backfill title for {source_id} failed: {e}");
+                        db.record_enrichment_step(
+                            source_id,
+                            "title_enrich",
+                            "failed",
+                            Some(&e.to_string()),
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+            }
+            if old.is_empty() {
+                let _ = db.set_app_metadata("title_backfill_done", "1").await;
+            }
+        }
+    }
+
     Ok(retried)
 }
 
@@ -4616,7 +4769,7 @@ mod tests {
             .await
             .unwrap();
         let tuning = crate::tuning::RefineryConfig::default();
-        let count = retry_failed_enrichment(&db, &tuning).await.unwrap();
+        let count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
         assert!(count > 0, "should have retried at least one memory");
         let steps = db.get_enrichment_steps("mem_retry_test").await.unwrap();
         let dedup = steps.iter().find(|s| s.step == "dedup").unwrap();
@@ -4637,9 +4790,30 @@ mod tests {
         .await
         .unwrap();
         let tuning = crate::tuning::RefineryConfig::default();
-        let count = retry_failed_enrichment(&db, &tuning).await.unwrap();
+        let count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
         assert_eq!(count, 0, "should not retry abandoned steps");
         let steps = db.get_enrichment_steps("mem_abandon_skip").await.unwrap();
         assert_eq!(steps[0].status, "abandoned");
+    }
+
+    #[tokio::test]
+    async fn test_title_reenrich_skipped_without_llm() {
+        let (db, _dir) = test_db().await;
+        let mut doc = make_memory(
+            "mem_title_no_llm",
+            "A very long memory content that will result in a truncated title when initially stored by the system",
+            "fact",
+            "tech",
+        );
+        doc.title = "A very long memory content that will result in a truncated title when ini...".to_string();
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.record_enrichment_step("mem_title_no_llm", "title_enrich", "failed", Some("llm error"))
+            .await.unwrap();
+
+        let tuning = crate::tuning::RefineryConfig::default();
+        let _count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
+        let steps = db.get_enrichment_steps("mem_title_no_llm").await.unwrap();
+        let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
+        assert_eq!(title_step.status, "failed", "should still be failed without LLM");
     }
 }
