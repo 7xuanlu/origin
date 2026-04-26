@@ -19258,14 +19258,19 @@ pub(crate) mod tests {
     async fn find_distillation_clusters_treats_empty_entity_id_as_unlinked() {
         // entity_backfill writes entity_id = "" as a "tried, no entities found"
         // marker so the memory isn't re-extracted forever. Bucketing under ""
-        // would group all such memories as if they shared an entity, which is
-        // exactly the runaway-cluster failure mode (Mode B). They must fall
-        // into the unlinked bucket where the size cap protects against that.
+        // would group all such memories as if they shared an entity — exactly
+        // the runaway-cluster failure mode (Mode B). They must fall into the
+        // unlinked bucket where the size cap protects against that.
+        //
+        // Setup: 8 highly-similar memories with empty-string entity_id, with
+        // max_unlinked_cluster_size = 5. If the bucketing bug is present, all
+        // 8 group under entity_groups[""] which has no size cap → returned as
+        // one 8-cluster, failing the <=5 assertion. With the fix, they fall
+        // into unlinked → cap kicks in → returned cluster sizes <= 5.
         let (db, _dir) = test_db().await;
 
         let now = chrono::Utc::now().timestamp_millis();
-        // 80 memories with empty-string entity_id and similar content
-        for i in 0..80 {
+        for i in 0..8 {
             let doc = RawDocument {
                 source: "memory".to_string(),
                 source_id: format!("mem_empty_eid_{}", i),
@@ -19288,20 +19293,16 @@ pub(crate) mod tests {
             .unwrap();
         }
 
-        // Cap at 50. If empty-string ids were entity-grouped together, the
-        // 80-member cluster would either:
-        //  (a) be returned as one entity_groups cluster (no cap on entity_groups), or
-        //  (b) leak past the unlinked cap entirely.
-        // After the fix, all 80 land in unlinked → re-split or skipped under cap.
         let clusters = db
-            .find_distillation_clusters(0.3, 2, 20, 3500, 50)
+            .find_distillation_clusters(0.3, 2, 20, 3500, 5)
             .await
             .unwrap();
 
         for cluster in &clusters {
             assert!(
-                cluster.source_ids.len() <= 50,
-                "cluster of {} memories with empty entity_id exceeded cap 50",
+                cluster.source_ids.len() <= 5,
+                "cluster of {} memories with empty entity_id exceeded cap 5 — \
+                 bucketing bug?",
                 cluster.source_ids.len(),
             );
         }
