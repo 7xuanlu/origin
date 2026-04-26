@@ -650,3 +650,23 @@ pub async fn run_concept_distillation_batch_api(
     eprintln!("[batch_distill] Distilled {} concepts", distilled);
     Ok(distilled)
 }
+
+/// Format a unix-seconds timestamp as ISO-8601 calendar date "YYYY-MM-DD" in UTC.
+/// Returns "unknown date" on conversion failure (e.g. malformed timestamp).
+pub fn format_ymd(ts: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown date".to_string())
+}
+
+#[cfg(test)]
+mod format_ymd_tests {
+    #[test]
+    fn test_format_ymd_round_trip() {
+        assert_eq!(super::format_ymd(1_681_168_020), "2023-04-10");
+        assert_eq!(super::format_ymd(1_683_554_160), "2023-05-08");
+        assert_eq!(super::format_ymd(0), "1970-01-01");
+    }
+}

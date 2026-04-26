@@ -484,7 +484,11 @@ pub async fn run_e2e_locomo_eval(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: chrono::Utc::now().timestamp(),
+                last_modified: mem
+                    .session_date
+                    .as_deref()
+                    .and_then(crate::eval::locomo::parse_locomo_date)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
                 ..Default::default()
             })
             .collect();
@@ -729,15 +733,23 @@ async fn generate_e2e_answers_for_question(
         .await?;
     let flat_context: String = flat_results
         .iter()
-        .enumerate()
-        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+        .map(|r| {
+            format!(
+                "On {}: {}",
+                crate::eval::shared::format_ymd(r.last_modified),
+                r.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let flat_tokens = count_tokens(&flat_context);
 
     let flat_request = LlmRequest {
         system_prompt: Some(system_prompt.clone()),
-        user_prompt: format!("Context:\n{}\n\nQuestion: {}", flat_context, question),
+        user_prompt: format!(
+            "Context (each line prefixed with the date the memory was recorded):\n{}\n\nQuestion: {}",
+            flat_context, question
+        ),
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_flat".to_string()),
@@ -770,8 +782,12 @@ async fn generate_e2e_answers_for_question(
     // Memory search results
     if !flat_results.is_empty() {
         structured_parts.push("## Relevant Memories".to_string());
-        for (i, r) in flat_results.iter().enumerate() {
-            structured_parts.push(format!("{}. {}", i + 1, r.content));
+        for r in flat_results.iter() {
+            structured_parts.push(format!(
+                "On {}: {}",
+                crate::eval::shared::format_ymd(r.last_modified),
+                r.content
+            ));
         }
     }
 
@@ -780,7 +796,10 @@ async fn generate_e2e_answers_for_question(
 
     let structured_request = LlmRequest {
         system_prompt: Some(system_prompt),
-        user_prompt: format!("Context:\n{}\n\nQuestion: {}", structured_context, question),
+        user_prompt: format!(
+            "Context (each line prefixed with the date the memory was recorded; concept articles are time-spanning):\n{}\n\nQuestion: {}",
+            structured_context, question
+        ),
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_structured".to_string()),
@@ -859,7 +878,11 @@ pub async fn run_e2e_context_eval(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: chrono::Utc::now().timestamp(),
+                last_modified: mem
+                    .session_date
+                    .as_deref()
+                    .and_then(crate::eval::locomo::parse_locomo_date)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
                 ..Default::default()
             })
             .collect();
@@ -1007,7 +1030,11 @@ pub async fn run_e2e_context_eval_longmemeval(
                     .to_string(),
                 ),
                 domain: Some("conversation".to_string()),
-                last_modified: chrono::Utc::now().timestamp(),
+                last_modified: mem
+                    .session_date
+                    .as_deref()
+                    .and_then(crate::eval::longmemeval::parse_lme_date)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
                 ..Default::default()
             })
             .collect();
@@ -1139,8 +1166,8 @@ async fn build_structured_context(
     }
     if !results.is_empty() {
         parts.push("## Relevant Memories".to_string());
-        for (i, r) in results.iter().enumerate() {
-            parts.push(format!("{}. {}", i + 1, r.content));
+        for r in results.iter() {
+            parts.push(format!("On {}: {}", crate::eval::shared::format_ymd(r.last_modified), r.content));
         }
     }
     let structured_context = parts.join("\n\n");
@@ -1629,4 +1656,11 @@ pub async fn run_fullpipeline_lme_batch(
     Ok(finished_tuples)
 }
 
-// ===== Flat cache loaders =====
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_format_ymd_used_in_context() {
+        assert_eq!(crate::eval::shared::format_ymd(1_681_168_020), "2023-04-10");
+        assert_eq!(crate::eval::shared::format_ymd(1_683_554_160), "2023-05-08");
+    }
+}
