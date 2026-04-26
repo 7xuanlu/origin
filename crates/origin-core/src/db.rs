@@ -8753,9 +8753,7 @@ impl MemoryDB {
                 libsql::params![max_attempts as i64, limit as i64],
             )
             .await
-            .map_err(|e| {
-                OriginError::VectorDb(format!("get_title_reenrich_candidates: {e}"))
-            })?;
+            .map_err(|e| OriginError::VectorDb(format!("get_title_reenrich_candidates: {e}")))?;
         let mut results = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             results.push((
@@ -8787,9 +8785,7 @@ impl MemoryDB {
                 libsql::params![limit as i64],
             )
             .await
-            .map_err(|e| {
-                OriginError::VectorDb(format!("get_truncated_title_memories: {e}"))
-            })?;
+            .map_err(|e| OriginError::VectorDb(format!("get_truncated_title_memories: {e}")))?;
         let mut results = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             results.push((
@@ -19221,14 +19217,9 @@ pub(crate) mod tests {
             };
             db.upsert_documents(vec![doc]).await.unwrap();
             // Mark enriched (must satisfy Task 4 gate)
-            db.record_enrichment_step(
-                &format!("mem_unlinked_{}", i),
-                "dedup",
-                "ok",
-                None,
-            )
-            .await
-            .unwrap();
+            db.record_enrichment_step(&format!("mem_unlinked_{}", i), "dedup", "ok", None)
+                .await
+                .unwrap();
         }
 
         // Run with cap = 30. The single 60-memory unlinked cluster should be
@@ -23712,14 +23703,33 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_enrichment_summary_counts_needs_retry_as_incomplete() {
         let (db, _dir) = test_db().await;
-        let doc = make_memory_doc("mem_needs_retry_summary", "test content for summary", "fact", "tech", "test");
+        let doc = make_memory_doc(
+            "mem_needs_retry_summary",
+            "test content for summary",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc]).await.unwrap();
         db.record_enrichment_step("mem_needs_retry_summary", "dedup", "ok", None)
-            .await.unwrap();
-        db.record_enrichment_step("mem_needs_retry_summary", "title_enrich", "needs_retry", Some("llm_rejected"))
-            .await.unwrap();
-        let summary = db.get_enrichment_summary("mem_needs_retry_summary").await.unwrap();
-        assert_eq!(summary, "enrichment_partial", "needs_retry should make summary partial, not enriched");
+            .await
+            .unwrap();
+        db.record_enrichment_step(
+            "mem_needs_retry_summary",
+            "title_enrich",
+            "needs_retry",
+            Some("llm_rejected"),
+        )
+        .await
+        .unwrap();
+        let summary = db
+            .get_enrichment_summary("mem_needs_retry_summary")
+            .await
+            .unwrap();
+        assert_eq!(
+            summary, "enrichment_partial",
+            "needs_retry should make summary partial, not enriched"
+        );
     }
 
     #[tokio::test]
@@ -23728,30 +23738,73 @@ pub(crate) mod tests {
 
         let doc1 = make_memory_doc("mem_title_failed", "A very long content that needs title enrichment and will be truncated because it exceeds the limit", "fact", "tech", "test");
         db.upsert_documents(vec![doc1]).await.unwrap();
-        db.record_enrichment_step("mem_title_failed", "title_enrich", "failed", Some("llm error"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_failed",
+            "title_enrich",
+            "failed",
+            Some("llm error"),
+        )
+        .await
+        .unwrap();
 
-        let doc2 = make_memory_doc("mem_title_needs_retry", "Another memory with rejected LLM title output", "fact", "tech", "test");
+        let doc2 = make_memory_doc(
+            "mem_title_needs_retry",
+            "Another memory with rejected LLM title output",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc2]).await.unwrap();
-        db.record_enrichment_step("mem_title_needs_retry", "title_enrich", "needs_retry", Some("llm_rejected"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_needs_retry",
+            "title_enrich",
+            "needs_retry",
+            Some("llm_rejected"),
+        )
+        .await
+        .unwrap();
 
-        let doc3 = make_memory_doc("mem_title_ok", "This memory has a good title", "fact", "tech", "test");
+        let doc3 = make_memory_doc(
+            "mem_title_ok",
+            "This memory has a good title",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc3]).await.unwrap();
         db.record_enrichment_step("mem_title_ok", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let doc4 = make_memory_doc("mem_title_abandoned", "Abandoned after max retries", "fact", "tech", "test");
+        let doc4 = make_memory_doc(
+            "mem_title_abandoned",
+            "Abandoned after max retries",
+            "fact",
+            "tech",
+            "test",
+        );
         db.upsert_documents(vec![doc4]).await.unwrap();
-        db.record_enrichment_step("mem_title_abandoned", "title_enrich", "abandoned", Some("gave up"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_abandoned",
+            "title_enrich",
+            "abandoned",
+            Some("gave up"),
+        )
+        .await
+        .unwrap();
 
         let candidates = db.get_title_reenrich_candidates(3, 10).await.unwrap();
         let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
         assert!(ids.contains(&"mem_title_failed"), "should include failed");
-        assert!(ids.contains(&"mem_title_needs_retry"), "should include needs_retry");
+        assert!(
+            ids.contains(&"mem_title_needs_retry"),
+            "should include needs_retry"
+        );
         assert!(!ids.contains(&"mem_title_ok"), "should not include ok");
-        assert!(!ids.contains(&"mem_title_abandoned"), "should not include abandoned");
+        assert!(
+            !ids.contains(&"mem_title_abandoned"),
+            "should not include abandoned"
+        );
         assert_eq!(candidates.len(), 2);
     }
 
@@ -23764,28 +23817,50 @@ pub(crate) mod tests {
             "This is a very long piece of content that got its title truncated during initial storage",
             "fact", "tech", "test",
         );
-        doc1.title = "This is a very long piece of content that got its title truncat...".to_string();
+        doc1.title =
+            "This is a very long piece of content that got its title truncat...".to_string();
         db.upsert_documents(vec![doc1]).await.unwrap();
         db.record_enrichment_step("mem_trunc_ellipsis", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let mut doc2 = make_memory_doc("mem_good_title", "Some content here", "fact", "tech", "test");
+        let mut doc2 = make_memory_doc(
+            "mem_good_title",
+            "Some content here",
+            "fact",
+            "tech",
+            "test",
+        );
         doc2.title = "Good Short Title".to_string();
         db.upsert_documents(vec![doc2]).await.unwrap();
         db.record_enrichment_step("mem_good_title", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let mut doc3 = make_memory_doc("mem_long_title", "Content for the long titled memory", "fact", "tech", "test");
+        let mut doc3 = make_memory_doc(
+            "mem_long_title",
+            "Content for the long titled memory",
+            "fact",
+            "tech",
+            "test",
+        );
         doc3.title = "a".repeat(80);
         db.upsert_documents(vec![doc3]).await.unwrap();
         db.record_enrichment_step("mem_long_title", "title_enrich", "ok", None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let candidates = db.get_truncated_title_memories(10).await.unwrap();
         let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(ids.contains(&"mem_trunc_ellipsis"), "should include ellipsis title");
+        assert!(
+            ids.contains(&"mem_trunc_ellipsis"),
+            "should include ellipsis title"
+        );
         assert!(ids.contains(&"mem_long_title"), "should include long title");
-        assert!(!ids.contains(&"mem_good_title"), "should not include good title");
+        assert!(
+            !ids.contains(&"mem_good_title"),
+            "should not include good title"
+        );
     }
 
     #[tokio::test]
@@ -23803,7 +23878,14 @@ pub(crate) mod tests {
 
         // Qualifying: archived, big, no domain, no entity, not user_edited
         db.insert_concept(
-            "c_stale", "Stale One", None, "content body", None, None, &big_refs, &now,
+            "c_stale",
+            "Stale One",
+            None,
+            "content body",
+            None,
+            None,
+            &big_refs,
+            &now,
         )
         .await
         .unwrap();
@@ -23811,7 +23893,14 @@ pub(crate) mod tests {
 
         // Disqualifying: small (size <= 50)
         db.insert_concept(
-            "c_small", "Small One", None, "content", None, None, &small_refs, &now,
+            "c_small",
+            "Small One",
+            None,
+            "content",
+            None,
+            None,
+            &small_refs,
+            &now,
         )
         .await
         .unwrap();
@@ -23819,7 +23908,14 @@ pub(crate) mod tests {
 
         // Disqualifying: has entity
         db.insert_concept(
-            "c_entity", "With Entity", None, "content", Some("ent_X"), None, &big_refs, &now,
+            "c_entity",
+            "With Entity",
+            None,
+            "content",
+            Some("ent_X"),
+            None,
+            &big_refs,
+            &now,
         )
         .await
         .unwrap();
@@ -23827,7 +23923,14 @@ pub(crate) mod tests {
 
         // Disqualifying: has domain
         db.insert_concept(
-            "c_domain", "With Domain", None, "content", None, Some("work"), &big_refs, &now,
+            "c_domain",
+            "With Domain",
+            None,
+            "content",
+            None,
+            Some("work"),
+            &big_refs,
+            &now,
         )
         .await
         .unwrap();
@@ -23843,10 +23946,22 @@ pub(crate) mod tests {
         let candidates = db.find_stale_archived_concepts().await.unwrap();
         let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
         assert!(ids.contains(&"c_stale".to_string()), "missing c_stale");
-        assert!(!ids.contains(&"c_small".to_string()), "small should not qualify");
-        assert!(!ids.contains(&"c_entity".to_string()), "entity-linked should not qualify");
-        assert!(!ids.contains(&"c_domain".to_string()), "domain-linked should not qualify");
-        assert!(!ids.contains(&"c_active".to_string()), "active should not qualify");
+        assert!(
+            !ids.contains(&"c_small".to_string()),
+            "small should not qualify"
+        );
+        assert!(
+            !ids.contains(&"c_entity".to_string()),
+            "entity-linked should not qualify"
+        );
+        assert!(
+            !ids.contains(&"c_domain".to_string()),
+            "domain-linked should not qualify"
+        );
+        assert!(
+            !ids.contains(&"c_active".to_string()),
+            "active should not qualify"
+        );
         assert_eq!(ids.len(), 1, "only c_stale should match: {:?}", ids);
     }
 
@@ -23855,7 +23970,14 @@ pub(crate) mod tests {
         let (db, _dir) = test_db().await;
         let now = chrono::Utc::now().to_rfc3339();
         db.insert_concept(
-            "c_cascade", "Cascade Test", None, "content", None, None, &["mem_x"], &now,
+            "c_cascade",
+            "Cascade Test",
+            None,
+            "content",
+            None,
+            None,
+            &["mem_x"],
+            &now,
         )
         .await
         .unwrap();

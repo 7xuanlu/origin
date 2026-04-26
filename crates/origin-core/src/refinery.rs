@@ -1839,7 +1839,7 @@ async fn recompile_single_concept(
     match response {
         Ok(raw) if !raw.trim().is_empty() => {
             let content = crate::llm_provider::strip_think_tags(&raw)
-                                .trim()
+                .trim()
                 .to_string();
             if !content.is_empty() {
                 let source_refs: Vec<&str> = concept
@@ -1956,7 +1956,7 @@ pub(crate) async fn re_distill_stale_concepts(
         match response {
             Ok(raw) if !raw.trim().is_empty() => {
                 let content = crate::llm_provider::strip_think_tags(&raw)
-                                        .trim()
+                    .trim()
                     .to_string();
                 if !content.is_empty() {
                     db.update_concept_content(&concept.id, &content, &source_id_refs, "re_distill")
@@ -2138,7 +2138,7 @@ pub async fn deep_distill_single(
         .map_err(|e| OriginError::Llm(format!("re-distill LLM: {}", e)))?;
 
     let content = crate::llm_provider::strip_think_tags(&response)
-                .trim()
+        .trim()
         .to_string();
 
     if content.is_empty() {
@@ -3170,12 +3170,12 @@ pub(crate) async fn retry_failed_enrichment(
                                 .map(|s| s.attempts)
                         })
                         .unwrap_or(0);
-                    let status =
-                        if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
-                            "abandoned"
-                        } else {
-                            "needs_retry"
-                        };
+                    let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries
+                    {
+                        "abandoned"
+                    } else {
+                        "needs_retry"
+                    };
                     db.record_enrichment_step(
                         source_id,
                         "title_enrich",
@@ -3205,12 +3205,12 @@ pub(crate) async fn retry_failed_enrichment(
                                 .map(|s| s.attempts)
                         })
                         .unwrap_or(0);
-                    let status =
-                        if (current_attempts + 1) as usize >= tuning.max_enrichment_retries {
-                            "abandoned"
-                        } else {
-                            "failed"
-                        };
+                    let status = if (current_attempts + 1) as usize >= tuning.max_enrichment_retries
+                    {
+                        "abandoned"
+                    } else {
+                        "failed"
+                    };
                     db.record_enrichment_step(
                         source_id,
                         "title_enrich",
@@ -4751,20 +4751,20 @@ mod tests {
         assert!(is_all_generic_tokens("Various Notes"));
         assert!(is_all_generic_tokens("Topic Notes"));
         assert!(is_all_generic_tokens("Misc Things"));
-        assert!(is_all_generic_tokens("Misc-things"));  // hyphen stripped
+        assert!(is_all_generic_tokens("Misc-things")); // hyphen stripped
         assert!(is_all_generic_tokens("random assorted stuff"));
 
         // True negatives — must keep
-        assert!(!is_all_generic_tokens("Topic and Notes"));    // 'and' saves it
+        assert!(!is_all_generic_tokens("Topic and Notes")); // 'and' saves it
         assert!(!is_all_generic_tokens("libsql Vector Storage"));
         assert!(!is_all_generic_tokens("Origin Memory Layer"));
         assert!(!is_all_generic_tokens("Origin Concept Model")); // wordlist excludes 'concept'
-        assert!(!is_all_generic_tokens("Notes on Origin"));      // 'on', 'origin' not generic
-        assert!(!is_all_generic_tokens("Content Strategy"));     // 'content' not in list, 'strategy' not in list
+        assert!(!is_all_generic_tokens("Notes on Origin")); // 'on', 'origin' not generic
+        assert!(!is_all_generic_tokens("Content Strategy")); // 'content' not in list, 'strategy' not in list
 
         // Edge cases
-        assert!(!is_all_generic_tokens(""));        // empty
-        assert!(!is_all_generic_tokens("   "));      // whitespace only
+        assert!(!is_all_generic_tokens("")); // empty
+        assert!(!is_all_generic_tokens("   ")); // whitespace only
         assert!(!is_all_generic_tokens("!!! ???")); // empty after punctuation strip
 
         // Chinese — out of scope (English-only wordlist by design)
@@ -4870,16 +4870,26 @@ mod tests {
             "fact",
             "tech",
         );
-        doc.title = "A very long memory content that will result in a truncated title when ini...".to_string();
+        doc.title = "A very long memory content that will result in a truncated title when ini..."
+            .to_string();
         db.upsert_documents(vec![doc]).await.unwrap();
-        db.record_enrichment_step("mem_title_no_llm", "title_enrich", "failed", Some("llm error"))
-            .await.unwrap();
+        db.record_enrichment_step(
+            "mem_title_no_llm",
+            "title_enrich",
+            "failed",
+            Some("llm error"),
+        )
+        .await
+        .unwrap();
 
         let tuning = crate::tuning::RefineryConfig::default();
         let _count = retry_failed_enrichment(&db, &tuning, None).await.unwrap();
         let steps = db.get_enrichment_steps("mem_title_no_llm").await.unwrap();
         let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
-        assert_eq!(title_step.status, "failed", "should still be failed without LLM");
+        assert_eq!(
+            title_step.status, "failed",
+            "should still be failed without LLM"
+        );
     }
 
     #[tokio::test]
@@ -4915,7 +4925,10 @@ mod tests {
         // The key assertion is that we got here at all (no early return).
         assert_eq!(count, 0);
         // Step should still be needs_retry (unchanged, since no LLM was provided)
-        let steps = db.get_enrichment_steps("mem_needs_retry_only").await.unwrap();
+        let steps = db
+            .get_enrichment_steps("mem_needs_retry_only")
+            .await
+            .unwrap();
         let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
         assert_eq!(title_step.status, "needs_retry");
     }

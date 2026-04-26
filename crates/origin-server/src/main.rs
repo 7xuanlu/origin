@@ -643,9 +643,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Install) => cmd_install(),
         Some(Command::Uninstall) => cmd_uninstall(),
         Some(Command::Status) => cmd_status().await,
-        Some(Command::BackfillStaleConcepts { dry_run }) => {
-            cmd_backfill::run(dry_run).await
-        }
+        Some(Command::BackfillStaleConcepts { dry_run }) => cmd_backfill::run(dry_run).await,
         None => run_daemon().await,
     }
 }
