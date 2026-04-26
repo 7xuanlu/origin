@@ -1707,3 +1707,234 @@ async fn judge_e2e_context_locomo_sonnet() {
     }
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
+
+// ---------------------------------------------------------------------------
+// LongMemEval 3-Phase Canonical Accuracy Pipeline
+// ---------------------------------------------------------------------------
+
+/// Phase 1: Retrieve context for each LongMemEval question using Origin's hybrid search.
+/// Run first, saves lme_retrieved.json for Phase 2.
+#[tokio::test]
+#[ignore]
+async fn lme_phase1_retrieve() {
+    let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data");
+    let oracle_path = data_dir.join("longmemeval_oracle.json");
+    let s_path = data_dir.join("longmemeval_s_cleaned.json");
+    let path = if oracle_path.exists() {
+        oracle_path
+    } else if s_path.exists() {
+        s_path
+    } else {
+        eprintln!("SKIP: LongMemEval dataset not found in eval/data/");
+        return;
+    };
+
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("lme_retrieved.json");
+
+    let retrieved =
+        origin_lib::eval::longmemeval::retrieve_for_accuracy_eval(&path, 10, usize::MAX)
+            .await
+            .expect("retrieve_for_accuracy_eval failed");
+
+    eprintln!("Retrieved {} questions", retrieved.len());
+    origin_lib::eval::longmemeval::save_retrieved(&retrieved, &out_path)
+        .expect("save_retrieved failed");
+    eprintln!("Saved to {:?}", out_path);
+    assert!(
+        !retrieved.is_empty(),
+        "Should retrieve at least some questions"
+    );
+}
+
+/// Phase 2: Generate answers for each retrieved question using the Anthropic API.
+/// Loads lme_retrieved.json, writes lme_answered.json. Supports resume.
+#[tokio::test]
+#[ignore]
+async fn lme_phase2_answer() {
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let retrieved_path = baselines_dir.join("lme_retrieved.json");
+    if !retrieved_path.exists() {
+        eprintln!("SKIP: run lme_phase1_retrieve first");
+        return;
+    }
+
+    let answer_model = std::env::var("LME_ANSWER_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    let retrieved =
+        origin_lib::eval::longmemeval::load_retrieved(&retrieved_path).expect("load_retrieved");
+    eprintln!("Loaded {} questions", retrieved.len());
+
+    let out_path = baselines_dir.join("lme_answered.json");
+    let existing = if out_path.exists() {
+        origin_lib::eval::longmemeval::load_answered(&out_path).unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let answered =
+        origin_lib::eval::longmemeval::generate_answers(&retrieved, &answer_model, 8, existing)
+            .await
+            .expect("generate_answers failed");
+
+    eprintln!("Total answers: {}", answered.len());
+    origin_lib::eval::longmemeval::save_answered(&answered, &out_path)
+        .expect("save_answered failed");
+    eprintln!("Saved to {:?}", out_path);
+    assert!(!answered.is_empty(), "Should have at least some answers");
+}
+
+/// Phase 3: Judge LongMemEval answers using the Anthropic API.
+/// Loads lme_answered.json, prints canonical accuracy report.
+#[tokio::test]
+#[ignore]
+async fn lme_phase3_judge() {
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let answered_path = baselines_dir.join("lme_answered.json");
+    if !answered_path.exists() {
+        eprintln!("SKIP: run lme_phase2_answer first");
+        return;
+    }
+
+    let judge_model = std::env::var("LME_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    let answered =
+        origin_lib::eval::longmemeval::load_answered(&answered_path).expect("load_answered");
+    eprintln!("Judging {} answers...", answered.len());
+
+    let report = origin_lib::eval::longmemeval::score_answers(&answered, &judge_model, 8)
+        .await
+        .expect("score_answers failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    let out_path = baselines_dir.join("lme_accuracy_report.json");
+    report.save(&out_path).expect("save report failed");
+    eprintln!("Report saved to {:?}", out_path);
+
+    assert!(report.total_questions > 0);
+    assert!(
+        report.overall_accuracy >= 0.0 && report.overall_accuracy <= 1.0,
+        "overall_accuracy out of [0,1]"
+    );
+    assert!(
+        report.task_averaged_accuracy >= 0.0 && report.task_averaged_accuracy <= 1.0,
+        "task_averaged_accuracy out of [0,1]"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LoCoMo 3-Phase Canonical Accuracy Pipeline
+// ---------------------------------------------------------------------------
+
+/// Phase 1: Retrieve context for each LoCoMo QA pair using Origin's hybrid search.
+/// Seeds one DB per conversation, runs per QA. Saves locomo_retrieved.json for Phase 2.
+#[tokio::test]
+#[ignore]
+async fn locomo_phase1_retrieve() {
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found in eval/data/");
+        return;
+    }
+
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("locomo_retrieved.json");
+
+    let retrieved =
+        origin_lib::eval::locomo::retrieve_for_locomo_accuracy(&locomo_path, 10, usize::MAX)
+            .await
+            .expect("retrieve_for_locomo_accuracy failed");
+
+    eprintln!("Retrieved {} questions", retrieved.len());
+    origin_lib::eval::locomo::save_locomo_retrieved(&retrieved, &out_path)
+        .expect("save_locomo_retrieved failed");
+    eprintln!("Saved to {:?}", out_path);
+    assert!(
+        !retrieved.is_empty(),
+        "Should retrieve at least some questions"
+    );
+}
+
+/// Phase 2: Generate answers for each LoCoMo question using the Anthropic API.
+/// Loads locomo_retrieved.json, writes locomo_answered.json. Supports resume.
+#[tokio::test]
+#[ignore]
+async fn locomo_phase2_answer() {
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let retrieved_path = baselines_dir.join("locomo_retrieved.json");
+    if !retrieved_path.exists() {
+        eprintln!("SKIP: run locomo_phase1_retrieve first");
+        return;
+    }
+
+    let answer_model = std::env::var("LME_ANSWER_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    let retrieved = origin_lib::eval::locomo::load_locomo_retrieved(&retrieved_path)
+        .expect("load_locomo_retrieved");
+    eprintln!("Loaded {} questions", retrieved.len());
+
+    let out_path = baselines_dir.join("locomo_answered.json");
+    let existing = if out_path.exists() {
+        origin_lib::eval::locomo::load_locomo_answered(&out_path).unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let answered =
+        origin_lib::eval::locomo::generate_locomo_answers(&retrieved, &answer_model, 8, existing)
+            .await
+            .expect("generate_locomo_answers failed");
+
+    eprintln!("Total answers: {}", answered.len());
+    origin_lib::eval::locomo::save_locomo_answered(&answered, &out_path)
+        .expect("save_locomo_answered failed");
+    eprintln!("Saved to {:?}", out_path);
+    assert!(!answered.is_empty(), "Should have at least some answers");
+}
+
+/// Phase 3: Judge LoCoMo answers using the Anthropic API.
+/// Loads locomo_answered.json, prints canonical accuracy report.
+#[tokio::test]
+#[ignore]
+async fn locomo_phase3_judge() {
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let answered_path = baselines_dir.join("locomo_answered.json");
+    if !answered_path.exists() {
+        eprintln!("SKIP: run locomo_phase2_answer first");
+        return;
+    }
+
+    let judge_model = std::env::var("LME_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    let answered = origin_lib::eval::locomo::load_locomo_answered(&answered_path)
+        .expect("load_locomo_answered");
+    eprintln!("Judging {} answers...", answered.len());
+
+    let report = origin_lib::eval::locomo::score_locomo_answers(&answered, &judge_model, 8)
+        .await
+        .expect("score_locomo_answers failed");
+
+    eprintln!("\n{}", report.to_terminal());
+
+    let out_path = baselines_dir.join("locomo_accuracy_report.json");
+    report.save(&out_path).expect("save report failed");
+    eprintln!("Report saved to {:?}", out_path);
+
+    assert!(report.total_questions > 0);
+    assert!(
+        report.overall_accuracy >= 0.0 && report.overall_accuracy <= 1.0,
+        "overall_accuracy out of [0,1]"
+    );
+    assert!(
+        report.task_averaged_accuracy >= 0.0 && report.task_averaged_accuracy <= 1.0,
+        "task_averaged_accuracy out of [0,1]"
+    );
+}

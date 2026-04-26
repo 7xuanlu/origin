@@ -39,7 +39,7 @@ static EVAL_EMBEDDER: LazyLock<Arc<std::sync::Mutex<fastembed::TextEmbedding>>> 
     });
 
 /// Returns the process-wide shared embedder for eval use.
-fn eval_shared_embedder() -> Arc<std::sync::Mutex<fastembed::TextEmbedding>> {
+pub fn eval_shared_embedder() -> Arc<std::sync::Mutex<fastembed::TextEmbedding>> {
     EVAL_EMBEDDER.clone()
 }
 

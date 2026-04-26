@@ -1015,6 +1015,587 @@ fn aggregate_by_category(
 }
 
 // ---------------------------------------------------------------------------
+// Canonical LLM-judge accuracy evaluation (3-phase pipeline)
+// ---------------------------------------------------------------------------
+
+/// Call the Anthropic API directly via reqwest. Returns response text.
+/// Much faster than `claude -p` (no process spawn overhead) and costs ~$0.001/call with Haiku.
+pub async fn call_anthropic_api(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+) -> Result<String, String> {
+    let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "messages": messages
+    });
+    if let Some(sys) = system_prompt {
+        body["system"] = serde_json::json!(sys);
+    }
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("API error {status}: {text}"));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse error: {e}"))?;
+    let answer = json["content"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|block| block["text"].as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(answer)
+}
+
+/// Build the canonical LongMemEval answer-check prompt for a given task type.
+/// Matches the official evaluation code exactly.
+pub fn get_anscheck_prompt(task: &str, question: &str, answer: &str, response: &str) -> String {
+    match task {
+        "single-session-user" | "single-session-assistant" | "multi-session" => {
+            format!(
+                "I will give you a question, a correct answer, and a response from a model. \
+                 Please answer yes if the response contains the correct answer. Otherwise, answer no. \
+                 If the response is equivalent to the correct answer or contains all the intermediate \
+                 steps to get the correct answer, you should also answer yes. If the response only \
+                 contains a subset of the information required by the answer, answer no. \n\n\
+                 Question: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\n\
+                 Is the model response correct? Answer yes or no only.",
+                question, answer, response
+            )
+        }
+        "temporal-reasoning" => {
+            format!(
+                "I will give you a question, a correct answer, and a response from a model. \
+                 Please answer yes if the response contains the correct answer. Otherwise, answer no. \
+                 If the response is equivalent to the correct answer or contains all the intermediate \
+                 steps to get the correct answer, you should also answer yes. If the response only \
+                 contains a subset of the information required by the answer, answer no. In addition, \
+                 do not penalize off-by-one errors for the number of days. If the question asks for \
+                 the number of days/weeks/months, etc., and the model makes off-by-one errors \
+                 (e.g., predicting 19 days when the answer is 18), the model's response is still \
+                 correct. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\n\
+                 Is the model response correct? Answer yes or no only.",
+                question, answer, response
+            )
+        }
+        "knowledge-update" => {
+            format!(
+                "I will give you a question, a correct answer, and a response from a model. \
+                 Please answer yes if the response contains the correct answer. Otherwise, answer no. \
+                 If the response contains some previous information along with an updated answer, the \
+                 response should be considered as correct as long as the updated answer is the required \
+                 answer.\n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\n\
+                 Is the model response correct? Answer yes or no only.",
+                question, answer, response
+            )
+        }
+        "single-session-preference" => {
+            format!(
+                "I will give you a question, a rubric for desired personalized response, and a \
+                 response from a model. Please answer yes if the response satisfies the desired \
+                 response. Otherwise, answer no. The model does not need to reflect all the points \
+                 in the rubric. The response is correct as long as it recalls and utilizes the \
+                 user's personal information correctly.\n\n\
+                 Question: {}\n\nRubric: {}\n\nModel Response: {}\n\n\
+                 Is the model response correct? Answer yes or no only.",
+                question, answer, response
+            )
+        }
+        _ => {
+            format!(
+                "I will give you a question, a correct answer, and a response from a model. \
+                 Please answer yes if the response contains the correct answer. Otherwise, answer no.\n\n\
+                 Question: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\n\
+                 Is the model response correct? Answer yes or no only.",
+                question, answer, response
+            )
+        }
+    }
+}
+
+fn build_answer_prompt(question: &str, context: &str, question_type: &str) -> (String, String) {
+    if context.is_empty() {
+        return (
+            format!(
+                "Question: {}\n\nAnswer the question as best you can. Be specific and concise.",
+                question
+            ),
+            "Be specific and concise. Respond in 1-3 sentences.".to_string(),
+        );
+    }
+    match question_type {
+        "single-session-preference" => {
+            let prompt = format!(
+                "The following context contains information about a user's preferences, \
+                 interests, and past choices:\n\n{}\n\nQuestion: {}\n\n\
+                 Use the user's preferences and interests from the context to \
+                 personalize your response. Apply their known preferences even if \
+                 this specific scenario isn't mentioned.",
+                context, question
+            );
+            let sys = "You are a personalized assistant. Use the user's known preferences \
+                to tailor your response. Be specific and concise. Respond in 1-3 sentences."
+                .to_string();
+            (prompt, sys)
+        }
+        _ => {
+            let prompt = format!(
+                "Context:\n{}\n\nQuestion: {}\n\nAnswer the question based on the context provided. \
+                 Be specific and concise.",
+                context, question
+            );
+            let sys =
+                "Answer the question based on the provided context. Be specific and concise. \
+                Respond in 1-3 sentences."
+                    .to_string();
+            (prompt, sys)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievedQuestion {
+    pub question_id: String,
+    pub question_type: String,
+    pub question: String,
+    pub ground_truth: String,
+    pub context: String,
+    pub context_tokens: usize,
+    pub memories_seeded: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnsweredQuestion {
+    pub question_id: String,
+    pub question_type: String,
+    pub question: String,
+    pub ground_truth: String,
+    pub model_answer: String,
+    pub answer_model: String,
+    pub context_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccuracyResult {
+    pub question_id: String,
+    pub question_type: String,
+    pub question: String,
+    pub ground_truth: String,
+    pub model_answer: String,
+    pub judge_response: String,
+    pub correct: Option<bool>,
+    pub context_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryAccuracy {
+    pub question_type: String,
+    pub code: String,
+    pub total: usize,
+    pub correct: usize,
+    pub accuracy: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LongMemEvalAccuracyReport {
+    pub overall_accuracy: f64,
+    pub task_averaged_accuracy: f64,
+    pub total_questions: usize,
+    pub total_correct: usize,
+    pub answer_model: String,
+    pub judge_model: String,
+    pub per_category: Vec<CategoryAccuracy>,
+    pub per_question: Vec<AccuracyResult>,
+}
+
+impl LongMemEvalAccuracyReport {
+    pub fn to_terminal(&self) -> String {
+        let mut out = String::new();
+        out.push_str("LongMemEval Canonical Accuracy\n");
+        out.push_str("==============================\n");
+        out.push_str(&format!("Answer model: {}\n", self.answer_model));
+        out.push_str(&format!("Judge model:  {}\n", self.judge_model));
+        out.push_str(&format!(
+            "Questions:    {}/{} correct\n\n",
+            self.total_correct, self.total_questions
+        ));
+        out.push_str(&format!(
+            "  Overall accuracy:      {:.1}%\n",
+            self.overall_accuracy * 100.0
+        ));
+        out.push_str(&format!(
+            "  Task-averaged accuracy: {:.1}%  <- leaderboard metric\n\n",
+            self.task_averaged_accuracy * 100.0
+        ));
+        out.push_str("Per category:\n");
+        for cat in &self.per_category {
+            out.push_str(&format!(
+                "  {} {:<28} {}/{} = {:.1}%\n",
+                cat.code,
+                cat.question_type,
+                cat.correct,
+                cat.total,
+                cat.accuracy * 100.0
+            ));
+        }
+        out
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
+    }
+}
+
+pub fn save_retrieved(
+    questions: &[RetrievedQuestion],
+    path: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    let json = serde_json::to_string_pretty(questions).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+pub fn load_retrieved(path: &std::path::Path) -> Result<Vec<RetrievedQuestion>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    serde_json::from_str(&content).map_err(std::io::Error::other)
+}
+
+pub fn save_answered(
+    questions: &[AnsweredQuestion],
+    path: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    let json = serde_json::to_string_pretty(questions).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+pub fn load_answered(path: &std::path::Path) -> Result<Vec<AnsweredQuestion>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    serde_json::from_str(&content).map_err(std::io::Error::other)
+}
+
+/// Phase 1: Retrieve context for each question using Origin's hybrid search.
+pub async fn retrieve_for_accuracy_eval(
+    path: &Path,
+    search_top_k: usize,
+    max_questions: usize,
+) -> Result<Vec<RetrievedQuestion>, OriginError> {
+    let samples = load_longmemeval(path)?;
+    let sample_limit = max_questions.min(samples.len());
+    let shared_embedder = crate::eval::token_efficiency::eval_shared_embedder();
+    let mut retrieved: Vec<RetrievedQuestion> = Vec::new();
+
+    for (q_idx, sample) in samples.iter().take(sample_limit).enumerate() {
+        let memories = extract_memories(sample);
+        if memories.is_empty() {
+            continue;
+        }
+        let ground_truth = sample
+            .answer
+            .as_str()
+            .unwrap_or(&sample.answer.to_string())
+            .to_string();
+        if ground_truth.is_empty() {
+            continue;
+        }
+        if q_idx % 50 == 0 {
+            eprintln!(
+                "[lme_retrieve] Q {}/{}: {} memories",
+                q_idx + 1,
+                sample_limit,
+                memories.len()
+            );
+        }
+
+        let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
+        let db = crate::db::MemoryDB::new_with_shared_embedder(
+            tmp.path(),
+            std::sync::Arc::new(crate::events::NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
+
+        let docs: Vec<crate::sources::RawDocument> = memories
+            .iter()
+            .map(|mem| crate::sources::RawDocument {
+                content: mem.content.clone(),
+                source_id: memory_source_id(&mem.question_id, mem.session_idx, mem.turn_idx),
+                source: "memory".to_string(),
+                title: format!("{} session {}", mem.role, mem.session_idx),
+                memory_type: Some(
+                    if sample.question_type == "single-session-preference" {
+                        "preference"
+                    } else {
+                        "fact"
+                    }
+                    .to_string(),
+                ),
+                domain: Some("conversation".to_string()),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            })
+            .collect();
+        let mem_count = docs.len();
+        db.upsert_documents(docs).await?;
+
+        let results = db
+            .search_memory(
+                &sample.question,
+                search_top_k,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let context: String = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context_tokens = crate::eval::token_efficiency::count_tokens(&context);
+
+        retrieved.push(RetrievedQuestion {
+            question_id: sample.question_id.clone(),
+            question_type: sample.question_type.clone(),
+            question: sample.question.clone(),
+            ground_truth,
+            context,
+            context_tokens,
+            memories_seeded: mem_count,
+        });
+    }
+    eprintln!(
+        "[lme_retrieve] Done: {} questions retrieved",
+        retrieved.len()
+    );
+    Ok(retrieved)
+}
+
+/// Phase 2: Generate answers using the Anthropic API. Supports resume via existing param.
+pub async fn generate_answers(
+    retrieved: &[RetrievedQuestion],
+    answer_model: &str,
+    concurrency: usize,
+    existing: Vec<AnsweredQuestion>,
+) -> Result<Vec<AnsweredQuestion>, OriginError> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| OriginError::Generic("ANTHROPIC_API_KEY not set".into()))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("reqwest: {e}")))?;
+
+    let answered_ids: HashSet<String> = existing.iter().map(|a| a.question_id.clone()).collect();
+    let todo: Vec<&RetrievedQuestion> = retrieved
+        .iter()
+        .filter(|rq| !answered_ids.contains(&rq.question_id))
+        .collect();
+    eprintln!(
+        "[lme_answer] {} already answered, {} remaining",
+        existing.len(),
+        todo.len()
+    );
+    if todo.is_empty() {
+        return Ok(existing);
+    }
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let client = Arc::new(client);
+    let api_key = Arc::new(api_key);
+    let total = todo.len();
+    let mut handles = Vec::new();
+
+    for (seq, rq) in todo.into_iter().enumerate() {
+        let sem = semaphore.clone();
+        let rq = rq.clone();
+        let model = answer_model.to_string();
+        let client = client.clone();
+        let api_key = api_key.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            if seq % 50 == 0 {
+                eprintln!("[lme_answer] {}/{}...", seq + 1, total);
+            }
+
+            let (prompt, sys) = build_answer_prompt(&rq.question, &rq.context, &rq.question_type);
+            match call_anthropic_api(&client, &api_key, &model, &prompt, Some(&sys), 300).await {
+                Ok(answer) => Some(AnsweredQuestion {
+                    question_id: rq.question_id,
+                    question_type: rq.question_type,
+                    question: rq.question,
+                    ground_truth: rq.ground_truth,
+                    model_answer: answer,
+                    answer_model: model,
+                    context_tokens: rq.context_tokens,
+                }),
+                Err(e) => {
+                    eprintln!("[lme_answer] failed: {}", e);
+                    None
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    let mut all = existing;
+    for handle in handles {
+        if let Ok(Some(aq)) = handle.await {
+            all.push(aq);
+        }
+    }
+    eprintln!("[lme_answer] Total: {} answers", all.len());
+    Ok(all)
+}
+
+/// Phase 3: Score answers using the Anthropic API as judge.
+pub async fn score_answers(
+    answered: &[AnsweredQuestion],
+    judge_model: &str,
+    concurrency: usize,
+) -> Result<LongMemEvalAccuracyReport, OriginError> {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| OriginError::Generic("ANTHROPIC_API_KEY not set".into()))?;
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| OriginError::Generic(format!("reqwest: {e}")))?,
+    );
+    let api_key = Arc::new(api_key);
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+
+    for aq in answered {
+        let sem = semaphore.clone();
+        let aq = aq.clone();
+        let model = judge_model.to_string();
+        let client = client.clone();
+        let api_key = api_key.clone();
+
+        let handle =
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let judge_prompt = get_anscheck_prompt(
+                    &aq.question_type,
+                    &aq.question,
+                    &aq.ground_truth,
+                    &aq.model_answer,
+                );
+                let (judge_response, correct) =
+                    match call_anthropic_api(&client, &api_key, &model, &judge_prompt, None, 10)
+                        .await
+                    {
+                        Ok(resp) => {
+                            let c = resp.to_lowercase().contains("yes");
+                            (resp, Some(c))
+                        }
+                        Err(e) => {
+                            eprintln!("[lme_judge] error: {}", e);
+                            (format!("ERROR: {e}"), None)
+                        }
+                    };
+                AccuracyResult {
+                    question_id: aq.question_id,
+                    question_type: aq.question_type,
+                    question: aq.question,
+                    ground_truth: aq.ground_truth,
+                    model_answer: aq.model_answer,
+                    judge_response,
+                    correct,
+                    context_tokens: aq.context_tokens,
+                }
+            });
+        handles.push(handle);
+    }
+
+    let mut results: Vec<AccuracyResult> = Vec::new();
+    for handle in handles {
+        if let Ok(r) = handle.await {
+            results.push(r);
+        }
+    }
+
+    let judged: Vec<&AccuracyResult> = results.iter().filter(|r| r.correct.is_some()).collect();
+    let errors = results.len() - judged.len();
+    if errors > 0 {
+        eprintln!("[lme_aggregate] {} judge errors excluded", errors);
+    }
+
+    let total = judged.len();
+    let total_correct = judged.iter().filter(|r| r.correct == Some(true)).count();
+    let overall = if total > 0 {
+        total_correct as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    let mut per_category: Vec<CategoryAccuracy> = Vec::new();
+    for &cat in CATEGORY_ORDER {
+        let cr: Vec<&&AccuracyResult> = judged.iter().filter(|r| r.question_type == cat).collect();
+        if cr.is_empty() {
+            continue;
+        }
+        let cc = cr.iter().filter(|r| r.correct == Some(true)).count();
+        per_category.push(CategoryAccuracy {
+            question_type: cat.to_string(),
+            code: category_code(cat).to_string(),
+            total: cr.len(),
+            correct: cc,
+            accuracy: cc as f64 / cr.len() as f64,
+        });
+    }
+    let task_avg = if per_category.is_empty() {
+        0.0
+    } else {
+        per_category.iter().map(|c| c.accuracy).sum::<f64>() / per_category.len() as f64
+    };
+
+    Ok(LongMemEvalAccuracyReport {
+        overall_accuracy: overall,
+        task_averaged_accuracy: task_avg,
+        total_questions: total,
+        total_correct,
+        answer_model: answered
+            .first()
+            .map(|a| a.answer_model.clone())
+            .unwrap_or_default(),
+        judge_model: judge_model.to_string(),
+        per_category,
+        per_question: results,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1369,5 +1950,47 @@ mod tests {
         assert!(text.contains("Baseline comparison:"));
         assert!(text.contains("->"));
         assert!(text.contains("single-session-user"));
+    }
+
+    #[test]
+    fn test_anscheck_prompt_task_specific() {
+        let q = "What is the user's pet?";
+        let a = "a dog named Max";
+        let r = "The user has a dog named Max.";
+        let ssu = get_anscheck_prompt("single-session-user", q, a, r);
+        assert!(ssu.contains("Answer yes or no only"));
+        assert!(!ssu.contains("off-by-one"));
+        let tr = get_anscheck_prompt("temporal-reasoning", q, a, r);
+        assert!(tr.contains("off-by-one"));
+        let ku = get_anscheck_prompt("knowledge-update", q, a, r);
+        assert!(ku.contains("updated answer"));
+        let ssp = get_anscheck_prompt("single-session-preference", q, a, r);
+        assert!(ssp.contains("rubric"));
+    }
+
+    #[test]
+    fn test_build_answer_prompt_empty_context() {
+        let (prompt, _sys) = build_answer_prompt("What is 2+2?", "", "multi-session");
+        assert!(prompt.contains("Answer the question as best you can"));
+        assert!(!prompt.contains("Context:"));
+    }
+
+    #[test]
+    fn test_build_answer_prompt_preference() {
+        let (prompt, sys) = build_answer_prompt(
+            "What restaurant?",
+            "User likes Italian.",
+            "single-session-preference",
+        );
+        assert!(prompt.contains("preferences"));
+        assert!(sys.contains("personalized assistant"));
+    }
+
+    #[test]
+    fn test_build_answer_prompt_default() {
+        let (prompt, sys) =
+            build_answer_prompt("What color?", "The car is red.", "single-session-user");
+        assert!(prompt.contains("Context:"));
+        assert!(sys.contains("based on the provided context"));
     }
 }
