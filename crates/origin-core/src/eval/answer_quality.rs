@@ -44,7 +44,7 @@ pub struct E2EEvalReport {
 /// For each relevant seed, extracts key words (length > 4) and checks
 /// whether at least 30% of them appear in the answer. Score = fraction
 /// of relevant seeds whose key content appears in the answer.
-fn score_answer(answer: &str, relevant_seeds: &[&str]) -> f64 {
+pub(crate) fn score_answer(answer: &str, relevant_seeds: &[&str]) -> f64 {
     if relevant_seeds.is_empty() {
         return 0.0;
     }

@@ -3476,6 +3476,7 @@ mod tests {
     }
 
     // ---- score_answer unit tests ----
+    use crate::eval::answer_quality::score_answer;
 
     #[test]
     fn test_score_answer_perfect_match() {

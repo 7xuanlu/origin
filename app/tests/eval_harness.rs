@@ -1709,398 +1709,58 @@ async fn judge_e2e_context_locomo_sonnet() {
 }
 
 // ---------------------------------------------------------------------------
-// LongMemEval 3-Phase Canonical Accuracy Pipeline
+// Batch API Judge
 // ---------------------------------------------------------------------------
 
-/// Phase 1: Retrieve context for each LongMemEval question using Origin's hybrid search.
-/// Run first, saves lme_retrieved.json for Phase 2.
-#[tokio::test]
-#[ignore]
-async fn lme_phase1_retrieve() {
-    let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data");
-    let oracle_path = data_dir.join("longmemeval_oracle.json");
-    let s_path = data_dir.join("longmemeval_s_cleaned.json");
-    let path = if oracle_path.exists() {
-        oracle_path
-    } else if s_path.exists() {
-        s_path
-    } else {
-        eprintln!("SKIP: LongMemEval dataset not found in eval/data/");
-        return;
-    };
-
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    std::fs::create_dir_all(&baselines_dir).ok();
-    let out_path = baselines_dir.join("lme_retrieved.json");
-
-    let retrieved =
-        origin_lib::eval::longmemeval::retrieve_for_accuracy_eval(&path, 10, usize::MAX)
-            .await
-            .expect("retrieve_for_accuracy_eval failed");
-
-    eprintln!("Retrieved {} questions", retrieved.len());
-    origin_lib::eval::longmemeval::save_retrieved(&retrieved, &out_path)
-        .expect("save_retrieved failed");
-    eprintln!("Saved to {:?}", out_path);
-    assert!(
-        !retrieved.is_empty(),
-        "Should retrieve at least some questions"
-    );
-}
-
-/// Phase 2: Generate answers for each retrieved question using the Anthropic API.
-/// Loads lme_retrieved.json, writes lme_answered.json. Supports resume.
-#[tokio::test]
-#[ignore]
-async fn lme_phase2_answer() {
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let retrieved_path = baselines_dir.join("lme_retrieved.json");
-    if !retrieved_path.exists() {
-        eprintln!("SKIP: run lme_phase1_retrieve first");
-        return;
-    }
-
-    let answer_model = std::env::var("LME_ANSWER_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
-
-    let retrieved =
-        origin_lib::eval::longmemeval::load_retrieved(&retrieved_path).expect("load_retrieved");
-    eprintln!("Loaded {} questions", retrieved.len());
-
-    let out_path = baselines_dir.join("lme_answered.json");
-    let existing = if out_path.exists() {
-        origin_lib::eval::longmemeval::load_answered(&out_path).unwrap_or_default()
-    } else {
-        vec![]
-    };
-
-    let answered =
-        origin_lib::eval::longmemeval::generate_answers(&retrieved, &answer_model, 8, existing)
-            .await
-            .expect("generate_answers failed");
-
-    eprintln!("Total answers: {}", answered.len());
-    origin_lib::eval::longmemeval::save_answered(&answered, &out_path)
-        .expect("save_answered failed");
-    eprintln!("Saved to {:?}", out_path);
-    assert!(!answered.is_empty(), "Should have at least some answers");
-}
-
-/// Phase 3: Judge LongMemEval answers using the Anthropic API.
-/// Loads lme_answered.json, prints canonical accuracy report.
-#[tokio::test]
-#[ignore]
-async fn lme_phase3_judge() {
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let answered_path = baselines_dir.join("lme_answered.json");
-    if !answered_path.exists() {
-        eprintln!("SKIP: run lme_phase2_answer first");
-        return;
-    }
-
-    let judge_model = std::env::var("LME_JUDGE_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
-
-    let answered =
-        origin_lib::eval::longmemeval::load_answered(&answered_path).expect("load_answered");
-    eprintln!("Judging {} answers...", answered.len());
-
-    let report = origin_lib::eval::longmemeval::score_answers(&answered, &judge_model, 8)
-        .await
-        .expect("score_answers failed");
-
-    eprintln!("\n{}", report.to_terminal());
-
-    let out_path = baselines_dir.join("lme_accuracy_report.json");
-    report.save(&out_path).expect("save report failed");
-    eprintln!("Report saved to {:?}", out_path);
-
-    assert!(report.total_questions > 0);
-    assert!(
-        report.overall_accuracy >= 0.0 && report.overall_accuracy <= 1.0,
-        "overall_accuracy out of [0,1]"
-    );
-    assert!(
-        report.task_averaged_accuracy >= 0.0 && report.task_averaged_accuracy <= 1.0,
-        "task_averaged_accuracy out of [0,1]"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// LoCoMo 3-Phase Canonical Accuracy Pipeline
-// ---------------------------------------------------------------------------
-
-/// Phase 1: Retrieve context for each LoCoMo QA pair using Origin's hybrid search.
-/// Seeds one DB per conversation, runs per QA. Saves locomo_retrieved.json for Phase 2.
-#[tokio::test]
-#[ignore]
-async fn locomo_phase1_retrieve() {
-    let locomo_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
-    if !locomo_path.exists() {
-        eprintln!("SKIP: locomo10.json not found in eval/data/");
-        return;
-    }
-
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    std::fs::create_dir_all(&baselines_dir).ok();
-    let out_path = baselines_dir.join("locomo_retrieved.json");
-
-    let retrieved =
-        origin_lib::eval::locomo::retrieve_for_locomo_accuracy(&locomo_path, 10, usize::MAX)
-            .await
-            .expect("retrieve_for_locomo_accuracy failed");
-
-    eprintln!("Retrieved {} questions", retrieved.len());
-    origin_lib::eval::locomo::save_locomo_retrieved(&retrieved, &out_path)
-        .expect("save_locomo_retrieved failed");
-    eprintln!("Saved to {:?}", out_path);
-    assert!(
-        !retrieved.is_empty(),
-        "Should retrieve at least some questions"
-    );
-}
-
-/// Phase 2: Generate answers for each LoCoMo question using the Anthropic API.
-/// Loads locomo_retrieved.json, writes locomo_answered.json. Supports resume.
-#[tokio::test]
-#[ignore]
-async fn locomo_phase2_answer() {
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let retrieved_path = baselines_dir.join("locomo_retrieved.json");
-    if !retrieved_path.exists() {
-        eprintln!("SKIP: run locomo_phase1_retrieve first");
-        return;
-    }
-
-    let answer_model = std::env::var("LME_ANSWER_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
-
-    let retrieved = origin_lib::eval::locomo::load_locomo_retrieved(&retrieved_path)
-        .expect("load_locomo_retrieved");
-    eprintln!("Loaded {} questions", retrieved.len());
-
-    let out_path = baselines_dir.join("locomo_answered.json");
-    let existing = if out_path.exists() {
-        origin_lib::eval::locomo::load_locomo_answered(&out_path).unwrap_or_default()
-    } else {
-        vec![]
-    };
-
-    let answered =
-        origin_lib::eval::locomo::generate_locomo_answers(&retrieved, &answer_model, 8, existing)
-            .await
-            .expect("generate_locomo_answers failed");
-
-    eprintln!("Total answers: {}", answered.len());
-    origin_lib::eval::locomo::save_locomo_answered(&answered, &out_path)
-        .expect("save_locomo_answered failed");
-    eprintln!("Saved to {:?}", out_path);
-    assert!(!answered.is_empty(), "Should have at least some answers");
-}
-
-/// Phase 3: Judge LoCoMo answers using the Anthropic API.
-/// Loads locomo_answered.json, prints canonical accuracy report.
-#[tokio::test]
-#[ignore]
-async fn locomo_phase3_judge() {
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let answered_path = baselines_dir.join("locomo_answered.json");
-    if !answered_path.exists() {
-        eprintln!("SKIP: run locomo_phase2_answer first");
-        return;
-    }
-
-    let judge_model = std::env::var("LME_JUDGE_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
-
-    let answered = origin_lib::eval::locomo::load_locomo_answered(&answered_path)
-        .expect("load_locomo_answered");
-    eprintln!("Judging {} answers...", answered.len());
-
-    let report = origin_lib::eval::locomo::score_locomo_answers(&answered, &judge_model, 8)
-        .await
-        .expect("score_locomo_answers failed");
-
-    eprintln!("\n{}", report.to_terminal());
-
-    let out_path = baselines_dir.join("locomo_accuracy_report.json");
-    report.save(&out_path).expect("save report failed");
-    eprintln!("Report saved to {:?}", out_path);
-
-    assert!(report.total_questions > 0);
-    assert!(
-        report.overall_accuracy >= 0.0 && report.overall_accuracy <= 1.0,
-        "overall_accuracy out of [0,1]"
-    );
-    assert!(
-        report.task_averaged_accuracy >= 0.0 && report.task_averaged_accuracy <= 1.0,
-        "task_averaged_accuracy out of [0,1]"
-    );
-}
-
-// ===== Batch API Eval (50% cheaper, no rate limits) =====
-
-/// LME: generate answers via Batch API.
+/// Judge saved E2E context tuples via Batch API.
 ///
 /// ```bash
-/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness lme_batch_answer -- --ignored --nocapture
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness judge_e2e_batch -- --ignored --nocapture
 /// ```
 #[tokio::test]
 #[ignore]
-async fn lme_batch_answer() {
-    use origin_lib::eval::longmemeval::{
-        generate_answers_batch, load_answered, load_retrieved, save_answered,
+async fn judge_e2e_batch() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
     };
 
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let retrieved_path = baselines.join("lme_retrieved.json");
-    if !retrieved_path.exists() {
-        println!("SKIP: lme_retrieved.json not found. Run lme_phase1_retrieve first.");
+    let tuples_path = baselines.join("e2e_context_tuples_locomo.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo first");
         return;
     }
 
-    let answer_model = std::env::var("LME_ANSWER_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
-    let out_path = baselines.join("lme_answered.json");
-
-    let retrieved = load_retrieved(&retrieved_path).expect("load failed");
-    let existing = if out_path.exists() {
-        load_answered(&out_path).unwrap_or_default()
-    } else {
-        vec![]
-    };
-
-    eprintln!(
-        "=== LME Batch Answer ({} Qs, model={}) ===",
-        retrieved.len(),
-        answer_model
-    );
-
-    let answered = generate_answers_batch(&retrieved, &answer_model, existing)
-        .await
-        .expect("batch answer failed");
-
-    save_answered(&answered, &out_path).unwrap();
-    eprintln!("Saved {} answers to {:?}", answered.len(), out_path);
-    assert!(!answered.is_empty());
-}
-
-/// LME: judge answers via Batch API.
-///
-/// ```bash
-/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness lme_batch_judge -- --ignored --nocapture
-/// ```
-#[tokio::test]
-#[ignore]
-async fn lme_batch_judge() {
-    use origin_lib::eval::longmemeval::{load_answered, score_answers_batch};
-
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let answered_path = baselines.join("lme_answered.json");
-    if !answered_path.exists() {
-        println!("SKIP: lme_answered.json not found. Run lme_batch_answer first.");
-        return;
-    }
-
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
     let judge_model = std::env::var("LME_JUDGE_MODEL")
         .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
 
-    let answered = load_answered(&answered_path).expect("load failed");
     eprintln!(
-        "=== LME Batch Judge ({} answers, judge={}) ===",
-        answered.len(),
+        "=== Batch Judge ({} tuples, model={}) ===",
+        tuples.len(),
         judge_model
     );
 
-    let report = score_answers_batch(&answered, &judge_model)
+    let results = judge_with_batch_api(&tuples, &judge_model, None)
         .await
         .expect("batch judge failed");
 
-    eprintln!("\n{}", report.to_terminal());
-
-    report.save(&baselines.join("lme_accuracy.json")).unwrap();
-}
-
-/// LoCoMo: generate answers via Batch API.
-///
-/// ```bash
-/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness locomo_batch_answer -- --ignored --nocapture
-/// ```
-#[tokio::test]
-#[ignore]
-async fn locomo_batch_answer() {
-    use origin_lib::eval::locomo::{
-        generate_locomo_answers_batch, load_locomo_answered, load_locomo_retrieved,
-        save_locomo_answered,
-    };
-
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let retrieved_path = baselines.join("locomo_retrieved.json");
-    if !retrieved_path.exists() {
-        println!("SKIP: locomo_retrieved.json not found");
-        return;
+    let report = aggregate_judgments(&results, &judge_model);
+    for r in &report.results_by_approach {
+        eprintln!(
+            "  {}: {:.1}% ({}/{}) — {:.0} ctx tokens",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.total,
+            r.mean_context_tokens
+        );
     }
-
-    let answer_model = std::env::var("LME_ANSWER_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
-    let out_path = baselines.join("locomo_answered.json");
-
-    let retrieved = load_locomo_retrieved(&retrieved_path).expect("load failed");
-    let existing = if out_path.exists() {
-        load_locomo_answered(&out_path).unwrap_or_default()
-    } else {
-        vec![]
-    };
-
-    eprintln!(
-        "=== LoCoMo Batch Answer ({} Qs, model={}) ===",
-        retrieved.len(),
-        answer_model
-    );
-
-    let answered = generate_locomo_answers_batch(&retrieved, &answer_model, existing)
-        .await
-        .expect("batch failed");
-
-    save_locomo_answered(&answered, &out_path).unwrap();
-    eprintln!("Saved {} answers to {:?}", answered.len(), out_path);
-    assert!(!answered.is_empty());
+    eprintln!("\nTotal judged: {}", report.total_judged);
 }
 
-/// LoCoMo: judge answers via Batch API.
-///
-/// ```bash
-/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness locomo_batch_judge -- --ignored --nocapture
-/// ```
-#[tokio::test]
-#[ignore]
-async fn locomo_batch_judge() {
-    use origin_lib::eval::locomo::{load_locomo_answered, score_locomo_answers_batch};
-
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let answered_path = baselines.join("locomo_answered.json");
-    if !answered_path.exists() {
-        println!("SKIP: locomo_answered.json not found");
-        return;
-    }
-
-    let judge_model = std::env::var("LME_JUDGE_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
-
-    let answered = load_locomo_answered(&answered_path).expect("load failed");
-    eprintln!(
-        "=== LoCoMo Batch Judge ({} answers, judge={}) ===",
-        answered.len(),
-        judge_model
-    );
-
-    let report = score_locomo_answers_batch(&answered, &judge_model)
-        .await
-        .expect("batch judge failed");
-
-    eprintln!("\n{}", report.to_terminal());
-    report
-        .save(&baselines.join("locomo_accuracy.json"))
-        .unwrap();
-}
+// Deleted: lme_phase1_retrieve, lme_phase2_answer, lme_phase3_judge (3-phase accuracy pipeline)
+// Deleted: locomo_phase1_retrieve, locomo_phase2_answer, locomo_phase3_judge
+// Deleted: lme_batch_answer, lme_batch_judge, locomo_batch_answer, locomo_batch_judge
+// These used types from the deleted accuracy pipeline in locomo.rs/longmemeval.rs.
+// Use judge_e2e_batch above for batch API judging of E2E context tuples.
