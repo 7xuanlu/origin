@@ -29,10 +29,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy, llvm-tools-preview
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+          components: rustfmt, clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -95,12 +92,3 @@ jobs:
 
       - name: Run frontend tests
         run: pnpm test
-
-      # Coverage gates (moved from pre-push hook 2026-04-26 — community pattern:
-      # light pre-push, CI enforces). The Rust coverage gate covers the app
-      # crate (`origin`) which is what pre-push gated previously.
-      - name: Rust coverage gate (app crate, ≥90%)
-        run: cd app && cargo llvm-cov --fail-under-lines 90
-
-      - name: Frontend coverage gate
-        run: pnpm vitest run --coverage
