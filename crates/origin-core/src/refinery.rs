@@ -2689,6 +2689,48 @@ fn build_burst_context(
     )
 }
 
+/// Tokens considered generic stand-ins (English only). A title made entirely
+/// of these is not useful as a concept title. Curated to avoid false
+/// positives — `concept`, `concepts`, `content`, `ideas` deliberately
+/// excluded because they appear in legitimate titles too often.
+const GENERIC_TOKENS: &[&str] = &[
+    "general",
+    "various",
+    "miscellaneous",
+    "topic",
+    "topics",
+    "notes",
+    "things",
+    "items",
+    "stuff",
+    "misc",
+    "other",
+    "unknown",
+    "untitled",
+    "random",
+    "assorted",
+    "cluster",
+    "clusters",
+];
+
+/// Returns true when every word-token of the input (after splitting on
+/// non-alphanumeric separators and lowercasing) is in GENERIC_TOKENS. Used to
+/// reject LLM-produced titles like "General topic" or "Various Notes" or
+/// "Misc-things" (hyphen treated as separator).
+fn is_all_generic_tokens(s: &str) -> bool {
+    let words: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return false;
+    }
+    words
+        .iter()
+        .all(|w| GENERIC_TOKENS.contains(&w.to_lowercase().as_str()))
+}
+
 /// Returns true for single-word generic stand-ins that are useless as concept titles.
 /// These are often the `topic` fallback value when no entity/domain is available.
 fn looks_like_generic_topic(s: &str) -> bool {
@@ -4702,6 +4744,40 @@ mod tests {
         assert!(!looks_like_generic_topic("General AI Architecture"));
         assert!(!looks_like_generic_topic("Origin Concept Model"));
         assert!(!looks_like_generic_topic("libSQL Storage"));
+    }
+
+    #[test]
+    fn is_all_generic_tokens_rejects_multi_word_generic() {
+        // Single word generics — preserved behavior
+        assert!(is_all_generic_tokens("general"));
+        assert!(is_all_generic_tokens("GENERAL"));
+        assert!(is_all_generic_tokens("topic"));
+        assert!(is_all_generic_tokens("untitled"));
+
+        // Multi-word all-generic — NEW behavior
+        assert!(is_all_generic_tokens("General topic"));
+        assert!(is_all_generic_tokens("Various Notes"));
+        assert!(is_all_generic_tokens("Topic Notes"));
+        assert!(is_all_generic_tokens("Misc Things"));
+        assert!(is_all_generic_tokens("Misc-things"));  // hyphen stripped
+        assert!(is_all_generic_tokens("random assorted stuff"));
+
+        // True negatives — must keep
+        assert!(!is_all_generic_tokens("Topic and Notes"));    // 'and' saves it
+        assert!(!is_all_generic_tokens("libsql Vector Storage"));
+        assert!(!is_all_generic_tokens("Origin Memory Layer"));
+        assert!(!is_all_generic_tokens("Origin Concept Model")); // wordlist excludes 'concept'
+        assert!(!is_all_generic_tokens("Notes on Origin"));      // 'on', 'origin' not generic
+        assert!(!is_all_generic_tokens("Content Strategy"));     // 'content' not in list, 'strategy' not in list
+
+        // Edge cases
+        assert!(!is_all_generic_tokens(""));        // empty
+        assert!(!is_all_generic_tokens("   "));      // whitespace only
+        assert!(!is_all_generic_tokens("!!! ???")); // empty after punctuation strip
+
+        // Chinese — out of scope (English-only wordlist by design)
+        assert!(!is_all_generic_tokens("杂项"));
+        assert!(!is_all_generic_tokens("**Roland** — 太正統，d-L 連接快"));
     }
 
     #[test]
