@@ -2949,6 +2949,48 @@ pub async fn sync_registered_source(
 
 static ICON_CARD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn icon_loading_card(
+    card_id: String,
+    title: String,
+    created_at: u64,
+) -> crate::ambient::types::AmbientCard {
+    use crate::ambient::types::{AmbientCard, AmbientCardKind};
+    AmbientCard {
+        card_id: card_id.clone(),
+        kind: AmbientCardKind::PersonContext,
+        title,
+        topic: "Searching…".to_string(),
+        body: "Looking up related memories…".to_string(),
+        sources: vec![],
+        memory_count: 0,
+        primary_source_id: card_id,
+        created_at,
+        loading: true,
+        snippets: vec![],
+    }
+}
+
+fn icon_no_results_card(
+    card_id: String,
+    title: String,
+    created_at: u64,
+) -> crate::ambient::types::AmbientCard {
+    use crate::ambient::types::{AmbientCard, AmbientCardKind};
+    AmbientCard {
+        card_id,
+        kind: AmbientCardKind::PersonContext,
+        title,
+        topic: String::new(),
+        body: "No relevant context found.".to_string(),
+        sources: vec![],
+        memory_count: 0,
+        primary_source_id: String::new(),
+        created_at,
+        loading: false,
+        snippets: vec![],
+    }
+}
+
 /// Called when the user clicks the icon overlay.
 /// Emits a loading placeholder card immediately, then searches memory via the
 /// daemon and replaces the card with real results.
@@ -2975,19 +3017,7 @@ pub async fn trigger_icon_click(
 
     // Emit loading placeholder immediately
     {
-        let loading_card = AmbientCard {
-            card_id: card_id.clone(),
-            kind: AmbientCardKind::PersonContext,
-            title: text.chars().take(40).collect(),
-            topic: "Searching…".to_string(),
-            body: "Looking up related memories…".to_string(),
-            sources: vec![],
-            memory_count: 0,
-            primary_source_id: card_id.clone(),
-            created_at: now,
-            loading: true,
-            snippets: vec![],
-        };
+        let loading_card = icon_loading_card(card_id.clone(), text.chars().take(40).collect(), now);
         let s = state.read().await;
         if let Some(handle) = &s.app_handle {
             let _ = handle.emit(
@@ -3032,6 +3062,7 @@ pub async fn trigger_icon_click(
             .as_secs();
 
         let good: Vec<_> = results.iter().filter(|r| r.raw_score >= 0.02).collect();
+        let title: String = text.chars().take(40).collect();
 
         let card = if !good.is_empty() {
             let primary = &good[0];
@@ -3067,7 +3098,7 @@ pub async fn trigger_icon_click(
             AmbientCard {
                 card_id: card_id_clone,
                 kind,
-                title: text.chars().take(40).collect(),
+                title,
                 topic: primary.domain.clone().unwrap_or_default(),
                 body,
                 sources,
@@ -3078,19 +3109,7 @@ pub async fn trigger_icon_click(
                 snippets,
             }
         } else {
-            AmbientCard {
-                card_id: card_id_clone,
-                kind: AmbientCardKind::PersonContext,
-                title: text.chars().take(40).collect(),
-                topic: String::new(),
-                body: "No relevant context found.".to_string(),
-                sources: vec![],
-                memory_count: 0,
-                primary_source_id: String::new(),
-                created_at: now2,
-                loading: false,
-                snippets: vec![],
-            }
+            icon_no_results_card(card_id_clone, title, now2)
         };
 
         let s = state_arc.read().await;

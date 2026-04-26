@@ -1015,6 +1015,17 @@ fn aggregate_by_category(
 }
 
 // ---------------------------------------------------------------------------
+// Backward-compat re-exports (prompt functions now live in judge.rs)
+// ---------------------------------------------------------------------------
+
+pub use crate::eval::anthropic::{
+    call_anthropic_api, download_batch_results, estimate_batch_cost, poll_batch, submit_batch,
+};
+pub use crate::eval::judge::{
+    lme_anscheck_prompt as get_anscheck_prompt, lme_answer_prompt as build_answer_prompt,
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -1707,3 +1707,54 @@ async fn judge_e2e_context_locomo_sonnet() {
     }
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
+
+// ---------------------------------------------------------------------------
+// Batch API Judge
+// ---------------------------------------------------------------------------
+
+/// Judge saved E2E context tuples via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness judge_e2e_batch -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_batch() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("e2e_context_tuples_locomo.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_locomo first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let judge_model = std::env::var("LME_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    eprintln!(
+        "=== Batch Judge ({} tuples, model={}) ===",
+        tuples.len(),
+        judge_model
+    );
+
+    let results = judge_with_batch_api(&tuples, &judge_model, None)
+        .await
+        .expect("batch judge failed");
+
+    let report = aggregate_judgments(&results, &judge_model);
+    for r in &report.results_by_approach {
+        eprintln!(
+            "  {}: {:.1}% ({}/{}) — {:.0} ctx tokens",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.total,
+            r.mean_context_tokens
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
