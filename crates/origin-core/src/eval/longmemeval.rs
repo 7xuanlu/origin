@@ -1069,14 +1069,45 @@ pub async fn call_anthropic_api(
 // Anthropic Batch API (50% cheaper, no rate limits)
 // ---------------------------------------------------------------------------
 
+/// Estimate batch cost in USD (Haiku batch pricing: $0.50/MTok input, $2.50/MTok output).
+pub fn estimate_batch_cost(prompts: &[(String, String, Option<String>, usize)]) -> f64 {
+    let input_tokens: usize = prompts
+        .iter()
+        .map(|(_, prompt, sys, _)| {
+            let sys_len = sys.as_ref().map(|s| s.len()).unwrap_or(0);
+            (prompt.len() + sys_len) / 4 // rough estimate: 4 chars per token
+        })
+        .sum();
+    let output_tokens: usize = prompts.iter().map(|(_, _, _, max_tok)| *max_tok).sum();
+    let input_cost = input_tokens as f64 * 0.50 / 1_000_000.0;
+    let output_cost = output_tokens as f64 * 2.50 / 1_000_000.0;
+    input_cost + output_cost
+}
+
 /// Submit a batch of prompts to the Anthropic Batch API.
 /// Returns the batch ID for polling.
+///
+/// Set `cost_cap_usd` to limit spending. Returns Err if estimated cost exceeds cap.
 pub async fn submit_batch(
     client: &reqwest::Client,
     api_key: &str,
     requests: Vec<(String, String, Option<String>, usize)>, // (custom_id, prompt, system, max_tokens)
     model: &str,
+    cost_cap_usd: f64,
 ) -> Result<String, String> {
+    let est_cost = estimate_batch_cost(&requests);
+    eprintln!(
+        "[batch] Estimated cost: ${:.3} ({} requests, cap: ${:.2})",
+        est_cost,
+        requests.len(),
+        cost_cap_usd,
+    );
+    if est_cost > cost_cap_usd {
+        return Err(format!(
+            "Estimated cost ${:.3} exceeds cap ${:.2}. Reduce questions or raise cap.",
+            est_cost, cost_cap_usd
+        ));
+    }
     let batch_requests: Vec<serde_json::Value> = requests
         .into_iter()
         .map(|(id, prompt, system, max_tokens)| {
@@ -1240,8 +1271,12 @@ pub async fn generate_answers_batch(
         })
         .collect();
 
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.0);
     eprintln!("[lme_batch] Submitting {} requests...", requests.len());
-    let batch_id = submit_batch(&client, &api_key, requests, answer_model)
+    let batch_id = submit_batch(&client, &api_key, requests, answer_model, cost_cap)
         .await
         .map_err(|e| OriginError::Generic(e))?;
     eprintln!("[lme_batch] Batch created: {}", batch_id);
@@ -1299,11 +1334,15 @@ pub async fn score_answers_batch(
         })
         .collect();
 
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.0);
     eprintln!(
         "[lme_judge_batch] Submitting {} judge requests...",
         requests.len()
     );
-    let batch_id = submit_batch(&client, &api_key, requests, judge_model)
+    let batch_id = submit_batch(&client, &api_key, requests, judge_model, cost_cap)
         .await
         .map_err(|e| OriginError::Generic(e))?;
     eprintln!("[lme_judge_batch] Batch created: {}", batch_id);
