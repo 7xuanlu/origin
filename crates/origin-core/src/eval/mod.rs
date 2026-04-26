@@ -2,6 +2,7 @@
 //! Memory eval system — quality measurement and feedback capture.
 
 pub mod anthropic;
+pub mod dates;
 pub mod judge;
 pub mod shared;
 

@@ -471,11 +471,10 @@ pub async fn run_locomo_pipeline_eval(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: mem
-                    .session_date
-                    .as_deref()
-                    .and_then(crate::eval::locomo::parse_locomo_date)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                last_modified: crate::eval::dates::seed_last_modified(
+                    mem.session_date.as_deref(),
+                    crate::eval::dates::parse_locomo_date,
+                ),
                 ..Default::default()
             })
             .collect();
@@ -792,11 +791,10 @@ pub async fn run_longmemeval_pipeline_eval(
                     .to_string(),
                 ),
                 domain: Some("conversation".to_string()),
-                last_modified: mem
-                    .session_date
-                    .as_deref()
-                    .and_then(crate::eval::longmemeval::parse_lme_date)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                last_modified: crate::eval::dates::seed_last_modified(
+                    mem.session_date.as_deref(),
+                    crate::eval::dates::parse_lme_date,
+                ),
                 ..Default::default()
             })
             .collect();

@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+// Bring date helpers into scope for use within this module.
+use crate::eval::dates::seed_last_modified;
+// Re-export so external callers using `crate::eval::locomo::parse_locomo_date` still compile.
+pub(crate) use crate::eval::dates::parse_locomo_date;
+
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
@@ -142,19 +147,6 @@ fn parse_session_num(key: &str) -> Option<usize> {
     let stripped = key.strip_prefix("session_")?;
     let num_str = stripped.split('_').next()?;
     num_str.parse().ok()
-}
-
-/// Parse a LoCoMo session date like "1:56 pm on 8 May, 2023" into Unix seconds.
-/// Returns None on parse failure (caller falls back to now()).
-pub(crate) fn parse_locomo_date(s: &str) -> Option<i64> {
-    use chrono::{NaiveDateTime, TimeZone, Utc};
-    // The dataset uses "<h:mm am/pm> on <D Month, YYYY>". chrono's strftime
-    // %p needs uppercase AM/PM; LoCoMo uses lowercase. Normalise first.
-    let normalised = s.replace(" am ", " AM ").replace(" pm ", " PM ");
-    NaiveDateTime::parse_from_str(&normalised, "%I:%M %p on %d %B, %Y")
-        .ok()
-        .and_then(|naive| Utc.from_local_datetime(&naive).single())
-        .map(|dt| dt.timestamp())
 }
 
 // ---------------------------------------------------------------------------
@@ -440,11 +432,7 @@ pub async fn run_locomo_eval(path: &Path) -> Result<LocomoReport, OriginError> {
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: mem
-                    .session_date
-                    .as_deref()
-                    .and_then(parse_locomo_date)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -575,11 +563,7 @@ pub async fn run_locomo_eval_reranked(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: mem
-                    .session_date
-                    .as_deref()
-                    .and_then(parse_locomo_date)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -704,11 +688,7 @@ pub async fn run_locomo_eval_expanded(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: mem
-                    .session_date
-                    .as_deref()
-                    .and_then(parse_locomo_date)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -974,11 +954,7 @@ pub async fn run_locomo_eval_with_gate(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: mem
-                    .session_date
-                    .as_deref()
-                    .and_then(parse_locomo_date)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -1453,18 +1429,6 @@ mod tests {
         assert!(text.contains("open-domain"));
         // Verify delta printing is present
         assert!(text.contains("->"));
-    }
-
-    #[test]
-    fn test_parse_locomo_date() {
-        let ts = super::parse_locomo_date("1:56 pm on 8 May, 2023").expect("should parse");
-        // 2023-05-08 13:56 UTC = 1683554160
-        assert_eq!(ts, 1_683_554_160);
-    }
-
-    #[test]
-    fn test_parse_locomo_date_garbage_returns_none() {
-        assert!(super::parse_locomo_date("nonsense").is_none());
     }
 
     #[tokio::test]
