@@ -2521,6 +2521,8 @@ pub struct JudgmentTuple {
     pub approach: String,
     pub answer: String,
     pub context_tokens: usize,
+    #[serde(default)]
+    pub category: String,
 }
 
 /// Result from the LLM judge.
@@ -3022,6 +3024,7 @@ pub async fn run_e2e_locomo_eval(
                         approach: "origin".to_string(),
                         answer,
                         context_tokens: origin_ctx_tokens,
+                        category: String::new(),
                     });
                 }
                 Err(e) => {
@@ -3058,6 +3061,7 @@ pub async fn run_e2e_locomo_eval(
                             approach: "full_replay".to_string(),
                             answer,
                             context_tokens: replay_ctx_tokens,
+                            category: String::new(),
                         });
                     }
                     Err(e) => {
@@ -3095,6 +3099,7 @@ pub async fn run_e2e_locomo_eval(
                         approach: "no_context".to_string(),
                         answer,
                         context_tokens: 0,
+                        category: String::new(),
                     });
                 }
                 Err(e) => {
@@ -4516,6 +4521,7 @@ async fn generate_e2e_answers_for_question(
             approach: format!("flat_{}", category),
             answer,
             context_tokens: flat_tokens,
+            category: category.to_string(),
         });
     }
 
@@ -4558,6 +4564,7 @@ async fn generate_e2e_answers_for_question(
             approach: format!("structured_{}", category),
             answer,
             context_tokens: structured_tokens,
+            category: category.to_string(),
         });
     }
 
@@ -6643,6 +6650,7 @@ mod tests {
             answer: "Origin uses libSQL, which is Turso's fork of SQLite, for its database layer."
                 .to_string(),
             context_tokens: 50,
+            category: String::new(),
         };
 
         let result = judge_single_tuple(&tuple).await.unwrap();

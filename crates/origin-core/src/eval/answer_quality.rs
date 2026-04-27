@@ -571,6 +571,7 @@ pub async fn run_e2e_locomo_eval(
                         approach: "origin".to_string(),
                         answer,
                         context_tokens: origin_ctx_tokens,
+                        category: String::new(),
                     });
                 }
                 Err(e) => {
@@ -607,6 +608,7 @@ pub async fn run_e2e_locomo_eval(
                             approach: "full_replay".to_string(),
                             answer,
                             context_tokens: replay_ctx_tokens,
+                            category: String::new(),
                         });
                     }
                     Err(e) => {
@@ -644,6 +646,7 @@ pub async fn run_e2e_locomo_eval(
                         approach: "no_context".to_string(),
                         answer,
                         context_tokens: 0,
+                        category: String::new(),
                     });
                 }
                 Err(e) => {
@@ -747,6 +750,7 @@ async fn generate_e2e_answers_for_question(
             approach: format!("flat_{}", category),
             answer,
             context_tokens: flat_tokens,
+            category: category.to_string(),
         });
     }
 
@@ -789,6 +793,7 @@ async fn generate_e2e_answers_for_question(
             approach: format!("structured_{}", category),
             answer,
             context_tokens: structured_tokens,
+            category: category.to_string(),
         });
     }
 
@@ -1064,6 +1069,7 @@ struct PendingAnswer {
     question: String,
     ground_truth: String,
     approach: String,
+    category: String,
     context_tokens: usize,
 }
 
@@ -1302,6 +1308,7 @@ pub async fn run_fullpipeline_locomo_batch(
                     question: qa.question.clone(),
                     ground_truth,
                     approach: format!("structured_{}", category),
+                    category: category.to_string(),
                     context_tokens: ctx_tokens,
                 },
             );
@@ -1355,6 +1362,7 @@ pub async fn run_fullpipeline_locomo_batch(
                 approach: meta.approach.clone(),
                 answer: answer.clone(),
                 context_tokens: meta.context_tokens,
+                category: meta.category.clone(),
             });
             matched += 1;
         }
@@ -1559,6 +1567,7 @@ pub async fn run_fullpipeline_lme_batch(
                 question: sample.question.clone(),
                 ground_truth,
                 approach: format!("structured_{}", category),
+                category: category.to_string(),
                 context_tokens: ctx_tokens,
             },
         );
@@ -1614,6 +1623,7 @@ pub async fn run_fullpipeline_lme_batch(
                 approach: meta.approach.clone(),
                 answer: answer.clone(),
                 context_tokens: meta.context_tokens,
+                category: meta.category.clone(),
             });
             matched += 1;
         }

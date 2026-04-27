@@ -9,17 +9,17 @@ use std::sync::Arc;
 
 // ===== Judge Prompt (shared between CLI and Batch API paths) =====
 
-/// Shared judge prompt template. Used by both `judge_single_tuple_model` (CLI)
-/// and `judge_with_batch_api` (Batch API) to ensure consistent scoring.
-/// No system prompt — all instructions are in the user prompt.
-fn judge_prompt(question: &str, ground_truth: &str, answer: &str) -> String {
-    format!(
-        "You are a strict judge. Given a question, ground truth answer, and a model's response, \
-         determine if the response correctly answers the question.\n\n\
-         Question: {}\n\nGround Truth: {}\n\nModel Response: {}\n\n\
-         Reply with ONLY 'yes' or 'no'.",
-        question, ground_truth, answer
-    )
+/// Task-specific judge prompt dispatcher. Both `judge_single_tuple_model` (CLI)
+/// and `judge_with_batch_api` (Batch API) call this, so judge behavior is
+/// identical regardless of path.
+///
+/// Dispatches to benchmark-sourced prompts based on `category`:
+/// - `temporal-reasoning`: off-by-one tolerance for day/week/month counts
+/// - `knowledge-update`: accepts old+new answers if updated answer is correct
+/// - `single-session-preference`: rubric-based (not exact-match)
+/// - Everything else (LoCoMo categories + LME SSU/SSA/MS): standard benchmark prompt
+fn task_judge_prompt(category: &str, question: &str, ground_truth: &str, answer: &str) -> String {
+    lme_anscheck_prompt(category, question, ground_truth, answer)
 }
 
 // ===== LLM-as-Judge Types =====
@@ -32,6 +32,10 @@ pub struct JudgmentTuple {
     pub approach: String,
     pub answer: String,
     pub context_tokens: usize,
+    /// Task category for task-specific judge prompts (e.g. "temporal-reasoning",
+    /// "single-hop"). Defaults to empty for backward compat with existing JSON.
+    #[serde(default)]
+    pub category: String,
 }
 
 /// Result from the LLM judge.
@@ -142,7 +146,12 @@ pub async fn judge_single_tuple_model(
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    let prompt = judge_prompt(&tuple.question, &tuple.ground_truth, &tuple.answer);
+    let prompt = task_judge_prompt(
+        &tuple.category,
+        &tuple.question,
+        &tuple.ground_truth,
+        &tuple.answer,
+    );
 
     let json_schema = r#"{"type":"object","properties":{"score":{"type":"integer","enum":[0,1]},"reason":{"type":"string"}},"required":["score","reason"]}"#;
 
@@ -317,19 +326,8 @@ pub fn aggregate_judgments(results: &[JudgmentResult], judge_model: &str) -> Jud
 /// LongMemEval answer-check prompt. Returns the appropriate judge prompt for the task type.
 pub fn lme_anscheck_prompt(task: &str, question: &str, answer: &str, response: &str) -> String {
     match task {
-        "single-session-user" | "single-session-assistant" | "multi-session" => {
-            format!(
-                "I will give you a question, a correct answer, and a response from a model. \
-                 Please answer yes if the response contains the correct answer. Otherwise, answer no. \
-                 If the response is equivalent to the correct answer or contains all the intermediate \
-                 steps to get the correct answer, you should also answer yes. If the response only \
-                 contains a subset of the information required by the answer, answer no. \n\n\
-                 Question: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\n\
-                 Is the model response correct? Answer yes or no only.",
-                question, answer, response
-            )
-        }
-        "temporal-reasoning" => {
+        // LME "temporal-reasoning" + LoCoMo "temporal" — both test temporal recall
+        "temporal-reasoning" | "temporal" => {
             format!(
                 "I will give you a question, a correct answer, and a response from a model. \
                  Please answer yes if the response contains the correct answer. Otherwise, answer no. \
@@ -368,9 +366,14 @@ pub fn lme_anscheck_prompt(task: &str, question: &str, answer: &str, response: &
             )
         }
         _ => {
+            // Standard benchmark prompt — same as LoCoMo and LME SSU/SSA/MS.
+            // Includes equivalence + subset guidance for fair evaluation.
             format!(
                 "I will give you a question, a correct answer, and a response from a model. \
-                 Please answer yes if the response contains the correct answer. Otherwise, answer no.\n\n\
+                 Please answer yes if the response contains the correct answer. Otherwise, answer no. \
+                 If the response is equivalent to the correct answer or contains all the intermediate \
+                 steps to get the correct answer, you should also answer yes. If the response only \
+                 contains a subset of the information required by the answer, answer no.\n\n\
                  Question: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\n\
                  Is the model response correct? Answer yes or no only.",
                 question, answer, response
@@ -466,7 +469,7 @@ pub async fn judge_with_batch_api(
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let prompt = judge_prompt(&t.question, &t.ground_truth, &t.answer);
+            let prompt = task_judge_prompt(&t.category, &t.question, &t.ground_truth, &t.answer);
             (format!("judge_{i}"), prompt, None, 10usize)
         })
         .collect();

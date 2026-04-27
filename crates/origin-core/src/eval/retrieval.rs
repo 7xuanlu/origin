@@ -3738,6 +3738,7 @@ mod tests {
             answer: "Origin uses libSQL, which is Turso's fork of SQLite, for its database layer."
                 .to_string(),
             context_tokens: 50,
+            category: String::new(),
         };
 
         let result = judge_single_tuple(&tuple).await.unwrap();
