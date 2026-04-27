@@ -1178,69 +1178,77 @@ pub async fn run_fullpipeline_locomo_batch(
     };
 
     // --- Phase 1: Seed all conversations into one DB, enrich once ---
-    let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
-    let db = MemoryDB::new_with_shared_embedder(
-        tmp.path(),
-        Arc::new(NoopEmitter),
-        shared_embedder.clone(),
-    )
-    .await?;
+    // Use a stable DB path (sibling to output_path) so enrichment survives crashes.
+    let db_dir = output_path.with_extension("db");
+    std::fs::create_dir_all(&db_dir).ok();
+    let db =
+        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
+            .await?;
 
-    let mut total_obs = 0usize;
-    for sample in &samples {
-        let memories = extract_observations(sample);
-        if memories.is_empty() {
-            continue;
+    // Check if DB already has enriched data (from a previous interrupted run)
+    let existing_count = db.memory_count().await.unwrap_or(0);
+    if existing_count > 0 {
+        eprintln!(
+            "[fullpipeline] Resuming with existing enriched DB ({} memories)",
+            existing_count
+        );
+    } else {
+        let mut total_obs = 0usize;
+        for sample in &samples {
+            let memories = extract_observations(sample);
+            if memories.is_empty() {
+                continue;
+            }
+
+            let docs: Vec<RawDocument> = memories
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect();
+            total_obs += docs.len();
+            db.upsert_documents(docs).await?;
+            eprintln!(
+                "[fullpipeline] Seeded {} ({} observations)",
+                sample.sample_id,
+                memories.len()
+            );
         }
 
-        let docs: Vec<RawDocument> = memories
-            .iter()
-            .enumerate()
-            .map(|(i, mem)| RawDocument {
-                content: mem.content.clone(),
-                source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
-                source: "memory".to_string(),
-                title: format!("{} session {}", mem.speaker, mem.session_num),
-                memory_type: Some("fact".to_string()),
-                domain: Some("conversation".to_string()),
-                last_modified: chrono::Utc::now().timestamp(),
-                ..Default::default()
-            })
-            .collect();
-        total_obs += docs.len();
-        db.upsert_documents(docs).await?;
         eprintln!(
-            "[fullpipeline] Seeded {} ({} observations)",
-            sample.sample_id,
-            memories.len()
+            "[fullpipeline] Total: {} observations in 1 DB. Enriching via Batch API...",
+            total_obs
+        );
+        let entities =
+            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
+                .await?;
+        let titles = crate::eval::shared::run_title_enrichment_batch_api(
+            &db,
+            api_key,
+            answer_model,
+            cost_cap_usd,
+        )
+        .await?;
+        let concepts = crate::eval::shared::run_concept_distillation_batch_api(
+            &db,
+            api_key,
+            answer_model,
+            cost_cap_usd,
+        )
+        .await?;
+        eprintln!(
+            "[fullpipeline] Enriched: {} entities, {} titles, {} concepts",
+            entities, titles, concepts
         );
     }
-
-    eprintln!(
-        "[fullpipeline] Total: {} observations in 1 DB. Enriching via Batch API...",
-        total_obs
-    );
-    let entities =
-        crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
-            .await?;
-    let titles = crate::eval::shared::run_title_enrichment_batch_api(
-        &db,
-        api_key,
-        answer_model,
-        cost_cap_usd,
-    )
-    .await?;
-    let concepts = crate::eval::shared::run_concept_distillation_batch_api(
-        &db,
-        api_key,
-        answer_model,
-        cost_cap_usd,
-    )
-    .await?;
-    eprintln!(
-        "[fullpipeline] Enriched: {} entities, {} titles, {} concepts",
-        entities, titles, concepts
-    );
 
     // --- Phase 2: Collect contexts for all questions ---
     let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
@@ -1448,74 +1456,80 @@ pub async fn run_fullpipeline_lme_batch(
     };
 
     // --- Phase 1: Seed all questions' memories into one DB, enrich once ---
-    let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
-    let db = MemoryDB::new_with_shared_embedder(
-        tmp.path(),
-        Arc::new(NoopEmitter),
-        shared_embedder.clone(),
-    )
-    .await?;
+    let db_dir = output_path.with_extension("db");
+    std::fs::create_dir_all(&db_dir).ok();
+    let db =
+        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
+            .await?;
 
-    let mut total_mems = 0usize;
-    for sample in &samples {
-        let memories = extract_memories(sample);
-        if memories.is_empty() {
-            continue;
+    let existing_count = db.memory_count().await.unwrap_or(0);
+    if existing_count > 0 {
+        eprintln!(
+            "[fullpipeline_lme] Resuming with existing enriched DB ({} memories)",
+            existing_count
+        );
+    } else {
+        let mut total_mems = 0usize;
+        for sample in &samples {
+            let memories = extract_memories(sample);
+            if memories.is_empty() {
+                continue;
+            }
+
+            let docs: Vec<RawDocument> = memories
+                .iter()
+                .map(|mem| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!(
+                        "lme_{}_{}_t{}",
+                        sample.question_id, mem.session_idx, mem.turn_idx
+                    ),
+                    source: "memory".to_string(),
+                    title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                    memory_type: Some(
+                        if sample.question_type == "single-session-preference" {
+                            "preference"
+                        } else {
+                            "fact"
+                        }
+                        .to_string(),
+                    ),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect();
+            total_mems += docs.len();
+            db.upsert_documents(docs).await?;
         }
 
-        let docs: Vec<RawDocument> = memories
-            .iter()
-            .map(|mem| RawDocument {
-                content: mem.content.clone(),
-                source_id: format!(
-                    "lme_{}_{}_t{}",
-                    sample.question_id, mem.session_idx, mem.turn_idx
-                ),
-                source: "memory".to_string(),
-                title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
-                memory_type: Some(
-                    if sample.question_type == "single-session-preference" {
-                        "preference"
-                    } else {
-                        "fact"
-                    }
-                    .to_string(),
-                ),
-                domain: Some("conversation".to_string()),
-                last_modified: chrono::Utc::now().timestamp(),
-                ..Default::default()
-            })
-            .collect();
-        total_mems += docs.len();
-        db.upsert_documents(docs).await?;
+        eprintln!(
+            "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching via Batch API...",
+            total_mems,
+            samples.len()
+        );
+        let entities =
+            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
+                .await?;
+        let titles = crate::eval::shared::run_title_enrichment_batch_api(
+            &db,
+            api_key,
+            answer_model,
+            cost_cap_usd,
+        )
+        .await?;
+        let concepts = crate::eval::shared::run_concept_distillation_batch_api(
+            &db,
+            api_key,
+            answer_model,
+            cost_cap_usd,
+        )
+        .await?;
+        eprintln!(
+            "[fullpipeline_lme] Enriched: {} entities, {} titles, {} concepts",
+            entities, titles, concepts
+        );
     }
-
-    eprintln!(
-        "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching via Batch API...",
-        total_mems,
-        samples.len()
-    );
-    let entities =
-        crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
-            .await?;
-    let titles = crate::eval::shared::run_title_enrichment_batch_api(
-        &db,
-        api_key,
-        answer_model,
-        cost_cap_usd,
-    )
-    .await?;
-    let concepts = crate::eval::shared::run_concept_distillation_batch_api(
-        &db,
-        api_key,
-        answer_model,
-        cost_cap_usd,
-    )
-    .await?;
-    eprintln!(
-        "[fullpipeline_lme] Enriched: {} entities, {} titles, {} concepts",
-        entities, titles, concepts
-    );
 
     // --- Phase 2: Collect contexts ---
     let mut pending: HashMap<String, PendingAnswer> = HashMap::new();

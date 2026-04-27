@@ -1787,7 +1787,7 @@ async fn generate_fullpipeline_locomo() {
     let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5.0);
+        .unwrap_or(10.0);
 
     // On-device 9B for enrichment (free, better entity extraction than 4B)
     let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
@@ -1872,7 +1872,7 @@ async fn generate_fullpipeline_lme() {
     let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5.0);
+        .unwrap_or(10.0);
 
     let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
         match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen3.5-9b")) {
