@@ -1758,3 +1758,261 @@ async fn judge_e2e_batch() {
     }
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
+
+// ---------------------------------------------------------------------------
+// Full-Pipeline (Enrichment + Concepts) — Batch API
+// ---------------------------------------------------------------------------
+
+/// Full-pipeline LoCoMo: enrich on-device, batch-generate answers, reuse flat cache.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness generate_fullpipeline_locomo -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn generate_fullpipeline_locomo() {
+    use origin_lib::eval::answer_quality::run_fullpipeline_locomo_batch;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let answer_model =
+        std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5.0);
+
+    // On-device for enrichment (free)
+    let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
+        match origin_lib::llm_provider::OnDeviceProvider::new() {
+            Ok(p) => {
+                eprintln!("[fullpipeline] On-device LLM for enrichment");
+                Some(Arc::new(p))
+            }
+            Err(e) => {
+                eprintln!("[fullpipeline] On-device unavailable ({e}), using API for enrichment");
+                None
+            }
+        };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines).ok();
+
+    // Reuse cached flat answers from retrieval-only pipeline
+    let flat_cache = baselines.join("locomo_answered_haiku.json");
+    let flat_cache_path = if flat_cache.exists() {
+        Some(flat_cache.as_path())
+    } else {
+        None
+    };
+
+    let output_path = baselines.join("fullpipeline_locomo_tuples.json");
+
+    eprintln!(
+        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  flat cache: {}\n  output: {:?}",
+        answer_model,
+        cost_cap,
+        if flat_cache_path.is_some() {
+            "yes"
+        } else {
+            "no"
+        },
+        output_path,
+    );
+
+    let tuples = run_fullpipeline_locomo_batch(
+        &locomo_path,
+        enrichment_llm,
+        &api_key,
+        &answer_model,
+        flat_cache_path,
+        &output_path,
+        cost_cap,
+    )
+    .await
+    .expect("fullpipeline locomo failed");
+
+    eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
+}
+
+/// Full-pipeline LME: enrich on-device, batch-generate answers, reuse flat cache.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness generate_fullpipeline_lme -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn generate_fullpipeline_lme() {
+    use origin_lib::eval::answer_quality::run_fullpipeline_lme_batch;
+    use std::sync::Arc;
+
+    let lme_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !lme_path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let answer_model =
+        std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5.0);
+
+    let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
+        match origin_lib::llm_provider::OnDeviceProvider::new() {
+            Ok(p) => {
+                eprintln!("[fullpipeline] On-device LLM for enrichment");
+                Some(Arc::new(p))
+            }
+            Err(e) => {
+                eprintln!("[fullpipeline] On-device unavailable ({e}), using API for enrichment");
+                None
+            }
+        };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines).ok();
+
+    let flat_cache = baselines.join("lme_answered_haiku.json");
+    let flat_cache_path = if flat_cache.exists() {
+        Some(flat_cache.as_path())
+    } else {
+        None
+    };
+
+    let output_path = baselines.join("fullpipeline_lme_tuples.json");
+
+    eprintln!(
+        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  flat cache: {} (500 answers)\n  output: {:?}",
+        answer_model,
+        cost_cap,
+        if flat_cache_path.is_some() { "yes" } else { "no" },
+        output_path,
+    );
+
+    let tuples = run_fullpipeline_lme_batch(
+        &lme_path,
+        enrichment_llm,
+        &api_key,
+        &answer_model,
+        flat_cache_path,
+        &output_path,
+        cost_cap,
+    )
+    .await
+    .expect("fullpipeline lme failed");
+
+    eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
+}
+
+/// Judge full-pipeline tuples for LoCoMo via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness judge_fullpipeline_locomo -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_locomo() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_locomo first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let judge_model = std::env::var("EVAL_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    eprintln!(
+        "=== Full-Pipeline LoCoMo Judge ({} tuples, judge={}) ===",
+        tuples.len(),
+        judge_model
+    );
+
+    let results = judge_with_batch_api(&tuples, &judge_model, None)
+        .await
+        .expect("batch judge failed");
+
+    let report = aggregate_judgments(&results, &judge_model);
+    eprintln!(
+        "\n{:<30} | {:>8} | {:>6} | {:>10}",
+        "Approach", "Accuracy", "N", "Ctx Tokens"
+    );
+    eprintln!("{:-<30}-+-{:-<8}-+-{:-<6}-+-{:-<10}", "", "", "", "");
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<30} | {:>7.1}% | {:>6} | {:>10.0}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.total,
+            r.mean_context_tokens
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
+
+/// Judge full-pipeline tuples for LME via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness judge_fullpipeline_lme -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_lme() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_lme first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let judge_model = std::env::var("EVAL_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    eprintln!(
+        "=== Full-Pipeline LME Judge ({} tuples, judge={}) ===",
+        tuples.len(),
+        judge_model
+    );
+
+    let results = judge_with_batch_api(&tuples, &judge_model, None)
+        .await
+        .expect("batch judge failed");
+
+    let report = aggregate_judgments(&results, &judge_model);
+    eprintln!(
+        "\n{:<30} | {:>8} | {:>6} | {:>10}",
+        "Approach", "Accuracy", "N", "Ctx Tokens"
+    );
+    eprintln!("{:-<30}-+-{:-<8}-+-{:-<6}-+-{:-<10}", "", "", "", "");
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<30} | {:>7.1}% | {:>6} | {:>10.0}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.total,
+            r.mean_context_tokens
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}

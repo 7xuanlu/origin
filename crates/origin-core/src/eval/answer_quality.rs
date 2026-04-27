@@ -1055,3 +1055,625 @@ pub async fn run_e2e_context_eval_longmemeval(
 
     Ok(all_tuples)
 }
+
+// ===== Batch-based full-scale variants =====
+
+/// Metadata for a pending answer request, submitted via Batch API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingAnswer {
+    question: String,
+    ground_truth: String,
+    approach: String,
+    context_tokens: usize,
+}
+
+/// System prompt used for all E2E answer generation.
+const E2E_SYSTEM_PROMPT: &str =
+    "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.";
+
+/// Build flat + structured contexts for a question against an enriched DB.
+///
+/// Returns `(flat_context, structured_context)`. The flat context uses only
+/// `search_memory` results; structured adds concept articles on top.
+async fn build_contexts(
+    db: &MemoryDB,
+    question: &str,
+    search_limit: usize,
+) -> Result<(String, String), OriginError> {
+    // Flat: search_memory only
+    let results = db
+        .search_memory(
+            question,
+            search_limit,
+            None,
+            Some("conversation"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let flat_context: String = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Structured: concepts + search results
+    let mut parts: Vec<String> = Vec::new();
+    let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
+    if !concepts.is_empty() {
+        parts.push("## Compiled Knowledge".to_string());
+        for c in &concepts {
+            let summary = c.summary.as_deref().unwrap_or("");
+            parts.push(format!("**{}**: {}\n{}", c.title, summary, c.content));
+        }
+    }
+    if !results.is_empty() {
+        parts.push("## Relevant Memories".to_string());
+        for (i, r) in results.iter().enumerate() {
+            parts.push(format!("{}. {}", i + 1, r.content));
+        }
+    }
+    let structured_context = parts.join("\n\n");
+
+    Ok((flat_context, structured_context))
+}
+
+/// Full-pipeline LoCoMo eval using Batch API for answer generation.
+///
+/// **Phase 1** (on-device, free): Enrich each conversation, collect contexts.
+/// **Phase 2** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
+/// **Phase 3** (instant): Merge batch results + cached flat answers into tuples.
+///
+/// - `enrichment_llm`: on-device LLM for entity extraction + concept distillation (free).
+///   Falls back to submitting enrichment through the Batch API model if None.
+/// - `api_key`: Anthropic API key for Batch API.
+/// - `answer_model`: model ID for answer generation (e.g. `claude-haiku-4-5-20251001`).
+/// - `flat_cache_path`: optional path to cached flat answers (e.g. `locomo_answered_haiku.json`).
+///   Reuses existing flat answers instead of regenerating them.
+/// - `output_path`: final tuples saved here. Also used for resume (skip already-done convs).
+/// - `cost_cap_usd`: max spend for the batch. Default $5.
+pub async fn run_fullpipeline_locomo_batch(
+    locomo_path: &Path,
+    enrichment_llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
+    api_key: &str,
+    answer_model: &str,
+    flat_cache_path: Option<&Path>,
+    output_path: &Path,
+    cost_cap_usd: f64,
+) -> Result<Vec<JudgmentTuple>, OriginError> {
+    use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
+    use crate::eval::judge::save_judgment_tuples;
+    use crate::eval::locomo::{category_name, extract_observations, load_locomo};
+    use crate::prompts::PromptRegistry;
+    use crate::tuning::DistillationConfig;
+
+    let samples = load_locomo(locomo_path)?;
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let tuning = DistillationConfig::default();
+    let shared_embedder = eval_shared_embedder();
+
+    // Resume: load existing tuples
+    let mut finished_tuples: Vec<JudgmentTuple> = if output_path.exists() {
+        let existing = crate::eval::judge::load_judgment_tuples(output_path)
+            .map_err(|e| OriginError::Generic(format!("load resume file: {e}")))?;
+        eprintln!(
+            "[fullpipeline] Resuming with {} existing tuples",
+            existing.len()
+        );
+        existing
+    } else {
+        Vec::new()
+    };
+    let done_questions: std::collections::HashSet<String> =
+        finished_tuples.iter().map(|t| t.question.clone()).collect();
+
+    // Load flat answer cache
+    let flat_cache: HashMap<String, (String, usize)> = load_flat_cache_locomo(flat_cache_path);
+    if !flat_cache.is_empty() {
+        eprintln!(
+            "[fullpipeline] Loaded {} cached flat answers",
+            flat_cache.len()
+        );
+    }
+
+    // --- Phase 1: Enrich + collect contexts ---
+    // Map custom_id -> PendingAnswer metadata
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    // Batch requests: (custom_id, prompt, system, max_tokens)
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    let enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
+        Some(llm) => llm,
+        None => {
+            eprintln!("[fullpipeline] No enrichment LLM, using API for enrichment too");
+            Arc::new(crate::llm_provider::ApiProvider::new(
+                api_key.to_string(),
+                answer_model.to_string(),
+            ))
+        }
+    };
+
+    for (conv_idx, sample) in samples.iter().enumerate() {
+        let memories = extract_observations(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        // Check if ALL questions in this conv are already done
+        let conv_questions: Vec<&str> = sample
+            .qa
+            .iter()
+            .filter(|qa| qa.category != 5)
+            .map(|qa| qa.question.as_str())
+            .collect();
+        if !conv_questions.is_empty() && conv_questions.iter().all(|q| done_questions.contains(*q))
+        {
+            eprintln!(
+                "[fullpipeline] Conv {}/{} ({}) — skipped (already done)",
+                conv_idx + 1,
+                samples.len(),
+                sample.sample_id
+            );
+            continue;
+        }
+
+        eprintln!(
+            "[fullpipeline] Conv {}/{} ({}): {} observations",
+            conv_idx + 1,
+            samples.len(),
+            sample.sample_id,
+            memories.len()
+        );
+
+        // Seed + enrich
+        let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
+        let docs: Vec<RawDocument> = memories
+            .iter()
+            .enumerate()
+            .map(|(i, mem)| RawDocument {
+                content: mem.content.clone(),
+                source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+                source: "memory".to_string(),
+                title: format!("{} session {}", mem.speaker, mem.session_num),
+                memory_type: Some("fact".to_string()),
+                domain: Some("conversation".to_string()),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            })
+            .collect();
+        db.upsert_documents(docs).await?;
+
+        eprintln!("  [enriching]...");
+        let entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
+        let concepts =
+            crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None)
+                .await?;
+        eprintln!("  [enriched] {} entities, {} concepts", entities, concepts);
+
+        // Collect contexts for each question
+        let mut q_count = 0usize;
+        for qa in &sample.qa {
+            if qa.category == 5 {
+                continue;
+            }
+            if done_questions.contains(&qa.question) {
+                continue;
+            }
+
+            let ground_truth = qa
+                .answer
+                .as_ref()
+                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                .unwrap_or_default();
+            if ground_truth.is_empty() {
+                continue;
+            }
+
+            let category = category_name(qa.category);
+            let (flat_ctx, structured_ctx) = build_contexts(&db, &qa.question, 10).await?;
+            let flat_tokens = count_tokens(&flat_ctx);
+            let structured_tokens = count_tokens(&structured_ctx);
+
+            // Flat approach: use cache if available, otherwise add to batch
+            if let Some((cached_answer, cached_tokens)) = flat_cache.get(&qa.question) {
+                finished_tuples.push(JudgmentTuple {
+                    question: qa.question.clone(),
+                    ground_truth: ground_truth.clone(),
+                    approach: format!("flat_{}", category),
+                    answer: cached_answer.clone(),
+                    context_tokens: *cached_tokens,
+                });
+            } else {
+                let flat_id = format!("flat_{}_{}", sample.sample_id, q_count);
+                batch_requests.push((
+                    flat_id.clone(),
+                    format!("Context:\n{}\n\nQuestion: {}", flat_ctx, qa.question),
+                    Some(E2E_SYSTEM_PROMPT.to_string()),
+                    200,
+                ));
+                pending.insert(
+                    flat_id,
+                    PendingAnswer {
+                        question: qa.question.clone(),
+                        ground_truth: ground_truth.clone(),
+                        approach: format!("flat_{}", category),
+                        context_tokens: flat_tokens,
+                    },
+                );
+            }
+
+            // Structured approach: always needs generation
+            let structured_id = format!("structured_{}_{}", sample.sample_id, q_count);
+            batch_requests.push((
+                structured_id.clone(),
+                format!("Context:\n{}\n\nQuestion: {}", structured_ctx, qa.question),
+                Some(E2E_SYSTEM_PROMPT.to_string()),
+                200,
+            ));
+            pending.insert(
+                structured_id,
+                PendingAnswer {
+                    question: qa.question.clone(),
+                    ground_truth,
+                    approach: format!("structured_{}", category),
+                    context_tokens: structured_tokens,
+                },
+            );
+
+            q_count += 1;
+        }
+        eprintln!("  Collected {} question contexts", q_count);
+    }
+
+    if batch_requests.is_empty() {
+        eprintln!("[fullpipeline] No new requests needed — all done from cache + resume");
+        save_judgment_tuples(&finished_tuples, output_path)
+            .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+        return Ok(finished_tuples);
+    }
+
+    // --- Phase 2: Submit batch ---
+    eprintln!(
+        "\n[fullpipeline] Submitting {} answer requests via Batch API (model={})",
+        batch_requests.len(),
+        answer_model
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+
+    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+    eprintln!("[fullpipeline] Batch submitted: {}", batch_id);
+
+    let results_url = poll_batch(&client, api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+    let raw_results = download_batch_results(&client, api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+
+    // --- Phase 3: Merge ---
+    let mut matched = 0usize;
+    for (custom_id, answer) in &raw_results {
+        if let Some(meta) = pending.get(custom_id) {
+            finished_tuples.push(JudgmentTuple {
+                question: meta.question.clone(),
+                ground_truth: meta.ground_truth.clone(),
+                approach: meta.approach.clone(),
+                answer: answer.clone(),
+                context_tokens: meta.context_tokens,
+            });
+            matched += 1;
+        }
+    }
+
+    eprintln!(
+        "[fullpipeline] Batch returned {} results, matched {} pending requests",
+        raw_results.len(),
+        matched
+    );
+
+    save_judgment_tuples(&finished_tuples, output_path)
+        .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+    eprintln!(
+        "[fullpipeline] Saved {} total tuples to {:?}",
+        finished_tuples.len(),
+        output_path
+    );
+
+    Ok(finished_tuples)
+}
+
+/// Full-pipeline LongMemEval eval using Batch API for answer generation.
+///
+/// Same architecture as [`run_fullpipeline_locomo_batch`]: enrich on-device,
+/// batch-generate answers, merge with cached flat answers.
+pub async fn run_fullpipeline_lme_batch(
+    longmemeval_path: &Path,
+    enrichment_llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
+    api_key: &str,
+    answer_model: &str,
+    flat_cache_path: Option<&Path>,
+    output_path: &Path,
+    cost_cap_usd: f64,
+) -> Result<Vec<JudgmentTuple>, OriginError> {
+    use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
+    use crate::eval::judge::save_judgment_tuples;
+    use crate::eval::longmemeval::{category_name, extract_memories, load_longmemeval};
+    use crate::prompts::PromptRegistry;
+    use crate::tuning::DistillationConfig;
+
+    let samples = load_longmemeval(longmemeval_path)?;
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let tuning = DistillationConfig::default();
+    let shared_embedder = eval_shared_embedder();
+
+    // Resume
+    let mut finished_tuples: Vec<JudgmentTuple> = if output_path.exists() {
+        let existing = crate::eval::judge::load_judgment_tuples(output_path)
+            .map_err(|e| OriginError::Generic(format!("load resume: {e}")))?;
+        eprintln!(
+            "[fullpipeline_lme] Resuming with {} existing tuples",
+            existing.len()
+        );
+        existing
+    } else {
+        Vec::new()
+    };
+    let done_questions: std::collections::HashSet<String> =
+        finished_tuples.iter().map(|t| t.question.clone()).collect();
+
+    // Flat cache
+    let flat_cache: HashMap<String, (String, usize)> = load_flat_cache_lme(flat_cache_path);
+    if !flat_cache.is_empty() {
+        eprintln!(
+            "[fullpipeline_lme] Loaded {} cached flat answers",
+            flat_cache.len()
+        );
+    }
+
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    let enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
+        Some(llm) => llm,
+        None => {
+            eprintln!("[fullpipeline_lme] No enrichment LLM, using API");
+            Arc::new(crate::llm_provider::ApiProvider::new(
+                api_key.to_string(),
+                answer_model.to_string(),
+            ))
+        }
+    };
+
+    for (q_idx, sample) in samples.iter().enumerate() {
+        if done_questions.contains(&sample.question) {
+            continue;
+        }
+
+        let memories = extract_memories(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        if q_idx % 50 == 0 {
+            eprintln!(
+                "[fullpipeline_lme] Q {}/{} ({}): {} memories",
+                q_idx + 1,
+                samples.len(),
+                sample.question_id,
+                memories.len()
+            );
+        }
+
+        // Seed + enrich
+        let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
+        let db = MemoryDB::new_with_shared_embedder(
+            tmp.path(),
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await?;
+        let docs: Vec<RawDocument> = memories
+            .iter()
+            .map(|mem| RawDocument {
+                content: mem.content.clone(),
+                source_id: format!(
+                    "lme_{}_{}_t{}",
+                    sample.question_id, mem.session_idx, mem.turn_idx
+                ),
+                source: "memory".to_string(),
+                title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                memory_type: Some(
+                    if sample.question_type == "single-session-preference" {
+                        "preference"
+                    } else {
+                        "fact"
+                    }
+                    .to_string(),
+                ),
+                domain: Some("conversation".to_string()),
+                last_modified: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            })
+            .collect();
+        db.upsert_documents(docs).await?;
+
+        let _entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
+        let _concepts =
+            crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None)
+                .await?;
+
+        let ground_truth = sample
+            .answer
+            .as_str()
+            .unwrap_or(&sample.answer.to_string())
+            .to_string();
+        if ground_truth.is_empty() {
+            continue;
+        }
+
+        let category = category_name(&sample.question_type);
+        let (flat_ctx, structured_ctx) = build_contexts(&db, &sample.question, 10).await?;
+        let flat_tokens = count_tokens(&flat_ctx);
+        let structured_tokens = count_tokens(&structured_ctx);
+
+        // Flat: cache or batch
+        if let Some((cached_answer, cached_tokens)) = flat_cache.get(&sample.question) {
+            finished_tuples.push(JudgmentTuple {
+                question: sample.question.clone(),
+                ground_truth: ground_truth.clone(),
+                approach: format!("flat_{}", category),
+                answer: cached_answer.clone(),
+                context_tokens: *cached_tokens,
+            });
+        } else {
+            let flat_id = format!("flat_lme_{}", q_idx);
+            batch_requests.push((
+                flat_id.clone(),
+                format!("Context:\n{}\n\nQuestion: {}", flat_ctx, sample.question),
+                Some(E2E_SYSTEM_PROMPT.to_string()),
+                200,
+            ));
+            pending.insert(
+                flat_id,
+                PendingAnswer {
+                    question: sample.question.clone(),
+                    ground_truth: ground_truth.clone(),
+                    approach: format!("flat_{}", category),
+                    context_tokens: flat_tokens,
+                },
+            );
+        }
+
+        // Structured: always batch
+        let structured_id = format!("structured_lme_{}", q_idx);
+        batch_requests.push((
+            structured_id.clone(),
+            format!(
+                "Context:\n{}\n\nQuestion: {}",
+                structured_ctx, sample.question
+            ),
+            Some(E2E_SYSTEM_PROMPT.to_string()),
+            200,
+        ));
+        pending.insert(
+            structured_id,
+            PendingAnswer {
+                question: sample.question.clone(),
+                ground_truth,
+                approach: format!("structured_{}", category),
+                context_tokens: structured_tokens,
+            },
+        );
+    }
+
+    if batch_requests.is_empty() {
+        eprintln!("[fullpipeline_lme] No new requests — all cached/resumed");
+        save_judgment_tuples(&finished_tuples, output_path)
+            .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+        return Ok(finished_tuples);
+    }
+
+    // Submit batch
+    eprintln!(
+        "\n[fullpipeline_lme] Submitting {} requests via Batch API (model={})",
+        batch_requests.len(),
+        answer_model
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+
+    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+    eprintln!("[fullpipeline_lme] Batch submitted: {}", batch_id);
+
+    let results_url = poll_batch(&client, api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+    let raw_results = download_batch_results(&client, api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+
+    let mut matched = 0usize;
+    for (custom_id, answer) in &raw_results {
+        if let Some(meta) = pending.get(custom_id) {
+            finished_tuples.push(JudgmentTuple {
+                question: meta.question.clone(),
+                ground_truth: meta.ground_truth.clone(),
+                approach: meta.approach.clone(),
+                answer: answer.clone(),
+                context_tokens: meta.context_tokens,
+            });
+            matched += 1;
+        }
+    }
+
+    eprintln!(
+        "[fullpipeline_lme] Batch: {} results, {} matched",
+        raw_results.len(),
+        matched
+    );
+
+    save_judgment_tuples(&finished_tuples, output_path)
+        .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+    eprintln!(
+        "[fullpipeline_lme] Saved {} total tuples to {:?}",
+        finished_tuples.len(),
+        output_path
+    );
+
+    Ok(finished_tuples)
+}
+
+// ===== Flat cache loaders =====
+
+/// Load cached LoCoMo flat answers: question -> (answer, context_tokens).
+fn load_flat_cache_locomo(path: Option<&Path>) -> HashMap<String, (String, usize)> {
+    let path = match path {
+        Some(p) if p.exists() => p,
+        _ => return HashMap::new(),
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let items: Vec<serde_json::Value> = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let question = item["question"].as_str()?.to_string();
+            let answer = item["model_answer"].as_str()?.to_string();
+            let tokens = item["context_tokens"].as_u64().unwrap_or(0) as usize;
+            Some((question, (answer, tokens)))
+        })
+        .collect()
+}
+
+/// Load cached LME flat answers: question -> (answer, context_tokens).
+fn load_flat_cache_lme(path: Option<&Path>) -> HashMap<String, (String, usize)> {
+    // Same format as LoCoMo
+    load_flat_cache_locomo(path)
+}
