@@ -1961,21 +1961,7 @@ async fn judge_fullpipeline_locomo() {
         .expect("batch judge failed");
 
     let report = aggregate_judgments(&results, &judge_model);
-    eprintln!(
-        "\n{:<30} | {:>8} | {:>6} | {:>10}",
-        "Approach", "Accuracy", "N", "Ctx Tokens"
-    );
-    eprintln!("{:-<30}-+-{:-<8}-+-{:-<6}-+-{:-<10}", "", "", "", "");
-    for r in &report.results_by_approach {
-        eprintln!(
-            "{:<30} | {:>7.1}% | {:>6} | {:>10.0}",
-            r.approach,
-            r.accuracy * 100.0,
-            r.total,
-            r.mean_context_tokens
-        );
-    }
-    eprintln!("\nTotal judged: {}", report.total_judged);
+    print_judge_report(&report);
 }
 
 /// Judge full-pipeline tuples for LME via Batch API.
@@ -2012,21 +1998,7 @@ async fn judge_fullpipeline_lme() {
         .expect("batch judge failed");
 
     let report = aggregate_judgments(&results, &judge_model);
-    eprintln!(
-        "\n{:<30} | {:>8} | {:>6} | {:>10}",
-        "Approach", "Accuracy", "N", "Ctx Tokens"
-    );
-    eprintln!("{:-<30}-+-{:-<8}-+-{:-<6}-+-{:-<10}", "", "", "", "");
-    for r in &report.results_by_approach {
-        eprintln!(
-            "{:<30} | {:>7.1}% | {:>6} | {:>10.0}",
-            r.approach,
-            r.accuracy * 100.0,
-            r.total,
-            r.mean_context_tokens
-        );
-    }
-    eprintln!("\nTotal judged: {}", report.total_judged);
+    print_judge_report(&report);
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,10 +2197,20 @@ async fn smoke_fullpipeline() {
 }
 
 /// Judge LME tuples via Claude CLI (Max plan, no API key).
+///
+/// Uses task-specific judge prompts matching the LongMemEval paper.
+/// Concurrency configurable via EVAL_CLI_CONCURRENCY (default 8).
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness judge_fullpipeline_lme_cli -- --ignored --nocapture
+/// EVAL_CLI_CONCURRENCY=4 cargo test -p origin --test eval_harness judge_fullpipeline_lme_cli -- --ignored --nocapture
+/// ```
 #[tokio::test]
 #[ignore]
 async fn judge_fullpipeline_lme_cli() {
-    use origin_lib::eval::judge::{aggregate_judgments, judge_with_claude, load_judgment_tuples};
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
     if !tuples_path.exists() {
@@ -2236,14 +2218,72 @@ async fn judge_fullpipeline_lme_cli() {
         return;
     }
     let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
-    eprintln!("Judging {} LME tuples via CLI (Max plan)...", tuples.len());
-    let results = judge_with_claude(&tuples, 5).await.expect("judge failed");
-    let report = aggregate_judgments(&results, "haiku-cli");
+    let concurrency: usize = std::env::var("EVAL_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+
+    eprintln!(
+        "Judging {} LME tuples via CLI (model={}, concurrency={})...",
+        tuples.len(),
+        model,
+        concurrency
+    );
+    let results = judge_with_claude_model(&tuples, concurrency, &model)
+        .await
+        .expect("judge failed");
+    let report = aggregate_judgments(&results, &format!("{}-cli", model));
+
+    print_judge_report(&report);
+}
+
+/// Judge LoCoMo tuples via Claude CLI (Max plan, no API key).
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness judge_fullpipeline_locomo_cli -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_locomo_cli() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_locomo first");
+        return;
+    }
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let concurrency: usize = std::env::var("EVAL_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+
+    eprintln!(
+        "Judging {} LoCoMo tuples via CLI (model={}, concurrency={})...",
+        tuples.len(),
+        model,
+        concurrency
+    );
+    let results = judge_with_claude_model(&tuples, concurrency, &model)
+        .await
+        .expect("judge failed");
+    let report = aggregate_judgments(&results, &format!("{}-cli", model));
+
+    print_judge_report(&report);
+}
+
+/// Print a judge report with per-category breakdown and task-averaged accuracy.
+fn print_judge_report(report: &origin_lib::eval::judge::JudgedE2EReport) {
     eprintln!(
         "\n{:<30} | {:>8} | {:>6} | {:>10}",
         "Approach", "Accuracy", "N", "Ctx Tokens"
     );
     eprintln!("{:-<30}-+-{:-<8}-+-{:-<6}-+-{:-<10}", "", "", "", "");
+    let mut task_accs = Vec::new();
     for r in &report.results_by_approach {
         eprintln!(
             "{:<30} | {:>7.1}% | {:>6} | {:>10.0}",
@@ -2252,6 +2292,13 @@ async fn judge_fullpipeline_lme_cli() {
             r.total,
             r.mean_context_tokens
         );
+        task_accs.push(r.accuracy);
     }
+    let task_avg = if task_accs.is_empty() {
+        0.0
+    } else {
+        task_accs.iter().sum::<f64>() / task_accs.len() as f64 * 100.0
+    };
     eprintln!("\nTotal judged: {}", report.total_judged);
+    eprintln!("Task-averaged accuracy: {:.1}%", task_avg);
 }
