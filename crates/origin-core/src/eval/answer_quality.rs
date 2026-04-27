@@ -1185,14 +1185,27 @@ pub async fn run_fullpipeline_locomo_batch(
         MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
             .await?;
 
-    // Check if DB already has enriched data (from a previous interrupted run)
-    let existing_count = db.memory_count().await.unwrap_or(0);
-    if existing_count > 0 {
+    // Check if DB already has COMPLETE enrichment (not just partial data).
+    // Enrichment is complete when enrichment_steps rows exist for memories.
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
+    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
+
+    if enrichment_complete {
         eprintln!(
-            "[fullpipeline] Resuming with existing enriched DB ({} memories)",
-            existing_count
+            "[fullpipeline] Resuming with enriched DB ({} memories, all enriched)",
+            mem_count
         );
     } else {
+        // Wipe partial data and start fresh to avoid inconsistencies
+        if mem_count > 0 && enriched_count < mem_count {
+            eprintln!(
+                "[fullpipeline] Partial data found ({}/{} enriched). Starting fresh.",
+                enriched_count, mem_count
+            );
+            db.clear_all_for_eval().await?;
+        }
+
         let mut total_obs = 0usize;
         for sample in &samples {
             let memories = extract_observations(sample);
@@ -1462,13 +1475,23 @@ pub async fn run_fullpipeline_lme_batch(
         MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
             .await?;
 
-    let existing_count = db.memory_count().await.unwrap_or(0);
-    if existing_count > 0 {
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
+    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
+
+    if enrichment_complete {
         eprintln!(
-            "[fullpipeline_lme] Resuming with existing enriched DB ({} memories)",
-            existing_count
+            "[fullpipeline_lme] Resuming with enriched DB ({} memories, all enriched)",
+            mem_count
         );
     } else {
+        if mem_count > 0 && enriched_count < mem_count {
+            eprintln!(
+                "[fullpipeline_lme] Partial data ({}/{} enriched). Starting fresh.",
+                enriched_count, mem_count
+            );
+            db.clear_all_for_eval().await?;
+        }
         let mut total_mems = 0usize;
         for sample in &samples {
             let memories = extract_memories(sample);

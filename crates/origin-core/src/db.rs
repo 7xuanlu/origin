@@ -12095,6 +12095,48 @@ impl MemoryDB {
         )
     }
 
+    /// Count memories that have been through enrichment (have enrichment_steps rows).
+    pub async fn enriched_memory_count(&self) -> Result<usize, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(DISTINCT es.source_id) FROM enrichment_steps es
+                 JOIN memories m ON m.source_id = es.source_id
+                 WHERE m.source = 'memory' AND m.chunk_index = 0",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("enriched_count: {e}")))?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get::<i64>(0).unwrap_or(0) as usize),
+            _ => Ok(0),
+        }
+    }
+
+    /// Clear all data for eval re-run (wipe partial state).
+    pub async fn clear_all_for_eval(&self) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        for table in &[
+            "enrichment_steps",
+            "observations",
+            "relations",
+            "entity_aliases",
+            "entities",
+            "memories",
+        ] {
+            conn.execute(&format!("DELETE FROM {}", table), ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("clear {}: {e}", table)))?;
+        }
+        for table in &["concepts", "concept_sources"] {
+            conn.execute(&format!("DELETE FROM {}", table), ())
+                .await
+                .ok();
+        }
+        eprintln!("[eval_db] Cleared all data for fresh start");
+        Ok(())
+    }
+
     /// Quick count of memories in the DB (for resume detection).
     pub async fn memory_count(&self) -> Result<usize, OriginError> {
         let conn = self.conn.lock().await;
