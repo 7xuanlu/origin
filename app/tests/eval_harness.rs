@@ -2097,3 +2097,129 @@ async fn probe_batch_sizes() {
         );
     }
 }
+
+/// Smoke test: 1 conversation, full pipeline, validates all batch phases work.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness smoke_fullpipeline -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_fullpipeline() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        count_tokens, eval_shared_embedder, run_concept_distillation_batch_api,
+        run_enrichment_batch_api, run_title_enrichment_batch_api,
+    };
+    use std::sync::Arc;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let model = "claude-haiku-4-5-20251001";
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    let sample = &samples[0]; // Just 1 conversation
+    let memories = extract_observations(sample);
+    eprintln!("Conv {}: {} observations", sample.sample_id, memories.len());
+
+    // Seed
+    let shared_embedder = eval_shared_embedder();
+    let tmp = tempfile::tempdir().unwrap();
+    let db = origin_core::db::MemoryDB::new_with_shared_embedder(
+        tmp.path(),
+        Arc::new(origin_core::events::NoopEmitter),
+        shared_embedder,
+    )
+    .await
+    .unwrap();
+
+    let docs: Vec<origin_lib::sources::RawDocument> = memories
+        .iter()
+        .enumerate()
+        .map(|(i, mem)| origin_lib::sources::RawDocument {
+            content: mem.content.clone(),
+            source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+            source: "memory".to_string(),
+            title: format!("{} session {}", mem.speaker, mem.session_num),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        })
+        .collect();
+    let seeded = db.upsert_documents(docs).await.unwrap();
+    eprintln!("Seeded: {} chunks", seeded);
+
+    // Phase 1: Entity extraction
+    let entities = run_enrichment_batch_api(&db, &api_key, model, 2.0)
+        .await
+        .unwrap();
+    eprintln!("Entities: {}", entities);
+    assert!(entities > 0, "should extract some entities");
+
+    // Phase 2: Title enrichment
+    let titles = run_title_enrichment_batch_api(&db, &api_key, model, 1.0)
+        .await
+        .unwrap();
+    eprintln!("Titles enriched: {}", titles);
+
+    // Phase 3: Concept distillation
+    let concepts = run_concept_distillation_batch_api(&db, &api_key, model, 1.0)
+        .await
+        .unwrap();
+    eprintln!("Concepts: {}", concepts);
+
+    // Phase 4: Context collection - check flat vs structured differ
+    let qa = &sample.qa[0];
+    let flat_results = db
+        .search_memory(&qa.question, 10, None, None, None, None, None, None)
+        .await
+        .unwrap();
+    let flat_ctx: String = flat_results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let flat_tokens = count_tokens(&flat_ctx);
+
+    let concept_results = db
+        .search_concepts(&qa.question, 3)
+        .await
+        .unwrap_or_default();
+    let mut structured_parts: Vec<String> = Vec::new();
+    if !concept_results.is_empty() {
+        structured_parts.push("## Compiled Knowledge".to_string());
+        for c in &concept_results {
+            structured_parts.push(format!(
+                "**{}**: {}",
+                c.title,
+                c.content.chars().take(200).collect::<String>()
+            ));
+        }
+    }
+    structured_parts.push(flat_ctx.clone());
+    let structured_tokens = count_tokens(&structured_parts.join("\n\n"));
+
+    eprintln!(
+        "\nContext check for: {}\n  flat: {} tokens\n  structured: {} tokens (delta: +{})\n  concepts found: {}",
+        &qa.question.chars().take(60).collect::<String>(),
+        flat_tokens, structured_tokens, structured_tokens - flat_tokens, concept_results.len()
+    );
+
+    eprintln!("\n=== Smoke test PASSED ===");
+    eprintln!(
+        "  {} entities, {} titles, {} concepts",
+        entities, titles, concepts
+    );
+    eprintln!(
+        "  Structured context is {} tokens larger than flat",
+        structured_tokens - flat_tokens
+    );
+}

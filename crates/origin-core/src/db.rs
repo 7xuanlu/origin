@@ -12104,7 +12104,9 @@ impl MemoryDB {
             .query(
                 "SELECT source_id, content FROM memories
                  WHERE source = 'memory' AND chunk_index = 0
-                   AND (title LIKE '%...' OR length(title) >= 75)",
+                   AND (title LIKE '%...' OR length(title) >= 75
+                        OR title LIKE '% session %'
+                        OR title = substr(content, 1, length(title)))",
                 (),
             )
             .await
