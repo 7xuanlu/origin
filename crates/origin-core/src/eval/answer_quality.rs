@@ -1079,19 +1079,11 @@ async fn build_contexts(
     db: &MemoryDB,
     question: &str,
     search_limit: usize,
+    domain: Option<&str>,
 ) -> Result<(String, String), OriginError> {
     // Flat: search_memory only
     let results = db
-        .search_memory(
-            question,
-            search_limit,
-            None,
-            Some("conversation"),
-            None,
-            None,
-            None,
-            None,
-        )
+        .search_memory(question, search_limit, None, domain, None, None, None, None)
         .await?;
     let flat_context: String = results
         .iter()
@@ -1123,18 +1115,14 @@ async fn build_contexts(
 
 /// Full-pipeline LoCoMo eval using Batch API for answer generation.
 ///
-/// **Phase 1** (on-device, free): Enrich each conversation, collect contexts.
-/// **Phase 2** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
-/// **Phase 3** (instant): Merge batch results + cached flat answers into tuples.
+/// **Single DB**: all conversations seeded into one database, each tagged with
+/// a conversation-specific domain. Enrichment runs once across all data, so
+/// entities accumulate and concepts can form from cross-observation clusters.
 ///
-/// - `enrichment_llm`: on-device LLM for entity extraction + concept distillation (free).
-///   Falls back to submitting enrichment through the Batch API model if None.
-/// - `api_key`: Anthropic API key for Batch API.
-/// - `answer_model`: model ID for answer generation (e.g. `claude-haiku-4-5-20251001`).
-/// - `flat_cache_path`: optional path to cached flat answers (e.g. `locomo_answered_haiku.json`).
-///   Reuses existing flat answers instead of regenerating them.
-/// - `output_path`: final tuples saved here. Also used for resume (skip already-done convs).
-/// - `cost_cap_usd`: max spend for the batch. Default $5.
+/// **Phase 1** (on-device, free): Seed all conversations, enrich once.
+/// **Phase 2** (free): Collect contexts for all questions (search with domain filter).
+/// **Phase 3** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
+/// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
 pub async fn run_fullpipeline_locomo_batch(
     locomo_path: &Path,
     enrichment_llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
@@ -1155,10 +1143,10 @@ pub async fn run_fullpipeline_locomo_batch(
     let tuning = DistillationConfig::default();
     let shared_embedder = eval_shared_embedder();
 
-    // Resume: load existing tuples
+    // Resume
     let mut finished_tuples: Vec<JudgmentTuple> = if output_path.exists() {
         let existing = crate::eval::judge::load_judgment_tuples(output_path)
-            .map_err(|e| OriginError::Generic(format!("load resume file: {e}")))?;
+            .map_err(|e| OriginError::Generic(format!("load resume: {e}")))?;
         eprintln!(
             "[fullpipeline] Resuming with {} existing tuples",
             existing.len()
@@ -1170,7 +1158,6 @@ pub async fn run_fullpipeline_locomo_batch(
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
 
-    // Load flat answer cache
     let flat_cache: HashMap<String, (String, usize)> = load_flat_cache_locomo(flat_cache_path);
     if !flat_cache.is_empty() {
         eprintln!(
@@ -1179,16 +1166,10 @@ pub async fn run_fullpipeline_locomo_batch(
         );
     }
 
-    // --- Phase 1: Enrich + collect contexts ---
-    // Map custom_id -> PendingAnswer metadata
-    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
-    // Batch requests: (custom_id, prompt, system, max_tokens)
-    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
-
     let enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
         Some(llm) => llm,
         None => {
-            eprintln!("[fullpipeline] No enrichment LLM, using API for enrichment too");
+            eprintln!("[fullpipeline] No enrichment LLM, using API");
             Arc::new(crate::llm_provider::ApiProvider::new(
                 api_key.to_string(),
                 answer_model.to_string(),
@@ -1196,46 +1177,22 @@ pub async fn run_fullpipeline_locomo_batch(
         }
     };
 
-    for (conv_idx, sample) in samples.iter().enumerate() {
+    // --- Phase 1: Seed all conversations into one DB, enrich once ---
+    let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
+    let db = MemoryDB::new_with_shared_embedder(
+        tmp.path(),
+        Arc::new(NoopEmitter),
+        shared_embedder.clone(),
+    )
+    .await?;
+
+    let mut total_obs = 0usize;
+    for sample in &samples {
         let memories = extract_observations(sample);
         if memories.is_empty() {
             continue;
         }
 
-        // Check if ALL questions in this conv are already done
-        let conv_questions: Vec<&str> = sample
-            .qa
-            .iter()
-            .filter(|qa| qa.category != 5)
-            .map(|qa| qa.question.as_str())
-            .collect();
-        if !conv_questions.is_empty() && conv_questions.iter().all(|q| done_questions.contains(*q))
-        {
-            eprintln!(
-                "[fullpipeline] Conv {}/{} ({}) — skipped (already done)",
-                conv_idx + 1,
-                samples.len(),
-                sample.sample_id
-            );
-            continue;
-        }
-
-        eprintln!(
-            "[fullpipeline] Conv {}/{} ({}): {} observations",
-            conv_idx + 1,
-            samples.len(),
-            sample.sample_id,
-            memories.len()
-        );
-
-        // Seed + enrich
-        let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
-        let db = MemoryDB::new_with_shared_embedder(
-            tmp.path(),
-            Arc::new(NoopEmitter),
-            shared_embedder.clone(),
-        )
-        .await?;
         let docs: Vec<RawDocument> = memories
             .iter()
             .enumerate()
@@ -1250,17 +1207,34 @@ pub async fn run_fullpipeline_locomo_batch(
                 ..Default::default()
             })
             .collect();
+        total_obs += docs.len();
         db.upsert_documents(docs).await?;
+        eprintln!(
+            "[fullpipeline] Seeded {} ({} observations)",
+            sample.sample_id,
+            memories.len()
+        );
+    }
 
-        eprintln!("  [enriching]...");
-        let entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
-        let concepts =
-            crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None)
-                .await?;
-        eprintln!("  [enriched] {} entities, {} concepts", entities, concepts);
+    eprintln!(
+        "[fullpipeline] Total: {} observations in 1 DB. Enriching...",
+        total_obs
+    );
+    let entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
+    let concepts =
+        crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None).await?;
+    eprintln!(
+        "[fullpipeline] Enriched: {} entities, {} concepts",
+        entities, concepts
+    );
 
-        // Collect contexts for each question
+    // --- Phase 2: Collect contexts for all questions ---
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    for sample in &samples {
         let mut q_count = 0usize;
+
         for qa in &sample.qa {
             if qa.category == 5 {
                 continue;
@@ -1279,11 +1253,11 @@ pub async fn run_fullpipeline_locomo_batch(
             }
 
             let category = category_name(qa.category);
-            let (flat_ctx, structured_ctx) = build_contexts(&db, &qa.question, 10).await?;
+            let (flat_ctx, structured_ctx) = build_contexts(&db, &qa.question, 10, None).await?;
             let flat_tokens = count_tokens(&flat_ctx);
             let structured_tokens = count_tokens(&structured_ctx);
 
-            // Flat approach: use cache if available, otherwise add to batch
+            // Flat: cache or batch
             if let Some((cached_answer, cached_tokens)) = flat_cache.get(&qa.question) {
                 finished_tuples.push(JudgmentTuple {
                     question: qa.question.clone(),
@@ -1311,7 +1285,7 @@ pub async fn run_fullpipeline_locomo_batch(
                 );
             }
 
-            // Structured approach: always needs generation
+            // Structured: always batch
             let structured_id = format!("structured_{}_{}", sample.sample_id, q_count);
             batch_requests.push((
                 structured_id.clone(),
@@ -1331,19 +1305,21 @@ pub async fn run_fullpipeline_locomo_batch(
 
             q_count += 1;
         }
-        eprintln!("  Collected {} question contexts", q_count);
+        if q_count > 0 {
+            eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+        }
     }
 
     if batch_requests.is_empty() {
-        eprintln!("[fullpipeline] No new requests needed — all done from cache + resume");
+        eprintln!("[fullpipeline] No new requests — all cached/resumed");
         save_judgment_tuples(&finished_tuples, output_path)
             .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
         return Ok(finished_tuples);
     }
 
-    // --- Phase 2: Submit batch ---
+    // --- Phase 3: Batch answer generation ---
     eprintln!(
-        "\n[fullpipeline] Submitting {} answer requests via Batch API (model={})",
+        "\n[fullpipeline] Submitting {} requests via Batch API (model={})",
         batch_requests.len(),
         answer_model
     );
@@ -1366,7 +1342,7 @@ pub async fn run_fullpipeline_locomo_batch(
         .await
         .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
 
-    // --- Phase 3: Merge ---
+    // --- Phase 4: Merge ---
     let mut matched = 0usize;
     for (custom_id, answer) in &raw_results {
         if let Some(meta) = pending.get(custom_id) {
@@ -1382,7 +1358,7 @@ pub async fn run_fullpipeline_locomo_batch(
     }
 
     eprintln!(
-        "[fullpipeline] Batch returned {} results, matched {} pending requests",
+        "[fullpipeline] Batch: {} results, {} matched",
         raw_results.len(),
         matched
     );
@@ -1400,8 +1376,9 @@ pub async fn run_fullpipeline_locomo_batch(
 
 /// Full-pipeline LongMemEval eval using Batch API for answer generation.
 ///
-/// Same architecture as [`run_fullpipeline_locomo_batch`]: enrich on-device,
-/// batch-generate answers, merge with cached flat answers.
+/// **Single DB**: all 500 questions' memories seeded into one database (~10K memories).
+/// No domain filter — search must find relevant memories among all data, like production.
+/// Enrichment runs once across all data.
 pub async fn run_fullpipeline_lme_batch(
     longmemeval_path: &Path,
     enrichment_llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
@@ -1437,7 +1414,6 @@ pub async fn run_fullpipeline_lme_batch(
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
 
-    // Flat cache
     let flat_cache: HashMap<String, (String, usize)> = load_flat_cache_lme(flat_cache_path);
     if !flat_cache.is_empty() {
         eprintln!(
@@ -1445,9 +1421,6 @@ pub async fn run_fullpipeline_lme_batch(
             flat_cache.len()
         );
     }
-
-    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
-    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
 
     let enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
         Some(llm) => llm,
@@ -1460,34 +1433,22 @@ pub async fn run_fullpipeline_lme_batch(
         }
     };
 
-    for (q_idx, sample) in samples.iter().enumerate() {
-        if done_questions.contains(&sample.question) {
-            continue;
-        }
+    // --- Phase 1: Seed all questions' memories into one DB, enrich once ---
+    let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
+    let db = MemoryDB::new_with_shared_embedder(
+        tmp.path(),
+        Arc::new(NoopEmitter),
+        shared_embedder.clone(),
+    )
+    .await?;
 
+    let mut total_mems = 0usize;
+    for sample in &samples {
         let memories = extract_memories(sample);
         if memories.is_empty() {
             continue;
         }
 
-        if q_idx % 50 == 0 {
-            eprintln!(
-                "[fullpipeline_lme] Q {}/{} ({}): {} memories",
-                q_idx + 1,
-                samples.len(),
-                sample.question_id,
-                memories.len()
-            );
-        }
-
-        // Seed + enrich
-        let tmp = tempfile::tempdir().map_err(|e| OriginError::Generic(format!("tempdir: {e}")))?;
-        let db = MemoryDB::new_with_shared_embedder(
-            tmp.path(),
-            Arc::new(NoopEmitter),
-            shared_embedder.clone(),
-        )
-        .await?;
         let docs: Vec<RawDocument> = memories
             .iter()
             .map(|mem| RawDocument {
@@ -1511,12 +1472,31 @@ pub async fn run_fullpipeline_lme_batch(
                 ..Default::default()
             })
             .collect();
+        total_mems += docs.len();
         db.upsert_documents(docs).await?;
+    }
 
-        let _entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
-        let _concepts =
-            crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None)
-                .await?;
+    eprintln!(
+        "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching...",
+        total_mems,
+        samples.len()
+    );
+    let entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
+    let concepts =
+        crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None).await?;
+    eprintln!(
+        "[fullpipeline_lme] Enriched: {} entities, {} concepts",
+        entities, concepts
+    );
+
+    // --- Phase 2: Collect contexts ---
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    for (q_idx, sample) in samples.iter().enumerate() {
+        if done_questions.contains(&sample.question) {
+            continue;
+        }
 
         let ground_truth = sample
             .answer
@@ -1528,7 +1508,7 @@ pub async fn run_fullpipeline_lme_batch(
         }
 
         let category = category_name(&sample.question_type);
-        let (flat_ctx, structured_ctx) = build_contexts(&db, &sample.question, 10).await?;
+        let (flat_ctx, structured_ctx) = build_contexts(&db, &sample.question, 10, None).await?;
         let flat_tokens = count_tokens(&flat_ctx);
         let structured_tokens = count_tokens(&structured_ctx);
 
@@ -1580,6 +1560,14 @@ pub async fn run_fullpipeline_lme_batch(
                 context_tokens: structured_tokens,
             },
         );
+
+        if q_idx % 100 == 99 {
+            eprintln!(
+                "  [contexts] {}/{} questions collected",
+                q_idx + 1,
+                samples.len()
+            );
+        }
     }
 
     if batch_requests.is_empty() {
@@ -1589,7 +1577,7 @@ pub async fn run_fullpipeline_lme_batch(
         return Ok(finished_tuples);
     }
 
-    // Submit batch
+    // --- Phase 3: Batch answer generation ---
     eprintln!(
         "\n[fullpipeline_lme] Submitting {} requests via Batch API (model={})",
         batch_requests.len(),
@@ -1614,6 +1602,7 @@ pub async fn run_fullpipeline_lme_batch(
         .await
         .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
 
+    // --- Phase 4: Merge ---
     let mut matched = 0usize;
     for (custom_id, answer) in &raw_results {
         if let Some(meta) = pending.get(custom_id) {

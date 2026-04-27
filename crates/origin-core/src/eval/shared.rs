@@ -71,5 +71,14 @@ pub async fn run_entity_extraction_for_eval(
         );
     }
 
+    // Mark all memories as enriched so find_distillation_clusters includes them.
+    // In production, the async post-ingest flow writes these rows. In eval we
+    // must do it explicitly after entity extraction completes.
+    let marked = db.mark_all_memories_enriched_for_eval().await?;
+    eprintln!(
+        "    [entity_extract] marked {} memories as enriched",
+        marked
+    );
+
     Ok(total)
 }
