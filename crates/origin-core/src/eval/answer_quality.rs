@@ -1217,10 +1217,12 @@ pub async fn run_fullpipeline_locomo_batch(
     }
 
     eprintln!(
-        "[fullpipeline] Total: {} observations in 1 DB. Enriching...",
+        "[fullpipeline] Total: {} observations in 1 DB. Enriching via Batch API...",
         total_obs
     );
-    let entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
+    let entities =
+        crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
+            .await?;
     let concepts =
         crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None).await?;
     eprintln!(
@@ -1477,11 +1479,13 @@ pub async fn run_fullpipeline_lme_batch(
     }
 
     eprintln!(
-        "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching...",
+        "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching via Batch API...",
         total_mems,
         samples.len()
     );
-    let entities = run_entity_extraction_for_eval(&db, &enrich_llm).await?;
+    let entities =
+        crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
+            .await?;
     let concepts =
         crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None).await?;
     eprintln!(
