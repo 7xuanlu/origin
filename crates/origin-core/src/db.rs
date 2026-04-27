@@ -8645,6 +8645,26 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Bulk-mark all chunk_index=0 memories as enriched (for eval).
+    /// Inserts an "extract" enrichment step for every memory that doesn't have one.
+    /// Returns the number of rows inserted.
+    pub async fn mark_all_memories_enriched_for_eval(&self) -> Result<usize, OriginError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "INSERT OR IGNORE INTO enrichment_steps (source_id, step_name, status, attempts, updated_at)
+                 SELECT source_id, 'extract', 'done', 1, ?1
+                 FROM memories
+                 WHERE source = 'memory' AND chunk_index = 0
+                   AND source_id NOT IN (SELECT source_id FROM enrichment_steps WHERE step_name = 'extract')",
+                libsql::params![now],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("mark_enriched_for_eval: {e}")))?;
+        Ok(affected as usize)
+    }
+
     /// Return all enrichment step records for a memory, ordered by insertion.
     pub async fn get_enrichment_steps(
         &self,
