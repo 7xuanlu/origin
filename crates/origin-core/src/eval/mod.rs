@@ -6,6 +6,7 @@ pub mod judge;
 pub mod shared;
 
 pub mod answer_quality;
+pub mod context_path;
 pub mod distillation_quality;
 pub mod fixtures;
 pub mod gen;
