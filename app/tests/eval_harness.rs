@@ -2028,3 +2028,72 @@ async fn judge_fullpipeline_lme() {
     }
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
+
+// ---------------------------------------------------------------------------
+// Batch Size Probe — find on-device extraction overflow point
+// ---------------------------------------------------------------------------
+
+/// Probe extraction at batch sizes 1, 5, 10, 20, 30, 50 to find the on-device
+/// context overflow point and quality degradation curve.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness probe_batch_sizes -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn probe_batch_sizes() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::probe_extraction_batch_sizes;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    let obs: Vec<(String, String)> = extract_observations(&samples[0])
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (format!("obs_{}", i), m.content.clone()))
+        .collect();
+    eprintln!(
+        "Loaded {} observations from {}",
+        obs.len(),
+        samples[0].sample_id
+    );
+
+    // Test 4B first (default), then 9B if available
+    let model_id = std::env::var("PROBE_MODEL").ok();
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new_with_model(model_id.as_deref())
+            .expect("on-device LLM required"),
+    );
+    eprintln!("Model: {}", model_id.as_deref().unwrap_or("4B (default)"));
+
+    let batch_sizes = [1, 2, 3, 5, 10, 20, 30, 50];
+    let results = probe_extraction_batch_sizes(&obs, &llm, &batch_sizes).await;
+
+    eprintln!("\n=== Batch Size Probe Results ===");
+    eprintln!(
+        "{:>5} | {:>8} | {:>8} | {:>8} | {:>8} | {:>10}",
+        "Batch", "InTok", "RespLen", "Entities", "Obs", "Ent/Input"
+    );
+    eprintln!(
+        "{:-<5}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<10}",
+        "", "", "", "", "", ""
+    );
+    for (bs, in_tok, resp_len, ents, obs_count) in &results {
+        let ratio = if *bs > 0 {
+            *ents as f64 / *bs as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{:>5} | {:>8} | {:>8} | {:>8} | {:>8} | {:>10.2}",
+            bs, in_tok, resp_len, ents, obs_count, ratio
+        );
+    }
+}

@@ -39,6 +39,93 @@ pub fn count_tokens(text: &str) -> usize {
     BPE.encode_with_special_tokens(text).len()
 }
 
+/// Probe on-device batch extraction at different batch sizes.
+/// Returns vec of (batch_size, input_tokens, response_len, entities_found, observations_found).
+pub async fn probe_extraction_batch_sizes(
+    observations: &[(String, String)], // (source_id, content)
+    llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+    batch_sizes: &[usize],
+) -> Vec<(usize, usize, usize, usize, usize)> {
+    use crate::extract::parse_kg_response;
+    use crate::prompts::PromptRegistry;
+
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let mut results = Vec::new();
+
+    for &batch_size in batch_sizes {
+        let batch: Vec<&(String, String)> = observations.iter().take(batch_size).collect();
+        if batch.is_empty() {
+            continue;
+        }
+
+        // Format numbered input (same as production batch extraction)
+        let numbered: String = batch
+            .iter()
+            .enumerate()
+            .map(|(i, (_, content))| {
+                let truncated: String = content.chars().take(500).collect();
+                format!("{}. {}", i + 1, truncated)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let input_tokens = count_tokens(&numbered) + count_tokens(&prompts.extract_knowledge_graph);
+
+        eprintln!(
+            "[probe] batch_size={}, input_tokens={}, sending...",
+            batch_size, input_tokens
+        );
+
+        let start = std::time::Instant::now();
+        match llm
+            .generate(crate::llm_provider::LlmRequest {
+                system_prompt: Some(prompts.extract_knowledge_graph.clone()),
+                user_prompt: numbered,
+                max_tokens: ((batch_size * 200) as u32).max(512), // scale with input, min 512
+                temperature: 0.3,
+                label: Some(format!("probe_batch_{}", batch_size)),
+            })
+            .await
+        {
+            Ok(response) => {
+                let elapsed = start.elapsed();
+                let memories: Vec<(usize, String)> = batch
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, c))| (i, c.clone()))
+                    .collect();
+                let kg = parse_kg_response(&response, &memories);
+                let total_entities: usize = kg.iter().map(|r| r.entities.len()).sum();
+                let total_obs: usize = kg.iter().map(|r| r.observations.len()).sum();
+
+                let resp_preview: String = response.chars().take(300).collect();
+                eprintln!(
+                    "[probe] batch_size={}: {}ms, response_len={}, entities={}, obs={}\n  preview: {}",
+                    batch_size,
+                    elapsed.as_millis(),
+                    response.len(),
+                    total_entities,
+                    total_obs,
+                    resp_preview,
+                );
+                results.push((
+                    batch_size,
+                    input_tokens,
+                    response.len(),
+                    total_entities,
+                    total_obs,
+                ));
+            }
+            Err(e) => {
+                eprintln!("[probe] batch_size={}: FAILED — {}", batch_size, e);
+                results.push((batch_size, input_tokens, 0, 0, 0));
+            }
+        }
+    }
+
+    results
+}
+
 /// Run entity extraction using Origin's production pipeline (refinery path).
 ///
 /// Uses `extract_entities_from_memories` which calls `extract_single_memory_entities`
