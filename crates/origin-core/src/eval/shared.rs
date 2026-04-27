@@ -126,6 +126,167 @@ pub async fn probe_extraction_batch_sizes(
     results
 }
 
+/// Run enrichment via Anthropic Batch API: entity extraction + title enrichment.
+///
+/// Much faster than on-device (~5 min vs ~2 hours for LoCoMo). Better quality
+/// (Haiku vs Qwen 4B). Costs ~$1 per benchmark run.
+///
+/// 1. Collects all memories needing extraction
+/// 2. Submits extraction prompts as one Batch API request
+/// 3. Parses results, creates entities/relations/observations in DB
+/// 4. Marks enrichment steps for concept distillation
+///
+/// Returns total entities created.
+pub async fn run_enrichment_batch_api(
+    db: &MemoryDB,
+    api_key: &str,
+    model: &str,
+    cost_cap_usd: f64,
+) -> Result<usize, OriginError> {
+    use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
+    use crate::extract::parse_kg_response;
+    use crate::prompts::PromptRegistry;
+
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+
+    // 1. Get all memories needing extraction
+    // Use a large limit to get everything in one query
+    let all_memories = db.get_unlinked_memories(100_000).await?;
+    if all_memories.is_empty() {
+        eprintln!("[batch_enrich] No unlinked memories found");
+        return Ok(0);
+    }
+    eprintln!("[batch_enrich] {} memories to extract", all_memories.len());
+
+    // 2. Format extraction prompts (1 per memory, same as production single-memory path)
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+    let mut memory_map: std::collections::HashMap<String, (String, String)> = // custom_id -> (source_id, content)
+        std::collections::HashMap::new();
+
+    for (idx, (source_id, content)) in all_memories.iter().enumerate() {
+        let truncated: String = content.chars().take(500).collect();
+        let numbered = format!("1. {}", truncated);
+        let custom_id = format!("extract_{}", idx);
+
+        batch_requests.push((
+            custom_id.clone(),
+            numbered,
+            Some(prompts.extract_knowledge_graph.clone()),
+            512,
+        ));
+        memory_map.insert(custom_id, (source_id.clone(), content.clone()));
+    }
+
+    // 3. Submit batch
+    eprintln!(
+        "[batch_enrich] Submitting {} extraction requests (model={}, cap=${:.2})",
+        batch_requests.len(),
+        model,
+        cost_cap_usd,
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+
+    let batch_id = submit_batch(&client, api_key, batch_requests, model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+    eprintln!("[batch_enrich] Batch submitted: {}", batch_id);
+
+    let results_url = poll_batch(&client, api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+    let raw_results = download_batch_results(&client, api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+
+    eprintln!(
+        "[batch_enrich] Downloaded {} results. Creating entities...",
+        raw_results.len()
+    );
+
+    // 4. Parse results and create entities
+    let mut total_entities = 0usize;
+    let mut entity_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for (custom_id, response) in &raw_results {
+        let (source_id, content) = match memory_map.get(custom_id) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let batch = [(0usize, content.clone())];
+        let kg_results = parse_kg_response(response, &batch);
+
+        let mut first_entity_id: Option<String> = None;
+
+        for kg in &kg_results {
+            for entity in &kg.entities {
+                match crate::importer::resolve_or_create_entity(
+                    db,
+                    &mut entity_cache,
+                    entity,
+                    "batch_eval",
+                )
+                .await
+                {
+                    Ok((id, _created)) => {
+                        total_entities += 1;
+                        if first_entity_id.is_none() {
+                            first_entity_id = Some(id);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("[batch_enrich] entity create failed: {e}");
+                    }
+                }
+            }
+            for obs in &kg.observations {
+                if let Some(entity_id) = entity_cache.get(&obs.entity.to_lowercase()) {
+                    let _ = db
+                        .add_observation(entity_id, &obs.content, Some("batch_eval"), None)
+                        .await;
+                }
+            }
+            for rel in &kg.relations {
+                let from_id = entity_cache.get(&rel.from.to_lowercase()).cloned();
+                let to_id = entity_cache.get(&rel.to.to_lowercase()).cloned();
+                if let (Some(from), Some(to)) = (from_id, to_id) {
+                    let _ = db
+                        .create_relation(
+                            &from,
+                            &to,
+                            &rel.relation_type,
+                            Some("batch_eval"),
+                            rel.confidence,
+                            rel.explanation.as_deref(),
+                            Some(source_id),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Link memory to first entity
+        if let Some(ref eid) = first_entity_id {
+            let _ = db.update_memory_entity_id(source_id, eid).await;
+        }
+    }
+
+    // 5. Mark all memories as enriched for concept distillation
+    let marked = db.mark_all_memories_enriched_for_eval().await?;
+    eprintln!(
+        "[batch_enrich] Done: {} entities created, {} memories marked enriched",
+        total_entities, marked
+    );
+
+    Ok(total_entities)
+}
+
 /// Run entity extraction using Origin's production pipeline (refinery path).
 ///
 /// Uses `extract_entities_from_memories` which calls `extract_single_memory_entities`
