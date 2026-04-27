@@ -12041,6 +12041,40 @@ impl MemoryDB {
         Ok(has)
     }
 
+    /// Diagnostic: count rows in memories table by key filters.
+    pub async fn debug_memory_counts(&self) -> String {
+        async fn count(conn: &libsql::Connection, sql: &str) -> i64 {
+            match conn.query(sql, ()).await {
+                Ok(mut rows) => match rows.next().await {
+                    Ok(Some(row)) => row.get::<i64>(0).unwrap_or(-1),
+                    _ => -2,
+                },
+                Err(_) => -3,
+            }
+        }
+        let conn = self.conn.lock().await;
+        let total = count(&conn, "SELECT COUNT(*) FROM memories").await;
+        let source_memory = count(
+            &conn,
+            "SELECT COUNT(*) FROM memories WHERE source = 'memory'",
+        )
+        .await;
+        let chunk0 = count(&conn, "SELECT COUNT(*) FROM memories WHERE chunk_index = 0").await;
+        let null_entity = count(
+            &conn,
+            "SELECT COUNT(*) FROM memories WHERE entity_id IS NULL",
+        )
+        .await;
+        let unlinked = count(
+            &conn,
+            "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND entity_id IS NULL AND is_recap = 0 AND chunk_index = 0",
+        ).await;
+        format!(
+            "total={}, source=memory:{}, chunk0={}, null_entity={}, unlinked(full_query)={}",
+            total, source_memory, chunk0, null_entity, unlinked
+        )
+    }
+
     /// Get memories that have no entity_id link (for reweave phase).
     pub async fn get_unlinked_memories(
         &self,
