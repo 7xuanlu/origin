@@ -12095,6 +12095,35 @@ impl MemoryDB {
         )
     }
 
+    /// Get memories with truncated/generic titles that need enrichment (for eval).
+    pub async fn get_memories_needing_title_enrichment(
+        &self,
+    ) -> Result<Vec<(String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_id, content FROM memories
+                 WHERE source = 'memory' AND chunk_index = 0
+                   AND (title LIKE '%...' OR length(title) >= 75)",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("title_enrichment query: {e}")))?;
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let source_id: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?;
+            let content: String = row.get::<String>(1).unwrap_or_default();
+            results.push((source_id, content));
+        }
+        Ok(results)
+    }
+
     /// Get memories that have no entity_id link (for reweave phase).
     pub async fn get_unlinked_memories(
         &self,

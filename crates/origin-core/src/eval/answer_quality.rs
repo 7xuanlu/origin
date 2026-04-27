@@ -1139,8 +1139,8 @@ pub async fn run_fullpipeline_locomo_batch(
     use crate::tuning::DistillationConfig;
 
     let samples = load_locomo(locomo_path)?;
-    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
-    let tuning = DistillationConfig::default();
+    let _prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let _tuning = DistillationConfig::default();
     let shared_embedder = eval_shared_embedder();
 
     // Resume
@@ -1166,7 +1166,7 @@ pub async fn run_fullpipeline_locomo_batch(
         );
     }
 
-    let enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
+    let _enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
         Some(llm) => llm,
         None => {
             eprintln!("[fullpipeline] No enrichment LLM, using API");
@@ -1223,11 +1223,23 @@ pub async fn run_fullpipeline_locomo_batch(
     let entities =
         crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
             .await?;
-    let concepts =
-        crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None).await?;
+    let titles = crate::eval::shared::run_title_enrichment_batch_api(
+        &db,
+        api_key,
+        answer_model,
+        cost_cap_usd,
+    )
+    .await?;
+    let concepts = crate::eval::shared::run_concept_distillation_batch_api(
+        &db,
+        api_key,
+        answer_model,
+        cost_cap_usd,
+    )
+    .await?;
     eprintln!(
-        "[fullpipeline] Enriched: {} entities, {} concepts",
-        entities, concepts
+        "[fullpipeline] Enriched: {} entities, {} titles, {} concepts",
+        entities, titles, concepts
     );
 
     // --- Phase 2: Collect contexts for all questions ---
@@ -1397,8 +1409,8 @@ pub async fn run_fullpipeline_lme_batch(
     use crate::tuning::DistillationConfig;
 
     let samples = load_longmemeval(longmemeval_path)?;
-    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
-    let tuning = DistillationConfig::default();
+    let _prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let _tuning = DistillationConfig::default();
     let shared_embedder = eval_shared_embedder();
 
     // Resume
@@ -1424,7 +1436,7 @@ pub async fn run_fullpipeline_lme_batch(
         );
     }
 
-    let enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
+    let _enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
         Some(llm) => llm,
         None => {
             eprintln!("[fullpipeline_lme] No enrichment LLM, using API");
@@ -1486,11 +1498,23 @@ pub async fn run_fullpipeline_lme_batch(
     let entities =
         crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
             .await?;
-    let concepts =
-        crate::refinery::distill_concepts(&db, Some(&enrich_llm), &prompts, &tuning, None).await?;
+    let titles = crate::eval::shared::run_title_enrichment_batch_api(
+        &db,
+        api_key,
+        answer_model,
+        cost_cap_usd,
+    )
+    .await?;
+    let concepts = crate::eval::shared::run_concept_distillation_batch_api(
+        &db,
+        api_key,
+        answer_model,
+        cost_cap_usd,
+    )
+    .await?;
     eprintln!(
-        "[fullpipeline_lme] Enriched: {} entities, {} concepts",
-        entities, concepts
+        "[fullpipeline_lme] Enriched: {} entities, {} titles, {} concepts",
+        entities, titles, concepts
     );
 
     // --- Phase 2: Collect contexts ---

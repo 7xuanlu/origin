@@ -330,3 +330,307 @@ pub async fn run_entity_extraction_for_eval(
 
     Ok(total)
 }
+
+/// Batch title enrichment via Anthropic Batch API.
+///
+/// Finds all memories with generic/truncated titles, generates semantic titles
+/// via Haiku, updates them in DB. Improves FTS search recall.
+pub async fn run_title_enrichment_batch_api(
+    db: &MemoryDB,
+    api_key: &str,
+    model: &str,
+    cost_cap_usd: f64,
+) -> Result<usize, OriginError> {
+    use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
+
+    let candidates = db.get_memories_needing_title_enrichment().await?;
+
+    if candidates.is_empty() {
+        eprintln!("[batch_title] No memories need title enrichment");
+        return Ok(0);
+    }
+    eprintln!(
+        "[batch_title] {} memories need title enrichment",
+        candidates.len()
+    );
+
+    let title_system = "Given a note, write a 3-5 word title. Output ONLY the title.\n\nExample: 'The system uses libsql for vector storage with DiskANN indexing' -> libsql Vector Storage\nExample: 'Google Sign-In fails with developer_error status 10' -> Google Sign-In SHA Fix".to_string();
+
+    let batch_requests: Vec<(String, String, Option<String>, usize)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, (_, content))| {
+            let input: String = content.chars().take(300).collect();
+            (
+                format!("title_{}", i),
+                input,
+                Some(title_system.clone()),
+                16,
+            )
+        })
+        .collect();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+
+    let batch_id = submit_batch(&client, api_key, batch_requests, model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("title batch submit: {e}")))?;
+    eprintln!("[batch_title] Batch submitted: {}", batch_id);
+
+    let results_url = poll_batch(&client, api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("title batch poll: {e}")))?;
+
+    let raw_results = download_batch_results(&client, api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("title batch download: {e}")))?;
+
+    let mut updated = 0usize;
+    for (i, (source_id, _)) in candidates.iter().enumerate() {
+        let custom_id = format!("title_{}", i);
+        if let Some(title) = raw_results.get(&custom_id) {
+            let clean = title.trim().trim_matches('"').trim();
+            if !clean.is_empty() && clean.len() < 100 {
+                db.update_title(source_id, clean).await?;
+                updated += 1;
+            }
+        }
+    }
+
+    eprintln!("[batch_title] Updated {} titles", updated);
+    Ok(updated)
+}
+
+/// Batch concept distillation via Anthropic Batch API.
+///
+/// Replaces production `distill_concepts` (which uses sequential on-device LLM)
+/// with a batch API approach. Same DB queries and concept storage, different
+/// LLM execution model.
+///
+/// Two batch submissions: refinement (merge/split clusters), then synthesis.
+pub async fn run_concept_distillation_batch_api(
+    db: &MemoryDB,
+    api_key: &str,
+    model: &str,
+    cost_cap_usd: f64,
+) -> Result<usize, OriginError> {
+    use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
+    use crate::prompts::PromptRegistry;
+    use crate::tuning::DistillationConfig;
+
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let tuning = DistillationConfig::default();
+
+    // Use Haiku's synthesis limit (200K context, generous)
+    let token_limit = 16_000;
+    let clusters = db
+        .find_distillation_clusters(
+            tuning.similarity_threshold,
+            tuning.concept_min_cluster_size,
+            tuning.max_clusters_per_steep,
+            token_limit,
+            tuning.max_unlinked_cluster_size,
+        )
+        .await?;
+
+    if clusters.is_empty() {
+        eprintln!("[batch_distill] No clusters found for distillation");
+        return Ok(0);
+    }
+    eprintln!("[batch_distill] {} clusters to distill", clusters.len());
+
+    // Skip refinement for eval (it only matters when entities have 2+ clusters,
+    // which is rare in a single benchmark run). Go straight to synthesis.
+
+    // Build synthesis prompts for each cluster
+    struct ClusterMeta {
+        idx: usize,
+        topic: String,
+        entity_id: Option<String>,
+        domain: Option<String>,
+        source_ids: Vec<String>,
+    }
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+    let mut cluster_meta: Vec<ClusterMeta> = Vec::new();
+
+    for (idx, cluster) in clusters.iter().enumerate() {
+        let topic = cluster
+            .entity_name
+            .as_deref()
+            .or(cluster.domain.as_deref())
+            .unwrap_or("general");
+
+        // Skip if concept with similar sources exists (Jaccard > 0.8)
+        let overlap = db
+            .max_concept_overlap(&cluster.source_ids)
+            .await
+            .unwrap_or(0.0);
+        if overlap > 0.8 {
+            continue;
+        }
+
+        // Clean and cap memory snippets
+        let memories_block: String = cluster
+            .source_ids
+            .iter()
+            .zip(cluster.contents.iter())
+            .map(|(id, content)| {
+                let snippet: String = content.chars().take(800).collect();
+                format!("[{}] {}", id, snippet)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // Skip thin clusters
+        let total_chars: usize = cluster.contents.iter().map(|c| c.len()).sum();
+        if total_chars < 200 {
+            continue;
+        }
+
+        let user_prompt = format!("Topic: {}\n\n{}", topic, memories_block);
+
+        batch_requests.push((
+            format!("synth_{}", idx),
+            user_prompt,
+            Some(prompts.distill_concept.clone()),
+            2048,
+        ));
+        cluster_meta.push(ClusterMeta {
+            idx,
+            topic: topic.to_string(),
+            entity_id: cluster.entity_id.clone(),
+            domain: cluster.domain.clone(),
+            source_ids: cluster.source_ids.clone(),
+        });
+    }
+
+    if batch_requests.is_empty() {
+        eprintln!("[batch_distill] No clusters passed filtering");
+        return Ok(0);
+    }
+
+    eprintln!(
+        "[batch_distill] Submitting {} synthesis requests",
+        batch_requests.len()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+
+    let batch_id = submit_batch(&client, api_key, batch_requests, model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("distill batch submit: {e}")))?;
+    eprintln!("[batch_distill] Batch submitted: {}", batch_id);
+
+    let results_url = poll_batch(&client, api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("distill batch poll: {e}")))?;
+
+    let raw_results = download_batch_results(&client, api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("distill batch download: {e}")))?;
+
+    // Also batch title generation for concepts
+    let mut title_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+    let mut synth_results: Vec<(usize, String)> = Vec::new(); // (meta_idx, content)
+
+    for (meta_idx, meta) in cluster_meta.iter().enumerate() {
+        let custom_id = format!("synth_{}", meta.idx);
+        if let Some(raw) = raw_results.get(&custom_id) {
+            let cleaned = crate::llm_provider::strip_think_tags(raw);
+            let content = cleaned.trim().to_string();
+            if !content.is_empty() {
+                let input: String = content.chars().take(300).collect();
+                title_requests.push((
+                    format!("ctitle_{}", meta_idx),
+                    input,
+                    Some(
+                        "Given a note, write a 3-5 word title. Output ONLY the title.".to_string(),
+                    ),
+                    16,
+                ));
+                synth_results.push((meta_idx, content));
+            }
+        }
+    }
+
+    if synth_results.is_empty() {
+        eprintln!("[batch_distill] No synthesis results to store");
+        return Ok(0);
+    }
+
+    // Batch concept titles
+    eprintln!(
+        "[batch_distill] Submitting {} title requests",
+        title_requests.len()
+    );
+    let title_batch_id = submit_batch(&client, api_key, title_requests, model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("ctitle batch submit: {e}")))?;
+
+    let title_results_url = poll_batch(&client, api_key, &title_batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("ctitle batch poll: {e}")))?;
+
+    let title_results = download_batch_results(&client, api_key, &title_results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("ctitle batch download: {e}")))?;
+
+    // Store concepts
+    let mut distilled = 0usize;
+    for (meta_idx, content) in &synth_results {
+        let meta = &cluster_meta[*meta_idx];
+
+        // Hallucination check via embedding similarity
+        let texts = vec![content.clone(), meta.source_ids.join(" ")];
+        if let Ok(embeddings) = db.generate_embeddings(&texts) {
+            if embeddings.len() == 2 {
+                let sim = crate::db::cosine_similarity(&embeddings[0], &embeddings[1]);
+                if sim < 0.6 {
+                    eprintln!(
+                        "[batch_distill] hallucination (sim={:.2}) for '{}', skipping",
+                        sim, meta.topic
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let title = title_results
+            .get(&format!("ctitle_{}", meta_idx))
+            .map(|t| t.trim().trim_matches('"').to_string())
+            .filter(|t| !t.is_empty() && t.len() < 100)
+            .unwrap_or_else(|| meta.topic.clone());
+
+        let summary = content
+            .lines()
+            .find(|l| l.starts_with("- "))
+            .map(|l| l.trim_start_matches("- ").to_string());
+
+        let source_refs: Vec<&str> = meta.source_ids.iter().map(|s| s.as_str()).collect();
+        let now = chrono::Utc::now().to_rfc3339();
+        let concept_id = crate::concepts::Concept::new_id();
+
+        db.insert_concept(
+            &concept_id,
+            &title,
+            summary.as_deref(),
+            content,
+            meta.entity_id.as_deref(),
+            meta.domain.as_deref(),
+            &source_refs,
+            &now,
+        )
+        .await?;
+
+        distilled += 1;
+    }
+
+    eprintln!("[batch_distill] Distilled {} concepts", distilled);
+    Ok(distilled)
+}
