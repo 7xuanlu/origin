@@ -1240,16 +1240,19 @@ pub async fn run_fullpipeline_locomo_batch(
             "[fullpipeline] Total: {} observations in 1 DB. Enriching via Batch API...",
             total_obs
         );
-        let entities =
-            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
-                .await?;
-        let titles = crate::eval::shared::run_title_enrichment_batch_api(
-            &db,
-            api_key,
-            answer_model,
-            cost_cap_usd,
-        )
-        .await?;
+        // Batch A: extraction + titles in parallel (independent)
+        let (entities_res, titles_res) = tokio::join!(
+            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd),
+            crate::eval::shared::run_title_enrichment_batch_api(
+                &db,
+                api_key,
+                answer_model,
+                cost_cap_usd,
+            ),
+        );
+        let entities = entities_res?;
+        let titles = titles_res?;
+        // Batch B: concept distillation (depends on entities + enrichment_steps)
         let concepts = crate::eval::shared::run_concept_distillation_batch_api(
             &db,
             api_key,
@@ -1531,16 +1534,19 @@ pub async fn run_fullpipeline_lme_batch(
             total_mems,
             samples.len()
         );
-        let entities =
-            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd)
-                .await?;
-        let titles = crate::eval::shared::run_title_enrichment_batch_api(
-            &db,
-            api_key,
-            answer_model,
-            cost_cap_usd,
-        )
-        .await?;
+        // Batch A: extraction + titles in parallel (independent)
+        let (entities_res, titles_res) = tokio::join!(
+            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd),
+            crate::eval::shared::run_title_enrichment_batch_api(
+                &db,
+                api_key,
+                answer_model,
+                cost_cap_usd,
+            ),
+        );
+        let entities = entities_res?;
+        let titles = titles_res?;
+        // Batch B: concept distillation (depends on entities + enrichment_steps)
         let concepts = crate::eval::shared::run_concept_distillation_batch_api(
             &db,
             api_key,
