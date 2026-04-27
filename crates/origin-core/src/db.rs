@@ -12095,6 +12095,22 @@ impl MemoryDB {
         )
     }
 
+    /// Quick count of memories in the DB (for resume detection).
+    pub async fn memory_count(&self) -> Result<usize, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("memory_count: {e}")))?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get::<i64>(0).unwrap_or(0) as usize),
+            _ => Ok(0),
+        }
+    }
+
     /// Get memories with truncated/generic titles that need enrichment (for eval).
     pub async fn get_memories_needing_title_enrichment(
         &self,
