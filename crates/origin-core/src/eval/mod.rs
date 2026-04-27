@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod judge;
 pub mod shared;
 
+pub mod answer_quality;
 pub mod distillation_quality;
 pub mod fixtures;
 pub mod gen;
