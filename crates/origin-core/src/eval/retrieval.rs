@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Token efficiency evaluation — measures quality vs cost across search strategies.
+//! Retrieval quality-cost evaluation: search strategy comparison, scaling, ablation.
 
 use crate::db::MemoryDB;
 use crate::error::OriginError;

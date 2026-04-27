@@ -18,10 +18,12 @@ pub mod longmemeval;
 pub mod metrics;
 pub mod pipeline;
 pub mod report;
+pub mod retrieval;
 pub mod runner;
 pub mod signals;
 pub mod store_quality;
-pub mod token_efficiency;
+/// Backward-compat alias: old code using `eval::token_efficiency::*` still works.
+pub use retrieval as token_efficiency;
 
 // Closed-core modules (proprietary, feature-gated)
 #[cfg(feature = "closed-core-eval")]
