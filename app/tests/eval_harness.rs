@@ -1789,16 +1789,22 @@ async fn generate_fullpipeline_locomo() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5.0);
 
-    // On-device for enrichment (free)
+    // On-device 9B for enrichment (free, better entity extraction than 4B)
     let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
-        match origin_lib::llm_provider::OnDeviceProvider::new() {
+        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen35-9b")) {
             Ok(p) => {
-                eprintln!("[fullpipeline] On-device LLM for enrichment");
+                eprintln!("[fullpipeline] On-device 9B LLM for enrichment");
                 Some(Arc::new(p))
             }
             Err(e) => {
-                eprintln!("[fullpipeline] On-device unavailable ({e}), using API for enrichment");
-                None
+                eprintln!("[fullpipeline] 9B unavailable ({e}), trying 4B...");
+                match origin_lib::llm_provider::OnDeviceProvider::new() {
+                    Ok(p) => Some(Arc::new(p) as Arc<dyn origin_lib::llm_provider::LlmProvider>),
+                    Err(e2) => {
+                        eprintln!("[fullpipeline] On-device unavailable ({e2}), using API");
+                        None
+                    }
+                }
             }
         };
 
@@ -1869,14 +1875,20 @@ async fn generate_fullpipeline_lme() {
         .unwrap_or(5.0);
 
     let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
-        match origin_lib::llm_provider::OnDeviceProvider::new() {
+        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen35-9b")) {
             Ok(p) => {
-                eprintln!("[fullpipeline] On-device LLM for enrichment");
+                eprintln!("[fullpipeline] On-device 9B LLM for enrichment");
                 Some(Arc::new(p))
             }
             Err(e) => {
-                eprintln!("[fullpipeline] On-device unavailable ({e}), using API for enrichment");
-                None
+                eprintln!("[fullpipeline] 9B unavailable ({e}), trying 4B...");
+                match origin_lib::llm_provider::OnDeviceProvider::new() {
+                    Ok(p) => Some(Arc::new(p) as Arc<dyn origin_lib::llm_provider::LlmProvider>),
+                    Err(e2) => {
+                        eprintln!("[fullpipeline] On-device unavailable ({e2}), using API");
+                        None
+                    }
+                }
             }
         };
 
