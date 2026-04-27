@@ -15,6 +15,7 @@ pub mod locomo;
 pub mod locomo_plus;
 pub mod longmemeval;
 pub mod metrics;
+pub mod pipeline;
 pub mod report;
 pub mod runner;
 pub mod signals;
