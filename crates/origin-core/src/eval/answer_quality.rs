@@ -1123,7 +1123,13 @@ async fn build_contexts(
         .await?;
     let flat_context: String = results
         .iter()
-        .map(|r| format!("On {}: {}", crate::eval::shared::format_ymd(r.last_modified), r.content))
+        .map(|r| {
+            format!(
+                "On {}: {}",
+                crate::eval::shared::format_ymd(r.last_modified),
+                r.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1140,7 +1146,11 @@ async fn build_contexts(
     if !results.is_empty() {
         parts.push("## Relevant Memories".to_string());
         for r in results.iter() {
-            parts.push(format!("On {}: {}", crate::eval::shared::format_ymd(r.last_modified), r.content));
+            parts.push(format!(
+                "On {}: {}",
+                crate::eval::shared::format_ymd(r.last_modified),
+                r.content
+            ));
         }
     }
     let structured_context = parts.join("\n\n");

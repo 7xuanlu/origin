@@ -1579,6 +1579,90 @@ async fn judge_e2e_context_locomo() {
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
 
+/// Generate LongMemEval E2E answers via Claude CLI Haiku (Max plan, no API key).
+///
+/// Mirrors `generate_e2e_context_tuples_locomo_api` for the LME side. Uses the
+/// same `run_e2e_context_eval_longmemeval` path that exercises Task #11's
+/// dated-context formatter and `question_date` system-prompt anchor.
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_longmemeval_api() {
+    use origin_lib::eval::token_efficiency::{
+        run_e2e_context_eval_longmemeval, save_judgment_tuples,
+    };
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> =
+        Arc::new(origin_lib::llm_provider::ClaudeCliProvider::haiku());
+
+    // 50 questions for validation, 1 answer per question.
+    let tuples = run_e2e_context_eval_longmemeval(&path, llm, 10, 50, 1)
+        .await
+        .expect("run_e2e_context_eval_longmemeval with Haiku CLI failed");
+
+    eprintln!("Generated {} judgment tuples (Haiku CLI)", tuples.len());
+    assert!(!tuples.is_empty());
+
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_longmemeval_api.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Judge LongMemEval API-generated tuples with Claude Haiku (matches the answer model).
+/// Run after `generate_e2e_context_tuples_longmemeval_api`.
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_longmemeval_api_haiku() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_longmemeval_api.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_longmemeval_api first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples with Haiku...", tuples.len());
+
+    let results = judge_with_claude_model(&tuples, 3, "haiku")
+        .await
+        .expect("judge failed");
+
+    let report = aggregate_judgments(&results, "haiku");
+    eprintln!("\n=== E2E Context Eval: LongMemEval (Haiku answers, Haiku judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
+    );
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
+
 // ---------------------------------------------------------------------------
 // API-based E2E: Haiku as answer model, Sonnet as judge
 // ---------------------------------------------------------------------------
