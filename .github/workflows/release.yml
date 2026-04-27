@@ -205,6 +205,8 @@ jobs:
           # APPLE_ID/PASSWORD/TEAM_ID must be omitted (not empty) or Tauri
           # attempts notarization and fails on "Team ID must be at least 3 characters".
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload standalone origin-server binary
         run: |
