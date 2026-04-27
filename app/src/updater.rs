@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
 /// How long a "Later" dismissal of a given version suppresses re-prompts.
@@ -108,10 +109,36 @@ pub async fn check_and_prompt(app: AppHandle) {
         return;
     }
 
+    // The Tauri dialog disappears when the user clicks Install, but
+    // download_and_install can take 5-60s for a multi-MB bundle. Use system
+    // notifications to keep the user informed instead of leaving them staring
+    // at a vanished dialog wondering if the app is frozen.
+    let _ = app
+        .notification()
+        .builder()
+        .title("Origin")
+        .body(format!("Downloading update v{version}…"))
+        .show();
+
     if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
         log::error!("update install failed: {e}");
+        let _ = app
+            .notification()
+            .builder()
+            .title("Origin update failed")
+            .body(format!("{e}. The current version will keep running."))
+            .show();
         return;
     }
+
+    let _ = app
+        .notification()
+        .builder()
+        .title("Origin")
+        .body(format!("Update v{version} installed. Restarting…"))
+        .show();
+    // Brief pause so the notification has time to appear before the process exits.
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
     app.restart();
 }
