@@ -587,7 +587,23 @@ pub async fn run_concept_distillation_batch_api(
         let meta = &cluster_meta[*meta_idx];
 
         // Hallucination check via embedding similarity
-        let texts = vec![content.clone(), meta.source_ids.join(" ")];
+        // Compare concept output against actual memory content (not source IDs)
+        let source_content = meta
+            .source_ids
+            .iter()
+            .filter_map(|sid| {
+                // Look up content from the cluster data
+                clusters
+                    .iter()
+                    .find(|c| c.source_ids.contains(sid))
+                    .and_then(|c| {
+                        let idx = c.source_ids.iter().position(|s| s == sid)?;
+                        c.contents.get(idx).cloned()
+                    })
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let texts = vec![content.clone(), source_content];
         if let Ok(embeddings) = db.generate_embeddings(&texts) {
             if embeddings.len() == 2 {
                 let sim = crate::db::cosine_similarity(&embeddings[0], &embeddings[1]);
