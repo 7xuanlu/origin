@@ -1071,28 +1071,23 @@ struct PendingAnswer {
 const E2E_SYSTEM_PROMPT: &str =
     "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.";
 
-/// Build flat + structured contexts for a question against an enriched DB.
+/// Build structured context for a question against an enriched DB.
 ///
-/// Returns `(flat_context, structured_context)`. The flat context uses only
-/// `search_memory` results; structured adds concept articles on top.
-async fn build_contexts(
+/// Returns the structured context: search_memory results + concept articles.
+/// Matches production `/api/chat-context` assembly pattern.
+/// Flat baseline comes from the retrieval-only pipeline caches.
+async fn build_structured_context(
     db: &MemoryDB,
     question: &str,
     search_limit: usize,
     domain: Option<&str>,
-) -> Result<(String, String), OriginError> {
-    // Flat: search_memory only
+) -> Result<(String, usize), OriginError> {
     let results = db
         .search_memory(question, search_limit, None, domain, None, None, None, None)
         .await?;
-    let flat_context: String = results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
-        .collect::<Vec<_>>()
-        .join("\n");
 
-    // Structured: concepts + search results
+    // Structured: concepts + search results (matches production /api/chat-context).
+    // No token cap or relevance threshold — production includes top-3 unconditionally.
     let mut parts: Vec<String> = Vec::new();
     let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
     if !concepts.is_empty() {
@@ -1109,8 +1104,9 @@ async fn build_contexts(
         }
     }
     let structured_context = parts.join("\n\n");
+    let tokens = count_tokens(&structured_context);
 
-    Ok((flat_context, structured_context))
+    Ok((structured_context, tokens))
 }
 
 /// Full-pipeline LoCoMo eval using Batch API for answer generation.
@@ -1291,53 +1287,22 @@ pub async fn run_fullpipeline_locomo_batch(
             }
 
             let category = category_name(qa.category);
-            let (flat_ctx, structured_ctx) = build_contexts(&db, &qa.question, 10, None).await?;
-            let flat_tokens = count_tokens(&flat_ctx);
-            let structured_tokens = count_tokens(&structured_ctx);
+            let (ctx, ctx_tokens) = build_structured_context(&db, &qa.question, 10, None).await?;
 
-            // Flat: cache or batch
-            if let Some((cached_answer, cached_tokens)) = flat_cache.get(&qa.question) {
-                finished_tuples.push(JudgmentTuple {
-                    question: qa.question.clone(),
-                    ground_truth: ground_truth.clone(),
-                    approach: format!("flat_{}", category),
-                    answer: cached_answer.clone(),
-                    context_tokens: *cached_tokens,
-                });
-            } else {
-                let flat_id = format!("flat_{}_{}", sample.sample_id, q_count);
-                batch_requests.push((
-                    flat_id.clone(),
-                    format!("Context:\n{}\n\nQuestion: {}", flat_ctx, qa.question),
-                    Some(E2E_SYSTEM_PROMPT.to_string()),
-                    200,
-                ));
-                pending.insert(
-                    flat_id,
-                    PendingAnswer {
-                        question: qa.question.clone(),
-                        ground_truth: ground_truth.clone(),
-                        approach: format!("flat_{}", category),
-                        context_tokens: flat_tokens,
-                    },
-                );
-            }
-
-            // Structured: always batch
-            let structured_id = format!("structured_{}_{}", sample.sample_id, q_count);
+            let req_id = format!("q_{}_{}", sample.sample_id, q_count);
             batch_requests.push((
-                structured_id.clone(),
-                format!("Context:\n{}\n\nQuestion: {}", structured_ctx, qa.question),
+                req_id.clone(),
+                format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
                 Some(E2E_SYSTEM_PROMPT.to_string()),
                 200,
             ));
             pending.insert(
-                structured_id,
+                req_id,
                 PendingAnswer {
                     question: qa.question.clone(),
                     ground_truth,
                     approach: format!("structured_{}", category),
-                    context_tokens: structured_tokens,
+                    context_tokens: ctx_tokens,
                 },
             );
 
@@ -1579,56 +1544,22 @@ pub async fn run_fullpipeline_lme_batch(
         }
 
         let category = category_name(&sample.question_type);
-        let (flat_ctx, structured_ctx) = build_contexts(&db, &sample.question, 10, None).await?;
-        let flat_tokens = count_tokens(&flat_ctx);
-        let structured_tokens = count_tokens(&structured_ctx);
+        let (ctx, ctx_tokens) = build_structured_context(&db, &sample.question, 10, None).await?;
 
-        // Flat: cache or batch
-        if let Some((cached_answer, cached_tokens)) = flat_cache.get(&sample.question) {
-            finished_tuples.push(JudgmentTuple {
-                question: sample.question.clone(),
-                ground_truth: ground_truth.clone(),
-                approach: format!("flat_{}", category),
-                answer: cached_answer.clone(),
-                context_tokens: *cached_tokens,
-            });
-        } else {
-            let flat_id = format!("flat_lme_{}", q_idx);
-            batch_requests.push((
-                flat_id.clone(),
-                format!("Context:\n{}\n\nQuestion: {}", flat_ctx, sample.question),
-                Some(E2E_SYSTEM_PROMPT.to_string()),
-                200,
-            ));
-            pending.insert(
-                flat_id,
-                PendingAnswer {
-                    question: sample.question.clone(),
-                    ground_truth: ground_truth.clone(),
-                    approach: format!("flat_{}", category),
-                    context_tokens: flat_tokens,
-                },
-            );
-        }
-
-        // Structured: always batch
-        let structured_id = format!("structured_lme_{}", q_idx);
+        let req_id = format!("q_lme_{}", q_idx);
         batch_requests.push((
-            structured_id.clone(),
-            format!(
-                "Context:\n{}\n\nQuestion: {}",
-                structured_ctx, sample.question
-            ),
+            req_id.clone(),
+            format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
             Some(E2E_SYSTEM_PROMPT.to_string()),
             200,
         ));
         pending.insert(
-            structured_id,
+            req_id,
             PendingAnswer {
                 question: sample.question.clone(),
                 ground_truth,
                 approach: format!("structured_{}", category),
-                context_tokens: structured_tokens,
+                context_tokens: ctx_tokens,
             },
         );
 

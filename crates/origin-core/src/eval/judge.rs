@@ -7,6 +7,21 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+// ===== Judge Prompt (shared between CLI and Batch API paths) =====
+
+/// Shared judge prompt template. Used by both `judge_single_tuple_model` (CLI)
+/// and `judge_with_batch_api` (Batch API) to ensure consistent scoring.
+/// No system prompt — all instructions are in the user prompt.
+fn judge_prompt(question: &str, ground_truth: &str, answer: &str) -> String {
+    format!(
+        "You are a strict judge. Given a question, ground truth answer, and a model's response, \
+         determine if the response correctly answers the question.\n\n\
+         Question: {}\n\nGround Truth: {}\n\nModel Response: {}\n\n\
+         Reply with ONLY 'yes' or 'no'.",
+        question, ground_truth, answer
+    )
+}
+
 // ===== LLM-as-Judge Types =====
 
 /// A single E2E answer to be judged.
@@ -127,18 +142,11 @@ pub async fn judge_single_tuple_model(
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    let prompt = format!(
-        "Question: {}\n\nReference answer: {}\n\nCandidate answer: {}\n\nIs the candidate answer correct? Compare against the reference.",
-        tuple.question, tuple.ground_truth, tuple.answer
-    );
+    let prompt = judge_prompt(&tuple.question, &tuple.ground_truth, &tuple.answer);
 
     let json_schema = r#"{"type":"object","properties":{"score":{"type":"integer","enum":[0,1]},"reason":{"type":"string"}},"required":["score","reason"]}"#;
 
-    let system_prompt = "You are an expert evaluator judging answer correctness. \
-        Score 1 if the candidate answer contains the key information from the reference answer \
-        (even if worded differently). Score 0 if the candidate answer is wrong, missing key \
-        information, or irrelevant. Think step by step before scoring.";
-
+    // No system prompt — all instructions are in the user prompt (shared with batch API)
     let mut child = Command::new("claude")
         .args([
             "-p",
@@ -148,8 +156,6 @@ pub async fn judge_single_tuple_model(
             "json",
             "--json-schema",
             json_schema,
-            "--system-prompt",
-            system_prompt,
             "--no-session-persistence",
             "--allowedTools",
             "",
@@ -460,13 +466,7 @@ pub async fn judge_with_batch_api(
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let prompt = format!(
-                "You are a strict judge. Given a question, ground truth answer, and a model's response, \
-                 determine if the response correctly answers the question.\n\n\
-                 Question: {}\n\nGround Truth: {}\n\nModel Response: {}\n\n\
-                 Reply with ONLY 'yes' or 'no'.",
-                t.question, t.ground_truth, t.answer
-            );
+            let prompt = judge_prompt(&t.question, &t.ground_truth, &t.answer);
             (format!("judge_{i}"), prompt, None, 10usize)
         })
         .collect();
