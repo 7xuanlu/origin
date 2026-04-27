@@ -123,6 +123,7 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_x::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
