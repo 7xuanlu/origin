@@ -1791,7 +1791,7 @@ async fn generate_fullpipeline_locomo() {
 
     // On-device 9B for enrichment (free, better entity extraction than 4B)
     let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
-        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen35-9b")) {
+        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen3.5-9b")) {
             Ok(p) => {
                 eprintln!("[fullpipeline] On-device 9B LLM for enrichment");
                 Some(Arc::new(p))
@@ -1875,7 +1875,7 @@ async fn generate_fullpipeline_lme() {
         .unwrap_or(5.0);
 
     let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
-        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen35-9b")) {
+        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen3.5-9b")) {
             Ok(p) => {
                 eprintln!("[fullpipeline] On-device 9B LLM for enrichment");
                 Some(Arc::new(p))
