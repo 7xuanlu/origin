@@ -2223,3 +2223,35 @@ async fn smoke_fullpipeline() {
         structured_tokens - flat_tokens
     );
 }
+
+/// Judge LME tuples via Claude CLI (Max plan, no API key).
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_lme_cli() {
+    use origin_lib::eval::judge::{aggregate_judgments, judge_with_claude, load_judgment_tuples};
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_lme first");
+        return;
+    }
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    eprintln!("Judging {} LME tuples via CLI (Max plan)...", tuples.len());
+    let results = judge_with_claude(&tuples, 5).await.expect("judge failed");
+    let report = aggregate_judgments(&results, "haiku-cli");
+    eprintln!(
+        "\n{:<30} | {:>8} | {:>6} | {:>10}",
+        "Approach", "Accuracy", "N", "Ctx Tokens"
+    );
+    eprintln!("{:-<30}-+-{:-<8}-+-{:-<6}-+-{:-<10}", "", "", "", "");
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<30} | {:>7.1}% | {:>6} | {:>10.0}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.total,
+            r.mean_context_tokens
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
