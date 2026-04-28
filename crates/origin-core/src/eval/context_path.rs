@@ -3,7 +3,10 @@
 
 use crate::db::MemoryDB;
 use crate::error::OriginError;
-use crate::eval::shared::{count_tokens, eval_shared_embedder, run_entity_extraction_for_eval};
+use crate::eval::shared::{
+    count_tokens, eval_shared_embedder, run_entity_extraction_for_eval,
+    run_title_enrichment_for_eval,
+};
 use crate::events::NoopEmitter;
 use crate::sources::RawDocument;
 use serde::{Deserialize, Serialize};
@@ -199,10 +202,13 @@ pub async fn run_context_path_eval(
             .collect();
         db.upsert_documents(docs).await?;
 
-        // Run enrichment + distillation
+        // Run enrichment + distillation (entity extraction → titles → distill)
         eprintln!("  [enriching] entity extraction...");
         let entities = run_entity_extraction_for_eval(&db, &llm).await?;
-        eprintln!("  [enriching] {} entities. distilling...", entities);
+        eprintln!("  [enriching] {} entities. enriching titles...", entities);
+
+        let titles = run_title_enrichment_for_eval(&db, &llm).await?;
+        eprintln!("  [enriching] {} titles. distilling...", titles);
 
         let concepts =
             crate::refinery::distill_concepts(&db, Some(&llm), &prompts, &tuning, None).await?;

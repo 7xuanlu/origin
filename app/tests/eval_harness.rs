@@ -1797,8 +1797,12 @@ async fn generate_fullpipeline_locomo() {
         answer_model, cost_cap, output_path,
     );
 
+    let enrichment = origin_lib::eval::shared::EnrichmentMode::from_env(&answer_model, cost_cap)
+        .expect("EnrichmentMode init failed");
+
     let tuples = run_fullpipeline_locomo_batch(
         &locomo_path,
+        enrichment,
         &api_key,
         &answer_model,
         &output_path,
@@ -1844,12 +1848,77 @@ async fn generate_fullpipeline_lme() {
         answer_model, cost_cap, output_path,
     );
 
-    let tuples =
-        run_fullpipeline_lme_batch(&lme_path, &api_key, &answer_model, &output_path, cost_cap)
-            .await
-            .expect("fullpipeline lme failed");
+    let enrichment = origin_lib::eval::shared::EnrichmentMode::from_env(&answer_model, cost_cap)
+        .expect("EnrichmentMode init failed");
+
+    let tuples = run_fullpipeline_lme_batch(
+        &lme_path,
+        enrichment,
+        &api_key,
+        &answer_model,
+        &output_path,
+        cost_cap,
+    )
+    .await
+    .expect("fullpipeline lme failed");
 
     eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
+}
+
+/// Smoke test: verify cached enriched DBs open and report fully-enriched.
+///
+/// Skips silently if either enriched DB is missing (gitignored, only present locally
+/// after a first eval run). When present, exercises the new `try_open_enriched_db`
+/// reuse helper that tasks #12 / #13 evals will rely on.
+///
+/// Fast (no LLM, no API) — just opens DB, counts memories, asserts enrichment_complete.
+#[tokio::test]
+async fn smoke_enriched_db_reuse() {
+    use origin_lib::eval::shared::{
+        try_open_enriched_db, ENRICHED_LME_DB_SUBPATH, ENRICHED_LOCOMO_DB_SUBPATH,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+
+    let mut checked = 0usize;
+    for (label, subpath) in [
+        ("LoCoMo", ENRICHED_LOCOMO_DB_SUBPATH),
+        ("LME", ENRICHED_LME_DB_SUBPATH),
+    ] {
+        let dir = baselines.join(subpath);
+        if !dir.exists() {
+            eprintln!("[smoke] SKIP {}: {} not found", label, dir.display());
+            continue;
+        }
+        let result = try_open_enriched_db(&baselines, subpath)
+            .await
+            .unwrap_or_else(|e| panic!("[smoke] {} open failed: {}", label, e));
+        let db = result.unwrap_or_else(|| {
+            panic!(
+                "[smoke] {} exists at {} but try_open_enriched_db returned None — \
+                 enriched_count != mem_count, eval would re-enrich",
+                label,
+                dir.display()
+            )
+        });
+        let mem = db.memory_count().await.expect("memory_count");
+        let enriched = db.enriched_memory_count().await.expect("enriched_count");
+        eprintln!(
+            "[smoke] {}: mem={} enriched={} (cached, ready for reuse)",
+            label, mem, enriched
+        );
+        assert!(mem > 0, "{} memory_count should be > 0", label);
+        assert_eq!(
+            mem, enriched,
+            "{} should be fully enriched (got {}/{})",
+            label, enriched, mem
+        );
+        checked += 1;
+    }
+
+    if checked == 0 {
+        eprintln!("[smoke] SKIP: no enriched DBs found locally (CI without baselines is normal).");
+    }
 }
 
 /// Judge full-pipeline tuples for LoCoMo via Batch API.

@@ -5,7 +5,10 @@ use super::retrieval::SearchStrategy;
 use crate::db::MemoryDB;
 use crate::error::OriginError;
 use crate::eval::metrics;
-use crate::eval::shared::{count_tokens, eval_shared_embedder, run_entity_extraction_for_eval};
+use crate::eval::shared::{
+    count_tokens, eval_shared_embedder, run_entity_extraction_for_eval,
+    run_title_enrichment_for_eval,
+};
 use crate::events::NoopEmitter;
 use crate::sources::RawDocument;
 use serde::{Deserialize, Serialize};
@@ -493,12 +496,12 @@ pub async fn run_locomo_pipeline_eval(
         )
         .await?;
 
-        // ---- Condition 2: Enriched (entity extraction) ----
+        // ---- Condition 2: Enriched (entity extraction + title enrichment) ----
         eprintln!("  [enriched] running entity extraction...");
-        // Run entity extraction via refinery's extract functions.
-        // We use the LLM to extract entities from each memory.
         let extract_count = run_entity_extraction_for_eval(&db, &llm).await?;
         eprintln!("    extracted {} entities", extract_count);
+        let title_count = run_title_enrichment_for_eval(&db, &llm).await?;
+        eprintln!("    enriched {} titles", title_count);
 
         let (enriched_corpus_tokens, enriched_mem_count) = count_corpus_tokens(&db).await?;
 
@@ -809,8 +812,9 @@ pub async fn run_longmemeval_pipeline_eval(
         )
         .await?;
 
-        // ---- Enriched ----
+        // ---- Enriched (entity extraction + title enrichment) ----
         let _extract_count = run_entity_extraction_for_eval(&db, &llm).await?;
+        let _title_count = run_title_enrichment_for_eval(&db, &llm).await?;
         let (enriched_corpus, enriched_count) = count_corpus_tokens(&db).await?;
         let enriched_cells = evaluate_condition(
             &db,

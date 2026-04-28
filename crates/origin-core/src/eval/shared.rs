@@ -126,15 +126,18 @@ pub async fn probe_extraction_batch_sizes(
     results
 }
 
-/// Run enrichment via Anthropic Batch API: entity extraction + title enrichment.
+/// Run entity-extraction enrichment via Anthropic Batch API. **Opt-in only** — production
+/// uses on-device Qwen3-4B; this path over-flatters quality vs production. Set
+/// `EVAL_ENRICHMENT=cloud` to use it.
 ///
-/// Much faster than on-device (~5 min vs ~2 hours for LoCoMo). Better quality
-/// (Haiku vs Qwen 4B). Costs ~$1 per benchmark run.
+/// Cost: not "~$1" — at LME scale (5500 memories) this single batch is ~$2-3 input + output
+/// at Haiku batch rates. Combined with `run_title_enrichment_batch_api` and
+/// `run_concept_distillation_batch_api` (the full enrichment trio), cumulative is
+/// ~$5-8 per LME run. Per-batch `cost_cap_usd` enforced inside `submit_batch`; session-aggregate
+/// caps NOT yet implemented (see Phase 2 cost ledger).
 ///
-/// 1. Collects all memories needing extraction
-/// 2. Submits extraction prompts as one Batch API request
-/// 3. Parses results, creates entities/relations/observations in DB
-/// 4. Marks enrichment steps for concept distillation
+/// Speed: ~5 min vs ~2 hours on-device for LoCoMo (10x faster). Useful for fast iteration when
+/// you knowingly want to spend.
 ///
 /// Returns total entities created.
 pub async fn run_enrichment_batch_api(
@@ -329,6 +332,219 @@ pub async fn run_entity_extraction_for_eval(
     );
 
     Ok(total)
+}
+
+/// Canonical paths for enriched eval DBs. Reused across eval pipelines so the
+/// (paid) Batch API enrichment work is not redone. Callers point `MemoryDB::new_with_shared_embedder`
+/// at these dirs to inherit the cached entities/titles/concepts.
+///
+/// Layout: `app/eval/baselines/fullpipeline_{lme,locomo}_tuples.db/origin_memory.db`.
+/// Both dirs were originally enriched via the (now opt-in) Batch API path. Subsequent eval
+/// runs default to on-device, but skip enrichment entirely when `enriched_count == mem_count`.
+///
+/// **Reuse pattern for new evals** (e.g. task #12 query decomposition, task #13 precision probe):
+/// ```ignore
+/// let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+/// let db = match try_open_enriched_db(&baselines, ENRICHED_LME_DB_SUBPATH).await? {
+///     Some(db) => db, // cached enrichment, skip seeding
+///     None => /* seed + enrich_db_for_eval */,
+/// };
+/// // run new eval against `db`
+/// ```
+pub const ENRICHED_LME_DB_SUBPATH: &str = "fullpipeline_lme_tuples.db";
+pub const ENRICHED_LOCOMO_DB_SUBPATH: &str = "fullpipeline_locomo_tuples.db";
+
+/// Open an existing enriched eval DB for reuse. Returns `Some(db)` only when the DB at
+/// `<baselines_dir>/<subpath>` exists AND is fully enriched (`mem_count > 0 && enriched_count == mem_count`).
+/// Returns `None` for missing dir, empty DB, or partially-enriched DB — caller should fall through
+/// to a fresh seed + `enrich_db_for_eval` path.
+///
+/// Uses the shared eval embedder so vector dim + index settings stay consistent across evals.
+pub async fn try_open_enriched_db(
+    baselines_dir: &std::path::Path,
+    subpath: &str,
+) -> Result<Option<MemoryDB>, OriginError> {
+    let db_dir = baselines_dir.join(subpath);
+    if !db_dir.exists() {
+        eprintln!("[reuse] {} not found, fresh DB needed", db_dir.display());
+        return Ok(None);
+    }
+    let db = MemoryDB::new_with_shared_embedder(
+        &db_dir,
+        Arc::new(crate::events::NoopEmitter),
+        eval_shared_embedder(),
+    )
+    .await?;
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
+    if mem_count > 0 && enriched_count == mem_count {
+        eprintln!(
+            "[reuse] {} ready: {} memories, all enriched",
+            db_dir.display(),
+            mem_count
+        );
+        Ok(Some(db))
+    } else {
+        eprintln!(
+            "[reuse] {} incomplete: {}/{} enriched, fresh DB needed",
+            db_dir.display(),
+            enriched_count,
+            mem_count
+        );
+        Ok(None)
+    }
+}
+
+/// Where to source enrichment work for an eval DB.
+///
+/// `OnDevice` mirrors production: free, slow, uses Qwen3-4B via the on-device LlmProvider.
+/// Use this when measuring what real users get.
+///
+/// `BatchApi` uses Anthropic Batch API: fast, paid, and over-flatters quality vs. production
+/// because Haiku is more capable than Qwen-4B. Opt-in only.
+pub enum EnrichmentMode {
+    OnDevice(Arc<dyn crate::llm_provider::LlmProvider>),
+    BatchApi {
+        api_key: String,
+        model: String,
+        cost_cap_usd: f64,
+    },
+}
+
+impl EnrichmentMode {
+    /// Construct from environment.
+    ///
+    /// - `EVAL_ENRICHMENT=cloud` (or `batch`) → `BatchApi` (requires `ANTHROPIC_API_KEY`).
+    /// - Anything else (default) → `OnDevice`, model selected by `EVAL_LOCAL_MODEL`:
+    ///   - unset → `qwen3-4b` (default, fast, lower quality)
+    ///   - `qwen3.5-9b` → 9B model (slower, higher quality)
+    ///
+    /// Returns Err if `cloud` is requested without `ANTHROPIC_API_KEY`, or if
+    /// `OnDeviceProvider` init fails (model load, GPU init, etc.).
+    pub fn from_env(answer_model: &str, cost_cap_usd: f64) -> Result<Self, OriginError> {
+        let mode = std::env::var("EVAL_ENRICHMENT").unwrap_or_else(|_| "local".into());
+        match mode.as_str() {
+            "cloud" | "batch" => {
+                let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                    OriginError::Generic("EVAL_ENRICHMENT=cloud requires ANTHROPIC_API_KEY".into())
+                })?;
+                Ok(Self::BatchApi {
+                    api_key,
+                    model: answer_model.to_string(),
+                    cost_cap_usd,
+                })
+            }
+            _ => {
+                let model_id = std::env::var("EVAL_LOCAL_MODEL").ok();
+                let provider = match model_id.as_deref() {
+                    Some(m) => crate::llm_provider::OnDeviceProvider::new_with_model(Some(m)),
+                    None => crate::llm_provider::OnDeviceProvider::new(),
+                }
+                .map_err(|e| {
+                    OriginError::Generic(format!(
+                        "OnDeviceProvider init failed (set EVAL_ENRICHMENT=cloud to use Batch API): {e}"
+                    ))
+                })?;
+                eprintln!(
+                    "[enrichment] mode=on-device model={}",
+                    model_id.as_deref().unwrap_or("qwen3-4b (default)")
+                );
+                Ok(Self::OnDevice(Arc::new(provider)))
+            }
+        }
+    }
+}
+
+/// Enrich a freshly-seeded eval DB: entity extraction + title enrichment + concept distillation.
+///
+/// Caller must check `mem_count == enriched_count` before calling — this function unconditionally
+/// re-enriches everything it sees. Returns `(entities, titles, concepts)` counts.
+pub async fn enrich_db_for_eval(
+    db: &MemoryDB,
+    mode: &EnrichmentMode,
+) -> Result<(usize, usize, usize), OriginError> {
+    match mode {
+        EnrichmentMode::OnDevice(llm) => enrich_db_for_eval_local(db, llm).await,
+        EnrichmentMode::BatchApi {
+            api_key,
+            model,
+            cost_cap_usd,
+        } => {
+            // Batch A: extraction + titles in parallel (independent).
+            let (entities_res, titles_res) = tokio::join!(
+                run_enrichment_batch_api(db, api_key, model, *cost_cap_usd),
+                run_title_enrichment_batch_api(db, api_key, model, *cost_cap_usd),
+            );
+            let entities = entities_res?;
+            let titles = titles_res?;
+            // Batch B: concept distillation (depends on entities + enrichment_steps).
+            let concepts =
+                run_concept_distillation_batch_api(db, api_key, model, *cost_cap_usd).await?;
+            Ok((entities, titles, concepts))
+        }
+    }
+}
+
+/// On-device title enrichment via production code path.
+///
+/// Loops over `db.get_memories_needing_title_enrichment` candidates, calls
+/// `post_ingest::enrich_title` per memory. Returns count of titles actually updated
+/// (some candidates may be rejected by the LLM or skipped).
+///
+/// Serial — single inference thread on Qwen3-4B / 9B.
+pub async fn run_title_enrichment_for_eval(
+    db: &MemoryDB,
+    llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+) -> Result<usize, OriginError> {
+    let candidates = db.get_memories_needing_title_enrichment().await?;
+    let total_candidates = candidates.len();
+    if total_candidates == 0 {
+        return Ok(0);
+    }
+    let mut updated = 0usize;
+    for (source_id, content) in &candidates {
+        if let Ok(crate::post_ingest::TitleEnrichResult::Enriched) =
+            crate::post_ingest::enrich_title(db, source_id, content, llm).await
+        {
+            updated += 1;
+        }
+    }
+    eprintln!(
+        "    [title_enrich_local] {}/{} titles enriched",
+        updated, total_candidates
+    );
+    Ok(updated)
+}
+
+/// On-device enrichment via production code paths. Mirrors production exactly:
+/// `refinery::extract_entities_from_memories` → `post_ingest::enrich_title` per memory →
+/// `refinery::distill_concepts`. Free but slow (Qwen3-4B serial ≈ several hours at LME scale).
+///
+/// All three steps run **serially**, intentionally: Qwen3-4B can't sustain parallel LLM calls
+/// (single GPU inference thread, OOM under concurrent load). 9B has the same constraint at the
+/// inference-thread level. The Batch API path runs A+B parallel via `tokio::join!` because Anthropic
+/// dispatches its own infra; that does not apply here.
+///
+/// For staged evals (e.g. `pipeline.rs` Flat/Enriched/Distilled), call the three sub-steps
+/// independently — `run_entity_extraction_for_eval`, `run_title_enrichment_for_eval`,
+/// `refinery::distill_concepts` — so each stage can be measured in isolation.
+pub async fn enrich_db_for_eval_local(
+    db: &MemoryDB,
+    llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+) -> Result<(usize, usize, usize), OriginError> {
+    use crate::prompts::PromptRegistry;
+    use crate::tuning::DistillationConfig;
+
+    let entities = run_entity_extraction_for_eval(db, llm).await?;
+    let titles = run_title_enrichment_for_eval(db, llm).await?;
+
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let tuning = DistillationConfig::default();
+    let concepts =
+        crate::refinery::distill_concepts(db, Some(llm), &prompts, &tuning, None).await?;
+    eprintln!("    [distill_local] {} concepts", concepts);
+
+    Ok((entities, titles, concepts))
 }
 
 /// Batch title enrichment via Anthropic Batch API.

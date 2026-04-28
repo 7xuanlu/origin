@@ -1161,6 +1161,7 @@ async fn build_structured_context(
 /// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
 pub async fn run_fullpipeline_locomo_batch(
     locomo_path: &Path,
+    enrichment: crate::eval::shared::EnrichmentMode,
     api_key: &str,
     answer_model: &str,
     output_path: &Path,
@@ -1246,30 +1247,16 @@ pub async fn run_fullpipeline_locomo_batch(
             );
         }
 
+        let mode_label = match &enrichment {
+            crate::eval::shared::EnrichmentMode::OnDevice(_) => "on-device (Qwen3-4B, free)",
+            crate::eval::shared::EnrichmentMode::BatchApi { .. } => "Batch API (Haiku, paid)",
+        };
         eprintln!(
-            "[fullpipeline] Total: {} observations in 1 DB. Enriching via Batch API...",
-            total_obs
+            "[fullpipeline] Total: {} observations in 1 DB. Enriching: {}...",
+            total_obs, mode_label
         );
-        // Batch A: extraction + titles in parallel (independent)
-        let (entities_res, titles_res) = tokio::join!(
-            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd),
-            crate::eval::shared::run_title_enrichment_batch_api(
-                &db,
-                api_key,
-                answer_model,
-                cost_cap_usd,
-            ),
-        );
-        let entities = entities_res?;
-        let titles = titles_res?;
-        // Batch B: concept distillation (depends on entities + enrichment_steps)
-        let concepts = crate::eval::shared::run_concept_distillation_batch_api(
-            &db,
-            api_key,
-            answer_model,
-            cost_cap_usd,
-        )
-        .await?;
+        let (entities, titles, concepts) =
+            crate::eval::shared::enrich_db_for_eval(&db, &enrichment).await?;
         eprintln!(
             "[fullpipeline] Enriched: {} entities, {} titles, {} concepts",
             entities, titles, concepts
@@ -1400,6 +1387,7 @@ pub async fn run_fullpipeline_locomo_batch(
 /// Enrichment runs once across all data.
 pub async fn run_fullpipeline_lme_batch(
     longmemeval_path: &Path,
+    enrichment: crate::eval::shared::EnrichmentMode,
     api_key: &str,
     answer_model: &str,
     output_path: &Path,
@@ -1485,31 +1473,18 @@ pub async fn run_fullpipeline_lme_batch(
             db.upsert_documents(docs).await?;
         }
 
+        let mode_label = match &enrichment {
+            crate::eval::shared::EnrichmentMode::OnDevice(_) => "on-device (Qwen3-4B, free)",
+            crate::eval::shared::EnrichmentMode::BatchApi { .. } => "Batch API (Haiku, paid)",
+        };
         eprintln!(
-            "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching via Batch API...",
+            "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching: {}...",
             total_mems,
-            samples.len()
+            samples.len(),
+            mode_label
         );
-        // Batch A: extraction + titles in parallel (independent)
-        let (entities_res, titles_res) = tokio::join!(
-            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd),
-            crate::eval::shared::run_title_enrichment_batch_api(
-                &db,
-                api_key,
-                answer_model,
-                cost_cap_usd,
-            ),
-        );
-        let entities = entities_res?;
-        let titles = titles_res?;
-        // Batch B: concept distillation (depends on entities + enrichment_steps)
-        let concepts = crate::eval::shared::run_concept_distillation_batch_api(
-            &db,
-            api_key,
-            answer_model,
-            cost_cap_usd,
-        )
-        .await?;
+        let (entities, titles, concepts) =
+            crate::eval::shared::enrich_db_for_eval(&db, &enrichment).await?;
         eprintln!(
             "[fullpipeline_lme] Enriched: {} entities, {} titles, {} concepts",
             entities, titles, concepts
