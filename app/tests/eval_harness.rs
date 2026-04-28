@@ -2320,8 +2320,8 @@ async fn probe_concept_scores() {
             samples.len()
         );
         eprintln!(
-            "{:<24} | {:>6} {:>6} {:>6} | {:>5} {:>5} {:>5} | {}",
-            "Category", "C1", "C2", "C3", "Tok1", "Tok2", "Tok3", "Question"
+            "{:<24} | {:>6} {:>6} {:>6} | {:>5} {:>5} {:>5} | Question",
+            "Category", "C1", "C2", "C3", "Tok1", "Tok2", "Tok3"
         );
         eprintln!("{}", "-".repeat(110));
 
