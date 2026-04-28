@@ -701,7 +701,7 @@ pub async fn run_e2e_locomo_eval(
 ///
 /// Requires enrichment + distillation to be run first (concepts must exist).
 /// Call this after seeding + enriching a DB, or use the all-in-one wrapper.
-async fn generate_e2e_answers_for_question(
+pub(crate) async fn generate_e2e_answers_for_question(
     db: &MemoryDB,
     question: &str,
     ground_truth: &str,
