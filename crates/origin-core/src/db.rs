@@ -4112,6 +4112,31 @@ impl MemoryDB {
             }
         }
 
+        // Migration 44: event_date column on memories — when the event the memory
+        // describes actually happened, distinct from last_modified (ingestion time).
+        // Necessary so importing old content (email archives, conversation backfills,
+        // benchmark seeds) doesn't get penalised by recency decay scoring, while still
+        // letting the LLM see real dates in retrieved context.
+        if version < 44 {
+            let chunk_cols = self.get_table_columns("memories").await?;
+            let conn = self.conn.lock().await;
+
+            if !chunk_cols.contains("event_date") {
+                conn.execute("ALTER TABLE memories ADD COLUMN event_date INTEGER", ())
+                    .await
+                    .map_err(|e| {
+                        OriginError::VectorDb(format!("migration 44 add event_date: {e}"))
+                    })?;
+                log::info!(
+                    "[memory_db] migration 44: added memories.event_date (NULL-able, no backfill)"
+                );
+            }
+
+            conn.execute("PRAGMA user_version = 44", ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("set user_version=44: {e}")))?;
+        }
+
         Ok(())
     }
 
@@ -5067,7 +5092,8 @@ impl MemoryDB {
     /// 11=byte_start, 12=byte_end, 13=semantic_unit, 14=memory_type, 15=domain,
     /// 16=source_agent, 17=confidence, 18=confirmed, 19=stability, 20=supersedes,
     /// 21=entity_id, 22=quality, 23=is_recap, 24=supersede_mode,
-    /// 25=structured_fields, 26=retrieval_cue, 27=source_text, 28=score/distance/rank
+    /// 25=structured_fields, 26=retrieval_cue, 27=source_text, 28=created_at,
+    /// 29=event_date, 30=score/distance/rank
     fn row_to_search_result(row: &libsql::Row, score: f32) -> Result<SearchResult, OriginError> {
         Ok(SearchResult {
             id: row
@@ -5111,6 +5137,8 @@ impl MemoryDB {
             structured_fields: row.get::<Option<String>>(25).unwrap_or(None),
             retrieval_cue: row.get::<Option<String>>(26).unwrap_or(None),
             source_text: row.get::<Option<String>>(27).unwrap_or(None),
+            created_at: row.get::<i64>(28).unwrap_or(0),
+            event_date: row.get::<Option<i64>>(29).unwrap_or(None),
             raw_score: 0.0, // Set later during normalization
         })
     }
@@ -5134,6 +5162,7 @@ impl MemoryDB {
             url: Option<String>,
             chunk_index: i32,
             last_modified: i64,
+            event_date: Option<i64>,
             chunk_type: String,
             language: Option<String>,
             byte_start: Option<i64>,
@@ -5223,6 +5252,7 @@ impl MemoryDB {
                     url: doc.url.clone(),
                     chunk_index: i as i32,
                     last_modified: doc.last_modified,
+                    event_date: doc.event_date,
                     chunk_type: chunk.chunk_type.clone(),
                     language: chunk.language.clone(),
                     byte_start: chunk.byte_range.map(|(s, _)| s as i64),
@@ -5356,6 +5386,11 @@ impl MemoryDB {
                 .map(|s| s.into())
                 .unwrap_or(libsql::Value::Null);
 
+            let event_date_val = row
+                .event_date
+                .map(libsql::Value::Integer)
+                .unwrap_or(libsql::Value::Null);
+
             conn.execute(
                 "INSERT INTO memories (id, content, source, source_id, title, summary, url,
                     chunk_index, last_modified, chunk_type, language, byte_start, byte_end,
@@ -5363,12 +5398,12 @@ impl MemoryDB {
                     stability, supersedes, pending_revision, word_count,
                     entity_id, enrichment_status, quality, is_recap, supersede_mode,
                     structured_fields, retrieval_cue, source_text,
-                    embedding, created_at)
+                    embedding, created_at, event_date)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
                     ?24, ?25, ?26, ?27, ?28,
                     ?29, ?30, ?31,
-                    vector32(?32), ?33)",
+                    vector32(?32), ?33, ?34)",
                 libsql::params![
                     row.id,
                     row.content,
@@ -5402,7 +5437,8 @@ impl MemoryDB {
                     retrieval_cue_val,
                     source_text_val,
                     vec_str,
-                    row.last_modified // created_at = last_modified at insert time
+                    row.last_modified, // created_at = last_modified at insert time
+                    event_date_val
                 ],
             )
             .await
@@ -5454,6 +5490,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5465,6 +5503,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5484,7 +5524,7 @@ impl MemoryDB {
             match rows_result {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(28).unwrap_or(1.0);
+                        let distance: f64 = row.get(30).unwrap_or(1.0);
                         if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
                             vector_results.push(result);
                         }
@@ -5510,6 +5550,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5523,6 +5565,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5545,7 +5589,7 @@ impl MemoryDB {
             match fts_result {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let rank: f64 = row.get(30).unwrap_or(0.0);
                         if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
                             fts_results.push(result);
                         }
@@ -5718,6 +5762,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5734,7 +5780,7 @@ impl MemoryDB {
             match conn.query(&sql, params).await {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(28).unwrap_or(1.0);
+                        let distance: f64 = row.get(30).unwrap_or(1.0);
                         if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
                             vector_results.push(result);
                         }
@@ -5777,6 +5823,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5801,7 +5849,7 @@ impl MemoryDB {
                 match conn.query(&fts_sql, params).await {
                     Ok(mut rows) => {
                         while let Ok(Some(row)) = rows.next().await {
-                            let rank: f64 = row.get(28).unwrap_or(0.0);
+                            let rank: f64 = row.get(30).unwrap_or(0.0);
                             if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
                                 fts_results.push(result);
                             }
@@ -5875,15 +5923,14 @@ impl MemoryDB {
             .map(|mut r| {
                 let rrf = *score_map.get(&r.id).unwrap_or(&0.0);
 
-                // Tiered retrieval: weight by confidence and recency decay
+                // Tiered retrieval: weight by confidence and recency decay.
+                // Decay anchored to last_modified (ingestion/edit time), NOT event_date —
+                // an old email imported today should rank as freshly ingested. event_date
+                // is for display only.
                 let conf = r.confidence.unwrap_or(0.5);
                 let tier = stability_tier(r.memory_type.as_deref());
-                // Inline decay rates (match TuningConfig defaults) — search doesn't hold config ref
-                let dr = match tier {
-                    crate::sources::StabilityTier::Protected => 0.001,
-                    crate::sources::StabilityTier::Standard => 0.01,
-                    crate::sources::StabilityTier::Ephemeral => 0.05,
-                };
+                let decay_cfg = crate::tuning::ConfidenceConfig::default();
+                let dr = crate::sources::decay_rate(&tier, &decay_cfg);
                 let age_days = ((now - r.last_modified) as f64 / 86400.0).max(0.0);
                 let recency = (-dr * age_days).exp() as f32;
 
@@ -6471,6 +6518,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -6490,6 +6539,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -6506,7 +6557,7 @@ impl MemoryDB {
         match conn.query(&sql, params).await {
             Ok(mut rows) => {
                 while let Ok(Some(row)) = rows.next().await {
-                    let distance: f64 = row.get(28).unwrap_or(1.0);
+                    let distance: f64 = row.get(30).unwrap_or(1.0);
                     let score = (1.0 - distance).max(0.0) as f32;
                     if let Ok(result) = Self::row_to_search_result(&row, score) {
                         results.push(result);
@@ -6562,6 +6613,8 @@ impl MemoryDB {
                     c.confidence, c.confirmed, c.stability, c.supersedes,
                     c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                     c.structured_fields, c.retrieval_cue, c.source_text,
+                    c.created_at,
+                    c.event_date,
                     fts.rank
              FROM memories_fts fts
              JOIN memories c ON fts.rowid = c.rowid
@@ -6589,7 +6642,7 @@ impl MemoryDB {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
                         // FTS5 rank is negative BM25; negate so higher = better
-                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let rank: f64 = row.get(30).unwrap_or(0.0);
                         let score = (-rank) as f32;
                         if let Ok(result) = Self::row_to_search_result(&row, score) {
                             results.push(result);
@@ -6845,6 +6898,8 @@ impl MemoryDB {
                 structured_fields: None,
                 retrieval_cue: None,
                 source_text: None,
+                created_at,
+                event_date: None,
                 raw_score: 0.0,
             });
         }
@@ -24268,6 +24323,102 @@ pub(crate) mod tests {
             sources_after.is_empty(),
             "concept_sources should be empty after concept delete (FK cascade): {:?}",
             sources_after
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_result_exposes_created_at() {
+        let (db, _dir) = test_db().await;
+
+        // Seed a chunk with a known historical timestamp (2023-01-01 00:00:00 UTC = 1672531200).
+        let known_ts: i64 = 1_672_531_200;
+        let docs = vec![crate::sources::RawDocument {
+            content: "Alice met Bob in Tokyo".to_string(),
+            source_id: "doc1".to_string(),
+            source: "memory".to_string(),
+            title: "test".to_string(),
+            last_modified: known_ts,
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            ..Default::default()
+        }];
+        db.upsert_documents(docs).await.unwrap();
+
+        let results = db
+            .search_memory(
+                "Tokyo",
+                5,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "search returned no results");
+        let r = &results[0];
+        assert_eq!(r.last_modified, known_ts, "last_modified mismatch");
+        assert_eq!(
+            r.created_at, known_ts,
+            "created_at mismatch (upsert_documents mirrors last_modified -> created_at on INSERT)"
+        );
+    }
+
+    /// Regression: search ranking must depend on `last_modified` (recency anchor),
+    /// not on `event_date` (display-only). A chunk with a 3-year-old event_date
+    /// but a fresh last_modified (think: imported old email, benchmark seed)
+    /// must score meaningfully — the recency multiplier should not crush it
+    /// to ~0 just because the *event* is old.
+    /// Guards against the recency-decay-eats-old-content regression that was
+    /// caught when an earlier change made `last_modified` carry the event time.
+    #[tokio::test]
+    async fn test_search_ranking_uses_last_modified_not_event_date() {
+        let (db, _dir) = test_db().await;
+        let now_ts = chrono::Utc::now().timestamp();
+        let three_years_ago = now_ts - 3 * 365 * 86400;
+
+        // Single row with old event_date + fresh last_modified (mirrors
+        // benchmark seeds and old-archive imports).
+        let docs = vec![crate::sources::RawDocument {
+            content: "Alice met Bob in Tokyo".to_string(),
+            source_id: "old_event_fresh_import".to_string(),
+            source: "memory".to_string(),
+            title: "test".to_string(),
+            last_modified: now_ts,
+            event_date: Some(three_years_ago),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            ..Default::default()
+        }];
+        db.upsert_documents(docs).await.unwrap();
+
+        let results = db
+            .search_memory(
+                "Tokyo",
+                10,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "expected one result: {results:?}");
+        let r = &results[0];
+        assert_eq!(r.last_modified, now_ts);
+        assert_eq!(r.event_date, Some(three_years_ago));
+        // Score must be meaningful. Pre-fix, recency multiplier was
+        // exp(-0.01 * 1095) ≈ 1.7e-5, crushing any RRF score to ~0.
+        // With ranking anchored to last_modified=now(), recency=1.0 and
+        // score should reflect actual RRF×confidence×... product (well above 1e-3).
+        assert!(
+            r.score > 0.001,
+            "score crushed by recency decay despite fresh last_modified: {}",
+            r.score
         );
     }
 }

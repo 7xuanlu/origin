@@ -485,6 +485,10 @@ pub async fn run_e2e_locomo_eval(
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
+                event_date: crate::eval::dates::seed_event_date(
+                    mem.session_date.as_deref(),
+                    crate::eval::dates::parse_locomo_date,
+                ),
                 ..Default::default()
             })
             .collect();
@@ -698,19 +702,18 @@ pub async fn run_e2e_locomo_eval(
 ///
 /// Requires enrichment + distillation to be run first (concepts must exist).
 /// Call this after seeding + enriching a DB, or use the all-in-one wrapper.
-async fn generate_e2e_answers_for_question(
+pub(crate) async fn generate_e2e_answers_for_question(
     db: &MemoryDB,
     question: &str,
     ground_truth: &str,
     category: &str,
     search_limit: usize,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+    question_date: Option<&str>,
 ) -> Result<Vec<JudgmentTuple>, OriginError> {
     use crate::llm_provider::{strip_think_tags, LlmRequest};
 
-    let system_prompt = "Answer the question using only the provided context. \
-        Be specific and concise. Respond in 1-3 sentences."
-        .to_string();
+    let system_prompt = build_e2e_system_prompt(question_date);
 
     let mut tuples = Vec::new();
 
@@ -729,15 +732,23 @@ async fn generate_e2e_answers_for_question(
         .await?;
     let flat_context: String = flat_results
         .iter()
-        .enumerate()
-        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+        .map(|r| {
+            format!(
+                "On {}: {}",
+                crate::eval::shared::format_ymd(r.event_date.unwrap_or(r.last_modified)),
+                r.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let flat_tokens = count_tokens(&flat_context);
 
     let flat_request = LlmRequest {
         system_prompt: Some(system_prompt.clone()),
-        user_prompt: format!("Context:\n{}\n\nQuestion: {}", flat_context, question),
+        user_prompt: format!(
+            "Context (each line prefixed with the date the memory was recorded):\n{}\n\nQuestion: {}",
+            flat_context, question
+        ),
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_flat".to_string()),
@@ -770,8 +781,12 @@ async fn generate_e2e_answers_for_question(
     // Memory search results
     if !flat_results.is_empty() {
         structured_parts.push("## Relevant Memories".to_string());
-        for (i, r) in flat_results.iter().enumerate() {
-            structured_parts.push(format!("{}. {}", i + 1, r.content));
+        for r in flat_results.iter() {
+            structured_parts.push(format!(
+                "On {}: {}",
+                crate::eval::shared::format_ymd(r.event_date.unwrap_or(r.last_modified)),
+                r.content
+            ));
         }
     }
 
@@ -780,7 +795,10 @@ async fn generate_e2e_answers_for_question(
 
     let structured_request = LlmRequest {
         system_prompt: Some(system_prompt),
-        user_prompt: format!("Context:\n{}\n\nQuestion: {}", structured_context, question),
+        user_prompt: format!(
+            "Context (each line prefixed with the date the memory was recorded; concept articles are time-spanning):\n{}\n\nQuestion: {}",
+            structured_context, question
+        ),
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_structured".to_string()),
@@ -860,6 +878,10 @@ pub async fn run_e2e_context_eval(
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
+                event_date: crate::eval::dates::seed_event_date(
+                    mem.session_date.as_deref(),
+                    crate::eval::dates::parse_locomo_date,
+                ),
                 ..Default::default()
             })
             .collect();
@@ -903,6 +925,7 @@ pub async fn run_e2e_context_eval(
                 category,
                 search_limit,
                 &llm,
+                None,
             )
             .await
             {
@@ -1008,6 +1031,10 @@ pub async fn run_e2e_context_eval_longmemeval(
                 ),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
+                event_date: crate::eval::dates::seed_event_date(
+                    mem.session_date.as_deref(),
+                    crate::eval::dates::parse_lme_date,
+                ),
                 ..Default::default()
             })
             .collect();
@@ -1037,6 +1064,7 @@ pub async fn run_e2e_context_eval_longmemeval(
             category,
             search_limit,
             &llm,
+            Some(&sample.question_date),
         )
         .await
         {
@@ -1073,9 +1101,22 @@ struct PendingAnswer {
     context_tokens: usize,
 }
 
-/// System prompt used for all E2E answer generation.
+/// System prompt used for all E2E answer generation (no date anchor).
 const E2E_SYSTEM_PROMPT: &str =
     "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.";
+
+/// Build the E2E system prompt, prepending the question's "asked on" date when available
+/// so the LLM has a temporal anchor for relative-time references in the question.
+fn build_e2e_system_prompt(question_date: Option<&str>) -> String {
+    match question_date {
+        Some(d) => format!(
+            "The question was asked on {}. Answer the question using only the provided context. \
+             Be specific and concise. Respond in 1-3 sentences.",
+            d
+        ),
+        None => E2E_SYSTEM_PROMPT.to_string(),
+    }
+}
 
 /// Build structured context for a question against an enriched DB.
 ///
@@ -1139,8 +1180,12 @@ async fn build_structured_context(
     }
     if !results.is_empty() {
         parts.push("## Relevant Memories".to_string());
-        for (i, r) in results.iter().enumerate() {
-            parts.push(format!("{}. {}", i + 1, r.content));
+        for r in results.iter() {
+            parts.push(format!(
+                "On {}: {}",
+                crate::eval::shared::format_ymd(r.event_date.unwrap_or(r.last_modified)),
+                r.content
+            ));
         }
     }
     let structured_context = parts.join("\n\n");
@@ -1234,6 +1279,10 @@ pub async fn run_fullpipeline_locomo_batch(
                     memory_type: Some("fact".to_string()),
                     domain: Some("conversation".to_string()),
                     last_modified: chrono::Utc::now().timestamp(),
+                    event_date: crate::eval::dates::seed_event_date(
+                        mem.session_date.as_deref(),
+                        crate::eval::locomo::parse_locomo_date,
+                    ),
                     ..Default::default()
                 })
                 .collect();
@@ -1283,6 +1332,14 @@ pub async fn run_fullpipeline_locomo_batch(
     for sample in &samples {
         let mut q_count = 0usize;
 
+        // Question "asked on" = latest session date in this sample (questions follow the conversation).
+        // Skipped when no session_date can be parsed; falls back to the date-blind prompt.
+        let sample_question_date: Option<String> = extract_observations(sample)
+            .iter()
+            .filter_map(|m| m.session_date.clone())
+            .filter(|d| crate::eval::locomo::parse_locomo_date(d).is_some())
+            .max_by_key(|d| crate::eval::locomo::parse_locomo_date(d).unwrap_or(0));
+
         for qa in &sample.qa {
             if qa.category == 5 {
                 continue;
@@ -1307,7 +1364,7 @@ pub async fn run_fullpipeline_locomo_batch(
             batch_requests.push((
                 req_id.clone(),
                 format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
-                Some(E2E_SYSTEM_PROMPT.to_string()),
+                Some(build_e2e_system_prompt(sample_question_date.as_deref())),
                 200,
             ));
             pending.insert(
@@ -1478,6 +1535,10 @@ pub async fn run_fullpipeline_lme_batch(
                     ),
                     domain: Some("conversation".to_string()),
                     last_modified: chrono::Utc::now().timestamp(),
+                    event_date: crate::eval::dates::seed_event_date(
+                        mem.session_date.as_deref(),
+                        crate::eval::longmemeval::parse_lme_date,
+                    ),
                     ..Default::default()
                 })
                 .collect();
@@ -1541,7 +1602,7 @@ pub async fn run_fullpipeline_lme_batch(
         batch_requests.push((
             req_id.clone(),
             format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
-            Some(E2E_SYSTEM_PROMPT.to_string()),
+            Some(build_e2e_system_prompt(Some(&sample.question_date))),
             200,
         ));
         pending.insert(
@@ -1629,4 +1690,45 @@ pub async fn run_fullpipeline_lme_batch(
     Ok(finished_tuples)
 }
 
-// ===== Flat cache loaders =====
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_format_ymd_used_in_context() {
+        assert_eq!(crate::eval::shared::format_ymd(1_681_168_020), "2023-04-10");
+        assert_eq!(crate::eval::shared::format_ymd(1_683_554_160), "2023-05-08");
+    }
+
+    #[test]
+    fn test_system_prompt_includes_question_date_when_provided() {
+        // Mirror the system_prompt construction from generate_e2e_answers_for_question
+        // to lock in the format. If the function changes, this test should reflect.
+        let with_date = match Some("2023/04/10 (Mon) 23:07") {
+            Some(d) => format!(
+                "The question was asked on {}. Answer the question using only the provided context. \
+                 Be specific and concise. Respond in 1-3 sentences.",
+                d
+            ),
+            None => "Answer the question using only the provided context. \
+                Be specific and concise. Respond in 1-3 sentences."
+                .to_string(),
+        };
+        assert!(with_date.contains("The question was asked on 2023/04/10"));
+        assert!(with_date.contains("only the provided context"));
+    }
+
+    #[test]
+    fn test_system_prompt_omits_when_no_question_date() {
+        let without_date: String = match None::<&str> {
+            Some(d) => format!(
+                "The question was asked on {}. Answer the question using only the provided context. \
+                 Be specific and concise. Respond in 1-3 sentences.",
+                d
+            ),
+            None => "Answer the question using only the provided context. \
+                Be specific and concise. Respond in 1-3 sentences."
+                .to_string(),
+        };
+        assert!(!without_date.contains("question was asked on"));
+        assert!(without_date.contains("only the provided context"));
+    }
+}

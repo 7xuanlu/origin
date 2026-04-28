@@ -4458,118 +4458,8 @@ pub async fn run_context_path_eval(
 }
 
 // ===== E2E Answer Quality: flat vs structured context with LLM-as-judge =====
-
-/// Run E2E answer quality comparison: flat (search_memory) vs structured (search + concepts).
-///
-/// For each LoCoMo question:
-/// 1. Build flat context: search_memory top-K concatenated
-/// 2. Build structured context: search_memory + concept articles (like chat-context)
-/// 3. Generate answers from both contexts using on-device LLM
-/// 4. Return JudgmentTuples for offline Claude Haiku judging
-///
-/// Requires enrichment + distillation to be run first (concepts must exist).
-/// Call this after seeding + enriching a DB, or use the all-in-one wrapper.
-async fn generate_e2e_answers_for_question(
-    db: &MemoryDB,
-    question: &str,
-    ground_truth: &str,
-    category: &str,
-    search_limit: usize,
-    llm: &Arc<dyn crate::llm_provider::LlmProvider>,
-) -> Result<Vec<JudgmentTuple>, OriginError> {
-    use crate::llm_provider::{strip_think_tags, LlmRequest};
-
-    let system_prompt = "Answer the question using only the provided context. \
-        Be specific and concise. Respond in 1-3 sentences."
-        .to_string();
-
-    let mut tuples = Vec::new();
-
-    // --- Flat context: search_memory only ---
-    let flat_results = db
-        .search_memory(
-            question,
-            search_limit,
-            None,
-            Some("conversation"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await?;
-    let flat_context: String = flat_results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let flat_tokens = count_tokens(&flat_context);
-
-    let flat_request = LlmRequest {
-        system_prompt: Some(system_prompt.clone()),
-        user_prompt: format!("Context:\n{}\n\nQuestion: {}", flat_context, question),
-        max_tokens: 200,
-        temperature: 0.1,
-        label: Some("e2e_flat".to_string()),
-    };
-    if let Ok(raw) = llm.generate(flat_request).await {
-        let answer = strip_think_tags(&raw);
-        tuples.push(JudgmentTuple {
-            question: question.to_string(),
-            ground_truth: ground_truth.to_string(),
-            approach: format!("flat_{}", category),
-            answer,
-            context_tokens: flat_tokens,
-            category: category.to_string(),
-        });
-    }
-
-    // --- Structured context: search_memory + concept articles ---
-    let mut structured_parts: Vec<String> = Vec::new();
-
-    // Concept articles (like chat-context's "Compiled Knowledge" section)
-    let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
-    if !concepts.is_empty() {
-        structured_parts.push("## Compiled Knowledge".to_string());
-        for c in &concepts {
-            let summary = c.summary.as_deref().unwrap_or("");
-            structured_parts.push(format!("**{}**: {}\n{}", c.title, summary, c.content));
-        }
-    }
-
-    // Memory search results
-    if !flat_results.is_empty() {
-        structured_parts.push("## Relevant Memories".to_string());
-        for (i, r) in flat_results.iter().enumerate() {
-            structured_parts.push(format!("{}. {}", i + 1, r.content));
-        }
-    }
-
-    let structured_context = structured_parts.join("\n\n");
-    let structured_tokens = count_tokens(&structured_context);
-
-    let structured_request = LlmRequest {
-        system_prompt: Some(system_prompt),
-        user_prompt: format!("Context:\n{}\n\nQuestion: {}", structured_context, question),
-        max_tokens: 200,
-        temperature: 0.1,
-        label: Some("e2e_structured".to_string()),
-    };
-    if let Ok(raw) = llm.generate(structured_request).await {
-        let answer = strip_think_tags(&raw);
-        tuples.push(JudgmentTuple {
-            question: question.to_string(),
-            ground_truth: ground_truth.to_string(),
-            approach: format!("structured_{}", category),
-            answer,
-            context_tokens: structured_tokens,
-            category: category.to_string(),
-        });
-    }
-
-    Ok(tuples)
-}
+// `generate_e2e_answers_for_question` is the date-aware version in
+// crate::eval::answer_quality; we use it for both LoCoMo and LongMemEval below.
 
 /// Run full E2E answer quality eval on LoCoMo: seed, enrich, distill, generate answers.
 ///
@@ -4602,6 +4492,14 @@ pub async fn run_e2e_context_eval(
             continue;
         }
 
+        // Question "asked on" = latest session date in this sample (questions follow the
+        // conversation in LoCoMo). Falls back to None if no session_date parses.
+        let sample_question_date: Option<String> = memories
+            .iter()
+            .filter_map(|m| m.session_date.clone())
+            .filter(|d| crate::eval::locomo::parse_locomo_date(d).is_some())
+            .max_by_key(|d| crate::eval::locomo::parse_locomo_date(d).unwrap_or(0));
+
         eprintln!(
             "[e2e_context] Conv {}/{} ({}): {} observations",
             conv_idx + 1,
@@ -4630,7 +4528,10 @@ pub async fn run_e2e_context_eval(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: chrono::Utc::now().timestamp(),
+                last_modified: crate::eval::dates::seed_last_modified(
+                    mem.session_date.as_deref(),
+                    crate::eval::locomo::parse_locomo_date,
+                ),
                 ..Default::default()
             })
             .collect();
@@ -4667,13 +4568,14 @@ pub async fn run_e2e_context_eval(
 
             let category = category_name(qa.category);
 
-            match generate_e2e_answers_for_question(
+            match crate::eval::answer_quality::generate_e2e_answers_for_question(
                 &db,
                 &qa.question,
                 &ground_truth,
                 category,
                 search_limit,
                 &llm,
+                sample_question_date.as_deref(),
             )
             .await
             {
@@ -4778,7 +4680,10 @@ pub async fn run_e2e_context_eval_longmemeval(
                     .to_string(),
                 ),
                 domain: Some("conversation".to_string()),
-                last_modified: chrono::Utc::now().timestamp(),
+                last_modified: crate::eval::dates::seed_last_modified(
+                    mem.session_date.as_deref(),
+                    crate::eval::longmemeval::parse_lme_date,
+                ),
                 ..Default::default()
             })
             .collect();
@@ -4801,13 +4706,14 @@ pub async fn run_e2e_context_eval_longmemeval(
 
         let category = category_name(&sample.question_type);
 
-        if let Ok(tuples) = generate_e2e_answers_for_question(
+        if let Ok(tuples) = crate::eval::answer_quality::generate_e2e_answers_for_question(
             &db,
             &sample.question,
             &ground_truth,
             category,
             search_limit,
             &llm,
+            Some(&sample.question_date),
         )
         .await
         {

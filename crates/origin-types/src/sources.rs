@@ -108,8 +108,15 @@ pub struct RawDocument {
     pub content: String,
     /// Deep link back to the source (URL, file path)
     pub url: Option<String>,
-    /// Unix timestamp of last modification
+    /// Unix timestamp of last modification (ingestion/edit time — used for recency ranking).
     pub last_modified: i64,
+    /// Unix timestamp of when the event the document describes actually happened.
+    /// Distinct from `last_modified` (ingestion time): a benchmark seed has session_date here
+    /// and now() in last_modified; an imported old email has the email Date header here and
+    /// the import time in last_modified. Used for date-aware display in retrieved context.
+    /// `None` = unknown event time; consumers should fall back to `last_modified`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_date: Option<i64>,
     /// Additional metadata
     pub metadata: HashMap<String, String>,
 
@@ -183,6 +190,7 @@ impl Default for RawDocument {
             content: String::new(),
             url: None,
             last_modified: 0,
+            event_date: None,
             metadata: HashMap::new(),
             memory_type: None,
             domain: None,

@@ -756,6 +756,7 @@ mod tests {
             content: content.to_string(),
             url: None,
             last_modified: chrono::Utc::now().timestamp(),
+            event_date: None,
             metadata: std::collections::HashMap::new(),
             memory_type: Some("fact".to_string()),
             domain: None,

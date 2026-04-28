@@ -39,6 +39,10 @@ pub fn count_tokens(text: &str) -> usize {
     BPE.encode_with_special_tokens(text).len()
 }
 
+/// Format a unix-seconds timestamp as ISO-8601 calendar date "YYYY-MM-DD" in UTC.
+/// Re-exported from [`crate::eval::dates`] for backward compatibility.
+pub use crate::eval::dates::format_ymd;
+
 /// Probe on-device batch extraction at different batch sizes.
 /// Returns vec of (batch_size, input_tokens, response_len, entities_found, observations_found).
 pub async fn probe_extraction_batch_sizes(

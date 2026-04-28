@@ -1579,6 +1579,90 @@ async fn judge_e2e_context_locomo() {
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
 
+/// Generate LongMemEval E2E answers via Claude CLI Haiku (Max plan, no API key).
+///
+/// Mirrors `generate_e2e_context_tuples_locomo_api` for the LME side. Uses the
+/// same `run_e2e_context_eval_longmemeval` path that exercises Task #11's
+/// dated-context formatter and `question_date` system-prompt anchor.
+#[tokio::test]
+#[ignore]
+async fn generate_e2e_context_tuples_longmemeval_api() {
+    use origin_lib::eval::token_efficiency::{
+        run_e2e_context_eval_longmemeval, save_judgment_tuples,
+    };
+    use std::sync::Arc;
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> =
+        Arc::new(origin_lib::llm_provider::ClaudeCliProvider::haiku());
+
+    // 50 questions for validation, 1 answer per question.
+    let tuples = run_e2e_context_eval_longmemeval(&path, llm, 10, 50, 1)
+        .await
+        .expect("run_e2e_context_eval_longmemeval with Haiku CLI failed");
+
+    eprintln!("Generated {} judgment tuples (Haiku CLI)", tuples.len());
+    assert!(!tuples.is_empty());
+
+    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines_dir).ok();
+    let out_path = baselines_dir.join("e2e_context_tuples_longmemeval_api.json");
+    save_judgment_tuples(&tuples, &out_path).expect("save tuples");
+    eprintln!("Saved to {:?}", out_path);
+}
+
+/// Judge LongMemEval API-generated tuples with Claude Haiku (matches the answer model).
+/// Run after `generate_e2e_context_tuples_longmemeval_api`.
+#[tokio::test]
+#[ignore]
+async fn judge_e2e_context_longmemeval_api_haiku() {
+    use origin_lib::eval::token_efficiency::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+
+    let tuples_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/baselines/e2e_context_tuples_longmemeval_api.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_e2e_context_tuples_longmemeval_api first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load tuples");
+    eprintln!("Judging {} tuples with Haiku...", tuples.len());
+
+    let results = judge_with_claude_model(&tuples, 3, "haiku")
+        .await
+        .expect("judge failed");
+
+    let report = aggregate_judgments(&results, "haiku");
+    eprintln!("\n=== E2E Context Eval: LongMemEval (Haiku answers, Haiku judge) ===");
+    eprintln!(
+        "{:<25} | {:<10} | {:<10} | {:<14} | Total",
+        "Approach", "Accuracy", "Correct", "Context Tok"
+    );
+    eprintln!(
+        "{:-<25}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<6}",
+        "", "", "", "", ""
+    );
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<25} | {:<10.1}% | {:<10} | {:<14.0} | {}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.correct,
+            r.mean_context_tokens,
+            r.total
+        );
+    }
+    eprintln!("\nTotal judged: {}", report.total_judged);
+}
+
 // ---------------------------------------------------------------------------
 // API-based E2E: Haiku as answer model, Sonnet as judge
 // ---------------------------------------------------------------------------
@@ -2547,4 +2631,412 @@ async fn probe_overlap_gate() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval-only diagnostic: no LLM calls, no API cost. Seeds conv-26, runs
+// search_memory for the 5 temporal questions, and dumps which hits came back
+// alongside whether the literal answer text exists in the seeded data and
+// where it ranks (or whether it ranks at all).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn temporal_retrieval_diag_locomo() {
+    use origin_core::events::NoopEmitter;
+    use origin_lib::memory_db::MemoryDB;
+    use origin_lib::sources::RawDocument;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    let samples = origin_lib::eval::locomo::load_locomo(&locomo_path).expect("load");
+    let sample = &samples[0];
+    let memories = origin_lib::eval::locomo::extract_observations(sample);
+    eprintln!("[diag] {} memories seeded", memories.len());
+
+    let probes = [
+        ("LGBTQ support group", "support group"),
+        ("painted a sunrise", "sunrise"),
+        ("charity race", "charity race"),
+        ("camping next month", "camping"),
+        ("speech at a school", "speech"),
+    ];
+    eprintln!("\n[diag] Substring check on raw extracted content:");
+    for (label, needle) in &probes {
+        let hits: Vec<&str> = memories
+            .iter()
+            .filter(|m| m.content.to_lowercase().contains(&needle.to_lowercase()))
+            .map(|m| m.content.as_str())
+            .collect();
+        eprintln!("  {:<22} ({} matches in extraction):", label, hits.len());
+        for h in hits.iter().take(3) {
+            eprintln!("    - {}", h.chars().take(120).collect::<String>());
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("db");
+    let docs: Vec<RawDocument> = memories
+        .iter()
+        .enumerate()
+        .map(|(i, mem)| RawDocument {
+            content: mem.content.clone(),
+            source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+            source: "memory".to_string(),
+            title: format!("{} session {}", mem.speaker, mem.session_num),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            last_modified: chrono::Utc::now().timestamp(),
+            event_date: origin_lib::eval::dates::seed_event_date(
+                mem.session_date.as_deref(),
+                origin_lib::eval::locomo::parse_locomo_date,
+            ),
+            ..Default::default()
+        })
+        .collect();
+    db.upsert_documents(docs).await.expect("upsert");
+
+    let queries = [
+        (
+            "Q1 LGBTQ support group",
+            "When did Caroline go to the LGBTQ support group?",
+            "support group",
+        ),
+        (
+            "Q2 painted sunrise",
+            "When did Melanie paint a sunrise?",
+            "sunrise",
+        ),
+        (
+            "Q3 charity race",
+            "When did Melanie run a charity race?",
+            "charity race",
+        ),
+        (
+            "Q4 camping plan",
+            "When is Melanie planning on going camping?",
+            "camping",
+        ),
+        (
+            "Q5 school speech",
+            "When did Caroline give a speech at a school?",
+            "speech",
+        ),
+    ];
+
+    for (label, q, needle) in &queries {
+        eprintln!("\n=== {} ===", label);
+        eprintln!("  query: {}", q);
+        let hits = db
+            .search_memory(q, 50, None, Some("conversation"), None, None, None, None)
+            .await
+            .expect("search");
+        eprintln!("  returned {} hits", hits.len());
+
+        let needle_l = needle.to_lowercase();
+        let target_rank = hits
+            .iter()
+            .position(|h| h.content.to_lowercase().contains(&needle_l));
+        match target_rank {
+            Some(r) => {
+                eprintln!("  ✓ first hit containing {:?}: rank {}", needle, r + 1);
+                eprintln!(
+                    "    {}",
+                    hits[r].content.chars().take(140).collect::<String>()
+                );
+            }
+            None => {
+                eprintln!("  ✗ NO hit in top-50 contains {:?}", needle);
+                let raw_hits: Vec<&origin_lib::eval::locomo::LocomoMemory> = memories
+                    .iter()
+                    .filter(|m| m.content.to_lowercase().contains(&needle_l))
+                    .collect();
+                if raw_hits.is_empty() {
+                    eprintln!("    + raw extraction also has 0 — extraction dropped it");
+                } else {
+                    eprintln!(
+                        "    + raw extraction has {} matches — search ranking missed them:",
+                        raw_hits.len()
+                    );
+                    for m in raw_hits.iter().take(3) {
+                        eprintln!(
+                            "      - {}",
+                            m.content.chars().take(140).collect::<String>()
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("  top 5 returned:");
+        for (i, h) in hits.iter().take(5).enumerate() {
+            eprintln!(
+                "    {}. [score={:.3}] {}",
+                i + 1,
+                h.score,
+                h.content.chars().take(110).collect::<String>()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal smoke: A/B compare date-aware vs date-blind context on 5 LoCoMo
+// temporal questions. No enrichment (search_memory works on vectors+FTS alone),
+// so the run completes in ~2 min on Haiku CLI. Used to verify the temporal
+// mechanisms before committing to the full 20- or 50-question eval.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn temporal_smoke_locomo_5q() {
+    use origin_core::events::NoopEmitter;
+    use origin_lib::llm_provider::{ClaudeCliProvider, LlmProvider, LlmRequest};
+    use origin_lib::memory_db::MemoryDB;
+    use origin_lib::sources::RawDocument;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = origin_lib::eval::locomo::load_locomo(&locomo_path).expect("load locomo");
+    let sample = &samples[0];
+    let memories = origin_lib::eval::locomo::extract_observations(sample);
+    eprintln!(
+        "[smoke] conv {} — {} observations across {} sessions",
+        sample.sample_id,
+        memories.len(),
+        memories
+            .iter()
+            .map(|m| m.session_num)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    );
+
+    // Seed with REAL session dates — date prefix and date-blind paths read the
+    // same DB; they differ only in how they render and prompt.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("db");
+    let docs: Vec<RawDocument> = memories
+        .iter()
+        .enumerate()
+        .map(|(i, mem)| RawDocument {
+            content: mem.content.clone(),
+            source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+            source: "memory".to_string(),
+            title: format!("{} session {}", mem.speaker, mem.session_num),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            last_modified: chrono::Utc::now().timestamp(),
+            event_date: origin_lib::eval::dates::seed_event_date(
+                mem.session_date.as_deref(),
+                origin_lib::eval::locomo::parse_locomo_date,
+            ),
+            ..Default::default()
+        })
+        .collect();
+    db.upsert_documents(docs).await.expect("upsert");
+
+    // Latest parseable session date = LoCoMo "asked on".
+    let asked_on: Option<String> = memories
+        .iter()
+        .filter_map(|m| m.session_date.clone())
+        .filter(|d| origin_lib::eval::locomo::parse_locomo_date(d).is_some())
+        .max_by_key(|d| origin_lib::eval::locomo::parse_locomo_date(d).unwrap_or(0));
+    eprintln!("[smoke] asked_on (latest session): {:?}", asked_on);
+
+    // First 5 temporal questions (category 2).
+    let temporal_qs: Vec<&origin_lib::eval::locomo::LocomoQA> = sample
+        .qa
+        .iter()
+        .filter(|qa| qa.category == 2)
+        .take(5)
+        .collect();
+
+    let llm: Arc<dyn LlmProvider> = Arc::new(ClaudeCliProvider::haiku());
+
+    let mut results: Vec<(String, String, String, String)> = Vec::new(); // q, gt, A, B
+    for (i, qa) in temporal_qs.iter().enumerate() {
+        let gt = qa
+            .answer
+            .as_ref()
+            .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+            .unwrap_or_default();
+        if gt.is_empty() {
+            continue;
+        }
+        eprintln!("\n[smoke] Q{}: {}", i + 1, qa.question);
+        eprintln!("        GT: {}", gt);
+
+        let hits = db
+            .search_memory(
+                &qa.question,
+                30,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("search");
+        // Diagnostic: is the relevant content in top-30?
+        eprintln!("        retrieved {} hits; first 3 contents:", hits.len());
+        for r in hits.iter().take(3) {
+            eprintln!(
+                "          - {}",
+                r.content.chars().take(90).collect::<String>()
+            );
+        }
+
+        // A: date-aware context + date-anchored system prompt
+        let ctx_a: String = hits
+            .iter()
+            .map(|r| {
+                format!(
+                    "On {}: {}",
+                    origin_lib::eval::shared::format_ymd(r.event_date.unwrap_or(r.last_modified)),
+                    r.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sys_a = match asked_on.as_deref() {
+            Some(d) => format!(
+                "The question was asked on {}. Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.",
+                d
+            ),
+            None => "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.".to_string(),
+        };
+        let answer_a = llm
+            .generate(LlmRequest {
+                system_prompt: Some(sys_a),
+                user_prompt: format!("Context:\n{}\n\nQuestion: {}", ctx_a, qa.question),
+                max_tokens: 200,
+                temperature: 0.1,
+                label: Some("smoke_A".to_string()),
+            })
+            .await
+            .unwrap_or_else(|e| format!("ERR: {e}"));
+        eprintln!("        A (with dates):    {}", answer_a.trim());
+
+        // B: date-blind context + plain system prompt
+        let ctx_b: String = hits
+            .iter()
+            .map(|r| r.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sys_b = "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.".to_string();
+        let answer_b = llm
+            .generate(LlmRequest {
+                system_prompt: Some(sys_b),
+                user_prompt: format!("Context:\n{}\n\nQuestion: {}", ctx_b, qa.question),
+                max_tokens: 200,
+                temperature: 0.1,
+                label: Some("smoke_B".to_string()),
+            })
+            .await
+            .unwrap_or_else(|e| format!("ERR: {e}"));
+        eprintln!("        B (no dates):      {}", answer_b.trim());
+
+        results.push((qa.question.clone(), gt, answer_a, answer_b));
+    }
+
+    // Substring-match scoring: extract the date/year from ground truth and look for it.
+    fn score(answer: &str, gt: &str) -> bool {
+        let needle: String = gt.to_lowercase();
+        let hay: String = answer.to_lowercase();
+        // Match on "may", "2023", "may 2023", "7 may", etc — any non-empty token from GT
+        // that's a year (4 digits) or a month name should appear in the answer.
+        let months = [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+            "jan",
+            "feb",
+            "mar",
+            "apr",
+            "jun",
+            "jul",
+            "aug",
+            "sep",
+            "oct",
+            "nov",
+            "dec",
+        ];
+        let years: Vec<&str> = needle
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| s.len() == 4 && s.starts_with("20"))
+            .collect();
+        let needs_year = !years.is_empty();
+        let needs_month = months.iter().any(|m| needle.contains(m));
+        let year_ok = years.iter().any(|y| hay.contains(y));
+        let month_ok = months.iter().any(|m| needle.contains(m) && hay.contains(m));
+        let approx_match = needle
+            .split_whitespace()
+            .any(|w| w.len() > 3 && hay.contains(w));
+        match (needs_year, needs_month) {
+            (true, true) => year_ok && month_ok,
+            (true, false) => year_ok,
+            (false, true) => month_ok,
+            (false, false) => approx_match,
+        }
+    }
+
+    let mut a_correct = 0;
+    let mut b_correct = 0;
+    eprintln!("\n========================================");
+    eprintln!("Smoke result: A=date-aware, B=date-blind");
+    eprintln!("========================================");
+    for (i, (q, gt, a, b)) in results.iter().enumerate() {
+        let a_ok = score(a, gt);
+        let b_ok = score(b, gt);
+        if a_ok {
+            a_correct += 1;
+        }
+        if b_ok {
+            b_correct += 1;
+        }
+        eprintln!(
+            "Q{}: A={} B={} — gt: {:?}",
+            i + 1,
+            if a_ok { "✓" } else { "✗" },
+            if b_ok { "✓" } else { "✗" },
+            gt.chars().take(40).collect::<String>(),
+        );
+        eprintln!("  Q: {}", q.chars().take(80).collect::<String>());
+    }
+    let n = results.len().max(1);
+    eprintln!(
+        "\nA (date-aware): {}/{} = {:.0}%",
+        a_correct,
+        n,
+        100.0 * a_correct as f64 / n as f64
+    );
+    eprintln!(
+        "B (date-blind): {}/{} = {:.0}%",
+        b_correct,
+        n,
+        100.0 * b_correct as f64 / n as f64
+    );
+    eprintln!(
+        "Lift: {} pp",
+        (a_correct as i64 - b_correct as i64) * 100 / n as i64
+    );
 }
