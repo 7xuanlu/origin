@@ -318,6 +318,23 @@ pub struct DistillationConfig {
     /// for the runaway-cluster failure mode (see spec 2026-04-25).
     #[serde(default = "d_50_usize")]
     pub max_unlinked_cluster_size: usize,
+    /// Minimum source-memory overlap required for a concept to pass the
+    /// retrieval-time relevance gate. A concept is included in chat context
+    /// only if at least this many of its source memories appear in the
+    /// search_memory results for the same query.
+    ///
+    /// Default 2: filters concepts whose source memories don't appear in
+    /// search results (LME-style noise) while keeping concepts with genuine
+    /// topical overlap (LoCoMo-style coherence).
+    ///
+    /// Tradeoffs measured 2026-04-27:
+    /// - LME (noisy data): 33.7% -> 39.9% (+6.2pp) at min_overlap=2
+    /// - LoCoMo (coherent data): 32.0% -> 30.5% (-1.5pp) at min_overlap=2
+    ///
+    /// Lower (1) preserves more concepts but lets noise back in.
+    /// Higher (3+) is more aggressive filtering.
+    #[serde(default = "d_2_usize")]
+    pub concept_min_overlap: usize,
     #[serde(default)]
     pub export_vault_path: Option<String>,
 }
@@ -569,6 +586,7 @@ impl Default for DistillationConfig {
             concept_growth_threshold: d_075(),
             concept_boost: d_13_f32(),
             max_unlinked_cluster_size: d_50_usize(),
+            concept_min_overlap: d_2_usize(),
             export_vault_path: None,
         }
     }
@@ -747,5 +765,11 @@ score_threshold = 0.25
     fn distillation_config_default_has_unlinked_cluster_cap() {
         let cfg = DistillationConfig::default();
         assert_eq!(cfg.max_unlinked_cluster_size, 50);
+    }
+
+    #[test]
+    fn distillation_config_default_concept_min_overlap() {
+        let cfg = DistillationConfig::default();
+        assert_eq!(cfg.concept_min_overlap, 2);
     }
 }

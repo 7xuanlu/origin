@@ -1772,7 +1772,6 @@ async fn judge_e2e_batch() {
 #[ignore]
 async fn generate_fullpipeline_locomo() {
     use origin_lib::eval::answer_quality::run_fullpipeline_locomo_batch;
-    use std::sync::Arc;
 
     let locomo_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
@@ -1866,7 +1865,11 @@ async fn judge_fullpipeline_locomo() {
     };
 
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-    let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
+    // EVAL_TUPLES_FILE override lets us judge alternate files (e.g. *_pregate.json)
+    let default_path = baselines.join("fullpipeline_locomo_tuples.json");
+    let tuples_path: std::path::PathBuf = std::env::var("EVAL_TUPLES_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_path);
     if !tuples_path.exists() {
         eprintln!("SKIP: run generate_fullpipeline_locomo first");
         return;
@@ -2360,6 +2363,187 @@ async fn probe_concept_scores() {
                 all_scores[n / 2],
                 all_scores[3 * n / 4],
                 n,
+            );
+        }
+    }
+}
+
+/// Probe source overlap gate across ALL questions in both enriched DBs.
+///
+/// Runs search_memory + search_concepts for every question, counts how many
+/// concepts pass the overlap gate (>= min_overlap source memories overlap
+/// with search results). This validates whether the gate behaves as expected
+/// without running expensive LLM answer generation.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness probe_overlap_gate -- --ignored --nocapture
+/// EVAL_MIN_OVERLAP=2 cargo test ... probe_overlap_gate -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn probe_overlap_gate() {
+    use origin_core::concepts::filter_concepts_by_source_overlap;
+    use origin_core::db::MemoryDB;
+    use origin_core::events::NoopEmitter;
+    use origin_lib::eval::shared::eval_shared_embedder;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let shared_embedder = eval_shared_embedder();
+    let min_overlap: usize = std::env::var("EVAL_MIN_OVERLAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
+    for (label, db_name, tuples_name) in [
+        (
+            "LoCoMo",
+            "fullpipeline_locomo_tuples.db",
+            "fullpipeline_locomo_tuples.json",
+        ),
+        (
+            "LME",
+            "fullpipeline_lme_tuples.db",
+            "fullpipeline_lme_tuples.json",
+        ),
+    ] {
+        let db_dir = baselines.join(db_name);
+        let tuples_path = baselines.join(tuples_name);
+        if !db_dir.exists() || !tuples_path.exists() {
+            eprintln!("SKIP {label}: artifacts missing");
+            continue;
+        }
+
+        let db = MemoryDB::new_with_shared_embedder(
+            &db_dir,
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await
+        .expect("open DB");
+
+        let tuples: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&tuples_path).unwrap()).unwrap();
+
+        // Dedup questions (same q may appear with different categories in some files)
+        let mut seen = std::collections::HashSet::new();
+        let questions: Vec<(String, String)> = tuples
+            .iter()
+            .filter_map(|t| {
+                let q = t["question"].as_str()?.to_string();
+                if !seen.insert(q.clone()) {
+                    return None;
+                }
+                let cat = t["category"]
+                    .as_str()
+                    .or_else(|| {
+                        t["approach"]
+                            .as_str()
+                            .and_then(|s| s.strip_prefix("structured_"))
+                    })
+                    .unwrap_or("?")
+                    .to_string();
+                Some((cat, q))
+            })
+            .collect();
+
+        let total_q = questions.len();
+        let mut total_concepts = 0usize;
+        let mut total_kept = 0usize;
+        let mut overlap_when_kept: Vec<usize> = Vec::new();
+        let mut overlap_when_filtered: Vec<usize> = Vec::new();
+        let mut per_q_kept_dist: HashMap<usize, usize> = HashMap::new();
+        let mut per_cat_kept: HashMap<String, (usize, usize)> = HashMap::new(); // cat -> (kept_q, total_q)
+
+        eprintln!("\n=== {label}: probing {total_q} questions (min_overlap={min_overlap}) ===",);
+
+        for (i, (cat, q)) in questions.iter().enumerate() {
+            // Real search_memory (top-10, no domain filter — matches eval pipeline)
+            let results = match db
+                .search_memory(q, 10, None, None, None, None, None, None)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let search_ids: std::collections::HashSet<String> =
+                results.iter().map(|r| r.source_id.clone()).collect();
+
+            // Real search_concepts (top-3)
+            let raw_concepts = db.search_concepts(q, 3).await.unwrap_or_default();
+            let kept = filter_concepts_by_source_overlap(&raw_concepts, &search_ids, min_overlap);
+
+            for c in &raw_concepts {
+                total_concepts += 1;
+                let overlap = c
+                    .source_memory_ids
+                    .iter()
+                    .filter(|sid| search_ids.contains(sid.as_str()))
+                    .count();
+                if kept.iter().any(|k| k.id == c.id) {
+                    total_kept += 1;
+                    overlap_when_kept.push(overlap);
+                } else {
+                    overlap_when_filtered.push(overlap);
+                }
+            }
+            *per_q_kept_dist.entry(kept.len()).or_insert(0) += 1;
+            let entry = per_cat_kept.entry(cat.clone()).or_insert((0, 0));
+            entry.1 += 1;
+            if !kept.is_empty() {
+                entry.0 += 1;
+            }
+
+            if i % 100 == 99 {
+                eprintln!("  [{}/{}] processed", i + 1, total_q);
+            }
+        }
+
+        let kept_pct = total_kept as f64 / total_concepts.max(1) as f64 * 100.0;
+        let mean_kept_overlap = if overlap_when_kept.is_empty() {
+            0.0
+        } else {
+            overlap_when_kept.iter().sum::<usize>() as f64 / overlap_when_kept.len() as f64
+        };
+        let mean_filt_overlap = if overlap_when_filtered.is_empty() {
+            0.0
+        } else {
+            overlap_when_filtered.iter().sum::<usize>() as f64 / overlap_when_filtered.len() as f64
+        };
+
+        eprintln!("\n  --- Results ---");
+        eprintln!("  Total concept-query pairs: {total_concepts}");
+        eprintln!(
+            "  Kept (passed gate): {total_kept} ({kept_pct:.1}%)  mean_overlap_when_kept={mean_kept_overlap:.1}"
+        );
+        eprintln!(
+            "  Filtered: {} ({:.1}%)  mean_overlap_when_filtered={:.2}",
+            total_concepts - total_kept,
+            (total_concepts - total_kept) as f64 / total_concepts.max(1) as f64 * 100.0,
+            mean_filt_overlap,
+        );
+
+        let mut dist: Vec<(usize, usize)> = per_q_kept_dist.into_iter().collect();
+        dist.sort();
+        eprintln!(
+            "  Concepts passing per question: {}",
+            dist.iter()
+                .map(|(k, v)| format!("{k}→{v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        eprintln!("\n  Per-category (questions with at least one passing concept):");
+        let mut cats: Vec<(String, (usize, usize))> = per_cat_kept.into_iter().collect();
+        cats.sort_by(|a, b| a.0.cmp(&b.0));
+        for (cat, (kept_q, total_q)) in cats {
+            eprintln!(
+                "    {:<28} {:4}/{:4} ({:5.1}%)",
+                cat,
+                kept_q,
+                total_q,
+                kept_q as f64 / total_q.max(1) as f64 * 100.0
             );
         }
     }

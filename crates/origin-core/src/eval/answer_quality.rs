@@ -1099,9 +1099,17 @@ async fn build_structured_context(
         results.iter().map(|r| r.source_id.clone()).collect();
 
     // Structured: concepts + search results (matches production /api/chat-context).
+    // EVAL_CONCEPT_MIN_OVERLAP env var lets us sweep thresholds without code changes;
+    // defaults to the production tuning value (2).
+    let min_overlap: usize = std::env::var("EVAL_CONCEPT_MIN_OVERLAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| crate::tuning::DistillationConfig::default().concept_min_overlap);
+
     let mut parts: Vec<String> = Vec::new();
     let raw_concepts = db.search_concepts(question, 3).await.unwrap_or_default();
-    let concepts = filter_concepts_by_source_overlap(&raw_concepts, &search_source_ids, 2);
+    let concepts =
+        filter_concepts_by_source_overlap(&raw_concepts, &search_source_ids, min_overlap);
 
     if !raw_concepts.is_empty() {
         for c in &raw_concepts {
