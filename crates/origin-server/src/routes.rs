@@ -213,10 +213,15 @@ pub async fn handle_chat_context(
     // search_memory_reranked, log_accesses, etc.) would block every writer
     // to ServerState — e.g. store_memory's space_store update — for the
     // full duration of a rerank call. See CLAUDE.md locking rules.
-    let (db_arc, llm, access_tracker) = {
+    let (db_arc, llm, access_tracker, concept_min_overlap) = {
         let s = state.read().await;
         let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
-        (db, s.llm.clone(), s.access_tracker.clone())
+        (
+            db,
+            s.llm.clone(),
+            s.access_tracker.clone(),
+            s.tuning.distillation.concept_min_overlap,
+        )
     }; // guard dropped here
     let db = db_arc.as_ref();
 
@@ -345,11 +350,23 @@ pub async fn handle_chat_context(
         .map(|r| format!("[{}] {}", r.title, r.content))
         .collect();
 
+    // Source IDs from search results — used to gate concept relevance.
+    // A concept is only included if its source memories overlap with the
+    // memories that search_memory returned for this query.
+    let search_source_ids: std::collections::HashSet<String> = filtered_search
+        .iter()
+        .map(|r| r.source_id.clone())
+        .collect();
+
     let concept_results: Vec<String> =
         if tier_allowed(&classification.trust_level, 2) && query != "recent context" {
-            db.search_concepts(query, 3)
-                .await
-                .unwrap_or_default()
+            let raw_concepts = db.search_concepts(query, 3).await.unwrap_or_default();
+            let concepts = origin_core::concepts::filter_concepts_by_source_overlap(
+                &raw_concepts,
+                &search_source_ids,
+                concept_min_overlap,
+            );
+            concepts
                 .iter()
                 .map(|c| {
                     let summary = c.summary.as_deref().unwrap_or("");

@@ -571,6 +571,7 @@ pub async fn run_e2e_locomo_eval(
                         approach: "origin".to_string(),
                         answer,
                         context_tokens: origin_ctx_tokens,
+                        category: String::new(),
                     });
                 }
                 Err(e) => {
@@ -607,6 +608,7 @@ pub async fn run_e2e_locomo_eval(
                             approach: "full_replay".to_string(),
                             answer,
                             context_tokens: replay_ctx_tokens,
+                            category: String::new(),
                         });
                     }
                     Err(e) => {
@@ -644,6 +646,7 @@ pub async fn run_e2e_locomo_eval(
                         approach: "no_context".to_string(),
                         answer,
                         context_tokens: 0,
+                        category: String::new(),
                     });
                 }
                 Err(e) => {
@@ -747,6 +750,7 @@ async fn generate_e2e_answers_for_question(
             approach: format!("flat_{}", category),
             answer,
             context_tokens: flat_tokens,
+            category: category.to_string(),
         });
     }
 
@@ -789,6 +793,7 @@ async fn generate_e2e_answers_for_question(
             approach: format!("structured_{}", category),
             answer,
             context_tokens: structured_tokens,
+            category: category.to_string(),
         });
     }
 
@@ -1055,3 +1060,573 @@ pub async fn run_e2e_context_eval_longmemeval(
 
     Ok(all_tuples)
 }
+
+// ===== Batch-based full-scale variants =====
+
+/// Metadata for a pending answer request, submitted via Batch API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingAnswer {
+    question: String,
+    ground_truth: String,
+    approach: String,
+    category: String,
+    context_tokens: usize,
+}
+
+/// System prompt used for all E2E answer generation.
+const E2E_SYSTEM_PROMPT: &str =
+    "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.";
+
+/// Build structured context for a question against an enriched DB.
+///
+/// Returns the structured context: search_memory results + concept articles.
+/// Matches production `/api/chat-context` assembly pattern.
+/// Flat baseline comes from the retrieval-only pipeline caches.
+async fn build_structured_context(
+    db: &MemoryDB,
+    question: &str,
+    search_limit: usize,
+    domain: Option<&str>,
+) -> Result<(String, usize), OriginError> {
+    use crate::concepts::filter_concepts_by_source_overlap;
+
+    let results = db
+        .search_memory(question, search_limit, None, domain, None, None, None, None)
+        .await?;
+
+    // Source IDs from search results — used to gate concept relevance
+    let search_source_ids: std::collections::HashSet<String> =
+        results.iter().map(|r| r.source_id.clone()).collect();
+
+    // Structured: concepts + search results (matches production /api/chat-context).
+    // EVAL_CONCEPT_MIN_OVERLAP env var lets us sweep thresholds without code changes;
+    // defaults to the production tuning value (2).
+    let min_overlap: usize = std::env::var("EVAL_CONCEPT_MIN_OVERLAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| crate::tuning::DistillationConfig::default().concept_min_overlap);
+
+    let mut parts: Vec<String> = Vec::new();
+    let raw_concepts = db.search_concepts(question, 3).await.unwrap_or_default();
+    let concepts =
+        filter_concepts_by_source_overlap(&raw_concepts, &search_source_ids, min_overlap);
+
+    if !raw_concepts.is_empty() {
+        for c in &raw_concepts {
+            let kept = concepts.iter().any(|k| k.id == c.id);
+            let overlap = c
+                .source_memory_ids
+                .iter()
+                .filter(|sid| search_source_ids.contains(sid.as_str()))
+                .count();
+            log::info!(
+                "[eval:concept] score={:.4} overlap={}/{} {} title={:?} q={:?}",
+                c.relevance_score,
+                overlap,
+                results.len(),
+                if kept { "KEPT" } else { "FILTERED" },
+                c.title.chars().take(40).collect::<String>(),
+                question.chars().take(50).collect::<String>(),
+            );
+        }
+    }
+    if !concepts.is_empty() {
+        parts.push("## Compiled Knowledge".to_string());
+        for c in &concepts {
+            let summary = c.summary.as_deref().unwrap_or("");
+            parts.push(format!("**{}**: {}\n{}", c.title, summary, c.content));
+        }
+    }
+    if !results.is_empty() {
+        parts.push("## Relevant Memories".to_string());
+        for (i, r) in results.iter().enumerate() {
+            parts.push(format!("{}. {}", i + 1, r.content));
+        }
+    }
+    let structured_context = parts.join("\n\n");
+    let tokens = count_tokens(&structured_context);
+
+    Ok((structured_context, tokens))
+}
+
+/// Full-pipeline LoCoMo eval using Batch API for answer generation.
+///
+/// **Single DB**: all conversations seeded into one database, each tagged with
+/// a conversation-specific domain. Enrichment runs once across all data, so
+/// entities accumulate and concepts can form from cross-observation clusters.
+///
+/// **Phase 1** (on-device, free): Seed all conversations, enrich once.
+/// **Phase 2** (free): Collect contexts for all questions (search with domain filter).
+/// **Phase 3** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
+/// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
+pub async fn run_fullpipeline_locomo_batch(
+    locomo_path: &Path,
+    api_key: &str,
+    answer_model: &str,
+    output_path: &Path,
+    cost_cap_usd: f64,
+) -> Result<Vec<JudgmentTuple>, OriginError> {
+    use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
+    use crate::eval::judge::save_judgment_tuples;
+    use crate::eval::locomo::{category_name, extract_observations, load_locomo};
+
+    let samples = load_locomo(locomo_path)?;
+    let shared_embedder = eval_shared_embedder();
+
+    // Resume
+    let mut finished_tuples: Vec<JudgmentTuple> = if output_path.exists() {
+        let existing = crate::eval::judge::load_judgment_tuples(output_path)
+            .map_err(|e| OriginError::Generic(format!("load resume: {e}")))?;
+        eprintln!(
+            "[fullpipeline] Resuming with {} existing tuples",
+            existing.len()
+        );
+        existing
+    } else {
+        Vec::new()
+    };
+    let done_questions: std::collections::HashSet<String> =
+        finished_tuples.iter().map(|t| t.question.clone()).collect();
+    // --- Phase 1: Seed all conversations into one DB, enrich once ---
+    // Use a stable DB path (sibling to output_path) so enrichment survives crashes.
+    let db_dir = output_path.with_extension("db");
+    std::fs::create_dir_all(&db_dir).ok();
+    let db =
+        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
+            .await?;
+
+    // Check if DB already has COMPLETE enrichment (not just partial data).
+    // Enrichment is complete when enrichment_steps rows exist for memories.
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
+    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
+
+    if enrichment_complete {
+        eprintln!(
+            "[fullpipeline] Resuming with enriched DB ({} memories, all enriched)",
+            mem_count
+        );
+    } else {
+        // Wipe partial data and start fresh to avoid inconsistencies
+        if mem_count > 0 && enriched_count < mem_count {
+            eprintln!(
+                "[fullpipeline] Partial data found ({}/{} enriched). Starting fresh.",
+                enriched_count, mem_count
+            );
+            db.clear_all_for_eval().await?;
+        }
+
+        let mut total_obs = 0usize;
+        for sample in &samples {
+            let memories = extract_observations(sample);
+            if memories.is_empty() {
+                continue;
+            }
+
+            let docs: Vec<RawDocument> = memories
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect();
+            total_obs += docs.len();
+            db.upsert_documents(docs).await?;
+            eprintln!(
+                "[fullpipeline] Seeded {} ({} observations)",
+                sample.sample_id,
+                memories.len()
+            );
+        }
+
+        eprintln!(
+            "[fullpipeline] Total: {} observations in 1 DB. Enriching via Batch API...",
+            total_obs
+        );
+        // Batch A: extraction + titles in parallel (independent)
+        let (entities_res, titles_res) = tokio::join!(
+            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd),
+            crate::eval::shared::run_title_enrichment_batch_api(
+                &db,
+                api_key,
+                answer_model,
+                cost_cap_usd,
+            ),
+        );
+        let entities = entities_res?;
+        let titles = titles_res?;
+        // Batch B: concept distillation (depends on entities + enrichment_steps)
+        let concepts = crate::eval::shared::run_concept_distillation_batch_api(
+            &db,
+            api_key,
+            answer_model,
+            cost_cap_usd,
+        )
+        .await?;
+        eprintln!(
+            "[fullpipeline] Enriched: {} entities, {} titles, {} concepts",
+            entities, titles, concepts
+        );
+    }
+
+    // --- Phase 2: Collect contexts for all questions ---
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    for sample in &samples {
+        let mut q_count = 0usize;
+
+        for qa in &sample.qa {
+            if qa.category == 5 {
+                continue;
+            }
+            if done_questions.contains(&qa.question) {
+                continue;
+            }
+
+            let ground_truth = qa
+                .answer
+                .as_ref()
+                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                .unwrap_or_default();
+            if ground_truth.is_empty() {
+                continue;
+            }
+
+            let category = category_name(qa.category);
+            let (ctx, ctx_tokens) = build_structured_context(&db, &qa.question, 10, None).await?;
+
+            let req_id = format!("q_{}_{}", sample.sample_id, q_count);
+            batch_requests.push((
+                req_id.clone(),
+                format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
+                Some(E2E_SYSTEM_PROMPT.to_string()),
+                200,
+            ));
+            pending.insert(
+                req_id,
+                PendingAnswer {
+                    question: qa.question.clone(),
+                    ground_truth,
+                    approach: format!("structured_{}", category),
+                    category: category.to_string(),
+                    context_tokens: ctx_tokens,
+                },
+            );
+
+            q_count += 1;
+        }
+        if q_count > 0 {
+            eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+        }
+    }
+
+    if batch_requests.is_empty() {
+        eprintln!("[fullpipeline] No new requests — all cached/resumed");
+        save_judgment_tuples(&finished_tuples, output_path)
+            .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+        return Ok(finished_tuples);
+    }
+
+    // --- Phase 3: Batch answer generation ---
+    eprintln!(
+        "\n[fullpipeline] Submitting {} requests via Batch API (model={})",
+        batch_requests.len(),
+        answer_model
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+
+    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+    eprintln!("[fullpipeline] Batch submitted: {}", batch_id);
+
+    let results_url = poll_batch(&client, api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+    let raw_results = download_batch_results(&client, api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+
+    // --- Phase 4: Merge ---
+    let mut matched = 0usize;
+    for (custom_id, answer) in &raw_results {
+        if let Some(meta) = pending.get(custom_id) {
+            finished_tuples.push(JudgmentTuple {
+                question: meta.question.clone(),
+                ground_truth: meta.ground_truth.clone(),
+                approach: meta.approach.clone(),
+                answer: answer.clone(),
+                context_tokens: meta.context_tokens,
+                category: meta.category.clone(),
+            });
+            matched += 1;
+        }
+    }
+
+    eprintln!(
+        "[fullpipeline] Batch: {} results, {} matched",
+        raw_results.len(),
+        matched
+    );
+
+    save_judgment_tuples(&finished_tuples, output_path)
+        .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+    eprintln!(
+        "[fullpipeline] Saved {} total tuples to {:?}",
+        finished_tuples.len(),
+        output_path
+    );
+
+    Ok(finished_tuples)
+}
+
+/// Full-pipeline LongMemEval eval using Batch API for answer generation.
+///
+/// **Single DB**: all 500 questions' memories seeded into one database (~10K memories).
+/// No domain filter — search must find relevant memories among all data, like production.
+/// Enrichment runs once across all data.
+pub async fn run_fullpipeline_lme_batch(
+    longmemeval_path: &Path,
+    api_key: &str,
+    answer_model: &str,
+    output_path: &Path,
+    cost_cap_usd: f64,
+) -> Result<Vec<JudgmentTuple>, OriginError> {
+    use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
+    use crate::eval::judge::save_judgment_tuples;
+    use crate::eval::longmemeval::{category_name, extract_memories, load_longmemeval};
+
+    let samples = load_longmemeval(longmemeval_path)?;
+    let shared_embedder = eval_shared_embedder();
+
+    // Resume
+    let mut finished_tuples: Vec<JudgmentTuple> = if output_path.exists() {
+        let existing = crate::eval::judge::load_judgment_tuples(output_path)
+            .map_err(|e| OriginError::Generic(format!("load resume: {e}")))?;
+        eprintln!(
+            "[fullpipeline_lme] Resuming with {} existing tuples",
+            existing.len()
+        );
+        existing
+    } else {
+        Vec::new()
+    };
+    let done_questions: std::collections::HashSet<String> =
+        finished_tuples.iter().map(|t| t.question.clone()).collect();
+
+    // --- Phase 1: Seed all questions' memories into one DB, enrich once ---
+    let db_dir = output_path.with_extension("db");
+    std::fs::create_dir_all(&db_dir).ok();
+    let db =
+        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
+            .await?;
+
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
+    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
+
+    if enrichment_complete {
+        eprintln!(
+            "[fullpipeline_lme] Resuming with enriched DB ({} memories, all enriched)",
+            mem_count
+        );
+    } else {
+        if mem_count > 0 && enriched_count < mem_count {
+            eprintln!(
+                "[fullpipeline_lme] Partial data ({}/{} enriched). Starting fresh.",
+                enriched_count, mem_count
+            );
+            db.clear_all_for_eval().await?;
+        }
+        let mut total_mems = 0usize;
+        for sample in &samples {
+            let memories = extract_memories(sample);
+            if memories.is_empty() {
+                continue;
+            }
+
+            let docs: Vec<RawDocument> = memories
+                .iter()
+                .map(|mem| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!(
+                        "lme_{}_{}_t{}",
+                        sample.question_id, mem.session_idx, mem.turn_idx
+                    ),
+                    source: "memory".to_string(),
+                    title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                    memory_type: Some(
+                        if sample.question_type == "single-session-preference" {
+                            "preference"
+                        } else {
+                            "fact"
+                        }
+                        .to_string(),
+                    ),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect();
+            total_mems += docs.len();
+            db.upsert_documents(docs).await?;
+        }
+
+        eprintln!(
+            "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching via Batch API...",
+            total_mems,
+            samples.len()
+        );
+        // Batch A: extraction + titles in parallel (independent)
+        let (entities_res, titles_res) = tokio::join!(
+            crate::eval::shared::run_enrichment_batch_api(&db, api_key, answer_model, cost_cap_usd),
+            crate::eval::shared::run_title_enrichment_batch_api(
+                &db,
+                api_key,
+                answer_model,
+                cost_cap_usd,
+            ),
+        );
+        let entities = entities_res?;
+        let titles = titles_res?;
+        // Batch B: concept distillation (depends on entities + enrichment_steps)
+        let concepts = crate::eval::shared::run_concept_distillation_batch_api(
+            &db,
+            api_key,
+            answer_model,
+            cost_cap_usd,
+        )
+        .await?;
+        eprintln!(
+            "[fullpipeline_lme] Enriched: {} entities, {} titles, {} concepts",
+            entities, titles, concepts
+        );
+    }
+
+    // --- Phase 2: Collect contexts ---
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    for (q_idx, sample) in samples.iter().enumerate() {
+        if done_questions.contains(&sample.question) {
+            continue;
+        }
+
+        let ground_truth = sample
+            .answer
+            .as_str()
+            .unwrap_or(&sample.answer.to_string())
+            .to_string();
+        if ground_truth.is_empty() {
+            continue;
+        }
+
+        let category = category_name(&sample.question_type);
+        let (ctx, ctx_tokens) = build_structured_context(&db, &sample.question, 10, None).await?;
+
+        let req_id = format!("q_lme_{}", q_idx);
+        batch_requests.push((
+            req_id.clone(),
+            format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
+            Some(E2E_SYSTEM_PROMPT.to_string()),
+            200,
+        ));
+        pending.insert(
+            req_id,
+            PendingAnswer {
+                question: sample.question.clone(),
+                ground_truth,
+                approach: format!("structured_{}", category),
+                category: category.to_string(),
+                context_tokens: ctx_tokens,
+            },
+        );
+
+        if q_idx % 100 == 99 {
+            eprintln!(
+                "  [contexts] {}/{} questions collected",
+                q_idx + 1,
+                samples.len()
+            );
+        }
+    }
+
+    if batch_requests.is_empty() {
+        eprintln!("[fullpipeline_lme] No new requests — all cached/resumed");
+        save_judgment_tuples(&finished_tuples, output_path)
+            .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+        return Ok(finished_tuples);
+    }
+
+    // --- Phase 3: Batch answer generation ---
+    eprintln!(
+        "\n[fullpipeline_lme] Submitting {} requests via Batch API (model={})",
+        batch_requests.len(),
+        answer_model
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+
+    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+    eprintln!("[fullpipeline_lme] Batch submitted: {}", batch_id);
+
+    let results_url = poll_batch(&client, api_key, &batch_id)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+    let raw_results = download_batch_results(&client, api_key, &results_url)
+        .await
+        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+
+    // --- Phase 4: Merge ---
+    let mut matched = 0usize;
+    for (custom_id, answer) in &raw_results {
+        if let Some(meta) = pending.get(custom_id) {
+            finished_tuples.push(JudgmentTuple {
+                question: meta.question.clone(),
+                ground_truth: meta.ground_truth.clone(),
+                approach: meta.approach.clone(),
+                answer: answer.clone(),
+                context_tokens: meta.context_tokens,
+                category: meta.category.clone(),
+            });
+            matched += 1;
+        }
+    }
+
+    eprintln!(
+        "[fullpipeline_lme] Batch: {} results, {} matched",
+        raw_results.len(),
+        matched
+    );
+
+    save_judgment_tuples(&finished_tuples, output_path)
+        .map_err(|e| OriginError::Generic(format!("save: {e}")))?;
+    eprintln!(
+        "[fullpipeline_lme] Saved {} total tuples to {:?}",
+        finished_tuples.len(),
+        output_path
+    );
+
+    Ok(finished_tuples)
+}
+
+// ===== Flat cache loaders =====

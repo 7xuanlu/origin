@@ -8645,6 +8645,26 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Bulk-mark all chunk_index=0 memories as enriched (for eval).
+    /// Inserts an "extract" enrichment step for every memory that doesn't have one.
+    /// Returns the number of rows inserted.
+    pub async fn mark_all_memories_enriched_for_eval(&self) -> Result<usize, OriginError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "INSERT OR IGNORE INTO enrichment_steps (source_id, step_name, status, attempts, updated_at)
+                 SELECT source_id, 'extract', 'done', 1, ?1
+                 FROM memories
+                 WHERE source = 'memory' AND chunk_index = 0
+                   AND source_id NOT IN (SELECT source_id FROM enrichment_steps WHERE step_name = 'extract')",
+                libsql::params![now],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("mark_enriched_for_eval: {e}")))?;
+        Ok(affected as usize)
+    }
+
     /// Return all enrichment step records for a memory, ordered by insertion.
     pub async fn get_enrichment_steps(
         &self,
@@ -12041,6 +12061,129 @@ impl MemoryDB {
         Ok(has)
     }
 
+    /// Diagnostic: count rows in memories table by key filters.
+    pub async fn debug_memory_counts(&self) -> String {
+        async fn count(conn: &libsql::Connection, sql: &str) -> i64 {
+            match conn.query(sql, ()).await {
+                Ok(mut rows) => match rows.next().await {
+                    Ok(Some(row)) => row.get::<i64>(0).unwrap_or(-1),
+                    _ => -2,
+                },
+                Err(_) => -3,
+            }
+        }
+        let conn = self.conn.lock().await;
+        let total = count(&conn, "SELECT COUNT(*) FROM memories").await;
+        let source_memory = count(
+            &conn,
+            "SELECT COUNT(*) FROM memories WHERE source = 'memory'",
+        )
+        .await;
+        let chunk0 = count(&conn, "SELECT COUNT(*) FROM memories WHERE chunk_index = 0").await;
+        let null_entity = count(
+            &conn,
+            "SELECT COUNT(*) FROM memories WHERE entity_id IS NULL",
+        )
+        .await;
+        let unlinked = count(
+            &conn,
+            "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND entity_id IS NULL AND is_recap = 0 AND chunk_index = 0",
+        ).await;
+        format!(
+            "total={}, source=memory:{}, chunk0={}, null_entity={}, unlinked(full_query)={}",
+            total, source_memory, chunk0, null_entity, unlinked
+        )
+    }
+
+    /// Count memories that have been through enrichment (have enrichment_steps rows).
+    pub async fn enriched_memory_count(&self) -> Result<usize, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(DISTINCT es.source_id) FROM enrichment_steps es
+                 JOIN memories m ON m.source_id = es.source_id
+                 WHERE m.source = 'memory' AND m.chunk_index = 0",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("enriched_count: {e}")))?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get::<i64>(0).unwrap_or(0) as usize),
+            _ => Ok(0),
+        }
+    }
+
+    /// Clear all data for eval re-run (wipe partial state).
+    pub async fn clear_all_for_eval(&self) -> Result<(), OriginError> {
+        let conn = self.conn.lock().await;
+        for table in &[
+            "enrichment_steps",
+            "observations",
+            "relations",
+            "entity_aliases",
+            "entities",
+            "memories",
+        ] {
+            conn.execute(&format!("DELETE FROM {}", table), ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("clear {}: {e}", table)))?;
+        }
+        for table in &["concepts", "concept_sources"] {
+            conn.execute(&format!("DELETE FROM {}", table), ())
+                .await
+                .ok();
+        }
+        eprintln!("[eval_db] Cleared all data for fresh start");
+        Ok(())
+    }
+
+    /// Quick count of memories in the DB (for resume detection).
+    pub async fn memory_count(&self) -> Result<usize, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("memory_count: {e}")))?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get::<i64>(0).unwrap_or(0) as usize),
+            _ => Ok(0),
+        }
+    }
+
+    /// Get memories with truncated/generic titles that need enrichment (for eval).
+    pub async fn get_memories_needing_title_enrichment(
+        &self,
+    ) -> Result<Vec<(String, String)>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_id, content FROM memories
+                 WHERE source = 'memory' AND chunk_index = 0
+                   AND (title LIKE '%...' OR length(title) >= 75
+                        OR title LIKE '% session %'
+                        OR title = substr(content, 1, length(title)))",
+                (),
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("title_enrichment query: {e}")))?;
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| OriginError::VectorDb(e.to_string()))?
+        {
+            let source_id: String = row
+                .get(0)
+                .map_err(|e| OriginError::VectorDb(e.to_string()))?;
+            let content: String = row.get::<String>(1).unwrap_or_default();
+            results.push((source_id, content));
+        }
+        Ok(results)
+    }
+
     /// Get memories that have no entity_id link (for reweave phase).
     pub async fn get_unlinked_memories(
         &self,
@@ -14012,7 +14155,14 @@ impl MemoryDB {
             concept_map.entry(id).or_insert(concept);
         }
 
-        // Sort by combined RRF score, return top limit
+        // Normalize scores to 0.0-1.0 (RRF-only, no multipliers — concepts
+        // don't have the recency/confidence/domain boosts that search_memory applies)
+        let theoretical_max_rrf = (1.0 + fts_weight) / rrf_k;
+        for score in score_map.values_mut() {
+            *score = (*score / theoretical_max_rrf).min(1.0);
+        }
+
+        // Sort by combined RRF score, attach to concepts, return top limit
         let mut final_results: Vec<Concept> = concept_map.into_values().collect();
         final_results.sort_by(|a, b| {
             let sa = score_map.get(&a.id).unwrap_or(&0.0);
@@ -14020,6 +14170,10 @@ impl MemoryDB {
             sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
         });
         final_results.truncate(limit);
+        // Attach normalized scores so callers can threshold-filter
+        for c in &mut final_results {
+            c.relevance_score = *score_map.get(&c.id).unwrap_or(&0.0);
+        }
         Ok(final_results)
     }
 
@@ -14120,6 +14274,7 @@ impl MemoryDB {
             sources_updated_count: row.get::<i64>(12).unwrap_or(0),
             stale_reason: row.get::<Option<String>>(13).unwrap_or(None),
             user_edited: row.get::<i64>(14).unwrap_or(0) != 0,
+            relevance_score: 0.0, // populated by search_concepts after RRF fusion
         })
     }
 

@@ -748,13 +748,33 @@ pub fn extract_json(text: &str) -> Option<&str> {
 /// since small on-device models (e.g., Qwen3-4B) often return a single
 /// object instead of an array when given a single input item.
 pub fn extract_json_array(text: &str) -> Option<String> {
-    // Try array first
-    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
-        if end > start {
-            return Some(text[start..=end].to_string());
+    // Try object-wrapping first: if the outermost structure is `{...}`,
+    // wrap it in `[...]`. This must come before the `[` search because
+    // a single JSON object like `{"entities": [...]}` contains inner `[`/`]`
+    // that would be mistakenly extracted as the top-level array.
+    if let Some(obj_start) = text.find('{') {
+        if text[..obj_start].find('[').is_none() {
+            // No `[` before the first `{` — the response is an object, not an array
+            if let Some(obj_end) = text.rfind('}') {
+                if obj_end > obj_start {
+                    let candidate = format!("[{}]", &text[obj_start..=obj_end]);
+                    if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
+                        return Some(candidate);
+                    }
+                }
+            }
         }
     }
-    // Fallback: wrap single JSON object in array brackets
+    // Try array extraction
+    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
+        if end > start {
+            let candidate = text[start..=end].to_string();
+            if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Last resort: wrap single JSON object in array brackets
     if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
         if end > start {
             return Some(format!("[{}]", &text[start..=end]));
@@ -859,5 +879,29 @@ mod tests {
             extract_json_array(text),
             Some(r#"[{"i":1,"type":"fact"}]"#.to_string())
         );
+    }
+
+    /// Regression: single KG object with inner arrays must be wrapped, not
+    /// misextracted by matching the inner `[`/`]` as the top-level array.
+    #[test]
+    fn test_extract_json_array_single_object_with_inner_arrays() {
+        let text = r#"{"i": 0, "entities": [{"name": "caroline", "type": "person"}], "observations": [{"entity": "caroline", "content": "joined the group"}]}"#;
+        let result = extract_json_array(text).unwrap();
+        // Must be a valid JSON array
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+        // Inner entities must survive
+        let entities = parsed[0]["entities"].as_array().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["name"], "caroline");
+    }
+
+    /// Array response (batch extraction) still works.
+    #[test]
+    fn test_extract_json_array_real_array_with_inner_arrays() {
+        let text = r#"[{"i": 0, "entities": [{"name": "a"}]}, {"i": 1, "entities": []}]"#;
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 2);
     }
 }

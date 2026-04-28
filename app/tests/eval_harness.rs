@@ -1758,3 +1758,793 @@ async fn judge_e2e_batch() {
     }
     eprintln!("\nTotal judged: {}", report.total_judged);
 }
+
+// ---------------------------------------------------------------------------
+// Full-Pipeline (Enrichment + Concepts) — Batch API
+// ---------------------------------------------------------------------------
+
+/// Full-pipeline LoCoMo: enrich on-device, batch-generate answers, reuse flat cache.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness generate_fullpipeline_locomo -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn generate_fullpipeline_locomo() {
+    use origin_lib::eval::answer_quality::run_fullpipeline_locomo_batch;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let answer_model =
+        std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines).ok();
+    let output_path = baselines.join("fullpipeline_locomo_tuples.json");
+
+    eprintln!(
+        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
+        answer_model, cost_cap, output_path,
+    );
+
+    let tuples = run_fullpipeline_locomo_batch(
+        &locomo_path,
+        &api_key,
+        &answer_model,
+        &output_path,
+        cost_cap,
+    )
+    .await
+    .expect("fullpipeline locomo failed");
+
+    eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
+}
+
+/// Full-pipeline LME: enrich on-device, batch-generate answers, reuse flat cache.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness generate_fullpipeline_lme -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn generate_fullpipeline_lme() {
+    use origin_lib::eval::answer_quality::run_fullpipeline_lme_batch;
+
+    let lme_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !lme_path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let answer_model =
+        std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines).ok();
+    let output_path = baselines.join("fullpipeline_lme_tuples.json");
+
+    eprintln!(
+        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
+        answer_model, cost_cap, output_path,
+    );
+
+    let tuples =
+        run_fullpipeline_lme_batch(&lme_path, &api_key, &answer_model, &output_path, cost_cap)
+            .await
+            .expect("fullpipeline lme failed");
+
+    eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
+}
+
+/// Judge full-pipeline tuples for LoCoMo via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness judge_fullpipeline_locomo -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_locomo() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    // EVAL_TUPLES_FILE override lets us judge alternate files (e.g. *_pregate.json)
+    let default_path = baselines.join("fullpipeline_locomo_tuples.json");
+    let tuples_path: std::path::PathBuf = std::env::var("EVAL_TUPLES_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_path);
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_locomo first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let judge_model = std::env::var("EVAL_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    eprintln!(
+        "=== Full-Pipeline LoCoMo Judge ({} tuples, judge={}) ===",
+        tuples.len(),
+        judge_model
+    );
+
+    let results = judge_with_batch_api(&tuples, &judge_model, None)
+        .await
+        .expect("batch judge failed");
+
+    let report = aggregate_judgments(&results, &judge_model);
+    print_judge_report(&report);
+}
+
+/// Judge full-pipeline tuples for LME via Batch API.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness judge_fullpipeline_lme -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_lme() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
+    };
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_lme first");
+        return;
+    }
+
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let judge_model = std::env::var("EVAL_JUDGE_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+
+    eprintln!(
+        "=== Full-Pipeline LME Judge ({} tuples, judge={}) ===",
+        tuples.len(),
+        judge_model
+    );
+
+    let results = judge_with_batch_api(&tuples, &judge_model, None)
+        .await
+        .expect("batch judge failed");
+
+    let report = aggregate_judgments(&results, &judge_model);
+    print_judge_report(&report);
+}
+
+// ---------------------------------------------------------------------------
+// Batch Size Probe — find on-device extraction overflow point
+// ---------------------------------------------------------------------------
+
+/// Probe extraction at batch sizes 1, 5, 10, 20, 30, 50 to find the on-device
+/// context overflow point and quality degradation curve.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness probe_batch_sizes -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn probe_batch_sizes() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::probe_extraction_batch_sizes;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    let obs: Vec<(String, String)> = extract_observations(&samples[0])
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (format!("obs_{}", i), m.content.clone()))
+        .collect();
+    eprintln!(
+        "Loaded {} observations from {}",
+        obs.len(),
+        samples[0].sample_id
+    );
+
+    // Test 4B first (default), then 9B if available
+    let model_id = std::env::var("PROBE_MODEL").ok();
+    let llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::OnDeviceProvider::new_with_model(model_id.as_deref())
+            .expect("on-device LLM required"),
+    );
+    eprintln!("Model: {}", model_id.as_deref().unwrap_or("4B (default)"));
+
+    let batch_sizes = [1, 2, 3, 5, 10, 20, 30, 50];
+    let results = probe_extraction_batch_sizes(&obs, &llm, &batch_sizes).await;
+
+    eprintln!("\n=== Batch Size Probe Results ===");
+    eprintln!(
+        "{:>5} | {:>8} | {:>8} | {:>8} | {:>8} | {:>10}",
+        "Batch", "InTok", "RespLen", "Entities", "Obs", "Ent/Input"
+    );
+    eprintln!(
+        "{:-<5}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<10}",
+        "", "", "", "", "", ""
+    );
+    for (bs, in_tok, resp_len, ents, obs_count) in &results {
+        let ratio = if *bs > 0 {
+            *ents as f64 / *bs as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{:>5} | {:>8} | {:>8} | {:>8} | {:>8} | {:>10.2}",
+            bs, in_tok, resp_len, ents, obs_count, ratio
+        );
+    }
+}
+
+/// Smoke test: 1 conversation, full pipeline, validates all batch phases work.
+///
+/// ```bash
+/// ANTHROPIC_API_KEY=... cargo test -p origin --test eval_harness smoke_fullpipeline -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_fullpipeline() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        count_tokens, eval_shared_embedder, run_concept_distillation_batch_api,
+        run_enrichment_batch_api, run_title_enrichment_batch_api,
+    };
+    use std::sync::Arc;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let model = "claude-haiku-4-5-20251001";
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    let sample = &samples[0]; // Just 1 conversation
+    let memories = extract_observations(sample);
+    eprintln!("Conv {}: {} observations", sample.sample_id, memories.len());
+
+    // Seed
+    let shared_embedder = eval_shared_embedder();
+    let tmp = tempfile::tempdir().unwrap();
+    let db = origin_core::db::MemoryDB::new_with_shared_embedder(
+        tmp.path(),
+        Arc::new(origin_core::events::NoopEmitter),
+        shared_embedder,
+    )
+    .await
+    .unwrap();
+
+    let docs: Vec<origin_lib::sources::RawDocument> = memories
+        .iter()
+        .enumerate()
+        .map(|(i, mem)| origin_lib::sources::RawDocument {
+            content: mem.content.clone(),
+            source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+            source: "memory".to_string(),
+            title: format!("{} session {}", mem.speaker, mem.session_num),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        })
+        .collect();
+    let seeded = db.upsert_documents(docs).await.unwrap();
+    eprintln!("Seeded: {} chunks", seeded);
+
+    // Phase 1: Entity extraction
+    let entities = run_enrichment_batch_api(&db, &api_key, model, 2.0)
+        .await
+        .unwrap();
+    eprintln!("Entities: {}", entities);
+    assert!(entities > 0, "should extract some entities");
+
+    // Phase 2: Title enrichment
+    let titles = run_title_enrichment_batch_api(&db, &api_key, model, 1.0)
+        .await
+        .unwrap();
+    eprintln!("Titles enriched: {}", titles);
+
+    // Phase 3: Concept distillation
+    let concepts = run_concept_distillation_batch_api(&db, &api_key, model, 1.0)
+        .await
+        .unwrap();
+    eprintln!("Concepts: {}", concepts);
+
+    // Phase 4: Context collection - check flat vs structured differ
+    let qa = &sample.qa[0];
+    let flat_results = db
+        .search_memory(&qa.question, 10, None, None, None, None, None, None)
+        .await
+        .unwrap();
+    let flat_ctx: String = flat_results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("{}. {}", i + 1, r.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let flat_tokens = count_tokens(&flat_ctx);
+
+    let concept_results = db
+        .search_concepts(&qa.question, 3)
+        .await
+        .unwrap_or_default();
+    let mut structured_parts: Vec<String> = Vec::new();
+    if !concept_results.is_empty() {
+        structured_parts.push("## Compiled Knowledge".to_string());
+        for c in &concept_results {
+            structured_parts.push(format!(
+                "**{}**: {}",
+                c.title,
+                c.content.chars().take(200).collect::<String>()
+            ));
+        }
+    }
+    structured_parts.push(flat_ctx.clone());
+    let structured_tokens = count_tokens(&structured_parts.join("\n\n"));
+
+    eprintln!(
+        "\nContext check for: {}\n  flat: {} tokens\n  structured: {} tokens (delta: +{})\n  concepts found: {}",
+        &qa.question.chars().take(60).collect::<String>(),
+        flat_tokens, structured_tokens, structured_tokens - flat_tokens, concept_results.len()
+    );
+
+    eprintln!("\n=== Smoke test PASSED ===");
+    eprintln!(
+        "  {} entities, {} titles, {} concepts",
+        entities, titles, concepts
+    );
+    eprintln!(
+        "  Structured context is {} tokens larger than flat",
+        structured_tokens - flat_tokens
+    );
+}
+
+/// Judge LME tuples via Claude CLI (Max plan, no API key).
+///
+/// Uses task-specific judge prompts matching the LongMemEval paper.
+/// Concurrency configurable via EVAL_CLI_CONCURRENCY (default 8).
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness judge_fullpipeline_lme_cli -- --ignored --nocapture
+/// EVAL_CLI_CONCURRENCY=4 cargo test -p origin --test eval_harness judge_fullpipeline_lme_cli -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_lme_cli() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_lme first");
+        return;
+    }
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let concurrency: usize = std::env::var("EVAL_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+
+    eprintln!(
+        "Judging {} LME tuples via CLI (model={}, concurrency={})...",
+        tuples.len(),
+        model,
+        concurrency
+    );
+    let results = judge_with_claude_model(&tuples, concurrency, &model)
+        .await
+        .expect("judge failed");
+    let report = aggregate_judgments(&results, &format!("{}-cli", model));
+
+    print_judge_report(&report);
+}
+
+/// Judge LoCoMo tuples via Claude CLI (Max plan, no API key).
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness judge_fullpipeline_locomo_cli -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn judge_fullpipeline_locomo_cli() {
+    use origin_lib::eval::judge::{
+        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+    };
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
+    if !tuples_path.exists() {
+        eprintln!("SKIP: run generate_fullpipeline_locomo first");
+        return;
+    }
+    let tuples = load_judgment_tuples(&tuples_path).expect("load failed");
+    let concurrency: usize = std::env::var("EVAL_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+
+    eprintln!(
+        "Judging {} LoCoMo tuples via CLI (model={}, concurrency={})...",
+        tuples.len(),
+        model,
+        concurrency
+    );
+    let results = judge_with_claude_model(&tuples, concurrency, &model)
+        .await
+        .expect("judge failed");
+    let report = aggregate_judgments(&results, &format!("{}-cli", model));
+
+    print_judge_report(&report);
+}
+
+/// Print a judge report with per-category breakdown and task-averaged accuracy.
+fn print_judge_report(report: &origin_lib::eval::judge::JudgedE2EReport) {
+    eprintln!(
+        "\n{:<30} | {:>8} | {:>6} | {:>10}",
+        "Approach", "Accuracy", "N", "Ctx Tokens"
+    );
+    eprintln!("{:-<30}-+-{:-<8}-+-{:-<6}-+-{:-<10}", "", "", "", "");
+    let mut task_accs = Vec::new();
+    for r in &report.results_by_approach {
+        eprintln!(
+            "{:<30} | {:>7.1}% | {:>6} | {:>10.0}",
+            r.approach,
+            r.accuracy * 100.0,
+            r.total,
+            r.mean_context_tokens
+        );
+        task_accs.push(r.accuracy);
+    }
+    let task_avg = if task_accs.is_empty() {
+        0.0
+    } else {
+        task_accs.iter().sum::<f64>() / task_accs.len() as f64 * 100.0
+    };
+    eprintln!("\nTotal judged: {}", report.total_judged);
+    eprintln!("Task-averaged accuracy: {:.1}%", task_avg);
+}
+
+/// Probe concept relevance scores from enriched DBs.
+///
+/// Runs search_concepts with real embeddings on sample questions from each benchmark.
+/// Prints score distributions so we can set a data-driven threshold.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness probe_concept_scores -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn probe_concept_scores() {
+    use origin_core::db::MemoryDB;
+    use origin_core::events::NoopEmitter;
+    use origin_lib::eval::shared::eval_shared_embedder;
+    use std::sync::Arc;
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let shared_embedder = eval_shared_embedder();
+
+    // Sample questions from tuples
+    let locomo_tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
+    let lme_tuples_path = baselines.join("fullpipeline_lme_tuples.json");
+
+    for (label, db_name, tuples_path, n_samples) in [
+        (
+            "LoCoMo",
+            "fullpipeline_locomo_tuples.db",
+            &locomo_tuples_path,
+            10,
+        ),
+        ("LME", "fullpipeline_lme_tuples.db", &lme_tuples_path, 10),
+    ] {
+        let db_dir = baselines.join(db_name);
+        if !db_dir.exists() || !tuples_path.exists() {
+            eprintln!("SKIP {label}: enriched DB or tuples not found");
+            continue;
+        }
+
+        let db = MemoryDB::new_with_shared_embedder(
+            &db_dir,
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await
+        .expect("open DB");
+
+        // Load sample questions spread across categories
+        let tuples: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(tuples_path).unwrap()).unwrap();
+
+        let mut by_cat: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for t in &tuples {
+            let cat = t["category"]
+                .as_str()
+                .unwrap_or(
+                    t["approach"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .strip_prefix("structured_")
+                        .unwrap_or("?"),
+                )
+                .to_string();
+            let q = t["question"].as_str().unwrap_or("").to_string();
+            by_cat.entry(cat).or_default().push(q);
+        }
+
+        let mut samples: Vec<(String, String)> = Vec::new();
+        for (cat, qs) in by_cat.iter() {
+            for q in qs.iter().take(n_samples / by_cat.len().max(1)) {
+                samples.push((cat.clone(), q.clone()));
+            }
+        }
+        // Fill remaining
+        'outer: for (cat, qs) in by_cat.iter() {
+            for q in qs.iter().skip(n_samples / by_cat.len().max(1)) {
+                if samples.len() >= n_samples {
+                    break 'outer;
+                }
+                samples.push((cat.clone(), q.clone()));
+            }
+        }
+
+        eprintln!(
+            "\n=== {label}: Concept Scores ({} samples) ===",
+            samples.len()
+        );
+        eprintln!(
+            "{:<24} | {:>6} {:>6} {:>6} | {:>5} {:>5} {:>5} | Question",
+            "Category", "C1", "C2", "C3", "Tok1", "Tok2", "Tok3"
+        );
+        eprintln!("{}", "-".repeat(110));
+
+        let mut all_scores: Vec<f32> = Vec::new();
+        for (cat, question) in &samples {
+            let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
+            let scores: Vec<f32> = concepts.iter().map(|c| c.relevance_score).collect();
+            let tokens: Vec<usize> = concepts
+                .iter()
+                .map(|c| c.content.len() / 4) // rough char-to-token
+                .collect();
+
+            all_scores.extend(&scores);
+
+            eprintln!(
+                "{:<24} | {:>5.3} {:>5.3} {:>5.3} | {:>5} {:>5} {:>5} | {}",
+                &cat[..cat.len().min(24)],
+                scores.first().unwrap_or(&0.0),
+                scores.get(1).unwrap_or(&0.0),
+                scores.get(2).unwrap_or(&0.0),
+                tokens.first().unwrap_or(&0),
+                tokens.get(1).unwrap_or(&0),
+                tokens.get(2).unwrap_or(&0),
+                &question[..question.len().min(45)],
+            );
+        }
+
+        // Summary stats
+        all_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = all_scores.len();
+        if n > 0 {
+            let mean: f32 = all_scores.iter().sum::<f32>() / n as f32;
+            eprintln!(
+                "\n  {label} scores: mean={:.3} min={:.3} max={:.3} p25={:.3} p50={:.3} p75={:.3} (n={})",
+                mean,
+                all_scores[0],
+                all_scores[n - 1],
+                all_scores[n / 4],
+                all_scores[n / 2],
+                all_scores[3 * n / 4],
+                n,
+            );
+        }
+    }
+}
+
+/// Probe source overlap gate across ALL questions in both enriched DBs.
+///
+/// Runs search_memory + search_concepts for every question, counts how many
+/// concepts pass the overlap gate (>= min_overlap source memories overlap
+/// with search results). This validates whether the gate behaves as expected
+/// without running expensive LLM answer generation.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness probe_overlap_gate -- --ignored --nocapture
+/// EVAL_MIN_OVERLAP=2 cargo test ... probe_overlap_gate -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn probe_overlap_gate() {
+    use origin_core::concepts::filter_concepts_by_source_overlap;
+    use origin_core::db::MemoryDB;
+    use origin_core::events::NoopEmitter;
+    use origin_lib::eval::shared::eval_shared_embedder;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let shared_embedder = eval_shared_embedder();
+    let min_overlap: usize = std::env::var("EVAL_MIN_OVERLAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
+    for (label, db_name, tuples_name) in [
+        (
+            "LoCoMo",
+            "fullpipeline_locomo_tuples.db",
+            "fullpipeline_locomo_tuples.json",
+        ),
+        (
+            "LME",
+            "fullpipeline_lme_tuples.db",
+            "fullpipeline_lme_tuples.json",
+        ),
+    ] {
+        let db_dir = baselines.join(db_name);
+        let tuples_path = baselines.join(tuples_name);
+        if !db_dir.exists() || !tuples_path.exists() {
+            eprintln!("SKIP {label}: artifacts missing");
+            continue;
+        }
+
+        let db = MemoryDB::new_with_shared_embedder(
+            &db_dir,
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await
+        .expect("open DB");
+
+        let tuples: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&tuples_path).unwrap()).unwrap();
+
+        // Dedup questions (same q may appear with different categories in some files)
+        let mut seen = std::collections::HashSet::new();
+        let questions: Vec<(String, String)> = tuples
+            .iter()
+            .filter_map(|t| {
+                let q = t["question"].as_str()?.to_string();
+                if !seen.insert(q.clone()) {
+                    return None;
+                }
+                let cat = t["category"]
+                    .as_str()
+                    .or_else(|| {
+                        t["approach"]
+                            .as_str()
+                            .and_then(|s| s.strip_prefix("structured_"))
+                    })
+                    .unwrap_or("?")
+                    .to_string();
+                Some((cat, q))
+            })
+            .collect();
+
+        let total_q = questions.len();
+        let mut total_concepts = 0usize;
+        let mut total_kept = 0usize;
+        let mut overlap_when_kept: Vec<usize> = Vec::new();
+        let mut overlap_when_filtered: Vec<usize> = Vec::new();
+        let mut per_q_kept_dist: HashMap<usize, usize> = HashMap::new();
+        let mut per_cat_kept: HashMap<String, (usize, usize)> = HashMap::new(); // cat -> (kept_q, total_q)
+
+        eprintln!("\n=== {label}: probing {total_q} questions (min_overlap={min_overlap}) ===",);
+
+        for (i, (cat, q)) in questions.iter().enumerate() {
+            // Real search_memory (top-10, no domain filter — matches eval pipeline)
+            let results = match db
+                .search_memory(q, 10, None, None, None, None, None, None)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let search_ids: std::collections::HashSet<String> =
+                results.iter().map(|r| r.source_id.clone()).collect();
+
+            // Real search_concepts (top-3)
+            let raw_concepts = db.search_concepts(q, 3).await.unwrap_or_default();
+            let kept = filter_concepts_by_source_overlap(&raw_concepts, &search_ids, min_overlap);
+
+            for c in &raw_concepts {
+                total_concepts += 1;
+                let overlap = c
+                    .source_memory_ids
+                    .iter()
+                    .filter(|sid| search_ids.contains(sid.as_str()))
+                    .count();
+                if kept.iter().any(|k| k.id == c.id) {
+                    total_kept += 1;
+                    overlap_when_kept.push(overlap);
+                } else {
+                    overlap_when_filtered.push(overlap);
+                }
+            }
+            *per_q_kept_dist.entry(kept.len()).or_insert(0) += 1;
+            let entry = per_cat_kept.entry(cat.clone()).or_insert((0, 0));
+            entry.1 += 1;
+            if !kept.is_empty() {
+                entry.0 += 1;
+            }
+
+            if i % 100 == 99 {
+                eprintln!("  [{}/{}] processed", i + 1, total_q);
+            }
+        }
+
+        let kept_pct = total_kept as f64 / total_concepts.max(1) as f64 * 100.0;
+        let mean_kept_overlap = if overlap_when_kept.is_empty() {
+            0.0
+        } else {
+            overlap_when_kept.iter().sum::<usize>() as f64 / overlap_when_kept.len() as f64
+        };
+        let mean_filt_overlap = if overlap_when_filtered.is_empty() {
+            0.0
+        } else {
+            overlap_when_filtered.iter().sum::<usize>() as f64 / overlap_when_filtered.len() as f64
+        };
+
+        eprintln!("\n  --- Results ---");
+        eprintln!("  Total concept-query pairs: {total_concepts}");
+        eprintln!(
+            "  Kept (passed gate): {total_kept} ({kept_pct:.1}%)  mean_overlap_when_kept={mean_kept_overlap:.1}"
+        );
+        eprintln!(
+            "  Filtered: {} ({:.1}%)  mean_overlap_when_filtered={:.2}",
+            total_concepts - total_kept,
+            (total_concepts - total_kept) as f64 / total_concepts.max(1) as f64 * 100.0,
+            mean_filt_overlap,
+        );
+
+        let mut dist: Vec<(usize, usize)> = per_q_kept_dist.into_iter().collect();
+        dist.sort();
+        eprintln!(
+            "  Concepts passing per question: {}",
+            dist.iter()
+                .map(|(k, v)| format!("{k}→{v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        eprintln!("\n  Per-category (questions with at least one passing concept):");
+        let mut cats: Vec<(String, (usize, usize))> = per_cat_kept.into_iter().collect();
+        cats.sort_by(|a, b| a.0.cmp(&b.0));
+        for (cat, (kept_q, total_q)) in cats {
+            eprintln!(
+                "    {:<28} {:4}/{:4} ({:5.1}%)",
+                cat,
+                kept_q,
+                total_q,
+                kept_q as f64 / total_q.max(1) as f64 * 100.0
+            );
+        }
+    }
+}

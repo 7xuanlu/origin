@@ -1,0 +1,98 @@
+name: Coverage (informational)
+
+# Non-blocking coverage report posted to PRs. Pre-push and the main CI lane
+# both skip coverage; this workflow exists to give visibility without slowing
+# the merge gate. See CLAUDE.md "Local vs CI test responsibilities".
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+# Don't run on every push — only PRs and manual triggers.
+# Cancel in-flight runs when a new commit lands on the PR.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Coverage report
+    runs-on: macos-latest
+    if: >-
+      !startsWith(github.event.head_commit.message, 'chore(main): release')
+    # Informational: never blocks merges. Failing this job is a warning, not a
+    # gate. Required-status-checks should NOT include this job.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache FastEmbed ONNX model
+        uses: actions/cache@v4
+        with:
+          path: ~/.fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v2
+          restore-keys: |
+            fastembed-bge-base-en-v1.5-q-
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Create sidecar placeholders for Tauri build script
+        run: |
+          mkdir -p app/binaries
+          touch app/binaries/origin-server-aarch64-apple-darwin
+          touch app/binaries/origin-mcp-aarch64-apple-darwin
+          touch app/binaries/cloudflared-aarch64-apple-darwin
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run Rust coverage (origin-core + origin-server)
+        # Skip --package origin (Tauri app); its crate is Tauri command proxies
+        # which can't be exercised meaningfully without a GUI runtime, and
+        # including it explodes memory on the runner.
+        run: |
+          cargo llvm-cov --package origin-core --package origin-server \
+            --summary-only --json --output-path rust-coverage.json
+          cargo llvm-cov --package origin-core --package origin-server \
+            --summary-only
+
+      - name: Run frontend coverage
+        run: pnpm vitest run --coverage
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            rust-coverage.json
+            coverage/
+          retention-days: 7
