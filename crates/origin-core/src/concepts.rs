@@ -70,3 +70,85 @@ pub fn filter_concepts_by_source_overlap(
         .cloned()
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn make_concept(id: &str, source_ids: &[&str]) -> Concept {
+        Concept {
+            id: id.to_string(),
+            title: id.to_string(),
+            summary: None,
+            content: String::new(),
+            entity_id: None,
+            domain: None,
+            source_memory_ids: source_ids.iter().map(|s| s.to_string()).collect(),
+            version: 1,
+            status: "active".to_string(),
+            created_at: String::new(),
+            last_compiled: String::new(),
+            last_modified: String::new(),
+            sources_updated_count: 0,
+            stale_reason: None,
+            user_edited: false,
+            relevance_score: 0.5,
+        }
+    }
+
+    #[test]
+    fn test_overlap_keeps_matching_concept() {
+        let concepts = vec![make_concept("c1", &["m1", "m2", "m3"])];
+        let search_ids: HashSet<String> = ["m1", "m2"].iter().map(|s| s.to_string()).collect();
+        let kept = filter_concepts_by_source_overlap(&concepts, &search_ids, 2);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn test_overlap_filters_low_overlap() {
+        let concepts = vec![make_concept("c1", &["m1", "m2", "m3"])];
+        let search_ids: HashSet<String> = ["m1", "m99"].iter().map(|s| s.to_string()).collect();
+        let kept = filter_concepts_by_source_overlap(&concepts, &search_ids, 2);
+        assert_eq!(kept.len(), 0); // only 1 overlap, need 2
+    }
+
+    #[test]
+    fn test_overlap_empty_concept_sources() {
+        let concepts = vec![make_concept("c1", &[])];
+        let search_ids: HashSet<String> = ["m1"].iter().map(|s| s.to_string()).collect();
+        let kept = filter_concepts_by_source_overlap(&concepts, &search_ids, 1);
+        assert_eq!(kept.len(), 0);
+    }
+
+    #[test]
+    fn test_overlap_empty_search_results() {
+        let concepts = vec![make_concept("c1", &["m1", "m2"])];
+        let search_ids: HashSet<String> = HashSet::new();
+        let kept = filter_concepts_by_source_overlap(&concepts, &search_ids, 1);
+        assert_eq!(kept.len(), 0);
+    }
+
+    #[test]
+    fn test_overlap_zero_threshold_keeps_all() {
+        let concepts = vec![make_concept("c1", &["m1"]), make_concept("c2", &["m99"])];
+        let search_ids: HashSet<String> = ["m1"].iter().map(|s| s.to_string()).collect();
+        let kept = filter_concepts_by_source_overlap(&concepts, &search_ids, 0);
+        assert_eq!(kept.len(), 2); // min_overlap=0 keeps everything
+    }
+
+    #[test]
+    fn test_overlap_mixed_keeps_and_filters() {
+        let concepts = vec![
+            make_concept("good", &["m1", "m2", "m3", "m4", "m5"]),
+            make_concept("noise", &["m90", "m91", "m92"]),
+            make_concept("edge", &["m1", "m90"]),
+        ];
+        let search_ids: HashSet<String> =
+            ["m1", "m2", "m3"].iter().map(|s| s.to_string()).collect();
+        let kept = filter_concepts_by_source_overlap(&concepts, &search_ids, 2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "good"); // 3 overlap
+                                        // "noise" has 0 overlap, "edge" has 1 overlap — both filtered at min_overlap=2
+    }
+}

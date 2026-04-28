@@ -14155,7 +14155,8 @@ impl MemoryDB {
             concept_map.entry(id).or_insert(concept);
         }
 
-        // Normalize scores to 0.0-1.0 (same approach as search_memory)
+        // Normalize scores to 0.0-1.0 (RRF-only, no multipliers — concepts
+        // don't have the recency/confidence/domain boosts that search_memory applies)
         let theoretical_max_rrf = (1.0 + fts_weight) / rrf_k;
         for score in score_map.values_mut() {
             *score = (*score / theoretical_max_rrf).min(1.0);

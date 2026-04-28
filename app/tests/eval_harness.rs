@@ -1789,56 +1789,19 @@ async fn generate_fullpipeline_locomo() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10.0);
 
-    // On-device 9B for enrichment (free, better entity extraction than 4B)
-    let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
-        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen3.5-9b")) {
-            Ok(p) => {
-                eprintln!("[fullpipeline] On-device 9B LLM for enrichment");
-                Some(Arc::new(p))
-            }
-            Err(e) => {
-                eprintln!("[fullpipeline] 9B unavailable ({e}), trying 4B...");
-                match origin_lib::llm_provider::OnDeviceProvider::new() {
-                    Ok(p) => Some(Arc::new(p) as Arc<dyn origin_lib::llm_provider::LlmProvider>),
-                    Err(e2) => {
-                        eprintln!("[fullpipeline] On-device unavailable ({e2}), using API");
-                        None
-                    }
-                }
-            }
-        };
-
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     std::fs::create_dir_all(&baselines).ok();
-
-    // Reuse cached flat answers from retrieval-only pipeline
-    let flat_cache = baselines.join("locomo_answered_haiku.json");
-    let flat_cache_path = if flat_cache.exists() {
-        Some(flat_cache.as_path())
-    } else {
-        None
-    };
-
     let output_path = baselines.join("fullpipeline_locomo_tuples.json");
 
     eprintln!(
-        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  flat cache: {}\n  output: {:?}",
-        answer_model,
-        cost_cap,
-        if flat_cache_path.is_some() {
-            "yes"
-        } else {
-            "no"
-        },
-        output_path,
+        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
+        answer_model, cost_cap, output_path,
     );
 
     let tuples = run_fullpipeline_locomo_batch(
         &locomo_path,
-        enrichment_llm,
         &api_key,
         &answer_model,
-        flat_cache_path,
         &output_path,
         cost_cap,
     )
@@ -1857,7 +1820,6 @@ async fn generate_fullpipeline_locomo() {
 #[ignore]
 async fn generate_fullpipeline_lme() {
     use origin_lib::eval::answer_quality::run_fullpipeline_lme_batch;
-    use std::sync::Arc;
 
     let lme_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
@@ -1874,55 +1836,19 @@ async fn generate_fullpipeline_lme() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10.0);
 
-    let enrichment_llm: Option<Arc<dyn origin_lib::llm_provider::LlmProvider>> =
-        match origin_lib::llm_provider::OnDeviceProvider::new_with_model(Some("qwen3.5-9b")) {
-            Ok(p) => {
-                eprintln!("[fullpipeline] On-device 9B LLM for enrichment");
-                Some(Arc::new(p))
-            }
-            Err(e) => {
-                eprintln!("[fullpipeline] 9B unavailable ({e}), trying 4B...");
-                match origin_lib::llm_provider::OnDeviceProvider::new() {
-                    Ok(p) => Some(Arc::new(p) as Arc<dyn origin_lib::llm_provider::LlmProvider>),
-                    Err(e2) => {
-                        eprintln!("[fullpipeline] On-device unavailable ({e2}), using API");
-                        None
-                    }
-                }
-            }
-        };
-
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     std::fs::create_dir_all(&baselines).ok();
-
-    let flat_cache = baselines.join("lme_answered_haiku.json");
-    let flat_cache_path = if flat_cache.exists() {
-        Some(flat_cache.as_path())
-    } else {
-        None
-    };
-
     let output_path = baselines.join("fullpipeline_lme_tuples.json");
 
     eprintln!(
-        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  flat cache: {} (500 answers)\n  output: {:?}",
-        answer_model,
-        cost_cap,
-        if flat_cache_path.is_some() { "yes" } else { "no" },
-        output_path,
+        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
+        answer_model, cost_cap, output_path,
     );
 
-    let tuples = run_fullpipeline_lme_batch(
-        &lme_path,
-        enrichment_llm,
-        &api_key,
-        &answer_model,
-        flat_cache_path,
-        &output_path,
-        cost_cap,
-    )
-    .await
-    .expect("fullpipeline lme failed");
+    let tuples =
+        run_fullpipeline_lme_batch(&lme_path, &api_key, &answer_model, &output_path, cost_cap)
+            .await
+            .expect("fullpipeline lme failed");
 
     eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
 }

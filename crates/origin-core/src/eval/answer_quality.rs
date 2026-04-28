@@ -1153,22 +1153,16 @@ async fn build_structured_context(
 /// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
 pub async fn run_fullpipeline_locomo_batch(
     locomo_path: &Path,
-    enrichment_llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
     api_key: &str,
     answer_model: &str,
-    flat_cache_path: Option<&Path>,
     output_path: &Path,
     cost_cap_usd: f64,
 ) -> Result<Vec<JudgmentTuple>, OriginError> {
     use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
     use crate::eval::judge::save_judgment_tuples;
     use crate::eval::locomo::{category_name, extract_observations, load_locomo};
-    use crate::prompts::PromptRegistry;
-    use crate::tuning::DistillationConfig;
 
     let samples = load_locomo(locomo_path)?;
-    let _prompts = PromptRegistry::load(&PromptRegistry::override_dir());
-    let _tuning = DistillationConfig::default();
     let shared_embedder = eval_shared_embedder();
 
     // Resume
@@ -1185,26 +1179,6 @@ pub async fn run_fullpipeline_locomo_batch(
     };
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
-
-    let flat_cache: HashMap<String, (String, usize)> = load_flat_cache_locomo(flat_cache_path);
-    if !flat_cache.is_empty() {
-        eprintln!(
-            "[fullpipeline] Loaded {} cached flat answers",
-            flat_cache.len()
-        );
-    }
-
-    let _enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
-        Some(llm) => llm,
-        None => {
-            eprintln!("[fullpipeline] No enrichment LLM, using API");
-            Arc::new(crate::llm_provider::ApiProvider::new(
-                api_key.to_string(),
-                answer_model.to_string(),
-            ))
-        }
-    };
-
     // --- Phase 1: Seed all conversations into one DB, enrich once ---
     // Use a stable DB path (sibling to output_path) so enrichment survives crashes.
     let db_dir = output_path.with_extension("db");
@@ -1418,22 +1392,16 @@ pub async fn run_fullpipeline_locomo_batch(
 /// Enrichment runs once across all data.
 pub async fn run_fullpipeline_lme_batch(
     longmemeval_path: &Path,
-    enrichment_llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
     api_key: &str,
     answer_model: &str,
-    flat_cache_path: Option<&Path>,
     output_path: &Path,
     cost_cap_usd: f64,
 ) -> Result<Vec<JudgmentTuple>, OriginError> {
     use crate::eval::anthropic::{download_batch_results, poll_batch, submit_batch};
     use crate::eval::judge::save_judgment_tuples;
     use crate::eval::longmemeval::{category_name, extract_memories, load_longmemeval};
-    use crate::prompts::PromptRegistry;
-    use crate::tuning::DistillationConfig;
 
     let samples = load_longmemeval(longmemeval_path)?;
-    let _prompts = PromptRegistry::load(&PromptRegistry::override_dir());
-    let _tuning = DistillationConfig::default();
     let shared_embedder = eval_shared_embedder();
 
     // Resume
@@ -1450,25 +1418,6 @@ pub async fn run_fullpipeline_lme_batch(
     };
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
-
-    let flat_cache: HashMap<String, (String, usize)> = load_flat_cache_lme(flat_cache_path);
-    if !flat_cache.is_empty() {
-        eprintln!(
-            "[fullpipeline_lme] Loaded {} cached flat answers",
-            flat_cache.len()
-        );
-    }
-
-    let _enrich_llm: Arc<dyn crate::llm_provider::LlmProvider> = match enrichment_llm {
-        Some(llm) => llm,
-        None => {
-            eprintln!("[fullpipeline_lme] No enrichment LLM, using API");
-            Arc::new(crate::llm_provider::ApiProvider::new(
-                api_key.to_string(),
-                answer_model.to_string(),
-            ))
-        }
-    };
 
     // --- Phase 1: Seed all questions' memories into one DB, enrich once ---
     let db_dir = output_path.with_extension("db");
@@ -1673,34 +1622,3 @@ pub async fn run_fullpipeline_lme_batch(
 }
 
 // ===== Flat cache loaders =====
-
-/// Load cached LoCoMo flat answers: question -> (answer, context_tokens).
-fn load_flat_cache_locomo(path: Option<&Path>) -> HashMap<String, (String, usize)> {
-    let path = match path {
-        Some(p) if p.exists() => p,
-        _ => return HashMap::new(),
-    };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
-    };
-    let items: Vec<serde_json::Value> = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return HashMap::new(),
-    };
-    items
-        .iter()
-        .filter_map(|item| {
-            let question = item["question"].as_str()?.to_string();
-            let answer = item["model_answer"].as_str()?.to_string();
-            let tokens = item["context_tokens"].as_u64().unwrap_or(0) as usize;
-            Some((question, (answer, tokens)))
-        })
-        .collect()
-}
-
-/// Load cached LME flat answers: question -> (answer, context_tokens).
-fn load_flat_cache_lme(path: Option<&Path>) -> HashMap<String, (String, usize)> {
-    // Same format as LoCoMo
-    load_flat_cache_locomo(path)
-}
