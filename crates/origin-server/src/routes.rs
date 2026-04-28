@@ -345,11 +345,23 @@ pub async fn handle_chat_context(
         .map(|r| format!("[{}] {}", r.title, r.content))
         .collect();
 
+    // Source IDs from search results — used to gate concept relevance.
+    // A concept is only included if its source memories overlap with the
+    // memories that search_memory returned for this query.
+    let search_source_ids: std::collections::HashSet<String> = filtered_search
+        .iter()
+        .map(|r| r.source_id.clone())
+        .collect();
+
     let concept_results: Vec<String> =
         if tier_allowed(&classification.trust_level, 2) && query != "recent context" {
-            db.search_concepts(query, 3)
-                .await
-                .unwrap_or_default()
+            let raw_concepts = db.search_concepts(query, 3).await.unwrap_or_default();
+            let concepts = origin_core::concepts::filter_concepts_by_source_overlap(
+                &raw_concepts,
+                &search_source_ids,
+                2,
+            );
+            concepts
                 .iter()
                 .map(|c| {
                     let summary = c.summary.as_deref().unwrap_or("");

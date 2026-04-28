@@ -1088,24 +1088,41 @@ async fn build_structured_context(
     search_limit: usize,
     domain: Option<&str>,
 ) -> Result<(String, usize), OriginError> {
+    use crate::concepts::filter_concepts_by_source_overlap;
+
     let results = db
         .search_memory(question, search_limit, None, domain, None, None, None, None)
         .await?;
 
+    // Source IDs from search results — used to gate concept relevance
+    let search_source_ids: std::collections::HashSet<String> =
+        results.iter().map(|r| r.source_id.clone()).collect();
+
     // Structured: concepts + search results (matches production /api/chat-context).
     let mut parts: Vec<String> = Vec::new();
-    let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
-    if !concepts.is_empty() {
-        for c in &concepts {
-            let ctokens = count_tokens(&c.content);
+    let raw_concepts = db.search_concepts(question, 3).await.unwrap_or_default();
+    let concepts = filter_concepts_by_source_overlap(&raw_concepts, &search_source_ids, 2);
+
+    if !raw_concepts.is_empty() {
+        for c in &raw_concepts {
+            let kept = concepts.iter().any(|k| k.id == c.id);
+            let overlap = c
+                .source_memory_ids
+                .iter()
+                .filter(|sid| search_source_ids.contains(sid.as_str()))
+                .count();
             log::info!(
-                "[eval:concept] score={:.4} tokens={} title={:?} q={:?}",
+                "[eval:concept] score={:.4} overlap={}/{} {} title={:?} q={:?}",
                 c.relevance_score,
-                ctokens,
+                overlap,
+                results.len(),
+                if kept { "KEPT" } else { "FILTERED" },
                 c.title.chars().take(40).collect::<String>(),
                 question.chars().take(50).collect::<String>(),
             );
         }
+    }
+    if !concepts.is_empty() {
         parts.push("## Compiled Knowledge".to_string());
         for c in &concepts {
             let summary = c.summary.as_deref().unwrap_or("");

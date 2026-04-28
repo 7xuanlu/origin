@@ -2302,3 +2302,139 @@ fn print_judge_report(report: &origin_lib::eval::judge::JudgedE2EReport) {
     eprintln!("\nTotal judged: {}", report.total_judged);
     eprintln!("Task-averaged accuracy: {:.1}%", task_avg);
 }
+
+/// Probe concept relevance scores from enriched DBs.
+///
+/// Runs search_concepts with real embeddings on sample questions from each benchmark.
+/// Prints score distributions so we can set a data-driven threshold.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness probe_concept_scores -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn probe_concept_scores() {
+    use origin_core::db::MemoryDB;
+    use origin_core::events::NoopEmitter;
+    use origin_lib::eval::shared::eval_shared_embedder;
+    use std::sync::Arc;
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let shared_embedder = eval_shared_embedder();
+
+    // Sample questions from tuples
+    let locomo_tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
+    let lme_tuples_path = baselines.join("fullpipeline_lme_tuples.json");
+
+    for (label, db_name, tuples_path, n_samples) in [
+        (
+            "LoCoMo",
+            "fullpipeline_locomo_tuples.db",
+            &locomo_tuples_path,
+            10,
+        ),
+        ("LME", "fullpipeline_lme_tuples.db", &lme_tuples_path, 10),
+    ] {
+        let db_dir = baselines.join(db_name);
+        if !db_dir.exists() || !tuples_path.exists() {
+            eprintln!("SKIP {label}: enriched DB or tuples not found");
+            continue;
+        }
+
+        let db = MemoryDB::new_with_shared_embedder(
+            &db_dir,
+            Arc::new(NoopEmitter),
+            shared_embedder.clone(),
+        )
+        .await
+        .expect("open DB");
+
+        // Load sample questions spread across categories
+        let tuples: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(tuples_path).unwrap()).unwrap();
+
+        let mut by_cat: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for t in &tuples {
+            let cat = t["category"]
+                .as_str()
+                .unwrap_or(
+                    t["approach"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .strip_prefix("structured_")
+                        .unwrap_or("?"),
+                )
+                .to_string();
+            let q = t["question"].as_str().unwrap_or("").to_string();
+            by_cat.entry(cat).or_default().push(q);
+        }
+
+        let mut samples: Vec<(String, String)> = Vec::new();
+        for (cat, qs) in by_cat.iter() {
+            for q in qs.iter().take(n_samples / by_cat.len().max(1)) {
+                samples.push((cat.clone(), q.clone()));
+            }
+        }
+        // Fill remaining
+        'outer: for (cat, qs) in by_cat.iter() {
+            for q in qs.iter().skip(n_samples / by_cat.len().max(1)) {
+                if samples.len() >= n_samples {
+                    break 'outer;
+                }
+                samples.push((cat.clone(), q.clone()));
+            }
+        }
+
+        eprintln!(
+            "\n=== {label}: Concept Scores ({} samples) ===",
+            samples.len()
+        );
+        eprintln!(
+            "{:<24} | {:>6} {:>6} {:>6} | {:>5} {:>5} {:>5} | {}",
+            "Category", "C1", "C2", "C3", "Tok1", "Tok2", "Tok3", "Question"
+        );
+        eprintln!("{}", "-".repeat(110));
+
+        let mut all_scores: Vec<f32> = Vec::new();
+        for (cat, question) in &samples {
+            let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
+            let scores: Vec<f32> = concepts.iter().map(|c| c.relevance_score).collect();
+            let tokens: Vec<usize> = concepts
+                .iter()
+                .map(|c| c.content.len() / 4) // rough char-to-token
+                .collect();
+
+            all_scores.extend(&scores);
+
+            eprintln!(
+                "{:<24} | {:>5.3} {:>5.3} {:>5.3} | {:>5} {:>5} {:>5} | {}",
+                &cat[..cat.len().min(24)],
+                scores.first().unwrap_or(&0.0),
+                scores.get(1).unwrap_or(&0.0),
+                scores.get(2).unwrap_or(&0.0),
+                tokens.first().unwrap_or(&0),
+                tokens.get(1).unwrap_or(&0),
+                tokens.get(2).unwrap_or(&0),
+                &question[..question.len().min(45)],
+            );
+        }
+
+        // Summary stats
+        all_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = all_scores.len();
+        if n > 0 {
+            let mean: f32 = all_scores.iter().sum::<f32>() / n as f32;
+            eprintln!(
+                "\n  {label} scores: mean={:.3} min={:.3} max={:.3} p25={:.3} p50={:.3} p75={:.3} (n={})",
+                mean,
+                all_scores[0],
+                all_scores[n - 1],
+                all_scores[n / 4],
+                all_scores[n / 2],
+                all_scores[3 * n / 4],
+                n,
+            );
+        }
+    }
+}

@@ -40,3 +40,33 @@ impl Concept {
         format!("concept_{}", uuid::Uuid::new_v4())
     }
 }
+
+/// Filter concepts by source overlap with search results.
+///
+/// A concept is contextually relevant if the memories it was compiled from
+/// overlap with the memories that search_memory returned for this query.
+/// This is the strongest relevance signal: it answers "is this concept about
+/// the thing I'm searching for?" rather than relying on embedding similarity
+/// (which we proved doesn't discriminate between good and garbage concepts).
+///
+/// `min_overlap`: minimum number of search result source_ids that must appear
+/// in the concept's `source_memory_ids`. Recommended: 2 (filters noise while
+/// keeping concepts with genuine topical overlap).
+pub fn filter_concepts_by_source_overlap(
+    concepts: &[Concept],
+    search_result_source_ids: &std::collections::HashSet<String>,
+    min_overlap: usize,
+) -> Vec<Concept> {
+    concepts
+        .iter()
+        .filter(|c| {
+            let overlap = c
+                .source_memory_ids
+                .iter()
+                .filter(|sid| search_result_source_ids.contains(sid.as_str()))
+                .count();
+            overlap >= min_overlap
+        })
+        .cloned()
+        .collect()
+}
