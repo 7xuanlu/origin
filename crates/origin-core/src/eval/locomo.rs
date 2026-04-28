@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // Bring date helpers into scope for use within this module.
-use crate::eval::dates::seed_last_modified;
+use crate::eval::dates::seed_event_date;
 // Re-export so external callers using `crate::eval::locomo::parse_locomo_date` still compile.
 pub use crate::eval::dates::parse_locomo_date;
 
@@ -432,7 +432,8 @@ pub async fn run_locomo_eval(path: &Path) -> Result<LocomoReport, OriginError> {
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
+                last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -563,7 +564,8 @@ pub async fn run_locomo_eval_reranked(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
+                last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -688,7 +690,8 @@ pub async fn run_locomo_eval_expanded(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
+                last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -954,7 +957,8 @@ pub async fn run_locomo_eval_with_gate(
                 title: format!("{} session {}", mem.speaker, mem.session_num),
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
-                last_modified: seed_last_modified(mem.session_date.as_deref(), parse_locomo_date),
+                last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();

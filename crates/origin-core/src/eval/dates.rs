@@ -7,7 +7,7 @@
 //! - [`parse_locomo_date`] — LoCoMo session timestamps ("1:56 pm on 8 May, 2023")
 //! - [`parse_lme_date`]    — LongMemEval session timestamps ("2023/04/10 (Mon) 23:07")
 //! - [`format_ymd`]        — Unix-seconds → "YYYY-MM-DD" formatting
-//! - [`seed_last_modified`] — resolve a benchmark chunk's `last_modified` field
+//! - [`seed_event_date`]   — resolve a benchmark chunk's `event_date` field
 
 /// Parse a LoCoMo session date like "1:56 pm on 8 May, 2023" into Unix seconds.
 /// Returns `None` on parse failure (caller falls back to `now()`).
@@ -49,22 +49,22 @@ pub fn format_ymd(ts: i64) -> String {
         .unwrap_or_else(|| "unknown date".to_string())
 }
 
-/// Resolve `last_modified` for a benchmark-seeded chunk: parse the per-session
-/// date string with `parser` if present, else fall back to `now()` (used for
-/// noise / undated entries).
+/// Resolve `event_date` for a benchmark-seeded chunk: parse the per-session
+/// date string with `parser`. Returns `None` if no date is provided, or if
+/// parsing fails (with a warning so silent degradation is visible in logs).
 ///
-/// Logs a warning when a non-empty date string fails to parse, so silent
-/// degradation to today's date is visible in eval logs.
-pub fn seed_last_modified(date: Option<&str>, parser: fn(&str) -> Option<i64>) -> i64 {
-    if let Some(s) = date {
-        if let Some(ts) = parser(s) {
-            return ts;
-        }
-        log::warn!(
-            "[eval:dates] failed to parse date {s:?}; falling back to now() — temporal accuracy lost"
-        );
+/// Used at seed sites to populate `RawDocument.event_date` while
+/// `last_modified` stays at `now()` — so search ranking treats benchmark
+/// memories as fresh while LLM context still sees the original event date.
+pub fn seed_event_date(date: Option<&str>, parser: fn(&str) -> Option<i64>) -> Option<i64> {
+    let s = date?;
+    if let Some(ts) = parser(s) {
+        return Some(ts);
     }
-    chrono::Utc::now().timestamp()
+    log::warn!(
+        "[eval:dates] failed to parse date {s:?}; event_date set to None — display falls back to last_modified"
+    );
+    None
 }
 
 #[cfg(test)]
@@ -109,27 +109,25 @@ mod tests {
         assert_eq!(format_ymd(0), "1970-01-01");
     }
 
-    // ── seed_last_modified ───────────────────────────────────────────────────
+    // ── seed_event_date ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_seed_last_modified_parses_when_date_present() {
-        let ts = seed_last_modified(Some("2023/04/10 (Mon) 23:07"), parse_lme_date);
-        assert_eq!(ts, 1_681_168_020);
+    fn test_seed_event_date_parses_when_date_present() {
+        assert_eq!(
+            seed_event_date(Some("2023/04/10 (Mon) 23:07"), parse_lme_date),
+            Some(1_681_168_020)
+        );
     }
 
     #[test]
-    fn test_seed_last_modified_falls_back_to_now_when_date_missing() {
-        let before = chrono::Utc::now().timestamp();
-        let ts = seed_last_modified(None, parse_lme_date);
-        let after = chrono::Utc::now().timestamp();
-        assert!(ts >= before && ts <= after);
+    fn test_seed_event_date_returns_none_when_date_missing() {
+        assert_eq!(seed_event_date(None, parse_lme_date), None);
     }
 
     #[test]
-    fn test_seed_last_modified_falls_back_when_parser_rejects() {
-        let before = chrono::Utc::now().timestamp();
-        let ts = seed_last_modified(Some("malformed"), parse_lme_date);
-        let after = chrono::Utc::now().timestamp();
-        assert!(ts >= before && ts <= after);
+    fn test_seed_event_date_returns_none_when_parser_rejects() {
+        // malformed string still yields None (with a logged warning) rather than
+        // silently turning into "today" — that was the bug seed_last_modified had.
+        assert_eq!(seed_event_date(Some("malformed"), parse_lme_date), None);
     }
 }

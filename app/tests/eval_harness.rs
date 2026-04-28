@@ -2634,6 +2634,154 @@ async fn probe_overlap_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// Retrieval-only diagnostic: no LLM calls, no API cost. Seeds conv-26, runs
+// search_memory for the 5 temporal questions, and dumps which hits came back
+// alongside whether the literal answer text exists in the seeded data and
+// where it ranks (or whether it ranks at all).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn temporal_retrieval_diag_locomo() {
+    use origin_core::events::NoopEmitter;
+    use origin_lib::memory_db::MemoryDB;
+    use origin_lib::sources::RawDocument;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    let samples = origin_lib::eval::locomo::load_locomo(&locomo_path).expect("load");
+    let sample = &samples[0];
+    let memories = origin_lib::eval::locomo::extract_observations(sample);
+    eprintln!("[diag] {} memories seeded", memories.len());
+
+    let probes = [
+        ("LGBTQ support group", "support group"),
+        ("painted a sunrise", "sunrise"),
+        ("charity race", "charity race"),
+        ("camping next month", "camping"),
+        ("speech at a school", "speech"),
+    ];
+    eprintln!("\n[diag] Substring check on raw extracted content:");
+    for (label, needle) in &probes {
+        let hits: Vec<&str> = memories
+            .iter()
+            .filter(|m| m.content.to_lowercase().contains(&needle.to_lowercase()))
+            .map(|m| m.content.as_str())
+            .collect();
+        eprintln!("  {:<22} ({} matches in extraction):", label, hits.len());
+        for h in hits.iter().take(3) {
+            eprintln!("    - {}", h.chars().take(120).collect::<String>());
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("db");
+    let docs: Vec<RawDocument> = memories
+        .iter()
+        .enumerate()
+        .map(|(i, mem)| RawDocument {
+            content: mem.content.clone(),
+            source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+            source: "memory".to_string(),
+            title: format!("{} session {}", mem.speaker, mem.session_num),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            last_modified: chrono::Utc::now().timestamp(),
+            event_date: origin_lib::eval::dates::seed_event_date(
+                mem.session_date.as_deref(),
+                origin_lib::eval::locomo::parse_locomo_date,
+            ),
+            ..Default::default()
+        })
+        .collect();
+    db.upsert_documents(docs).await.expect("upsert");
+
+    let queries = [
+        (
+            "Q1 LGBTQ support group",
+            "When did Caroline go to the LGBTQ support group?",
+            "support group",
+        ),
+        (
+            "Q2 painted sunrise",
+            "When did Melanie paint a sunrise?",
+            "sunrise",
+        ),
+        (
+            "Q3 charity race",
+            "When did Melanie run a charity race?",
+            "charity race",
+        ),
+        (
+            "Q4 camping plan",
+            "When is Melanie planning on going camping?",
+            "camping",
+        ),
+        (
+            "Q5 school speech",
+            "When did Caroline give a speech at a school?",
+            "speech",
+        ),
+    ];
+
+    for (label, q, needle) in &queries {
+        eprintln!("\n=== {} ===", label);
+        eprintln!("  query: {}", q);
+        let hits = db
+            .search_memory(q, 50, None, Some("conversation"), None, None, None, None)
+            .await
+            .expect("search");
+        eprintln!("  returned {} hits", hits.len());
+
+        let needle_l = needle.to_lowercase();
+        let target_rank = hits
+            .iter()
+            .position(|h| h.content.to_lowercase().contains(&needle_l));
+        match target_rank {
+            Some(r) => {
+                eprintln!("  ✓ first hit containing {:?}: rank {}", needle, r + 1);
+                eprintln!(
+                    "    {}",
+                    hits[r].content.chars().take(140).collect::<String>()
+                );
+            }
+            None => {
+                eprintln!("  ✗ NO hit in top-50 contains {:?}", needle);
+                let raw_hits: Vec<&origin_lib::eval::locomo::LocomoMemory> = memories
+                    .iter()
+                    .filter(|m| m.content.to_lowercase().contains(&needle_l))
+                    .collect();
+                if raw_hits.is_empty() {
+                    eprintln!("    + raw extraction also has 0 — extraction dropped it");
+                } else {
+                    eprintln!(
+                        "    + raw extraction has {} matches — search ranking missed them:",
+                        raw_hits.len()
+                    );
+                    for m in raw_hits.iter().take(3) {
+                        eprintln!(
+                            "      - {}",
+                            m.content.chars().take(140).collect::<String>()
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("  top 5 returned:");
+        for (i, h) in hits.iter().take(5).enumerate() {
+            eprintln!(
+                "    {}. [score={:.3}] {}",
+                i + 1,
+                h.score,
+                h.content.chars().take(110).collect::<String>()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Temporal smoke: A/B compare date-aware vs date-blind context on 5 LoCoMo
 // temporal questions. No enrichment (search_memory works on vectors+FTS alone),
 // so the run completes in ~2 min on Haiku CLI. Used to verify the temporal
@@ -2685,7 +2833,8 @@ async fn temporal_smoke_locomo_5q() {
             title: format!("{} session {}", mem.speaker, mem.session_num),
             memory_type: Some("fact".to_string()),
             domain: Some("conversation".to_string()),
-            last_modified: origin_lib::eval::dates::seed_last_modified(
+            last_modified: chrono::Utc::now().timestamp(),
+            event_date: origin_lib::eval::dates::seed_event_date(
                 mem.session_date.as_deref(),
                 origin_lib::eval::locomo::parse_locomo_date,
             ),
@@ -2753,7 +2902,7 @@ async fn temporal_smoke_locomo_5q() {
             .map(|r| {
                 format!(
                     "On {}: {}",
-                    origin_lib::eval::shared::format_ymd(r.last_modified),
+                    origin_lib::eval::shared::format_ymd(r.event_date.unwrap_or(r.last_modified)),
                     r.content
                 )
             })

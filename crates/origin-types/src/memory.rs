@@ -18,6 +18,12 @@ pub struct SearchResult {
     /// Equal to `last_modified` for benchmark/eval seeds; diverges in real use as memories get re-enriched.
     #[serde(default)]
     pub created_at: i64,
+    /// Unix timestamp of when the event the document describes actually happened.
+    /// Distinct from `last_modified` (ingestion time). `None` = unknown; display code should
+    /// fall back to `last_modified`. Does NOT influence search ranking — recency decay
+    /// continues to use `last_modified` so old-but-just-imported content isn't penalised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_date: Option<i64>,
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_type: Option<String>,

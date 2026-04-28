@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // Bring date helpers into scope for use within this module.
-use crate::eval::dates::seed_last_modified;
+use crate::eval::dates::seed_event_date;
 // Re-export so external callers using `crate::eval::longmemeval::parse_lme_date` still compile.
 pub use crate::eval::dates::parse_lme_date;
 
@@ -431,7 +431,8 @@ pub async fn run_longmemeval_eval(path: &Path) -> Result<LongMemEvalReport, Orig
                     title: format!("{} session {}", mem.role, mem.session_idx),
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
-                    last_modified: seed_last_modified(mem.session_date.as_deref(), parse_lme_date),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -542,7 +543,8 @@ pub async fn run_longmemeval_eval_reranked(
                     title: format!("{} session {}", mem.role, mem.session_idx),
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
-                    last_modified: seed_last_modified(mem.session_date.as_deref(), parse_lme_date),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -653,7 +655,8 @@ pub async fn run_longmemeval_eval_expanded(
                     title: format!("{} session {}", mem.role, mem.session_idx),
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
-                    last_modified: seed_last_modified(mem.session_date.as_deref(), parse_lme_date),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -878,7 +881,8 @@ pub async fn run_longmemeval_eval_with_gate(
                     title: format!("{} session {}", mem.role, mem.session_idx),
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
-                    last_modified: seed_last_modified(mem.session_date.as_deref(), parse_lme_date),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -1406,10 +1410,9 @@ mod tests {
             question_id: "q1".to_string(),
             session_date: Some("2023/04/10 (Mon) 23:07".to_string()),
         };
-        let last_modified = crate::eval::dates::seed_last_modified(
-            mem.session_date.as_deref(),
-            super::parse_lme_date,
-        );
+        let event_date =
+            crate::eval::dates::seed_event_date(mem.session_date.as_deref(), super::parse_lme_date);
+        let now_ts = chrono::Utc::now().timestamp();
 
         let tmp = tempfile::tempdir().unwrap();
         let db =
@@ -1421,7 +1424,8 @@ mod tests {
             source_id: "lme/q1/s1/0".to_string(),
             source: "memory".to_string(),
             title: "test".to_string(),
-            last_modified,
+            last_modified: now_ts,
+            event_date,
             memory_type: Some("fact".to_string()),
             domain: Some("conversation".to_string()),
             ..Default::default()
@@ -1443,7 +1447,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].last_modified, 1_681_168_020);
-        assert_eq!(results[0].created_at, 1_681_168_020);
+        assert_eq!(results[0].last_modified, now_ts);
+        assert_eq!(results[0].event_date, Some(1_681_168_020));
     }
 }

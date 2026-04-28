@@ -539,6 +539,7 @@ pub async fn handle_store_memory(
         content: req.content.clone(),
         url: None,
         last_modified: chrono::Utc::now().timestamp(),
+        event_date: None,
         metadata: HashMap::new(),
         memory_type: Some(memory_type_str.clone()),
         domain: final_domain.clone(),
