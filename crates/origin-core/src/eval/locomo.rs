@@ -21,7 +21,7 @@ use std::path::Path;
 // Bring date helpers into scope for use within this module.
 use crate::eval::dates::seed_last_modified;
 // Re-export so external callers using `crate::eval::locomo::parse_locomo_date` still compile.
-pub(crate) use crate::eval::dates::parse_locomo_date;
+pub use crate::eval::dates::parse_locomo_date;
 
 // ---------------------------------------------------------------------------
 // Data structures

@@ -11,7 +11,7 @@
 
 /// Parse a LoCoMo session date like "1:56 pm on 8 May, 2023" into Unix seconds.
 /// Returns `None` on parse failure (caller falls back to `now()`).
-pub(crate) fn parse_locomo_date(s: &str) -> Option<i64> {
+pub fn parse_locomo_date(s: &str) -> Option<i64> {
     use chrono::{NaiveDateTime, TimeZone, Utc};
     // The dataset uses "<h:mm am/pm> on <D Month, YYYY>". chrono's strftime
     // %p needs uppercase AM/PM; LoCoMo uses lowercase. Normalise first.
@@ -25,7 +25,7 @@ pub(crate) fn parse_locomo_date(s: &str) -> Option<i64> {
 /// Parse a LongMemEval `question_date` / `haystack_date` into Unix seconds.
 /// Format example: "2023/04/10 (Mon) 23:07". Returns `None` on parse failure
 /// (e.g. dataset variants with different formats -- caller falls back to `now()`).
-pub(crate) fn parse_lme_date(s: &str) -> Option<i64> {
+pub fn parse_lme_date(s: &str) -> Option<i64> {
     use chrono::{NaiveDateTime, TimeZone, Utc};
     // Strip the weekday tag in parens: "2023/04/10 (Mon) 23:07" -> "2023/04/10 23:07"
     let cleaned: String = s
@@ -55,7 +55,7 @@ pub fn format_ymd(ts: i64) -> String {
 ///
 /// Logs a warning when a non-empty date string fails to parse, so silent
 /// degradation to today's date is visible in eval logs.
-pub(crate) fn seed_last_modified(date: Option<&str>, parser: fn(&str) -> Option<i64>) -> i64 {
+pub fn seed_last_modified(date: Option<&str>, parser: fn(&str) -> Option<i64>) -> i64 {
     if let Some(s) = date {
         if let Some(ts) = parser(s) {
             return ts;

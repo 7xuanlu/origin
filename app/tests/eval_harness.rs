@@ -2632,3 +2632,262 @@ async fn probe_overlap_gate() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Temporal smoke: A/B compare date-aware vs date-blind context on 5 LoCoMo
+// temporal questions. No enrichment (search_memory works on vectors+FTS alone),
+// so the run completes in ~2 min on Haiku CLI. Used to verify the temporal
+// mechanisms before committing to the full 20- or 50-question eval.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn temporal_smoke_locomo_5q() {
+    use origin_core::events::NoopEmitter;
+    use origin_lib::llm_provider::{ClaudeCliProvider, LlmProvider, LlmRequest};
+    use origin_lib::memory_db::MemoryDB;
+    use origin_lib::sources::RawDocument;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = origin_lib::eval::locomo::load_locomo(&locomo_path).expect("load locomo");
+    let sample = &samples[0];
+    let memories = origin_lib::eval::locomo::extract_observations(sample);
+    eprintln!(
+        "[smoke] conv {} — {} observations across {} sessions",
+        sample.sample_id,
+        memories.len(),
+        memories
+            .iter()
+            .map(|m| m.session_num)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    );
+
+    // Seed with REAL session dates — date prefix and date-blind paths read the
+    // same DB; they differ only in how they render and prompt.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = MemoryDB::new(tmp.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("db");
+    let docs: Vec<RawDocument> = memories
+        .iter()
+        .enumerate()
+        .map(|(i, mem)| RawDocument {
+            content: mem.content.clone(),
+            source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
+            source: "memory".to_string(),
+            title: format!("{} session {}", mem.speaker, mem.session_num),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            last_modified: origin_lib::eval::dates::seed_last_modified(
+                mem.session_date.as_deref(),
+                origin_lib::eval::locomo::parse_locomo_date,
+            ),
+            ..Default::default()
+        })
+        .collect();
+    db.upsert_documents(docs).await.expect("upsert");
+
+    // Latest parseable session date = LoCoMo "asked on".
+    let asked_on: Option<String> = memories
+        .iter()
+        .filter_map(|m| m.session_date.clone())
+        .filter(|d| origin_lib::eval::locomo::parse_locomo_date(d).is_some())
+        .max_by_key(|d| origin_lib::eval::locomo::parse_locomo_date(d).unwrap_or(0));
+    eprintln!("[smoke] asked_on (latest session): {:?}", asked_on);
+
+    // First 5 temporal questions (category 2).
+    let temporal_qs: Vec<&origin_lib::eval::locomo::LocomoQA> = sample
+        .qa
+        .iter()
+        .filter(|qa| qa.category == 2)
+        .take(5)
+        .collect();
+
+    let llm: Arc<dyn LlmProvider> = Arc::new(ClaudeCliProvider::haiku());
+
+    let mut results: Vec<(String, String, String, String)> = Vec::new(); // q, gt, A, B
+    for (i, qa) in temporal_qs.iter().enumerate() {
+        let gt = qa
+            .answer
+            .as_ref()
+            .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+            .unwrap_or_default();
+        if gt.is_empty() {
+            continue;
+        }
+        eprintln!("\n[smoke] Q{}: {}", i + 1, qa.question);
+        eprintln!("        GT: {}", gt);
+
+        let hits = db
+            .search_memory(
+                &qa.question,
+                30,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("search");
+        // Diagnostic: is the relevant content in top-30?
+        eprintln!("        retrieved {} hits; first 3 contents:", hits.len());
+        for r in hits.iter().take(3) {
+            eprintln!(
+                "          - {}",
+                r.content.chars().take(90).collect::<String>()
+            );
+        }
+
+        // A: date-aware context + date-anchored system prompt
+        let ctx_a: String = hits
+            .iter()
+            .map(|r| {
+                format!(
+                    "On {}: {}",
+                    origin_lib::eval::shared::format_ymd(r.last_modified),
+                    r.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sys_a = match asked_on.as_deref() {
+            Some(d) => format!(
+                "The question was asked on {}. Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.",
+                d
+            ),
+            None => "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.".to_string(),
+        };
+        let answer_a = llm
+            .generate(LlmRequest {
+                system_prompt: Some(sys_a),
+                user_prompt: format!("Context:\n{}\n\nQuestion: {}", ctx_a, qa.question),
+                max_tokens: 200,
+                temperature: 0.1,
+                label: Some("smoke_A".to_string()),
+            })
+            .await
+            .unwrap_or_else(|e| format!("ERR: {e}"));
+        eprintln!("        A (with dates):    {}", answer_a.trim());
+
+        // B: date-blind context + plain system prompt
+        let ctx_b: String = hits
+            .iter()
+            .map(|r| r.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sys_b = "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.".to_string();
+        let answer_b = llm
+            .generate(LlmRequest {
+                system_prompt: Some(sys_b),
+                user_prompt: format!("Context:\n{}\n\nQuestion: {}", ctx_b, qa.question),
+                max_tokens: 200,
+                temperature: 0.1,
+                label: Some("smoke_B".to_string()),
+            })
+            .await
+            .unwrap_or_else(|e| format!("ERR: {e}"));
+        eprintln!("        B (no dates):      {}", answer_b.trim());
+
+        results.push((qa.question.clone(), gt, answer_a, answer_b));
+    }
+
+    // Substring-match scoring: extract the date/year from ground truth and look for it.
+    fn score(answer: &str, gt: &str) -> bool {
+        let needle: String = gt.to_lowercase();
+        let hay: String = answer.to_lowercase();
+        // Match on "may", "2023", "may 2023", "7 may", etc — any non-empty token from GT
+        // that's a year (4 digits) or a month name should appear in the answer.
+        let months = [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+            "jan",
+            "feb",
+            "mar",
+            "apr",
+            "jun",
+            "jul",
+            "aug",
+            "sep",
+            "oct",
+            "nov",
+            "dec",
+        ];
+        let years: Vec<&str> = needle
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| s.len() == 4 && s.starts_with("20"))
+            .collect();
+        let needs_year = !years.is_empty();
+        let needs_month = months.iter().any(|m| needle.contains(m));
+        let year_ok = years.iter().any(|y| hay.contains(y));
+        let month_ok = months.iter().any(|m| needle.contains(m) && hay.contains(m));
+        let approx_match = needle
+            .split_whitespace()
+            .any(|w| w.len() > 3 && hay.contains(w));
+        match (needs_year, needs_month) {
+            (true, true) => year_ok && month_ok,
+            (true, false) => year_ok,
+            (false, true) => month_ok,
+            (false, false) => approx_match,
+        }
+    }
+
+    let mut a_correct = 0;
+    let mut b_correct = 0;
+    eprintln!("\n========================================");
+    eprintln!("Smoke result: A=date-aware, B=date-blind");
+    eprintln!("========================================");
+    for (i, (q, gt, a, b)) in results.iter().enumerate() {
+        let a_ok = score(a, gt);
+        let b_ok = score(b, gt);
+        if a_ok {
+            a_correct += 1;
+        }
+        if b_ok {
+            b_correct += 1;
+        }
+        eprintln!(
+            "Q{}: A={} B={} — gt: {:?}",
+            i + 1,
+            if a_ok { "✓" } else { "✗" },
+            if b_ok { "✓" } else { "✗" },
+            gt.chars().take(40).collect::<String>(),
+        );
+        eprintln!("  Q: {}", q.chars().take(80).collect::<String>());
+    }
+    let n = results.len().max(1);
+    eprintln!(
+        "\nA (date-aware): {}/{} = {:.0}%",
+        a_correct,
+        n,
+        100.0 * a_correct as f64 / n as f64
+    );
+    eprintln!(
+        "B (date-blind): {}/{} = {:.0}%",
+        b_correct,
+        n,
+        100.0 * b_correct as f64 / n as f64
+    );
+    eprintln!(
+        "Lift: {} pp",
+        (a_correct as i64 - b_correct as i64) * 100 / n as i64
+    );
+}
