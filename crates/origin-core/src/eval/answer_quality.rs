@@ -712,18 +712,7 @@ async fn generate_e2e_answers_for_question(
 ) -> Result<Vec<JudgmentTuple>, OriginError> {
     use crate::llm_provider::{strip_think_tags, LlmRequest};
 
-    // If we have a question_date (LongMemEval), prepend it to the system prompt
-    // so the LLM has a "today" anchor for relative time references in the question.
-    let system_prompt = match question_date {
-        Some(d) => format!(
-            "The question was asked on {}. Answer the question using only the provided context. \
-             Be specific and concise. Respond in 1-3 sentences.",
-            d
-        ),
-        None => "Answer the question using only the provided context. \
-            Be specific and concise. Respond in 1-3 sentences."
-            .to_string(),
-    };
+    let system_prompt = build_e2e_system_prompt(question_date);
 
     let mut tuples = Vec::new();
 
@@ -1109,9 +1098,22 @@ struct PendingAnswer {
     context_tokens: usize,
 }
 
-/// System prompt used for all E2E answer generation.
+/// System prompt used for all E2E answer generation (no date anchor).
 const E2E_SYSTEM_PROMPT: &str =
     "Answer the question using only the provided context. Be specific and concise. Respond in 1-3 sentences.";
+
+/// Build the E2E system prompt, prepending the question's "asked on" date when available
+/// so the LLM has a temporal anchor for relative-time references in the question.
+fn build_e2e_system_prompt(question_date: Option<&str>) -> String {
+    match question_date {
+        Some(d) => format!(
+            "The question was asked on {}. Answer the question using only the provided context. \
+             Be specific and concise. Respond in 1-3 sentences.",
+            d
+        ),
+        None => E2E_SYSTEM_PROMPT.to_string(),
+    }
+}
 
 /// Build structured context for a question against an enriched DB.
 ///
@@ -1273,7 +1275,10 @@ pub async fn run_fullpipeline_locomo_batch(
                     title: format!("{} session {}", mem.speaker, mem.session_num),
                     memory_type: Some("fact".to_string()),
                     domain: Some("conversation".to_string()),
-                    last_modified: chrono::Utc::now().timestamp(),
+                    last_modified: crate::eval::dates::seed_last_modified(
+                        mem.session_date.as_deref(),
+                        crate::eval::locomo::parse_locomo_date,
+                    ),
                     ..Default::default()
                 })
                 .collect();
@@ -1323,6 +1328,14 @@ pub async fn run_fullpipeline_locomo_batch(
     for sample in &samples {
         let mut q_count = 0usize;
 
+        // Question "asked on" = latest session date in this sample (questions follow the conversation).
+        // Skipped when no session_date can be parsed; falls back to the date-blind prompt.
+        let sample_question_date: Option<String> = extract_observations(sample)
+            .iter()
+            .filter_map(|m| m.session_date.clone())
+            .filter(|d| crate::eval::locomo::parse_locomo_date(d).is_some())
+            .max_by_key(|d| crate::eval::locomo::parse_locomo_date(d).unwrap_or(0));
+
         for qa in &sample.qa {
             if qa.category == 5 {
                 continue;
@@ -1347,7 +1360,7 @@ pub async fn run_fullpipeline_locomo_batch(
             batch_requests.push((
                 req_id.clone(),
                 format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
-                Some(E2E_SYSTEM_PROMPT.to_string()),
+                Some(build_e2e_system_prompt(sample_question_date.as_deref())),
                 200,
             ));
             pending.insert(
@@ -1517,7 +1530,10 @@ pub async fn run_fullpipeline_lme_batch(
                         .to_string(),
                     ),
                     domain: Some("conversation".to_string()),
-                    last_modified: chrono::Utc::now().timestamp(),
+                    last_modified: crate::eval::dates::seed_last_modified(
+                        mem.session_date.as_deref(),
+                        crate::eval::longmemeval::parse_lme_date,
+                    ),
                     ..Default::default()
                 })
                 .collect();
@@ -1581,7 +1597,7 @@ pub async fn run_fullpipeline_lme_batch(
         batch_requests.push((
             req_id.clone(),
             format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
-            Some(E2E_SYSTEM_PROMPT.to_string()),
+            Some(build_e2e_system_prompt(Some(&sample.question_date))),
             200,
         ));
         pending.insert(

@@ -52,9 +52,19 @@ pub fn format_ymd(ts: i64) -> String {
 /// Resolve `last_modified` for a benchmark-seeded chunk: parse the per-session
 /// date string with `parser` if present, else fall back to `now()` (used for
 /// noise / undated entries).
+///
+/// Logs a warning when a non-empty date string fails to parse, so silent
+/// degradation to today's date is visible in eval logs.
 pub(crate) fn seed_last_modified(date: Option<&str>, parser: fn(&str) -> Option<i64>) -> i64 {
-    date.and_then(parser)
-        .unwrap_or_else(|| chrono::Utc::now().timestamp())
+    if let Some(s) = date {
+        if let Some(ts) = parser(s) {
+            return ts;
+        }
+        log::warn!(
+            "[eval:dates] failed to parse date {s:?}; falling back to now() — temporal accuracy lost"
+        );
+    }
+    chrono::Utc::now().timestamp()
 }
 
 #[cfg(test)]
