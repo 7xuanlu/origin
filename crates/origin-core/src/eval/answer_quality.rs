@@ -1093,10 +1093,19 @@ async fn build_structured_context(
         .await?;
 
     // Structured: concepts + search results (matches production /api/chat-context).
-    // No token cap or relevance threshold — production includes top-3 unconditionally.
     let mut parts: Vec<String> = Vec::new();
     let concepts = db.search_concepts(question, 3).await.unwrap_or_default();
     if !concepts.is_empty() {
+        for c in &concepts {
+            let ctokens = count_tokens(&c.content);
+            log::info!(
+                "[eval:concept] score={:.4} tokens={} title={:?} q={:?}",
+                c.relevance_score,
+                ctokens,
+                c.title.chars().take(40).collect::<String>(),
+                question.chars().take(50).collect::<String>(),
+            );
+        }
         parts.push("## Compiled Knowledge".to_string());
         for c in &concepts {
             let summary = c.summary.as_deref().unwrap_or("");

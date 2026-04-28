@@ -14155,7 +14155,13 @@ impl MemoryDB {
             concept_map.entry(id).or_insert(concept);
         }
 
-        // Sort by combined RRF score, return top limit
+        // Normalize scores to 0.0-1.0 (same approach as search_memory)
+        let theoretical_max_rrf = (1.0 + fts_weight) / rrf_k;
+        for score in score_map.values_mut() {
+            *score = (*score / theoretical_max_rrf).min(1.0);
+        }
+
+        // Sort by combined RRF score, attach to concepts, return top limit
         let mut final_results: Vec<Concept> = concept_map.into_values().collect();
         final_results.sort_by(|a, b| {
             let sa = score_map.get(&a.id).unwrap_or(&0.0);
@@ -14163,6 +14169,10 @@ impl MemoryDB {
             sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
         });
         final_results.truncate(limit);
+        // Attach normalized scores so callers can threshold-filter
+        for c in &mut final_results {
+            c.relevance_score = *score_map.get(&c.id).unwrap_or(&0.0);
+        }
         Ok(final_results)
     }
 
@@ -14263,6 +14273,7 @@ impl MemoryDB {
             sources_updated_count: row.get::<i64>(12).unwrap_or(0),
             stale_reason: row.get::<Option<String>>(13).unwrap_or(None),
             user_edited: row.get::<i64>(14).unwrap_or(0) != 0,
+            relevance_score: 0.0, // populated by search_concepts after RRF fusion
         })
     }
 

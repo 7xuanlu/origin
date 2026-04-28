@@ -129,6 +129,7 @@ mod tests {
             sources_updated_count: 0,
             stale_reason: None,
             user_edited: false,
+            relevance_score: 0.0,
         }
     }
 

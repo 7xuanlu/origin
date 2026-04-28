@@ -25,6 +25,14 @@ pub struct Concept {
     pub stale_reason: Option<String>,
     /// True if a human has edited this concept's content directly.
     pub user_edited: bool,
+    /// Relevance score from search (0.0-1.0). Only populated by `search_concepts`;
+    /// zero for persisted/non-search contexts.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub relevance_score: f32,
+}
+
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.0
 }
 
 impl Concept {
