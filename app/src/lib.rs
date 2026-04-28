@@ -16,6 +16,7 @@ mod sensor;
 pub mod sources;
 pub mod state;
 mod trigger;
+mod updater;
 
 // ── Re-export origin-core modules ──
 // These re-exports let existing `crate::module::Type` paths work unchanged
@@ -123,6 +124,7 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_x::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -794,6 +796,12 @@ pub fn run() {
                     });
                 }
             }
+
+            // Check for updates on startup; prompt user if one is available
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                crate::updater::check_and_prompt(handle).await;
+            });
 
             Ok(())
         })

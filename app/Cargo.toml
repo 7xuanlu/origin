@@ -23,6 +23,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-clipboard-x = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
+tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 
