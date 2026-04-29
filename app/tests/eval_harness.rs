@@ -3442,14 +3442,15 @@ async fn probe_overlap_gate() {
 /// measures wall-clock and per-call latency, and reports throughput. Useful
 /// for verifying that the persistent LlamaContext optimization (build the
 /// context once, clear KV cache between calls) actually pays off vs the old
-/// per-call `new_context()` path.
+/// per-call `new_context()` path, and for measuring the impact of the
+/// multi-worker pool (S1, `ORIGIN_LLM_WORKERS`) and continuous batching
+/// (S2, `ORIGIN_LLM_PARALLEL_SEQS`).
 ///
-/// On the current architecture (single std::thread worker), all calls are
-/// serialized through one inference loop, so wall-clock should scale roughly
-/// linearly with N. The point of this test is to confirm:
-///   1. The system doesn't break under concurrent load (no panics/timeouts).
-///   2. Per-call latency is stable (not climbing with N due to context churn).
-///   3. We have a baseline number to compare against future continuous-batch work.
+/// Three useful invocations to compare:
+///   ORIGIN_LLM_WORKERS=1 ORIGIN_LLM_PARALLEL_SEQS=1   # baseline (single seq, single ctx)
+///   ORIGIN_LLM_WORKERS=4 ORIGIN_LLM_PARALLEL_SEQS=1   # S1: 4 contexts, 1 seq each
+///   ORIGIN_LLM_WORKERS=1 ORIGIN_LLM_PARALLEL_SEQS=4   # S2: 1 context, 4 parallel seqs
+///   ORIGIN_LLM_WORKERS=2 ORIGIN_LLM_PARALLEL_SEQS=2   # composed: 2 ctx x 2 seq = 4 concurrent
 ///
 /// Requires Metal GPU + a downloaded Qwen3-4B model. Marked `#[ignore]` so it
 /// doesn't run in CI. Invoke with:
