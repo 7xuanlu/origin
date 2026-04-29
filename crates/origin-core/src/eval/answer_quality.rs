@@ -1195,97 +1195,239 @@ pub async fn run_fullpipeline_locomo_batch(
         .parent()
         .ok_or_else(|| OriginError::Generic("output_path has no parent".to_string()))?;
 
+    let scenario_concurrency: usize = std::env::var("EVAL_SCENARIO_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .min(8);
+    eprintln!("[fullpipeline] scenario concurrency = {scenario_concurrency}");
+
     let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
     let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
 
-    for sample in &samples {
-        let memories = extract_observations(sample);
-        if memories.is_empty() {
-            continue;
-        }
+    // Each scenario yields a Vec of (req_id, prompt, system, max_tokens, PendingAnswer).
+    type ScenarioOutput = Vec<(String, String, Option<String>, usize, String, PendingAnswer)>;
 
-        let scope_dir =
-            crate::eval::shared::scenario_db_dir(baselines_dir, "locomo", &sample.sample_id);
-
-        let sample_id = sample.sample_id.clone();
-        let memories_owned = memories.clone();
-        let db = crate::eval::shared::open_or_seed_scenario_db(
-            &scope_dir,
-            shared_embedder.clone(),
-            move || {
-                memories_owned
-                    .iter()
-                    .enumerate()
-                    .map(|(i, mem)| RawDocument {
-                        content: mem.content.clone(),
-                        source_id: format!("locomo_{}_obs_{}", sample_id, i),
-                        source: "memory".to_string(),
-                        title: format!("{} session {}", mem.speaker, mem.session_num),
-                        memory_type: Some("fact".to_string()),
-                        domain: Some("conversation".to_string()),
-                        last_modified: chrono::Utc::now().timestamp(),
-                        ..Default::default()
-                    })
-                    .collect()
-            },
-            &enrichment,
-        )
-        .await?;
-
-        let db_mem_count = db.memory_count().await.unwrap_or(0);
-        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
-        eprintln!(
-            "[fullpipeline] Conv {}: {} obs, {}/{} enriched",
-            sample.sample_id,
-            memories.len(),
-            db_enriched,
-            db_mem_count,
-        );
-
-        let mut q_count = 0usize;
-
-        for qa in &sample.qa {
-            if qa.category == 5 {
-                continue;
-            }
-            if done_questions.contains(&qa.question) {
+    if scenario_concurrency <= 1 {
+        // Serial path — preserves existing behavior exactly.
+        for sample in &samples {
+            let memories = extract_observations(sample);
+            if memories.is_empty() {
                 continue;
             }
 
-            let ground_truth = qa
-                .answer
-                .as_ref()
-                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
-                .unwrap_or_default();
-            if ground_truth.is_empty() {
-                continue;
-            }
+            let scope_dir =
+                crate::eval::shared::scenario_db_dir(baselines_dir, "locomo", &sample.sample_id);
 
-            let category = category_name(qa.category);
-            let (ctx, ctx_tokens) = build_structured_context(&db, &qa.question, 10, None).await?;
-
-            let req_id = format!("q_{}_{}", sample.sample_id, q_count);
-            batch_requests.push((
-                req_id.clone(),
-                format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
-                Some(E2E_SYSTEM_PROMPT.to_string()),
-                200,
-            ));
-            pending.insert(
-                req_id,
-                PendingAnswer {
-                    question: qa.question.clone(),
-                    ground_truth,
-                    approach: format!("structured_{}", category),
-                    category: category.to_string(),
-                    context_tokens: ctx_tokens,
+            let sample_id = sample.sample_id.clone();
+            let memories_owned = memories.clone();
+            let db = crate::eval::shared::open_or_seed_scenario_db(
+                &scope_dir,
+                shared_embedder.clone(),
+                move || {
+                    memories_owned
+                        .iter()
+                        .enumerate()
+                        .map(|(i, mem)| RawDocument {
+                            content: mem.content.clone(),
+                            source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                            source: "memory".to_string(),
+                            title: format!("{} session {}", mem.speaker, mem.session_num),
+                            memory_type: Some("fact".to_string()),
+                            domain: Some("conversation".to_string()),
+                            last_modified: chrono::Utc::now().timestamp(),
+                            ..Default::default()
+                        })
+                        .collect()
                 },
+                &enrichment,
+            )
+            .await?;
+
+            let db_mem_count = db.memory_count().await.unwrap_or(0);
+            let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+            eprintln!(
+                "[fullpipeline] Conv {}: {} obs, {}/{} enriched",
+                sample.sample_id,
+                memories.len(),
+                db_enriched,
+                db_mem_count,
             );
 
-            q_count += 1;
+            let mut q_count = 0usize;
+
+            for qa in &sample.qa {
+                if qa.category == 5 {
+                    continue;
+                }
+                if done_questions.contains(&qa.question) {
+                    continue;
+                }
+
+                let ground_truth = qa
+                    .answer
+                    .as_ref()
+                    .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                    .unwrap_or_default();
+                if ground_truth.is_empty() {
+                    continue;
+                }
+
+                let category = category_name(qa.category);
+                let (ctx, ctx_tokens) =
+                    build_structured_context(&db, &qa.question, 10, None).await?;
+
+                let req_id = format!("q_{}_{}", sample.sample_id, q_count);
+                batch_requests.push((
+                    req_id.clone(),
+                    format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
+                    Some(E2E_SYSTEM_PROMPT.to_string()),
+                    200,
+                ));
+                pending.insert(
+                    req_id,
+                    PendingAnswer {
+                        question: qa.question.clone(),
+                        ground_truth,
+                        approach: format!("structured_{}", category),
+                        category: category.to_string(),
+                        context_tokens: ctx_tokens,
+                    },
+                );
+
+                q_count += 1;
+            }
+            if q_count > 0 {
+                eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+            }
         }
-        if q_count > 0 {
-            eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+    } else {
+        // Concurrent path — overlaps CPU/DB/IO across scenarios.
+        // Phase 3 (batch API) stays serial after this block.
+        use futures::StreamExt;
+
+        let enrichment_arc = Arc::new(enrichment);
+        let done_arc = Arc::new(done_questions.clone());
+        let baselines_dir_owned = baselines_dir.to_path_buf();
+        // Wrap samples in Arc so each future can index without cloning the whole vec.
+        let samples_arc = Arc::new(samples);
+
+        let scenario_outputs: Vec<Result<ScenarioOutput, OriginError>> =
+            futures::stream::iter(0..samples_arc.len())
+                .map(|s_idx| {
+                    let shared_embedder = shared_embedder.clone();
+                    let enrichment_arc = enrichment_arc.clone();
+                    let done_arc = done_arc.clone();
+                    let baselines_dir_owned = baselines_dir_owned.clone();
+                    let samples_arc = samples_arc.clone();
+                    async move {
+                        let sample = &samples_arc[s_idx];
+                        let memories = extract_observations(sample);
+                        if memories.is_empty() {
+                            return Ok(Vec::new());
+                        }
+
+                        let scope_dir = crate::eval::shared::scenario_db_dir(
+                            &baselines_dir_owned,
+                            "locomo",
+                            &sample.sample_id,
+                        );
+
+                        let sample_id = sample.sample_id.clone();
+                        let memories_owned = memories.clone();
+                        let db = crate::eval::shared::open_or_seed_scenario_db(
+                            &scope_dir,
+                            shared_embedder,
+                            move || {
+                                memories_owned
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, mem)| RawDocument {
+                                        content: mem.content.clone(),
+                                        source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                                        source: "memory".to_string(),
+                                        title: format!(
+                                            "{} session {}",
+                                            mem.speaker, mem.session_num
+                                        ),
+                                        memory_type: Some("fact".to_string()),
+                                        domain: Some("conversation".to_string()),
+                                        last_modified: chrono::Utc::now().timestamp(),
+                                        ..Default::default()
+                                    })
+                                    .collect()
+                            },
+                            &enrichment_arc,
+                        )
+                        .await?;
+
+                        let db_mem_count = db.memory_count().await.unwrap_or(0);
+                        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+                        eprintln!(
+                            "[fullpipeline] Conv {}: {} obs, {}/{} enriched",
+                            sample.sample_id,
+                            memories.len(),
+                            db_enriched,
+                            db_mem_count,
+                        );
+
+                        let mut entries: ScenarioOutput = Vec::new();
+                        let mut q_count = 0usize;
+
+                        for qa in &sample.qa {
+                            if qa.category == 5 {
+                                continue;
+                            }
+                            if done_arc.contains(&qa.question) {
+                                continue;
+                            }
+
+                            let ground_truth = qa
+                                .answer
+                                .as_ref()
+                                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                                .unwrap_or_default();
+                            if ground_truth.is_empty() {
+                                continue;
+                            }
+
+                            let category = category_name(qa.category);
+                            let (ctx, ctx_tokens) =
+                                build_structured_context(&db, &qa.question, 10, None).await?;
+
+                            let req_id = format!("q_{}_{}", sample.sample_id, q_count);
+                            entries.push((
+                                req_id,
+                                format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
+                                Some(E2E_SYSTEM_PROMPT.to_string()),
+                                200,
+                                sample.sample_id.clone(),
+                                PendingAnswer {
+                                    question: qa.question.clone(),
+                                    ground_truth,
+                                    approach: format!("structured_{}", category),
+                                    category: category.to_string(),
+                                    context_tokens: ctx_tokens,
+                                },
+                            ));
+                            q_count += 1;
+                        }
+                        if q_count > 0 {
+                            eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+                        }
+                        Ok(entries)
+                    }
+                })
+                .buffer_unordered(scenario_concurrency)
+                .collect()
+                .await;
+
+        for result in scenario_outputs {
+            let entries = result?;
+            for (req_id, prompt, system, max_tok, _sid, meta) in entries {
+                batch_requests.push((req_id.clone(), prompt, system, max_tok));
+                pending.insert(req_id, meta);
+            }
         }
     }
 
@@ -1400,103 +1542,245 @@ pub async fn run_fullpipeline_lme_batch(
         .parent()
         .ok_or_else(|| OriginError::Generic("output_path has no parent".to_string()))?;
 
+    let scenario_concurrency: usize = std::env::var("EVAL_SCENARIO_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .min(8);
+    eprintln!("[fullpipeline_lme] scenario concurrency = {scenario_concurrency}");
+
     let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
     let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
 
-    for (q_idx, sample) in samples.iter().enumerate() {
-        if done_questions.contains(&sample.question) {
-            continue;
-        }
+    // Each scenario yields a Vec of (req_id, prompt, system, max_tokens, PendingAnswer).
+    type LmeScenarioOutput = Vec<(String, String, Option<String>, usize, PendingAnswer)>;
 
-        let ground_truth = sample
-            .answer
-            .as_str()
-            .unwrap_or(&sample.answer.to_string())
-            .to_string();
-        if ground_truth.is_empty() {
-            continue;
-        }
+    if scenario_concurrency <= 1 {
+        // Serial path — preserves existing behavior exactly.
+        for (q_idx, sample) in samples.iter().enumerate() {
+            if done_questions.contains(&sample.question) {
+                continue;
+            }
 
-        let memories = extract_memories(sample);
-        if memories.is_empty() {
-            continue;
-        }
+            let ground_truth = sample
+                .answer
+                .as_str()
+                .unwrap_or(&sample.answer.to_string())
+                .to_string();
+            if ground_truth.is_empty() {
+                continue;
+            }
 
-        let scope_dir =
-            crate::eval::shared::scenario_db_dir(baselines_dir, "lme", &sample.question_id);
+            let memories = extract_memories(sample);
+            if memories.is_empty() {
+                continue;
+            }
 
-        let question_id = sample.question_id.clone();
-        let question_type = sample.question_type.clone();
-        let memories_owned = memories.clone();
-        let db = crate::eval::shared::open_or_seed_scenario_db(
-            &scope_dir,
-            shared_embedder.clone(),
-            move || {
-                memories_owned
-                    .iter()
-                    .map(|mem| RawDocument {
-                        content: mem.content.clone(),
-                        source_id: format!(
-                            "lme_{}_{}_t{}",
-                            question_id, mem.session_idx, mem.turn_idx
-                        ),
-                        source: "memory".to_string(),
-                        title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
-                        memory_type: Some(
-                            if question_type == "single-session-preference" {
-                                "preference"
-                            } else {
-                                "fact"
-                            }
-                            .to_string(),
-                        ),
-                        domain: Some("conversation".to_string()),
-                        last_modified: chrono::Utc::now().timestamp(),
-                        ..Default::default()
-                    })
-                    .collect()
-            },
-            &enrichment,
-        )
-        .await?;
+            let scope_dir =
+                crate::eval::shared::scenario_db_dir(baselines_dir, "lme", &sample.question_id);
 
-        let db_mem_count = db.memory_count().await.unwrap_or(0);
-        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
-        eprintln!(
-            "[fullpipeline_lme] Q {}: {} memories, {}/{} enriched",
-            sample.question_id,
-            memories.len(),
-            db_enriched,
-            db_mem_count,
-        );
+            let question_id = sample.question_id.clone();
+            let question_type = sample.question_type.clone();
+            let memories_owned = memories.clone();
+            let db = crate::eval::shared::open_or_seed_scenario_db(
+                &scope_dir,
+                shared_embedder.clone(),
+                move || {
+                    memories_owned
+                        .iter()
+                        .map(|mem| RawDocument {
+                            content: mem.content.clone(),
+                            source_id: format!(
+                                "lme_{}_{}_t{}",
+                                question_id, mem.session_idx, mem.turn_idx
+                            ),
+                            source: "memory".to_string(),
+                            title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                            memory_type: Some(
+                                if question_type == "single-session-preference" {
+                                    "preference"
+                                } else {
+                                    "fact"
+                                }
+                                .to_string(),
+                            ),
+                            domain: Some("conversation".to_string()),
+                            last_modified: chrono::Utc::now().timestamp(),
+                            ..Default::default()
+                        })
+                        .collect()
+                },
+                &enrichment,
+            )
+            .await?;
 
-        let category = category_name(&sample.question_type);
-        let (ctx, ctx_tokens) = build_structured_context(&db, &sample.question, 10, None).await?;
-
-        let req_id = format!("q_lme_{}", q_idx);
-        batch_requests.push((
-            req_id.clone(),
-            format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
-            Some(E2E_SYSTEM_PROMPT.to_string()),
-            200,
-        ));
-        pending.insert(
-            req_id,
-            PendingAnswer {
-                question: sample.question.clone(),
-                ground_truth,
-                approach: format!("structured_{}", category),
-                category: category.to_string(),
-                context_tokens: ctx_tokens,
-            },
-        );
-
-        if q_idx % 100 == 99 {
+            let db_mem_count = db.memory_count().await.unwrap_or(0);
+            let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
             eprintln!(
-                "  [contexts] {}/{} questions collected",
-                q_idx + 1,
-                samples.len()
+                "[fullpipeline_lme] Q {}: {} memories, {}/{} enriched",
+                sample.question_id,
+                memories.len(),
+                db_enriched,
+                db_mem_count,
             );
+
+            let category = category_name(&sample.question_type);
+            let (ctx, ctx_tokens) =
+                build_structured_context(&db, &sample.question, 10, None).await?;
+
+            let req_id = format!("q_lme_{}", q_idx);
+            batch_requests.push((
+                req_id.clone(),
+                format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
+                Some(E2E_SYSTEM_PROMPT.to_string()),
+                200,
+            ));
+            pending.insert(
+                req_id,
+                PendingAnswer {
+                    question: sample.question.clone(),
+                    ground_truth,
+                    approach: format!("structured_{}", category),
+                    category: category.to_string(),
+                    context_tokens: ctx_tokens,
+                },
+            );
+
+            if q_idx % 100 == 99 {
+                eprintln!(
+                    "  [contexts] {}/{} questions collected",
+                    q_idx + 1,
+                    samples.len()
+                );
+            }
+        }
+    } else {
+        // Concurrent path — overlaps CPU/DB/IO across scenarios.
+        // Phase 3 (batch API) stays serial after this block.
+        use futures::StreamExt;
+
+        let enrichment_arc = Arc::new(enrichment);
+        let done_arc = Arc::new(done_questions.clone());
+        let baselines_dir_owned = baselines_dir.to_path_buf();
+        let total = samples.len();
+        // Wrap samples in Arc so each future can index without cloning the whole vec.
+        let samples_arc = Arc::new(samples);
+
+        let scenario_outputs: Vec<Result<LmeScenarioOutput, OriginError>> =
+            futures::stream::iter(0..total)
+                .map(|q_idx| {
+                    let shared_embedder = shared_embedder.clone();
+                    let enrichment_arc = enrichment_arc.clone();
+                    let done_arc = done_arc.clone();
+                    let baselines_dir_owned = baselines_dir_owned.clone();
+                    let samples_arc = samples_arc.clone();
+                    async move {
+                        let sample = &samples_arc[q_idx];
+                        if done_arc.contains(&sample.question) {
+                            return Ok(Vec::new());
+                        }
+
+                        let ground_truth = sample
+                            .answer
+                            .as_str()
+                            .unwrap_or(&sample.answer.to_string())
+                            .to_string();
+                        if ground_truth.is_empty() {
+                            return Ok(Vec::new());
+                        }
+
+                        let memories = extract_memories(sample);
+                        if memories.is_empty() {
+                            return Ok(Vec::new());
+                        }
+
+                        let scope_dir = crate::eval::shared::scenario_db_dir(
+                            &baselines_dir_owned,
+                            "lme",
+                            &sample.question_id,
+                        );
+
+                        let question_id = sample.question_id.clone();
+                        let question_type = sample.question_type.clone();
+                        let memories_owned = memories.clone();
+                        let db = crate::eval::shared::open_or_seed_scenario_db(
+                            &scope_dir,
+                            shared_embedder,
+                            move || {
+                                memories_owned
+                                    .iter()
+                                    .map(|mem| RawDocument {
+                                        content: mem.content.clone(),
+                                        source_id: format!(
+                                            "lme_{}_{}_t{}",
+                                            question_id, mem.session_idx, mem.turn_idx
+                                        ),
+                                        source: "memory".to_string(),
+                                        title: format!(
+                                            "session {} turn {}",
+                                            mem.session_idx, mem.turn_idx
+                                        ),
+                                        memory_type: Some(
+                                            if question_type == "single-session-preference" {
+                                                "preference"
+                                            } else {
+                                                "fact"
+                                            }
+                                            .to_string(),
+                                        ),
+                                        domain: Some("conversation".to_string()),
+                                        last_modified: chrono::Utc::now().timestamp(),
+                                        ..Default::default()
+                                    })
+                                    .collect()
+                            },
+                            &enrichment_arc,
+                        )
+                        .await?;
+
+                        let db_mem_count = db.memory_count().await.unwrap_or(0);
+                        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+                        eprintln!(
+                            "[fullpipeline_lme] Q {}: {} memories, {}/{} enriched",
+                            sample.question_id,
+                            memories.len(),
+                            db_enriched,
+                            db_mem_count,
+                        );
+
+                        let category = category_name(&sample.question_type);
+                        let (ctx, ctx_tokens) =
+                            build_structured_context(&db, &sample.question, 10, None).await?;
+
+                        let req_id = format!("q_lme_{}", q_idx);
+                        if q_idx % 100 == 99 {
+                            eprintln!("  [contexts] {}/{} questions collected", q_idx + 1, total);
+                        }
+                        Ok(vec![(
+                            req_id,
+                            format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
+                            Some(E2E_SYSTEM_PROMPT.to_string()),
+                            200usize,
+                            PendingAnswer {
+                                question: sample.question.clone(),
+                                ground_truth,
+                                approach: format!("structured_{}", category),
+                                category: category.to_string(),
+                                context_tokens: ctx_tokens,
+                            },
+                        )])
+                    }
+                })
+                .buffer_unordered(scenario_concurrency)
+                .collect()
+                .await;
+
+        for result in scenario_outputs {
+            let entries = result?;
+            for (req_id, prompt, system, max_tok, meta) in entries {
+                batch_requests.push((req_id.clone(), prompt, system, max_tok));
+                pending.insert(req_id, meta);
+            }
         }
     }
 
