@@ -1865,59 +1865,92 @@ async fn generate_fullpipeline_lme() {
     eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
 }
 
-/// Smoke test: verify cached enriched DBs open and report fully-enriched.
+/// Smoke test: verify cached per-scenario enriched DBs open and report fully-enriched.
 ///
-/// Skips silently if either enriched DB is missing (gitignored, only present locally
-/// after a first eval run). When present, exercises the new `try_open_enriched_db`
-/// reuse helper that tasks #12 / #13 evals will rely on.
+/// Skips silently if no per-scenario DBs are present (gitignored, only present locally
+/// after a full-pipeline eval run). When present, walks each benchmark's scenario
+/// subdirectories and asserts that any non-empty scenario DB is fully enriched.
 ///
 /// Fast (no LLM, no API) — just opens DB, counts memories, asserts enrichment_complete.
 #[tokio::test]
 async fn smoke_enriched_db_reuse() {
-    use origin_lib::eval::shared::{
-        try_open_enriched_db, ENRICHED_LME_DB_SUBPATH, ENRICHED_LOCOMO_DB_SUBPATH,
-    };
+    use origin_lib::memory_db::MemoryDB;
+    use std::sync::Arc;
 
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
 
-    let mut checked = 0usize;
-    for (label, subpath) in [
-        ("LoCoMo", ENRICHED_LOCOMO_DB_SUBPATH),
-        ("LME", ENRICHED_LME_DB_SUBPATH),
-    ] {
-        let dir = baselines.join(subpath);
-        if !dir.exists() {
-            eprintln!("[smoke] SKIP {}: {} not found", label, dir.display());
+    let mut total_scenarios_checked = 0usize;
+    let mut total_passed = 0usize;
+
+    for benchmark in ["locomo", "lme"] {
+        let bench_dir = baselines.join("fullpipeline").join(benchmark);
+        if !bench_dir.exists() {
+            eprintln!(
+                "[smoke] SKIP {}: {} not found",
+                benchmark,
+                bench_dir.display()
+            );
             continue;
         }
-        let result = try_open_enriched_db(&baselines, subpath)
-            .await
-            .unwrap_or_else(|e| panic!("[smoke] {} open failed: {}", label, e));
-        let db = result.unwrap_or_else(|| {
-            panic!(
-                "[smoke] {} exists at {} but try_open_enriched_db returned None — \
-                 enriched_count != mem_count, eval would re-enrich",
-                label,
-                dir.display()
-            )
-        });
-        let mem = db.memory_count().await.expect("memory_count");
-        let enriched = db.enriched_memory_count().await.expect("enriched_count");
-        eprintln!(
-            "[smoke] {}: mem={} enriched={} (cached, ready for reuse)",
-            label, mem, enriched
-        );
-        assert!(mem > 0, "{} memory_count should be > 0", label);
-        assert_eq!(
-            mem, enriched,
-            "{} should be fully enriched (got {}/{})",
-            label, enriched, mem
-        );
-        checked += 1;
+
+        let entries = match std::fs::read_dir(&bench_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[smoke] SKIP {}: read_dir failed: {}", benchmark, e);
+                continue;
+            }
+        };
+
+        let mut bench_checked = 0usize;
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let scenario_id = entry.file_name().to_string_lossy().to_string();
+            let scenario_dir = entry.path();
+
+            let emitter: Arc<dyn origin_core::events::EventEmitter> =
+                Arc::new(origin_core::NoopEmitter);
+            let db = MemoryDB::new(&scenario_dir, emitter)
+                .await
+                .expect("[smoke] open scenario DB");
+            let mem = db.memory_count().await.expect("memory_count");
+            let enriched = db.enriched_memory_count().await.expect("enriched_count");
+
+            if mem == 0 {
+                // empty / partial scenario — skip rather than fail
+                continue;
+            }
+
+            assert_eq!(
+                mem,
+                enriched,
+                "[smoke] {}/{} should be fully enriched (got {}/{})",
+                benchmark,
+                scenario_id,
+                enriched,
+                mem
+            );
+            total_scenarios_checked += 1;
+            total_passed += 1;
+            bench_checked += 1;
+        }
+
+        if bench_checked > 0 {
+            eprintln!(
+                "[smoke] {}: checked {} scenarios, all fully enriched",
+                benchmark, bench_checked
+            );
+        }
     }
 
-    if checked == 0 {
-        eprintln!("[smoke] SKIP: no enriched DBs found locally (CI without baselines is normal).");
+    if total_scenarios_checked == 0 {
+        eprintln!(
+            "[smoke] SKIP: no per-scenario enriched DBs found locally \
+             (CI without baselines is normal)."
+        );
+    } else {
+        eprintln!("[smoke] OK: {} scenarios verified", total_passed);
     }
 }
 
