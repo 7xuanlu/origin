@@ -2029,6 +2029,155 @@ async fn judge_fullpipeline_lme() {
 }
 
 // ---------------------------------------------------------------------------
+// Distill A/B — 4B vs 9B quality probe at 90s budget
+// ---------------------------------------------------------------------------
+
+/// Quick A/B test: distill same cluster with 4B and 9B at 90s budget.
+/// Quality comparison via embedding similarity to source mems + manual review.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness quality_distill_4b_vs_9b -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn quality_distill_4b_vs_9b() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::eval_shared_embedder;
+    use origin_lib::llm_provider::{LlmProvider, LlmRequest, OnDeviceProvider};
+    use origin_lib::prompts::PromptRegistry;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found at {:?}", locomo_path);
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    let observations = extract_observations(&samples[0]);
+    let obs_slice: Vec<&str> = observations
+        .iter()
+        .take(5)
+        .map(|o| o.content.as_str())
+        .collect();
+
+    if obs_slice.is_empty() {
+        eprintln!("SKIP: no observations found in first sample");
+        return;
+    }
+
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+
+    // Build prompt matching distill_one_cluster format
+    let topic = "Caroline";
+    let memories_block: String = obs_slice
+        .iter()
+        .enumerate()
+        .map(|(i, content)| {
+            let snippet: String = content.chars().take(800).collect();
+            format!("[obs_{}] {}", i, snippet)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let user_prompt = format!("Topic: {}\n\n{}", topic, memories_block);
+    let source_text = obs_slice.join(" ");
+
+    eprintln!(
+        "\n[distill-ab] cluster: {} observations, prompt ~{} chars",
+        obs_slice.len(),
+        user_prompt.len()
+    );
+
+    // Helper: embed texts with shared embedder
+    let embedder = eval_shared_embedder();
+    let embed_texts = |texts: Vec<String>| -> Vec<Vec<f32>> {
+        let mut embedder = embedder.lock().unwrap();
+        embedder.embed(texts, None).unwrap_or_default()
+    };
+
+    // Helper: cosine similarity (inline, cosine_similarity is pub(crate))
+    let cosine_sim = |a: &[f32], b: &[f32]| -> f64 {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            (dot / (na * nb)) as f64
+        }
+    };
+
+    // Embed source for similarity comparison
+    let source_embs = embed_texts(vec![source_text.clone()]);
+    let source_emb = match source_embs.into_iter().next() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: embedding failed");
+            return;
+        }
+    };
+
+    for (model_id, label) in [("qwen3-4b", "4B"), ("qwen3.5-9b", "9B")] {
+        eprintln!("\n[distill-ab] loading {} ...", label);
+        let llm: Arc<dyn LlmProvider> = match OnDeviceProvider::new_with_model(Some(model_id)) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("[distill-ab] SKIP {}: {}", label, e);
+                continue;
+            }
+        };
+
+        let max_tokens = llm.recommended_max_output();
+        let t0 = std::time::Instant::now();
+        let result = llm
+            .generate(LlmRequest {
+                system_prompt: Some(prompts.distill_concept.clone()),
+                user_prompt: user_prompt.clone(),
+                max_tokens,
+                temperature: 0.1,
+                label: Some(format!("distill_ab_{}", label)),
+                timeout_secs: Some(90),
+            })
+            .await;
+        let elapsed = t0.elapsed();
+
+        match result {
+            Ok(raw) => {
+                let cleaned = origin_lib::llm_provider::strip_think_tags(&raw);
+                let text = cleaned.trim().to_string();
+
+                // Compute similarity to source
+                let out_embs = embed_texts(vec![text.clone()]);
+                let sim = out_embs
+                    .into_iter()
+                    .next()
+                    .map(|e| cosine_sim(&e, &source_emb))
+                    .unwrap_or(0.0);
+
+                eprintln!(
+                    "[distill-ab] {} sim={:.3} len={} elapsed={:.1}s",
+                    label,
+                    sim,
+                    text.len(),
+                    elapsed.as_secs_f64()
+                );
+
+                let out_path = format!("/tmp/distill_{}.txt", label.to_lowercase());
+                let _ = std::fs::write(&out_path, &text);
+                eprintln!("[distill-ab] {} output saved to {}", label, out_path);
+                eprintln!("--- {} output (first 400 chars) ---", label);
+                eprintln!("{}", text.chars().take(400).collect::<String>());
+                eprintln!("---");
+            }
+            Err(e) => {
+                eprintln!("[distill-ab] {} FAILED: {}", label, e);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Batch Size Probe — find on-device extraction overflow point
 // ---------------------------------------------------------------------------
 
