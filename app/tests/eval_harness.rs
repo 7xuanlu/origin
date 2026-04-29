@@ -1923,13 +1923,9 @@ async fn smoke_enriched_db_reuse() {
             }
 
             assert_eq!(
-                mem,
-                enriched,
+                mem, enriched,
                 "[smoke] {}/{} should be fully enriched (got {}/{})",
-                benchmark,
-                scenario_id,
-                enriched,
-                mem
+                benchmark, scenario_id, enriched, mem
             );
             total_scenarios_checked += 1;
             total_passed += 1;
