@@ -3435,3 +3435,162 @@ async fn probe_overlap_gate() {
         }
     }
 }
+
+/// Stress-test the on-device LLM provider with rising concurrency.
+///
+/// Submits N concurrent `generate()` calls to a single `OnDeviceProvider`,
+/// measures wall-clock and per-call latency, and reports throughput. Useful
+/// for verifying that the persistent LlamaContext optimization (build the
+/// context once, clear KV cache between calls) actually pays off vs the old
+/// per-call `new_context()` path.
+///
+/// On the current architecture (single std::thread worker), all calls are
+/// serialized through one inference loop, so wall-clock should scale roughly
+/// linearly with N. The point of this test is to confirm:
+///   1. The system doesn't break under concurrent load (no panics/timeouts).
+///   2. Per-call latency is stable (not climbing with N due to context churn).
+///   3. We have a baseline number to compare against future continuous-batch work.
+///
+/// Requires Metal GPU + a downloaded Qwen3-4B model. Marked `#[ignore]` so it
+/// doesn't run in CI. Invoke with:
+///   cargo test -p origin --test eval_harness stress_concurrent_inference \
+///       -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn stress_concurrent_inference() {
+    use futures::future::join_all;
+    use origin_lib::llm_provider::{LlmProvider, LlmRequest, OnDeviceProvider};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    eprintln!("[stress] booting OnDeviceProvider (Qwen3-4B default)...");
+    let boot_start = Instant::now();
+    let provider: Arc<dyn LlmProvider> = match OnDeviceProvider::new_with_model(None) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("[stress] SKIP: failed to init OnDeviceProvider: {e}");
+            return;
+        }
+    };
+    eprintln!("[stress] provider ready in {:?}", boot_start.elapsed());
+
+    // Small entity-extraction style prompt — representative of the calls made
+    // during a real LoCoMo / LongMemEval run. Kept short to make per-call
+    // latency the dominant signal (not prompt prefill).
+    let system_prompt = "You extract structured information from text. \
+                         Return strict JSON only, no preamble, no markdown."
+        .to_string();
+    let user_prompt = "Extract entities (people, places, organizations) from: \
+                       'Alice met Bob in Paris last summer. They discussed Acme Corp.'\n\
+                       Reply as JSON: {\"entities\": [...]}"
+        .to_string();
+
+    // Warmup: one call to JIT Metal pipelines and trigger the persistent
+    // context build. Without this, the first concurrent batch absorbs setup
+    // cost and skews the N=1 measurement.
+    eprintln!("[stress] warmup call...");
+    let warmup_start = Instant::now();
+    let _ = provider
+        .generate(LlmRequest {
+            system_prompt: Some(system_prompt.clone()),
+            user_prompt: user_prompt.clone(),
+            max_tokens: 64,
+            temperature: 0.1,
+            label: Some("warmup".into()),
+            timeout_secs: None,
+        })
+        .await;
+    eprintln!("[stress] warmup done in {:?}", warmup_start.elapsed());
+
+    eprintln!("\n[stress] N | wall(s) | throughput(c/s) | mean(s) | p50(s) | p95(s) | failures");
+    eprintln!("[stress] --|---------|-----------------|---------|--------|--------|---------");
+
+    for &n in &[1usize, 2, 4, 8, 16] {
+        let total_start = Instant::now();
+        let mut handles = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let prov = Arc::clone(&provider);
+            let sys = system_prompt.clone();
+            let usr = user_prompt.clone();
+            let label = format!("stress_n{n}_i{i}");
+            handles.push(tokio::spawn(async move {
+                let call_start = Instant::now();
+                let res = prov
+                    .generate(LlmRequest {
+                        system_prompt: Some(sys),
+                        user_prompt: usr,
+                        max_tokens: 128,
+                        temperature: 0.1,
+                        label: Some(label),
+                        timeout_secs: None,
+                    })
+                    .await;
+                (res.is_ok(), call_start.elapsed())
+            }));
+        }
+
+        let outcomes: Vec<(bool, std::time::Duration)> = join_all(handles)
+            .await
+            .into_iter()
+            .map(|j| j.unwrap_or((false, std::time::Duration::from_secs(0))))
+            .collect();
+
+        let wall = total_start.elapsed();
+        let failures = outcomes.iter().filter(|(ok, _)| !ok).count();
+        let mut latencies: Vec<f64> = outcomes
+            .iter()
+            .filter(|(ok, _)| *ok)
+            .map(|(_, d)| d.as_secs_f64())
+            .collect();
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let mean = if latencies.is_empty() {
+            0.0
+        } else {
+            latencies.iter().sum::<f64>() / latencies.len() as f64
+        };
+        let p50 = percentile(&latencies, 0.50);
+        let p95 = percentile(&latencies, 0.95);
+        let throughput = (n - failures) as f64 / wall.as_secs_f64().max(0.001);
+
+        eprintln!(
+            "[stress] {n:>2} | {wall:>7.2} | {tput:>15.2} | {mean:>7.2} | {p50:>6.2} | {p95:>6.2} | {fail}",
+            wall = wall.as_secs_f64(),
+            tput = throughput,
+            fail = failures,
+        );
+
+        // Cool-down between batches so KV cache pressure resets and Metal
+        // queue allocator has a chance to drain.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Memory ceiling note: each persistent context allocates ~256-512 MiB of
+    // KV cache for Qwen3-4B Q4_K_M at 8K context. With the current
+    // single-worker architecture, only ONE context is alive at a time, so
+    // real GPU memory usage stays bounded regardless of N. Continuous
+    // batching (slot-based, deferred) would multiply this per slot.
+    eprintln!("\n[stress] M2 Pro memory note:");
+    eprintln!("[stress]   Single persistent KV cache: ~256-512 MiB (Qwen3-4B @ 8K)");
+    eprintln!(
+        "[stress]   With continuous batching (deferred): N slots = N x KV cache, \
+         practical cap 4-8 slots on 16GB"
+    );
+}
+
+/// Percentile helper for sorted f64 slice. Linear interpolation between
+/// adjacent ranks. Returns 0.0 if empty.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = p * (sorted.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
+    }
+}
