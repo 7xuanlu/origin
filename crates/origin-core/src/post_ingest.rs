@@ -600,6 +600,12 @@ pub(crate) async fn suggest_entity_creation(
 }
 
 /// Generate a short topic title if the current title looks like a content truncation.
+///
+/// By default, enrichment only fires when the title appears truncated (ends with "...",
+/// matches the first content line verbatim, or is 75+ characters long). Eval benchmarks
+/// use short synthetic titles that never trigger this heuristic. Set the env var
+/// `EVAL_FORCE_TITLE_ENRICHMENT=1` to bypass the truncation check and always enrich.
+/// Default behavior (env unset) is identical to before.
 pub(crate) async fn enrich_title(
     db: &MemoryDB,
     source_id: &str,
@@ -611,17 +617,23 @@ pub(crate) async fn enrich_title(
         return Ok(TitleEnrichResult::NotNeeded);
     }
 
+    let force_enrichment = std::env::var("EVAL_FORCE_TITLE_ENRICHMENT").as_deref() == Ok("1");
+
     // Check if current title is a truncation (ends with "..." or matches first line)
     let detail = db.get_memory_detail(source_id).await?;
     let current_title = match &detail {
         Some(d) => &d.title,
         None => return Ok(TitleEnrichResult::NotNeeded),
     };
-    let first_line = content.lines().next().unwrap_or(content);
-    let is_truncated =
-        current_title.ends_with("...") || current_title == first_line || current_title.len() >= 75;
-    if !is_truncated {
-        return Ok(TitleEnrichResult::NotNeeded);
+
+    if !force_enrichment {
+        let first_line = content.lines().next().unwrap_or(content);
+        let is_truncated = current_title.ends_with("...")
+            || current_title == first_line
+            || current_title.len() >= 75;
+        if !is_truncated {
+            return Ok(TitleEnrichResult::NotNeeded);
+        }
     }
 
     if let Some(short_title) = crate::refinery::generate_short_title(llm, content).await {
