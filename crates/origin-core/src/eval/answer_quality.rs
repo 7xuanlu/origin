@@ -551,6 +551,7 @@ pub async fn run_e2e_locomo_eval(
                 max_tokens: 200,
                 temperature: 0.1,
                 label: Some("e2e_locomo_origin".to_string()),
+                timeout_secs: None,
             };
             match llm_provider.generate(origin_request).await {
                 Ok(raw_answer) => {
@@ -588,6 +589,7 @@ pub async fn run_e2e_locomo_eval(
                     max_tokens: 200,
                     temperature: 0.1,
                     label: Some("e2e_locomo_full_replay".to_string()),
+                    timeout_secs: None,
                 };
                 match llm_provider.generate(replay_request).await {
                     Ok(raw_answer) => {
@@ -629,6 +631,7 @@ pub async fn run_e2e_locomo_eval(
                 max_tokens: 200,
                 temperature: 0.1,
                 label: Some("e2e_locomo_no_context".to_string()),
+                timeout_secs: None,
             };
             match llm_provider.generate(no_ctx_request).await {
                 Ok(raw_answer) => {
@@ -741,6 +744,7 @@ async fn generate_e2e_answers_for_question(
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_flat".to_string()),
+        timeout_secs: None,
     };
     if let Ok(raw) = llm.generate(flat_request).await {
         let answer = strip_think_tags(&raw);
@@ -784,6 +788,7 @@ async fn generate_e2e_answers_for_question(
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_structured".to_string()),
+        timeout_secs: None,
     };
     if let Ok(raw) = llm.generate(structured_request).await {
         let answer = strip_think_tags(&raw);

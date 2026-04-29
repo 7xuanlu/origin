@@ -140,6 +140,7 @@ pub async fn generate_briefing(
                     max_tokens: 60,
                     temperature: 0.1,
                     label: None,
+                    timeout_secs: None,
                 })
                 .await
             {

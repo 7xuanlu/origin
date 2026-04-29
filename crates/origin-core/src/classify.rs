@@ -159,6 +159,7 @@ pub async fn classify_profile_subtype_via_provider(
         max_tokens: 16,
         temperature: 0.1,
         label: None,
+        timeout_secs: None,
     };
 
     match provider.generate(request).await {

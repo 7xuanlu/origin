@@ -511,6 +511,7 @@ pub async fn import_phase2_llm(
                     max_tokens: 2048,
                     temperature: 0.3,
                     label: None,
+                    timeout_secs: None,
                 })
                 .await;
 
@@ -576,6 +577,7 @@ pub async fn import_phase2_llm(
                         max_tokens: 2048,
                         temperature: 0.3,
                         label: None,
+                        timeout_secs: None,
                     })
                     .await;
 

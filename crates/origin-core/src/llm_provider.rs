@@ -60,6 +60,10 @@ pub struct LlmRequest {
     /// "title_gen"). Appears in inference log lines so operators can see
     /// what each LLM call is doing.
     pub label: Option<String>,
+    /// Override the default 30s on-device inference timeout. When `Some(n)`,
+    /// `OnDeviceProvider` routes through `run_inference_raw` instead of
+    /// `run_inference`. Has no effect for cloud providers (Anthropic, etc.).
+    pub timeout_secs: Option<u64>,
 }
 
 /// Errors returned by an [`LlmProvider`].
@@ -120,6 +124,7 @@ struct InferenceRequest {
     temperature: f32,
     ctx_size: u32,
     label: Option<String>,
+    timeout_secs: Option<u64>,
     response_tx: tokio::sync::oneshot::Sender<Result<String, LlmError>>,
 }
 
@@ -265,13 +270,22 @@ impl OnDeviceProvider {
                         ),
                     };
 
-                    let result = engine.run_inference(
-                        &full_prompt,
-                        req.max_tokens,
-                        req.temperature,
-                        req.ctx_size,
-                        req.label.as_deref(),
-                    );
+                    let result = match req.timeout_secs {
+                        Some(secs) => engine.run_inference_raw(
+                            &full_prompt,
+                            req.max_tokens,
+                            req.temperature,
+                            secs,
+                            req.ctx_size,
+                        ),
+                        None => engine.run_inference(
+                            &full_prompt,
+                            req.max_tokens,
+                            req.temperature,
+                            req.ctx_size,
+                            req.label.as_deref(),
+                        ),
+                    };
 
                     let response = match result {
                         Some(text) => {
@@ -327,6 +341,7 @@ impl LlmProvider for OnDeviceProvider {
             temperature: request.temperature,
             ctx_size: self.model_context_size,
             label: request.label,
+            timeout_secs: request.timeout_secs,
             response_tx,
         };
 
@@ -856,6 +871,7 @@ mod tests {
             max_tokens: 256,
             temperature: 0.1,
             label: None,
+            timeout_secs: None,
         };
         let cloned = req.clone();
         assert_eq!(cloned.user_prompt, "Hello");
@@ -882,6 +898,7 @@ mod tests {
                 max_tokens: 100,
                 temperature: 0.0,
                 label: None,
+                timeout_secs: None,
             })
             .await
             .unwrap();
@@ -899,6 +916,7 @@ mod tests {
                 max_tokens: 100,
                 temperature: 0.0,
                 label: None,
+                timeout_secs: None,
             })
             .await;
         assert!(matches!(result, Err(LlmError::NotAvailable)));
@@ -927,6 +945,7 @@ mod tests {
                 max_tokens: 100,
                 temperature: 0.0,
                 label: None,
+                timeout_secs: None,
             })
             .await;
         // Empty key → API call will fail

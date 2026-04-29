@@ -164,6 +164,7 @@ pub async fn generate_narrative(
                     max_tokens: 200,
                     temperature: 0.3,
                     label: None,
+                    timeout_secs: None,
                 })
                 .await
             {

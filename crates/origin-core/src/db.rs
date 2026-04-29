@@ -6178,6 +6178,7 @@ impl MemoryDB {
                         max_tokens: 128,
                         temperature: 0.1,
                         label: None,
+                        timeout_secs: None,
                     }),
                 )
                 .await;
@@ -6281,6 +6282,7 @@ impl MemoryDB {
                     max_tokens: 256,
                     temperature: 0.3,
                     label: None,
+                    timeout_secs: None,
                 }),
             )
             .await;

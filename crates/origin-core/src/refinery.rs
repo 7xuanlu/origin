@@ -869,6 +869,7 @@ async fn reclassify_imports(
                     max_tokens: 128,
                     temperature: 0.1,
                     label: None,
+                    timeout_secs: None,
                 })
                 .await;
 
@@ -953,6 +954,7 @@ pub async fn extract_single_memory_entities(
             max_tokens: 512,
             temperature: 0.3,
             label: None,
+            timeout_secs: None,
         })
         .await
         .map_err(|e| OriginError::Llm(format!("entity extraction: {}", e)))?;
@@ -1152,6 +1154,7 @@ async fn refine_clusters_with_llm(
                 max_tokens: 512,
                 temperature: 0.2,
                 label: None,
+                timeout_secs: None,
             })
             .await;
 
@@ -1380,6 +1383,7 @@ async fn distill_one_cluster(
             max_tokens: llm.recommended_max_output(),
             temperature: 0.1,
             label: Some("distill_body".into()),
+            timeout_secs: None,
         })
         .await;
 
@@ -1676,6 +1680,7 @@ pub async fn distill_concepts(
                 max_tokens: llm.recommended_max_output(),
                 temperature: 0.1,
                 label: Some("distill_body".into()),
+                timeout_secs: None,
             })
             .await;
 
@@ -1861,6 +1866,7 @@ async fn assign_orphan_memories(
             max_tokens: 1024,
             temperature: 0.3,
             label: Some("orphan_assign".into()),
+            timeout_secs: None,
         })
         .await
         .map_err(|e| OriginError::Llm(format!("orphan assignment: {}", e)))?;
@@ -2135,6 +2141,7 @@ async fn recompile_single_concept(
             max_tokens: llm.recommended_max_output(),
             temperature: 0.1,
             label: Some("distill_body".into()),
+            timeout_secs: None,
         })
         .await;
 
@@ -2252,6 +2259,7 @@ pub(crate) async fn re_distill_stale_concepts(
                 max_tokens: llm_ref.recommended_max_output(),
                 temperature: 0.1,
                 label: Some("re-distill-stale".into()),
+                timeout_secs: None,
             })
             .await;
 
@@ -2309,6 +2317,7 @@ async fn global_concept_review(
             max_tokens: 1024,
             temperature: 0.3,
             label: Some("global_review".into()),
+            timeout_secs: None,
         })
         .await
         .map_err(|e| OriginError::Llm(format!("global review: {}", e)))?;
@@ -2435,6 +2444,7 @@ pub async fn deep_distill_single(
             max_tokens: llm.recommended_max_output(),
             temperature: 0.1,
             label: Some("distill_body".into()),
+            timeout_secs: None,
         })
         .await
         .map_err(|e| OriginError::Llm(format!("re-distill LLM: {}", e)))?;
@@ -2506,6 +2516,7 @@ async fn process_refinement_queue(
                             max_tokens: 256,
                             temperature: 0.1,
                             label: None,
+                            timeout_secs: None,
                         })
                         .await;
 
@@ -2608,6 +2619,7 @@ pub(crate) async fn backfill_decision_structured_fields(
                 max_tokens: 256,
                 temperature: 0.1,
                 label: None,
+                timeout_secs: None,
             }),
         )
         .await
@@ -2704,6 +2716,7 @@ pub(crate) async fn generate_decision_logs(
                     max_tokens: 128,
                     temperature: 0.1,
                     label: None,
+                    timeout_secs: None,
                 })
                 .await;
 
@@ -2883,6 +2896,7 @@ pub(crate) async fn generate_recaps(
                     max_tokens: 128,
                     temperature: 0.1,
                     label: None,
+                    timeout_secs: None,
                 })
                 .await;
 
@@ -3181,6 +3195,7 @@ pub(crate) async fn generate_short_title(
         max_tokens: 16,
         temperature: 0.3,
         label: None,
+        timeout_secs: None,
     }).await;
 
     match response {

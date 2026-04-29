@@ -96,6 +96,7 @@ pub async fn probe_extraction_batch_sizes(
                 max_tokens: ((batch_size * 200) as u32).max(512), // scale with input, min 512
                 temperature: 0.3,
                 label: Some(format!("probe_batch_{}", batch_size)),
+                timeout_secs: None,
             })
             .await
         {
@@ -468,6 +469,7 @@ pub async fn run_entity_extraction_for_eval_batched(
                 max_tokens: ((chunk.len() * 256) as u32).max(512),
                 temperature: 0.3,
                 label: Some(format!("batch_extract_chunk_{}", chunk_idx)),
+                timeout_secs: None,
             })
             .await;
 

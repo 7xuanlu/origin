@@ -688,6 +688,7 @@ pub(crate) async fn grow_concept(
             max_tokens: 1024,
             temperature: 0.1,
             label: None,
+            timeout_secs: None,
         })
         .await
         .map_err(|e| OriginError::Llm(format!("concept growth LLM: {e}")))?;
