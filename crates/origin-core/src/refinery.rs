@@ -1170,11 +1170,13 @@ async fn refine_clusters_with_llm(
                                     if let Some(to_merge) =
                                         action.get("clusters").and_then(|v| v.as_array())
                                     {
-                                        let merge_indices: Vec<usize> = to_merge
+                                        let mut merge_indices: Vec<usize> = to_merge
                                             .iter()
                                             .filter_map(|v| v.as_u64().map(|n| n as usize))
                                             .filter(|&j| j < indices.len())
                                             .collect();
+                                        merge_indices.sort_unstable();
+                                        merge_indices.dedup();
                                         if merge_indices.len() >= 2 {
                                             // Guard: don't merge if the result would exceed
                                             // the token limit that sub_cluster_by_tokens split
@@ -3486,7 +3488,7 @@ pub(crate) async fn retry_failed_enrichment(
             .await?;
         for (source_id, content) in &candidates {
             log::info!("[refinery] re-enriching title for {source_id}");
-            match crate::post_ingest::enrich_title(db, source_id, content, llm_ref).await {
+            match crate::post_ingest::enrich_title(db, source_id, content, llm_ref, false).await {
                 Ok(crate::post_ingest::TitleEnrichResult::Enriched) => {
                     db.record_enrichment_step(source_id, "title_enrich", "ok", None)
                         .await
@@ -3583,7 +3585,8 @@ pub(crate) async fn retry_failed_enrichment(
             let old = db.get_truncated_title_memories(10).await?;
             for (source_id, content) in &old {
                 log::info!("[refinery] backfill title re-enrichment for {source_id}");
-                match crate::post_ingest::enrich_title(db, source_id, content, llm_ref).await {
+                match crate::post_ingest::enrich_title(db, source_id, content, llm_ref, false).await
+                {
                     Ok(crate::post_ingest::TitleEnrichResult::Enriched) => {
                         db.record_enrichment_step(source_id, "title_enrich", "ok", None)
                             .await

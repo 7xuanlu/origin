@@ -808,9 +808,13 @@ pub fn extract_json_array(text: &str) -> Option<String> {
         }
     }
     // Strategy 3: last resort — wrap a single best-effort `{...}` slice in array brackets.
+    // Validate the result before returning so callers never receive unparseable JSON.
     if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
         if end > start {
-            return Some(format!("[{}]", &trimmed[start..=end]));
+            let candidate = format!("[{}]", &trimmed[start..=end]);
+            if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -1045,5 +1049,14 @@ mod tests {
         let result = extract_json_array(text).unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.len(), 1);
+    }
+
+    /// Strategy-3 validation: garbage input that finds `{` and `}` but produces
+    /// invalid JSON when wrapped must return None instead of unparseable output.
+    #[test]
+    fn test_extract_json_array_strategy3_invalid_returns_none() {
+        // Contains { and } but is not valid JSON — Strategy 3 must reject it.
+        let text = "garbage{ broken } stuff { incomplete";
+        assert_eq!(extract_json_array(text), None);
     }
 }

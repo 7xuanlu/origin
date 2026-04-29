@@ -76,10 +76,9 @@ pub async fn submit_batch(
     model: &str,
     cost_cap_usd: f64,
 ) -> Result<String, String> {
-    debug_assert!(
-        cost_cap_usd <= 100.0,
-        "cost_cap_usd suspiciously high: ${cost_cap_usd}"
-    );
+    if !cost_cap_usd.is_finite() || cost_cap_usd > 100.0 {
+        return Err(format!("cost_cap_usd suspicious: ${cost_cap_usd}"));
+    }
     let est_cost = estimate_batch_cost(&requests);
     eprintln!(
         "[batch] Estimated cost: ${:.3} ({} requests, cap: ${:.2})",

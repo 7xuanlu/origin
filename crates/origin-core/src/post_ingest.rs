@@ -300,7 +300,7 @@ pub async fn run_post_ingest_enrichment(
 
     // 5. Title enrichment — generate short topic title if current title is a truncation
     if let Some(llm_ref) = llm {
-        match enrich_title(db, source_id, content, llm_ref).await {
+        match enrich_title(db, source_id, content, llm_ref, false).await {
             Ok(TitleEnrichResult::Enriched) => {
                 log::info!("[post_ingest] {source_id}: title enriched");
                 db.record_enrichment_step(source_id, "title_enrich", "ok", None)
@@ -611,13 +611,14 @@ pub(crate) async fn enrich_title(
     source_id: &str,
     content: &str,
     llm: &Arc<dyn LlmProvider>,
+    force: bool,
 ) -> Result<TitleEnrichResult, OriginError> {
     // Skip recaps and merged memories — they get titles during generation
     if source_id.starts_with("recap_") || source_id.starts_with("merged_") {
         return Ok(TitleEnrichResult::NotNeeded);
     }
 
-    let force_enrichment = std::env::var("EVAL_FORCE_TITLE_ENRICHMENT").as_deref() == Ok("1");
+    let force_enrichment = force;
 
     // Check if current title is a truncation (ends with "..." or matches first line)
     let detail = db.get_memory_detail(source_id).await?;

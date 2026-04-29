@@ -32,6 +32,16 @@ static EVAL_EMBEDDER: LazyLock<Arc<std::sync::Mutex<fastembed::TextEmbedding>>> 
     });
 
 /// Returns the process-wide shared embedder for eval use.
+///
+/// # Concurrency safety
+/// The underlying lock is `std::sync::Mutex`, which is safe here because
+/// `MemoryDB::generate_embeddings` is a synchronous function: it acquires the
+/// lock, calls `embed()`, and drops the guard before returning. The guard is
+/// never held across an `.await` point, so there is no risk of deadlock even
+/// when `EVAL_SCENARIO_CONCURRENCY > 1` drives multiple async tasks
+/// concurrently. Tasks contend on the mutex, but they do not block the Tokio
+/// executor (sync computation inside an async context is acceptable for CPU-
+/// bound work that completes in milliseconds).
 pub fn eval_shared_embedder() -> Arc<std::sync::Mutex<fastembed::TextEmbedding>> {
     EVAL_EMBEDDER.clone()
 }
@@ -786,9 +796,10 @@ pub async fn run_title_enrichment_for_eval(
     let t0 = std::time::Instant::now();
     let mut processed = 0usize;
 
+    let force = std::env::var("EVAL_FORCE_TITLE_ENRICHMENT").as_deref() == Ok("1");
     let results: Vec<_> = futures::stream::iter(candidates.into_iter().map(
         |(source_id, content)| async move {
-            crate::post_ingest::enrich_title(db, &source_id, &content, llm).await
+            crate::post_ingest::enrich_title(db, &source_id, &content, llm, force).await
         },
     ))
     .buffer_unordered(concurrency.max(1))
