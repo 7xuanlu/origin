@@ -241,134 +241,194 @@ impl OnDeviceProvider {
         // silently unclassified. 256 absorbs bursts up to ~64 concurrent
         // stores before backpressure.
         let (tx, rx) = std::sync::mpsc::sync_channel::<InferenceRequest>(256);
+
+        // Multi-context worker pool. ORIGIN_LLM_WORKERS controls the number of
+        // parallel inference threads, each owning a persistent LlamaContext.
+        // Workers compete on a shared receiver: lock is held only during recv(),
+        // released before GPU inference, so contention is minimal.
+        //
+        // Memory budget per worker: ~0.8 GB KV cache at ctx=8192.
+        // N=4 workers = 3.2 GB KV + 2.7 GB shared weights ≈ safe on 16 GB Mac.
+        // Default N=1 is identical to the previous single-thread behavior.
+        //
+        // GGML_METAL_NO_RESIDENCY (set above) mitigates Metal command queue
+        // exhaustion from multiple simultaneous contexts.
+        let n_workers = std::env::var("ORIGIN_LLM_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8);
+        log::info!("[on_device_provider] spawning {n_workers} worker thread(s)");
+
         let available = Arc::new(AtomicBool::new(true));
 
-        let thread_available = Arc::clone(&available);
-        std::thread::Builder::new()
-            .name("llm-provider-worker".into())
-            .spawn(move || {
-                log::info!("[on_device_provider] worker thread started");
+        // Wrap the receiver so it can be shared across worker threads.
+        // std::sync::mpsc::Receiver is Send but not Sync, so we guard it with
+        // a Mutex. Only one worker holds the lock at a time (during recv()),
+        // then releases it before the actual GPU inference call.
+        let rx_shared = Arc::new(std::sync::Mutex::new(rx));
 
-                // Persistent LlamaContext: build lazily on first request, then
-                // reuse across all subsequent requests by clearing the KV cache
-                // between calls. Saves the per-call cost of `new_context()`
-                // (KV cache allocation + Metal pipeline rebuild) which was the
-                // dominant overhead under serial inference. If a request
-                // arrives with a different ctx_size, the context is rebuilt.
-                //
-                // n_batch is sized to the model's context_size so any
-                // tokenized prompt fits in a single decode call.
-                let mut persistent_ctx: Option<llama_cpp_2::context::LlamaContext<'_>> = None;
-                let mut persistent_ctx_size: u32 = 0;
+        // Shared engine across all workers. LlmEngine holds the model weights
+        // once (loaded onto the GPU); each worker creates its own LlamaContext
+        // from it, so the weights are not duplicated.
+        let engine = Arc::new(engine);
 
-                while let Ok(req) = rx.recv() {
-                    // Wrap in Qwen chat template so the model sees
-                    // system/user/assistant turns instead of a raw blob.
-                    // The empty <think></think> block disables thinking mode
-                    // for Qwen3.5 (which defaults to thinking-on). Without it,
-                    // all output tokens go to reasoning and strip_think_tags
-                    // removes them, leaving empty output. Harmless for Qwen3.
-                    let full_prompt = match &req.system_prompt {
-                        Some(sys) => format!(
-                            "<|im_start|>system\n{sys}\n<|im_end|>\n\
-                             <|im_start|>user\n{user}\n<|im_end|>\n\
-                             <|im_start|>assistant\n<think>\n\n</think>\n\n",
-                            sys = sys,
-                            user = req.prompt,
-                        ),
-                        None => format!(
-                            "<|im_start|>user\n{user}\n<|im_end|>\n\
-                             <|im_start|>assistant\n<think>\n\n</think>\n\n",
-                            user = req.prompt,
-                        ),
-                    };
+        for i in 0..n_workers {
+            let rx_arc = Arc::clone(&rx_shared);
+            let engine = Arc::clone(&engine);
+            let thread_available = Arc::clone(&available);
 
-                    // (Re)build the persistent context if missing or if the
-                    // requested ctx_size doesn't match the current allocation.
-                    if persistent_ctx.is_none() || persistent_ctx_size != req.ctx_size {
-                        // Explicit drop to free old KV cache before allocating
-                        // a new context. Avoids holding two contexts at once.
-                        let _ = persistent_ctx.take();
-                        persistent_ctx = engine.build_persistent_context(req.ctx_size);
-                        if persistent_ctx.is_some() {
-                            persistent_ctx_size = req.ctx_size;
-                            log::info!(
-                                "[on_device_provider] persistent context built (ctx_size={})",
-                                req.ctx_size
-                            );
-                        }
-                    }
+            std::thread::Builder::new()
+                .name(format!("llm-provider-worker-{i}"))
+                .spawn(move || {
+                    log::info!("[on_device_provider] worker {i} thread started");
 
-                    // Pick generation parameters: timeout and whether to strip
-                    // <think> tags. Mirrors the old run_inference (30s, strip)
-                    // vs run_inference_raw (configurable, raw) split.
-                    let (timeout_secs, strip_think) = match req.timeout_secs {
-                        Some(secs) => (secs, false),
-                        None => (30, true),
-                    };
+                    // Persistent LlamaContext: build lazily on first request,
+                    // then reuse across all subsequent requests by clearing the
+                    // KV cache between calls. Saves the per-call cost of
+                    // `new_context()` (KV cache allocation + Metal pipeline
+                    // rebuild) which was the dominant overhead under serial
+                    // inference. If a request arrives with a different
+                    // ctx_size, the context is rebuilt.
+                    //
+                    // n_batch is sized to the model's context_size so any
+                    // tokenized prompt fits in a single decode call.
+                    let mut persistent_ctx: Option<llama_cpp_2::context::LlamaContext<'_>> = None;
+                    let mut persistent_ctx_size: u32 = 0;
 
-                    let result = match persistent_ctx.as_mut() {
-                        Some(ctx) => engine.run_inference_persistent(
-                            ctx,
-                            &full_prompt,
-                            req.max_tokens,
-                            req.temperature,
-                            timeout_secs,
-                            strip_think,
-                            req.label.as_deref(),
-                        ),
-                        None => {
-                            // Fallback to per-call context if persistent build
-                            // failed (e.g., Metal queue exhaustion). Behavior
-                            // matches the pre-optimization path.
-                            log::warn!(
-                                "[on_device_provider] persistent context unavailable, \
-                                 falling back to per-call context"
-                            );
-                            match req.timeout_secs {
-                                Some(secs) => engine.run_inference_raw(
-                                    &full_prompt,
-                                    req.max_tokens,
-                                    req.temperature,
-                                    secs,
-                                    req.ctx_size,
-                                ),
-                                None => engine.run_inference(
-                                    &full_prompt,
-                                    req.max_tokens,
-                                    req.temperature,
-                                    req.ctx_size,
-                                    req.label.as_deref(),
-                                ),
+                    loop {
+                        // Acquire the shared receiver lock only long enough to
+                        // dequeue one request. Lock is released before any
+                        // GPU inference call.
+                        let req = match rx_arc.lock().unwrap().recv() {
+                            Ok(r) => r,
+                            Err(_) => break, // channel closed — sender dropped
+                        };
+
+                        // Wrap in Qwen chat template so the model sees
+                        // system/user/assistant turns instead of a raw blob.
+                        // The empty <think></think> block disables thinking mode
+                        // for Qwen3.5 (which defaults to thinking-on). Without
+                        // it, all output tokens go to reasoning and
+                        // strip_think_tags removes them, leaving empty output.
+                        // Harmless for Qwen3.
+                        let full_prompt = match &req.system_prompt {
+                            Some(sys) => format!(
+                                "<|im_start|>system\n{sys}\n<|im_end|>\n\
+                                 <|im_start|>user\n{user}\n<|im_end|>\n\
+                                 <|im_start|>assistant\n<think>\n\n</think>\n\n",
+                                sys = sys,
+                                user = req.prompt,
+                            ),
+                            None => format!(
+                                "<|im_start|>user\n{user}\n<|im_end|>\n\
+                                 <|im_start|>assistant\n<think>\n\n</think>\n\n",
+                                user = req.prompt,
+                            ),
+                        };
+
+                        // (Re)build the persistent context if missing or if
+                        // the requested ctx_size doesn't match the current
+                        // allocation.
+                        if persistent_ctx.is_none() || persistent_ctx_size != req.ctx_size {
+                            // Explicit drop to free old KV cache before
+                            // allocating a new context. Avoids holding two
+                            // contexts at once.
+                            let _ = persistent_ctx.take();
+                            persistent_ctx = engine.build_persistent_context(req.ctx_size);
+                            if persistent_ctx.is_some() {
+                                persistent_ctx_size = req.ctx_size;
+                                log::info!(
+                                    "[on_device_provider] worker {i} persistent context built \
+                                     (ctx_size={})",
+                                    req.ctx_size
+                                );
                             }
                         }
-                    };
 
-                    let response = match result {
-                        Some(text) => {
-                            // First successful inference = model is warm and
-                            // serving traffic. Safe to fire the onboarding
-                            // readiness hook; subsequent calls are no-ops.
-                            mark_llm_ready();
-                            Ok(text)
-                        }
-                        None => Err(LlmError::InferenceFailed(
-                            "inference returned no output".into(),
-                        )),
-                    };
+                        // Pick generation parameters: timeout and whether to
+                        // strip <think> tags. Mirrors the old run_inference
+                        // (30s, strip) vs run_inference_raw (configurable,
+                        // raw) split.
+                        let (timeout_secs, strip_think) = match req.timeout_secs {
+                            Some(secs) => (secs, false),
+                            None => (30, true),
+                        };
 
-                    // Ignore send error — caller may have dropped the receiver
-                    let _ = req.response_tx.send(response);
-                }
-                // Drop the persistent context before exiting so Metal queues
-                // are released cleanly.
-                drop(persistent_ctx);
-                log::info!("[on_device_provider] worker thread exiting");
-                thread_available.store(false, Ordering::SeqCst);
-            })
-            .map_err(|e| {
-                crate::error::OriginError::Llm(format!("failed to spawn inference thread: {e}"))
-            })?;
+                        let result = match persistent_ctx.as_mut() {
+                            Some(ctx) => engine.run_inference_persistent(
+                                ctx,
+                                &full_prompt,
+                                req.max_tokens,
+                                req.temperature,
+                                timeout_secs,
+                                strip_think,
+                                req.label.as_deref(),
+                            ),
+                            None => {
+                                // Fallback to per-call context if persistent
+                                // build failed (e.g., Metal queue exhaustion).
+                                // Behavior matches the pre-optimization path.
+                                log::warn!(
+                                    "[on_device_provider] worker {i} persistent context \
+                                     unavailable, falling back to per-call context"
+                                );
+                                match req.timeout_secs {
+                                    Some(secs) => engine.run_inference_raw(
+                                        &full_prompt,
+                                        req.max_tokens,
+                                        req.temperature,
+                                        secs,
+                                        req.ctx_size,
+                                    ),
+                                    None => engine.run_inference(
+                                        &full_prompt,
+                                        req.max_tokens,
+                                        req.temperature,
+                                        req.ctx_size,
+                                        req.label.as_deref(),
+                                    ),
+                                }
+                            }
+                        };
+
+                        let response = match result {
+                            Some(text) => {
+                                // First successful inference = model is warm
+                                // and serving traffic. Safe to fire the
+                                // onboarding readiness hook; subsequent calls
+                                // are no-ops (guarded by OnceLock).
+                                mark_llm_ready();
+                                Ok(text)
+                            }
+                            None => Err(LlmError::InferenceFailed(
+                                "inference returned no output".into(),
+                            )),
+                        };
+
+                        // Ignore send error — caller may have dropped the
+                        // receiver.
+                        let _ = req.response_tx.send(response);
+                    }
+
+                    // Drop the persistent context before exiting so Metal
+                    // queues are released cleanly.
+                    drop(persistent_ctx);
+                    log::info!("[on_device_provider] worker {i} thread exiting");
+                    // Mark available=false only when the last worker exits.
+                    // Workers share the AtomicBool; any surviving worker
+                    // keeps the provider available. We use a simple approach:
+                    // set false unconditionally — if another worker is still
+                    // running it will not reset it, but the channel being
+                    // closed means no new requests can succeed anyway.
+                    thread_available.store(false, Ordering::SeqCst);
+                })
+                .map_err(|e| {
+                    crate::error::OriginError::Llm(format!(
+                        "failed to spawn inference thread {i}: {e}"
+                    ))
+                })?;
+        }
 
         Ok(Self {
             tx,
