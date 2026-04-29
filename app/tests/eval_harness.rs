@@ -2223,6 +2223,191 @@ async fn smoke_fullpipeline() {
     );
 }
 
+/// Manual smoke for the per-scenario DB refactor (T1-T6).
+///
+/// Exercises `open_or_seed_scenario_db` with 2 LoCoMo samples on-device:
+/// 1. Seeds + enriches per-conv DB at `{tempdir}/fullpipeline/locomo/{sample_id}/`.
+/// 2. Verifies expected paths exist with `mem == enriched`.
+/// 3. Builds context for first qa via per-conv DB.
+/// 4. Re-runs `open_or_seed_scenario_db` to confirm cache-hit branch (no re-enrich).
+/// 5. Asserts the two per-conv DBs are PHYSICALLY ISOLATED (no cross-conv source_ids).
+///
+/// On-device Qwen3-4B (free, Metal GPU). Requires `--ignored --nocapture`.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness smoke_per_scenario_locomo -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_locomo() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    assert!(samples.len() >= 2, "need >=2 LoCoMo samples for smoke");
+
+    // Tempdir for baselines so we don't pollute real eval cache
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!("[smoke-per-scenario] baselines: {}", baselines_dir.display());
+
+    // On-device enrichment (default per EnrichmentMode::from_env when EVAL_ENRICHMENT unset)
+    let enrichment = EnrichmentMode::from_env("claude-haiku-4-5-20251001", 1.0)
+        .expect("EnrichmentMode::from_env");
+    let shared_embedder = eval_shared_embedder();
+
+    // Truncate aggressively: 2 conversations, 10 observations each.
+    // Smoke validates structural correctness; full enrichment runs are tested separately.
+    const MAX_OBS_PER_CONV: usize = 10;
+    let pair = &samples[..2];
+    let mut per_sample_source_ids: Vec<Vec<String>> = Vec::new();
+
+    let smoke_t0 = std::time::Instant::now();
+    for sample in pair {
+        let mut memories = extract_observations(sample);
+        memories.truncate(MAX_OBS_PER_CONV);
+        eprintln!(
+            "[smoke-per-scenario] {} ({} obs, truncated from full) -> open_or_seed",
+            sample.sample_id,
+            memories.len()
+        );
+
+        let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+
+        let sample_id = sample.sample_id.clone();
+        let memories_owned = memories.clone();
+        let conv_t0 = std::time::Instant::now();
+        let db = open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, mem)| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                        source: "memory".to_string(),
+                        title: format!("{} session {}", mem.speaker, mem.session_num),
+                        memory_type: Some("fact".to_string()),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await
+        .expect("open_or_seed_scenario_db");
+        let conv_elapsed = conv_t0.elapsed().as_secs_f32();
+
+        let mem_count = db.memory_count().await.unwrap_or(0);
+        let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        eprintln!(
+            "[smoke-per-scenario] {}: seed+enrich done in {:.1}s, mem={} enriched={}",
+            sample.sample_id, conv_elapsed, mem_count, enriched
+        );
+        assert!(mem_count > 0, "{}: should have seeded memories", sample.sample_id);
+        assert_eq!(
+            mem_count, enriched,
+            "{}: should be fully enriched ({}/{})",
+            sample.sample_id, enriched, mem_count
+        );
+
+        // Verify physical path exists
+        assert!(
+            scope_dir.join("origin_memory.db").exists(),
+            "{}: DB file should exist at {}",
+            sample.sample_id,
+            scope_dir.display()
+        );
+
+        // Retrieval scoped to own conv: every result must come from this sample's source_id prefix
+        let results = db
+            .search_memory("anything", 50, None, None, None, None, None, None)
+            .await
+            .expect("search_memory");
+        let expected_prefix = format!("locomo_{}_obs_", sample.sample_id);
+        for r in &results {
+            assert!(
+                r.source_id.starts_with(&expected_prefix),
+                "{}: cross-conv leak! result source_id={} (expected prefix {})",
+                sample.sample_id,
+                r.source_id,
+                expected_prefix
+            );
+        }
+        per_sample_source_ids.push(results.iter().map(|r| r.source_id.clone()).collect());
+    }
+
+    // Cross-conv isolation: zero source_id overlap between conv 0 and conv 1
+    let conv0: std::collections::HashSet<_> = per_sample_source_ids[0].iter().collect();
+    let conv1: std::collections::HashSet<_> = per_sample_source_ids[1].iter().collect();
+    let overlap: Vec<_> = conv0.intersection(&conv1).copied().collect();
+    assert!(overlap.is_empty(), "cross-conv source_id leak: {:?}", overlap);
+
+    // Cache-hit verification: re-open first conv. Should NOT re-enrich.
+    let sample = &pair[0];
+    let mut memories = extract_observations(sample);
+    memories.truncate(MAX_OBS_PER_CONV);
+    let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+    let sample_id_2 = sample.sample_id.clone();
+    let memories_owned_2 = memories.clone();
+    let cache_t0 = std::time::Instant::now();
+    let _db_cached = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned_2
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample_id_2, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("re-open cached");
+    let cache_ms = cache_t0.elapsed().as_millis();
+    eprintln!(
+        "[smoke-per-scenario] cache-hit re-open of {}: {} ms (expected <2000ms; no re-enrich)",
+        sample.sample_id, cache_ms
+    );
+    assert!(
+        cache_ms < 5000,
+        "cache hit too slow ({} ms) -- helper likely re-enriched",
+        cache_ms
+    );
+
+    let total_elapsed = smoke_t0.elapsed().as_secs_f32();
+    eprintln!("\n=== smoke_per_scenario_locomo PASSED in {:.1}s ===", total_elapsed);
+    eprintln!("  per-conv DB layout: ✓");
+    eprintln!("  enrichment per-conv (truncated to {} obs each): ✓", MAX_OBS_PER_CONV);
+    eprintln!("  retrieval scoped to own conv: ✓");
+    eprintln!("  cross-conv source_id isolation: ✓");
+    eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
+}
+
 /// Judge LME tuples via Claude CLI (Max plan, no API key).
 ///
 /// Uses task-specific judge prompts matching the LongMemEval paper.
