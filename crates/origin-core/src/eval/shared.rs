@@ -8,11 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
-/// Subdirectory under baselines for per-scenario LongMemEval DBs.
-pub const FULLPIPELINE_LME_SUBDIR: &str = "fullpipeline/lme";
-/// Subdirectory under baselines for per-scenario LoCoMo DBs.
-pub const FULLPIPELINE_LOCOMO_SUBDIR: &str = "fullpipeline/locomo";
-
 /// Shared BPE tokenizer instance (cl100k_base). Initialized once, intentionally
 /// leaked to avoid destructor conflicts with ONNX runtime at process exit.
 static BPE: LazyLock<&'static tiktoken_rs::CoreBPE> = LazyLock::new(|| {
@@ -404,6 +399,8 @@ pub async fn try_open_enriched_db(
 
 /// Resolve the per-scenario DB directory under `baselines/fullpipeline/{benchmark}/{scenario_id}/`.
 ///
+/// `benchmark` is the short name (`"lme"` or `"locomo"`). The function prepends `"fullpipeline/"`,
+/// so the result is `baselines_dir/fullpipeline/{benchmark}/{scenario_id}`.
 /// `MemoryDB::new_with_shared_embedder` will create `origin_memory.db` inside the returned dir.
 pub fn scenario_db_dir(baselines_dir: &Path, benchmark: &str, scenario_id: &str) -> PathBuf {
     baselines_dir
@@ -414,17 +411,17 @@ pub fn scenario_db_dir(baselines_dir: &Path, benchmark: &str, scenario_id: &str)
 
 /// Open existing per-scenario DB if fully enriched; otherwise seed and enrich, then return.
 ///
-/// Seed docs are provided lazily via `seed_docs_fn` so callers avoid materializing them
+/// Seed docs are provided lazily via `seed_docs` so callers avoid materializing them
 /// when the DB is already cached. Partial state (memories present but not fully enriched)
 /// is wiped and restarted to guarantee consistency.
 ///
-/// Cache hit: `mem_count > 0 && enriched_count == mem_count` — returns immediately.
-/// Partial resume: `mem_count > 0 && enriched_count < mem_count` — clears and re-seeds.
-/// Empty or new DB: seeds from `seed_docs_fn()` and runs full enrichment.
+/// Cache hit: `mem_count > 0 && enriched_count == mem_count` - returns immediately.
+/// Partial resume: `mem_count > 0 && enriched_count < mem_count` - clears and re-seeds.
+/// Empty or new DB: seeds from `seed_docs()` and runs full enrichment.
 pub async fn open_or_seed_scenario_db<F>(
     db_dir: &Path,
     shared_embedder: Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
-    seed_docs_fn: F,
+    seed_docs: F,
     enrichment: &EnrichmentMode,
 ) -> Result<MemoryDB, OriginError>
 where
@@ -433,8 +430,12 @@ where
     std::fs::create_dir_all(db_dir)
         .map_err(|e| OriginError::Generic(format!("create db_dir: {e}")))?;
 
-    let db = MemoryDB::new_with_shared_embedder(db_dir, Arc::new(crate::events::NoopEmitter), shared_embedder)
-        .await?;
+    let db = MemoryDB::new_with_shared_embedder(
+        db_dir,
+        Arc::new(crate::events::NoopEmitter),
+        shared_embedder,
+    )
+    .await?;
 
     let mem_count = db.memory_count().await.unwrap_or(0);
     let enriched = db.enriched_memory_count().await.unwrap_or(0);
@@ -450,7 +451,7 @@ where
 
     if mem_count > 0 && enriched < mem_count {
         log::info!(
-            "[scenario_db] partial state {}/{} enriched — wiping and re-seeding: {}",
+            "[scenario_db] partial state {}/{} enriched - wiping and re-seeding: {}",
             enriched,
             mem_count,
             db_dir.display()
@@ -458,10 +459,10 @@ where
         db.clear_all_for_eval().await?;
     }
 
-    let docs = seed_docs_fn();
+    let docs = seed_docs();
     if docs.is_empty() {
         log::info!(
-            "[scenario_db] no seed docs for {} — skipping enrichment",
+            "[scenario_db] no seed docs for {} - skipping enrichment",
             db_dir.display()
         );
         return Ok(db);
