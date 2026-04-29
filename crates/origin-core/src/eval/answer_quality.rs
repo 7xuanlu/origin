@@ -1154,6 +1154,61 @@ async fn build_structured_context(
     Ok((structured_context, tokens))
 }
 
+/// Drive Phase 3 answer generation via `claude -p` subprocesses instead of the Batch API.
+///
+/// Set `EVAL_PHASE3_CLI=1` to use this path. Useful when the Anthropic API balance is
+/// insufficient for Batch API calls — this uses the Max subscription via OAuth instead.
+///
+/// Returns a `HashMap<String, String>` with `req_id -> answer` pairs in the same format that
+/// `download_batch_results` returns, so the Phase 4 merge loop needs no changes.
+///
+/// Per-request failures are logged as warnings and produce an empty answer string; they are
+/// skipped by the Phase 4 `pending.get(custom_id)` lookup because the answer is still present
+/// as a key — callers that need strict filtering should check `answer.is_empty()`.
+async fn run_phase3_via_cli(
+    batch_requests: Vec<(String, String, Option<String>, usize)>,
+    cli_concurrency: usize,
+) -> HashMap<String, String> {
+    use crate::llm_provider::{ClaudeCliProvider, LlmProvider, LlmRequest};
+    use futures::StreamExt;
+
+    eprintln!(
+        "[phase3_cli] Running {} requests via claude -p (concurrency={})",
+        batch_requests.len(),
+        cli_concurrency,
+    );
+
+    let provider = Arc::new(ClaudeCliProvider::haiku());
+
+    let results: HashMap<String, String> = futures::stream::iter(batch_requests)
+        .map(|(req_id, user_prompt, system_prompt, max_tokens)| {
+            let provider = provider.clone();
+            async move {
+                let request = LlmRequest {
+                    system_prompt,
+                    user_prompt,
+                    max_tokens: max_tokens as u32,
+                    temperature: 0.0,
+                    label: Some("phase3_cli".to_string()),
+                    timeout_secs: None,
+                };
+                match provider.generate(request).await {
+                    Ok(answer) => (req_id, answer),
+                    Err(e) => {
+                        eprintln!("[phase3_cli] WARN: req {req_id} failed: {e}");
+                        (req_id, String::new())
+                    }
+                }
+            }
+        })
+        .buffer_unordered(cli_concurrency)
+        .collect()
+        .await;
+
+    eprintln!("[phase3_cli] {} answers collected", results.len());
+    results
+}
+
 /// Full-pipeline LoCoMo eval using Batch API for answer generation.
 ///
 /// **Per-conversation DB**: each LoCoMo conversation gets its own isolated database so
@@ -1176,7 +1231,20 @@ pub async fn run_fullpipeline_locomo_batch(
     use crate::eval::judge::save_judgment_tuples;
     use crate::eval::locomo::{category_name, extract_observations, load_locomo};
 
-    let samples = load_locomo(locomo_path)?;
+    let samples_all = load_locomo(locomo_path)?;
+
+    // LOCOMO_LIMIT_CONVS=N: take only the first N conversations.  Useful for a quick
+    // smoke-test before committing to a full run.
+    let limit_convs: Option<usize> = std::env::var("LOCOMO_LIMIT_CONVS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let samples = if let Some(n) = limit_convs {
+        eprintln!("[fullpipeline] LOCOMO_LIMIT_CONVS={n}: limiting to first {n} conversations");
+        samples_all.into_iter().take(n).collect::<Vec<_>>()
+    } else {
+        samples_all
+    };
+
     let shared_embedder = eval_shared_embedder();
 
     // Resume
@@ -1492,30 +1560,44 @@ pub async fn run_fullpipeline_locomo_batch(
         return Ok(finished_tuples);
     }
 
-    // --- Phase 3: Batch answer generation ---
-    eprintln!(
-        "\n[fullpipeline] Submitting {} requests via Batch API (model={})",
-        batch_requests.len(),
-        answer_model
-    );
+    // --- Phase 3: Answer generation (Batch API or CLI subprocess) ---
+    let use_cli = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let cli_concurrency: usize = std::env::var("EVAL_PHASE3_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+    let raw_results: HashMap<String, String> = if use_cli {
+        eprintln!(
+            "\n[fullpipeline] EVAL_PHASE3_CLI=1: running {} requests via claude -p",
+            batch_requests.len()
+        );
+        run_phase3_via_cli(batch_requests, cli_concurrency).await
+    } else {
+        eprintln!(
+            "\n[fullpipeline] Submitting {} requests via Batch API (model={})",
+            batch_requests.len(),
+            answer_model
+        );
 
-    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
-    eprintln!("[fullpipeline] Batch submitted: {}", batch_id);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
 
-    let results_url = poll_batch(&client, api_key, &batch_id)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+        let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+        eprintln!("[fullpipeline] Batch submitted: {}", batch_id);
 
-    let raw_results = download_batch_results(&client, api_key, &results_url)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+        let results_url = poll_batch(&client, api_key, &batch_id)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+        download_batch_results(&client, api_key, &results_url)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?
+    };
 
     // --- Phase 4: Merge ---
     // Incremental save: persist after every 10 tuples so a mid-phase crash loses minimal work.
@@ -1899,30 +1981,44 @@ pub async fn run_fullpipeline_lme_batch(
         return Ok(finished_tuples);
     }
 
-    // --- Phase 3: Batch answer generation ---
-    eprintln!(
-        "\n[fullpipeline_lme] Submitting {} requests via Batch API (model={})",
-        batch_requests.len(),
-        answer_model
-    );
+    // --- Phase 3: Answer generation (Batch API or CLI subprocess) ---
+    let use_cli = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let cli_concurrency: usize = std::env::var("EVAL_PHASE3_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
+    let raw_results: HashMap<String, String> = if use_cli {
+        eprintln!(
+            "\n[fullpipeline_lme] EVAL_PHASE3_CLI=1: running {} requests via claude -p",
+            batch_requests.len()
+        );
+        run_phase3_via_cli(batch_requests, cli_concurrency).await
+    } else {
+        eprintln!(
+            "\n[fullpipeline_lme] Submitting {} requests via Batch API (model={})",
+            batch_requests.len(),
+            answer_model
+        );
 
-    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
-    eprintln!("[fullpipeline_lme] Batch submitted: {}", batch_id);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
 
-    let results_url = poll_batch(&client, api_key, &batch_id)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+        let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+        eprintln!("[fullpipeline_lme] Batch submitted: {}", batch_id);
 
-    let raw_results = download_batch_results(&client, api_key, &results_url)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+        let results_url = poll_batch(&client, api_key, &batch_id)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+        download_batch_results(&client, api_key, &results_url)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?
+    };
 
     // --- Phase 4: Merge ---
     // Incremental save: persist after every 10 tuples so a mid-phase crash loses minimal work.
