@@ -303,25 +303,66 @@ pub async fn run_entity_extraction_for_eval(
     db: &MemoryDB,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
 ) -> Result<usize, OriginError> {
-    use crate::prompts::PromptRegistry;
+    run_entity_extraction_for_eval_concurrent(db, llm, 1).await
+}
 
-    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
-    let batch_size = 10;
+/// Like `run_entity_extraction_for_eval` but with configurable per-memory concurrency.
+///
+/// Fetches all unlinked memories up front, then dispatches up to `concurrency` parallel
+/// `extract_single_memory_entities` calls via `buffer_unordered`. Benefit: overlaps LLM
+/// inference time across memories; DB writes still serialize through the internal Mutex.
+pub async fn run_entity_extraction_for_eval_concurrent(
+    db: &MemoryDB,
+    llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+    concurrency: usize,
+) -> Result<usize, OriginError> {
+    use crate::prompts::PromptRegistry;
+    use futures::StreamExt;
+
+    let prompts = Arc::new(PromptRegistry::load(&PromptRegistry::override_dir()));
     let mut total = 0usize;
 
-    // Keep extracting until no unlinked memories remain (or no progress)
+    // Drain all unlinked memories in batches, re-querying after each concurrent round
+    // so new entities written by one batch don't block the next.
     loop {
-        let extracted =
-            crate::refinery::extract_entities_from_memories(db, Some(llm), &prompts, batch_size)
-                .await?;
-        if extracted == 0 {
+        let unlinked = db.get_unlinked_memories(256).await?;
+        if unlinked.is_empty() {
             break;
         }
-        total += extracted;
+        let batch_len = unlinked.len();
+        let results: Vec<_> =
+            futures::stream::iter(unlinked.into_iter().map(|(source_id, content)| {
+                let llm = llm.clone();
+                let prompts = prompts.clone();
+                async move {
+                    crate::refinery::extract_single_memory_entities(
+                        db, &llm, &prompts, &source_id, &content,
+                    )
+                    .await
+                }
+            }))
+            .buffer_unordered(concurrency.max(1))
+            .collect()
+            .await;
+
+        let mut batch_extracted = 0usize;
+        for result in results {
+            match result {
+                Ok(Some(_)) => batch_extracted += 1,
+                Ok(None) => {}
+                Err(e) => log::warn!("[entity_extract] extraction failed: {}", e),
+            }
+        }
+        total += batch_extracted;
         eprintln!(
-            "    [entity_extract] batch: +{} entities (total: {})",
-            extracted, total
+            "    [entity_extract] batch: +{} entities from {} memories (total: {})",
+            batch_extracted, batch_len, total
         );
+
+        if batch_extracted == 0 {
+            // No progress despite unlinked memories remaining — break to avoid infinite loop.
+            break;
+        }
     }
 
     // Mark all memories as enriched so find_distillation_clusters includes them.
@@ -529,24 +570,38 @@ pub async fn enrich_db_for_eval(
 /// `post_ingest::enrich_title` per memory. Returns count of titles actually updated
 /// (some candidates may be rejected by the LLM or skipped).
 ///
-/// Serial — single inference thread on Qwen3-4B / 9B.
+/// Concurrency: up to `concurrency` parallel LLM calls (pass 1 for serial).
 pub async fn run_title_enrichment_for_eval(
     db: &MemoryDB,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+    concurrency: usize,
 ) -> Result<usize, OriginError> {
+    use futures::StreamExt;
+
     let candidates = db.get_memories_needing_title_enrichment().await?;
     let total_candidates = candidates.len();
     if total_candidates == 0 {
         return Ok(0);
     }
+
+    let results: Vec<_> = futures::stream::iter(candidates.into_iter().map(
+        |(source_id, content)| async move {
+            crate::post_ingest::enrich_title(db, &source_id, &content, llm).await
+        },
+    ))
+    .buffer_unordered(concurrency.max(1))
+    .collect()
+    .await;
+
     let mut updated = 0usize;
-    for (source_id, content) in &candidates {
-        if let Ok(crate::post_ingest::TitleEnrichResult::Enriched) =
-            crate::post_ingest::enrich_title(db, source_id, content, llm).await
-        {
-            updated += 1;
+    for result in results {
+        match result {
+            Ok(crate::post_ingest::TitleEnrichResult::Enriched) => updated += 1,
+            Ok(_) => {}
+            Err(e) => log::warn!("[title_enrich_local] title enrichment failed: {}", e),
         }
     }
+
     eprintln!(
         "    [title_enrich_local] {}/{} titles enriched",
         updated, total_candidates
@@ -558,10 +613,10 @@ pub async fn run_title_enrichment_for_eval(
 /// `refinery::extract_entities_from_memories` → `post_ingest::enrich_title` per memory →
 /// `refinery::distill_concepts`. Free but slow (Qwen3-4B serial ≈ several hours at LME scale).
 ///
-/// All three steps run **serially**, intentionally: Qwen3-4B can't sustain parallel LLM calls
-/// (single GPU inference thread, OOM under concurrent load). 9B has the same constraint at the
-/// inference-thread level. The Batch API path runs A+B parallel via `tokio::join!` because Anthropic
-/// dispatches its own infra; that does not apply here.
+/// Concurrency: entity + title phases dispatch up to `EVAL_ENRICHMENT_CONCURRENCY` parallel LLM
+/// calls (default 1 = serial). Distillation stays serial due to cluster ordering dependencies:
+/// `distill_concepts` builds clusters by scanning enrichment state written by prior phases, and
+/// splitting it would break the FK ordering assumptions in `find_distillation_clusters`.
 ///
 /// For staged evals (e.g. `pipeline.rs` Flat/Enriched/Distilled), call the three sub-steps
 /// independently — `run_entity_extraction_for_eval`, `run_title_enrichment_for_eval`,
@@ -573,8 +628,15 @@ pub async fn enrich_db_for_eval_local(
     use crate::prompts::PromptRegistry;
     use crate::tuning::DistillationConfig;
 
-    let entities = run_entity_extraction_for_eval(db, llm).await?;
-    let titles = run_title_enrichment_for_eval(db, llm).await?;
+    let concurrency: usize = std::env::var("EVAL_ENRICHMENT_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    eprintln!("    [enrich_local] concurrency={}", concurrency);
+
+    let entities = run_entity_extraction_for_eval_concurrent(db, llm, concurrency).await?;
+    let titles = run_title_enrichment_for_eval(db, llm, concurrency).await?;
 
     let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
     let tuning = DistillationConfig::default();

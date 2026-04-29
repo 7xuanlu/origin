@@ -63,5 +63,6 @@ env_logger = "0.11"
 # for BPE token counting in quality-cost benchmarks. Same pattern as tempfile above:
 # eval modules are not feature-gated, so their deps are regular deps.
 tiktoken-rs = "0.6"
+futures = { workspace = true }
 
 [dev-dependencies]

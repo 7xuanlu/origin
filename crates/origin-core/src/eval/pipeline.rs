@@ -500,7 +500,7 @@ pub async fn run_locomo_pipeline_eval(
         eprintln!("  [enriched] running entity extraction...");
         let extract_count = run_entity_extraction_for_eval(&db, &llm).await?;
         eprintln!("    extracted {} entities", extract_count);
-        let title_count = run_title_enrichment_for_eval(&db, &llm).await?;
+        let title_count = run_title_enrichment_for_eval(&db, &llm, 1).await?;
         eprintln!("    enriched {} titles", title_count);
 
         let (enriched_corpus_tokens, enriched_mem_count) = count_corpus_tokens(&db).await?;
@@ -814,7 +814,7 @@ pub async fn run_longmemeval_pipeline_eval(
 
         // ---- Enriched (entity extraction + title enrichment) ----
         let _extract_count = run_entity_extraction_for_eval(&db, &llm).await?;
-        let _title_count = run_title_enrichment_for_eval(&db, &llm).await?;
+        let _title_count = run_title_enrichment_for_eval(&db, &llm, 1).await?;
         let (enriched_corpus, enriched_count) = count_corpus_tokens(&db).await?;
         let enriched_cells = evaluate_condition(
             &db,

@@ -5261,6 +5261,7 @@ dependencies = [
  "encoding_rs",
  "env_logger",
  "fastembed",
+ "futures",
  "hf-hub",
  "libsql",
  "llama-cpp-2",
