@@ -248,6 +248,19 @@ impl OnDeviceProvider {
             .name("llm-provider-worker".into())
             .spawn(move || {
                 log::info!("[on_device_provider] worker thread started");
+
+                // Persistent LlamaContext: build lazily on first request, then
+                // reuse across all subsequent requests by clearing the KV cache
+                // between calls. Saves the per-call cost of `new_context()`
+                // (KV cache allocation + Metal pipeline rebuild) which was the
+                // dominant overhead under serial inference. If a request
+                // arrives with a different ctx_size, the context is rebuilt.
+                //
+                // n_batch is sized to the model's context_size so any
+                // tokenized prompt fits in a single decode call.
+                let mut persistent_ctx: Option<llama_cpp_2::context::LlamaContext<'_>> = None;
+                let mut persistent_ctx_size: u32 = 0;
+
                 while let Ok(req) = rx.recv() {
                     // Wrap in Qwen chat template so the model sees
                     // system/user/assistant turns instead of a raw blob.
@@ -270,21 +283,65 @@ impl OnDeviceProvider {
                         ),
                     };
 
-                    let result = match req.timeout_secs {
-                        Some(secs) => engine.run_inference_raw(
+                    // (Re)build the persistent context if missing or if the
+                    // requested ctx_size doesn't match the current allocation.
+                    if persistent_ctx.is_none() || persistent_ctx_size != req.ctx_size {
+                        // Explicit drop to free old KV cache before allocating
+                        // a new context. Avoids holding two contexts at once.
+                        let _ = persistent_ctx.take();
+                        persistent_ctx = engine.build_persistent_context(req.ctx_size);
+                        if persistent_ctx.is_some() {
+                            persistent_ctx_size = req.ctx_size;
+                            log::info!(
+                                "[on_device_provider] persistent context built (ctx_size={})",
+                                req.ctx_size
+                            );
+                        }
+                    }
+
+                    // Pick generation parameters: timeout and whether to strip
+                    // <think> tags. Mirrors the old run_inference (30s, strip)
+                    // vs run_inference_raw (configurable, raw) split.
+                    let (timeout_secs, strip_think) = match req.timeout_secs {
+                        Some(secs) => (secs, false),
+                        None => (30, true),
+                    };
+
+                    let result = match persistent_ctx.as_mut() {
+                        Some(ctx) => engine.run_inference_persistent(
+                            ctx,
                             &full_prompt,
                             req.max_tokens,
                             req.temperature,
-                            secs,
-                            req.ctx_size,
-                        ),
-                        None => engine.run_inference(
-                            &full_prompt,
-                            req.max_tokens,
-                            req.temperature,
-                            req.ctx_size,
+                            timeout_secs,
+                            strip_think,
                             req.label.as_deref(),
                         ),
+                        None => {
+                            // Fallback to per-call context if persistent build
+                            // failed (e.g., Metal queue exhaustion). Behavior
+                            // matches the pre-optimization path.
+                            log::warn!(
+                                "[on_device_provider] persistent context unavailable, \
+                                 falling back to per-call context"
+                            );
+                            match req.timeout_secs {
+                                Some(secs) => engine.run_inference_raw(
+                                    &full_prompt,
+                                    req.max_tokens,
+                                    req.temperature,
+                                    secs,
+                                    req.ctx_size,
+                                ),
+                                None => engine.run_inference(
+                                    &full_prompt,
+                                    req.max_tokens,
+                                    req.temperature,
+                                    req.ctx_size,
+                                    req.label.as_deref(),
+                                ),
+                            }
+                        }
                     };
 
                     let response = match result {
@@ -303,6 +360,9 @@ impl OnDeviceProvider {
                     // Ignore send error — caller may have dropped the receiver
                     let _ = req.response_tx.send(response);
                 }
+                // Drop the persistent context before exiting so Metal queues
+                // are released cleanly.
+                drop(persistent_ctx);
                 log::info!("[on_device_provider] worker thread exiting");
                 thread_available.store(false, Ordering::SeqCst);
             })

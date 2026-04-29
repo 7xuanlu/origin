@@ -11,6 +11,7 @@
 use crate::error::OriginError;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use std::sync::{Arc, OnceLock};
 
@@ -469,6 +470,166 @@ impl LlmEngine {
             None
         } else {
             Some(trimmed)
+        }
+    }
+
+    /// Build a long-lived context that the caller owns. Designed for the
+    /// `OnDeviceProvider` worker thread: one allocation, then `clear_kv_cache()`
+    /// between requests instead of `new_context()` every call.
+    ///
+    /// `n_batch` is set to `ctx_size` so any prompt up to the context window
+    /// fits in a single `decode()` call. `n_ubatch` defaults to the same value.
+    ///
+    /// Returns `None` if Metal context creation fails (caller should log and
+    /// fall back to per-call context creation, which is still valid).
+    pub fn build_persistent_context(&self, ctx_size: u32) -> Option<LlamaContext<'_>> {
+        let params = LlamaContextParams::default()
+            .with_n_ctx(Some(NonZeroU32::new(ctx_size)?))
+            .with_n_batch(ctx_size);
+        match self.model.new_context(&self.backend, params) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log::warn!("[llm_engine] persistent context creation failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Run inference reusing a caller-owned `LlamaContext`. The KV cache is
+    /// cleared at the start of each call, so callers must not assume any
+    /// session state persists between invocations. Saves the per-call cost of
+    /// `new_context()` (KV allocation + Metal pipeline setup), which is the
+    /// dominant overhead for short inference calls (~5-20s on M2 Pro for
+    /// quantized models at 8K context).
+    ///
+    /// `timeout_secs` and `strip_think` mirror the choices in `run_inference`
+    /// (30s + strip) vs `run_inference_raw` (configurable + raw). The worker
+    /// thread routes by `LlmRequest::timeout_secs` so we cover both paths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_inference_persistent(
+        &self,
+        ctx: &mut LlamaContext<'_>,
+        prompt: &str,
+        max_output_tokens: i32,
+        temperature: f32,
+        timeout_secs: u64,
+        strip_think: bool,
+        label: Option<&str>,
+    ) -> Option<String> {
+        let start = Instant::now();
+
+        // Reset KV cache from previous request. Cheap (no allocation) compared
+        // to creating a new context.
+        ctx.clear_kv_cache();
+
+        let tokens = match self.model.str_to_token(prompt, AddBos::Always) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[llm_engine] persistent tokenization failed: {e}");
+                return None;
+            }
+        };
+
+        let ctx_size = ctx.n_ctx();
+        let max_prompt_tokens = (ctx_size as usize).saturating_sub(max_output_tokens as usize);
+        if max_prompt_tokens == 0 {
+            log::warn!(
+                "[llm_engine] max_output_tokens={} >= ctx_size={}, refusing to run inference",
+                max_output_tokens,
+                ctx_size
+            );
+            return None;
+        }
+        let tokens = if tokens.len() > max_prompt_tokens {
+            tokens[..max_prompt_tokens].to_vec()
+        } else {
+            tokens
+        };
+
+        let mut batch = LlamaBatch::new(tokens.len(), 1);
+        for (i, token) in tokens.iter().enumerate() {
+            if batch
+                .add(*token, i as i32, &[0], i == tokens.len() - 1)
+                .is_err()
+            {
+                return None;
+            }
+        }
+
+        if ctx.decode(&mut batch).is_err() {
+            return None;
+        }
+
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::penalties(256, 1.2, 0.0, 0.0),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(42),
+        ]);
+
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut output = String::new();
+        let mut n_cur = batch.n_tokens();
+        let max_pos = n_cur + max_output_tokens;
+
+        while n_cur < max_pos {
+            if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
+                log::warn!(
+                    "[llm_engine] persistent inference timeout at {}s",
+                    timeout_secs
+                );
+                break;
+            }
+
+            let token = sampler.sample(ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
+
+            if self.model.is_eog_token(token) {
+                break;
+            }
+
+            match self.model.token_to_piece(token, &mut decoder, true, None) {
+                Ok(piece) => output.push_str(&piece),
+                Err(_) => break,
+            }
+
+            batch.clear();
+            if batch.add(token, n_cur, &[0], true).is_err() {
+                break;
+            }
+            if ctx.decode(&mut batch).is_err() {
+                break;
+            }
+            n_cur += 1;
+        }
+
+        let label_suffix = label.map(|l| format!(" [{}]", l)).unwrap_or_default();
+
+        if strip_think {
+            let cleaned = strip_think_tags(&output);
+            let trimmed = cleaned.trim().to_string();
+            log::info!(
+                "[llm_engine] persistent inference{}: {} chars in {:?}",
+                label_suffix,
+                trimmed.len(),
+                start.elapsed()
+            );
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        } else {
+            log::info!(
+                "[llm_engine] persistent raw inference{}: {} chars in {:?}",
+                label_suffix,
+                output.len(),
+                start.elapsed()
+            );
+            if output.is_empty() {
+                None
+            } else {
+                Some(output)
+            }
         }
     }
 
