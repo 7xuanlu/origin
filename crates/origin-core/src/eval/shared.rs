@@ -311,6 +311,8 @@ pub async fn run_entity_extraction_for_eval(
 /// Fetches all unlinked memories up front, then dispatches up to `concurrency` parallel
 /// `extract_single_memory_entities` calls via `buffer_unordered`. Benefit: overlaps LLM
 /// inference time across memories; DB writes still serialize through the internal Mutex.
+///
+/// Logs progress every 20 memories processed: phase, processed/total, elapsed, rate, eta.
 pub async fn run_entity_extraction_for_eval_concurrent(
     db: &MemoryDB,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
@@ -321,6 +323,8 @@ pub async fn run_entity_extraction_for_eval_concurrent(
 
     let prompts = Arc::new(PromptRegistry::load(&PromptRegistry::override_dir()));
     let mut total = 0usize;
+    let t0 = std::time::Instant::now();
+    let mut processed = 0usize;
 
     // Drain all unlinked memories in batches, re-querying after each concurrent round
     // so new entities written by one batch don't block the next.
@@ -352,6 +356,15 @@ pub async fn run_entity_extraction_for_eval_concurrent(
                 Ok(None) => {}
                 Err(e) => log::warn!("[entity_extract] extraction failed: {}", e),
             }
+            processed += 1;
+            if processed.is_multiple_of(20) {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let rate = processed as f64 / elapsed.max(0.001);
+                eprintln!(
+                    "[enrich] phase=entity processed={} elapsed={:.0}s rate={:.1}/s",
+                    processed, elapsed, rate,
+                );
+            }
         }
         total += batch_extracted;
         eprintln!(
@@ -375,6 +388,191 @@ pub async fn run_entity_extraction_for_eval_concurrent(
     );
 
     Ok(total)
+}
+
+/// Batched entity extraction for on-device LLMs (Qwen3.5-9B or larger).
+///
+/// Packs `batch_size` memories into a single numbered prompt, makes one LLM call per chunk,
+/// and parses per-memory entities from the response using `parse_kg_response`. This is the
+/// preferred path when `EVAL_ENRICHMENT_BATCH_SIZE > 1` because Metal is single-device — true
+/// parallelism doesn't help, but fewer round-trips per token amortizes inference overhead.
+///
+/// Qwen3.5-9B handles batches of 5-10 memories reliably. Qwen3-4B degrades above 1-2.
+///
+/// Returns total entity-linked memories (memories that got at least one entity).
+///
+/// Logs progress every 5 chunks: `[entity_extract_batched] chunk K/N: ...`.
+pub async fn run_entity_extraction_for_eval_batched(
+    db: &MemoryDB,
+    llm: &Arc<dyn crate::llm_provider::LlmProvider>,
+    batch_size: usize,
+) -> Result<usize, OriginError> {
+    use crate::extract::parse_kg_response;
+    use crate::prompts::PromptRegistry;
+
+    let batch_size = batch_size.max(1);
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+    let mut entity_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut total_linked = 0usize;
+    let t0 = std::time::Instant::now();
+
+    // Collect all unlinked memories once. Re-querying per chunk would re-fetch the same
+    // rows until `update_memory_entity_id` marks them linked — expensive and racy.
+    let all_unlinked = db.get_unlinked_memories(100_000).await?;
+    if all_unlinked.is_empty() {
+        eprintln!("[entity_extract_batched] no unlinked memories — skipping");
+        let marked = db.mark_all_memories_enriched_for_eval().await?;
+        eprintln!(
+            "[entity_extract_batched] marked {} memories as enriched",
+            marked
+        );
+        return Ok(0);
+    }
+
+    let total_memories = all_unlinked.len();
+    let chunks: Vec<&[(String, String)]> = all_unlinked.chunks(batch_size).collect();
+    let num_chunks = chunks.len();
+
+    eprintln!(
+        "[entity_extract_batched] {} memories in {} chunks (batch_size={})",
+        total_memories, num_chunks, batch_size
+    );
+
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        // Format numbered prompt: "1. <content>\n2. <content>\n..."
+        let numbered: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, (_, content))| {
+                let truncated: String = content.chars().take(500).collect();
+                format!("{}. {}", i + 1, truncated)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let response = llm
+            .generate(crate::llm_provider::LlmRequest {
+                system_prompt: Some(prompts.extract_knowledge_graph.clone()),
+                user_prompt: numbered,
+                max_tokens: ((chunk.len() * 256) as u32).max(512),
+                temperature: 0.3,
+                label: Some(format!("batch_extract_chunk_{}", chunk_idx)),
+            })
+            .await;
+
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "[entity_extract_batched] chunk {}/{}: LLM failed: {}",
+                    chunk_idx + 1,
+                    num_chunks,
+                    e
+                );
+                continue;
+            }
+        };
+
+        // parse_kg_response expects (index, content) pairs — index is used to map
+        // numbered sections back to individual memories.
+        let indexed: Vec<(usize, String)> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, (_, c))| (i, c.clone()))
+            .collect();
+        let kg_results = parse_kg_response(&response, &indexed);
+
+        let mut chunk_entities = 0usize;
+        let mut chunk_linked = 0usize;
+
+        for (mem_idx, kg) in kg_results.iter().enumerate() {
+            if mem_idx >= chunk.len() {
+                break;
+            }
+            let (source_id, _) = &chunk[mem_idx];
+            let mut first_entity_id: Option<String> = None;
+
+            for entity in &kg.entities {
+                match crate::importer::resolve_or_create_entity(
+                    db,
+                    &mut entity_cache,
+                    entity,
+                    "batch_eval",
+                )
+                .await
+                {
+                    Ok((id, _)) => {
+                        chunk_entities += 1;
+                        if first_entity_id.is_none() {
+                            first_entity_id = Some(id);
+                        }
+                    }
+                    Err(e) => log::warn!("[entity_extract_batched] entity create failed: {e}"),
+                }
+            }
+            for obs in &kg.observations {
+                if let Some(entity_id) = entity_cache.get(&obs.entity.to_lowercase()) {
+                    let _ = db
+                        .add_observation(entity_id, &obs.content, Some("batch_eval"), None)
+                        .await;
+                }
+            }
+            for rel in &kg.relations {
+                let from_id = entity_cache.get(&rel.from.to_lowercase()).cloned();
+                let to_id = entity_cache.get(&rel.to.to_lowercase()).cloned();
+                if let (Some(from), Some(to)) = (from_id, to_id) {
+                    let _ = db
+                        .create_relation(
+                            &from,
+                            &to,
+                            &rel.relation_type,
+                            Some("batch_eval"),
+                            rel.confidence,
+                            rel.explanation.as_deref(),
+                            Some(source_id),
+                        )
+                        .await;
+                }
+            }
+
+            if let Some(ref eid) = first_entity_id {
+                let _ = db.update_memory_entity_id(source_id, eid).await;
+                chunk_linked += 1;
+            }
+        }
+
+        total_linked += chunk_linked;
+
+        if (chunk_idx + 1) % 5 == 0 || chunk_idx + 1 == num_chunks {
+            let elapsed = t0.elapsed().as_secs_f64();
+            let rate = (chunk_idx + 1) as f64 / elapsed.max(0.001);
+            let eta = if rate > 0.0 {
+                (num_chunks - chunk_idx - 1) as f64 / rate
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[entity_extract_batched] chunk {}/{}: extracted {} entities from {} memories (total_linked: {}) elapsed={:.0}s rate={:.1}chunk/s eta={:.0}s",
+                chunk_idx + 1,
+                num_chunks,
+                chunk_entities,
+                chunk.len(),
+                total_linked,
+                elapsed,
+                rate,
+                eta,
+            );
+        }
+    }
+
+    let marked = db.mark_all_memories_enriched_for_eval().await?;
+    eprintln!(
+        "[entity_extract_batched] done: {} memories linked, {} marked enriched",
+        total_linked, marked
+    );
+
+    Ok(total_linked)
 }
 
 /// Resolve the per-scenario DB directory under `baselines/fullpipeline/{benchmark}/{scenario_id}/`.
@@ -571,6 +769,7 @@ pub async fn enrich_db_for_eval(
 /// (some candidates may be rejected by the LLM or skipped).
 ///
 /// Concurrency: up to `concurrency` parallel LLM calls (pass 1 for serial).
+/// Logs progress every 20 memories: phase, processed, elapsed, rate.
 pub async fn run_title_enrichment_for_eval(
     db: &MemoryDB,
     llm: &Arc<dyn crate::llm_provider::LlmProvider>,
@@ -584,12 +783,18 @@ pub async fn run_title_enrichment_for_eval(
         return Ok(0);
     }
 
+    let t0 = std::time::Instant::now();
+    let mut processed = 0usize;
+
     let results: Vec<_> = futures::stream::iter(candidates.into_iter().map(
         |(source_id, content)| async move {
             crate::post_ingest::enrich_title(db, &source_id, &content, llm).await
         },
     ))
     .buffer_unordered(concurrency.max(1))
+    .inspect(|_| {
+        // Note: inspect runs before collect; count is approximate within a concurrent batch.
+    })
     .collect()
     .await;
 
@@ -599,6 +804,16 @@ pub async fn run_title_enrichment_for_eval(
             Ok(crate::post_ingest::TitleEnrichResult::Enriched) => updated += 1,
             Ok(_) => {}
             Err(e) => log::warn!("[title_enrich_local] title enrichment failed: {}", e),
+        }
+        processed += 1;
+        if processed.is_multiple_of(20) {
+            let elapsed = t0.elapsed().as_secs_f64();
+            let rate = processed as f64 / elapsed.max(0.001);
+            let eta = (total_candidates - processed) as f64 / rate.max(0.001);
+            eprintln!(
+                "[enrich] phase=title processed={}/{} elapsed={:.0}s rate={:.1}/s eta={:.0}s",
+                processed, total_candidates, elapsed, rate, eta,
+            );
         }
     }
 
@@ -618,6 +833,12 @@ pub async fn run_title_enrichment_for_eval(
 /// `distill_concepts` builds clusters by scanning enrichment state written by prior phases, and
 /// splitting it would break the FK ordering assumptions in `find_distillation_clusters`.
 ///
+/// Batching: when `EVAL_ENRICHMENT_BATCH_SIZE > 1`, entity extraction uses
+/// `run_entity_extraction_for_eval_batched` instead of the per-memory concurrent path.
+/// Batch mode packs multiple memories into one LLM call, which is faster on single-device Metal
+/// where true concurrency is limited. Qwen3.5-9B handles batch_size=5-10 reliably;
+/// Qwen3-4B degrades above 1-2. Default (1) preserves current per-memory behavior.
+///
 /// For staged evals (e.g. `pipeline.rs` Flat/Enriched/Distilled), call the three sub-steps
 /// independently — `run_entity_extraction_for_eval`, `run_title_enrichment_for_eval`,
 /// `refinery::distill_concepts` — so each stage can be measured in isolation.
@@ -633,9 +854,21 @@ pub async fn enrich_db_for_eval_local(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    eprintln!("    [enrich_local] concurrency={}", concurrency);
+    let batch_size: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
-    let entities = run_entity_extraction_for_eval_concurrent(db, llm, concurrency).await?;
+    eprintln!(
+        "    [enrich_local] concurrency={} batch_size={}",
+        concurrency, batch_size
+    );
+
+    let entities = if batch_size > 1 {
+        run_entity_extraction_for_eval_batched(db, llm, batch_size).await?
+    } else {
+        run_entity_extraction_for_eval_concurrent(db, llm, concurrency).await?
+    };
     let titles = run_title_enrichment_for_eval(db, llm, concurrency).await?;
 
     let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
