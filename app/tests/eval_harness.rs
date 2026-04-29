@@ -2425,6 +2425,170 @@ async fn smoke_per_scenario_locomo() {
     eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
 }
 
+/// Manual smoke for per-scenario enrichment using Claude CLI provider (D2).
+///
+/// Validates that `EnrichmentMode::OnDevice(ClaudeCliProvider)` works end-to-end:
+/// seed → concurrent entity extraction + title enrichment (EVAL_ENRICHMENT_CONCURRENCY=4)
+/// → distillation → isolation check. Uses claude-haiku-4-5-20251001 via Max plan.
+///
+/// - 1 LoCoMo conversation, 5 observations (small: CLI subprocess ~2-3s/call)
+/// - Expected duration: ~20s (5 obs × 2 phases / 4 concurrency × 3s + distill)
+/// - Skips silently if `claude` binary is not in PATH
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness smoke_per_scenario_locomo_cli -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_locomo_cli() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+    use std::sync::Arc;
+
+    // Probe for `claude` binary — skip silently if not available.
+    let probe = std::process::Command::new("claude")
+        .arg("--version")
+        .output();
+    match probe {
+        Ok(out) if out.status.success() => {
+            eprintln!(
+                "[smoke-cli] claude binary found: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        _ => {
+            eprintln!(
+                "SKIP: `claude` binary not in PATH — install Claude Code CLI to run this smoke"
+            );
+            return;
+        }
+    }
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    assert!(!samples.is_empty(), "need at least 1 LoCoMo sample");
+
+    // Set EVAL_ENRICHMENT_CONCURRENCY=4 for this test scope.
+    // SAFETY: single-threaded test setup; env var is read by enrich_db_for_eval_local.
+    let prev_concurrency = std::env::var("EVAL_ENRICHMENT_CONCURRENCY").ok();
+    std::env::set_var("EVAL_ENRICHMENT_CONCURRENCY", "4");
+    // Restore on drop via a simple guard.
+    struct EnvGuard(Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("EVAL_ENRICHMENT_CONCURRENCY", v),
+                None => std::env::remove_var("EVAL_ENRICHMENT_CONCURRENCY"),
+            }
+        }
+    }
+    let _env_guard = EnvGuard(prev_concurrency);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!("[smoke-cli] baselines: {}", baselines_dir.display());
+
+    let cli_llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::ClaudeCliProvider::new("claude-haiku-4-5-20251001"),
+    );
+    let enrichment = EnrichmentMode::OnDevice(cli_llm);
+    let shared_embedder = eval_shared_embedder();
+
+    // 1 conversation × 5 observations — small enough for CLI subprocess overhead.
+    const MAX_OBS: usize = 5;
+    let sample = &samples[0];
+    let mut memories = extract_observations(sample);
+    memories.truncate(MAX_OBS);
+
+    eprintln!(
+        "[smoke-cli] {} ({} obs) -> open_or_seed",
+        sample.sample_id,
+        memories.len()
+    );
+
+    let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+    let sample_id = sample.sample_id.clone();
+    let memories_owned = memories.clone();
+    let t0 = std::time::Instant::now();
+
+    let db = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("open_or_seed_scenario_db CLI");
+
+    let elapsed = t0.elapsed().as_secs_f32();
+
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched = db.enriched_memory_count().await.unwrap_or(0);
+
+    eprintln!(
+        "[smoke-cli] done in {:.1}s — mem={} enriched={}",
+        elapsed, mem_count, enriched
+    );
+
+    assert!(mem_count > 0, "should have seeded memories");
+    assert_eq!(
+        mem_count, enriched,
+        "should be fully enriched ({}/{})",
+        enriched, mem_count
+    );
+    assert!(
+        scope_dir.join("origin_memory.db").exists(),
+        "DB file should exist"
+    );
+
+    // Verify retrieval is scoped to this sample.
+    let results = db
+        .search_memory("anything", 50, None, None, None, None, None, None)
+        .await
+        .expect("search_memory");
+    let expected_prefix = format!("locomo_{}_obs_", sample.sample_id);
+    for r in &results {
+        assert!(
+            r.source_id.starts_with(&expected_prefix),
+            "cross-conv leak! source_id={} (expected prefix {})",
+            r.source_id,
+            expected_prefix
+        );
+    }
+
+    eprintln!(
+        "\n=== smoke_per_scenario_locomo_cli PASSED in {:.1}s ===",
+        elapsed
+    );
+    eprintln!("  CLI enrichment (concurrency=4): ✓");
+    eprintln!("  mem={} enriched={}: ✓", mem_count, enriched);
+    eprintln!("  retrieval scoped to own conv: ✓");
+}
+
 /// Manual smoke for LME per-scenario DB refactor (T3).
 ///
 /// Mirrors `smoke_per_scenario_locomo` but for LongMemEval:
