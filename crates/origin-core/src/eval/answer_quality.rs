@@ -1226,7 +1226,7 @@ pub async fn run_fullpipeline_locomo_batch(
 
             let sample_id = sample.sample_id.clone();
             let memories_owned = memories.clone();
-            let db = crate::eval::shared::open_or_seed_scenario_db(
+            let db = match crate::eval::shared::open_or_seed_scenario_db(
                 &scope_dir,
                 shared_embedder.clone(),
                 move || {
@@ -1247,7 +1247,17 @@ pub async fn run_fullpipeline_locomo_batch(
                 },
                 &enrichment,
             )
-            .await?;
+            .await
+            {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                        sample.sample_id, e
+                    );
+                    continue;
+                }
+            };
 
             let db_mem_count = db.memory_count().await.unwrap_or(0);
             let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
@@ -1279,8 +1289,17 @@ pub async fn run_fullpipeline_locomo_batch(
                 }
 
                 let category = category_name(qa.category);
-                let (ctx, ctx_tokens) =
-                    build_structured_context(&db, &qa.question, 10, None).await?;
+                let ctx_result = build_structured_context(&db, &qa.question, 10, None).await;
+                let (ctx, ctx_tokens) = match ctx_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "[fullpipeline] WARN: scenario {} question context failed: {}. Skipping question.",
+                            sample.sample_id, e
+                        );
+                        continue;
+                    }
+                };
 
                 let req_id = format!("q_{}_{}", sample.sample_id, q_count);
                 batch_requests.push((
@@ -1340,7 +1359,7 @@ pub async fn run_fullpipeline_locomo_batch(
 
                         let sample_id = sample.sample_id.clone();
                         let memories_owned = memories.clone();
-                        let db = crate::eval::shared::open_or_seed_scenario_db(
+                        let db = match crate::eval::shared::open_or_seed_scenario_db(
                             &scope_dir,
                             shared_embedder,
                             move || {
@@ -1364,7 +1383,17 @@ pub async fn run_fullpipeline_locomo_batch(
                             },
                             &enrichment_arc,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(db) => db,
+                            Err(e) => {
+                                eprintln!(
+                                    "[fullpipeline] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                                    sample.sample_id, e
+                                );
+                                return Ok(Vec::new());
+                            }
+                        };
 
                         let db_mem_count = db.memory_count().await.unwrap_or(0);
                         let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
@@ -1397,8 +1426,19 @@ pub async fn run_fullpipeline_locomo_batch(
                             }
 
                             let category = category_name(qa.category);
-                            let (ctx, ctx_tokens) =
-                                build_structured_context(&db, &qa.question, 10, None).await?;
+                            let ctx_result =
+                                build_structured_context(&db, &qa.question, 10, None)
+                                    .await;
+                            let (ctx, ctx_tokens) = match ctx_result {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[fullpipeline] WARN: scenario {} question context failed: {}. Skipping question.",
+                                        sample.sample_id, e
+                                    );
+                                    continue;
+                                }
+                            };
 
                             let req_id = format!("q_{}_{}", sample.sample_id, q_count);
                             entries.push((
@@ -1428,7 +1468,16 @@ pub async fn run_fullpipeline_locomo_batch(
                 .await;
 
         for result in scenario_outputs {
-            let entries = result?;
+            let entries = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline] WARN: scenario stream error: {}. Skipping.",
+                        e
+                    );
+                    continue;
+                }
+            };
             for (req_id, prompt, system, max_tok, _sid, meta) in entries {
                 batch_requests.push((req_id.clone(), prompt, system, max_tok));
                 pending.insert(req_id, meta);
@@ -1469,6 +1518,7 @@ pub async fn run_fullpipeline_locomo_batch(
         .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
 
     // --- Phase 4: Merge ---
+    // Incremental save: persist after every 10 tuples so a mid-phase crash loses minimal work.
     let mut matched = 0usize;
     for (custom_id, answer) in &raw_results {
         if let Some(meta) = pending.get(custom_id) {
@@ -1481,6 +1531,11 @@ pub async fn run_fullpipeline_locomo_batch(
                 category: meta.category.clone(),
             });
             matched += 1;
+            if matched.is_multiple_of(10) {
+                if let Err(e) = save_judgment_tuples(&finished_tuples, output_path) {
+                    eprintln!("[fullpipeline] WARN: incremental save failed: {e}");
+                }
+            }
         }
     }
 
@@ -1587,7 +1642,7 @@ pub async fn run_fullpipeline_lme_batch(
             let question_id = sample.question_id.clone();
             let question_type = sample.question_type.clone();
             let memories_owned = memories.clone();
-            let db = crate::eval::shared::open_or_seed_scenario_db(
+            let db = match crate::eval::shared::open_or_seed_scenario_db(
                 &scope_dir,
                 shared_embedder.clone(),
                 move || {
@@ -1617,7 +1672,17 @@ pub async fn run_fullpipeline_lme_batch(
                 },
                 &enrichment,
             )
-            .await?;
+            .await
+            {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline_lme] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                        sample.question_id, e
+                    );
+                    continue;
+                }
+            };
 
             let db_mem_count = db.memory_count().await.unwrap_or(0);
             let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
@@ -1630,8 +1695,17 @@ pub async fn run_fullpipeline_lme_batch(
             );
 
             let category = category_name(&sample.question_type);
-            let (ctx, ctx_tokens) =
-                build_structured_context(&db, &sample.question, 10, None).await?;
+            let ctx_result = build_structured_context(&db, &sample.question, 10, None).await;
+            let (ctx, ctx_tokens) = match ctx_result {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline_lme] WARN: scenario {} context build failed: {}. Skipping.",
+                        sample.question_id, e
+                    );
+                    continue;
+                }
+            };
 
             let req_id = format!("q_lme_{}", q_idx);
             batch_requests.push((
@@ -1708,7 +1782,7 @@ pub async fn run_fullpipeline_lme_batch(
                         let question_id = sample.question_id.clone();
                         let question_type = sample.question_type.clone();
                         let memories_owned = memories.clone();
-                        let db = crate::eval::shared::open_or_seed_scenario_db(
+                        let db = match crate::eval::shared::open_or_seed_scenario_db(
                             &scope_dir,
                             shared_embedder,
                             move || {
@@ -1741,7 +1815,17 @@ pub async fn run_fullpipeline_lme_batch(
                             },
                             &enrichment_arc,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(db) => db,
+                            Err(e) => {
+                                eprintln!(
+                                    "[fullpipeline_lme] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                                    sample.question_id, e
+                                );
+                                return Ok(Vec::new());
+                            }
+                        };
 
                         let db_mem_count = db.memory_count().await.unwrap_or(0);
                         let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
@@ -1754,8 +1838,18 @@ pub async fn run_fullpipeline_lme_batch(
                         );
 
                         let category = category_name(&sample.question_type);
-                        let (ctx, ctx_tokens) =
-                            build_structured_context(&db, &sample.question, 10, None).await?;
+                        let ctx_result =
+                            build_structured_context(&db, &sample.question, 10, None).await;
+                        let (ctx, ctx_tokens) = match ctx_result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!(
+                                    "[fullpipeline_lme] WARN: scenario {} context build failed: {}. Skipping.",
+                                    sample.question_id, e
+                                );
+                                return Ok(Vec::new());
+                            }
+                        };
 
                         let req_id = format!("q_lme_{}", q_idx);
                         if q_idx % 100 == 99 {
@@ -1781,7 +1875,16 @@ pub async fn run_fullpipeline_lme_batch(
                 .await;
 
         for result in scenario_outputs {
-            let entries = result?;
+            let entries = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline_lme] WARN: scenario stream error: {}. Skipping.",
+                        e
+                    );
+                    continue;
+                }
+            };
             for (req_id, prompt, system, max_tok, meta) in entries {
                 batch_requests.push((req_id.clone(), prompt, system, max_tok));
                 pending.insert(req_id, meta);
@@ -1822,6 +1925,7 @@ pub async fn run_fullpipeline_lme_batch(
         .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
 
     // --- Phase 4: Merge ---
+    // Incremental save: persist after every 10 tuples so a mid-phase crash loses minimal work.
     let mut matched = 0usize;
     for (custom_id, answer) in &raw_results {
         if let Some(meta) = pending.get(custom_id) {
@@ -1834,6 +1938,11 @@ pub async fn run_fullpipeline_lme_batch(
                 category: meta.category.clone(),
             });
             matched += 1;
+            if matched.is_multiple_of(10) {
+                if let Err(e) = save_judgment_tuples(&finished_tuples, output_path) {
+                    eprintln!("[fullpipeline_lme] WARN: incremental save failed: {e}");
+                }
+            }
         }
     }
 
