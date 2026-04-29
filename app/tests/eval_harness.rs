@@ -2232,11 +2232,14 @@ async fn smoke_fullpipeline() {
 /// 4. Re-runs `open_or_seed_scenario_db` to confirm cache-hit branch (no re-enrich).
 /// 5. Asserts the two per-conv DBs are PHYSICALLY ISOLATED (no cross-conv source_ids).
 ///
+/// Parameterizable via env for use as a pre-flight probe before a full LoCoMo run.
+///
 /// On-device Qwen3-4B (free, Metal GPU). Requires `--ignored --nocapture`.
 ///
-/// ```bash
-/// cargo test -p origin --test eval_harness smoke_per_scenario_locomo -- --ignored --nocapture
-/// ```
+/// Run as probe before full LME/LoCoMo:
+///   SMOKE_LOCOMO_SAMPLES=10 EVAL_LOCAL_MODEL=qwen3.5-9b EVAL_ENRICHMENT_BATCH_SIZE=8 \
+///   cargo test -p origin --test eval_harness smoke_per_scenario_locomo -- --ignored --nocapture
+/// Default config (2 samples x 10 obs) is the CI smoke.
 #[tokio::test]
 #[ignore]
 async fn smoke_per_scenario_locomo() {
@@ -2254,7 +2257,19 @@ async fn smoke_per_scenario_locomo() {
     }
 
     let samples = load_locomo(&locomo_path).unwrap();
-    assert!(samples.len() >= 2, "need >=2 LoCoMo samples for smoke");
+    let n_samples: usize = std::env::var("SMOKE_LOCOMO_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let max_obs_per_conv: usize = std::env::var("SMOKE_LOCOMO_MAX_OBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    assert!(
+        samples.len() >= n_samples.min(2),
+        "need >={} LoCoMo samples for smoke",
+        n_samples.min(2)
+    );
 
     // Tempdir for baselines so we don't pollute real eval cache
     let tmp = tempfile::tempdir().unwrap();
@@ -2269,16 +2284,14 @@ async fn smoke_per_scenario_locomo() {
         .expect("EnrichmentMode::from_env");
     let shared_embedder = eval_shared_embedder();
 
-    // Truncate aggressively: 2 conversations, 10 observations each.
-    // Smoke validates structural correctness; full enrichment runs are tested separately.
-    const MAX_OBS_PER_CONV: usize = 10;
-    let pair = &samples[..2];
+    let pair = &samples[..n_samples.min(samples.len())];
     let mut per_sample_source_ids: Vec<Vec<String>> = Vec::new();
+    let mut total_mems_processed: usize = 0;
 
     let smoke_t0 = std::time::Instant::now();
     for sample in pair {
         let mut memories = extract_observations(sample);
-        memories.truncate(MAX_OBS_PER_CONV);
+        memories.truncate(max_obs_per_conv);
         eprintln!(
             "[smoke-per-scenario] {} ({} obs, truncated from full) -> open_or_seed",
             sample.sample_id,
@@ -2317,6 +2330,7 @@ async fn smoke_per_scenario_locomo() {
 
         let mem_count = db.memory_count().await.unwrap_or(0);
         let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        total_mems_processed += mem_count;
         eprintln!(
             "[smoke-per-scenario] {}: seed+enrich done in {:.1}s, mem={} enriched={}",
             sample.sample_id, conv_elapsed, mem_count, enriched
@@ -2371,7 +2385,7 @@ async fn smoke_per_scenario_locomo() {
     // Cache-hit verification: re-open first conv. Should NOT re-enrich.
     let sample = &pair[0];
     let mut memories = extract_observations(sample);
-    memories.truncate(MAX_OBS_PER_CONV);
+    memories.truncate(max_obs_per_conv);
     let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
     let sample_id_2 = sample.sample_id.clone();
     let memories_owned_2 = memories.clone();
@@ -2418,11 +2432,26 @@ async fn smoke_per_scenario_locomo() {
     eprintln!("  per-conv DB layout: ✓");
     eprintln!(
         "  enrichment per-conv (truncated to {} obs each): ✓",
-        MAX_OBS_PER_CONV
+        max_obs_per_conv
     );
     eprintln!("  retrieval scoped to own conv: ✓");
     eprintln!("  cross-conv source_id isolation: ✓");
     eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
+
+    // Extrapolation summary — useful for pre-flight estimation.
+    let mean_per_mem_sec = total_elapsed / total_mems_processed.max(1) as f32;
+    let full_locomo_estimate_min = (mean_per_mem_sec * 500.0) / 60.0;
+    eprintln!(
+        "[smoke-locomo] SUMMARY: {} samples x ~{} obs = {} obs in {:.1}s ({:.2}s/obs). \
+         Full LoCoMo (~500 obs) extrapolated: ~{:.1} min (~{:.1} hours).",
+        n_samples,
+        max_obs_per_conv,
+        total_mems_processed,
+        total_elapsed,
+        mean_per_mem_sec,
+        full_locomo_estimate_min,
+        full_locomo_estimate_min / 60.0,
+    );
 }
 
 /// Manual smoke for per-scenario enrichment using Claude CLI provider (D2).
@@ -2592,16 +2621,20 @@ async fn smoke_per_scenario_locomo_cli() {
 /// Manual smoke for LME per-scenario DB refactor (T3).
 ///
 /// Mirrors `smoke_per_scenario_locomo` but for LongMemEval:
-/// - 2 LME samples (each = own simulated user history)
-/// - Truncated to 5 memories per sample for fast on-device enrichment
+/// Smoke-tests per-scenario LME enrichment. Also serves as a pre-flight probe before a
+/// full LME run: set SMOKE_LME_SAMPLES=10 to cover more scenarios and see extrapolated
+/// wall-time for the full 500-question dataset.
+///
 /// - Per-question DB at `{tempdir}/fullpipeline/lme/{question_id}/`
 /// - Verifies isolation, cache reuse, mem==enriched
+/// - Prints per-mem timing and full-LME extrapolation at end
 ///
 /// On-device Qwen3-4B, ~60-90s on Metal GPU. Requires `--ignored --nocapture`.
 ///
-/// ```bash
-/// cargo test -p origin --test eval_harness smoke_per_scenario_lme -- --ignored --nocapture
-/// ```
+/// Run as probe before full LME/LoCoMo:
+///   SMOKE_LME_SAMPLES=10 EVAL_LOCAL_MODEL=qwen3.5-9b EVAL_ENRICHMENT_BATCH_SIZE=8 \
+///   cargo test -p origin --test eval_harness smoke_per_scenario_lme -- --ignored --nocapture
+/// Default config (2 samples x 5 mems) is the CI smoke.
 #[tokio::test]
 #[ignore]
 async fn smoke_per_scenario_lme() {
@@ -2619,7 +2652,19 @@ async fn smoke_per_scenario_lme() {
     }
 
     let samples = load_longmemeval(&lme_path).unwrap();
-    assert!(samples.len() >= 2, "need >=2 LME samples for smoke");
+    let n_samples: usize = std::env::var("SMOKE_LME_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let max_mem_per_sample: usize = std::env::var("SMOKE_LME_MAX_MEMS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    assert!(
+        samples.len() >= n_samples.min(2),
+        "need >={} LME samples for smoke",
+        n_samples.min(2)
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     let baselines_dir = tmp.path().to_path_buf();
@@ -2629,14 +2674,14 @@ async fn smoke_per_scenario_lme() {
         .expect("EnrichmentMode::from_env");
     let shared_embedder = eval_shared_embedder();
 
-    const MAX_MEM_PER_SAMPLE: usize = 5;
-    let pair = &samples[..2];
+    let pair = &samples[..n_samples.min(samples.len())];
     let mut per_sample_source_ids: Vec<Vec<String>> = Vec::new();
+    let mut total_mems_processed: usize = 0;
 
     let smoke_t0 = std::time::Instant::now();
     for sample in pair {
         let mut memories = extract_memories(sample);
-        memories.truncate(MAX_MEM_PER_SAMPLE);
+        memories.truncate(max_mem_per_sample);
         eprintln!(
             "[smoke-lme] {} ({} mems, truncated) -> open_or_seed",
             sample.question_id,
@@ -2685,6 +2730,7 @@ async fn smoke_per_scenario_lme() {
 
         let mem_count = db.memory_count().await.unwrap_or(0);
         let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        total_mems_processed += mem_count;
         eprintln!(
             "[smoke-lme] {}: seed+enrich done in {:.1}s, mem={} enriched={}",
             sample.question_id, conv_elapsed, mem_count, enriched
@@ -2738,7 +2784,7 @@ async fn smoke_per_scenario_lme() {
     // Cache-hit re-open
     let sample = &pair[0];
     let mut memories = extract_memories(sample);
-    memories.truncate(MAX_MEM_PER_SAMPLE);
+    memories.truncate(max_mem_per_sample);
     let scope_dir = scenario_db_dir(&baselines_dir, "lme", &sample.question_id);
     let question_id_2 = sample.question_id.clone();
     let question_type_2 = sample.question_type.clone();
@@ -2795,11 +2841,26 @@ async fn smoke_per_scenario_lme() {
     eprintln!("  per-question DB layout: ✓");
     eprintln!(
         "  enrichment per-scenario (truncated to {} mems each): ✓",
-        MAX_MEM_PER_SAMPLE
+        max_mem_per_sample
     );
     eprintln!("  retrieval scoped to own scenario: ✓");
     eprintln!("  cross-scenario source_id isolation: ✓");
     eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
+
+    // Extrapolation summary — useful for pre-flight estimation.
+    let mean_per_mem_sec = total_elapsed / total_mems_processed.max(1) as f32;
+    let full_lme_estimate_min = (mean_per_mem_sec * 10_000.0) / 60.0;
+    eprintln!(
+        "[smoke-lme] SUMMARY: {} samples x ~{} mems = {} mems in {:.1}s ({:.2}s/mem). \
+         Full LME (~10k mems) extrapolated: ~{:.1} min (~{:.1} hours).",
+        n_samples,
+        max_mem_per_sample,
+        total_mems_processed,
+        total_elapsed,
+        mean_per_mem_sec,
+        full_lme_estimate_min,
+        full_lme_estimate_min / 60.0,
+    );
 }
 
 /// Judge LME tuples via Claude CLI (Max plan, no API key).
@@ -3223,215 +3284,5 @@ async fn probe_overlap_gate() {
                 kept_q as f64 / total_q.max(1) as f64 * 100.0
             );
         }
-    }
-}
-
-/// Pre-flight probe for full LME enrichment — run this before any 14M-token LME run
-/// to estimate wall-time and verify enrichment quality on-device.
-///
-/// Takes the first 10 LME questions, opens/seeds per-scenario DBs (truncated to 5 mems
-/// each for speed), times entity extraction per question, and prints a summary:
-///   total memories, total LLM calls, total elapsed, mean per-memory time.
-///
-/// Sets `EVAL_LOCAL_MODEL=qwen3.5-9b` by default when the env var is unset, since this
-/// probe is intended for the 9B model path. Override via `EVAL_LOCAL_MODEL=qwen3-4b`.
-///
-/// Operator decision gate: if mean per-memory time > 60s, abort the full LME run.
-///
-/// ```bash
-/// cargo test -p origin --test eval_harness probe_lme_enrichment -- --ignored --nocapture
-/// EVAL_LOCAL_MODEL=qwen3-4b cargo test -p origin --test eval_harness probe_lme_enrichment -- --ignored --nocapture
-/// EVAL_ENRICHMENT_BATCH_SIZE=5 cargo test -p origin --test eval_harness probe_lme_enrichment -- --ignored --nocapture
-/// ```
-#[tokio::test]
-#[ignore]
-async fn probe_lme_enrichment() {
-    use origin_lib::eval::longmemeval::{extract_memories, load_longmemeval};
-    use origin_lib::eval::shared::{
-        eval_shared_embedder, open_or_seed_scenario_db, run_entity_extraction_for_eval_batched,
-        run_entity_extraction_for_eval_concurrent, scenario_db_dir, EnrichmentMode,
-    };
-    use origin_lib::sources::RawDocument;
-
-    let lme_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
-    if !lme_path.exists() {
-        eprintln!("SKIP: longmemeval_oracle.json not found at {:?}", lme_path);
-        return;
-    }
-
-    // Default to 9B for this probe — the probe's purpose is to verify 9B is usable.
-    // Operator can override with EVAL_LOCAL_MODEL=qwen3-4b.
-    if std::env::var("EVAL_LOCAL_MODEL").is_err() {
-        std::env::set_var("EVAL_LOCAL_MODEL", "qwen3.5-9b");
-    }
-
-    let enrichment = EnrichmentMode::from_env("claude-haiku-4-5-20251001", 1.0)
-        .expect("EnrichmentMode::from_env — check EVAL_LOCAL_MODEL and GPU availability");
-
-    let batch_size: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-
-    let model_label = std::env::var("EVAL_LOCAL_MODEL").unwrap_or_else(|_| "qwen3.5-9b".into());
-    eprintln!(
-        "\n=== probe_lme_enrichment: model={} batch_size={} ===\n",
-        model_label, batch_size
-    );
-
-    let samples = load_longmemeval(&lme_path).unwrap();
-    let probe_samples = samples.iter().take(10).collect::<Vec<_>>();
-    assert!(
-        !probe_samples.is_empty(),
-        "LME dataset must have at least 1 sample"
-    );
-
-    let tmp = tempfile::tempdir().unwrap();
-    let baselines_dir = tmp.path().to_path_buf();
-    let shared_embedder = eval_shared_embedder();
-
-    const MAX_MEM_PER_SAMPLE: usize = 5;
-
-    let mut total_memories = 0usize;
-    let mut total_entities = 0usize;
-    let mut per_question_elapsed: Vec<(String, usize, usize, f64)> = Vec::new(); // (qid, mems, entities, secs)
-
-    let probe_t0 = std::time::Instant::now();
-
-    for sample in &probe_samples {
-        let mut memories = extract_memories(sample);
-        memories.truncate(MAX_MEM_PER_SAMPLE);
-        let n_mems = memories.len();
-        total_memories += n_mems;
-
-        eprintln!(
-            "[probe-lme] {} ({} mems) -> seed + entity extraction",
-            sample.question_id, n_mems
-        );
-
-        let scope_dir = scenario_db_dir(&baselines_dir, "lme", &sample.question_id);
-        let question_id = sample.question_id.clone();
-        let question_type = sample.question_type.clone();
-        let memories_owned = memories.clone();
-
-        // Seed only — skip full enrichment (no titles/concepts) to isolate entity timing.
-        let db = open_or_seed_scenario_db(
-            &scope_dir,
-            shared_embedder.clone(),
-            move || {
-                memories_owned
-                    .iter()
-                    .map(|mem| RawDocument {
-                        content: mem.content.clone(),
-                        source_id: format!(
-                            "lme_{}_{}_t{}",
-                            question_id, mem.session_idx, mem.turn_idx
-                        ),
-                        source: "memory".to_string(),
-                        title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
-                        memory_type: Some(
-                            if question_type == "single-session-preference" {
-                                "preference"
-                            } else {
-                                "fact"
-                            }
-                            .to_string(),
-                        ),
-                        domain: Some("conversation".to_string()),
-                        last_modified: chrono::Utc::now().timestamp(),
-                        ..Default::default()
-                    })
-                    .collect()
-            },
-            &enrichment,
-        )
-        .await
-        .expect("open_or_seed_scenario_db");
-
-        // Time entity extraction independently (open_or_seed already ran full enrich;
-        // we reset and re-run to get accurate per-phase timing).
-        // For the probe we just measure against the already-enriched DB's entity count.
-        let q_entities = db.memory_count().await.unwrap_or(0);
-
-        let q_t0 = std::time::Instant::now();
-        // Re-run entity extraction phase to get accurate timing.
-        // DB is already enriched from open_or_seed, so get_unlinked_memories returns 0
-        // and the call completes immediately. For timing purposes we count the seeded count.
-        // This is intentional: the probe validates the pipeline compiles and runs end-to-end.
-        let llm = match &enrichment {
-            EnrichmentMode::OnDevice(l) => l.clone(),
-            EnrichmentMode::BatchApi { .. } => {
-                eprintln!("[probe-lme] SKIP: BatchApi mode not supported for this probe");
-                return;
-            }
-        };
-        let entities = if batch_size > 1 {
-            run_entity_extraction_for_eval_batched(&db, &llm, batch_size)
-                .await
-                .unwrap_or(0)
-        } else {
-            run_entity_extraction_for_eval_concurrent(&db, &llm, 1)
-                .await
-                .unwrap_or(0)
-        };
-        let q_elapsed = q_t0.elapsed().as_secs_f64();
-
-        // Use seeded mem count as a proxy for entity calls since DB was pre-enriched.
-        let effective_entities = entities.max(q_entities);
-        total_entities += effective_entities;
-        per_question_elapsed.push((
-            sample.question_id.clone(),
-            n_mems,
-            effective_entities,
-            q_elapsed,
-        ));
-
-        eprintln!(
-            "[probe-lme] {}: {} mems, {} entities, {:.1}s",
-            sample.question_id, n_mems, effective_entities, q_elapsed
-        );
-    }
-
-    let total_elapsed = probe_t0.elapsed().as_secs_f64();
-    let mean_per_mem = if total_memories > 0 {
-        total_elapsed / total_memories as f64
-    } else {
-        0.0
-    };
-    let full_lme_estimate_h = mean_per_mem * 500.0 * 20.0 / 3600.0; // 500 questions × ~20 mems
-
-    eprintln!("\n=== probe_lme_enrichment SUMMARY ===");
-    eprintln!(
-        "  Questions probed: {} (first 10, {} mems each)",
-        probe_samples.len(),
-        MAX_MEM_PER_SAMPLE
-    );
-    eprintln!("  Total memories: {}", total_memories);
-    eprintln!("  Total entities found: {}", total_entities);
-    eprintln!("  Total elapsed: {:.1}s", total_elapsed);
-    eprintln!(
-        "  Mean per-memory: {:.1}s ({:.1}/min)",
-        mean_per_mem,
-        60.0 / mean_per_mem.max(0.001)
-    );
-    eprintln!(
-        "  Full LME estimate (500q × 20mems): {:.1}h",
-        full_lme_estimate_h
-    );
-    eprintln!("  Model: {}  batch_size: {}", model_label, batch_size);
-    eprintln!("\n  Per-question breakdown:");
-    for (qid, mems, entities, secs) in &per_question_elapsed {
-        eprintln!(
-            "    {:<50} mems={} entities={} {:.1}s",
-            qid, mems, entities, secs
-        );
-    }
-    if full_lme_estimate_h > 24.0 {
-        eprintln!(
-            "\n  WARNING: estimated full LME run > 24h. Consider batch_size > 1 or 9B model."
-        );
-    } else {
-        eprintln!("\n  OK: estimated full LME run is feasible.");
     }
 }
