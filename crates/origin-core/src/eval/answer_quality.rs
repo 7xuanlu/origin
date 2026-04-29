@@ -1151,12 +1151,12 @@ async fn build_structured_context(
 
 /// Full-pipeline LoCoMo eval using Batch API for answer generation.
 ///
-/// **Single DB**: all conversations seeded into one database, each tagged with
-/// a conversation-specific domain. Enrichment runs once across all data, so
-/// entities accumulate and concepts can form from cross-observation clusters.
+/// **Per-conversation DB**: each LoCoMo conversation gets its own isolated database so
+/// enrichment (entity dedup, concept distillation, KG augmentation) cannot cross-pollinate
+/// between scenarios. DBs are cached under `baselines_dir/fullpipeline/locomo/{sample_id}/`.
 ///
-/// **Phase 1** (on-device, free): Seed all conversations, enrich once.
-/// **Phase 2** (free): Collect contexts for all questions (search with domain filter).
+/// **Phase 1+2** (on-device, free): For each conversation, open or seed its DB (cached on
+/// re-runs), then build contexts for all questions against that conversation's DB.
 /// **Phase 3** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
 /// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
 pub async fn run_fullpipeline_locomo_batch(
@@ -1188,86 +1188,60 @@ pub async fn run_fullpipeline_locomo_batch(
     };
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
-    // --- Phase 1: Seed all conversations into one DB, enrich once ---
-    // Use a stable DB path (sibling to output_path) so enrichment survives crashes.
-    let db_dir = output_path.with_extension("db");
-    std::fs::create_dir_all(&db_dir).ok();
-    let db =
-        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
-            .await?;
 
-    // Check if DB already has COMPLETE enrichment (not just partial data).
-    // Enrichment is complete when enrichment_steps rows exist for memories.
-    let mem_count = db.memory_count().await.unwrap_or(0);
-    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
-    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
+    // --- Phase 1+2 merged: per-conversation DB open (cached) + context build ---
+    // output_path is e.g. baselines/fullpipeline_locomo_tuples.json; its parent is baselines/.
+    let baselines_dir = output_path
+        .parent()
+        .ok_or_else(|| OriginError::Generic("output_path has no parent".to_string()))?;
 
-    if enrichment_complete {
-        eprintln!(
-            "[fullpipeline] Resuming with enriched DB ({} memories, all enriched)",
-            mem_count
-        );
-    } else {
-        // Wipe partial data and start fresh to avoid inconsistencies
-        if mem_count > 0 && enriched_count < mem_count {
-            eprintln!(
-                "[fullpipeline] Partial data found ({}/{} enriched). Starting fresh.",
-                enriched_count, mem_count
-            );
-            db.clear_all_for_eval().await?;
-        }
-
-        let mut total_obs = 0usize;
-        for sample in &samples {
-            let memories = extract_observations(sample);
-            if memories.is_empty() {
-                continue;
-            }
-
-            let docs: Vec<RawDocument> = memories
-                .iter()
-                .enumerate()
-                .map(|(i, mem)| RawDocument {
-                    content: mem.content.clone(),
-                    source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
-                    source: "memory".to_string(),
-                    title: format!("{} session {}", mem.speaker, mem.session_num),
-                    memory_type: Some("fact".to_string()),
-                    domain: Some("conversation".to_string()),
-                    last_modified: chrono::Utc::now().timestamp(),
-                    ..Default::default()
-                })
-                .collect();
-            total_obs += docs.len();
-            db.upsert_documents(docs).await?;
-            eprintln!(
-                "[fullpipeline] Seeded {} ({} observations)",
-                sample.sample_id,
-                memories.len()
-            );
-        }
-
-        let mode_label = match &enrichment {
-            crate::eval::shared::EnrichmentMode::OnDevice(_) => "on-device (Qwen3-4B, free)",
-            crate::eval::shared::EnrichmentMode::BatchApi { .. } => "Batch API (Haiku, paid)",
-        };
-        eprintln!(
-            "[fullpipeline] Total: {} observations in 1 DB. Enriching: {}...",
-            total_obs, mode_label
-        );
-        let (entities, titles, concepts) =
-            crate::eval::shared::enrich_db_for_eval(&db, &enrichment).await?;
-        eprintln!(
-            "[fullpipeline] Enriched: {} entities, {} titles, {} concepts",
-            entities, titles, concepts
-        );
-    }
-
-    // --- Phase 2: Collect contexts for all questions ---
     let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
     let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
 
     for sample in &samples {
+        let memories = extract_observations(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        let scope_dir =
+            crate::eval::shared::scenario_db_dir(baselines_dir, "locomo", &sample.sample_id);
+
+        let sample_id = sample.sample_id.clone();
+        let memories_owned = memories.clone();
+        let db = crate::eval::shared::open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, mem)| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                        source: "memory".to_string(),
+                        title: format!("{} session {}", mem.speaker, mem.session_num),
+                        memory_type: Some("fact".to_string()),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await?;
+
+        let db_mem_count = db.memory_count().await.unwrap_or(0);
+        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+        eprintln!(
+            "[fullpipeline] Conv {}: {} obs, {}/{} enriched",
+            sample.sample_id,
+            memories.len(),
+            db_enriched,
+            db_mem_count,
+        );
+
         let mut q_count = 0usize;
 
         for qa in &sample.qa {
