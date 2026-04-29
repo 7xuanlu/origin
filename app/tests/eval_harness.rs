@@ -2259,7 +2259,10 @@ async fn smoke_per_scenario_locomo() {
     // Tempdir for baselines so we don't pollute real eval cache
     let tmp = tempfile::tempdir().unwrap();
     let baselines_dir = tmp.path().to_path_buf();
-    eprintln!("[smoke-per-scenario] baselines: {}", baselines_dir.display());
+    eprintln!(
+        "[smoke-per-scenario] baselines: {}",
+        baselines_dir.display()
+    );
 
     // On-device enrichment (default per EnrichmentMode::from_env when EVAL_ENRICHMENT unset)
     let enrichment = EnrichmentMode::from_env("claude-haiku-4-5-20251001", 1.0)
@@ -2318,7 +2321,11 @@ async fn smoke_per_scenario_locomo() {
             "[smoke-per-scenario] {}: seed+enrich done in {:.1}s, mem={} enriched={}",
             sample.sample_id, conv_elapsed, mem_count, enriched
         );
-        assert!(mem_count > 0, "{}: should have seeded memories", sample.sample_id);
+        assert!(
+            mem_count > 0,
+            "{}: should have seeded memories",
+            sample.sample_id
+        );
         assert_eq!(
             mem_count, enriched,
             "{}: should be fully enriched ({}/{})",
@@ -2355,7 +2362,11 @@ async fn smoke_per_scenario_locomo() {
     let conv0: std::collections::HashSet<_> = per_sample_source_ids[0].iter().collect();
     let conv1: std::collections::HashSet<_> = per_sample_source_ids[1].iter().collect();
     let overlap: Vec<_> = conv0.intersection(&conv1).copied().collect();
-    assert!(overlap.is_empty(), "cross-conv source_id leak: {:?}", overlap);
+    assert!(
+        overlap.is_empty(),
+        "cross-conv source_id leak: {:?}",
+        overlap
+    );
 
     // Cache-hit verification: re-open first conv. Should NOT re-enrich.
     let sample = &pair[0];
@@ -2400,9 +2411,15 @@ async fn smoke_per_scenario_locomo() {
     );
 
     let total_elapsed = smoke_t0.elapsed().as_secs_f32();
-    eprintln!("\n=== smoke_per_scenario_locomo PASSED in {:.1}s ===", total_elapsed);
+    eprintln!(
+        "\n=== smoke_per_scenario_locomo PASSED in {:.1}s ===",
+        total_elapsed
+    );
     eprintln!("  per-conv DB layout: ✓");
-    eprintln!("  enrichment per-conv (truncated to {} obs each): ✓", MAX_OBS_PER_CONV);
+    eprintln!(
+        "  enrichment per-conv (truncated to {} obs each): ✓",
+        MAX_OBS_PER_CONV
+    );
     eprintln!("  retrieval scoped to own conv: ✓");
     eprintln!("  cross-conv source_id isolation: ✓");
     eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
@@ -2430,8 +2447,8 @@ async fn smoke_per_scenario_lme() {
     };
     use origin_lib::sources::RawDocument;
 
-    let lme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("eval/data/longmemeval_oracle.json");
+    let lme_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
     if !lme_path.exists() {
         eprintln!("SKIP: longmemeval_oracle.json not found");
         return;
@@ -2548,7 +2565,11 @@ async fn smoke_per_scenario_lme() {
     let s0: std::collections::HashSet<_> = per_sample_source_ids[0].iter().collect();
     let s1: std::collections::HashSet<_> = per_sample_source_ids[1].iter().collect();
     let overlap: Vec<_> = s0.intersection(&s1).copied().collect();
-    assert!(overlap.is_empty(), "cross-scenario source_id leak: {:?}", overlap);
+    assert!(
+        overlap.is_empty(),
+        "cross-scenario source_id leak: {:?}",
+        overlap
+    );
 
     // Cache-hit re-open
     let sample = &pair[0];
@@ -2603,7 +2624,10 @@ async fn smoke_per_scenario_lme() {
     );
 
     let total_elapsed = smoke_t0.elapsed().as_secs_f32();
-    eprintln!("\n=== smoke_per_scenario_lme PASSED in {:.1}s ===", total_elapsed);
+    eprintln!(
+        "\n=== smoke_per_scenario_lme PASSED in {:.1}s ===",
+        total_elapsed
+    );
     eprintln!("  per-question DB layout: ✓");
     eprintln!(
         "  enrichment per-scenario (truncated to {} mems each): ✓",

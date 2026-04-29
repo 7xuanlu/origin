@@ -389,8 +389,20 @@ where
     }
 
     if mem_count > 0 && enriched < mem_count {
-        log::info!(
-            "[scenario_db] partial state {}/{} enriched - wiping and re-seeding: {}",
+        // Refuse to silently destroy data. Past incident: pooled eval DBs lost ~5901
+        // memories because helper wiped on partial state with no operator confirmation.
+        // Operator must opt-in via EVAL_ALLOW_WIPE=1 after inspecting the partial DB.
+        if std::env::var("EVAL_ALLOW_WIPE").as_deref() != Ok("1") {
+            return Err(OriginError::Generic(format!(
+                "[scenario_db] refused to wipe partial state at {} ({}/{} enriched). \
+                 Set EVAL_ALLOW_WIPE=1 to permit destruction, or inspect/repair the DB manually.",
+                db_dir.display(),
+                enriched,
+                mem_count
+            )));
+        }
+        log::warn!(
+            "[scenario_db] partial state {}/{} enriched - WIPING (EVAL_ALLOW_WIPE=1): {}",
             enriched,
             mem_count,
             db_dir.display()

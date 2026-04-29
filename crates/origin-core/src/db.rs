@@ -12113,8 +12113,20 @@ impl MemoryDB {
         }
     }
 
-    /// Clear all data for eval re-run (wipe partial state).
+    /// Eval-only destructive reset. Drops all memories, entities, relations, observations,
+    /// concepts, and enrichment steps.
+    ///
+    /// **Caller must explicitly opt-in via `EVAL_ALLOW_WIPE=1`.** Past incident:
+    /// a pooled LME eval DB lost ~5901 enriched memories from a silent wipe path
+    /// (helper detected partial state mid-flight and called this without operator
+    /// confirmation). Cost was ~$25 in re-enrichment via Batch API.
     pub async fn clear_all_for_eval(&self) -> Result<(), OriginError> {
+        if std::env::var("EVAL_ALLOW_WIPE").as_deref() != Ok("1") {
+            return Err(OriginError::Generic(
+                "clear_all_for_eval refused: set EVAL_ALLOW_WIPE=1 to permit destruction"
+                    .to_string(),
+            ));
+        }
         let conn = self.conn.lock().await;
         for table in &[
             "enrichment_steps",
@@ -12133,7 +12145,7 @@ impl MemoryDB {
                 .await
                 .ok();
         }
-        eprintln!("[eval_db] Cleared all data for fresh start");
+        eprintln!("[eval_db] Cleared all data for fresh start (EVAL_ALLOW_WIPE=1)");
         Ok(())
     }
 
