@@ -1404,6 +1404,19 @@ pub async fn run_fullpipeline_lme_batch(
     let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
 
     for (q_idx, sample) in samples.iter().enumerate() {
+        if done_questions.contains(&sample.question) {
+            continue;
+        }
+
+        let ground_truth = sample
+            .answer
+            .as_str()
+            .unwrap_or(&sample.answer.to_string())
+            .to_string();
+        if ground_truth.is_empty() {
+            continue;
+        }
+
         let memories = extract_memories(sample);
         if memories.is_empty() {
             continue;
@@ -1456,19 +1469,6 @@ pub async fn run_fullpipeline_lme_batch(
             db_enriched,
             db_mem_count,
         );
-
-        if done_questions.contains(&sample.question) {
-            continue;
-        }
-
-        let ground_truth = sample
-            .answer
-            .as_str()
-            .unwrap_or(&sample.answer.to_string())
-            .to_string();
-        if ground_truth.is_empty() {
-            continue;
-        }
 
         let category = category_name(&sample.question_type);
         let (ctx, ctx_tokens) = build_structured_context(&db, &sample.question, 10, None).await?;
