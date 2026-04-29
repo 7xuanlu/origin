@@ -764,24 +764,41 @@ pub fn extract_json(text: &str) -> Option<&str> {
 /// since small on-device models (e.g., Qwen3-4B) often return a single
 /// object instead of an array when given a single input item.
 pub fn extract_json_array(text: &str) -> Option<String> {
+    // Strip markdown code fences (Qwen3.5-9B wraps output in ```json...```).
+    // Find first JSON-relevant char (`[` or `{`) and last `]` or `}` to
+    // narrow the window. The streaming Deserializer (Strategy 2) cannot
+    // skip leading backticks on its own.
+    let trimmed = {
+        let json_start = text.find(['[', '{']);
+        match json_start {
+            Some(start) => &text[start..],
+            None => return None,
+        }
+    };
+
     // Strategy 1: try array extraction `[...]` if present and parses cleanly.
-    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
+    if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
         if end > start {
-            let candidate = text[start..=end].to_string();
+            let candidate = trimmed[start..=end].to_string();
             if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
                 return Some(candidate);
             }
         }
     }
-    // Strategy 2: NDJSON-style — multiple top-level `{...}` objects without
-    // enclosing brackets. Use a streaming `Deserializer` to collect each
-    // object, then re-emit as a JSON array. Handles whitespace and any
-    // separator (newlines, commas, neither) between objects.
-    if text.contains('{') {
-        let de = serde_json::Deserializer::from_str(text);
-        let collected: Vec<serde_json::Value> = de
-            .into_iter::<serde_json::Value>()
-            .filter_map(|r| r.ok())
+    // Strategy 2: walk brace depth to collect each complete top-level `{...}`.
+    // Handles:
+    //   (a) NDJSON `{...}{...}` (no enclosing array)
+    //   (b) Truncated array `[{...},{...},{..` where strategy 1 fails because
+    //       the closing `]` is missing
+    //   (c) Comma-separated objects `{...},{...}` (which Deserializer streaming
+    //       chokes on)
+    // Tracks string state so braces inside JSON string literals don't confuse
+    // the depth count.
+    if trimmed.contains('{') {
+        let slices = collect_top_level_objects(trimmed);
+        let collected: Vec<serde_json::Value> = slices
+            .iter()
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
             .filter(|v| v.is_object())
             .collect();
         if !collected.is_empty() {
@@ -791,12 +808,58 @@ pub fn extract_json_array(text: &str) -> Option<String> {
         }
     }
     // Strategy 3: last resort — wrap a single best-effort `{...}` slice in array brackets.
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
         if end > start {
-            return Some(format!("[{}]", &text[start..=end]));
+            return Some(format!("[{}]", &trimmed[start..=end]));
         }
     }
     None
+}
+
+/// Walk `text` and return each complete top-level `{...}` slice in order.
+/// Tracks string state (with `\\"` escape handling) so braces inside JSON
+/// string literals are not counted toward depth. Truncated trailing objects
+/// are skipped.
+fn collect_top_level_objects(text: &str) -> Vec<&str> {
+    let mut results = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start {
+                            results.push(&text[s..=i]);
+                            start = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    results
 }
 
 /// Truncate text at a word boundary, not exceeding `max_chars` bytes.
@@ -942,5 +1005,47 @@ mod tests {
         let result = extract_json_array(text).unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.len(), 2);
+    }
+
+    /// Markdown code-fenced output (Qwen3.5-9B). Must strip leading fence.
+    #[test]
+    fn test_extract_json_array_markdown_fence() {
+        let text = "```json\n[{\"i\": 0, \"entities\": [{\"name\": \"a\"}]}]\n```";
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["entities"][0]["name"], "a");
+    }
+
+    /// Markdown fence + NDJSON inside.
+    #[test]
+    fn test_extract_json_array_fence_with_ndjson() {
+        let text = "```json\n{\"i\": 0, \"entities\": []}\n{\"i\": 1, \"entities\": []}\n```";
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    /// Truncated array — model wrote `[{..},{..},{..` and got cut off.
+    /// Common at high batch sizes where output exceeds time budget.
+    /// Strategy 2 must skip the leading `[` and stream-collect partial objects.
+    #[test]
+    fn test_extract_json_array_truncated_no_close() {
+        let text = r#"[{"i":0,"entities":[{"name":"a"}]},{"i":1,"entities":[{"name":"b"}]},{"i":2,"entities":[{"na"#;
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        // Should recover the 2 complete objects, drop the truncated 3rd
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["entities"][0]["name"], "a");
+        assert_eq!(parsed[1]["entities"][0]["name"], "b");
+    }
+
+    /// Markdown fence + truncated array (real 9B failure case).
+    #[test]
+    fn test_extract_json_array_fence_truncated() {
+        let text = "```json\n[\n  {\"i\": 0, \"entities\": []},\n  {\"i\": 1, \"entities\":";
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
     }
 }
