@@ -1261,6 +1261,252 @@ async fn refine_clusters_with_llm(
     result
 }
 
+/// Process a single distillation cluster.
+///
+/// Returns `Ok(true)` if a concept was created, `Ok(false)` if the cluster was skipped.
+/// Extracted from `distill_concepts` to enable parallel cluster processing via
+/// `DISTILL_CLUSTER_CONCURRENCY`.
+async fn distill_one_cluster(
+    db: &MemoryDB,
+    llm: &Arc<dyn LlmProvider>,
+    prompts: &PromptRegistry,
+    cluster: &crate::db::DistillationCluster,
+    knowledge_writer: Option<&crate::export::knowledge::KnowledgeWriter>,
+) -> Result<bool, OriginError> {
+    let topic = cluster
+        .entity_name
+        .as_deref()
+        .or(cluster.domain.as_deref())
+        .unwrap_or("general");
+
+    // Skip if a concept with very similar sources already exists (Jaccard > 0.8)
+    // Memories CAN appear in multiple concepts — this only prevents duplicate concepts
+    let overlap = db
+        .max_concept_overlap(&cluster.source_ids)
+        .await
+        .unwrap_or(0.0);
+    if overlap > 0.8 {
+        log::info!(
+            "[emergence] cluster '{}' overlaps {:.0}% with existing concept, skipping",
+            topic,
+            overlap * 100.0
+        );
+        return Ok(false);
+    }
+
+    // Clean input: strip recap headers, domain prefixes, and structured field noise
+    let cleaned_contents: Vec<String> = cluster
+        .contents
+        .iter()
+        .map(|c| {
+            let mut s = c.trim().to_string();
+            // Strip "Activity burst: ..." header lines
+            if let Some(pos) = s.find("\n- ") {
+                let prefix: String = s.chars().take(pos).collect();
+                if prefix.contains("Activity burst") || prefix.contains("memories across") {
+                    s = s.chars().skip(pos + 1).collect();
+                }
+            }
+            // Strip "- [domain] " prefixes from each line
+            s = s
+                .lines()
+                .map(|line| {
+                    let trimmed = line.trim_start_matches("- ");
+                    if trimmed.starts_with('[') {
+                        if let Some(end) = trimmed.find("] ") {
+                            trimmed[end + 2..].to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Strip "claim: " prefix
+            if let Some(rest) = s.strip_prefix("claim: ") {
+                s = rest.to_string();
+            }
+            s
+        })
+        .collect();
+
+    // Skip thin clusters — not enough substance for meaningful compilation
+    let total_content_chars: usize = cleaned_contents.iter().map(|c| c.len()).sum();
+    if total_content_chars < 200 {
+        log::info!(
+            "[compile] cluster too thin ({} chars), skipping topic='{}'",
+            total_content_chars,
+            topic
+        );
+        return Ok(false);
+    }
+
+    log::info!(
+        "[distill] processing cluster: {} memories, ~{} tokens",
+        cluster.source_ids.len(),
+        cluster.estimated_tokens
+    );
+
+    // Build user prompt with memory IDs for source attribution.
+    // Cap each memory at 800 chars so the LLM gets meaningful substance
+    // without runaway context. The 800-char cap is honest: it matches the
+    // amount the model can synthesize well at 2048 output tokens.
+    const MEM_SNIPPET_CAP: usize = 800;
+    let memories_block: String = cluster
+        .source_ids
+        .iter()
+        .zip(cleaned_contents.iter())
+        .map(|(id, content)| {
+            let snippet: String = content.chars().take(MEM_SNIPPET_CAP).collect();
+            let snippet = if content.chars().count() > MEM_SNIPPET_CAP {
+                format!("{}...", snippet.trim_end())
+            } else {
+                snippet
+            };
+            format!("[{}] {}", id, snippet)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let user_prompt = format!("Topic: {}\n\n{}", topic, memories_block);
+
+    let response = llm
+        .generate(LlmRequest {
+            system_prompt: Some(prompts.distill_concept.clone()),
+            user_prompt,
+            max_tokens: llm.recommended_max_output(),
+            temperature: 0.1,
+            label: Some("distill_body".into()),
+        })
+        .await;
+
+    match response {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let cleaned = crate::llm_provider::strip_think_tags(&raw);
+            let content = cleaned.trim().to_string();
+
+            if content.is_empty() {
+                log::warn!("[distill] empty output for topic='{}', skipping", topic);
+                return Ok(false);
+            }
+
+            // Hallucination check: output must be semantically similar to input
+            let texts = vec![content.clone(), cleaned_contents.join(" ")];
+            if let Ok(embeddings) = db.generate_embeddings(&texts) {
+                if embeddings.len() == 2 {
+                    let sim = crate::db::cosine_similarity(&embeddings[0], &embeddings[1]);
+                    if sim < 0.6 {
+                        log::warn!(
+                            "[compile] hallucination detected (sim={:.2}) for topic='{}', skipping",
+                            sim,
+                            topic
+                        );
+                        return Ok(false);
+                    }
+                    log::info!(
+                        "[compile] quality check passed (sim={:.2}) for topic='{}'",
+                        sim,
+                        topic
+                    );
+                }
+            }
+
+            // Generate title. If LLM returns None and the only fallback is a generic
+            // placeholder (e.g. "general"), skip this cluster entirely — a generic title
+            // is worse than no concept at all.
+            let llm_title = generate_short_title(llm, &content).await;
+            let title = match llm_title {
+                Some(t) => t,
+                None if is_all_generic_tokens(topic)
+                    || looks_like_markup_styled(topic)
+                    || looks_like_path(topic)
+                    || looks_like_code(topic)
+                    || looks_like_uuid(topic)
+                    || looks_like_short_hash(topic)
+                    || looks_like_commit_message(topic) =>
+                {
+                    log::info!(
+                        "[distill] no title and topic='{}' is garbage, skipping cluster",
+                        topic
+                    );
+                    return Ok(false);
+                }
+                None => topic.to_string(),
+            };
+
+            // Extract summary from first bullet point
+            let summary = content
+                .lines()
+                .find(|l| l.starts_with("- "))
+                .map(|l| l.trim_start_matches("- ").to_string());
+
+            // Build source IDs as &str refs
+            let source_refs: Vec<&str> = cluster.source_ids.iter().map(|s| s.as_str()).collect();
+            let now = chrono::Utc::now().to_rfc3339();
+            let concept_id = crate::concepts::Concept::new_id();
+
+            db.insert_concept(
+                &concept_id,
+                &title,
+                summary.as_deref(),
+                &content,
+                cluster.entity_id.as_deref(),
+                cluster.domain.as_deref(),
+                &source_refs,
+                &now,
+            )
+            .await?;
+
+            log::info!(
+                "[distill] distilled {} memories -> concept '{}' ('{}')",
+                cluster.source_ids.len(),
+                title,
+                content.chars().take(40).collect::<String>()
+            );
+
+            // Log activity — system-attributed, since distillation is background refinery work.
+            let source_memory_ids: Vec<String> = cluster.source_ids.to_vec();
+            let detail = format!(
+                "created \"{}\" from {} memories",
+                title,
+                cluster.source_ids.len()
+            );
+            if let Err(e) = db
+                .log_agent_activity(
+                    "system",
+                    "concept_create",
+                    &source_memory_ids,
+                    None,
+                    &detail,
+                )
+                .await
+            {
+                log::warn!("[distill] log concept_create activity failed: {e}");
+            }
+
+            if let Some(writer) = knowledge_writer {
+                if let Ok(Some(c)) = db.get_concept(&concept_id).await {
+                    match writer.write_concept(&c) {
+                        Ok(p) => log::info!("[distill] wrote concept to {p}"),
+                        Err(e) => log::warn!("[distill] knowledge write failed: {e}"),
+                    }
+                }
+            }
+
+            Ok(true)
+        }
+        Ok(_) => {
+            log::warn!("[distill] empty output for topic='{}'", topic);
+            Ok(false)
+        }
+        Err(e) => {
+            log::warn!("[distill] LLM error for topic='{}': {}", topic, e);
+            Ok(false)
+        }
+    }
+}
+
 /// Distill memory clusters into structured concepts.
 /// Memories can appear in multiple concepts. Jaccard overlap prevents duplicate concepts.
 pub async fn distill_concepts(
@@ -1293,11 +1539,34 @@ pub async fn distill_concepts(
     // LLM cluster refinement: let LLM merge/split/rename clusters per entity
     let clusters = refine_clusters_with_llm(llm, prompts, raw_clusters, token_limit).await;
 
+    let cluster_concurrency: usize = std::env::var("DISTILL_CLUSTER_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .min(4);
+
     let mut distilled = 0usize;
 
     // Create the writer once, outside the loop
     let knowledge_writer =
         knowledge_path.map(|kp| crate::export::knowledge::KnowledgeWriter::new(kp.to_path_buf()));
+
+    if cluster_concurrency > 1 {
+        let kw = knowledge_writer.as_ref();
+        for chunk in clusters.chunks(cluster_concurrency) {
+            let futs: Vec<_> = chunk
+                .iter()
+                .map(|cluster| distill_one_cluster(db, llm, prompts, cluster, kw))
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            for r in results {
+                if r? {
+                    distilled += 1;
+                }
+            }
+        }
+        return Ok(distilled);
+    }
 
     for cluster in &clusters {
         let topic = cluster
