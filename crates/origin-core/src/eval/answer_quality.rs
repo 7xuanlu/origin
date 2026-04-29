@@ -1356,9 +1356,14 @@ pub async fn run_fullpipeline_locomo_batch(
 
 /// Full-pipeline LongMemEval eval using Batch API for answer generation.
 ///
-/// **Single DB**: all 500 questions' memories seeded into one database (~10K memories).
-/// No domain filter — search must find relevant memories among all data, like production.
-/// Enrichment runs once across all data.
+/// **Per-question DB**: each LME question gets its own isolated database so enrichment
+/// (entity dedup, concept distillation, KG augmentation) cannot cross-pollinate between
+/// scenarios. DBs are cached under `baselines_dir/fullpipeline/lme/{question_id}/`.
+///
+/// **Phase 1+2** (on-device, free): For each question, open or seed its DB (cached on
+/// re-runs), then build context for that question against its own DB.
+/// **Phase 3** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
+/// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
 pub async fn run_fullpipeline_lme_batch(
     longmemeval_path: &Path,
     enrichment: crate::eval::shared::EnrichmentMode,
@@ -1389,87 +1394,69 @@ pub async fn run_fullpipeline_lme_batch(
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
 
-    // --- Phase 1: Seed all questions' memories into one DB, enrich once ---
-    let db_dir = output_path.with_extension("db");
-    std::fs::create_dir_all(&db_dir).ok();
-    let db =
-        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
-            .await?;
+    // --- Phase 1+2 merged: per-question DB open (cached) + context build ---
+    // output_path is e.g. baselines/fullpipeline_lme_tuples.json; its parent is baselines/.
+    let baselines_dir = output_path
+        .parent()
+        .ok_or_else(|| OriginError::Generic("output_path has no parent".to_string()))?;
 
-    let mem_count = db.memory_count().await.unwrap_or(0);
-    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
-    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
-
-    if enrichment_complete {
-        eprintln!(
-            "[fullpipeline_lme] Resuming with enriched DB ({} memories, all enriched)",
-            mem_count
-        );
-    } else {
-        if mem_count > 0 && enriched_count < mem_count {
-            eprintln!(
-                "[fullpipeline_lme] Partial data ({}/{} enriched). Starting fresh.",
-                enriched_count, mem_count
-            );
-            db.clear_all_for_eval().await?;
-        }
-        let mut total_mems = 0usize;
-        for sample in &samples {
-            let memories = extract_memories(sample);
-            if memories.is_empty() {
-                continue;
-            }
-
-            let docs: Vec<RawDocument> = memories
-                .iter()
-                .map(|mem| RawDocument {
-                    content: mem.content.clone(),
-                    source_id: format!(
-                        "lme_{}_{}_t{}",
-                        sample.question_id, mem.session_idx, mem.turn_idx
-                    ),
-                    source: "memory".to_string(),
-                    title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
-                    memory_type: Some(
-                        if sample.question_type == "single-session-preference" {
-                            "preference"
-                        } else {
-                            "fact"
-                        }
-                        .to_string(),
-                    ),
-                    domain: Some("conversation".to_string()),
-                    last_modified: chrono::Utc::now().timestamp(),
-                    ..Default::default()
-                })
-                .collect();
-            total_mems += docs.len();
-            db.upsert_documents(docs).await?;
-        }
-
-        let mode_label = match &enrichment {
-            crate::eval::shared::EnrichmentMode::OnDevice(_) => "on-device (Qwen3-4B, free)",
-            crate::eval::shared::EnrichmentMode::BatchApi { .. } => "Batch API (Haiku, paid)",
-        };
-        eprintln!(
-            "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching: {}...",
-            total_mems,
-            samples.len(),
-            mode_label
-        );
-        let (entities, titles, concepts) =
-            crate::eval::shared::enrich_db_for_eval(&db, &enrichment).await?;
-        eprintln!(
-            "[fullpipeline_lme] Enriched: {} entities, {} titles, {} concepts",
-            entities, titles, concepts
-        );
-    }
-
-    // --- Phase 2: Collect contexts ---
     let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
     let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
 
     for (q_idx, sample) in samples.iter().enumerate() {
+        let memories = extract_memories(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        let scope_dir =
+            crate::eval::shared::scenario_db_dir(baselines_dir, "lme", &sample.question_id);
+
+        let question_id = sample.question_id.clone();
+        let question_type = sample.question_type.clone();
+        let memories_owned = memories.clone();
+        let db = crate::eval::shared::open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .map(|mem| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!(
+                            "lme_{}_{}_t{}",
+                            question_id, mem.session_idx, mem.turn_idx
+                        ),
+                        source: "memory".to_string(),
+                        title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                        memory_type: Some(
+                            if question_type == "single-session-preference" {
+                                "preference"
+                            } else {
+                                "fact"
+                            }
+                            .to_string(),
+                        ),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await?;
+
+        let db_mem_count = db.memory_count().await.unwrap_or(0);
+        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+        eprintln!(
+            "[fullpipeline_lme] Q {}: {} memories, {}/{} enriched",
+            sample.question_id,
+            memories.len(),
+            db_enriched,
+            db_mem_count,
+        );
+
         if done_questions.contains(&sample.question) {
             continue;
         }
