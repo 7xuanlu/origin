@@ -336,67 +336,6 @@ pub async fn run_entity_extraction_for_eval(
     Ok(total)
 }
 
-/// Canonical paths for enriched eval DBs. Reused across eval pipelines so the
-/// (paid) Batch API enrichment work is not redone. Callers point `MemoryDB::new_with_shared_embedder`
-/// at these dirs to inherit the cached entities/titles/concepts.
-///
-/// Layout: `app/eval/baselines/fullpipeline_{lme,locomo}_tuples.db/origin_memory.db`.
-/// Both dirs were originally enriched via the (now opt-in) Batch API path. Subsequent eval
-/// runs default to on-device, but skip enrichment entirely when `enriched_count == mem_count`.
-///
-/// **Reuse pattern for new evals** (e.g. task #12 query decomposition, task #13 precision probe):
-/// ```ignore
-/// let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
-/// let db = match try_open_enriched_db(&baselines, ENRICHED_LME_DB_SUBPATH).await? {
-///     Some(db) => db, // cached enrichment, skip seeding
-///     None => /* seed + enrich_db_for_eval */,
-/// };
-/// // run new eval against `db`
-/// ```
-pub const ENRICHED_LME_DB_SUBPATH: &str = "fullpipeline_lme_tuples.db";
-pub const ENRICHED_LOCOMO_DB_SUBPATH: &str = "fullpipeline_locomo_tuples.db";
-
-/// Open an existing enriched eval DB for reuse. Returns `Some(db)` only when the DB at
-/// `<baselines_dir>/<subpath>` exists AND is fully enriched (`mem_count > 0 && enriched_count == mem_count`).
-/// Returns `None` for missing dir, empty DB, or partially-enriched DB — caller should fall through
-/// to a fresh seed + `enrich_db_for_eval` path.
-///
-/// Uses the shared eval embedder so vector dim + index settings stay consistent across evals.
-pub async fn try_open_enriched_db(
-    baselines_dir: &std::path::Path,
-    subpath: &str,
-) -> Result<Option<MemoryDB>, OriginError> {
-    let db_dir = baselines_dir.join(subpath);
-    if !db_dir.exists() {
-        eprintln!("[reuse] {} not found, fresh DB needed", db_dir.display());
-        return Ok(None);
-    }
-    let db = MemoryDB::new_with_shared_embedder(
-        &db_dir,
-        Arc::new(crate::events::NoopEmitter),
-        eval_shared_embedder(),
-    )
-    .await?;
-    let mem_count = db.memory_count().await.unwrap_or(0);
-    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
-    if mem_count > 0 && enriched_count == mem_count {
-        eprintln!(
-            "[reuse] {} ready: {} memories, all enriched",
-            db_dir.display(),
-            mem_count
-        );
-        Ok(Some(db))
-    } else {
-        eprintln!(
-            "[reuse] {} incomplete: {}/{} enriched, fresh DB needed",
-            db_dir.display(),
-            enriched_count,
-            mem_count
-        );
-        Ok(None)
-    }
-}
-
 /// Resolve the per-scenario DB directory under `baselines/fullpipeline/{benchmark}/{scenario_id}/`.
 ///
 /// `benchmark` is the short name (`"lme"` or `"locomo"`). The function prepends `"fullpipeline/"`,
