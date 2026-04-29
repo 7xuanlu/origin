@@ -373,7 +373,15 @@ impl LlmEngine {
             }
         };
 
-        let max_prompt_tokens = ctx_size as usize - max_output_tokens as usize;
+        let max_prompt_tokens = (ctx_size as usize).saturating_sub(max_output_tokens as usize);
+        if max_prompt_tokens == 0 {
+            log::warn!(
+                "[llm_engine] max_output_tokens={} >= ctx_size={}, refusing to run inference",
+                max_output_tokens,
+                ctx_size
+            );
+            return None;
+        }
         let tokens = if tokens.len() > max_prompt_tokens {
             tokens[..max_prompt_tokens].to_vec()
         } else {
@@ -484,7 +492,15 @@ impl LlmEngine {
             }
         };
 
-        let max_prompt_tokens = ctx_size as usize - max_output_tokens as usize;
+        let max_prompt_tokens = (ctx_size as usize).saturating_sub(max_output_tokens as usize);
+        if max_prompt_tokens == 0 {
+            log::warn!(
+                "[llm_engine] max_output_tokens={} >= ctx_size={}, refusing to run inference",
+                max_output_tokens,
+                ctx_size
+            );
+            return None;
+        }
         let tokens = if tokens.len() > max_prompt_tokens {
             tokens[..max_prompt_tokens].to_vec()
         } else {
@@ -748,24 +764,7 @@ pub fn extract_json(text: &str) -> Option<&str> {
 /// since small on-device models (e.g., Qwen3-4B) often return a single
 /// object instead of an array when given a single input item.
 pub fn extract_json_array(text: &str) -> Option<String> {
-    // Try object-wrapping first: if the outermost structure is `{...}`,
-    // wrap it in `[...]`. This must come before the `[` search because
-    // a single JSON object like `{"entities": [...]}` contains inner `[`/`]`
-    // that would be mistakenly extracted as the top-level array.
-    if let Some(obj_start) = text.find('{') {
-        if text[..obj_start].find('[').is_none() {
-            // No `[` before the first `{` — the response is an object, not an array
-            if let Some(obj_end) = text.rfind('}') {
-                if obj_end > obj_start {
-                    let candidate = format!("[{}]", &text[obj_start..=obj_end]);
-                    if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-    }
-    // Try array extraction
+    // Strategy 1: try array extraction `[...]` if present and parses cleanly.
     if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
         if end > start {
             let candidate = text[start..=end].to_string();
@@ -774,7 +773,24 @@ pub fn extract_json_array(text: &str) -> Option<String> {
             }
         }
     }
-    // Last resort: wrap single JSON object in array brackets
+    // Strategy 2: NDJSON-style — multiple top-level `{...}` objects without
+    // enclosing brackets. Use a streaming `Deserializer` to collect each
+    // object, then re-emit as a JSON array. Handles whitespace and any
+    // separator (newlines, commas, neither) between objects.
+    if text.contains('{') {
+        let de = serde_json::Deserializer::from_str(text);
+        let collected: Vec<serde_json::Value> = de
+            .into_iter::<serde_json::Value>()
+            .filter_map(|r| r.ok())
+            .filter(|v| v.is_object())
+            .collect();
+        if !collected.is_empty() {
+            if let Ok(s) = serde_json::to_string(&collected) {
+                return Some(s);
+            }
+        }
+    }
+    // Strategy 3: last resort — wrap a single best-effort `{...}` slice in array brackets.
     if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
         if end > start {
             return Some(format!("[{}]", &text[start..=end]));
@@ -900,6 +916,29 @@ mod tests {
     #[test]
     fn test_extract_json_array_real_array_with_inner_arrays() {
         let text = r#"[{"i": 0, "entities": [{"name": "a"}]}, {"i": 1, "entities": []}]"#;
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    /// NDJSON-style: model returns multiple top-level objects without enclosing
+    /// `[]`. This is what Qwen3-4B emits at batch>1. Must collect all into array.
+    #[test]
+    fn test_extract_json_array_ndjson_multiple_objects() {
+        let text = r#"{"i": 0, "entities": [{"name": "a"}]}
+{"i": 1, "entities": [{"name": "b"}]}
+{"i": 2, "entities": []}"#;
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["i"], 0);
+        assert_eq!(parsed[1]["entities"][0]["name"], "b");
+    }
+
+    /// NDJSON without separator: `{...}{...}` directly back-to-back.
+    #[test]
+    fn test_extract_json_array_ndjson_no_separator() {
+        let text = r#"{"i":0,"entities":[]}{"i":1,"entities":[]}"#;
         let result = extract_json_array(text).unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.len(), 2);
