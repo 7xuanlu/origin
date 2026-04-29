@@ -2408,6 +2408,212 @@ async fn smoke_per_scenario_locomo() {
     eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
 }
 
+/// Manual smoke for LME per-scenario DB refactor (T3).
+///
+/// Mirrors `smoke_per_scenario_locomo` but for LongMemEval:
+/// - 2 LME samples (each = own simulated user history)
+/// - Truncated to 5 memories per sample for fast on-device enrichment
+/// - Per-question DB at `{tempdir}/fullpipeline/lme/{question_id}/`
+/// - Verifies isolation, cache reuse, mem==enriched
+///
+/// On-device Qwen3-4B, ~60-90s on Metal GPU. Requires `--ignored --nocapture`.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness smoke_per_scenario_lme -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_lme() {
+    use origin_lib::eval::longmemeval::{extract_memories, load_longmemeval};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let lme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/data/longmemeval_oracle.json");
+    if !lme_path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let samples = load_longmemeval(&lme_path).unwrap();
+    assert!(samples.len() >= 2, "need >=2 LME samples for smoke");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!("[smoke-lme] baselines: {}", baselines_dir.display());
+
+    let enrichment = EnrichmentMode::from_env("claude-haiku-4-5-20251001", 1.0)
+        .expect("EnrichmentMode::from_env");
+    let shared_embedder = eval_shared_embedder();
+
+    const MAX_MEM_PER_SAMPLE: usize = 5;
+    let pair = &samples[..2];
+    let mut per_sample_source_ids: Vec<Vec<String>> = Vec::new();
+
+    let smoke_t0 = std::time::Instant::now();
+    for sample in pair {
+        let mut memories = extract_memories(sample);
+        memories.truncate(MAX_MEM_PER_SAMPLE);
+        eprintln!(
+            "[smoke-lme] {} ({} mems, truncated) -> open_or_seed",
+            sample.question_id,
+            memories.len()
+        );
+
+        let scope_dir = scenario_db_dir(&baselines_dir, "lme", &sample.question_id);
+
+        let question_id = sample.question_id.clone();
+        let question_type = sample.question_type.clone();
+        let memories_owned = memories.clone();
+        let conv_t0 = std::time::Instant::now();
+        let db = open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .map(|mem| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!(
+                            "lme_{}_{}_t{}",
+                            question_id, mem.session_idx, mem.turn_idx
+                        ),
+                        source: "memory".to_string(),
+                        title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                        memory_type: Some(
+                            if question_type == "single-session-preference" {
+                                "preference"
+                            } else {
+                                "fact"
+                            }
+                            .to_string(),
+                        ),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await
+        .expect("open_or_seed_scenario_db");
+        let conv_elapsed = conv_t0.elapsed().as_secs_f32();
+
+        let mem_count = db.memory_count().await.unwrap_or(0);
+        let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        eprintln!(
+            "[smoke-lme] {}: seed+enrich done in {:.1}s, mem={} enriched={}",
+            sample.question_id, conv_elapsed, mem_count, enriched
+        );
+        assert!(
+            mem_count > 0,
+            "{}: should have seeded memories",
+            sample.question_id
+        );
+        assert_eq!(
+            mem_count, enriched,
+            "{}: should be fully enriched ({}/{})",
+            sample.question_id, enriched, mem_count
+        );
+
+        assert!(
+            scope_dir.join("origin_memory.db").exists(),
+            "{}: DB file should exist at {}",
+            sample.question_id,
+            scope_dir.display()
+        );
+
+        // Retrieval scoped to own scenario
+        let results = db
+            .search_memory("anything", 50, None, None, None, None, None, None)
+            .await
+            .expect("search_memory");
+        let expected_prefix = format!("lme_{}_", sample.question_id);
+        for r in &results {
+            assert!(
+                r.source_id.starts_with(&expected_prefix),
+                "{}: cross-scenario leak! result source_id={} (expected prefix {})",
+                sample.question_id,
+                r.source_id,
+                expected_prefix
+            );
+        }
+        per_sample_source_ids.push(results.iter().map(|r| r.source_id.clone()).collect());
+    }
+
+    // Cross-scenario isolation
+    let s0: std::collections::HashSet<_> = per_sample_source_ids[0].iter().collect();
+    let s1: std::collections::HashSet<_> = per_sample_source_ids[1].iter().collect();
+    let overlap: Vec<_> = s0.intersection(&s1).copied().collect();
+    assert!(overlap.is_empty(), "cross-scenario source_id leak: {:?}", overlap);
+
+    // Cache-hit re-open
+    let sample = &pair[0];
+    let mut memories = extract_memories(sample);
+    memories.truncate(MAX_MEM_PER_SAMPLE);
+    let scope_dir = scenario_db_dir(&baselines_dir, "lme", &sample.question_id);
+    let question_id_2 = sample.question_id.clone();
+    let question_type_2 = sample.question_type.clone();
+    let memories_owned_2 = memories.clone();
+    let cache_t0 = std::time::Instant::now();
+    let _db_cached = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned_2
+                .iter()
+                .map(|mem| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!(
+                        "lme_{}_{}_t{}",
+                        question_id_2, mem.session_idx, mem.turn_idx
+                    ),
+                    source: "memory".to_string(),
+                    title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                    memory_type: Some(
+                        if question_type_2 == "single-session-preference" {
+                            "preference"
+                        } else {
+                            "fact"
+                        }
+                        .to_string(),
+                    ),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("re-open cached");
+    let cache_ms = cache_t0.elapsed().as_millis();
+    eprintln!(
+        "[smoke-lme] cache-hit re-open of {}: {} ms (expected <2000ms; no re-enrich)",
+        sample.question_id, cache_ms
+    );
+    assert!(
+        cache_ms < 5000,
+        "cache hit too slow ({} ms) -- helper likely re-enriched",
+        cache_ms
+    );
+
+    let total_elapsed = smoke_t0.elapsed().as_secs_f32();
+    eprintln!("\n=== smoke_per_scenario_lme PASSED in {:.1}s ===", total_elapsed);
+    eprintln!("  per-question DB layout: ✓");
+    eprintln!(
+        "  enrichment per-scenario (truncated to {} mems each): ✓",
+        MAX_MEM_PER_SAMPLE
+    );
+    eprintln!("  retrieval scoped to own scenario: ✓");
+    eprintln!("  cross-scenario source_id isolation: ✓");
+    eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
+}
+
 /// Judge LME tuples via Claude CLI (Max plan, no API key).
 ///
 /// Uses task-specific judge prompts matching the LongMemEval paper.
