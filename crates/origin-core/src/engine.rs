@@ -845,14 +845,12 @@ fn collect_top_level_objects(text: &str) -> Vec<&str> {
                 }
                 depth += 1;
             }
-            '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                    if depth == 0 {
-                        if let Some(s) = start {
-                            results.push(&text[s..=i]);
-                            start = None;
-                        }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        results.push(&text[s..=i]);
+                        start = None;
                     }
                 }
             }

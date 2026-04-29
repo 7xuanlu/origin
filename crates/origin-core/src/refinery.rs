@@ -1158,8 +1158,8 @@ async fn refine_clusters_with_llm(
         match response {
             Ok(raw) => {
                 let clean = crate::llm_provider::strip_think_tags(&raw);
-                if let Some(json_str) = crate::llm_provider::extract_json(&clean) {
-                    if let Ok(actions) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                if let Some(json_str) = crate::engine::extract_json_array(&clean) {
+                    if let Ok(actions) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                         for action in &actions {
                             let act = action
                                 .get("action")
@@ -5302,5 +5302,15 @@ mod tests {
             .unwrap();
         let title_step = steps.iter().find(|s| s.step == "title_enrich").unwrap();
         assert_eq!(title_step.status, "needs_retry");
+    }
+
+    #[test]
+    fn test_refine_clusters_parses_array_response() {
+        let raw = r#"[{"action":"merge","clusters":[0,1]},{"action":"keep","clusters":[2]}]"#;
+        let extracted = crate::engine::extract_json_array(raw).unwrap();
+        let actions: Vec<serde_json::Value> = serde_json::from_str(&extracted).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0]["action"], "merge");
+        assert_eq!(actions[1]["action"], "keep");
     }
 }
