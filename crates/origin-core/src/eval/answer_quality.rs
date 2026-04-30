@@ -2153,10 +2153,10 @@ pub async fn run_fullpipeline_lme_batch(
 
     let mut samples = load_longmemeval(longmemeval_path)?;
     // Optional limit for small test runs (set LME_LIMIT_QUESTIONS=N).
-    if let Some(n) = std::env::var("LME_LIMIT_QUESTIONS")
+    let limit_active = std::env::var("LME_LIMIT_QUESTIONS")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
+        .and_then(|s| s.parse::<usize>().ok());
+    if let Some(n) = limit_active {
         let total_before = samples.len();
         samples.truncate(n);
         eprintln!(
@@ -2179,6 +2179,22 @@ pub async fn run_fullpipeline_lme_batch(
     } else {
         Vec::new()
     };
+    // When LME_LIMIT_QUESTIONS is active, restrict resume tuples to questions in the
+    // truncated sample window so the returned vec matches the limit (avoids leaking
+    // tuples from prior unbounded runs back to caller).
+    if limit_active.is_some() {
+        let allowed: std::collections::HashSet<String> =
+            samples.iter().map(|s| s.question.clone()).collect();
+        let before = finished_tuples.len();
+        finished_tuples.retain(|t| allowed.contains(&t.question));
+        if before != finished_tuples.len() {
+            eprintln!(
+                "[fullpipeline_lme] resume filter: kept {}/{} tuples within limit window",
+                finished_tuples.len(),
+                before
+            );
+        }
+    }
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
 

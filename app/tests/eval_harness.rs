@@ -3367,7 +3367,7 @@ async fn judge_fullpipeline_lme_cli() {
         baselines.join("fullpipeline_lme_judgments.jsonl")
     };
 
-    let results = if batch_size > 1 {
+    let (results, label) = if batch_size > 1 {
         eprintln!(
             "Judging {} LME tuples via CLI BATCHED (model={}, batch={}, rotation={}, retries={}, cache={})...",
             tuples_to_judge.len(),
@@ -3377,7 +3377,7 @@ async fn judge_fullpipeline_lme_cli() {
             max_retries,
             cache_path.display()
         );
-        judge_with_claude_model_batched_persistent(
+        let r = judge_with_claude_model_batched_persistent(
             &tuples_to_judge,
             batch_size,
             rotation_calls,
@@ -3386,7 +3386,8 @@ async fn judge_fullpipeline_lme_cli() {
             max_retries,
         )
         .await
-        .expect("judge failed")
+        .expect("judge failed");
+        (r, format!("{}-batch{}-cli", model, batch_size))
     } else {
         eprintln!(
             "Judging {} LME tuples via CLI (model={}, concurrency={}, retries={}, cache={})...",
@@ -3396,7 +3397,7 @@ async fn judge_fullpipeline_lme_cli() {
             max_retries,
             cache_path.display()
         );
-        judge_with_claude_model_persistent(
+        let r = judge_with_claude_model_persistent(
             &tuples_to_judge,
             concurrency,
             &model,
@@ -3404,9 +3405,10 @@ async fn judge_fullpipeline_lme_cli() {
             max_retries,
         )
         .await
-        .expect("judge failed")
+        .expect("judge failed");
+        (r, format!("{}-cli", model))
     };
-    let report = aggregate_judgments(&results, &format!("{}-cli", model));
+    let report = aggregate_judgments(&results, &label);
 
     print_judge_report(&report);
 }
