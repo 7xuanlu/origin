@@ -49,6 +49,16 @@ pub struct JudgmentResult {
     pub context_tokens: usize,
 }
 
+/// Cost telemetry extracted from `claude -p` JSON envelope.
+#[derive(Debug, Clone, Default)]
+pub struct JudgeCostInfo {
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
 /// Per-approach aggregated result in a judged E2E report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgedApproachResult {
@@ -95,6 +105,9 @@ pub async fn judge_with_claude(
 }
 
 /// Judge tuples with a specific Claude model (e.g. "haiku", "sonnet").
+///
+/// In-memory only. For long runs prefer `judge_with_claude_model_persistent`,
+/// which caches each judgment to disk so partial failures aren't lost.
 pub async fn judge_with_claude_model(
     tuples: &[JudgmentTuple],
     concurrency: usize,
@@ -118,15 +131,245 @@ pub async fn judge_with_claude_model(
     }
 
     let mut results = Vec::new();
+    let mut fail_count = 0usize;
     for handle in handles {
         match handle.await {
             Ok(Ok(result)) => results.push(result),
-            Ok(Err(e)) => log::warn!("[judge] judgment failed: {}", e),
-            Err(e) => log::warn!("[judge] task panicked: {}", e),
+            Ok(Err(e)) => {
+                fail_count += 1;
+                eprintln!("[judge] FAILED: {}", e);
+            }
+            Err(e) => {
+                fail_count += 1;
+                eprintln!("[judge] PANICKED: {}", e);
+            }
+        }
+    }
+    eprintln!(
+        "[judge] {} succeeded, {} failed (no persistence — failures lost)",
+        results.len(),
+        fail_count
+    );
+
+    Ok(results)
+}
+
+/// Judge tuples with on-disk persistence + retry + resume.
+///
+/// Behavior:
+/// - Loads any existing judgments from `cache_path` (JSONL, one `JudgmentResult` per line)
+/// - Skips tuples whose (question, approach) pair is already judged
+/// - Retries each unsuccessful tuple up to `max_retries` times with exponential backoff
+/// - Appends each successful judgment to `cache_path` immediately (under file mutex)
+/// - Prints visible per-failure messages + final summary to stderr
+///
+/// Safe to ctrl-C and re-run: re-running picks up where it left off.
+pub async fn judge_with_claude_model_persistent(
+    tuples: &[JudgmentTuple],
+    concurrency: usize,
+    model: &str,
+    cache_path: &Path,
+    max_retries: u32,
+) -> Result<Vec<JudgmentResult>, OriginError> {
+    use std::collections::HashSet;
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+
+    let cached: Vec<JudgmentResult> = if cache_path.exists() {
+        let f = std::fs::File::open(cache_path).map_err(OriginError::from)?;
+        BufReader::new(f)
+            .lines()
+            .map_while(|l| l.ok())
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<JudgmentResult>(&l).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let cached_keys: HashSet<(String, String)> = cached
+        .iter()
+        .map(|r| (r.question.clone(), r.approach.clone()))
+        .collect();
+
+    let todo: Vec<JudgmentTuple> = tuples
+        .iter()
+        .filter(|t| !cached_keys.contains(&(t.question.clone(), t.approach.clone())))
+        .cloned()
+        .collect();
+
+    eprintln!(
+        "[judge] cache: {} existing, {} to judge ({} total)",
+        cached.len(),
+        todo.len(),
+        tuples.len()
+    );
+
+    if todo.is_empty() {
+        return Ok(cached);
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(OriginError::from)?;
+    }
+    let cache_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_path)
+        .map_err(OriginError::from)?;
+    let cache_writer = Arc::new(AsyncMutex::new(cache_file));
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let retry_count = Arc::new(AtomicUsize::new(0));
+    let fail_count = Arc::new(AtomicUsize::new(0));
+    let succ_count = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::new(AtomicUsize::new(0));
+    let total_cost_usd = Arc::new(std::sync::atomic::AtomicU64::new(0)); // cost * 1_000_000
+    let total_in_tokens = Arc::new(AtomicUsize::new(0));
+    let total_out_tokens = Arc::new(AtomicUsize::new(0));
+    let total_cache_create = Arc::new(AtomicUsize::new(0));
+    let total_cache_read = Arc::new(AtomicUsize::new(0));
+    let total = todo.len();
+
+    let mut handles = Vec::with_capacity(todo.len());
+    for tuple in todo {
+        let sem = semaphore.clone();
+        let model = model.to_string();
+        let writer = cache_writer.clone();
+        let retries = retry_count.clone();
+        let fails = fail_count.clone();
+        let succs = succ_count.clone();
+        let prog = progress.clone();
+
+        let cost_us = total_cost_usd.clone();
+        let in_tok = total_in_tokens.clone();
+        let out_tok = total_out_tokens.clone();
+        let cc_tok = total_cache_create.clone();
+        let cr_tok = total_cache_read.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let mut last_err: Option<String> = None;
+            let mut result: Option<JudgmentResult> = None;
+            for attempt in 0..=max_retries {
+                match judge_single_tuple_model_with_cost(&tuple, &model).await {
+                    Ok((r, cost)) => {
+                        if let Some(c) = cost {
+                            cost_us.fetch_add(
+                                (c.cost_usd * 1_000_000.0) as u64,
+                                Ordering::Relaxed,
+                            );
+                            in_tok.fetch_add(c.input_tokens as usize, Ordering::Relaxed);
+                            out_tok.fetch_add(c.output_tokens as usize, Ordering::Relaxed);
+                            cc_tok.fetch_add(c.cache_creation_tokens as usize, Ordering::Relaxed);
+                            cr_tok.fetch_add(c.cache_read_tokens as usize, Ordering::Relaxed);
+                        }
+                        result = Some(r);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        if attempt < max_retries {
+                            retries.fetch_add(1, Ordering::Relaxed);
+                            let delay_ms = 500u64 * (1 << attempt);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                }
+            }
+
+            let done = prog.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 50 == 0 || done == total {
+                eprintln!(
+                    "[judge] progress {}/{} (succ={}, fail={}, retries={})",
+                    done,
+                    total,
+                    succs.load(Ordering::Relaxed),
+                    fails.load(Ordering::Relaxed),
+                    retries.load(Ordering::Relaxed)
+                );
+            }
+
+            match result {
+                Some(r) => {
+                    let line = match serde_json::to_string(&r) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            fails.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("[judge] serialize FAIL for {:?}: {}", tuple.question, e);
+                            return None;
+                        }
+                    };
+                    let mut guard = writer.lock().await;
+                    if let Err(e) = writeln!(*guard, "{}", line) {
+                        fails.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[judge] write FAIL for {:?}: {}", tuple.question, e);
+                        return None;
+                    }
+                    let _ = guard.flush();
+                    drop(guard);
+                    succs.fetch_add(1, Ordering::Relaxed);
+                    Some(r)
+                }
+                None => {
+                    fails.fetch_add(1, Ordering::Relaxed);
+                    let q_preview: String = tuple.question.chars().take(60).collect();
+                    eprintln!(
+                        "[judge] FAILED after {} retries: {:?} — last_err: {}",
+                        max_retries,
+                        q_preview,
+                        last_err.unwrap_or_else(|| "?".into())
+                    );
+                    None
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    let mut new_results = Vec::new();
+    for handle in handles {
+        if let Ok(Some(r)) = handle.await {
+            new_results.push(r);
         }
     }
 
-    Ok(results)
+    let cost_total_dollars = total_cost_usd.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let succ_n = succ_count.load(Ordering::Relaxed) as f64;
+    let mean_cost = if succ_n > 0.0 {
+        cost_total_dollars / succ_n
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[judge] DONE: {} succ, {} fail, {} retries (cache: {} → {})",
+        succ_count.load(Ordering::Relaxed),
+        fail_count.load(Ordering::Relaxed),
+        retry_count.load(Ordering::Relaxed),
+        cached.len(),
+        cached.len() + new_results.len()
+    );
+    eprintln!(
+        "[judge] cost: ${:.4} total (${:.5}/call) | in={} out={} cache_create={} cache_read={}",
+        cost_total_dollars,
+        mean_cost,
+        total_in_tokens.load(Ordering::Relaxed),
+        total_out_tokens.load(Ordering::Relaxed),
+        total_cache_create.load(Ordering::Relaxed),
+        total_cache_read.load(Ordering::Relaxed),
+    );
+    if mean_cost > 0.05 {
+        eprintln!(
+            "[judge] WARN: mean cost ${:.5}/call is high — claude -p re-creates the system-prompt cache each call. Consider Anthropic API direct (~1000x cheaper) for full runs.",
+            mean_cost
+        );
+    }
+
+    let mut all = cached;
+    all.extend(new_results);
+    Ok(all)
 }
 
 /// Judge a single (question, ground_truth, answer) tuple via `claude -p`.
@@ -139,10 +382,23 @@ pub async fn judge_single_tuple(tuple: &JudgmentTuple) -> Result<JudgmentResult,
 }
 
 /// Judge a single tuple with a specific Claude model.
+///
+/// Backward-compat wrapper that drops cost telemetry. New callers should prefer
+/// `judge_single_tuple_model_with_cost`.
 pub async fn judge_single_tuple_model(
     tuple: &JudgmentTuple,
     model: &str,
 ) -> Result<JudgmentResult, OriginError> {
+    judge_single_tuple_model_with_cost(tuple, model)
+        .await
+        .map(|(r, _)| r)
+}
+
+/// Judge a single tuple, also extracting cost telemetry from the CLI envelope.
+pub async fn judge_single_tuple_model_with_cost(
+    tuple: &JudgmentTuple,
+    model: &str,
+) -> Result<(JudgmentResult, Option<JudgeCostInfo>), OriginError> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
@@ -155,8 +411,11 @@ pub async fn judge_single_tuple_model(
 
     let json_schema = r#"{"type":"object","properties":{"score":{"type":"integer","enum":[0,1]},"reason":{"type":"string"}},"required":["score","reason"]}"#;
 
-    // No system prompt — all instructions are in the user prompt (shared with batch API)
+    // No system prompt — all instructions are in the user prompt (shared with batch API).
+    // Strip ANTHROPIC_API_KEY so Claude Code uses Max-plan OAuth instead of an empty
+    // API balance (mirrors ClaudeCliProvider in llm_provider.rs).
     let mut child = Command::new("claude")
+        .env_remove("ANTHROPIC_API_KEY")
         .args([
             "-p",
             "--model",
@@ -201,6 +460,35 @@ pub async fn judge_single_tuple_model(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
+    // Try to also extract cost telemetry from the envelope (best-effort, never fatal).
+    let cost = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .map(|env| {
+            let usage = env.get("usage");
+            JudgeCostInfo {
+                cost_usd: env
+                    .get("total_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                input_tokens: usage
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                output_tokens: usage
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_creation_tokens: usage
+                    .and_then(|u| u.get("cache_creation_input_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_read_tokens: usage
+                    .and_then(|u| u.get("cache_read_input_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            }
+        });
+
     // Parse the JSON response. `--output-format json` returns an envelope; the structured
     // output lives in the `structured_output` field when `--json-schema` is used.
     let parsed: serde_json::Value = parse_judge_json(&stdout).map_err(|e| {
@@ -217,13 +505,16 @@ pub async fn judge_single_tuple_model(
         .unwrap_or("no reason")
         .to_string();
 
-    Ok(JudgmentResult {
-        question: tuple.question.clone(),
-        approach: tuple.approach.clone(),
-        score,
-        reason,
-        context_tokens: tuple.context_tokens,
-    })
+    Ok((
+        JudgmentResult {
+            question: tuple.question.clone(),
+            approach: tuple.approach.clone(),
+            score,
+            reason,
+            context_tokens: tuple.context_tokens,
+        },
+        cost,
+    ))
 }
 
 /// Try to extract the judgment JSON object from `claude -p` output.

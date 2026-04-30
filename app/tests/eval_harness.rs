@@ -1865,6 +1865,156 @@ async fn generate_fullpipeline_lme() {
     eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
 }
 
+/// Enrich LongMemEval per-question DBs without answer generation.
+///
+/// Runs the same per-scenario seed/enrich path as `generate_fullpipeline_lme`,
+/// then stops before Batch API / CLI answer generation. This is useful for
+/// warming the expensive local phases first: entity extraction, title
+/// enrichment, and concept distillation.
+///
+/// ```bash
+/// ORIGIN_LLM_WORKERS=1 ORIGIN_LLM_PARALLEL_SEQS=8 EVAL_ENRICHMENT_CONCURRENCY=8 \
+///   cargo test -p origin --test eval_harness enrich_fullpipeline_lme_only -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn enrich_fullpipeline_lme_only() {
+    use origin_lib::eval::longmemeval::{extract_memories, load_longmemeval};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let lme_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !lme_path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let answer_model =
+        std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
+    let limit: Option<usize> = std::env::var("LME_LIMIT_QUESTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let skip: usize = std::env::var("LME_SKIP_QUESTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines).ok();
+
+    eprintln!(
+        "[lme_enrich_only] baselines={} skip={} limit={:?}",
+        baselines.display(),
+        skip,
+        limit
+    );
+
+    let samples = load_longmemeval(&lme_path).expect("load_longmemeval");
+    let enrichment =
+        EnrichmentMode::from_env(&answer_model, cost_cap).expect("EnrichmentMode init failed");
+    let shared_embedder = eval_shared_embedder();
+
+    let t0 = std::time::Instant::now();
+    let mut processed = 0usize;
+    let mut total_memories = 0usize;
+
+    for (idx, sample) in samples.iter().enumerate().skip(skip) {
+        if limit.is_some_and(|n| processed >= n) {
+            break;
+        }
+
+        let ground_truth = sample
+            .answer
+            .as_str()
+            .unwrap_or(&sample.answer.to_string())
+            .to_string();
+        if ground_truth.is_empty() {
+            continue;
+        }
+
+        let memories = extract_memories(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        let scope_dir = scenario_db_dir(&baselines, "lme", &sample.question_id);
+        let question_id = sample.question_id.clone();
+        let question_type = sample.question_type.clone();
+        let memories_owned = memories.clone();
+
+        let scenario_t0 = std::time::Instant::now();
+        let db = open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .map(|mem| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!(
+                            "lme_{}_{}_t{}",
+                            question_id, mem.session_idx, mem.turn_idx
+                        ),
+                        source: "memory".to_string(),
+                        title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                        memory_type: Some(
+                            if question_type == "single-session-preference" {
+                                "preference"
+                            } else {
+                                "fact"
+                            }
+                            .to_string(),
+                        ),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await
+        .expect("open_or_seed_scenario_db");
+
+        let mem_count = db.memory_count().await.unwrap_or(0);
+        let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        processed += 1;
+        total_memories += mem_count;
+
+        eprintln!(
+            "[lme_enrich_only] {}/{} idx={} q={} mem={} enriched={}/{} elapsed={:.1}s total={:.1}m",
+            processed,
+            limit.unwrap_or(samples.len().saturating_sub(skip)),
+            idx,
+            sample.question_id,
+            memories.len(),
+            enriched,
+            mem_count,
+            scenario_t0.elapsed().as_secs_f32(),
+            t0.elapsed().as_secs_f32() / 60.0,
+        );
+        assert_eq!(
+            mem_count, enriched,
+            "{} should be fully enriched ({}/{})",
+            sample.question_id, enriched, mem_count
+        );
+    }
+
+    eprintln!(
+        "[lme_enrich_only] done: {} scenarios, {} memories in {:.1}m",
+        processed,
+        total_memories,
+        t0.elapsed().as_secs_f32() / 60.0
+    );
+}
+
 /// Smoke test: verify cached per-scenario enriched DBs open and report fully-enriched.
 ///
 /// Skips silently if no per-scenario DBs are present (gitignored, only present locally
@@ -3025,7 +3175,7 @@ async fn smoke_per_scenario_lme() {
 #[ignore]
 async fn judge_fullpipeline_lme_cli() {
     use origin_lib::eval::judge::{
-        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+        aggregate_judgments, judge_with_claude_model_persistent, load_judgment_tuples,
     };
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
@@ -3039,16 +3189,24 @@ async fn judge_fullpipeline_lme_cli() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+    let max_retries: u32 = std::env::var("EVAL_JUDGE_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let cache_path = baselines.join("fullpipeline_lme_judgments.jsonl");
 
     eprintln!(
-        "Judging {} LME tuples via CLI (model={}, concurrency={})...",
+        "Judging {} LME tuples via CLI (model={}, concurrency={}, retries={}, cache={})...",
         tuples.len(),
         model,
-        concurrency
+        concurrency,
+        max_retries,
+        cache_path.display()
     );
-    let results = judge_with_claude_model(&tuples, concurrency, &model)
-        .await
-        .expect("judge failed");
+    let results =
+        judge_with_claude_model_persistent(&tuples, concurrency, &model, &cache_path, max_retries)
+            .await
+            .expect("judge failed");
     let report = aggregate_judgments(&results, &format!("{}-cli", model));
 
     print_judge_report(&report);
@@ -3063,7 +3221,7 @@ async fn judge_fullpipeline_lme_cli() {
 #[ignore]
 async fn judge_fullpipeline_locomo_cli() {
     use origin_lib::eval::judge::{
-        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+        aggregate_judgments, judge_with_claude_model_persistent, load_judgment_tuples,
     };
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
@@ -3077,16 +3235,24 @@ async fn judge_fullpipeline_locomo_cli() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+    let max_retries: u32 = std::env::var("EVAL_JUDGE_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let cache_path = baselines.join("fullpipeline_locomo_judgments.jsonl");
 
     eprintln!(
-        "Judging {} LoCoMo tuples via CLI (model={}, concurrency={})...",
+        "Judging {} LoCoMo tuples via CLI (model={}, concurrency={}, retries={}, cache={})...",
         tuples.len(),
         model,
-        concurrency
+        concurrency,
+        max_retries,
+        cache_path.display()
     );
-    let results = judge_with_claude_model(&tuples, concurrency, &model)
-        .await
-        .expect("judge failed");
+    let results =
+        judge_with_claude_model_persistent(&tuples, concurrency, &model, &cache_path, max_retries)
+            .await
+            .expect("judge failed");
     let report = aggregate_judgments(&results, &format!("{}-cli", model));
 
     print_judge_report(&report);
