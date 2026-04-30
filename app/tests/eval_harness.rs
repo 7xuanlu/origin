@@ -1493,7 +1493,8 @@ async fn generate_e2e_context_tuples_locomo() {
     assert!(!tuples.is_empty(), "should generate at least some tuples");
 
     // Save for offline judging (try baselines dir, fallback to tmpdir)
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines_dir = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     std::fs::create_dir_all(&baselines_dir).ok();
     let out_path = baselines_dir.join("e2e_context_tuples_locomo.json");
     save_judgment_tuples(&tuples, &out_path).expect("save tuples");
@@ -1528,7 +1529,8 @@ async fn generate_e2e_context_tuples_longmemeval() {
     eprintln!("Generated {} judgment tuples", tuples.len());
     assert!(!tuples.is_empty());
 
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines_dir = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     std::fs::create_dir_all(&baselines_dir).ok();
     let out_path = baselines_dir.join("e2e_context_tuples_longmemeval.json");
     save_judgment_tuples(&tuples, &out_path).expect("save tuples");
@@ -1609,7 +1611,8 @@ async fn generate_e2e_context_tuples_locomo_api() {
     eprintln!("Generated {} judgment tuples (Haiku CLI)", tuples.len());
     assert!(!tuples.is_empty());
 
-    let baselines_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines_dir = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     std::fs::create_dir_all(&baselines_dir).ok();
     let out_path = baselines_dir.join("e2e_context_tuples_locomo_api.json");
     save_judgment_tuples(&tuples, &out_path).expect("save tuples");
@@ -1724,7 +1727,8 @@ async fn judge_e2e_batch() {
         aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
     };
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     let tuples_path = baselines.join("e2e_context_tuples_locomo.json");
     if !tuples_path.exists() {
         eprintln!("SKIP: run generate_e2e_context_tuples_locomo first");
@@ -1793,7 +1797,8 @@ async fn generate_fullpipeline_locomo() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10.0);
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     std::fs::create_dir_all(&baselines).ok();
     let output_path = baselines.join("fullpipeline_locomo_tuples.json");
 
@@ -1849,7 +1854,8 @@ async fn generate_fullpipeline_lme() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10.0);
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     std::fs::create_dir_all(&baselines).ok();
     let output_path = baselines.join("fullpipeline_lme_tuples.json");
 
@@ -1916,7 +1922,8 @@ async fn enrich_fullpipeline_lme_only() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     std::fs::create_dir_all(&baselines).ok();
 
     eprintln!(
@@ -2037,7 +2044,8 @@ async fn smoke_enriched_db_reuse() {
     use origin_lib::memory_db::MemoryDB;
     use std::sync::Arc;
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
 
     let mut total_scenarios_checked = 0usize;
     let mut total_passed = 0usize;
@@ -2122,7 +2130,8 @@ async fn judge_fullpipeline_locomo() {
         aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
     };
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     // EVAL_TUPLES_FILE override lets us judge alternate files (e.g. *_pregate.json)
     let default_path = baselines.join("fullpipeline_locomo_tuples.json");
     let tuples_path: std::path::PathBuf = std::env::var("EVAL_TUPLES_FILE")
@@ -2163,7 +2172,8 @@ async fn judge_fullpipeline_lme() {
         aggregate_judgments, judge_with_batch_api, load_judgment_tuples,
     };
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
     if !tuples_path.exists() {
         eprintln!("SKIP: run generate_fullpipeline_lme first");
@@ -3329,7 +3339,8 @@ async fn judge_fullpipeline_lme_cli() {
         aggregate_judgments, judge_with_claude_model_batched_persistent,
         judge_with_claude_model_persistent, load_judgment_tuples,
     };
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
     if !tuples_path.exists() {
         eprintln!("SKIP: run generate_fullpipeline_lme first");
@@ -3425,7 +3436,8 @@ async fn judge_fullpipeline_locomo_cli() {
         aggregate_judgments, judge_with_claude_model_batched_persistent,
         judge_with_claude_model_persistent, load_judgment_tuples,
     };
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
     if !tuples_path.exists() {
         eprintln!("SKIP: run generate_fullpipeline_locomo first");
@@ -3551,7 +3563,8 @@ async fn probe_concept_scores() {
     use origin_lib::eval::shared::eval_shared_embedder;
     use std::sync::Arc;
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     let shared_embedder = eval_shared_embedder();
 
     // Sample questions from tuples
@@ -3692,7 +3705,8 @@ async fn probe_overlap_gate() {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    let baselines = origin_lib::eval::shared::eval_baselines_dir_override()
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines"));
     let shared_embedder = eval_shared_embedder();
     let min_overlap: usize = std::env::var("EVAL_MIN_OVERLAP")
         .ok()
