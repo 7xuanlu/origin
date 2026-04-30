@@ -517,6 +517,445 @@ pub async fn judge_single_tuple_model_with_cost(
     ))
 }
 
+/// Strict batch judge prompt for N tuples per call.
+///
+/// Explicit conservative scoring rules counter the leniency bias observed when
+/// the model judges multiple tuples in one call (probe 2026-04-29 measured
+/// 90% agreement with single-call gold for standard prompt vs 100% for strict).
+pub fn strict_batch_judge_prompt(tuples: &[JudgmentTuple]) -> String {
+    let mut s = String::with_capacity(2048 + tuples.len() * 256);
+    s.push_str(
+        "You will judge multiple (question, ground_truth, model_answer) tuples. Be CONSERVATIVE and STRICT.\n\n",
+    );
+    s.push_str("Scoring rules:\n");
+    s.push_str("- Score 1 ONLY if model_answer explicitly contains the exact information in ground_truth\n");
+    s.push_str("- Score 0 if answer is a vague paraphrase, implication, or generic equivalent\n");
+    s.push_str(
+        "- Score 0 if answer is missing any required element of a multi-part ground_truth\n",
+    );
+    s.push_str(
+        "- Score 0 if answer hedges on a key fact (date, name, number) the question requires\n",
+    );
+    s.push_str(
+        "- Off-by-one tolerance allowed only for explicit numeric temporal counts (days/weeks/months)\n\n",
+    );
+    s.push_str(&format!(
+        "Return JSON object with a 'results' array containing exactly {} entries in input order.\n\nTuples:\n",
+        tuples.len()
+    ));
+    for (i, t) in tuples.iter().enumerate() {
+        s.push_str(&format!(
+            "[{}] Q: {}\n    GT: {}\n    A: {}\n\n",
+            i + 1,
+            t.question,
+            t.ground_truth,
+            t.answer
+        ));
+    }
+    s
+}
+
+/// Strip markdown code fence (```json ... ``` or ``` ... ```) wrapping JSON.
+fn strip_markdown_fence(text: &str) -> String {
+    let t = text.trim();
+    let after_open = if let Some(rest) = t.strip_prefix("```json\n").or_else(|| t.strip_prefix("```\n")) {
+        rest
+    } else if let Some(rest) = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")) {
+        rest
+    } else {
+        return t.to_string();
+    };
+    after_open
+        .trim_end_matches("```")
+        .trim_end_matches('\n')
+        .trim()
+        .to_string()
+}
+
+/// Defensive parser for batch judge envelope. Returns Vec<(score, reason)> or None.
+///
+/// Tries multiple strategies because `--json-schema` enforcement is unreliable
+/// after several --resume turns (model drifts to conversational mode and returns
+/// markdown-wrapped JSON in `.result` field instead of `.structured_output`).
+pub fn parse_batch_judge_envelope(stdout: &str) -> Option<Vec<(u8, String)>> {
+    let trimmed = stdout.trim();
+    let env: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+
+    // Strategy 1: structured_output.results (primary)
+    if let Some(results) = env
+        .get("structured_output")
+        .and_then(|v| v.get("results"))
+        .and_then(|v| v.as_array())
+    {
+        if !results.is_empty() {
+            return Some(extract_score_reason_pairs(results));
+        }
+    }
+
+    // Strategy 2: result field with markdown fence (schema drift fallback)
+    if let Some(result_str) = env.get("result").and_then(|v| v.as_str()) {
+        let stripped = strip_markdown_fence(result_str);
+        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&stripped) {
+            if let Some(results) = inner.get("results").and_then(|v| v.as_array()) {
+                if !results.is_empty() {
+                    return Some(extract_score_reason_pairs(results));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_score_reason_pairs(arr: &[serde_json::Value]) -> Vec<(u8, String)> {
+    arr.iter()
+        .map(|v| {
+            let score = v.get("score").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+            let reason = v
+                .get("reason")
+                .and_then(|x| x.as_str())
+                .unwrap_or("no reason")
+                .to_string();
+            (score, reason)
+        })
+        .collect()
+}
+
+/// Run one batched judge subprocess call.
+///
+/// If `session_id` is `Some`, uses `--resume` for cache reuse. Returns
+/// `(results, cost, new_session_id)`. The new_session_id is the session of THIS
+/// call (caller passes it into the next call's `session_id` for --resume).
+async fn run_batch_judge_subprocess(
+    prompt: &str,
+    model: &str,
+    session_id: Option<&str>,
+) -> Result<
+    (
+        Vec<(u8, String)>,
+        Option<JudgeCostInfo>,
+        Option<String>,
+    ),
+    OriginError,
+> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"score":{"type":"integer","enum":[0,1]},"reason":{"type":"string"}},"required":["score","reason"]}}},"required":["results"]}"#;
+
+    let mut args: Vec<String> = vec![
+        "-p".into(),
+        "--model".into(),
+        model.into(),
+        "--output-format".into(),
+        "json".into(),
+        "--json-schema".into(),
+        json_schema.into(),
+        "--allowedTools".into(),
+        "".into(),
+    ];
+    if let Some(sid) = session_id {
+        args.push("--resume".into());
+        args.push(sid.into());
+    }
+
+    let mut child = Command::new("claude")
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| OriginError::Generic(format!("claude -p failed to start: {}", e)))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| OriginError::Generic(format!("write to claude stdin failed: {}", e)))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| OriginError::Generic(format!("claude -p wait failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(OriginError::Generic(format!(
+            "claude -p exited with error: {}",
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Cost telemetry from envelope
+    let env: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
+    let cost = env.as_ref().map(|e| {
+        let usage = e.get("usage");
+        JudgeCostInfo {
+            cost_usd: e
+                .get("total_cost_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            input_tokens: usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_tokens: usage
+                .and_then(|u| u.get("cache_creation_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_read_tokens: usage
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        }
+    });
+
+    let new_sid = env
+        .as_ref()
+        .and_then(|e| e.get("session_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let results = parse_batch_judge_envelope(&stdout).ok_or_else(|| {
+        OriginError::Generic(format!(
+            "batch judge parse error — raw envelope head: {}",
+            stdout.chars().take(200).collect::<String>()
+        ))
+    })?;
+
+    Ok((results, cost, new_sid))
+}
+
+/// Batched persistent judging with --resume cache reuse + session rotation.
+///
+/// Cost-optimized path:
+/// - Each subprocess call judges `batch_size` tuples (10 = empirical sweet spot).
+/// - Within a session, second+ calls use `--resume` so claude-code re-loads cached
+///   system prompt cheaply (cache_create drops ~92k → ~3k after first call).
+/// - Every `rotation_calls` calls (default 3), session is reset to avoid schema
+///   drift — claude treats long --resume conversations as casual chat and stops
+///   honoring `--json-schema`, falling back to markdown-wrapped output.
+/// - Defensive parser handles markdown fence fallback if schema drift slips through.
+/// - Strict prompt counters the leniency bias observed in standard batched judging.
+///
+/// Persistence + retry semantics match `judge_with_claude_model_persistent`:
+/// JSONL append-only cache, resume across runs, exp-backoff retry per batch.
+pub async fn judge_with_claude_model_batched_persistent(
+    tuples: &[JudgmentTuple],
+    batch_size: usize,
+    rotation_calls: usize,
+    model: &str,
+    cache_path: &Path,
+    max_retries: u32,
+) -> Result<Vec<JudgmentResult>, OriginError> {
+    use std::collections::HashSet;
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    let cached: Vec<JudgmentResult> = if cache_path.exists() {
+        let f = std::fs::File::open(cache_path).map_err(OriginError::from)?;
+        BufReader::new(f)
+            .lines()
+            .map_while(|l| l.ok())
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<JudgmentResult>(&l).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let cached_keys: HashSet<(String, String)> = cached
+        .iter()
+        .map(|r| (r.question.clone(), r.approach.clone()))
+        .collect();
+
+    let todo: Vec<&JudgmentTuple> = tuples
+        .iter()
+        .filter(|t| !cached_keys.contains(&(t.question.clone(), t.approach.clone())))
+        .collect();
+
+    eprintln!(
+        "[judge-batch] cache: {} existing, {} to judge ({} total) | batch_size={} rotation={}",
+        cached.len(),
+        todo.len(),
+        tuples.len(),
+        batch_size,
+        rotation_calls
+    );
+
+    if todo.is_empty() {
+        return Ok(cached);
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(OriginError::from)?;
+    }
+    let mut cache_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_path)
+        .map_err(OriginError::from)?;
+
+    let total_batches = todo.len().div_ceil(batch_size);
+    let mut new_results: Vec<JudgmentResult> = Vec::new();
+    let mut session_id: Option<String> = None;
+    let mut calls_in_session: usize = 0;
+    let mut total_cost_usd: f64 = 0.0;
+    let mut total_cache_create: u64 = 0;
+    let mut total_cache_read: u64 = 0;
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
+    let mut succ_tuples: usize = 0;
+    let mut fail_batches: usize = 0;
+    let mut retry_count: usize = 0;
+
+    for (batch_i, chunk) in todo.chunks(batch_size).enumerate() {
+        let chunk_owned: Vec<JudgmentTuple> = chunk.iter().map(|t| (*t).clone()).collect();
+        let prompt = strict_batch_judge_prompt(&chunk_owned);
+
+        // Rotate session if we hit the cap.
+        if calls_in_session >= rotation_calls {
+            session_id = None;
+            calls_in_session = 0;
+        }
+
+        let mut batch_result: Option<(Vec<(u8, String)>, Option<JudgeCostInfo>, Option<String>)> =
+            None;
+        let mut last_err: Option<String> = None;
+
+        for attempt in 0..=max_retries {
+            match run_batch_judge_subprocess(&prompt, model, session_id.as_deref()).await {
+                Ok((results, cost, sid)) if results.len() == chunk_owned.len() => {
+                    batch_result = Some((results, cost, sid));
+                    break;
+                }
+                Ok((results, _, _)) => {
+                    last_err = Some(format!(
+                        "expected {} results, got {}",
+                        chunk_owned.len(),
+                        results.len()
+                    ));
+                    if attempt < max_retries {
+                        retry_count += 1;
+                        // Reset session — schema drift suspected.
+                        session_id = None;
+                        calls_in_session = 0;
+                        let delay_ms = 500u64 * (1 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < max_retries {
+                        retry_count += 1;
+                        // Reset session on error — may be transient state corruption.
+                        session_id = None;
+                        calls_in_session = 0;
+                        let delay_ms = 500u64 * (1 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        match batch_result {
+            Some((results, cost, sid)) => {
+                if let Some(c) = cost {
+                    total_cost_usd += c.cost_usd;
+                    total_cache_create += c.cache_creation_tokens;
+                    total_cache_read += c.cache_read_tokens;
+                    total_input += c.input_tokens;
+                    total_output += c.output_tokens;
+                }
+                if session_id.is_none() {
+                    session_id = sid;
+                    calls_in_session = 1;
+                } else {
+                    calls_in_session += 1;
+                }
+
+                for (i, (score, reason)) in results.iter().enumerate() {
+                    let tuple = &chunk_owned[i];
+                    let r = JudgmentResult {
+                        question: tuple.question.clone(),
+                        approach: tuple.approach.clone(),
+                        score: *score,
+                        reason: reason.clone(),
+                        context_tokens: tuple.context_tokens,
+                    };
+                    let line = match serde_json::to_string(&r) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[judge-batch] serialize FAIL: {}", e);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = writeln!(cache_file, "{}", line) {
+                        eprintln!("[judge-batch] write FAIL: {}", e);
+                        continue;
+                    }
+                    new_results.push(r);
+                    succ_tuples += 1;
+                }
+                let _ = cache_file.flush();
+                eprintln!(
+                    "[judge-batch] batch {}/{} ok | call_in_session={} | cost so far: ${:.4} | tuples: {}",
+                    batch_i + 1,
+                    total_batches,
+                    calls_in_session,
+                    total_cost_usd,
+                    succ_tuples
+                );
+            }
+            None => {
+                fail_batches += 1;
+                eprintln!(
+                    "[judge-batch] batch {}/{} FAILED after {} retries: {}",
+                    batch_i + 1,
+                    total_batches,
+                    max_retries,
+                    last_err.unwrap_or_else(|| "?".into())
+                );
+                // Reset session for next batch
+                session_id = None;
+                calls_in_session = 0;
+            }
+        }
+    }
+
+    let mean_cost_per_call = if total_batches > fail_batches {
+        total_cost_usd / (total_batches - fail_batches) as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[judge-batch] DONE: {} succ tuples / {} target | {} batches failed | {} retries | sessions={} | total_cost=${:.4} (${:.4}/call)",
+        succ_tuples,
+        todo.len(),
+        fail_batches,
+        retry_count,
+        total_batches.div_ceil(rotation_calls),
+        total_cost_usd,
+        mean_cost_per_call
+    );
+    eprintln!(
+        "[judge-batch] tokens: input={} output={} cache_create={} cache_read={}",
+        total_input, total_output, total_cache_create, total_cache_read
+    );
+
+    let mut all = cached;
+    all.extend(new_results);
+    Ok(all)
+}
+
 /// Try to extract the judgment JSON object from `claude -p` output.
 ///
 /// When `--output-format json` is combined with `--json-schema`, Claude Code returns an

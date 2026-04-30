@@ -3221,7 +3221,8 @@ async fn judge_fullpipeline_lme_cli() {
 #[ignore]
 async fn judge_fullpipeline_locomo_cli() {
     use origin_lib::eval::judge::{
-        aggregate_judgments, judge_with_claude_model_persistent, load_judgment_tuples,
+        aggregate_judgments, judge_with_claude_model_batched_persistent,
+        judge_with_claude_model_persistent, load_judgment_tuples,
     };
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
@@ -3239,23 +3240,71 @@ async fn judge_fullpipeline_locomo_cli() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    let cache_path = baselines.join("fullpipeline_locomo_judgments.jsonl");
+    let batch_size: usize = std::env::var("EVAL_JUDGE_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let rotation_calls: usize = std::env::var("EVAL_JUDGE_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let limit: Option<usize> = std::env::var("EVAL_JUDGE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
-    eprintln!(
-        "Judging {} LoCoMo tuples via CLI (model={}, concurrency={}, retries={}, cache={})...",
-        tuples.len(),
-        model,
-        concurrency,
-        max_retries,
-        cache_path.display()
-    );
-    let results =
-        judge_with_claude_model_persistent(&tuples, concurrency, &model, &cache_path, max_retries)
-            .await
-            .expect("judge failed");
-    let report = aggregate_judgments(&results, &format!("{}-cli", model));
+    let tuples_to_judge: Vec<_> = match limit {
+        Some(n) => tuples.iter().take(n).cloned().collect(),
+        None => tuples,
+    };
+    let cache_path = if batch_size > 1 {
+        baselines.join("fullpipeline_locomo_judgments_batch.jsonl")
+    } else {
+        baselines.join("fullpipeline_locomo_judgments.jsonl")
+    };
 
-    print_judge_report(&report);
+    if batch_size > 1 {
+        eprintln!(
+            "Judging {} LoCoMo tuples via CLI BATCHED (model={}, batch={}, rotation={}, retries={}, cache={})...",
+            tuples_to_judge.len(),
+            model,
+            batch_size,
+            rotation_calls,
+            max_retries,
+            cache_path.display()
+        );
+        let results = judge_with_claude_model_batched_persistent(
+            &tuples_to_judge,
+            batch_size,
+            rotation_calls,
+            &model,
+            &cache_path,
+            max_retries,
+        )
+        .await
+        .expect("judge failed");
+        let report = aggregate_judgments(&results, &format!("{}-batch{}-cli", model, batch_size));
+        print_judge_report(&report);
+    } else {
+        eprintln!(
+            "Judging {} LoCoMo tuples via CLI SINGLE (model={}, concurrency={}, retries={}, cache={})...",
+            tuples_to_judge.len(),
+            model,
+            concurrency,
+            max_retries,
+            cache_path.display()
+        );
+        let results = judge_with_claude_model_persistent(
+            &tuples_to_judge,
+            concurrency,
+            &model,
+            &cache_path,
+            max_retries,
+        )
+        .await
+        .expect("judge failed");
+        let report = aggregate_judgments(&results, &format!("{}-cli", model));
+        print_judge_report(&report);
+    }
 }
 
 /// Print a judge report with per-category breakdown and task-averaged accuracy.
