@@ -1703,6 +1703,7 @@ mod tests {
             max_tokens: 512,
             temperature: 0.1,
             label: None,
+            timeout_secs: None,
         })).unwrap();
         assert!(!result.is_empty());
         assert!(result.contains("Rust"));
@@ -1719,6 +1720,7 @@ mod tests {
                 max_tokens: 512,
                 temperature: 0.3,
                 label: None,
+                timeout_secs: None,
             }))
             .unwrap();
         assert!(result.contains("Alice"));

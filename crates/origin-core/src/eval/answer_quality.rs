@@ -551,6 +551,7 @@ pub async fn run_e2e_locomo_eval(
                 max_tokens: 200,
                 temperature: 0.1,
                 label: Some("e2e_locomo_origin".to_string()),
+                timeout_secs: None,
             };
             match llm_provider.generate(origin_request).await {
                 Ok(raw_answer) => {
@@ -588,6 +589,7 @@ pub async fn run_e2e_locomo_eval(
                     max_tokens: 200,
                     temperature: 0.1,
                     label: Some("e2e_locomo_full_replay".to_string()),
+                    timeout_secs: None,
                 };
                 match llm_provider.generate(replay_request).await {
                     Ok(raw_answer) => {
@@ -629,6 +631,7 @@ pub async fn run_e2e_locomo_eval(
                 max_tokens: 200,
                 temperature: 0.1,
                 label: Some("e2e_locomo_no_context".to_string()),
+                timeout_secs: None,
             };
             match llm_provider.generate(no_ctx_request).await {
                 Ok(raw_answer) => {
@@ -741,6 +744,7 @@ async fn generate_e2e_answers_for_question(
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_flat".to_string()),
+        timeout_secs: None,
     };
     if let Ok(raw) = llm.generate(flat_request).await {
         let answer = strip_think_tags(&raw);
@@ -784,6 +788,7 @@ async fn generate_e2e_answers_for_question(
         max_tokens: 200,
         temperature: 0.1,
         label: Some("e2e_structured".to_string()),
+        timeout_secs: None,
     };
     if let Ok(raw) = llm.generate(structured_request).await {
         let answer = strip_think_tags(&raw);
@@ -1149,14 +1154,523 @@ async fn build_structured_context(
     Ok((structured_context, tokens))
 }
 
+/// Drive Phase 3 answer generation via `claude -p` subprocesses instead of the Batch API.
+///
+/// Set `EVAL_PHASE3_CLI=1` to use this path. Useful when the Anthropic API balance is
+/// insufficient for Batch API calls — this uses the Max subscription via OAuth instead.
+///
+/// Returns a `HashMap<String, String>` with `req_id -> answer` pairs in the same format that
+/// `download_batch_results` returns, so the Phase 4 merge loop needs no changes.
+///
+/// Per-request failures are logged as warnings and produce an empty answer string; they are
+/// skipped by the Phase 4 `pending.get(custom_id)` lookup because the answer is still present
+/// as a key — callers that need strict filtering should check `answer.is_empty()`.
+async fn run_phase3_via_cli(
+    batch_requests: Vec<(String, String, Option<String>, usize)>,
+    cli_concurrency: usize,
+) -> HashMap<String, String> {
+    use crate::llm_provider::{ClaudeCliProvider, LlmProvider, LlmRequest};
+    use futures::StreamExt;
+
+    eprintln!(
+        "[phase3_cli] Running {} requests via claude -p (concurrency={})",
+        batch_requests.len(),
+        cli_concurrency,
+    );
+
+    let provider = Arc::new(ClaudeCliProvider::haiku());
+
+    let results: HashMap<String, String> = futures::stream::iter(batch_requests)
+        .map(|(req_id, user_prompt, system_prompt, max_tokens)| {
+            let provider = provider.clone();
+            async move {
+                let request = LlmRequest {
+                    system_prompt,
+                    user_prompt,
+                    max_tokens: max_tokens as u32,
+                    temperature: 0.0,
+                    label: Some("phase3_cli".to_string()),
+                    timeout_secs: None,
+                };
+                match provider.generate(request).await {
+                    Ok(answer) => (req_id, answer),
+                    Err(e) => {
+                        eprintln!("[phase3_cli] WARN: req {req_id} failed: {e}");
+                        (req_id, String::new())
+                    }
+                }
+            }
+        })
+        .buffer_unordered(cli_concurrency)
+        .collect()
+        .await;
+
+    eprintln!("[phase3_cli] {} answers collected", results.len());
+    results
+}
+
+// ============================================================================
+// Phase 3 batched + persistent CLI path (selected by EVAL_PHASE3_BATCH_SIZE>=2)
+// ============================================================================
+//
+// Why this exists: each `claude -p` subprocess re-loads ~190k tokens of Claude
+// Code system prompt. The per-question path above pays that cost 1388 times per
+// LoCoMo run. The batched path below judges N (default 10) questions per call
+// and uses `--resume` to reuse the cached system prompt across calls in the
+// same session, with rotation every 3 calls to avoid schema drift. Pattern
+// mirrors `judge_with_claude_model_batched_persistent` in `judge.rs`.
+//
+// Cost target: ~25x cheaper than per-question path on LoCoMo Phase 3.
+
+/// Cache record for one persisted answer. JSONL append-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Phase3AnswerRecord {
+    /// Format version. Bump and migrate when shape changes; loader filters mismatches.
+    schema_version: u32,
+    /// SHA-256 of `format!("{system}\n{user_prompt}")` — stable across runs given
+    /// deterministic retrieval. Same key = same context = same expected answer.
+    key: String,
+    /// Question text for human readability + per-category aggregation.
+    question: String,
+    /// Approach label, e.g. "structured_single-hop".
+    approach: String,
+    /// The Haiku answer.
+    answer: String,
+}
+
+const PHASE3_SCHEMA_VERSION: u32 = 1;
+
+/// Strict batch answer prompt — explicit conservative instructions to counter
+/// the cognitive-load relaxation observed when batching multiple Q+context
+/// pairs in one call. Directs the model to admit uncertainty rather than
+/// hallucinate when the provided context lacks the answer.
+fn strict_batch_answer_prompt(items: &[(usize, &str, &str)]) -> String {
+    let mut s = String::with_capacity(2048 + items.len() * 1024);
+    s.push_str(
+        "You will answer multiple (context, question) pairs. Be CONSERVATIVE and DISCIPLINED.\n\n",
+    );
+    s.push_str("Rules:\n");
+    s.push_str("- Use ONLY the context provided in each pair. Do not add external knowledge.\n");
+    s.push_str("- Do not invent, paraphrase, or speculate beyond what the context states.\n");
+    s.push_str("- If the context does not contain enough information to answer, output exactly: \"Information not available\".\n");
+    s.push_str("- Be specific and concise. 1-3 sentences per answer.\n\n");
+    s.push_str(&format!(
+        "Return JSON object with a 'results' array containing exactly {} entries in input order, each with {{ idx, answer }}.\n\nPairs:\n",
+        items.len()
+    ));
+    for (idx, question, context) in items {
+        s.push_str(&format!(
+            "[{}]\nContext:\n{}\n\nQuestion: {}\n\n",
+            idx, context, question
+        ));
+    }
+    s
+}
+
+/// Defensive parser for batch answer envelope. Tries `structured_output.results`
+/// first; falls back to markdown-fence-stripped JSON in `.result` field if
+/// `--json-schema` enforcement drops (which happens after several `--resume`
+/// turns when the model treats the conversation as casual chat).
+///
+/// Returns Vec<(idx, answer)> or None.
+fn parse_batch_answer_envelope(stdout: &str) -> Option<Vec<(usize, String)>> {
+    use crate::eval::cli_batch::strip_markdown_fence;
+    let trimmed = stdout.trim();
+    let env: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+
+    let extract = |arr: &[serde_json::Value]| -> Vec<(usize, String)> {
+        arr.iter()
+            .filter_map(|v| {
+                let idx = v.get("idx").and_then(|x| x.as_u64())? as usize;
+                let answer = v
+                    .get("answer")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((idx, answer))
+            })
+            .collect()
+    };
+
+    if let Some(results) = env
+        .get("structured_output")
+        .and_then(|v| v.get("results"))
+        .and_then(|v| v.as_array())
+    {
+        if !results.is_empty() {
+            return Some(extract(results));
+        }
+    }
+
+    if let Some(result_str) = env.get("result").and_then(|v| v.as_str()) {
+        let stripped = strip_markdown_fence(result_str);
+        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&stripped) {
+            if let Some(results) = inner.get("results").and_then(|v| v.as_array()) {
+                if !results.is_empty() {
+                    return Some(extract(results));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Compute the cache key for a Phase 3 request.
+fn phase3_cache_key(system_prompt: Option<&str>, user_prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(system_prompt.unwrap_or("").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(user_prompt.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Split a Phase 3 user prompt back into (context, question) for batched re-formatting.
+/// Format from caller: `"Context:\n{ctx}\n\nQuestion: {question}"`.
+fn split_context_question(user_prompt: &str) -> (String, String) {
+    if let Some(stripped) = user_prompt.strip_prefix("Context:\n") {
+        if let Some((ctx, question)) = stripped.split_once("\n\nQuestion: ") {
+            return (ctx.to_string(), question.to_string());
+        }
+    }
+    (String::new(), user_prompt.to_string())
+}
+
+/// Run Phase 3 with batched + persistent CLI subprocesses and cache-aware resume.
+///
+/// Sequential per `--resume` invariant (single-writer session). Each batch sends
+/// up to `batch_size` (Q, context) pairs. Sessions rotate every `rotation_calls`
+/// calls to avoid schema-drift after long --resume conversations. Cost is hard-
+/// capped at `cost_cap_usd` (process aborts with error if exceeded).
+///
+/// JSONL cache lives at `cache_path` and is keyed by SHA-256 of
+/// `system_prompt + "\n" + user_prompt` so identical (context, question, system)
+/// triples reuse cached answers across runs.
+#[allow(clippy::too_many_arguments)]
+async fn run_phase3_batched_persistent(
+    batch_requests: Vec<(String, String, Option<String>, usize)>,
+    pending: &HashMap<String, PendingAnswer>,
+    batch_size: usize,
+    rotation_calls: usize,
+    model: &str,
+    cache_path: &Path,
+    max_retries: u32,
+    cost_cap_usd: f64,
+) -> HashMap<String, String> {
+    use crate::eval::cli_batch::run_cli_batch_subprocess;
+    use std::collections::HashMap as StdMap;
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    eprintln!(
+        "[phase3-batch] {} requests | batch_size={} rotation={} retries={} cost_cap=${:.2} | cache={}",
+        batch_requests.len(),
+        batch_size,
+        rotation_calls,
+        max_retries,
+        cost_cap_usd,
+        cache_path.display()
+    );
+
+    // Load existing cache (key -> answer).
+    let mut cached: StdMap<String, String> = StdMap::new();
+    let mut bad_lines = 0usize;
+    if cache_path.exists() {
+        if let Ok(f) = std::fs::File::open(cache_path) {
+            for line in BufReader::new(f).lines().map_while(|l| l.ok()) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Phase3AnswerRecord>(&line) {
+                    Ok(rec) if rec.schema_version == PHASE3_SCHEMA_VERSION => {
+                        cached.insert(rec.key, rec.answer);
+                    }
+                    Ok(rec) => {
+                        eprintln!(
+                            "[phase3-batch] WARN: skipping cache record with schema_version={} (expected {})",
+                            rec.schema_version, PHASE3_SCHEMA_VERSION
+                        );
+                    }
+                    Err(_) => bad_lines += 1,
+                }
+            }
+        }
+    }
+    if bad_lines > 0 {
+        eprintln!(
+            "[phase3-batch] WARN: skipped {} corrupt JSONL lines in cache",
+            bad_lines
+        );
+    }
+    eprintln!("[phase3-batch] cache: {} existing entries", cached.len());
+
+    let mut results: HashMap<String, String> = HashMap::new();
+
+    // Partition: cache hits return immediately; misses go to CLI.
+    let mut todo: Vec<(String, String, String, String, String, String, usize)> = Vec::new();
+    // (req_id, key, question, context, approach, system_prompt, max_tokens)
+    for (req_id, user_prompt, system, max_tokens) in batch_requests {
+        let key = phase3_cache_key(system.as_deref(), &user_prompt);
+        if let Some(answer) = cached.get(&key) {
+            results.insert(req_id, answer.clone());
+            continue;
+        }
+        let (context, question) = split_context_question(&user_prompt);
+        let (approach_label, _gt, _cat, _ctx_tokens) = match pending.get(&req_id) {
+            Some(p) => (
+                p.approach.clone(),
+                p.ground_truth.clone(),
+                p.category.clone(),
+                p.context_tokens,
+            ),
+            None => {
+                eprintln!(
+                    "[phase3-batch] WARN: req {req_id} has no pending metadata; using empty approach"
+                );
+                (String::new(), String::new(), String::new(), 0usize)
+            }
+        };
+        todo.push((
+            req_id,
+            key,
+            question,
+            context,
+            approach_label,
+            system.unwrap_or_default(),
+            max_tokens,
+        ));
+    }
+
+    eprintln!(
+        "[phase3-batch] cache hits: {} | to call: {}",
+        results.len(),
+        todo.len()
+    );
+
+    if todo.is_empty() {
+        return results;
+    }
+
+    // Open cache file for append.
+    if let Some(parent) = cache_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[phase3-batch] WARN: cache dir create failed: {e}");
+        }
+    }
+    let mut cache_file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_path)
+    {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("[phase3-batch] WARN: cache open failed: {e}; running without persistence");
+            None
+        }
+    };
+
+    let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"idx":{"type":"integer"},"answer":{"type":"string"}},"required":["idx","answer"]}}},"required":["results"]}"#;
+
+    let total_batches = todo.len().div_ceil(batch_size);
+    let mut session_id: Option<String> = None;
+    let mut calls_in_session = 0usize;
+    let mut total_cost_usd = 0.0f64;
+    let mut total_cc_tokens: u64 = 0;
+    let mut total_cr_tokens: u64 = 0;
+    let mut total_in_tokens: u64 = 0;
+    let mut total_out_tokens: u64 = 0;
+    let mut succ = 0usize;
+    let mut fail_batches = 0usize;
+    let mut retries = 0usize;
+    let mut aborted = false;
+
+    for (batch_i, chunk) in todo.chunks(batch_size).enumerate() {
+        if total_cost_usd > cost_cap_usd {
+            eprintln!(
+                "[phase3-batch] ABORT: cumulative cost ${:.4} exceeds cost_cap=${:.2}",
+                total_cost_usd, cost_cap_usd
+            );
+            aborted = true;
+            break;
+        }
+
+        // Build prompt for this batch.
+        let items: Vec<(usize, &str, &str)> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t.2.as_str(), t.3.as_str()))
+            .collect();
+        let prompt = strict_batch_answer_prompt(&items);
+
+        // Rotate session if at cap.
+        if calls_in_session >= rotation_calls {
+            session_id = None;
+            calls_in_session = 0;
+        }
+
+        let mut batch_result: Option<(Vec<(usize, String)>, _, _)> = None;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..=max_retries {
+            match run_cli_batch_subprocess(&prompt, model, json_schema, session_id.as_deref()).await
+            {
+                Ok((stdout, cost, sid)) => match parse_batch_answer_envelope(&stdout) {
+                    Some(parsed) if parsed.len() == chunk.len() => {
+                        batch_result = Some((parsed, cost, sid));
+                        break;
+                    }
+                    Some(parsed) => {
+                        last_err = Some(format!(
+                            "expected {} answers, got {}",
+                            chunk.len(),
+                            parsed.len()
+                        ));
+                        if attempt < max_retries {
+                            retries += 1;
+                            session_id = None;
+                            calls_in_session = 0;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500u64 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                    None => {
+                        last_err = Some(format!(
+                            "parse failed — head: {}",
+                            stdout.chars().take(200).collect::<String>()
+                        ));
+                        if attempt < max_retries {
+                            retries += 1;
+                            session_id = None;
+                            calls_in_session = 0;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500u64 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < max_retries {
+                        retries += 1;
+                        session_id = None;
+                        calls_in_session = 0;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500u64 * (1 << attempt),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        match batch_result {
+            Some((parsed, cost, sid)) => {
+                if let Some(c) = cost {
+                    total_cost_usd += c.cost_usd;
+                    total_cc_tokens += c.cache_creation_tokens;
+                    total_cr_tokens += c.cache_read_tokens;
+                    total_in_tokens += c.input_tokens;
+                    total_out_tokens += c.output_tokens;
+                }
+                if session_id.is_none() {
+                    session_id = sid;
+                    calls_in_session = 1;
+                } else {
+                    calls_in_session += 1;
+                }
+
+                // Map idx → answer, then write to cache + results map.
+                let by_idx: HashMap<usize, String> = parsed.into_iter().collect();
+                for (i, t) in chunk.iter().enumerate() {
+                    let answer = by_idx.get(&i).cloned().unwrap_or_default();
+                    let (req_id, key, question, _ctx, approach, _sys, _max) = t;
+                    if let Some(file) = cache_file.as_mut() {
+                        let rec = Phase3AnswerRecord {
+                            schema_version: PHASE3_SCHEMA_VERSION,
+                            key: key.clone(),
+                            question: question.clone(),
+                            approach: approach.clone(),
+                            answer: answer.clone(),
+                        };
+                        if let Ok(line) = serde_json::to_string(&rec) {
+                            let _ = writeln!(file, "{}", line);
+                            let _ = file.flush();
+                        }
+                    }
+                    results.insert(req_id.clone(), answer);
+                    succ += 1;
+                }
+                eprintln!(
+                    "[phase3-batch] {}/{} ok | call_in_session={} | cost so far: ${:.4} | answers: {}",
+                    batch_i + 1,
+                    total_batches,
+                    calls_in_session,
+                    total_cost_usd,
+                    succ
+                );
+            }
+            None => {
+                fail_batches += 1;
+                eprintln!(
+                    "[phase3-batch] {}/{} FAILED after {} retries: {}",
+                    batch_i + 1,
+                    total_batches,
+                    max_retries,
+                    last_err.unwrap_or_else(|| "?".into())
+                );
+                // Insert empty answers for this batch's req_ids so the caller's lookup works.
+                for t in chunk.iter() {
+                    results.insert(t.0.clone(), String::new());
+                }
+                session_id = None;
+                calls_in_session = 0;
+            }
+        }
+    }
+
+    let mean_cost_per_call = if total_batches > fail_batches {
+        total_cost_usd / (total_batches - fail_batches) as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[phase3-batch] DONE: {} succ / {} target | {} batches failed | {} retries | aborted={}",
+        succ,
+        todo.len(),
+        fail_batches,
+        retries,
+        aborted
+    );
+    eprintln!(
+        "[phase3-batch] cost: ${:.4} total (${:.5}/call) | tokens: input={} output={} cache_create={} cache_read={}",
+        total_cost_usd,
+        mean_cost_per_call,
+        total_in_tokens,
+        total_out_tokens,
+        total_cc_tokens,
+        total_cr_tokens
+    );
+    if mean_cost_per_call > 0.05 {
+        eprintln!(
+            "[phase3-batch] WARN: mean cost ${:.5}/call is high — investigate cache hit rate or batch size",
+            mean_cost_per_call
+        );
+    }
+
+    results
+}
+
 /// Full-pipeline LoCoMo eval using Batch API for answer generation.
 ///
-/// **Single DB**: all conversations seeded into one database, each tagged with
-/// a conversation-specific domain. Enrichment runs once across all data, so
-/// entities accumulate and concepts can form from cross-observation clusters.
+/// **Per-conversation DB**: each LoCoMo conversation gets its own isolated database so
+/// enrichment (entity dedup, concept distillation, KG augmentation) cannot cross-pollinate
+/// between scenarios. DBs are cached under `baselines_dir/fullpipeline/locomo/{sample_id}/`.
 ///
-/// **Phase 1** (on-device, free): Seed all conversations, enrich once.
-/// **Phase 2** (free): Collect contexts for all questions (search with domain filter).
+/// **Phase 1+2** (on-device, free): For each conversation, open or seed its DB (cached on
+/// re-runs), then build contexts for all questions against that conversation's DB.
 /// **Phase 3** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
 /// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
 pub async fn run_fullpipeline_locomo_batch(
@@ -1171,7 +1685,20 @@ pub async fn run_fullpipeline_locomo_batch(
     use crate::eval::judge::save_judgment_tuples;
     use crate::eval::locomo::{category_name, extract_observations, load_locomo};
 
-    let samples = load_locomo(locomo_path)?;
+    let samples_all = load_locomo(locomo_path)?;
+
+    // LOCOMO_LIMIT_CONVS=N: take only the first N conversations.  Useful for a quick
+    // smoke-test before committing to a full run.
+    let limit_convs: Option<usize> = std::env::var("LOCOMO_LIMIT_CONVS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let samples = if let Some(n) = limit_convs {
+        eprintln!("[fullpipeline] LOCOMO_LIMIT_CONVS={n}: limiting to first {n} conversations");
+        samples_all.into_iter().take(n).collect::<Vec<_>>()
+    } else {
+        samples_all
+    };
+
     let shared_embedder = eval_shared_embedder();
 
     // Resume
@@ -1188,130 +1715,295 @@ pub async fn run_fullpipeline_locomo_batch(
     };
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
-    // --- Phase 1: Seed all conversations into one DB, enrich once ---
-    // Use a stable DB path (sibling to output_path) so enrichment survives crashes.
-    let db_dir = output_path.with_extension("db");
-    std::fs::create_dir_all(&db_dir).ok();
-    let db =
-        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
-            .await?;
 
-    // Check if DB already has COMPLETE enrichment (not just partial data).
-    // Enrichment is complete when enrichment_steps rows exist for memories.
-    let mem_count = db.memory_count().await.unwrap_or(0);
-    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
-    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
+    // --- Phase 1+2 merged: per-conversation DB open (cached) + context build ---
+    // output_path is e.g. baselines/fullpipeline_locomo_tuples.json; its parent is baselines/.
+    let baselines_dir = output_path
+        .parent()
+        .ok_or_else(|| OriginError::Generic("output_path has no parent".to_string()))?;
 
-    if enrichment_complete {
-        eprintln!(
-            "[fullpipeline] Resuming with enriched DB ({} memories, all enriched)",
-            mem_count
-        );
-    } else {
-        // Wipe partial data and start fresh to avoid inconsistencies
-        if mem_count > 0 && enriched_count < mem_count {
-            eprintln!(
-                "[fullpipeline] Partial data found ({}/{} enriched). Starting fresh.",
-                enriched_count, mem_count
-            );
-            db.clear_all_for_eval().await?;
-        }
+    let scenario_concurrency: usize = std::env::var("EVAL_SCENARIO_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .min(8);
+    eprintln!("[fullpipeline] scenario concurrency = {scenario_concurrency}");
 
-        let mut total_obs = 0usize;
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    // Each scenario yields a Vec of (req_id, prompt, system, max_tokens, PendingAnswer).
+    type ScenarioOutput = Vec<(String, String, Option<String>, usize, String, PendingAnswer)>;
+
+    if scenario_concurrency <= 1 {
+        // Serial path — preserves existing behavior exactly.
         for sample in &samples {
             let memories = extract_observations(sample);
             if memories.is_empty() {
                 continue;
             }
 
-            let docs: Vec<RawDocument> = memories
-                .iter()
-                .enumerate()
-                .map(|(i, mem)| RawDocument {
-                    content: mem.content.clone(),
-                    source_id: format!("locomo_{}_obs_{}", sample.sample_id, i),
-                    source: "memory".to_string(),
-                    title: format!("{} session {}", mem.speaker, mem.session_num),
-                    memory_type: Some("fact".to_string()),
-                    domain: Some("conversation".to_string()),
-                    last_modified: chrono::Utc::now().timestamp(),
-                    ..Default::default()
-                })
-                .collect();
-            total_obs += docs.len();
-            db.upsert_documents(docs).await?;
-            eprintln!(
-                "[fullpipeline] Seeded {} ({} observations)",
-                sample.sample_id,
-                memories.len()
-            );
-        }
+            let scope_dir =
+                crate::eval::shared::scenario_db_dir(baselines_dir, "locomo", &sample.sample_id);
 
-        let mode_label = match &enrichment {
-            crate::eval::shared::EnrichmentMode::OnDevice(_) => "on-device (Qwen3-4B, free)",
-            crate::eval::shared::EnrichmentMode::BatchApi { .. } => "Batch API (Haiku, paid)",
-        };
-        eprintln!(
-            "[fullpipeline] Total: {} observations in 1 DB. Enriching: {}...",
-            total_obs, mode_label
-        );
-        let (entities, titles, concepts) =
-            crate::eval::shared::enrich_db_for_eval(&db, &enrichment).await?;
-        eprintln!(
-            "[fullpipeline] Enriched: {} entities, {} titles, {} concepts",
-            entities, titles, concepts
-        );
-    }
-
-    // --- Phase 2: Collect contexts for all questions ---
-    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
-    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
-
-    for sample in &samples {
-        let mut q_count = 0usize;
-
-        for qa in &sample.qa {
-            if qa.category == 5 {
-                continue;
-            }
-            if done_questions.contains(&qa.question) {
-                continue;
-            }
-
-            let ground_truth = qa
-                .answer
-                .as_ref()
-                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
-                .unwrap_or_default();
-            if ground_truth.is_empty() {
-                continue;
-            }
-
-            let category = category_name(qa.category);
-            let (ctx, ctx_tokens) = build_structured_context(&db, &qa.question, 10, None).await?;
-
-            let req_id = format!("q_{}_{}", sample.sample_id, q_count);
-            batch_requests.push((
-                req_id.clone(),
-                format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
-                Some(E2E_SYSTEM_PROMPT.to_string()),
-                200,
-            ));
-            pending.insert(
-                req_id,
-                PendingAnswer {
-                    question: qa.question.clone(),
-                    ground_truth,
-                    approach: format!("structured_{}", category),
-                    category: category.to_string(),
-                    context_tokens: ctx_tokens,
+            let sample_id = sample.sample_id.clone();
+            let memories_owned = memories.clone();
+            let db = match crate::eval::shared::open_or_seed_scenario_db(
+                &scope_dir,
+                shared_embedder.clone(),
+                move || {
+                    memories_owned
+                        .iter()
+                        .enumerate()
+                        .map(|(i, mem)| RawDocument {
+                            content: mem.content.clone(),
+                            source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                            source: "memory".to_string(),
+                            title: format!("{} session {}", mem.speaker, mem.session_num),
+                            memory_type: Some("fact".to_string()),
+                            domain: Some("conversation".to_string()),
+                            last_modified: chrono::Utc::now().timestamp(),
+                            ..Default::default()
+                        })
+                        .collect()
                 },
+                &enrichment,
+            )
+            .await
+            {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                        sample.sample_id, e
+                    );
+                    continue;
+                }
+            };
+
+            let db_mem_count = db.memory_count().await.unwrap_or(0);
+            let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+            eprintln!(
+                "[fullpipeline] Conv {}: {} obs, {}/{} enriched",
+                sample.sample_id,
+                memories.len(),
+                db_enriched,
+                db_mem_count,
             );
 
-            q_count += 1;
+            let mut q_count = 0usize;
+
+            for qa in &sample.qa {
+                if qa.category == 5 {
+                    continue;
+                }
+                if done_questions.contains(&qa.question) {
+                    continue;
+                }
+
+                let ground_truth = qa
+                    .answer
+                    .as_ref()
+                    .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                    .unwrap_or_default();
+                if ground_truth.is_empty() {
+                    continue;
+                }
+
+                let category = category_name(qa.category);
+                let ctx_result = build_structured_context(&db, &qa.question, 10, None).await;
+                let (ctx, ctx_tokens) = match ctx_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "[fullpipeline] WARN: scenario {} question context failed: {}. Skipping question.",
+                            sample.sample_id, e
+                        );
+                        continue;
+                    }
+                };
+
+                let req_id = format!("q_{}_{}", sample.sample_id, q_count);
+                batch_requests.push((
+                    req_id.clone(),
+                    format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
+                    Some(E2E_SYSTEM_PROMPT.to_string()),
+                    200,
+                ));
+                pending.insert(
+                    req_id,
+                    PendingAnswer {
+                        question: qa.question.clone(),
+                        ground_truth,
+                        approach: format!("structured_{}", category),
+                        category: category.to_string(),
+                        context_tokens: ctx_tokens,
+                    },
+                );
+
+                q_count += 1;
+            }
+            if q_count > 0 {
+                eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+            }
         }
-        if q_count > 0 {
-            eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+    } else {
+        // Concurrent path — overlaps CPU/DB/IO across scenarios.
+        // Phase 3 (batch API) stays serial after this block.
+        use futures::StreamExt;
+
+        let enrichment_arc = Arc::new(enrichment);
+        let done_arc = Arc::new(done_questions.clone());
+        let baselines_dir_owned = baselines_dir.to_path_buf();
+        // Wrap samples in Arc so each future can index without cloning the whole vec.
+        let samples_arc = Arc::new(samples);
+
+        let scenario_outputs: Vec<Result<ScenarioOutput, OriginError>> =
+            futures::stream::iter(0..samples_arc.len())
+                .map(|s_idx| {
+                    let shared_embedder = shared_embedder.clone();
+                    let enrichment_arc = enrichment_arc.clone();
+                    let done_arc = done_arc.clone();
+                    let baselines_dir_owned = baselines_dir_owned.clone();
+                    let samples_arc = samples_arc.clone();
+                    async move {
+                        let sample = &samples_arc[s_idx];
+                        let memories = extract_observations(sample);
+                        if memories.is_empty() {
+                            return Ok(Vec::new());
+                        }
+
+                        let scope_dir = crate::eval::shared::scenario_db_dir(
+                            &baselines_dir_owned,
+                            "locomo",
+                            &sample.sample_id,
+                        );
+
+                        let sample_id = sample.sample_id.clone();
+                        let memories_owned = memories.clone();
+                        let db = match crate::eval::shared::open_or_seed_scenario_db(
+                            &scope_dir,
+                            shared_embedder,
+                            move || {
+                                memories_owned
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, mem)| RawDocument {
+                                        content: mem.content.clone(),
+                                        source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                                        source: "memory".to_string(),
+                                        title: format!(
+                                            "{} session {}",
+                                            mem.speaker, mem.session_num
+                                        ),
+                                        memory_type: Some("fact".to_string()),
+                                        domain: Some("conversation".to_string()),
+                                        last_modified: chrono::Utc::now().timestamp(),
+                                        ..Default::default()
+                                    })
+                                    .collect()
+                            },
+                            &enrichment_arc,
+                        )
+                        .await
+                        {
+                            Ok(db) => db,
+                            Err(e) => {
+                                eprintln!(
+                                    "[fullpipeline] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                                    sample.sample_id, e
+                                );
+                                return Ok(Vec::new());
+                            }
+                        };
+
+                        let db_mem_count = db.memory_count().await.unwrap_or(0);
+                        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+                        eprintln!(
+                            "[fullpipeline] Conv {}: {} obs, {}/{} enriched",
+                            sample.sample_id,
+                            memories.len(),
+                            db_enriched,
+                            db_mem_count,
+                        );
+
+                        let mut entries: ScenarioOutput = Vec::new();
+                        let mut q_count = 0usize;
+
+                        for qa in &sample.qa {
+                            if qa.category == 5 {
+                                continue;
+                            }
+                            if done_arc.contains(&qa.question) {
+                                continue;
+                            }
+
+                            let ground_truth = qa
+                                .answer
+                                .as_ref()
+                                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                                .unwrap_or_default();
+                            if ground_truth.is_empty() {
+                                continue;
+                            }
+
+                            let category = category_name(qa.category);
+                            let ctx_result =
+                                build_structured_context(&db, &qa.question, 10, None)
+                                    .await;
+                            let (ctx, ctx_tokens) = match ctx_result {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[fullpipeline] WARN: scenario {} question context failed: {}. Skipping question.",
+                                        sample.sample_id, e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let req_id = format!("q_{}_{}", sample.sample_id, q_count);
+                            entries.push((
+                                req_id,
+                                format!("Context:\n{}\n\nQuestion: {}", ctx, qa.question),
+                                Some(E2E_SYSTEM_PROMPT.to_string()),
+                                200,
+                                sample.sample_id.clone(),
+                                PendingAnswer {
+                                    question: qa.question.clone(),
+                                    ground_truth,
+                                    approach: format!("structured_{}", category),
+                                    category: category.to_string(),
+                                    context_tokens: ctx_tokens,
+                                },
+                            ));
+                            q_count += 1;
+                        }
+                        if q_count > 0 {
+                            eprintln!("  {} — {} questions collected", sample.sample_id, q_count);
+                        }
+                        Ok(entries)
+                    }
+                })
+                .buffer_unordered(scenario_concurrency)
+                .collect()
+                .await;
+
+        for result in scenario_outputs {
+            let entries = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline] WARN: scenario stream error: {}. Skipping.",
+                        e
+                    );
+                    continue;
+                }
+            };
+            for (req_id, prompt, system, max_tok, _sid, meta) in entries {
+                batch_requests.push((req_id.clone(), prompt, system, max_tok));
+                pending.insert(req_id, meta);
+            }
         }
     }
 
@@ -1322,32 +2014,84 @@ pub async fn run_fullpipeline_locomo_batch(
         return Ok(finished_tuples);
     }
 
-    // --- Phase 3: Batch answer generation ---
-    eprintln!(
-        "\n[fullpipeline] Submitting {} requests via Batch API (model={})",
-        batch_requests.len(),
-        answer_model
-    );
+    // --- Phase 3: Answer generation (Batch API or CLI subprocess) ---
+    let use_cli = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let cli_concurrency: usize = std::env::var("EVAL_PHASE3_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let phase3_batch_size: usize = std::env::var("EVAL_PHASE3_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let phase3_rotation: usize = std::env::var("EVAL_PHASE3_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+        .max(1);
+    let phase3_retries: u32 = std::env::var("EVAL_PHASE3_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let phase3_cost_cap: f64 = std::env::var("EVAL_PHASE3_COST_CAP_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
-
-    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+    let raw_results: HashMap<String, String> = if use_cli && phase3_batch_size >= 2 {
+        eprintln!(
+            "\n[fullpipeline] EVAL_PHASE3_CLI=1, batch_size={}: running {} requests via batched claude -p",
+            phase3_batch_size,
+            batch_requests.len()
+        );
+        let cache_path = baselines_dir.join("fullpipeline_locomo_phase3_answers_batch.jsonl");
+        run_phase3_batched_persistent(
+            batch_requests,
+            &pending,
+            phase3_batch_size,
+            phase3_rotation,
+            "haiku",
+            &cache_path,
+            phase3_retries,
+            phase3_cost_cap,
+        )
         .await
-        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
-    eprintln!("[fullpipeline] Batch submitted: {}", batch_id);
+    } else if use_cli {
+        eprintln!(
+            "\n[fullpipeline] EVAL_PHASE3_CLI=1: running {} requests via claude -p (per-question, concurrency={})",
+            batch_requests.len(),
+            cli_concurrency
+        );
+        run_phase3_via_cli(batch_requests, cli_concurrency).await
+    } else {
+        eprintln!(
+            "\n[fullpipeline] Submitting {} requests via Batch API (model={})",
+            batch_requests.len(),
+            answer_model
+        );
 
-    let results_url = poll_batch(&client, api_key, &batch_id)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
 
-    let raw_results = download_batch_results(&client, api_key, &results_url)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+        let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+        eprintln!("[fullpipeline] Batch submitted: {}", batch_id);
+
+        let results_url = poll_batch(&client, api_key, &batch_id)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+        download_batch_results(&client, api_key, &results_url)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?
+    };
 
     // --- Phase 4: Merge ---
+    // Incremental save: persist after every 10 tuples so a mid-phase crash loses minimal work.
     let mut matched = 0usize;
     for (custom_id, answer) in &raw_results {
         if let Some(meta) = pending.get(custom_id) {
@@ -1360,6 +2104,11 @@ pub async fn run_fullpipeline_locomo_batch(
                 category: meta.category.clone(),
             });
             matched += 1;
+            if matched.is_multiple_of(10) {
+                if let Err(e) = save_judgment_tuples(&finished_tuples, output_path) {
+                    eprintln!("[fullpipeline] WARN: incremental save failed: {e}");
+                }
+            }
         }
     }
 
@@ -1382,9 +2131,14 @@ pub async fn run_fullpipeline_locomo_batch(
 
 /// Full-pipeline LongMemEval eval using Batch API for answer generation.
 ///
-/// **Single DB**: all 500 questions' memories seeded into one database (~10K memories).
-/// No domain filter — search must find relevant memories among all data, like production.
-/// Enrichment runs once across all data.
+/// **Per-question DB**: each LME question gets its own isolated database so enrichment
+/// (entity dedup, concept distillation, KG augmentation) cannot cross-pollinate between
+/// scenarios. DBs are cached under `baselines_dir/fullpipeline/lme/{question_id}/`.
+///
+/// **Phase 1+2** (on-device, free): For each question, open or seed its DB (cached on
+/// re-runs), then build context for that question against its own DB.
+/// **Phase 3** (Batch API, 50% cheaper): Submit all answer prompts in one batch.
+/// **Phase 4** (instant): Merge batch results + cached flat answers into tuples.
 pub async fn run_fullpipeline_lme_batch(
     longmemeval_path: &Path,
     enrichment: crate::eval::shared::EnrichmentMode,
@@ -1397,7 +2151,20 @@ pub async fn run_fullpipeline_lme_batch(
     use crate::eval::judge::save_judgment_tuples;
     use crate::eval::longmemeval::{category_name, extract_memories, load_longmemeval};
 
-    let samples = load_longmemeval(longmemeval_path)?;
+    let mut samples = load_longmemeval(longmemeval_path)?;
+    // Optional limit for small test runs (set LME_LIMIT_QUESTIONS=N).
+    let limit_active = std::env::var("LME_LIMIT_QUESTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    if let Some(n) = limit_active {
+        let total_before = samples.len();
+        samples.truncate(n);
+        eprintln!(
+            "[fullpipeline_lme] LME_LIMIT_QUESTIONS={n} -> processing {}/{}",
+            samples.len(),
+            total_before
+        );
+    }
     let shared_embedder = eval_shared_embedder();
 
     // Resume
@@ -1412,130 +2179,318 @@ pub async fn run_fullpipeline_lme_batch(
     } else {
         Vec::new()
     };
+    // When LME_LIMIT_QUESTIONS is active, restrict resume tuples to questions in the
+    // truncated sample window so the returned vec matches the limit (avoids leaking
+    // tuples from prior unbounded runs back to caller).
+    if limit_active.is_some() {
+        let allowed: std::collections::HashSet<String> =
+            samples.iter().map(|s| s.question.clone()).collect();
+        let before = finished_tuples.len();
+        finished_tuples.retain(|t| allowed.contains(&t.question));
+        if before != finished_tuples.len() {
+            eprintln!(
+                "[fullpipeline_lme] resume filter: kept {}/{} tuples within limit window",
+                finished_tuples.len(),
+                before
+            );
+        }
+    }
     let done_questions: std::collections::HashSet<String> =
         finished_tuples.iter().map(|t| t.question.clone()).collect();
 
-    // --- Phase 1: Seed all questions' memories into one DB, enrich once ---
-    let db_dir = output_path.with_extension("db");
-    std::fs::create_dir_all(&db_dir).ok();
-    let db =
-        MemoryDB::new_with_shared_embedder(&db_dir, Arc::new(NoopEmitter), shared_embedder.clone())
-            .await?;
+    // --- Phase 1+2 merged: per-question DB open (cached) + context build ---
+    // output_path is e.g. baselines/fullpipeline_lme_tuples.json; its parent is baselines/.
+    let baselines_dir = output_path
+        .parent()
+        .ok_or_else(|| OriginError::Generic("output_path has no parent".to_string()))?;
 
-    let mem_count = db.memory_count().await.unwrap_or(0);
-    let enriched_count = db.enriched_memory_count().await.unwrap_or(0);
-    let enrichment_complete = mem_count > 0 && enriched_count == mem_count;
+    let scenario_concurrency: usize = std::env::var("EVAL_SCENARIO_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .min(8);
+    eprintln!("[fullpipeline_lme] scenario concurrency = {scenario_concurrency}");
 
-    if enrichment_complete {
-        eprintln!(
-            "[fullpipeline_lme] Resuming with enriched DB ({} memories, all enriched)",
-            mem_count
-        );
-    } else {
-        if mem_count > 0 && enriched_count < mem_count {
-            eprintln!(
-                "[fullpipeline_lme] Partial data ({}/{} enriched). Starting fresh.",
-                enriched_count, mem_count
-            );
-            db.clear_all_for_eval().await?;
-        }
-        let mut total_mems = 0usize;
-        for sample in &samples {
+    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
+    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
+
+    // Each scenario yields a Vec of (req_id, prompt, system, max_tokens, PendingAnswer).
+    type LmeScenarioOutput = Vec<(String, String, Option<String>, usize, PendingAnswer)>;
+
+    if scenario_concurrency <= 1 {
+        // Serial path — preserves existing behavior exactly.
+        for (q_idx, sample) in samples.iter().enumerate() {
+            if done_questions.contains(&sample.question) {
+                continue;
+            }
+
+            let ground_truth = sample
+                .answer
+                .as_str()
+                .unwrap_or(&sample.answer.to_string())
+                .to_string();
+            if ground_truth.is_empty() {
+                continue;
+            }
+
             let memories = extract_memories(sample);
             if memories.is_empty() {
                 continue;
             }
 
-            let docs: Vec<RawDocument> = memories
-                .iter()
-                .map(|mem| RawDocument {
-                    content: mem.content.clone(),
-                    source_id: format!(
-                        "lme_{}_{}_t{}",
-                        sample.question_id, mem.session_idx, mem.turn_idx
-                    ),
-                    source: "memory".to_string(),
-                    title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
-                    memory_type: Some(
-                        if sample.question_type == "single-session-preference" {
-                            "preference"
-                        } else {
-                            "fact"
-                        }
-                        .to_string(),
-                    ),
-                    domain: Some("conversation".to_string()),
-                    last_modified: chrono::Utc::now().timestamp(),
-                    ..Default::default()
-                })
-                .collect();
-            total_mems += docs.len();
-            db.upsert_documents(docs).await?;
-        }
+            let scope_dir =
+                crate::eval::shared::scenario_db_dir(baselines_dir, "lme", &sample.question_id);
 
-        let mode_label = match &enrichment {
-            crate::eval::shared::EnrichmentMode::OnDevice(_) => "on-device (Qwen3-4B, free)",
-            crate::eval::shared::EnrichmentMode::BatchApi { .. } => "Batch API (Haiku, paid)",
-        };
-        eprintln!(
-            "[fullpipeline_lme] Seeded {} memories from {} questions. Enriching: {}...",
-            total_mems,
-            samples.len(),
-            mode_label
-        );
-        let (entities, titles, concepts) =
-            crate::eval::shared::enrich_db_for_eval(&db, &enrichment).await?;
-        eprintln!(
-            "[fullpipeline_lme] Enriched: {} entities, {} titles, {} concepts",
-            entities, titles, concepts
-        );
-    }
+            let question_id = sample.question_id.clone();
+            let question_type = sample.question_type.clone();
+            let memories_owned = memories.clone();
+            let db = match crate::eval::shared::open_or_seed_scenario_db(
+                &scope_dir,
+                shared_embedder.clone(),
+                move || {
+                    memories_owned
+                        .iter()
+                        .map(|mem| RawDocument {
+                            content: mem.content.clone(),
+                            source_id: format!(
+                                "lme_{}_{}_t{}",
+                                question_id, mem.session_idx, mem.turn_idx
+                            ),
+                            source: "memory".to_string(),
+                            title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                            memory_type: Some(
+                                if question_type == "single-session-preference" {
+                                    "preference"
+                                } else {
+                                    "fact"
+                                }
+                                .to_string(),
+                            ),
+                            domain: Some("conversation".to_string()),
+                            last_modified: chrono::Utc::now().timestamp(),
+                            ..Default::default()
+                        })
+                        .collect()
+                },
+                &enrichment,
+            )
+            .await
+            {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline_lme] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                        sample.question_id, e
+                    );
+                    continue;
+                }
+            };
 
-    // --- Phase 2: Collect contexts ---
-    let mut pending: HashMap<String, PendingAnswer> = HashMap::new();
-    let mut batch_requests: Vec<(String, String, Option<String>, usize)> = Vec::new();
-
-    for (q_idx, sample) in samples.iter().enumerate() {
-        if done_questions.contains(&sample.question) {
-            continue;
-        }
-
-        let ground_truth = sample
-            .answer
-            .as_str()
-            .unwrap_or(&sample.answer.to_string())
-            .to_string();
-        if ground_truth.is_empty() {
-            continue;
-        }
-
-        let category = category_name(&sample.question_type);
-        let (ctx, ctx_tokens) = build_structured_context(&db, &sample.question, 10, None).await?;
-
-        let req_id = format!("q_lme_{}", q_idx);
-        batch_requests.push((
-            req_id.clone(),
-            format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
-            Some(E2E_SYSTEM_PROMPT.to_string()),
-            200,
-        ));
-        pending.insert(
-            req_id,
-            PendingAnswer {
-                question: sample.question.clone(),
-                ground_truth,
-                approach: format!("structured_{}", category),
-                category: category.to_string(),
-                context_tokens: ctx_tokens,
-            },
-        );
-
-        if q_idx % 100 == 99 {
+            let db_mem_count = db.memory_count().await.unwrap_or(0);
+            let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
             eprintln!(
-                "  [contexts] {}/{} questions collected",
-                q_idx + 1,
-                samples.len()
+                "[fullpipeline_lme] Q {}: {} memories, {}/{} enriched",
+                sample.question_id,
+                memories.len(),
+                db_enriched,
+                db_mem_count,
             );
+
+            let category = category_name(&sample.question_type);
+            let ctx_result = build_structured_context(&db, &sample.question, 10, None).await;
+            let (ctx, ctx_tokens) = match ctx_result {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline_lme] WARN: scenario {} context build failed: {}. Skipping.",
+                        sample.question_id, e
+                    );
+                    continue;
+                }
+            };
+
+            let req_id = format!("q_lme_{}", q_idx);
+            batch_requests.push((
+                req_id.clone(),
+                format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
+                Some(E2E_SYSTEM_PROMPT.to_string()),
+                200,
+            ));
+            pending.insert(
+                req_id,
+                PendingAnswer {
+                    question: sample.question.clone(),
+                    ground_truth,
+                    approach: format!("structured_{}", category),
+                    category: category.to_string(),
+                    context_tokens: ctx_tokens,
+                },
+            );
+
+            if q_idx % 100 == 99 {
+                eprintln!(
+                    "  [contexts] {}/{} questions collected",
+                    q_idx + 1,
+                    samples.len()
+                );
+            }
+        }
+    } else {
+        // Concurrent path — overlaps CPU/DB/IO across scenarios.
+        // Phase 3 (batch API) stays serial after this block.
+        use futures::StreamExt;
+
+        let enrichment_arc = Arc::new(enrichment);
+        let done_arc = Arc::new(done_questions.clone());
+        let baselines_dir_owned = baselines_dir.to_path_buf();
+        let total = samples.len();
+        // Wrap samples in Arc so each future can index without cloning the whole vec.
+        let samples_arc = Arc::new(samples);
+
+        let scenario_outputs: Vec<Result<LmeScenarioOutput, OriginError>> =
+            futures::stream::iter(0..total)
+                .map(|q_idx| {
+                    let shared_embedder = shared_embedder.clone();
+                    let enrichment_arc = enrichment_arc.clone();
+                    let done_arc = done_arc.clone();
+                    let baselines_dir_owned = baselines_dir_owned.clone();
+                    let samples_arc = samples_arc.clone();
+                    async move {
+                        let sample = &samples_arc[q_idx];
+                        if done_arc.contains(&sample.question) {
+                            return Ok(Vec::new());
+                        }
+
+                        let ground_truth = sample
+                            .answer
+                            .as_str()
+                            .unwrap_or(&sample.answer.to_string())
+                            .to_string();
+                        if ground_truth.is_empty() {
+                            return Ok(Vec::new());
+                        }
+
+                        let memories = extract_memories(sample);
+                        if memories.is_empty() {
+                            return Ok(Vec::new());
+                        }
+
+                        let scope_dir = crate::eval::shared::scenario_db_dir(
+                            &baselines_dir_owned,
+                            "lme",
+                            &sample.question_id,
+                        );
+
+                        let question_id = sample.question_id.clone();
+                        let question_type = sample.question_type.clone();
+                        let memories_owned = memories.clone();
+                        let db = match crate::eval::shared::open_or_seed_scenario_db(
+                            &scope_dir,
+                            shared_embedder,
+                            move || {
+                                memories_owned
+                                    .iter()
+                                    .map(|mem| RawDocument {
+                                        content: mem.content.clone(),
+                                        source_id: format!(
+                                            "lme_{}_{}_t{}",
+                                            question_id, mem.session_idx, mem.turn_idx
+                                        ),
+                                        source: "memory".to_string(),
+                                        title: format!(
+                                            "session {} turn {}",
+                                            mem.session_idx, mem.turn_idx
+                                        ),
+                                        memory_type: Some(
+                                            if question_type == "single-session-preference" {
+                                                "preference"
+                                            } else {
+                                                "fact"
+                                            }
+                                            .to_string(),
+                                        ),
+                                        domain: Some("conversation".to_string()),
+                                        last_modified: chrono::Utc::now().timestamp(),
+                                        ..Default::default()
+                                    })
+                                    .collect()
+                            },
+                            &enrichment_arc,
+                        )
+                        .await
+                        {
+                            Ok(db) => db,
+                            Err(e) => {
+                                eprintln!(
+                                    "[fullpipeline_lme] WARN: scenario {} failed to open/seed DB: {}. Skipping.",
+                                    sample.question_id, e
+                                );
+                                return Ok(Vec::new());
+                            }
+                        };
+
+                        let db_mem_count = db.memory_count().await.unwrap_or(0);
+                        let db_enriched = db.enriched_memory_count().await.unwrap_or(0);
+                        eprintln!(
+                            "[fullpipeline_lme] Q {}: {} memories, {}/{} enriched",
+                            sample.question_id,
+                            memories.len(),
+                            db_enriched,
+                            db_mem_count,
+                        );
+
+                        let category = category_name(&sample.question_type);
+                        let ctx_result =
+                            build_structured_context(&db, &sample.question, 10, None).await;
+                        let (ctx, ctx_tokens) = match ctx_result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!(
+                                    "[fullpipeline_lme] WARN: scenario {} context build failed: {}. Skipping.",
+                                    sample.question_id, e
+                                );
+                                return Ok(Vec::new());
+                            }
+                        };
+
+                        let req_id = format!("q_lme_{}", q_idx);
+                        if q_idx % 100 == 99 {
+                            eprintln!("  [contexts] {}/{} questions collected", q_idx + 1, total);
+                        }
+                        Ok(vec![(
+                            req_id,
+                            format!("Context:\n{}\n\nQuestion: {}", ctx, sample.question),
+                            Some(E2E_SYSTEM_PROMPT.to_string()),
+                            200usize,
+                            PendingAnswer {
+                                question: sample.question.clone(),
+                                ground_truth,
+                                approach: format!("structured_{}", category),
+                                category: category.to_string(),
+                                context_tokens: ctx_tokens,
+                            },
+                        )])
+                    }
+                })
+                .buffer_unordered(scenario_concurrency)
+                .collect()
+                .await;
+
+        for result in scenario_outputs {
+            let entries = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[fullpipeline_lme] WARN: scenario stream error: {}. Skipping.",
+                        e
+                    );
+                    continue;
+                }
+            };
+            for (req_id, prompt, system, max_tok, meta) in entries {
+                batch_requests.push((req_id.clone(), prompt, system, max_tok));
+                pending.insert(req_id, meta);
+            }
         }
     }
 
@@ -1546,32 +2501,84 @@ pub async fn run_fullpipeline_lme_batch(
         return Ok(finished_tuples);
     }
 
-    // --- Phase 3: Batch answer generation ---
-    eprintln!(
-        "\n[fullpipeline_lme] Submitting {} requests via Batch API (model={})",
-        batch_requests.len(),
-        answer_model
-    );
+    // --- Phase 3: Answer generation (Batch API or CLI subprocess) ---
+    let use_cli = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let cli_concurrency: usize = std::env::var("EVAL_PHASE3_CLI_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let phase3_batch_size: usize = std::env::var("EVAL_PHASE3_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let phase3_rotation: usize = std::env::var("EVAL_PHASE3_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+        .max(1);
+    let phase3_retries: u32 = std::env::var("EVAL_PHASE3_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let phase3_cost_cap: f64 = std::env::var("EVAL_PHASE3_COST_CAP_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50.0);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
-
-    let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+    let raw_results: HashMap<String, String> = if use_cli && phase3_batch_size >= 2 {
+        eprintln!(
+            "\n[fullpipeline_lme] EVAL_PHASE3_CLI=1, batch_size={}: running {} requests via batched claude -p",
+            phase3_batch_size,
+            batch_requests.len()
+        );
+        let cache_path = baselines_dir.join("fullpipeline_lme_phase3_answers_batch.jsonl");
+        run_phase3_batched_persistent(
+            batch_requests,
+            &pending,
+            phase3_batch_size,
+            phase3_rotation,
+            "haiku",
+            &cache_path,
+            phase3_retries,
+            phase3_cost_cap,
+        )
         .await
-        .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
-    eprintln!("[fullpipeline_lme] Batch submitted: {}", batch_id);
+    } else if use_cli {
+        eprintln!(
+            "\n[fullpipeline_lme] EVAL_PHASE3_CLI=1: running {} requests via claude -p (per-question, concurrency={})",
+            batch_requests.len(),
+            cli_concurrency
+        );
+        run_phase3_via_cli(batch_requests, cli_concurrency).await
+    } else {
+        eprintln!(
+            "\n[fullpipeline_lme] Submitting {} requests via Batch API (model={})",
+            batch_requests.len(),
+            answer_model
+        );
 
-    let results_url = poll_batch(&client, api_key, &batch_id)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| OriginError::Generic(format!("client: {e}")))?;
 
-    let raw_results = download_batch_results(&client, api_key, &results_url)
-        .await
-        .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?;
+        let batch_id = submit_batch(&client, api_key, batch_requests, answer_model, cost_cap_usd)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch submit: {e}")))?;
+        eprintln!("[fullpipeline_lme] Batch submitted: {}", batch_id);
+
+        let results_url = poll_batch(&client, api_key, &batch_id)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch poll: {e}")))?;
+
+        download_batch_results(&client, api_key, &results_url)
+            .await
+            .map_err(|e| OriginError::Generic(format!("batch download: {e}")))?
+    };
 
     // --- Phase 4: Merge ---
+    // Incremental save: persist after every 10 tuples so a mid-phase crash loses minimal work.
     let mut matched = 0usize;
     for (custom_id, answer) in &raw_results {
         if let Some(meta) = pending.get(custom_id) {
@@ -1584,6 +2591,11 @@ pub async fn run_fullpipeline_lme_batch(
                 category: meta.category.clone(),
             });
             matched += 1;
+            if matched.is_multiple_of(10) {
+                if let Err(e) = save_judgment_tuples(&finished_tuples, output_path) {
+                    eprintln!("[fullpipeline_lme] WARN: incremental save failed: {e}");
+                }
+            }
         }
     }
 

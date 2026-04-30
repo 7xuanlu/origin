@@ -262,6 +262,7 @@ async fn generate_case(
             max_tokens: 1024,
             temperature: 0.9, // Higher temperature for diverse generation; grader uses 0.1
             label: None,
+            timeout_secs: None,
         })
         .await
         .map_err(|e| crate::error::OriginError::Generic(format!("LLM generate: {e}")))?;
@@ -310,6 +311,7 @@ async fn grade_case(
         max_tokens: 64,
         temperature: 0.1,
         label: None,
+        timeout_secs: None,
     }).await.map_err(|e| crate::error::OriginError::Generic(format!("LLM grade: {e}")))?;
 
     let grades = parse_grades(&response, case.seeds.len() + case.negative_seeds.len());

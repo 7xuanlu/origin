@@ -3186,6 +3186,7 @@ pub async fn test_external_llm(endpoint: String, model: String) -> Result<String
         max_tokens: 10,
         temperature: 0.0,
         label: None,
+        timeout_secs: None,
     };
     provider
         .generate(request)

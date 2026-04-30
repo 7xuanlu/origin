@@ -1780,7 +1780,12 @@ async fn generate_fullpipeline_locomo() {
         return;
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let cli_mode = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) => k,
+        Err(_) if cli_mode => String::new(), // CLI path doesn't use the key (Batch API bypassed)
+        Err(_) => panic!("ANTHROPIC_API_KEY required (or set EVAL_PHASE3_CLI=1 for CLI path)"),
+    };
     let answer_model =
         std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
     let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
@@ -1793,8 +1798,8 @@ async fn generate_fullpipeline_locomo() {
     let output_path = baselines.join("fullpipeline_locomo_tuples.json");
 
     eprintln!(
-        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
-        answer_model, cost_cap, output_path,
+        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}\n  cli_mode: {}",
+        answer_model, cost_cap, output_path, cli_mode,
     );
 
     let enrichment = origin_lib::eval::shared::EnrichmentMode::from_env(&answer_model, cost_cap)
@@ -1831,7 +1836,12 @@ async fn generate_fullpipeline_lme() {
         return;
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let cli_mode = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) => k,
+        Err(_) if cli_mode => String::new(),
+        Err(_) => panic!("ANTHROPIC_API_KEY required (or set EVAL_PHASE3_CLI=1 for CLI path)"),
+    };
     let answer_model =
         std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
     let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
@@ -1844,8 +1854,8 @@ async fn generate_fullpipeline_lme() {
     let output_path = baselines.join("fullpipeline_lme_tuples.json");
 
     eprintln!(
-        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
-        answer_model, cost_cap, output_path,
+        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}\n  cli_mode: {}",
+        answer_model, cost_cap, output_path, cli_mode,
     );
 
     let enrichment = origin_lib::eval::shared::EnrichmentMode::from_env(&answer_model, cost_cap)
@@ -1865,59 +1875,238 @@ async fn generate_fullpipeline_lme() {
     eprintln!("\nDone: {} tuples saved to {:?}", tuples.len(), output_path);
 }
 
-/// Smoke test: verify cached enriched DBs open and report fully-enriched.
+/// Enrich LongMemEval per-question DBs without answer generation.
 ///
-/// Skips silently if either enriched DB is missing (gitignored, only present locally
-/// after a first eval run). When present, exercises the new `try_open_enriched_db`
-/// reuse helper that tasks #12 / #13 evals will rely on.
+/// Runs the same per-scenario seed/enrich path as `generate_fullpipeline_lme`,
+/// then stops before Batch API / CLI answer generation. This is useful for
+/// warming the expensive local phases first: entity extraction, title
+/// enrichment, and concept distillation.
+///
+/// ```bash
+/// ORIGIN_LLM_WORKERS=1 ORIGIN_LLM_PARALLEL_SEQS=8 EVAL_ENRICHMENT_CONCURRENCY=8 \
+///   cargo test -p origin --test eval_harness enrich_fullpipeline_lme_only -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn enrich_fullpipeline_lme_only() {
+    use origin_lib::eval::longmemeval::{extract_memories, load_longmemeval};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let lme_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !lme_path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let answer_model =
+        std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+    let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
+    let limit: Option<usize> = std::env::var("LME_LIMIT_QUESTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let skip: usize = std::env::var("LME_SKIP_QUESTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
+    std::fs::create_dir_all(&baselines).ok();
+
+    eprintln!(
+        "[lme_enrich_only] baselines={} skip={} limit={:?}",
+        baselines.display(),
+        skip,
+        limit
+    );
+
+    let samples = load_longmemeval(&lme_path).expect("load_longmemeval");
+    let enrichment =
+        EnrichmentMode::from_env(&answer_model, cost_cap).expect("EnrichmentMode init failed");
+    let shared_embedder = eval_shared_embedder();
+
+    let t0 = std::time::Instant::now();
+    let mut processed = 0usize;
+    let mut total_memories = 0usize;
+
+    for (idx, sample) in samples.iter().enumerate().skip(skip) {
+        if limit.is_some_and(|n| processed >= n) {
+            break;
+        }
+
+        let ground_truth = sample
+            .answer
+            .as_str()
+            .unwrap_or(&sample.answer.to_string())
+            .to_string();
+        if ground_truth.is_empty() {
+            continue;
+        }
+
+        let memories = extract_memories(sample);
+        if memories.is_empty() {
+            continue;
+        }
+
+        let scope_dir = scenario_db_dir(&baselines, "lme", &sample.question_id);
+        let question_id = sample.question_id.clone();
+        let question_type = sample.question_type.clone();
+        let memories_owned = memories.clone();
+
+        let scenario_t0 = std::time::Instant::now();
+        let db = open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .map(|mem| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!(
+                            "lme_{}_{}_t{}",
+                            question_id, mem.session_idx, mem.turn_idx
+                        ),
+                        source: "memory".to_string(),
+                        title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                        memory_type: Some(
+                            if question_type == "single-session-preference" {
+                                "preference"
+                            } else {
+                                "fact"
+                            }
+                            .to_string(),
+                        ),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await
+        .expect("open_or_seed_scenario_db");
+
+        let mem_count = db.memory_count().await.unwrap_or(0);
+        let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        processed += 1;
+        total_memories += mem_count;
+
+        eprintln!(
+            "[lme_enrich_only] {}/{} idx={} q={} mem={} enriched={}/{} elapsed={:.1}s total={:.1}m",
+            processed,
+            limit.unwrap_or(samples.len().saturating_sub(skip)),
+            idx,
+            sample.question_id,
+            memories.len(),
+            enriched,
+            mem_count,
+            scenario_t0.elapsed().as_secs_f32(),
+            t0.elapsed().as_secs_f32() / 60.0,
+        );
+        assert_eq!(
+            mem_count, enriched,
+            "{} should be fully enriched ({}/{})",
+            sample.question_id, enriched, mem_count
+        );
+    }
+
+    eprintln!(
+        "[lme_enrich_only] done: {} scenarios, {} memories in {:.1}m",
+        processed,
+        total_memories,
+        t0.elapsed().as_secs_f32() / 60.0
+    );
+}
+
+/// Smoke test: verify cached per-scenario enriched DBs open and report fully-enriched.
+///
+/// Skips silently if no per-scenario DBs are present (gitignored, only present locally
+/// after a full-pipeline eval run). When present, walks each benchmark's scenario
+/// subdirectories and asserts that any non-empty scenario DB is fully enriched.
 ///
 /// Fast (no LLM, no API) — just opens DB, counts memories, asserts enrichment_complete.
 #[tokio::test]
 async fn smoke_enriched_db_reuse() {
-    use origin_lib::eval::shared::{
-        try_open_enriched_db, ENRICHED_LME_DB_SUBPATH, ENRICHED_LOCOMO_DB_SUBPATH,
-    };
+    use origin_lib::memory_db::MemoryDB;
+    use std::sync::Arc;
 
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
 
-    let mut checked = 0usize;
-    for (label, subpath) in [
-        ("LoCoMo", ENRICHED_LOCOMO_DB_SUBPATH),
-        ("LME", ENRICHED_LME_DB_SUBPATH),
-    ] {
-        let dir = baselines.join(subpath);
-        if !dir.exists() {
-            eprintln!("[smoke] SKIP {}: {} not found", label, dir.display());
+    let mut total_scenarios_checked = 0usize;
+    let mut total_passed = 0usize;
+
+    for benchmark in ["locomo", "lme"] {
+        let bench_dir = baselines.join("fullpipeline").join(benchmark);
+        if !bench_dir.exists() {
+            eprintln!(
+                "[smoke] SKIP {}: {} not found",
+                benchmark,
+                bench_dir.display()
+            );
             continue;
         }
-        let result = try_open_enriched_db(&baselines, subpath)
-            .await
-            .unwrap_or_else(|e| panic!("[smoke] {} open failed: {}", label, e));
-        let db = result.unwrap_or_else(|| {
-            panic!(
-                "[smoke] {} exists at {} but try_open_enriched_db returned None — \
-                 enriched_count != mem_count, eval would re-enrich",
-                label,
-                dir.display()
-            )
-        });
-        let mem = db.memory_count().await.expect("memory_count");
-        let enriched = db.enriched_memory_count().await.expect("enriched_count");
-        eprintln!(
-            "[smoke] {}: mem={} enriched={} (cached, ready for reuse)",
-            label, mem, enriched
-        );
-        assert!(mem > 0, "{} memory_count should be > 0", label);
-        assert_eq!(
-            mem, enriched,
-            "{} should be fully enriched (got {}/{})",
-            label, enriched, mem
-        );
-        checked += 1;
+
+        let entries = match std::fs::read_dir(&bench_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[smoke] SKIP {}: read_dir failed: {}", benchmark, e);
+                continue;
+            }
+        };
+
+        let mut bench_checked = 0usize;
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let scenario_id = entry.file_name().to_string_lossy().to_string();
+            let scenario_dir = entry.path();
+
+            let emitter: Arc<dyn origin_core::events::EventEmitter> =
+                Arc::new(origin_core::NoopEmitter);
+            let db = MemoryDB::new(&scenario_dir, emitter)
+                .await
+                .expect("[smoke] open scenario DB");
+            let mem = db.memory_count().await.expect("memory_count");
+            let enriched = db.enriched_memory_count().await.expect("enriched_count");
+
+            if mem == 0 {
+                // empty / partial scenario — skip rather than fail
+                continue;
+            }
+
+            assert_eq!(
+                mem, enriched,
+                "[smoke] {}/{} should be fully enriched (got {}/{})",
+                benchmark, scenario_id, enriched, mem
+            );
+            total_scenarios_checked += 1;
+            total_passed += 1;
+            bench_checked += 1;
+        }
+
+        if bench_checked > 0 {
+            eprintln!(
+                "[smoke] {}: checked {} scenarios, all fully enriched",
+                benchmark, bench_checked
+            );
+        }
     }
 
-    if checked == 0 {
-        eprintln!("[smoke] SKIP: no enriched DBs found locally (CI without baselines is normal).");
+    if total_scenarios_checked == 0 {
+        eprintln!(
+            "[smoke] SKIP: no per-scenario enriched DBs found locally \
+             (CI without baselines is normal)."
+        );
+    } else {
+        eprintln!("[smoke] OK: {} scenarios verified", total_passed);
     }
 }
 
@@ -1997,6 +2186,155 @@ async fn judge_fullpipeline_lme() {
 
     let report = aggregate_judgments(&results, &judge_model);
     print_judge_report(&report);
+}
+
+// ---------------------------------------------------------------------------
+// Distill A/B — 4B vs 9B quality probe at 90s budget
+// ---------------------------------------------------------------------------
+
+/// Quick A/B test: distill same cluster with 4B and 9B at 90s budget.
+/// Quality comparison via embedding similarity to source mems + manual review.
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness quality_distill_4b_vs_9b -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn quality_distill_4b_vs_9b() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::eval_shared_embedder;
+    use origin_lib::llm_provider::{LlmProvider, LlmRequest, OnDeviceProvider};
+    use origin_lib::prompts::PromptRegistry;
+    use std::sync::Arc;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found at {:?}", locomo_path);
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    let observations = extract_observations(&samples[0]);
+    let obs_slice: Vec<&str> = observations
+        .iter()
+        .take(5)
+        .map(|o| o.content.as_str())
+        .collect();
+
+    if obs_slice.is_empty() {
+        eprintln!("SKIP: no observations found in first sample");
+        return;
+    }
+
+    let prompts = PromptRegistry::load(&PromptRegistry::override_dir());
+
+    // Build prompt matching distill_one_cluster format
+    let topic = "Caroline";
+    let memories_block: String = obs_slice
+        .iter()
+        .enumerate()
+        .map(|(i, content)| {
+            let snippet: String = content.chars().take(800).collect();
+            format!("[obs_{}] {}", i, snippet)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let user_prompt = format!("Topic: {}\n\n{}", topic, memories_block);
+    let source_text = obs_slice.join(" ");
+
+    eprintln!(
+        "\n[distill-ab] cluster: {} observations, prompt ~{} chars",
+        obs_slice.len(),
+        user_prompt.len()
+    );
+
+    // Helper: embed texts with shared embedder
+    let embedder = eval_shared_embedder();
+    let embed_texts = |texts: Vec<String>| -> Vec<Vec<f32>> {
+        let mut embedder = embedder.lock().unwrap();
+        embedder.embed(texts, None).unwrap_or_default()
+    };
+
+    // Helper: cosine similarity (inline, cosine_similarity is pub(crate))
+    let cosine_sim = |a: &[f32], b: &[f32]| -> f64 {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            (dot / (na * nb)) as f64
+        }
+    };
+
+    // Embed source for similarity comparison
+    let source_embs = embed_texts(vec![source_text.clone()]);
+    let source_emb = match source_embs.into_iter().next() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: embedding failed");
+            return;
+        }
+    };
+
+    for (model_id, label) in [("qwen3-4b", "4B"), ("qwen3.5-9b", "9B")] {
+        eprintln!("\n[distill-ab] loading {} ...", label);
+        let llm: Arc<dyn LlmProvider> = match OnDeviceProvider::new_with_model(Some(model_id)) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("[distill-ab] SKIP {}: {}", label, e);
+                continue;
+            }
+        };
+
+        let max_tokens = llm.recommended_max_output();
+        let t0 = std::time::Instant::now();
+        let result = llm
+            .generate(LlmRequest {
+                system_prompt: Some(prompts.distill_concept.clone()),
+                user_prompt: user_prompt.clone(),
+                max_tokens,
+                temperature: 0.1,
+                label: Some(format!("distill_ab_{}", label)),
+                timeout_secs: Some(90),
+            })
+            .await;
+        let elapsed = t0.elapsed();
+
+        match result {
+            Ok(raw) => {
+                let cleaned = origin_lib::llm_provider::strip_think_tags(&raw);
+                let text = cleaned.trim().to_string();
+
+                // Compute similarity to source
+                let out_embs = embed_texts(vec![text.clone()]);
+                let sim = out_embs
+                    .into_iter()
+                    .next()
+                    .map(|e| cosine_sim(&e, &source_emb))
+                    .unwrap_or(0.0);
+
+                eprintln!(
+                    "[distill-ab] {} sim={:.3} len={} elapsed={:.1}s",
+                    label,
+                    sim,
+                    text.len(),
+                    elapsed.as_secs_f64()
+                );
+
+                let out_path = format!("/tmp/distill_{}.txt", label.to_lowercase());
+                let _ = std::fs::write(&out_path, &text);
+                eprintln!("[distill-ab] {} output saved to {}", label, out_path);
+                eprintln!("--- {} output (first 400 chars) ---", label);
+                eprintln!("{}", text.chars().take(400).collect::<String>());
+                eprintln!("---");
+            }
+            Err(e) => {
+                eprintln!("[distill-ab] {} FAILED: {}", label, e);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2194,6 +2532,787 @@ async fn smoke_fullpipeline() {
     );
 }
 
+/// Manual smoke for the per-scenario DB refactor (T1-T6).
+///
+/// Exercises `open_or_seed_scenario_db` with 2 LoCoMo samples on-device:
+/// 1. Seeds + enriches per-conv DB at `{tempdir}/fullpipeline/locomo/{sample_id}/`.
+/// 2. Verifies expected paths exist with `mem == enriched`.
+/// 3. Builds context for first qa via per-conv DB.
+/// 4. Re-runs `open_or_seed_scenario_db` to confirm cache-hit branch (no re-enrich).
+/// 5. Asserts the two per-conv DBs are PHYSICALLY ISOLATED (no cross-conv source_ids).
+///
+/// Parameterizable via env for use as a pre-flight probe before a full LoCoMo run.
+///
+/// On-device Qwen3-4B (free, Metal GPU). Requires `--ignored --nocapture`.
+///
+/// Run as probe before full LME/LoCoMo:
+///   SMOKE_LOCOMO_SAMPLES=10 EVAL_LOCAL_MODEL=qwen3.5-9b EVAL_ENRICHMENT_BATCH_SIZE=8 \
+///   cargo test -p origin --test eval_harness smoke_per_scenario_locomo -- --ignored --nocapture
+/// Default config (2 samples x 10 obs) is the CI smoke.
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_locomo() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    let n_samples: usize = std::env::var("SMOKE_LOCOMO_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let max_obs_per_conv: usize = std::env::var("SMOKE_LOCOMO_MAX_OBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    assert!(
+        samples.len() >= n_samples.min(2),
+        "need >={} LoCoMo samples for smoke",
+        n_samples.min(2)
+    );
+
+    // Tempdir for baselines so we don't pollute real eval cache
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!(
+        "[smoke-per-scenario] baselines: {}",
+        baselines_dir.display()
+    );
+
+    // On-device enrichment (default per EnrichmentMode::from_env when EVAL_ENRICHMENT unset)
+    let enrichment = EnrichmentMode::from_env("claude-haiku-4-5-20251001", 1.0)
+        .expect("EnrichmentMode::from_env");
+    let shared_embedder = eval_shared_embedder();
+
+    let pair = &samples[..n_samples.min(samples.len())];
+    let mut per_sample_source_ids: Vec<Vec<String>> = Vec::new();
+    let mut total_mems_processed: usize = 0;
+
+    let smoke_t0 = std::time::Instant::now();
+    for sample in pair {
+        let mut memories = extract_observations(sample);
+        memories.truncate(max_obs_per_conv);
+        eprintln!(
+            "[smoke-per-scenario] {} ({} obs, truncated from full) -> open_or_seed",
+            sample.sample_id,
+            memories.len()
+        );
+
+        let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+
+        let sample_id = sample.sample_id.clone();
+        let memories_owned = memories.clone();
+        let conv_t0 = std::time::Instant::now();
+        let db = open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, mem)| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                        source: "memory".to_string(),
+                        title: format!("{} session {}", mem.speaker, mem.session_num),
+                        memory_type: Some("fact".to_string()),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await
+        .expect("open_or_seed_scenario_db");
+        let conv_elapsed = conv_t0.elapsed().as_secs_f32();
+
+        let mem_count = db.memory_count().await.unwrap_or(0);
+        let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        total_mems_processed += mem_count;
+        eprintln!(
+            "[smoke-per-scenario] {}: seed+enrich done in {:.1}s, mem={} enriched={}",
+            sample.sample_id, conv_elapsed, mem_count, enriched
+        );
+        assert!(
+            mem_count > 0,
+            "{}: should have seeded memories",
+            sample.sample_id
+        );
+        assert_eq!(
+            mem_count, enriched,
+            "{}: should be fully enriched ({}/{})",
+            sample.sample_id, enriched, mem_count
+        );
+
+        // Verify physical path exists
+        assert!(
+            scope_dir.join("origin_memory.db").exists(),
+            "{}: DB file should exist at {}",
+            sample.sample_id,
+            scope_dir.display()
+        );
+
+        // Retrieval scoped to own conv: every result must come from this sample's source_id prefix
+        let results = db
+            .search_memory("anything", 50, None, None, None, None, None, None)
+            .await
+            .expect("search_memory");
+        let expected_prefix = format!("locomo_{}_obs_", sample.sample_id);
+        for r in &results {
+            assert!(
+                r.source_id.starts_with(&expected_prefix),
+                "{}: cross-conv leak! result source_id={} (expected prefix {})",
+                sample.sample_id,
+                r.source_id,
+                expected_prefix
+            );
+        }
+        per_sample_source_ids.push(results.iter().map(|r| r.source_id.clone()).collect());
+    }
+
+    // Cross-conv isolation: zero source_id overlap between conv 0 and conv 1
+    let conv0: std::collections::HashSet<_> = per_sample_source_ids[0].iter().collect();
+    let conv1: std::collections::HashSet<_> = per_sample_source_ids[1].iter().collect();
+    let overlap: Vec<_> = conv0.intersection(&conv1).copied().collect();
+    assert!(
+        overlap.is_empty(),
+        "cross-conv source_id leak: {:?}",
+        overlap
+    );
+
+    // Cache-hit verification: re-open first conv. Should NOT re-enrich.
+    let sample = &pair[0];
+    let mut memories = extract_observations(sample);
+    memories.truncate(max_obs_per_conv);
+    let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+    let sample_id_2 = sample.sample_id.clone();
+    let memories_owned_2 = memories.clone();
+    let cache_t0 = std::time::Instant::now();
+    let _db_cached = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned_2
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample_id_2, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("re-open cached");
+    let cache_ms = cache_t0.elapsed().as_millis();
+    eprintln!(
+        "[smoke-per-scenario] cache-hit re-open of {}: {} ms (expected <2000ms; no re-enrich)",
+        sample.sample_id, cache_ms
+    );
+    assert!(
+        cache_ms < 5000,
+        "cache hit too slow ({} ms) -- helper likely re-enriched",
+        cache_ms
+    );
+
+    let total_elapsed = smoke_t0.elapsed().as_secs_f32();
+    eprintln!(
+        "\n=== smoke_per_scenario_locomo PASSED in {:.1}s ===",
+        total_elapsed
+    );
+    eprintln!("  per-conv DB layout: ✓");
+    eprintln!(
+        "  enrichment per-conv (truncated to {} obs each): ✓",
+        max_obs_per_conv
+    );
+    eprintln!("  retrieval scoped to own conv: ✓");
+    eprintln!("  cross-conv source_id isolation: ✓");
+    eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
+
+    // Extrapolation summary — useful for pre-flight estimation.
+    let mean_per_mem_sec = total_elapsed / total_mems_processed.max(1) as f32;
+    let full_locomo_estimate_min = (mean_per_mem_sec * 500.0) / 60.0;
+    eprintln!(
+        "[smoke-locomo] SUMMARY: {} samples x ~{} obs = {} obs in {:.1}s ({:.2}s/obs). \
+         Full LoCoMo (~500 obs) extrapolated: ~{:.1} min (~{:.1} hours).",
+        n_samples,
+        max_obs_per_conv,
+        total_mems_processed,
+        total_elapsed,
+        mean_per_mem_sec,
+        full_locomo_estimate_min,
+        full_locomo_estimate_min / 60.0,
+    );
+}
+
+/// Manual smoke for per-scenario enrichment using Claude CLI provider (D2).
+///
+/// Validates that `EnrichmentMode::OnDevice(ClaudeCliProvider)` works end-to-end:
+/// seed → concurrent entity extraction + title enrichment (EVAL_ENRICHMENT_CONCURRENCY=4)
+/// → distillation → isolation check. Uses claude-haiku-4-5-20251001 via Max plan.
+///
+/// - 1 LoCoMo conversation, 5 observations (small: CLI subprocess ~2-3s/call)
+/// - Expected duration: ~20s (5 obs × 2 phases / 4 concurrency × 3s + distill)
+/// - Skips silently if `claude` binary is not in PATH
+///
+/// ```bash
+/// cargo test -p origin --test eval_harness smoke_per_scenario_locomo_cli -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_locomo_cli() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+    use std::sync::Arc;
+
+    // Probe for `claude` binary — skip silently if not available.
+    let probe = std::process::Command::new("claude")
+        .arg("--version")
+        .output();
+    match probe {
+        Ok(out) if out.status.success() => {
+            eprintln!(
+                "[smoke-cli] claude binary found: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        _ => {
+            eprintln!(
+                "SKIP: `claude` binary not in PATH — install Claude Code CLI to run this smoke"
+            );
+            return;
+        }
+    }
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    assert!(!samples.is_empty(), "need at least 1 LoCoMo sample");
+
+    // Set EVAL_ENRICHMENT_CONCURRENCY=4 for this test scope.
+    // SAFETY: single-threaded test setup; env var is read by enrich_db_for_eval_local.
+    let prev_concurrency = std::env::var("EVAL_ENRICHMENT_CONCURRENCY").ok();
+    std::env::set_var("EVAL_ENRICHMENT_CONCURRENCY", "4");
+    // Restore on drop via a simple guard.
+    struct EnvGuard(Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("EVAL_ENRICHMENT_CONCURRENCY", v),
+                None => std::env::remove_var("EVAL_ENRICHMENT_CONCURRENCY"),
+            }
+        }
+    }
+    let _env_guard = EnvGuard(prev_concurrency);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!("[smoke-cli] baselines: {}", baselines_dir.display());
+
+    let cli_llm: Arc<dyn origin_lib::llm_provider::LlmProvider> = Arc::new(
+        origin_lib::llm_provider::ClaudeCliProvider::new("claude-haiku-4-5-20251001"),
+    );
+    let enrichment = EnrichmentMode::OnDevice(cli_llm);
+    let shared_embedder = eval_shared_embedder();
+
+    // 1 conversation × 5 observations — small enough for CLI subprocess overhead.
+    const MAX_OBS: usize = 5;
+    let sample = &samples[0];
+    let mut memories = extract_observations(sample);
+    memories.truncate(MAX_OBS);
+
+    eprintln!(
+        "[smoke-cli] {} ({} obs) -> open_or_seed",
+        sample.sample_id,
+        memories.len()
+    );
+
+    let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+    let sample_id = sample.sample_id.clone();
+    let memories_owned = memories.clone();
+    let t0 = std::time::Instant::now();
+
+    let db = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("open_or_seed_scenario_db CLI");
+
+    let elapsed = t0.elapsed().as_secs_f32();
+
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched = db.enriched_memory_count().await.unwrap_or(0);
+
+    eprintln!(
+        "[smoke-cli] done in {:.1}s — mem={} enriched={}",
+        elapsed, mem_count, enriched
+    );
+
+    assert!(mem_count > 0, "should have seeded memories");
+    assert_eq!(
+        mem_count, enriched,
+        "should be fully enriched ({}/{})",
+        enriched, mem_count
+    );
+    assert!(
+        scope_dir.join("origin_memory.db").exists(),
+        "DB file should exist"
+    );
+
+    // Verify retrieval is scoped to this sample.
+    let results = db
+        .search_memory("anything", 50, None, None, None, None, None, None)
+        .await
+        .expect("search_memory");
+    let expected_prefix = format!("locomo_{}_obs_", sample.sample_id);
+    for r in &results {
+        assert!(
+            r.source_id.starts_with(&expected_prefix),
+            "cross-conv leak! source_id={} (expected prefix {})",
+            r.source_id,
+            expected_prefix
+        );
+    }
+
+    eprintln!(
+        "\n=== smoke_per_scenario_locomo_cli PASSED in {:.1}s ===",
+        elapsed
+    );
+    eprintln!("  CLI enrichment (concurrency=4): ✓");
+    eprintln!("  mem={} enriched={}: ✓", mem_count, enriched);
+    eprintln!("  retrieval scoped to own conv: ✓");
+}
+
+/// Smoke for new `EnrichmentMode::Cli` (batched + persistent CLI enrichment).
+///
+/// Distinct from `smoke_per_scenario_locomo_cli` above which exercises the
+/// per-memory `OnDevice(ClaudeCliProvider)` route (one subprocess per memory).
+/// This test exercises the new batched route with `--resume`, session rotation,
+/// JSONL persistence, retry, and cost telemetry.
+///
+/// ```bash
+/// EVAL_ENRICHMENT_BATCH_SIZE_ENTITIES=5 EVAL_ENRICHMENT_BATCH_SIZE_TITLES=10 \
+///   cargo test -p origin --test eval_harness smoke_per_scenario_locomo_cli_batched -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_locomo_cli_batched() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let probe = std::process::Command::new("claude")
+        .arg("--version")
+        .output();
+    match probe {
+        Ok(out) if out.status.success() => {
+            eprintln!(
+                "[smoke-cli-batched] claude binary: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        _ => {
+            eprintln!("SKIP: `claude` binary not in PATH");
+            return;
+        }
+    }
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    assert!(!samples.is_empty(), "need at least 1 LoCoMo sample");
+
+    let batch_entities: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE_ENTITIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let batch_titles: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE_TITLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let rotation: usize = std::env::var("EVAL_ENRICHMENT_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let cost_cap: f64 = std::env::var("EVAL_ENRICHMENT_COST_CAP_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.0);
+    let max_obs: usize = std::env::var("SMOKE_MAX_OBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    let cache_subdir = tempfile::tempdir().unwrap();
+    let enrichment = EnrichmentMode::Cli {
+        model: std::env::var("EVAL_ENRICHMENT_CLI_MODEL").unwrap_or_else(|_| "haiku".into()),
+        batch_entities,
+        batch_titles,
+        rotation,
+        retries: 3,
+        cost_cap_usd: cost_cap,
+        cache_dir: cache_subdir.path().to_path_buf(),
+    };
+    let shared_embedder = eval_shared_embedder();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!(
+        "[smoke-cli-batched] baselines: {} | batch_entities={} batch_titles={} cost_cap=${:.2} max_obs={}",
+        baselines_dir.display(),
+        batch_entities,
+        batch_titles,
+        cost_cap,
+        max_obs,
+    );
+
+    let sample = &samples[0];
+    let mut memories = extract_observations(sample);
+    memories.truncate(max_obs);
+
+    let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+    let sample_id = sample.sample_id.clone();
+    let memories_owned = memories.clone();
+    let t0 = std::time::Instant::now();
+
+    let db = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("open_or_seed_scenario_db CLI batched");
+
+    let elapsed = t0.elapsed().as_secs_f32();
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched = db.enriched_memory_count().await.unwrap_or(0);
+
+    eprintln!(
+        "[smoke-cli-batched] done in {:.1}s | mem={} enriched={}",
+        elapsed, mem_count, enriched
+    );
+
+    assert!(mem_count > 0);
+    assert_eq!(mem_count, enriched, "should be fully enriched");
+
+    eprintln!(
+        "\n=== smoke_per_scenario_locomo_cli_batched PASSED in {:.1}s ===",
+        elapsed
+    );
+}
+
+/// Manual smoke for LME per-scenario DB refactor (T3).
+///
+/// Mirrors `smoke_per_scenario_locomo` but for LongMemEval:
+/// Smoke-tests per-scenario LME enrichment. Also serves as a pre-flight probe before a
+/// full LME run: set SMOKE_LME_SAMPLES=10 to cover more scenarios and see extrapolated
+/// wall-time for the full 500-question dataset.
+///
+/// - Per-question DB at `{tempdir}/fullpipeline/lme/{question_id}/`
+/// - Verifies isolation, cache reuse, mem==enriched
+/// - Prints per-mem timing and full-LME extrapolation at end
+///
+/// On-device Qwen3-4B, ~60-90s on Metal GPU. Requires `--ignored --nocapture`.
+///
+/// Run as probe before full LME/LoCoMo:
+///   SMOKE_LME_SAMPLES=10 EVAL_LOCAL_MODEL=qwen3.5-9b EVAL_ENRICHMENT_BATCH_SIZE=8 \
+///   cargo test -p origin --test eval_harness smoke_per_scenario_lme -- --ignored --nocapture
+/// Default config (2 samples x 5 mems) is the CI smoke.
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_lme() {
+    use origin_lib::eval::longmemeval::{extract_memories, load_longmemeval};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let lme_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/longmemeval_oracle.json");
+    if !lme_path.exists() {
+        eprintln!("SKIP: longmemeval_oracle.json not found");
+        return;
+    }
+
+    let samples = load_longmemeval(&lme_path).unwrap();
+    let n_samples: usize = std::env::var("SMOKE_LME_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let max_mem_per_sample: usize = std::env::var("SMOKE_LME_MAX_MEMS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    assert!(
+        samples.len() >= n_samples.min(2),
+        "need >={} LME samples for smoke",
+        n_samples.min(2)
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!("[smoke-lme] baselines: {}", baselines_dir.display());
+
+    let enrichment = EnrichmentMode::from_env("claude-haiku-4-5-20251001", 1.0)
+        .expect("EnrichmentMode::from_env");
+    let shared_embedder = eval_shared_embedder();
+
+    let pair = &samples[..n_samples.min(samples.len())];
+    let mut per_sample_source_ids: Vec<Vec<String>> = Vec::new();
+    let mut total_mems_processed: usize = 0;
+
+    let smoke_t0 = std::time::Instant::now();
+    for sample in pair {
+        let mut memories = extract_memories(sample);
+        memories.truncate(max_mem_per_sample);
+        eprintln!(
+            "[smoke-lme] {} ({} mems, truncated) -> open_or_seed",
+            sample.question_id,
+            memories.len()
+        );
+
+        let scope_dir = scenario_db_dir(&baselines_dir, "lme", &sample.question_id);
+
+        let question_id = sample.question_id.clone();
+        let question_type = sample.question_type.clone();
+        let memories_owned = memories.clone();
+        let conv_t0 = std::time::Instant::now();
+        let db = open_or_seed_scenario_db(
+            &scope_dir,
+            shared_embedder.clone(),
+            move || {
+                memories_owned
+                    .iter()
+                    .map(|mem| RawDocument {
+                        content: mem.content.clone(),
+                        source_id: format!(
+                            "lme_{}_{}_t{}",
+                            question_id, mem.session_idx, mem.turn_idx
+                        ),
+                        source: "memory".to_string(),
+                        title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                        memory_type: Some(
+                            if question_type == "single-session-preference" {
+                                "preference"
+                            } else {
+                                "fact"
+                            }
+                            .to_string(),
+                        ),
+                        domain: Some("conversation".to_string()),
+                        last_modified: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+            &enrichment,
+        )
+        .await
+        .expect("open_or_seed_scenario_db");
+        let conv_elapsed = conv_t0.elapsed().as_secs_f32();
+
+        let mem_count = db.memory_count().await.unwrap_or(0);
+        let enriched = db.enriched_memory_count().await.unwrap_or(0);
+        total_mems_processed += mem_count;
+        eprintln!(
+            "[smoke-lme] {}: seed+enrich done in {:.1}s, mem={} enriched={}",
+            sample.question_id, conv_elapsed, mem_count, enriched
+        );
+        assert!(
+            mem_count > 0,
+            "{}: should have seeded memories",
+            sample.question_id
+        );
+        assert_eq!(
+            mem_count, enriched,
+            "{}: should be fully enriched ({}/{})",
+            sample.question_id, enriched, mem_count
+        );
+
+        assert!(
+            scope_dir.join("origin_memory.db").exists(),
+            "{}: DB file should exist at {}",
+            sample.question_id,
+            scope_dir.display()
+        );
+
+        // Retrieval scoped to own scenario
+        let results = db
+            .search_memory("anything", 50, None, None, None, None, None, None)
+            .await
+            .expect("search_memory");
+        let expected_prefix = format!("lme_{}_", sample.question_id);
+        for r in &results {
+            assert!(
+                r.source_id.starts_with(&expected_prefix),
+                "{}: cross-scenario leak! result source_id={} (expected prefix {})",
+                sample.question_id,
+                r.source_id,
+                expected_prefix
+            );
+        }
+        per_sample_source_ids.push(results.iter().map(|r| r.source_id.clone()).collect());
+    }
+
+    // Cross-scenario isolation
+    let s0: std::collections::HashSet<_> = per_sample_source_ids[0].iter().collect();
+    let s1: std::collections::HashSet<_> = per_sample_source_ids[1].iter().collect();
+    let overlap: Vec<_> = s0.intersection(&s1).copied().collect();
+    assert!(
+        overlap.is_empty(),
+        "cross-scenario source_id leak: {:?}",
+        overlap
+    );
+
+    // Cache-hit re-open
+    let sample = &pair[0];
+    let mut memories = extract_memories(sample);
+    memories.truncate(max_mem_per_sample);
+    let scope_dir = scenario_db_dir(&baselines_dir, "lme", &sample.question_id);
+    let question_id_2 = sample.question_id.clone();
+    let question_type_2 = sample.question_type.clone();
+    let memories_owned_2 = memories.clone();
+    let cache_t0 = std::time::Instant::now();
+    let _db_cached = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned_2
+                .iter()
+                .map(|mem| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!(
+                        "lme_{}_{}_t{}",
+                        question_id_2, mem.session_idx, mem.turn_idx
+                    ),
+                    source: "memory".to_string(),
+                    title: format!("session {} turn {}", mem.session_idx, mem.turn_idx),
+                    memory_type: Some(
+                        if question_type_2 == "single-session-preference" {
+                            "preference"
+                        } else {
+                            "fact"
+                        }
+                        .to_string(),
+                    ),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("re-open cached");
+    let cache_ms = cache_t0.elapsed().as_millis();
+    eprintln!(
+        "[smoke-lme] cache-hit re-open of {}: {} ms (expected <2000ms; no re-enrich)",
+        sample.question_id, cache_ms
+    );
+    assert!(
+        cache_ms < 5000,
+        "cache hit too slow ({} ms) -- helper likely re-enriched",
+        cache_ms
+    );
+
+    let total_elapsed = smoke_t0.elapsed().as_secs_f32();
+    eprintln!(
+        "\n=== smoke_per_scenario_lme PASSED in {:.1}s ===",
+        total_elapsed
+    );
+    eprintln!("  per-question DB layout: ✓");
+    eprintln!(
+        "  enrichment per-scenario (truncated to {} mems each): ✓",
+        max_mem_per_sample
+    );
+    eprintln!("  retrieval scoped to own scenario: ✓");
+    eprintln!("  cross-scenario source_id isolation: ✓");
+    eprintln!("  cache-hit re-open ({}ms): ✓", cache_ms);
+
+    // Extrapolation summary — useful for pre-flight estimation.
+    let mean_per_mem_sec = total_elapsed / total_mems_processed.max(1) as f32;
+    let full_lme_estimate_min = (mean_per_mem_sec * 10_000.0) / 60.0;
+    eprintln!(
+        "[smoke-lme] SUMMARY: {} samples x ~{} mems = {} mems in {:.1}s ({:.2}s/mem). \
+         Full LME (~10k mems) extrapolated: ~{:.1} min (~{:.1} hours).",
+        n_samples,
+        max_mem_per_sample,
+        total_mems_processed,
+        total_elapsed,
+        mean_per_mem_sec,
+        full_lme_estimate_min,
+        full_lme_estimate_min / 60.0,
+    );
+}
+
 /// Judge LME tuples via Claude CLI (Max plan, no API key).
 ///
 /// Uses task-specific judge prompts matching the LongMemEval paper.
@@ -2207,7 +3326,8 @@ async fn smoke_fullpipeline() {
 #[ignore]
 async fn judge_fullpipeline_lme_cli() {
     use origin_lib::eval::judge::{
-        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+        aggregate_judgments, judge_with_claude_model_batched_persistent,
+        judge_with_claude_model_persistent, load_judgment_tuples,
     };
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     let tuples_path = baselines.join("fullpipeline_lme_tuples.json");
@@ -2221,17 +3341,74 @@ async fn judge_fullpipeline_lme_cli() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+    let max_retries: u32 = std::env::var("EVAL_JUDGE_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let batch_size: usize = std::env::var("EVAL_JUDGE_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let rotation_calls: usize = std::env::var("EVAL_JUDGE_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let limit: Option<usize> = std::env::var("EVAL_JUDGE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
-    eprintln!(
-        "Judging {} LME tuples via CLI (model={}, concurrency={})...",
-        tuples.len(),
-        model,
-        concurrency
-    );
-    let results = judge_with_claude_model(&tuples, concurrency, &model)
+    let tuples_to_judge: Vec<_> = match limit {
+        Some(n) => tuples.iter().take(n).cloned().collect(),
+        None => tuples,
+    };
+    let cache_path = if batch_size > 1 {
+        baselines.join("fullpipeline_lme_judgments_batch.jsonl")
+    } else {
+        baselines.join("fullpipeline_lme_judgments.jsonl")
+    };
+
+    let (results, label) = if batch_size > 1 {
+        eprintln!(
+            "Judging {} LME tuples via CLI BATCHED (model={}, batch={}, rotation={}, retries={}, cache={})...",
+            tuples_to_judge.len(),
+            model,
+            batch_size,
+            rotation_calls,
+            max_retries,
+            cache_path.display()
+        );
+        let r = judge_with_claude_model_batched_persistent(
+            &tuples_to_judge,
+            batch_size,
+            rotation_calls,
+            &model,
+            &cache_path,
+            max_retries,
+        )
         .await
         .expect("judge failed");
-    let report = aggregate_judgments(&results, &format!("{}-cli", model));
+        (r, format!("{}-batch{}-cli", model, batch_size))
+    } else {
+        eprintln!(
+            "Judging {} LME tuples via CLI (model={}, concurrency={}, retries={}, cache={})...",
+            tuples_to_judge.len(),
+            model,
+            concurrency,
+            max_retries,
+            cache_path.display()
+        );
+        let r = judge_with_claude_model_persistent(
+            &tuples_to_judge,
+            concurrency,
+            &model,
+            &cache_path,
+            max_retries,
+        )
+        .await
+        .expect("judge failed");
+        (r, format!("{}-cli", model))
+    };
+    let report = aggregate_judgments(&results, &label);
 
     print_judge_report(&report);
 }
@@ -2245,7 +3422,8 @@ async fn judge_fullpipeline_lme_cli() {
 #[ignore]
 async fn judge_fullpipeline_locomo_cli() {
     use origin_lib::eval::judge::{
-        aggregate_judgments, judge_with_claude_model, load_judgment_tuples,
+        aggregate_judgments, judge_with_claude_model_batched_persistent,
+        judge_with_claude_model_persistent, load_judgment_tuples,
     };
     let baselines = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/baselines");
     let tuples_path = baselines.join("fullpipeline_locomo_tuples.json");
@@ -2259,19 +3437,75 @@ async fn judge_fullpipeline_locomo_cli() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     let model = std::env::var("EVAL_CLI_MODEL").unwrap_or_else(|_| "haiku".to_string());
+    let max_retries: u32 = std::env::var("EVAL_JUDGE_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let batch_size: usize = std::env::var("EVAL_JUDGE_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let rotation_calls: usize = std::env::var("EVAL_JUDGE_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let limit: Option<usize> = std::env::var("EVAL_JUDGE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
-    eprintln!(
-        "Judging {} LoCoMo tuples via CLI (model={}, concurrency={})...",
-        tuples.len(),
-        model,
-        concurrency
-    );
-    let results = judge_with_claude_model(&tuples, concurrency, &model)
+    let tuples_to_judge: Vec<_> = match limit {
+        Some(n) => tuples.iter().take(n).cloned().collect(),
+        None => tuples,
+    };
+    let cache_path = if batch_size > 1 {
+        baselines.join("fullpipeline_locomo_judgments_batch.jsonl")
+    } else {
+        baselines.join("fullpipeline_locomo_judgments.jsonl")
+    };
+
+    if batch_size > 1 {
+        eprintln!(
+            "Judging {} LoCoMo tuples via CLI BATCHED (model={}, batch={}, rotation={}, retries={}, cache={})...",
+            tuples_to_judge.len(),
+            model,
+            batch_size,
+            rotation_calls,
+            max_retries,
+            cache_path.display()
+        );
+        let results = judge_with_claude_model_batched_persistent(
+            &tuples_to_judge,
+            batch_size,
+            rotation_calls,
+            &model,
+            &cache_path,
+            max_retries,
+        )
         .await
         .expect("judge failed");
-    let report = aggregate_judgments(&results, &format!("{}-cli", model));
-
-    print_judge_report(&report);
+        let report = aggregate_judgments(&results, &format!("{}-batch{}-cli", model, batch_size));
+        print_judge_report(&report);
+    } else {
+        eprintln!(
+            "Judging {} LoCoMo tuples via CLI SINGLE (model={}, concurrency={}, retries={}, cache={})...",
+            tuples_to_judge.len(),
+            model,
+            concurrency,
+            max_retries,
+            cache_path.display()
+        );
+        let results = judge_with_claude_model_persistent(
+            &tuples_to_judge,
+            concurrency,
+            &model,
+            &cache_path,
+            max_retries,
+        )
+        .await
+        .expect("judge failed");
+        let report = aggregate_judgments(&results, &format!("{}-cli", model));
+        print_judge_report(&report);
+    }
 }
 
 /// Print a judge report with per-category breakdown and task-averaged accuracy.
@@ -2615,5 +3849,165 @@ async fn probe_overlap_gate() {
                 kept_q as f64 / total_q.max(1) as f64 * 100.0
             );
         }
+    }
+}
+
+/// Stress-test the on-device LLM provider with rising concurrency.
+///
+/// Submits N concurrent `generate()` calls to a single `OnDeviceProvider`,
+/// measures wall-clock and per-call latency, and reports throughput. Useful
+/// for verifying that the persistent LlamaContext optimization (build the
+/// context once, clear KV cache between calls) actually pays off vs the old
+/// per-call `new_context()` path, and for measuring the impact of the
+/// multi-worker pool (S1, `ORIGIN_LLM_WORKERS`) and continuous batching
+/// (S2, `ORIGIN_LLM_PARALLEL_SEQS`).
+///
+/// Three useful invocations to compare:
+///   ORIGIN_LLM_WORKERS=1 ORIGIN_LLM_PARALLEL_SEQS=1   # baseline (single seq, single ctx)
+///   ORIGIN_LLM_WORKERS=4 ORIGIN_LLM_PARALLEL_SEQS=1   # S1: 4 contexts, 1 seq each
+///   ORIGIN_LLM_WORKERS=1 ORIGIN_LLM_PARALLEL_SEQS=4   # S2: 1 context, 4 parallel seqs
+///   ORIGIN_LLM_WORKERS=2 ORIGIN_LLM_PARALLEL_SEQS=2   # composed: 2 ctx x 2 seq = 4 concurrent
+///
+/// Requires Metal GPU + a downloaded Qwen3-4B model. Marked `#[ignore]` so it
+/// doesn't run in CI. Invoke with:
+///   cargo test -p origin --test eval_harness stress_concurrent_inference \
+///       -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn stress_concurrent_inference() {
+    use futures::future::join_all;
+    use origin_lib::llm_provider::{LlmProvider, LlmRequest, OnDeviceProvider};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    eprintln!("[stress] booting OnDeviceProvider (Qwen3-4B default)...");
+    let boot_start = Instant::now();
+    let provider: Arc<dyn LlmProvider> = match OnDeviceProvider::new_with_model(None) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("[stress] SKIP: failed to init OnDeviceProvider: {e}");
+            return;
+        }
+    };
+    eprintln!("[stress] provider ready in {:?}", boot_start.elapsed());
+
+    // Small entity-extraction style prompt — representative of the calls made
+    // during a real LoCoMo / LongMemEval run. Kept short to make per-call
+    // latency the dominant signal (not prompt prefill).
+    let system_prompt = "You extract structured information from text. \
+                         Return strict JSON only, no preamble, no markdown."
+        .to_string();
+    let user_prompt = "Extract entities (people, places, organizations) from: \
+                       'Alice met Bob in Paris last summer. They discussed Acme Corp.'\n\
+                       Reply as JSON: {\"entities\": [...]}"
+        .to_string();
+
+    // Warmup: one call to JIT Metal pipelines and trigger the persistent
+    // context build. Without this, the first concurrent batch absorbs setup
+    // cost and skews the N=1 measurement.
+    eprintln!("[stress] warmup call...");
+    let warmup_start = Instant::now();
+    let _ = provider
+        .generate(LlmRequest {
+            system_prompt: Some(system_prompt.clone()),
+            user_prompt: user_prompt.clone(),
+            max_tokens: 64,
+            temperature: 0.1,
+            label: Some("warmup".into()),
+            timeout_secs: None,
+        })
+        .await;
+    eprintln!("[stress] warmup done in {:?}", warmup_start.elapsed());
+
+    eprintln!("\n[stress] N | wall(s) | throughput(c/s) | mean(s) | p50(s) | p95(s) | failures");
+    eprintln!("[stress] --|---------|-----------------|---------|--------|--------|---------");
+
+    for &n in &[1usize, 2, 4, 8, 16] {
+        let total_start = Instant::now();
+        let mut handles = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let prov = Arc::clone(&provider);
+            let sys = system_prompt.clone();
+            let usr = user_prompt.clone();
+            let label = format!("stress_n{n}_i{i}");
+            handles.push(tokio::spawn(async move {
+                let call_start = Instant::now();
+                let res = prov
+                    .generate(LlmRequest {
+                        system_prompt: Some(sys),
+                        user_prompt: usr,
+                        max_tokens: 128,
+                        temperature: 0.1,
+                        label: Some(label),
+                        timeout_secs: None,
+                    })
+                    .await;
+                (res.is_ok(), call_start.elapsed())
+            }));
+        }
+
+        let outcomes: Vec<(bool, std::time::Duration)> = join_all(handles)
+            .await
+            .into_iter()
+            .map(|j| j.unwrap_or((false, std::time::Duration::from_secs(0))))
+            .collect();
+
+        let wall = total_start.elapsed();
+        let failures = outcomes.iter().filter(|(ok, _)| !ok).count();
+        let mut latencies: Vec<f64> = outcomes
+            .iter()
+            .filter(|(ok, _)| *ok)
+            .map(|(_, d)| d.as_secs_f64())
+            .collect();
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let mean = if latencies.is_empty() {
+            0.0
+        } else {
+            latencies.iter().sum::<f64>() / latencies.len() as f64
+        };
+        let p50 = percentile(&latencies, 0.50);
+        let p95 = percentile(&latencies, 0.95);
+        let throughput = (n - failures) as f64 / wall.as_secs_f64().max(0.001);
+
+        eprintln!(
+            "[stress] {n:>2} | {wall:>7.2} | {tput:>15.2} | {mean:>7.2} | {p50:>6.2} | {p95:>6.2} | {fail}",
+            wall = wall.as_secs_f64(),
+            tput = throughput,
+            fail = failures,
+        );
+
+        // Cool-down between batches so KV cache pressure resets and Metal
+        // queue allocator has a chance to drain.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Memory ceiling note: each persistent context allocates ~256-512 MiB of
+    // KV cache for Qwen3-4B Q4_K_M at 8K context. With the current
+    // single-worker architecture, only ONE context is alive at a time, so
+    // real GPU memory usage stays bounded regardless of N. Continuous
+    // batching (slot-based, deferred) would multiply this per slot.
+    eprintln!("\n[stress] M2 Pro memory note:");
+    eprintln!("[stress]   Single persistent KV cache: ~256-512 MiB (Qwen3-4B @ 8K)");
+    eprintln!(
+        "[stress]   With continuous batching (deferred): N slots = N x KV cache, \
+         practical cap 4-8 slots on 16GB"
+    );
+}
+
+/// Percentile helper for sorted f64 slice. Linear interpolation between
+/// adjacent ranks. Returns 0.0 if empty.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = p * (sorted.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
     }
 }

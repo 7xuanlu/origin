@@ -880,6 +880,7 @@ pub async fn handle_store_memory(
                         max_tokens: 128,
                         temperature: 0.1,
                         label: None,
+                        timeout_secs: None,
                     }),
                 )
                 .await
@@ -925,6 +926,7 @@ pub async fn handle_store_memory(
                             max_tokens: 256,
                             temperature: 0.1,
                             label: None,
+                            timeout_secs: None,
                         }),
                     )
                     .await
@@ -2771,6 +2773,7 @@ pub async fn handle_correct_memory(
             max_tokens: 2048,
             temperature: 0.1,
             label: None,
+            timeout_secs: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("LLM correction failed: {}", e)))?;

@@ -300,7 +300,7 @@ pub async fn run_post_ingest_enrichment(
 
     // 5. Title enrichment — generate short topic title if current title is a truncation
     if let Some(llm_ref) = llm {
-        match enrich_title(db, source_id, content, llm_ref).await {
+        match enrich_title(db, source_id, content, llm_ref, false).await {
             Ok(TitleEnrichResult::Enriched) => {
                 log::info!("[post_ingest] {source_id}: title enriched");
                 db.record_enrichment_step(source_id, "title_enrich", "ok", None)
@@ -600,16 +600,25 @@ pub(crate) async fn suggest_entity_creation(
 }
 
 /// Generate a short topic title if the current title looks like a content truncation.
+///
+/// By default, enrichment only fires when the title appears truncated (ends with "...",
+/// matches the first content line verbatim, or is 75+ characters long). Eval benchmarks
+/// use short synthetic titles that never trigger this heuristic. Set the env var
+/// `EVAL_FORCE_TITLE_ENRICHMENT=1` to bypass the truncation check and always enrich.
+/// Default behavior (env unset) is identical to before.
 pub(crate) async fn enrich_title(
     db: &MemoryDB,
     source_id: &str,
     content: &str,
     llm: &Arc<dyn LlmProvider>,
+    force: bool,
 ) -> Result<TitleEnrichResult, OriginError> {
     // Skip recaps and merged memories — they get titles during generation
     if source_id.starts_with("recap_") || source_id.starts_with("merged_") {
         return Ok(TitleEnrichResult::NotNeeded);
     }
+
+    let force_enrichment = force;
 
     // Check if current title is a truncation (ends with "..." or matches first line)
     let detail = db.get_memory_detail(source_id).await?;
@@ -617,11 +626,15 @@ pub(crate) async fn enrich_title(
         Some(d) => &d.title,
         None => return Ok(TitleEnrichResult::NotNeeded),
     };
-    let first_line = content.lines().next().unwrap_or(content);
-    let is_truncated =
-        current_title.ends_with("...") || current_title == first_line || current_title.len() >= 75;
-    if !is_truncated {
-        return Ok(TitleEnrichResult::NotNeeded);
+
+    if !force_enrichment {
+        let first_line = content.lines().next().unwrap_or(content);
+        let is_truncated = current_title.ends_with("...")
+            || current_title == first_line
+            || current_title.len() >= 75;
+        if !is_truncated {
+            return Ok(TitleEnrichResult::NotNeeded);
+        }
     }
 
     if let Some(short_title) = crate::refinery::generate_short_title(llm, content).await {
@@ -675,6 +688,7 @@ pub(crate) async fn grow_concept(
             max_tokens: 1024,
             temperature: 0.1,
             label: None,
+            timeout_secs: None,
         })
         .await
         .map_err(|e| OriginError::Llm(format!("concept growth LLM: {e}")))?;

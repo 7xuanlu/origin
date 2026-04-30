@@ -11,6 +11,7 @@
 use crate::error::OriginError;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use std::sync::{Arc, OnceLock};
 
@@ -373,7 +374,15 @@ impl LlmEngine {
             }
         };
 
-        let max_prompt_tokens = ctx_size as usize - max_output_tokens as usize;
+        let max_prompt_tokens = (ctx_size as usize).saturating_sub(max_output_tokens as usize);
+        if max_prompt_tokens == 0 {
+            log::warn!(
+                "[llm_engine] max_output_tokens={} >= ctx_size={}, refusing to run inference",
+                max_output_tokens,
+                ctx_size
+            );
+            return None;
+        }
         let tokens = if tokens.len() > max_prompt_tokens {
             tokens[..max_prompt_tokens].to_vec()
         } else {
@@ -464,6 +473,559 @@ impl LlmEngine {
         }
     }
 
+    /// Build a long-lived context that the caller owns. Designed for the
+    /// `OnDeviceProvider` worker thread: one allocation, then `clear_kv_cache()`
+    /// between requests instead of `new_context()` every call.
+    ///
+    /// `n_batch` is set to `ctx_size` so any prompt up to the context window
+    /// fits in a single `decode()` call. `n_ubatch` defaults to the same value.
+    ///
+    /// Returns `None` if Metal context creation fails (caller should log and
+    /// fall back to per-call context creation, which is still valid).
+    pub fn build_persistent_context(&self, ctx_size: u32) -> Option<LlamaContext<'_>> {
+        self.build_persistent_context_with_seq_max(ctx_size, 1)
+    }
+
+    /// Build a long-lived context with `n_seq_max` parallel sequence slots.
+    /// Used by the continuous-batching worker (Option B / S2): one
+    /// `LlamaContext` decodes up to `n_seq_max` independent sequences in
+    /// parallel via llama.cpp's continuous-batching scheduler.
+    ///
+    /// At `n_seq_max == 1` this is byte-equivalent to `build_persistent_context`
+    /// (the underlying llama.cpp default for `n_seq_max` is 1). The KV cache
+    /// budget per sequence is `ctx_size / n_seq_max` — callers must enforce
+    /// per-seq prompt+output bounds accordingly.
+    pub fn build_persistent_context_with_seq_max(
+        &self,
+        ctx_size: u32,
+        n_seq_max: u32,
+    ) -> Option<LlamaContext<'_>> {
+        let params = LlamaContextParams::default()
+            .with_n_ctx(Some(NonZeroU32::new(ctx_size)?))
+            .with_n_batch(ctx_size)
+            .with_n_seq_max(n_seq_max.max(1));
+        match self.model.new_context(&self.backend, params) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log::warn!(
+                    "[llm_engine] persistent context creation failed (ctx_size={ctx_size}, \
+                     n_seq_max={n_seq_max}): {e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Run inference reusing a caller-owned `LlamaContext`. The KV cache is
+    /// cleared at the start of each call, so callers must not assume any
+    /// session state persists between invocations. Saves the per-call cost of
+    /// `new_context()` (KV allocation + Metal pipeline setup), which is the
+    /// dominant overhead for short inference calls (~5-20s on M2 Pro for
+    /// quantized models at 8K context).
+    ///
+    /// `timeout_secs` and `strip_think` mirror the choices in `run_inference`
+    /// (30s + strip) vs `run_inference_raw` (configurable + raw). The worker
+    /// thread routes by `LlmRequest::timeout_secs` so we cover both paths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_inference_persistent(
+        &self,
+        ctx: &mut LlamaContext<'_>,
+        prompt: &str,
+        max_output_tokens: i32,
+        temperature: f32,
+        timeout_secs: u64,
+        strip_think: bool,
+        label: Option<&str>,
+    ) -> Option<String> {
+        let start = Instant::now();
+
+        // Reset KV cache from previous request. Cheap (no allocation) compared
+        // to creating a new context.
+        ctx.clear_kv_cache();
+
+        let tokens = match self.model.str_to_token(prompt, AddBos::Always) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[llm_engine] persistent tokenization failed: {e}");
+                return None;
+            }
+        };
+
+        let ctx_size = ctx.n_ctx();
+        let max_prompt_tokens = (ctx_size as usize).saturating_sub(max_output_tokens as usize);
+        if max_prompt_tokens == 0 {
+            log::warn!(
+                "[llm_engine] max_output_tokens={} >= ctx_size={}, refusing to run inference",
+                max_output_tokens,
+                ctx_size
+            );
+            return None;
+        }
+        let tokens = if tokens.len() > max_prompt_tokens {
+            tokens[..max_prompt_tokens].to_vec()
+        } else {
+            tokens
+        };
+
+        let mut batch = LlamaBatch::new(tokens.len(), 1);
+        for (i, token) in tokens.iter().enumerate() {
+            if batch
+                .add(*token, i as i32, &[0], i == tokens.len() - 1)
+                .is_err()
+            {
+                return None;
+            }
+        }
+
+        if ctx.decode(&mut batch).is_err() {
+            return None;
+        }
+
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::penalties(256, 1.2, 0.0, 0.0),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(42),
+        ]);
+
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut output = String::new();
+        let mut n_cur = batch.n_tokens();
+        let max_pos = n_cur + max_output_tokens;
+        let mut failed = false;
+
+        while n_cur < max_pos {
+            if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
+                log::warn!(
+                    "[llm_engine] persistent inference timeout at {}s",
+                    timeout_secs
+                );
+                break;
+            }
+
+            let token = sampler.sample(ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
+
+            if self.model.is_eog_token(token) {
+                break;
+            }
+
+            match self.model.token_to_piece(token, &mut decoder, true, None) {
+                Ok(piece) => output.push_str(&piece),
+                Err(e) => {
+                    log::warn!("[llm_engine] persistent token decode failed: {e}");
+                    failed = true;
+                    break;
+                }
+            }
+
+            batch.clear();
+            if batch.add(token, n_cur, &[0], true).is_err() {
+                failed = true;
+                break;
+            }
+            if ctx.decode(&mut batch).is_err() {
+                failed = true;
+                break;
+            }
+            n_cur += 1;
+        }
+
+        let label_suffix = label.map(|l| format!(" [{}]", l)).unwrap_or_default();
+        if failed {
+            log::warn!(
+                "[llm_engine] persistent inference{} failed after {} partial chars in {:?}",
+                label_suffix,
+                output.len(),
+                start.elapsed()
+            );
+            return None;
+        }
+
+        if strip_think {
+            let cleaned = strip_think_tags(&output);
+            let trimmed = cleaned.trim().to_string();
+            log::info!(
+                "[llm_engine] persistent inference{}: {} chars in {:?}",
+                label_suffix,
+                trimmed.len(),
+                start.elapsed()
+            );
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        } else {
+            log::info!(
+                "[llm_engine] persistent raw inference{}: {} chars in {:?}",
+                label_suffix,
+                output.len(),
+                start.elapsed()
+            );
+            if output.is_empty() {
+                None
+            } else {
+                Some(output)
+            }
+        }
+    }
+
+    /// Run continuous-batch inference over multiple prompts in a single context.
+    ///
+    /// This is the Option B (S2) entry point: one `LlamaContext` (built with
+    /// `n_seq_max >= prompts.len()`) decodes all input prompts in parallel via
+    /// llama.cpp's continuous-batching scheduler. Each prompt occupies a
+    /// distinct `seq_id` slot; their sampled tokens are demultiplexed back to
+    /// per-prompt output strings.
+    ///
+    /// Inputs:
+    /// - `ctx`: a context built with `build_persistent_context_with_seq_max`.
+    /// - `prompts`: list of (prompt, max_output_tokens, temperature, timeout_secs,
+    ///   strip_think, label) tuples — one per sequence.
+    /// - `seq_capacity`: the configured `n_seq_max` for the context.
+    ///
+    /// Returns a vector aligned with `prompts`: each element is `Some(output)`
+    /// if that sequence finished successfully, `None` if it timed out or was
+    /// terminated early (e.g. truncation). The KV cache is fully cleared on
+    /// entry so previous decodes do not leak into this batch.
+    ///
+    /// Per-seq budget math: each prompt's token count is capped at
+    /// `(ctx_size / seq_capacity) - max_output_tokens`. This intentionally uses
+    /// configured capacity, not current batch size, so truncation behavior does
+    /// not depend on queue timing.
+    #[allow(clippy::type_complexity)]
+    pub fn run_inference_continuous_batch(
+        &self,
+        ctx: &mut LlamaContext<'_>,
+        prompts: &[(String, i32, f32, u64, bool, Option<String>)],
+        seq_capacity: usize,
+    ) -> Vec<Option<String>> {
+        let batch_start = Instant::now();
+        let n_seqs = prompts.len();
+        if n_seqs == 0 {
+            return Vec::new();
+        }
+
+        // Reset KV cache from any previous batch.
+        ctx.clear_kv_cache();
+
+        let ctx_size = ctx.n_ctx();
+        let seq_capacity = seq_capacity.max(n_seqs).max(1);
+        // Per-seq context budget: divide context window by number of slots,
+        // then subtract per-seq output reserve. Defensive saturating math
+        // prevents underflow when callers configure aggressive M values.
+        let max_per_seq = (ctx_size as usize) / seq_capacity;
+        log::debug!(
+            "[llm_engine] continuous batch: {n_seqs} seqs, seq_capacity={seq_capacity}, ctx_size={ctx_size}, \
+             per-seq budget={max_per_seq}"
+        );
+
+        // Tokenize each prompt and apply per-seq prompt cap.
+        let mut tokenized: Vec<Vec<llama_cpp_2::token::LlamaToken>> = Vec::with_capacity(n_seqs);
+        let mut max_output_per_seq: Vec<i32> = Vec::with_capacity(n_seqs);
+        let mut temperatures: Vec<f32> = Vec::with_capacity(n_seqs);
+        let mut timeouts: Vec<u64> = Vec::with_capacity(n_seqs);
+        let mut strip_think_flags: Vec<bool> = Vec::with_capacity(n_seqs);
+        let mut labels: Vec<Option<String>> = Vec::with_capacity(n_seqs);
+        let mut failed: Vec<bool> = vec![false; n_seqs];
+
+        for (seq_id, (prompt, max_out, temp, timeout_secs, strip_think, label)) in
+            prompts.iter().enumerate()
+        {
+            let max_out_usize = (*max_out).max(0) as usize;
+            let max_prompt_tokens = max_per_seq.saturating_sub(max_out_usize);
+            if max_prompt_tokens == 0 {
+                log::warn!(
+                    "[llm_engine] continuous: max_output_tokens={} >= per-seq budget={}, \
+                     refusing seq",
+                    max_out,
+                    max_per_seq
+                );
+                tokenized.push(Vec::new());
+                max_output_per_seq.push(*max_out);
+                temperatures.push(*temp);
+                timeouts.push(*timeout_secs);
+                strip_think_flags.push(*strip_think);
+                labels.push(label.clone());
+                failed[seq_id] = true;
+                continue;
+            }
+            let tokens = match self.model.str_to_token(prompt, AddBos::Always) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::warn!("[llm_engine] continuous tokenize failed: {e}");
+                    failed[seq_id] = true;
+                    Vec::new()
+                }
+            };
+            let tokens = if tokens.len() > max_prompt_tokens {
+                log::warn!(
+                    "[llm_engine] continuous: prompt tokens ({}) exceed per-seq budget ({}), \
+                     truncating",
+                    tokens.len(),
+                    max_prompt_tokens
+                );
+                tokens[..max_prompt_tokens].to_vec()
+            } else {
+                tokens
+            };
+            tokenized.push(tokens);
+            max_output_per_seq.push(*max_out);
+            temperatures.push(*temp);
+            timeouts.push(*timeout_secs);
+            strip_think_flags.push(*strip_think);
+            labels.push(label.clone());
+        }
+
+        // Total prefill tokens across all sequences. Sized exactly so the
+        // single prefill decode covers every prompt in one pass.
+        let total_prefill: usize = tokenized.iter().map(|t| t.len()).sum();
+        if total_prefill == 0 {
+            // All sequences were rejected (empty prompts or budget exhaustion).
+            return vec![None; n_seqs];
+        }
+
+        // Build a batch big enough for prefill (multi-seq) plus the largest
+        // possible per-step decode (one token per active seq).
+        let batch_capacity = total_prefill.max(n_seqs);
+        let mut batch = LlamaBatch::new(batch_capacity, n_seqs as i32);
+
+        // Prefill: add every sequence's prompt tokens to the batch.
+        // Track each seq's `logits_idx` (the offset in the batch where its
+        // last prompt token lives — that's the row we sample for the first
+        // continuation token). Also track `n_past` per seq (position of the
+        // next token to write).
+        let mut logits_idx: Vec<i32> = vec![-1; n_seqs];
+        let mut n_past: Vec<i32> = vec![0; n_seqs];
+        let mut active: Vec<bool> = vec![true; n_seqs];
+        let mut current_batch_offset: i32 = 0;
+
+        for (seq_id, tokens) in tokenized.iter().enumerate() {
+            if tokens.is_empty() {
+                active[seq_id] = false;
+                continue;
+            }
+            for (i, token) in tokens.iter().enumerate() {
+                let is_last = i == tokens.len() - 1;
+                if let Err(e) = batch.add(*token, i as i32, &[seq_id as i32], is_last) {
+                    log::warn!("[llm_engine] continuous prefill batch.add failed: {e}");
+                    active[seq_id] = false;
+                    failed[seq_id] = true;
+                    break;
+                }
+                if is_last {
+                    logits_idx[seq_id] = current_batch_offset + i as i32;
+                }
+            }
+            n_past[seq_id] = tokens.len() as i32;
+            current_batch_offset += tokens.len() as i32;
+        }
+
+        if let Err(e) = ctx.decode(&mut batch) {
+            log::warn!("[llm_engine] continuous prefill decode failed: {e}");
+            return vec![None; n_seqs];
+        }
+
+        // Per-seq sampler chain. Each seq gets independent sampler state so
+        // repetition penalties and temperature don't leak between requests.
+        // Seed varies per seq to break dist() determinism collisions.
+        let mut samplers: Vec<LlamaSampler> = (0..n_seqs)
+            .map(|i| {
+                LlamaSampler::chain_simple([
+                    LlamaSampler::penalties(256, 1.2, 0.0, 0.0),
+                    LlamaSampler::temp(temperatures[i]),
+                    LlamaSampler::dist(42 + i as u32),
+                ])
+            })
+            .collect();
+
+        // Per-seq accumulated output bytes (decoded incrementally).
+        let mut decoders: Vec<encoding_rs::Decoder> = (0..n_seqs)
+            .map(|_| encoding_rs::UTF_8.new_decoder())
+            .collect();
+        let mut outputs: Vec<String> = vec![String::new(); n_seqs];
+        let mut tokens_generated: Vec<i32> = vec![0; n_seqs];
+        let start_times: Vec<Instant> = vec![Instant::now(); n_seqs];
+
+        // Generation loop: each iteration samples one new token per active
+        // seq from the previous decode, writes them all into a fresh batch,
+        // then runs one decode. Continues until every seq is inactive
+        // (EOG, max_output reached, or timeout).
+        loop {
+            let any_active = active.iter().any(|&a| a);
+            if !any_active {
+                break;
+            }
+
+            batch.clear();
+            let mut next_logits_idx: Vec<i32> = vec![-1; n_seqs];
+            let mut batch_pos: i32 = 0;
+
+            for seq_id in 0..n_seqs {
+                if !active[seq_id] {
+                    continue;
+                }
+
+                // Per-seq timeout. Mirrors the single-seq timeout semantics.
+                if start_times[seq_id].elapsed().as_secs() > timeouts[seq_id] {
+                    log::warn!(
+                        "[llm_engine] continuous seq {seq_id} timeout at {}s",
+                        timeouts[seq_id]
+                    );
+                    active[seq_id] = false;
+                    failed[seq_id] = true;
+                    continue;
+                }
+
+                if logits_idx[seq_id] < 0 {
+                    log::warn!("[llm_engine] continuous seq {seq_id} has no logits row");
+                    active[seq_id] = false;
+                    failed[seq_id] = true;
+                    continue;
+                }
+
+                // Sample next token from this seq's logits row.
+                let token = samplers[seq_id].sample(ctx, logits_idx[seq_id]);
+                samplers[seq_id].accept(token);
+
+                if self.model.is_eog_token(token) {
+                    active[seq_id] = false;
+                    continue;
+                }
+
+                // Append decoded piece to this seq's output. token_to_piece
+                // updates the seq-local UTF-8 decoder so multi-byte glyphs
+                // are split correctly across calls.
+                match self
+                    .model
+                    .token_to_piece(token, &mut decoders[seq_id], true, None)
+                {
+                    Ok(piece) => outputs[seq_id].push_str(&piece),
+                    Err(_) => {
+                        active[seq_id] = false;
+                        failed[seq_id] = true;
+                        continue;
+                    }
+                }
+
+                tokens_generated[seq_id] += 1;
+                if tokens_generated[seq_id] >= max_output_per_seq[seq_id] {
+                    active[seq_id] = false;
+                    continue;
+                }
+
+                // Stage this token into the next decode batch.
+                if let Err(e) = batch.add(token, n_past[seq_id], &[seq_id as i32], true) {
+                    log::warn!(
+                        "[llm_engine] continuous decode batch.add failed (seq {seq_id}): {e}"
+                    );
+                    active[seq_id] = false;
+                    failed[seq_id] = true;
+                    continue;
+                }
+                next_logits_idx[seq_id] = batch_pos;
+                batch_pos += 1;
+                n_past[seq_id] += 1;
+            }
+
+            if batch_pos == 0 {
+                // Every seq finished/expired this round.
+                break;
+            }
+
+            if let Err(e) = ctx.decode(&mut batch) {
+                log::warn!("[llm_engine] continuous decode failed: {e}");
+                // All remaining active seqs are unrecoverable.
+                for (seq_id, is_active) in active.iter_mut().enumerate() {
+                    if *is_active {
+                        failed[seq_id] = true;
+                        *is_active = false;
+                    }
+                }
+                break;
+            }
+
+            logits_idx = next_logits_idx;
+        }
+
+        // Free per-seq KV cache so the next batch reuses slots cleanly.
+        // (clear_kv_cache() at the next entry would do this anyway, but
+        // explicit per-seq removal keeps the invariant tight if the same
+        // ctx is later used at a different M.)
+        for seq_id in 0..n_seqs {
+            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+        }
+
+        // Apply strip_think + trimming per seq, mirroring run_inference_persistent.
+        Self::finalize_continuous_batch_outputs(
+            outputs,
+            &failed,
+            &strip_think_flags,
+            &labels,
+            batch_start,
+        )
+    }
+
+    fn finalize_continuous_batch_outputs(
+        outputs: Vec<String>,
+        failed: &[bool],
+        strip_think_flags: &[bool],
+        labels: &[Option<String>],
+        batch_start: Instant,
+    ) -> Vec<Option<String>> {
+        outputs
+            .into_iter()
+            .enumerate()
+            .map(|(seq_id, raw)| {
+                let label_suffix = labels[seq_id]
+                    .as_deref()
+                    .map(|l| format!(" [{}]", l))
+                    .unwrap_or_default();
+
+                if failed.get(seq_id).copied().unwrap_or(false) {
+                    log::warn!(
+                        "[llm_engine] continuous inference{} failed (seq={}, partial_chars={}, batch={:?})",
+                        label_suffix,
+                        seq_id,
+                        raw.len(),
+                        batch_start.elapsed()
+                    );
+                    return None;
+                }
+
+                if strip_think_flags[seq_id] {
+                    let cleaned = strip_think_tags(&raw);
+                    let trimmed = cleaned.trim().to_string();
+                    log::info!(
+                        "[llm_engine] continuous inference{}: {} chars (seq={}, batch={:?})",
+                        label_suffix,
+                        trimmed.len(),
+                        seq_id,
+                        batch_start.elapsed()
+                    );
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                } else {
+                    log::info!(
+                        "[llm_engine] continuous raw inference{}: {} chars (seq={}, batch={:?})",
+                        label_suffix,
+                        raw.len(),
+                        seq_id,
+                        batch_start.elapsed()
+                    );
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        Some(raw)
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Benchmark-focused inference: configurable timeout, larger context, and
     /// returns raw output (caller decides whether to strip think tags).
     pub fn run_inference_raw(
@@ -484,7 +1046,15 @@ impl LlmEngine {
             }
         };
 
-        let max_prompt_tokens = ctx_size as usize - max_output_tokens as usize;
+        let max_prompt_tokens = (ctx_size as usize).saturating_sub(max_output_tokens as usize);
+        if max_prompt_tokens == 0 {
+            log::warn!(
+                "[llm_engine] max_output_tokens={} >= ctx_size={}, refusing to run inference",
+                max_output_tokens,
+                ctx_size
+            );
+            return None;
+        }
         let tokens = if tokens.len() > max_prompt_tokens {
             tokens[..max_prompt_tokens].to_vec()
         } else {
@@ -748,39 +1318,104 @@ pub fn extract_json(text: &str) -> Option<&str> {
 /// since small on-device models (e.g., Qwen3-4B) often return a single
 /// object instead of an array when given a single input item.
 pub fn extract_json_array(text: &str) -> Option<String> {
-    // Try object-wrapping first: if the outermost structure is `{...}`,
-    // wrap it in `[...]`. This must come before the `[` search because
-    // a single JSON object like `{"entities": [...]}` contains inner `[`/`]`
-    // that would be mistakenly extracted as the top-level array.
-    if let Some(obj_start) = text.find('{') {
-        if text[..obj_start].find('[').is_none() {
-            // No `[` before the first `{` — the response is an object, not an array
-            if let Some(obj_end) = text.rfind('}') {
-                if obj_end > obj_start {
-                    let candidate = format!("[{}]", &text[obj_start..=obj_end]);
-                    if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
-                        return Some(candidate);
-                    }
-                }
-            }
+    // Strip markdown code fences (Qwen3.5-9B wraps output in ```json...```).
+    // Find first JSON-relevant char (`[` or `{`) and last `]` or `}` to
+    // narrow the window. The streaming Deserializer (Strategy 2) cannot
+    // skip leading backticks on its own.
+    let trimmed = {
+        let json_start = text.find(['[', '{']);
+        match json_start {
+            Some(start) => &text[start..],
+            None => return None,
         }
-    }
-    // Try array extraction
-    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
+    };
+
+    // Strategy 1: try array extraction `[...]` if present and parses cleanly.
+    if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
         if end > start {
-            let candidate = text[start..=end].to_string();
+            let candidate = trimmed[start..=end].to_string();
             if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
                 return Some(candidate);
             }
         }
     }
-    // Last resort: wrap single JSON object in array brackets
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+    // Strategy 2: walk brace depth to collect each complete top-level `{...}`.
+    // Handles:
+    //   (a) NDJSON `{...}{...}` (no enclosing array)
+    //   (b) Truncated array `[{...},{...},{..` where strategy 1 fails because
+    //       the closing `]` is missing
+    //   (c) Comma-separated objects `{...},{...}` (which Deserializer streaming
+    //       chokes on)
+    // Tracks string state so braces inside JSON string literals don't confuse
+    // the depth count.
+    if trimmed.contains('{') {
+        let slices = collect_top_level_objects(trimmed);
+        let collected: Vec<serde_json::Value> = slices
+            .iter()
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v.is_object())
+            .collect();
+        if !collected.is_empty() {
+            if let Ok(s) = serde_json::to_string(&collected) {
+                return Some(s);
+            }
+        }
+    }
+    // Strategy 3: last resort — wrap a single best-effort `{...}` slice in array brackets.
+    // Validate the result before returning so callers never receive unparseable JSON.
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
         if end > start {
-            return Some(format!("[{}]", &text[start..=end]));
+            let candidate = format!("[{}]", &trimmed[start..=end]);
+            if serde_json::from_str::<Vec<serde_json::Value>>(&candidate).is_ok() {
+                return Some(candidate);
+            }
         }
     }
     None
+}
+
+/// Walk `text` and return each complete top-level `{...}` slice in order.
+/// Tracks string state (with `\\"` escape handling) so braces inside JSON
+/// string literals are not counted toward depth. Truncated trailing objects
+/// are skipped.
+fn collect_top_level_objects(text: &str) -> Vec<&str> {
+    let mut results = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        results.push(&text[s..=i]);
+                        start = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    results
 }
 
 /// Truncate text at a word boundary, not exceeding `max_chars` bytes.
@@ -857,6 +1492,28 @@ mod tests {
     }
 
     #[test]
+    fn test_finalize_continuous_batch_outputs_marks_failed_partial_none() {
+        let outputs = vec![
+            "partial json".to_string(),
+            "<think>x</think> ok ".to_string(),
+        ];
+        let failed = vec![true, false];
+        let strip = vec![true, true];
+        let labels = vec![Some("failed".to_string()), Some("ok".to_string())];
+
+        let result = LlmEngine::finalize_continuous_batch_outputs(
+            outputs,
+            &failed,
+            &strip,
+            &labels,
+            Instant::now(),
+        );
+
+        assert_eq!(result[0], None);
+        assert_eq!(result[1].as_deref(), Some("ok"));
+    }
+
+    #[test]
     fn test_extract_json() {
         assert_eq!(
             extract_json(r#"Sure! {"key": "val"}"#),
@@ -903,5 +1560,79 @@ mod tests {
         let result = extract_json_array(text).unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.len(), 2);
+    }
+
+    /// NDJSON-style: model returns multiple top-level objects without enclosing
+    /// `[]`. This is what Qwen3-4B emits at batch>1. Must collect all into array.
+    #[test]
+    fn test_extract_json_array_ndjson_multiple_objects() {
+        let text = r#"{"i": 0, "entities": [{"name": "a"}]}
+{"i": 1, "entities": [{"name": "b"}]}
+{"i": 2, "entities": []}"#;
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["i"], 0);
+        assert_eq!(parsed[1]["entities"][0]["name"], "b");
+    }
+
+    /// NDJSON without separator: `{...}{...}` directly back-to-back.
+    #[test]
+    fn test_extract_json_array_ndjson_no_separator() {
+        let text = r#"{"i":0,"entities":[]}{"i":1,"entities":[]}"#;
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    /// Markdown code-fenced output (Qwen3.5-9B). Must strip leading fence.
+    #[test]
+    fn test_extract_json_array_markdown_fence() {
+        let text = "```json\n[{\"i\": 0, \"entities\": [{\"name\": \"a\"}]}]\n```";
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["entities"][0]["name"], "a");
+    }
+
+    /// Markdown fence + NDJSON inside.
+    #[test]
+    fn test_extract_json_array_fence_with_ndjson() {
+        let text = "```json\n{\"i\": 0, \"entities\": []}\n{\"i\": 1, \"entities\": []}\n```";
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    /// Truncated array — model wrote `[{..},{..},{..` and got cut off.
+    /// Common at high batch sizes where output exceeds time budget.
+    /// Strategy 2 must skip the leading `[` and stream-collect partial objects.
+    #[test]
+    fn test_extract_json_array_truncated_no_close() {
+        let text = r#"[{"i":0,"entities":[{"name":"a"}]},{"i":1,"entities":[{"name":"b"}]},{"i":2,"entities":[{"na"#;
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        // Should recover the 2 complete objects, drop the truncated 3rd
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["entities"][0]["name"], "a");
+        assert_eq!(parsed[1]["entities"][0]["name"], "b");
+    }
+
+    /// Markdown fence + truncated array (real 9B failure case).
+    #[test]
+    fn test_extract_json_array_fence_truncated() {
+        let text = "```json\n[\n  {\"i\": 0, \"entities\": []},\n  {\"i\": 1, \"entities\":";
+        let result = extract_json_array(text).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+    }
+
+    /// Strategy-3 validation: garbage input that finds `{` and `}` but produces
+    /// invalid JSON when wrapped must return None instead of unparseable output.
+    #[test]
+    fn test_extract_json_array_strategy3_invalid_returns_none() {
+        // Contains { and } but is not valid JSON — Strategy 3 must reject it.
+        let text = "garbage{ broken } stuff { incomplete";
+        assert_eq!(extract_json_array(text), None);
     }
 }

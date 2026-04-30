@@ -207,7 +207,7 @@ pub async fn run_context_path_eval(
         let entities = run_entity_extraction_for_eval(&db, &llm).await?;
         eprintln!("  [enriching] {} entities. enriching titles...", entities);
 
-        let titles = run_title_enrichment_for_eval(&db, &llm).await?;
+        let titles = run_title_enrichment_for_eval(&db, &llm, 1).await?;
         eprintln!("  [enriching] {} titles. distilling...", titles);
 
         let concepts =

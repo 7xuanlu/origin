@@ -60,6 +60,10 @@ pub struct LlmRequest {
     /// "title_gen"). Appears in inference log lines so operators can see
     /// what each LLM call is doing.
     pub label: Option<String>,
+    /// Override the default 30s on-device inference timeout. When `Some(n)`,
+    /// `OnDeviceProvider` routes through `run_inference_raw` instead of
+    /// `run_inference`. Has no effect for cloud providers (Anthropic, etc.).
+    pub timeout_secs: Option<u64>,
 }
 
 /// Errors returned by an [`LlmProvider`].
@@ -112,6 +116,26 @@ pub trait LlmProvider: Send + Sync {
 // OnDeviceProvider — wraps LlmEngine on a dedicated GPU inference thread
 // ---------------------------------------------------------------------------
 
+/// Wrap a user/system prompt pair in the Qwen ChatML template.
+///
+/// The empty `<think></think>` block disables thinking mode for Qwen3.5
+/// (which defaults to thinking-on). Without it, all output tokens go to
+/// reasoning and `strip_think_tags` removes them, leaving empty output.
+/// Harmless for Qwen3 (which has no thinking mode).
+fn format_chatml_prompt(system: Option<&str>, user: &str) -> String {
+    match system {
+        Some(sys) => format!(
+            "<|im_start|>system\n{sys}\n<|im_end|>\n\
+             <|im_start|>user\n{user}\n<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ),
+        None => format!(
+            "<|im_start|>user\n{user}\n<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ),
+    }
+}
+
 /// Internal message sent to the inference worker thread.
 struct InferenceRequest {
     prompt: String,
@@ -120,7 +144,59 @@ struct InferenceRequest {
     temperature: f32,
     ctx_size: u32,
     label: Option<String>,
+    timeout_secs: Option<u64>,
     response_tx: tokio::sync::oneshot::Sender<Result<String, LlmError>>,
+}
+
+const MAX_LLM_WORKERS: usize = 8;
+const MAX_LLM_PARALLEL_SEQS: usize = 8;
+const DEFAULT_BATCH_COALESCE_MS: u64 = 0;
+const MAX_BATCH_COALESCE_MS: u64 = 25;
+const MIN_CONTINUOUS_BATCH_PROMPT_RESERVE_TOKENS: usize = 256;
+
+fn parse_clamped_usize_env(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn parse_clamped_u64_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn continuous_batch_per_seq_budget(ctx_size: u32, seq_capacity: usize) -> usize {
+    (ctx_size as usize) / seq_capacity.max(1)
+}
+
+fn continuous_batch_eligible(ctx_size: u32, max_tokens: i32, seq_capacity: usize) -> bool {
+    if seq_capacity <= 1 || max_tokens <= 0 {
+        return false;
+    }
+    let per_seq_budget = continuous_batch_per_seq_budget(ctx_size, seq_capacity);
+    let max_tokens = max_tokens as usize;
+
+    // Continuous batching splits one KV context across sequence slots. Keep
+    // high-output synthesis/distillation calls on the single-seq path; they
+    // need the whole context and should not become queue-timing dependent.
+    max_tokens.saturating_add(MIN_CONTINUOUS_BATCH_PROMPT_RESERVE_TOKENS) <= per_seq_budget
+}
+
+fn request_continuous_batch_eligible(req: &InferenceRequest, seq_capacity: usize) -> bool {
+    continuous_batch_eligible(req.ctx_size, req.max_tokens, seq_capacity)
+}
+
+fn context_seq_max_for_batch(batch_len: usize, parallel_seqs: usize) -> u32 {
+    if batch_len > 1 {
+        parallel_seqs.max(1) as u32
+    } else {
+        1
+    }
 }
 
 /// On-device LLM provider that runs inference on a dedicated `std::thread`.
@@ -236,65 +312,331 @@ impl OnDeviceProvider {
         // silently unclassified. 256 absorbs bursts up to ~64 concurrent
         // stores before backpressure.
         let (tx, rx) = std::sync::mpsc::sync_channel::<InferenceRequest>(256);
+
+        // Multi-context worker pool. ORIGIN_LLM_WORKERS controls the number of
+        // parallel inference threads, each owning a persistent LlamaContext.
+        // Workers compete on a shared receiver: lock is held only during recv(),
+        // released before GPU inference, so contention is minimal.
+        //
+        // ORIGIN_LLM_PARALLEL_SEQS (Option B / S2) controls how many sequences
+        // each worker decodes in parallel inside its single LlamaContext via
+        // llama.cpp's continuous batching scheduler. M=1 (default) routes
+        // through the single-seq persistent path and is byte-identical to S1.
+        // M>1 enables the batched decode loop in
+        // `LlmEngine::run_inference_continuous_batch`.
+        //
+        // Memory budget per worker: ~0.8 GB KV cache at ctx=8192 for M=1.
+        // M sequences in one context still share the same `n_ctx` allocation,
+        // so per-worker KV memory does NOT scale linearly with M — but each
+        // sequence's effective per-seq budget shrinks to ctx_size / M.
+        // N=4 workers = 3.2 GB KV + 2.7 GB shared weights ≈ safe on 16 GB Mac.
+        // Default N=1, M=1 is identical to the previous single-thread behavior.
+        //
+        // GGML_METAL_NO_RESIDENCY (set above) mitigates Metal command queue
+        // exhaustion from multiple simultaneous contexts.
+        let n_workers = parse_clamped_usize_env("ORIGIN_LLM_WORKERS", 1, 1, MAX_LLM_WORKERS);
+        let parallel_seqs =
+            parse_clamped_usize_env("ORIGIN_LLM_PARALLEL_SEQS", 1, 1, MAX_LLM_PARALLEL_SEQS);
+        let coalesce_ms = parse_clamped_u64_env(
+            "ORIGIN_LLM_COALESCE_MS",
+            DEFAULT_BATCH_COALESCE_MS,
+            0,
+            MAX_BATCH_COALESCE_MS,
+        );
+        log::info!(
+            "[on_device_provider] {n_workers} worker(s) x {parallel_seqs} seq(s) each \
+             (max concurrent = {}, coalesce_ms={coalesce_ms})",
+            n_workers * parallel_seqs
+        );
+
         let available = Arc::new(AtomicBool::new(true));
 
-        let thread_available = Arc::clone(&available);
-        std::thread::Builder::new()
-            .name("llm-provider-worker".into())
-            .spawn(move || {
-                log::info!("[on_device_provider] worker thread started");
-                while let Ok(req) = rx.recv() {
-                    // Wrap in Qwen chat template so the model sees
-                    // system/user/assistant turns instead of a raw blob.
-                    // The empty <think></think> block disables thinking mode
-                    // for Qwen3.5 (which defaults to thinking-on). Without it,
-                    // all output tokens go to reasoning and strip_think_tags
-                    // removes them, leaving empty output. Harmless for Qwen3.
-                    let full_prompt = match &req.system_prompt {
-                        Some(sys) => format!(
-                            "<|im_start|>system\n{sys}\n<|im_end|>\n\
-                             <|im_start|>user\n{user}\n<|im_end|>\n\
-                             <|im_start|>assistant\n<think>\n\n</think>\n\n",
-                            sys = sys,
-                            user = req.prompt,
-                        ),
-                        None => format!(
-                            "<|im_start|>user\n{user}\n<|im_end|>\n\
-                             <|im_start|>assistant\n<think>\n\n</think>\n\n",
-                            user = req.prompt,
-                        ),
-                    };
+        // Wrap the receiver so it can be shared across worker threads.
+        // std::sync::mpsc::Receiver is Send but not Sync, so we guard it with
+        // a Mutex. Only one worker holds the lock at a time (during recv()),
+        // then releases it before the actual GPU inference call.
+        let rx_shared = Arc::new(std::sync::Mutex::new(rx));
 
-                    let result = engine.run_inference(
-                        &full_prompt,
-                        req.max_tokens,
-                        req.temperature,
-                        req.ctx_size,
-                        req.label.as_deref(),
+        // Shared engine across all workers. LlmEngine holds the model weights
+        // once (loaded onto the GPU); each worker creates its own LlamaContext
+        // from it, so the weights are not duplicated.
+        let engine = Arc::new(engine);
+
+        for i in 0..n_workers {
+            let rx_arc = Arc::clone(&rx_shared);
+            let engine = Arc::clone(&engine);
+            let thread_available = Arc::clone(&available);
+            let m = parallel_seqs;
+            let coalesce_wait = std::time::Duration::from_millis(coalesce_ms);
+
+            std::thread::Builder::new()
+                .name(format!("llm-provider-worker-{i}"))
+                .spawn(move || {
+                    let mut deferred_reqs: std::collections::VecDeque<InferenceRequest> =
+                        std::collections::VecDeque::new();
+                    log::info!(
+                        "[on_device_provider] worker {i} thread started (parallel_seqs={m})"
                     );
 
-                    let response = match result {
-                        Some(text) => {
-                            // First successful inference = model is warm and
-                            // serving traffic. Safe to fire the onboarding
-                            // readiness hook; subsequent calls are no-ops.
-                            mark_llm_ready();
-                            Ok(text)
-                        }
-                        None => Err(LlmError::InferenceFailed(
-                            "inference returned no output".into(),
-                        )),
-                    };
+                    // Persistent LlamaContext: build lazily on first request,
+                    // then reuse across all subsequent requests by clearing the
+                    // KV cache between calls. Saves the per-call cost of
+                    // `new_context()` (KV cache allocation + Metal pipeline
+                    // rebuild) which was the dominant overhead under serial
+                    // inference. If a request arrives with a different
+                    // ctx_size or n_seq_max requirement, the context is rebuilt.
+                    //
+                    // True multi-request batches use n_seq_max=M so the
+                    // continuous-batching scheduler can slot up to M sequences.
+                    // Singleton requests use n_seq_max=1, including high-output
+                    // synthesis/distillation calls, so they retain the full
+                    // context window.
+                    let mut persistent_ctx: Option<llama_cpp_2::context::LlamaContext<'_>> = None;
+                    let mut persistent_ctx_size: u32 = 0;
+                    let mut persistent_ctx_seq_max: u32 = 0;
 
-                    // Ignore send error — caller may have dropped the receiver
-                    let _ = req.response_tx.send(response);
-                }
-                log::info!("[on_device_provider] worker thread exiting");
-                thread_available.store(false, Ordering::SeqCst);
-            })
-            .map_err(|e| {
-                crate::error::OriginError::Llm(format!("failed to spawn inference thread: {e}"))
-            })?;
+                    loop {
+                        // Block on the first request, then opportunistically
+                        // pull up to M-1 more if M>1. By default, the follow-up
+                        // drain is immediate so isolated calls do not wait for
+                        // siblings; ORIGIN_LLM_COALESCE_MS can opt into a tiny
+                        // wait for trickle workloads.
+                        let first_req = match deferred_reqs.pop_front() {
+                            Some(r) => r,
+                            None => match rx_arc.lock().unwrap().recv() {
+                                Ok(r) => r,
+                                Err(_) => break, // channel closed — sender dropped
+                            },
+                        };
+
+                        let mut batch_reqs: Vec<InferenceRequest> = Vec::with_capacity(m);
+                        let batch_eligible = request_continuous_batch_eligible(&first_req, m);
+                        batch_reqs.push(first_req);
+
+                        if m > 1 && batch_eligible {
+                            // Short coalescing window: try to drain up to M-1
+                            // additional pending requests. By default this is
+                            // an immediate drain (0ms wait) so isolated calls
+                            // pay no artificial latency. Operators can set
+                            // ORIGIN_LLM_COALESCE_MS for trickle workloads.
+                            let coalesce_attempts: u32 =
+                                if coalesce_wait.is_zero() { 1 } else { 3 };
+                            for _ in 0..coalesce_attempts {
+                                if batch_reqs.len() >= m {
+                                    break;
+                                }
+                                let drained = {
+                                    let rx = rx_arc.lock().unwrap();
+                                    let mut local = Vec::new();
+                                    while batch_reqs.len() + local.len() < m {
+                                        match rx.try_recv() {
+                                            Ok(r) if request_continuous_batch_eligible(&r, m) => {
+                                                local.push(r)
+                                            }
+                                            Ok(r) => {
+                                                deferred_reqs.push_back(r);
+                                                break;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    local
+                                };
+                                let did_drain = !drained.is_empty();
+                                batch_reqs.extend(drained);
+                                if !did_drain && !coalesce_wait.is_zero() {
+                                    std::thread::sleep(coalesce_wait);
+                                } else if coalesce_wait.is_zero() {
+                                    break;
+                                }
+                            }
+                        }
+
+                        // The required ctx_size is the max across the batched
+                        // requests (callers normally use a single value, but be
+                        // defensive). Rebuild context if it changes.
+                        let target_ctx_size =
+                            batch_reqs.iter().map(|r| r.ctx_size).max().unwrap_or(0);
+                        let target_seq_max = context_seq_max_for_batch(batch_reqs.len(), m);
+
+                        if persistent_ctx.is_none()
+                            || persistent_ctx_size != target_ctx_size
+                            || persistent_ctx_seq_max != target_seq_max
+                        {
+                            let _ = persistent_ctx.take();
+                            persistent_ctx = engine.build_persistent_context_with_seq_max(
+                                target_ctx_size,
+                                target_seq_max,
+                            );
+                            if persistent_ctx.is_some() {
+                                persistent_ctx_size = target_ctx_size;
+                                persistent_ctx_seq_max = target_seq_max;
+                                log::info!(
+                                    "[on_device_provider] worker {i} persistent context built \
+                                     (ctx_size={target_ctx_size}, n_seq_max={target_seq_max})"
+                                );
+                            }
+                        }
+
+                        // M=1 path: byte-identical to S1 (single-seq persistent
+                        // inference). This is critical for backward compat —
+                        // single-request latency must not regress.
+                        if m == 1 || batch_reqs.len() == 1 {
+                            let req = batch_reqs.pop().expect("batch has at least 1 req");
+                            let full_prompt =
+                                format_chatml_prompt(req.system_prompt.as_deref(), &req.prompt);
+                            let (timeout_secs, strip_think) = match req.timeout_secs {
+                                Some(secs) => (secs, false),
+                                None => (30, true),
+                            };
+
+                            let result = match persistent_ctx.as_mut() {
+                                Some(ctx) => engine.run_inference_persistent(
+                                    ctx,
+                                    &full_prompt,
+                                    req.max_tokens,
+                                    req.temperature,
+                                    timeout_secs,
+                                    strip_think,
+                                    req.label.as_deref(),
+                                ),
+                                None => {
+                                    log::warn!(
+                                        "[on_device_provider] worker {i} persistent context \
+                                         unavailable, falling back to per-call context"
+                                    );
+                                    match req.timeout_secs {
+                                        Some(secs) => engine.run_inference_raw(
+                                            &full_prompt,
+                                            req.max_tokens,
+                                            req.temperature,
+                                            secs,
+                                            req.ctx_size,
+                                        ),
+                                        None => engine.run_inference(
+                                            &full_prompt,
+                                            req.max_tokens,
+                                            req.temperature,
+                                            req.ctx_size,
+                                            req.label.as_deref(),
+                                        ),
+                                    }
+                                }
+                            };
+
+                            let response = match result {
+                                Some(text) => {
+                                    mark_llm_ready();
+                                    Ok(text)
+                                }
+                                None => Err(LlmError::InferenceFailed(
+                                    "inference returned no output".into(),
+                                )),
+                            };
+                            let _ = req.response_tx.send(response);
+                            continue;
+                        }
+
+                        // M>1 with multiple coalesced requests: run continuous
+                        // batching. Each request gets a distinct seq_id slot.
+                        // Outputs are demultiplexed back to per-request channels.
+                        let prompts: Vec<(String, i32, f32, u64, bool, Option<String>)> =
+                            batch_reqs
+                                .iter()
+                                .map(|req| {
+                                    let prompt = format_chatml_prompt(
+                                        req.system_prompt.as_deref(),
+                                        &req.prompt,
+                                    );
+                                    let (timeout_secs, strip_think) = match req.timeout_secs {
+                                        Some(secs) => (secs, false),
+                                        None => (30, true),
+                                    };
+                                    (
+                                        prompt,
+                                        req.max_tokens,
+                                        req.temperature,
+                                        timeout_secs,
+                                        strip_think,
+                                        req.label.clone(),
+                                    )
+                                })
+                                .collect();
+
+                        let outputs: Vec<Option<String>> = match persistent_ctx.as_mut() {
+                            Some(ctx) => engine.run_inference_continuous_batch(ctx, &prompts, m),
+                            None => {
+                                log::warn!(
+                                    "[on_device_provider] worker {i} persistent multi-seq \
+                                     context unavailable, falling back to serial per-call"
+                                );
+                                // Serial fallback: run each request through
+                                // run_inference_raw / run_inference. Slower
+                                // but preserves correctness.
+                                prompts
+                                    .iter()
+                                    .zip(batch_reqs.iter())
+                                    .map(
+                                        |((p, max_t, temp, timeout, _strip, label), req)| match req
+                                            .timeout_secs
+                                        {
+                                            Some(_) => engine.run_inference_raw(
+                                                p,
+                                                *max_t,
+                                                *temp,
+                                                *timeout,
+                                                req.ctx_size,
+                                            ),
+                                            None => engine.run_inference(
+                                                p,
+                                                *max_t,
+                                                *temp,
+                                                req.ctx_size,
+                                                label.as_deref(),
+                                            ),
+                                        },
+                                    )
+                                    .collect()
+                            }
+                        };
+
+                        // Demultiplex per-seq results back to per-request channels.
+                        let mut any_ok = false;
+                        for (req, out) in batch_reqs.into_iter().zip(outputs) {
+                            let response = match out {
+                                Some(text) => {
+                                    any_ok = true;
+                                    Ok(text)
+                                }
+                                None => Err(LlmError::InferenceFailed(
+                                    "continuous-batch inference returned no output".into(),
+                                )),
+                            };
+                            let _ = req.response_tx.send(response);
+                        }
+                        if any_ok {
+                            mark_llm_ready();
+                        }
+                    }
+
+                    // Drop the persistent context before exiting so Metal
+                    // queues are released cleanly.
+                    drop(persistent_ctx);
+                    log::info!("[on_device_provider] worker {i} thread exiting");
+                    // Mark available=false only when the last worker exits.
+                    // Workers share the AtomicBool; any surviving worker
+                    // keeps the provider available. We use a simple approach:
+                    // set false unconditionally — if another worker is still
+                    // running it will not reset it, but the channel being
+                    // closed means no new requests can succeed anyway.
+                    thread_available.store(false, Ordering::SeqCst);
+                })
+                .map_err(|e| {
+                    crate::error::OriginError::Llm(format!(
+                        "failed to spawn inference thread {i}: {e}"
+                    ))
+                })?;
+        }
 
         Ok(Self {
             tx,
@@ -327,6 +669,7 @@ impl LlmProvider for OnDeviceProvider {
             temperature: request.temperature,
             ctx_size: self.model_context_size,
             label: request.label,
+            timeout_secs: request.timeout_secs,
             response_tx,
         };
 
@@ -747,7 +1090,11 @@ impl LlmProvider for ClaudeCliProvider {
             args.push(sys.clone());
         }
 
+        // Strip ANTHROPIC_API_KEY so claude CLI uses Max plan OAuth instead of
+        // routing through an API account that may have a low credit balance.
+        // The eval harness intentionally chose CLI over Batch API to avoid API costs.
         let mut child = Command::new("claude")
+            .env_remove("ANTHROPIC_API_KEY")
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -849,6 +1196,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_format_chatml_prompt_with_system() {
+        let p = format_chatml_prompt(Some("you are helpful"), "hi");
+        assert!(p.contains("<|im_start|>system\nyou are helpful\n<|im_end|>"));
+        assert!(p.contains("<|im_start|>user\nhi\n<|im_end|>"));
+        assert!(p.contains("<|im_start|>assistant\n<think>"));
+    }
+
+    #[test]
+    fn test_format_chatml_prompt_no_system() {
+        let p = format_chatml_prompt(None, "hello world");
+        assert!(!p.contains("<|im_start|>system"));
+        assert!(p.contains("<|im_start|>user\nhello world\n<|im_end|>"));
+        assert!(p.contains("<|im_start|>assistant\n<think>"));
+    }
+
+    #[test]
+    fn test_parallel_seqs_env_clamping() {
+        // Document the clamp behavior expected by the worker init: invalid
+        // / out-of-range values must clamp to [1, 8]. This characterizes the
+        // env-parsing logic without spinning up an OnDeviceProvider (which
+        // requires GPU + model files).
+        for (input, expected) in [
+            (Some("0"), 1usize),
+            (Some("1"), 1),
+            (Some("4"), 4),
+            (Some("8"), 8),
+            (Some("99"), 8),
+            (Some("not_a_number"), 1),
+            (None, 1),
+        ] {
+            let parsed = input
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, MAX_LLM_PARALLEL_SEQS);
+            assert_eq!(
+                parsed, expected,
+                "input {input:?} should clamp to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_continuous_batch_eligibility_keeps_long_outputs_single_seq() {
+        // 8K context / 8 seq slots = 1024 tokens per seq. Entity extraction
+        // style calls fit; distillation/chat synthesis calls keep the full
+        // single-seq context instead of being silently budget-truncated.
+        assert!(continuous_batch_eligible(8192, 128, 8));
+        assert!(continuous_batch_eligible(8192, 512, 8));
+        assert!(!continuous_batch_eligible(8192, 1024, 8));
+        assert!(!continuous_batch_eligible(8192, 2048, 8));
+        assert!(!continuous_batch_eligible(8192, 128, 1));
+    }
+
+    #[test]
+    fn test_continuous_batch_budget_uses_configured_capacity() {
+        assert_eq!(continuous_batch_per_seq_budget(8192, 8), 1024);
+        assert_eq!(continuous_batch_per_seq_budget(8192, 4), 2048);
+        assert_eq!(continuous_batch_per_seq_budget(8192, 0), 8192);
+    }
+
+    #[test]
+    fn test_singleton_requests_use_single_seq_context() {
+        assert_eq!(context_seq_max_for_batch(0, 8), 1);
+        assert_eq!(context_seq_max_for_batch(1, 8), 1);
+        assert_eq!(context_seq_max_for_batch(2, 8), 8);
+        assert_eq!(context_seq_max_for_batch(8, 8), 8);
+    }
+
+    #[test]
     fn test_llm_request_clone() {
         let req = LlmRequest {
             system_prompt: Some("You are helpful.".into()),
@@ -856,6 +1272,7 @@ mod tests {
             max_tokens: 256,
             temperature: 0.1,
             label: None,
+            timeout_secs: None,
         };
         let cloned = req.clone();
         assert_eq!(cloned.user_prompt, "Hello");
@@ -882,6 +1299,7 @@ mod tests {
                 max_tokens: 100,
                 temperature: 0.0,
                 label: None,
+                timeout_secs: None,
             })
             .await
             .unwrap();
@@ -899,6 +1317,7 @@ mod tests {
                 max_tokens: 100,
                 temperature: 0.0,
                 label: None,
+                timeout_secs: None,
             })
             .await;
         assert!(matches!(result, Err(LlmError::NotAvailable)));
@@ -927,6 +1346,7 @@ mod tests {
                 max_tokens: 100,
                 temperature: 0.0,
                 label: None,
+                timeout_secs: None,
             })
             .await;
         // Empty key → API call will fail
