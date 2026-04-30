@@ -2800,7 +2800,7 @@ async fn smoke_eval_baselines_dir_e2e() {
         .await
         .expect("MemoryDB should open at override path");
 
-    let count = db.list_memories(None, None, None, None, 1).await.map(|v| v.len()).unwrap_or(0);
+    let count = db.memory_count().await.unwrap_or(0);
     assert_eq!(count, 0, "fresh DB should have 0 memories");
 
     let expected_db_path = scope.join("origin_memory.db");
