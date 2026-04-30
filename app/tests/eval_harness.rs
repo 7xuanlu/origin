@@ -2788,29 +2788,35 @@ async fn smoke_eval_baselines_dir_e2e() {
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("EVAL_BASELINES_DIR", tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
-    let baselines = eval_baselines_dir_override().expect("override should resolve");
-    assert_eq!(baselines, tmp.path());
+    // Use temp_env::async_with_vars for closure-scoped, panic-safe restore.
+    // Avoids env-var leak if any assertion below panics.
+    temp_env::async_with_vars(
+        [("EVAL_BASELINES_DIR", Some(path_str.as_str()))],
+        async {
+            let baselines = eval_baselines_dir_override().expect("override should resolve");
+            assert_eq!(baselines, tmp.path());
 
-    let scope = scenario_db_dir(&baselines, "smoketest", "id-1");
-    std::fs::create_dir_all(&scope).unwrap();
+            let scope = scenario_db_dir(&baselines, "smoketest", "id-1");
+            std::fs::create_dir_all(&scope).unwrap();
 
-    let db = MemoryDB::new(&scope, Arc::new(NoopEmitter))
-        .await
-        .expect("MemoryDB should open at override path");
+            let db = MemoryDB::new(&scope, Arc::new(NoopEmitter))
+                .await
+                .expect("MemoryDB should open at override path");
 
-    let count = db.memory_count().await.unwrap_or(0);
-    assert_eq!(count, 0, "fresh DB should have 0 memories");
+            let count = db.memory_count().await.unwrap_or(0);
+            assert_eq!(count, 0, "fresh DB should have 0 memories");
 
-    let expected_db_path = scope.join("origin_memory.db");
-    assert!(
-        expected_db_path.exists(),
-        "DB not at expected EVAL_BASELINES_DIR path: {}",
-        expected_db_path.display()
-    );
-
-    std::env::remove_var("EVAL_BASELINES_DIR");
+            let expected_db_path = scope.join("origin_memory.db");
+            assert!(
+                expected_db_path.exists(),
+                "DB not at expected EVAL_BASELINES_DIR path: {}",
+                expected_db_path.display()
+            );
+        },
+    )
+    .await;
 }
 
 /// Manual smoke for per-scenario enrichment using Claude CLI provider (D2).

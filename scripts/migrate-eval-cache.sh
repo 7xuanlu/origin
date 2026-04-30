@@ -39,6 +39,14 @@ if [[ -d "$DEST/fullpipeline" ]] && [[ $FORCE -eq 0 ]]; then
     exit 1
 fi
 
+# DEST sanity check: refuse destructive ops on dangerous paths.
+# Catches accidental EVAL_BASELINES_DIR=$HOME or =/ before --force rm -rf.
+if [[ -z "$DEST" ]] || [[ "$DEST" == "/" ]] || [[ "$DEST" == "$HOME" ]]; then
+    echo "ERROR: refusing to operate on dangerous DEST: '$DEST'"
+    echo "  EVAL_BASELINES_DIR must be a dedicated subdirectory, not / or \$HOME."
+    exit 1
+fi
+
 mkdir -p "$DEST"
 echo "Copying $SRC/fullpipeline -> $DEST/fullpipeline ..."
 [[ $FORCE -eq 1 ]] && rm -rf "$DEST/fullpipeline"
