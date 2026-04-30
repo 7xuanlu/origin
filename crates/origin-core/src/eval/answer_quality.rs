@@ -2151,7 +2151,20 @@ pub async fn run_fullpipeline_lme_batch(
     use crate::eval::judge::save_judgment_tuples;
     use crate::eval::longmemeval::{category_name, extract_memories, load_longmemeval};
 
-    let samples = load_longmemeval(longmemeval_path)?;
+    let mut samples = load_longmemeval(longmemeval_path)?;
+    // Optional limit for small test runs (set LME_LIMIT_QUESTIONS=N).
+    if let Some(n) = std::env::var("LME_LIMIT_QUESTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        let total_before = samples.len();
+        samples.truncate(n);
+        eprintln!(
+            "[fullpipeline_lme] LME_LIMIT_QUESTIONS={n} -> processing {}/{}",
+            samples.len(),
+            total_before
+        );
+    }
     let shared_embedder = eval_shared_embedder();
 
     // Resume
