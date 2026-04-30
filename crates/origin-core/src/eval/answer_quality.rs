@@ -1209,6 +1209,460 @@ async fn run_phase3_via_cli(
     results
 }
 
+// ============================================================================
+// Phase 3 batched + persistent CLI path (selected by EVAL_PHASE3_BATCH_SIZE>=2)
+// ============================================================================
+//
+// Why this exists: each `claude -p` subprocess re-loads ~190k tokens of Claude
+// Code system prompt. The per-question path above pays that cost 1388 times per
+// LoCoMo run. The batched path below judges N (default 10) questions per call
+// and uses `--resume` to reuse the cached system prompt across calls in the
+// same session, with rotation every 3 calls to avoid schema drift. Pattern
+// mirrors `judge_with_claude_model_batched_persistent` in `judge.rs`.
+//
+// Cost target: ~25x cheaper than per-question path on LoCoMo Phase 3.
+
+/// Cache record for one persisted answer. JSONL append-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Phase3AnswerRecord {
+    /// Format version. Bump and migrate when shape changes; loader filters mismatches.
+    schema_version: u32,
+    /// SHA-256 of `format!("{system}\n{user_prompt}")` — stable across runs given
+    /// deterministic retrieval. Same key = same context = same expected answer.
+    key: String,
+    /// Question text for human readability + per-category aggregation.
+    question: String,
+    /// Approach label, e.g. "structured_single-hop".
+    approach: String,
+    /// The Haiku answer.
+    answer: String,
+}
+
+const PHASE3_SCHEMA_VERSION: u32 = 1;
+
+/// Strict batch answer prompt — explicit conservative instructions to counter
+/// the cognitive-load relaxation observed when batching multiple Q+context
+/// pairs in one call. Directs the model to admit uncertainty rather than
+/// hallucinate when the provided context lacks the answer.
+fn strict_batch_answer_prompt(items: &[(usize, &str, &str)]) -> String {
+    let mut s = String::with_capacity(2048 + items.len() * 1024);
+    s.push_str(
+        "You will answer multiple (context, question) pairs. Be CONSERVATIVE and DISCIPLINED.\n\n",
+    );
+    s.push_str("Rules:\n");
+    s.push_str("- Use ONLY the context provided in each pair. Do not add external knowledge.\n");
+    s.push_str("- Do not invent, paraphrase, or speculate beyond what the context states.\n");
+    s.push_str("- If the context does not contain enough information to answer, output exactly: \"Information not available\".\n");
+    s.push_str("- Be specific and concise. 1-3 sentences per answer.\n\n");
+    s.push_str(&format!(
+        "Return JSON object with a 'results' array containing exactly {} entries in input order, each with {{ idx, answer }}.\n\nPairs:\n",
+        items.len()
+    ));
+    for (idx, question, context) in items {
+        s.push_str(&format!(
+            "[{}]\nContext:\n{}\n\nQuestion: {}\n\n",
+            idx, context, question
+        ));
+    }
+    s
+}
+
+/// Defensive parser for batch answer envelope. Tries `structured_output.results`
+/// first; falls back to markdown-fence-stripped JSON in `.result` field if
+/// `--json-schema` enforcement drops (which happens after several `--resume`
+/// turns when the model treats the conversation as casual chat).
+///
+/// Returns Vec<(idx, answer)> or None.
+fn parse_batch_answer_envelope(stdout: &str) -> Option<Vec<(usize, String)>> {
+    use crate::eval::cli_batch::strip_markdown_fence;
+    let trimmed = stdout.trim();
+    let env: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+
+    let extract = |arr: &[serde_json::Value]| -> Vec<(usize, String)> {
+        arr.iter()
+            .filter_map(|v| {
+                let idx = v.get("idx").and_then(|x| x.as_u64())? as usize;
+                let answer = v
+                    .get("answer")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((idx, answer))
+            })
+            .collect()
+    };
+
+    if let Some(results) = env
+        .get("structured_output")
+        .and_then(|v| v.get("results"))
+        .and_then(|v| v.as_array())
+    {
+        if !results.is_empty() {
+            return Some(extract(results));
+        }
+    }
+
+    if let Some(result_str) = env.get("result").and_then(|v| v.as_str()) {
+        let stripped = strip_markdown_fence(result_str);
+        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&stripped) {
+            if let Some(results) = inner.get("results").and_then(|v| v.as_array()) {
+                if !results.is_empty() {
+                    return Some(extract(results));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Compute the cache key for a Phase 3 request.
+fn phase3_cache_key(system_prompt: Option<&str>, user_prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(system_prompt.unwrap_or("").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(user_prompt.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Split a Phase 3 user prompt back into (context, question) for batched re-formatting.
+/// Format from caller: `"Context:\n{ctx}\n\nQuestion: {question}"`.
+fn split_context_question(user_prompt: &str) -> (String, String) {
+    if let Some(stripped) = user_prompt.strip_prefix("Context:\n") {
+        if let Some((ctx, question)) = stripped.split_once("\n\nQuestion: ") {
+            return (ctx.to_string(), question.to_string());
+        }
+    }
+    (String::new(), user_prompt.to_string())
+}
+
+/// Run Phase 3 with batched + persistent CLI subprocesses and cache-aware resume.
+///
+/// Sequential per `--resume` invariant (single-writer session). Each batch sends
+/// up to `batch_size` (Q, context) pairs. Sessions rotate every `rotation_calls`
+/// calls to avoid schema-drift after long --resume conversations. Cost is hard-
+/// capped at `cost_cap_usd` (process aborts with error if exceeded).
+///
+/// JSONL cache lives at `cache_path` and is keyed by SHA-256 of
+/// `system_prompt + "\n" + user_prompt` so identical (context, question, system)
+/// triples reuse cached answers across runs.
+#[allow(clippy::too_many_arguments)]
+async fn run_phase3_batched_persistent(
+    batch_requests: Vec<(String, String, Option<String>, usize)>,
+    pending: &HashMap<String, PendingAnswer>,
+    batch_size: usize,
+    rotation_calls: usize,
+    model: &str,
+    cache_path: &Path,
+    max_retries: u32,
+    cost_cap_usd: f64,
+) -> HashMap<String, String> {
+    use crate::eval::cli_batch::run_cli_batch_subprocess;
+    use std::collections::HashMap as StdMap;
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    eprintln!(
+        "[phase3-batch] {} requests | batch_size={} rotation={} retries={} cost_cap=${:.2} | cache={}",
+        batch_requests.len(),
+        batch_size,
+        rotation_calls,
+        max_retries,
+        cost_cap_usd,
+        cache_path.display()
+    );
+
+    // Load existing cache (key -> answer).
+    let mut cached: StdMap<String, String> = StdMap::new();
+    let mut bad_lines = 0usize;
+    if cache_path.exists() {
+        if let Ok(f) = std::fs::File::open(cache_path) {
+            for line in BufReader::new(f).lines().map_while(|l| l.ok()) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Phase3AnswerRecord>(&line) {
+                    Ok(rec) if rec.schema_version == PHASE3_SCHEMA_VERSION => {
+                        cached.insert(rec.key, rec.answer);
+                    }
+                    Ok(rec) => {
+                        eprintln!(
+                            "[phase3-batch] WARN: skipping cache record with schema_version={} (expected {})",
+                            rec.schema_version, PHASE3_SCHEMA_VERSION
+                        );
+                    }
+                    Err(_) => bad_lines += 1,
+                }
+            }
+        }
+    }
+    if bad_lines > 0 {
+        eprintln!(
+            "[phase3-batch] WARN: skipped {} corrupt JSONL lines in cache",
+            bad_lines
+        );
+    }
+    eprintln!("[phase3-batch] cache: {} existing entries", cached.len());
+
+    let mut results: HashMap<String, String> = HashMap::new();
+
+    // Partition: cache hits return immediately; misses go to CLI.
+    let mut todo: Vec<(String, String, String, String, String, String, usize)> = Vec::new();
+    // (req_id, key, question, context, approach, system_prompt, max_tokens)
+    for (req_id, user_prompt, system, max_tokens) in batch_requests {
+        let key = phase3_cache_key(system.as_deref(), &user_prompt);
+        if let Some(answer) = cached.get(&key) {
+            results.insert(req_id, answer.clone());
+            continue;
+        }
+        let (context, question) = split_context_question(&user_prompt);
+        let (approach_label, _gt, _cat, _ctx_tokens) = match pending.get(&req_id) {
+            Some(p) => (
+                p.approach.clone(),
+                p.ground_truth.clone(),
+                p.category.clone(),
+                p.context_tokens,
+            ),
+            None => {
+                eprintln!(
+                    "[phase3-batch] WARN: req {req_id} has no pending metadata; using empty approach"
+                );
+                (String::new(), String::new(), String::new(), 0usize)
+            }
+        };
+        todo.push((
+            req_id,
+            key,
+            question,
+            context,
+            approach_label,
+            system.unwrap_or_default(),
+            max_tokens,
+        ));
+    }
+
+    eprintln!(
+        "[phase3-batch] cache hits: {} | to call: {}",
+        results.len(),
+        todo.len()
+    );
+
+    if todo.is_empty() {
+        return results;
+    }
+
+    // Open cache file for append.
+    if let Some(parent) = cache_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[phase3-batch] WARN: cache dir create failed: {e}");
+        }
+    }
+    let mut cache_file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_path)
+    {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("[phase3-batch] WARN: cache open failed: {e}; running without persistence");
+            None
+        }
+    };
+
+    let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"idx":{"type":"integer"},"answer":{"type":"string"}},"required":["idx","answer"]}}},"required":["results"]}"#;
+
+    let total_batches = todo.len().div_ceil(batch_size);
+    let mut session_id: Option<String> = None;
+    let mut calls_in_session = 0usize;
+    let mut total_cost_usd = 0.0f64;
+    let mut total_cc_tokens: u64 = 0;
+    let mut total_cr_tokens: u64 = 0;
+    let mut total_in_tokens: u64 = 0;
+    let mut total_out_tokens: u64 = 0;
+    let mut succ = 0usize;
+    let mut fail_batches = 0usize;
+    let mut retries = 0usize;
+    let mut aborted = false;
+
+    for (batch_i, chunk) in todo.chunks(batch_size).enumerate() {
+        if total_cost_usd > cost_cap_usd {
+            eprintln!(
+                "[phase3-batch] ABORT: cumulative cost ${:.4} exceeds cost_cap=${:.2}",
+                total_cost_usd, cost_cap_usd
+            );
+            aborted = true;
+            break;
+        }
+
+        // Build prompt for this batch.
+        let items: Vec<(usize, &str, &str)> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t.2.as_str(), t.3.as_str()))
+            .collect();
+        let prompt = strict_batch_answer_prompt(&items);
+
+        // Rotate session if at cap.
+        if calls_in_session >= rotation_calls {
+            session_id = None;
+            calls_in_session = 0;
+        }
+
+        let mut batch_result: Option<(Vec<(usize, String)>, _, _)> = None;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..=max_retries {
+            match run_cli_batch_subprocess(&prompt, model, json_schema, session_id.as_deref()).await
+            {
+                Ok((stdout, cost, sid)) => match parse_batch_answer_envelope(&stdout) {
+                    Some(parsed) if parsed.len() == chunk.len() => {
+                        batch_result = Some((parsed, cost, sid));
+                        break;
+                    }
+                    Some(parsed) => {
+                        last_err = Some(format!(
+                            "expected {} answers, got {}",
+                            chunk.len(),
+                            parsed.len()
+                        ));
+                        if attempt < max_retries {
+                            retries += 1;
+                            session_id = None;
+                            calls_in_session = 0;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500u64 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                    None => {
+                        last_err = Some(format!(
+                            "parse failed — head: {}",
+                            stdout.chars().take(200).collect::<String>()
+                        ));
+                        if attempt < max_retries {
+                            retries += 1;
+                            session_id = None;
+                            calls_in_session = 0;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500u64 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < max_retries {
+                        retries += 1;
+                        session_id = None;
+                        calls_in_session = 0;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500u64 * (1 << attempt),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        match batch_result {
+            Some((parsed, cost, sid)) => {
+                if let Some(c) = cost {
+                    total_cost_usd += c.cost_usd;
+                    total_cc_tokens += c.cache_creation_tokens;
+                    total_cr_tokens += c.cache_read_tokens;
+                    total_in_tokens += c.input_tokens;
+                    total_out_tokens += c.output_tokens;
+                }
+                if session_id.is_none() {
+                    session_id = sid;
+                    calls_in_session = 1;
+                } else {
+                    calls_in_session += 1;
+                }
+
+                // Map idx → answer, then write to cache + results map.
+                let by_idx: HashMap<usize, String> = parsed.into_iter().collect();
+                for (i, t) in chunk.iter().enumerate() {
+                    let answer = by_idx.get(&i).cloned().unwrap_or_default();
+                    let (req_id, key, question, _ctx, approach, _sys, _max) = t;
+                    if let Some(file) = cache_file.as_mut() {
+                        let rec = Phase3AnswerRecord {
+                            schema_version: PHASE3_SCHEMA_VERSION,
+                            key: key.clone(),
+                            question: question.clone(),
+                            approach: approach.clone(),
+                            answer: answer.clone(),
+                        };
+                        if let Ok(line) = serde_json::to_string(&rec) {
+                            let _ = writeln!(file, "{}", line);
+                            let _ = file.flush();
+                        }
+                    }
+                    results.insert(req_id.clone(), answer);
+                    succ += 1;
+                }
+                eprintln!(
+                    "[phase3-batch] {}/{} ok | call_in_session={} | cost so far: ${:.4} | answers: {}",
+                    batch_i + 1,
+                    total_batches,
+                    calls_in_session,
+                    total_cost_usd,
+                    succ
+                );
+            }
+            None => {
+                fail_batches += 1;
+                eprintln!(
+                    "[phase3-batch] {}/{} FAILED after {} retries: {}",
+                    batch_i + 1,
+                    total_batches,
+                    max_retries,
+                    last_err.unwrap_or_else(|| "?".into())
+                );
+                // Insert empty answers for this batch's req_ids so the caller's lookup works.
+                for t in chunk.iter() {
+                    results.insert(t.0.clone(), String::new());
+                }
+                session_id = None;
+                calls_in_session = 0;
+            }
+        }
+    }
+
+    let mean_cost_per_call = if total_batches > fail_batches {
+        total_cost_usd / (total_batches - fail_batches) as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[phase3-batch] DONE: {} succ / {} target | {} batches failed | {} retries | aborted={}",
+        succ,
+        todo.len(),
+        fail_batches,
+        retries,
+        aborted
+    );
+    eprintln!(
+        "[phase3-batch] cost: ${:.4} total (${:.5}/call) | tokens: input={} output={} cache_create={} cache_read={}",
+        total_cost_usd,
+        mean_cost_per_call,
+        total_in_tokens,
+        total_out_tokens,
+        total_cc_tokens,
+        total_cr_tokens
+    );
+    if mean_cost_per_call > 0.05 {
+        eprintln!(
+            "[phase3-batch] WARN: mean cost ${:.5}/call is high — investigate cache hit rate or batch size",
+            mean_cost_per_call
+        );
+    }
+
+    results
+}
+
 /// Full-pipeline LoCoMo eval using Batch API for answer generation.
 ///
 /// **Per-conversation DB**: each LoCoMo conversation gets its own isolated database so
@@ -1566,11 +2020,48 @@ pub async fn run_fullpipeline_locomo_batch(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
+    let phase3_batch_size: usize = std::env::var("EVAL_PHASE3_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let phase3_rotation: usize = std::env::var("EVAL_PHASE3_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+        .max(1);
+    let phase3_retries: u32 = std::env::var("EVAL_PHASE3_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let phase3_cost_cap: f64 = std::env::var("EVAL_PHASE3_COST_CAP_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
 
-    let raw_results: HashMap<String, String> = if use_cli {
+    let raw_results: HashMap<String, String> = if use_cli && phase3_batch_size >= 2 {
         eprintln!(
-            "\n[fullpipeline] EVAL_PHASE3_CLI=1: running {} requests via claude -p",
+            "\n[fullpipeline] EVAL_PHASE3_CLI=1, batch_size={}: running {} requests via batched claude -p",
+            phase3_batch_size,
             batch_requests.len()
+        );
+        let cache_path = baselines_dir.join("fullpipeline_locomo_phase3_answers_batch.jsonl");
+        run_phase3_batched_persistent(
+            batch_requests,
+            &pending,
+            phase3_batch_size,
+            phase3_rotation,
+            "haiku",
+            &cache_path,
+            phase3_retries,
+            phase3_cost_cap,
+        )
+        .await
+    } else if use_cli {
+        eprintln!(
+            "\n[fullpipeline] EVAL_PHASE3_CLI=1: running {} requests via claude -p (per-question, concurrency={})",
+            batch_requests.len(),
+            cli_concurrency
         );
         run_phase3_via_cli(batch_requests, cli_concurrency).await
     } else {
@@ -1987,11 +2478,48 @@ pub async fn run_fullpipeline_lme_batch(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
+    let phase3_batch_size: usize = std::env::var("EVAL_PHASE3_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let phase3_rotation: usize = std::env::var("EVAL_PHASE3_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+        .max(1);
+    let phase3_retries: u32 = std::env::var("EVAL_PHASE3_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let phase3_cost_cap: f64 = std::env::var("EVAL_PHASE3_COST_CAP_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50.0);
 
-    let raw_results: HashMap<String, String> = if use_cli {
+    let raw_results: HashMap<String, String> = if use_cli && phase3_batch_size >= 2 {
         eprintln!(
-            "\n[fullpipeline_lme] EVAL_PHASE3_CLI=1: running {} requests via claude -p",
+            "\n[fullpipeline_lme] EVAL_PHASE3_CLI=1, batch_size={}: running {} requests via batched claude -p",
+            phase3_batch_size,
             batch_requests.len()
+        );
+        let cache_path = baselines_dir.join("fullpipeline_lme_phase3_answers_batch.jsonl");
+        run_phase3_batched_persistent(
+            batch_requests,
+            &pending,
+            phase3_batch_size,
+            phase3_rotation,
+            "haiku",
+            &cache_path,
+            phase3_retries,
+            phase3_cost_cap,
+        )
+        .await
+    } else if use_cli {
+        eprintln!(
+            "\n[fullpipeline_lme] EVAL_PHASE3_CLI=1: running {} requests via claude -p (per-question, concurrency={})",
+            batch_requests.len(),
+            cli_concurrency
         );
         run_phase3_via_cli(batch_requests, cli_concurrency).await
     } else {

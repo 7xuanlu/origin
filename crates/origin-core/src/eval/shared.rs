@@ -4,6 +4,7 @@
 use crate::db::MemoryDB;
 use crate::error::OriginError;
 use crate::sources::RawDocument;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -692,10 +693,26 @@ where
 /// `BatchApi` uses Anthropic Batch API: fast, paid, and over-flatters quality vs. production
 /// because Haiku is more capable than Qwen-4B. Opt-in only.
 pub enum EnrichmentMode {
+    /// On-device Qwen3-4B/9B. Free + slow + production-faithful (matches what users
+    /// run locally). Best for LME-scale (~10k memories, ~2h on M2 Pro).
     OnDevice(Arc<dyn crate::llm_provider::LlmProvider>),
+    /// Anthropic Batch API. Paid (~$2-3 per LME run) + fast + Haiku quality. Best
+    /// for production-quality fast enrichment when API balance is available.
     BatchApi {
         api_key: String,
         model: String,
+        cost_cap_usd: f64,
+    },
+    /// `claude -p` subprocess via Max-plan OAuth. Paid in Max quota + slower than
+    /// Batch API at scale + Haiku quality. Best for interactive dev iteration on
+    /// LoCoMo-scale (~500 memories) when API balance is empty but Max OAuth is
+    /// available. NOT recommended for LME-scale (sequential CLI runs ≈ 3+ hours).
+    Cli {
+        model: String,
+        batch_entities: usize,
+        batch_titles: usize,
+        rotation: usize,
+        retries: u32,
         cost_cap_usd: f64,
     },
 }
@@ -704,12 +721,16 @@ impl EnrichmentMode {
     /// Construct from environment.
     ///
     /// - `EVAL_ENRICHMENT=cloud` (or `batch`) → `BatchApi` (requires `ANTHROPIC_API_KEY`).
-    /// - Anything else (default) → `OnDevice`, model selected by `EVAL_LOCAL_MODEL`:
-    ///   - unset → `qwen3-4b` (default, fast, lower quality)
-    ///   - `qwen3.5-9b` → 9B model (slower, higher quality)
+    /// - `EVAL_ENRICHMENT=cli` → `Cli` (uses Max OAuth via `claude -p`).
+    /// - Anything else (default) → `OnDevice`, model selected by `EVAL_LOCAL_MODEL`.
     ///
-    /// Returns Err if `cloud` is requested without `ANTHROPIC_API_KEY`, or if
-    /// `OnDeviceProvider` init fails (model load, GPU init, etc.).
+    /// CLI knobs:
+    /// - `EVAL_ENRICHMENT_CLI_MODEL` (default `haiku`)
+    /// - `EVAL_ENRICHMENT_BATCH_SIZE_ENTITIES` (default 1; ≥2 selects batched path)
+    /// - `EVAL_ENRICHMENT_BATCH_SIZE_TITLES` (default 1; ≥2 selects batched path)
+    /// - `EVAL_ENRICHMENT_ROTATION` (default 3 calls/session)
+    /// - `EVAL_ENRICHMENT_RETRIES` (default 3)
+    /// - `EVAL_ENRICHMENT_COST_CAP_USD` (default $5; suggest $20 for LME)
     pub fn from_env(answer_model: &str, cost_cap_usd: f64) -> Result<Self, OriginError> {
         let mode = std::env::var("EVAL_ENRICHMENT").unwrap_or_else(|_| "local".into());
         match mode.as_str() {
@@ -721,6 +742,45 @@ impl EnrichmentMode {
                     api_key,
                     model: answer_model.to_string(),
                     cost_cap_usd,
+                })
+            }
+            "cli" => {
+                let model =
+                    std::env::var("EVAL_ENRICHMENT_CLI_MODEL").unwrap_or_else(|_| "haiku".into());
+                let batch_entities: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE_ENTITIES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                let batch_titles: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE_TITLES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                let rotation: usize = std::env::var("EVAL_ENRICHMENT_ROTATION")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3)
+                    .max(1);
+                let retries: u32 = std::env::var("EVAL_ENRICHMENT_RETRIES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
+                let cli_cost_cap: f64 = std::env::var("EVAL_ENRICHMENT_COST_CAP_USD")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5.0);
+                eprintln!(
+                    "[enrichment] mode=cli model={} batch_entities={} batch_titles={} rotation={} retries={} cost_cap=${:.2}",
+                    model, batch_entities, batch_titles, rotation, retries, cli_cost_cap
+                );
+                Ok(Self::Cli {
+                    model,
+                    batch_entities,
+                    batch_titles,
+                    rotation,
+                    retries,
+                    cost_cap_usd: cli_cost_cap,
                 })
             }
             _ => {
@@ -771,7 +831,656 @@ pub async fn enrich_db_for_eval(
                 run_concept_distillation_batch_api(db, api_key, model, *cost_cap_usd).await?;
             Ok((entities, titles, concepts))
         }
+        EnrichmentMode::Cli {
+            model,
+            batch_entities,
+            batch_titles,
+            rotation,
+            retries,
+            cost_cap_usd,
+        } => {
+            // Run entity extraction first (Phase A), then titles (Phase B). They use
+            // separate sessions so the schema doesn't switch mid-conversation (the
+            // model can drift if entity-schema and title-schema interleave under
+            // --resume — same root cause as judge schema drift).
+            let entities =
+                run_entity_extraction_for_eval_cli(db, model, *batch_entities, *rotation, *retries, *cost_cap_usd)
+                    .await?;
+            let titles =
+                run_title_enrichment_for_eval_cli(db, model, *batch_titles, *rotation, *retries, *cost_cap_usd)
+                    .await?;
+            // Concept distillation: not yet ported to CLI. Skip for now; user can
+            // separately run on-device or Batch API distillation if needed.
+            // TODO: add Cli concept distillation in a follow-up if usage warrants.
+            eprintln!("[enrichment-cli] entities={} titles={} concepts=0 (distillation not implemented in CLI mode)", entities, titles);
+            Ok((entities, titles, 0))
+        }
     }
+}
+
+// ============================================================================
+// Phase 1 enrichment via `claude -p` CLI (selected by EVAL_ENRICHMENT=cli).
+// ============================================================================
+//
+// Mirrors the judge.rs batched + persistent pattern: strict prompts, --resume
+// cache reuse, session rotation every N calls, JSONL persistence, retry with
+// exp backoff, cost telemetry, hard cost cap.
+//
+// Scope: entity extraction + title enrichment only. Observations, relations,
+// and concept distillation remain on-device or Batch-API-only paths. CLI mode
+// is intended for interactive dev iteration on LoCoMo-scale benchmarks where
+// API balance is unavailable but Max OAuth is.
+//
+// JSONL caches:
+// - app/eval/baselines/_enrichment_entities_cli.jsonl
+// - app/eval/baselines/_enrichment_titles_cli.jsonl
+// (path is db-relative — caller controls placement via env if needed).
+
+const ENRICH_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EntityRecordCli {
+    name: String,
+    #[serde(default)]
+    entity_type: String,
+    #[serde(default)]
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EntityCacheRecord {
+    schema_version: u32,
+    memory_id: String,
+    entities: Vec<EntityRecordCli>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TitleCacheRecord {
+    schema_version: u32,
+    memory_id: String,
+    title: String,
+}
+
+fn strict_batch_entity_prompt(memories: &[(String, String)]) -> String {
+    let mut s = String::with_capacity(2048 + memories.len() * 512);
+    s.push_str("You will extract named entities (people, places, organizations, events) from each numbered memory below. Be CONSERVATIVE.\n\n");
+    s.push_str("Rules:\n");
+    s.push_str("- Extract ONLY entities explicitly mentioned in the memory text.\n");
+    s.push_str("- Do not invent entities or infer from context.\n");
+    s.push_str("- If a memory has no clear entities, output an empty list.\n");
+    s.push_str("- Use type labels: person, place, organization, event, other.\n\n");
+    s.push_str(&format!(
+        "Return JSON object {{\"results\":[{{idx, memory_id, entities:[{{name, type, confidence}}]}}]}} with exactly {} entries in input order.\n\nMemories:\n",
+        memories.len()
+    ));
+    for (i, (mid, content)) in memories.iter().enumerate() {
+        let truncated: String = content.chars().take(500).collect();
+        s.push_str(&format!(
+            "[{}] memory_id={}\n{}\n\n",
+            i, mid, truncated
+        ));
+    }
+    s
+}
+
+fn strict_batch_title_prompt(memories: &[(String, String)]) -> String {
+    let mut s = String::with_capacity(1024 + memories.len() * 256);
+    s.push_str("You will generate a short title (3-5 words) for each numbered memory below.\n\n");
+    s.push_str("Rules:\n");
+    s.push_str("- Title must reflect what the memory ACTUALLY states.\n");
+    s.push_str("- Do not paraphrase facts the memory doesn't contain.\n");
+    s.push_str("- Avoid generic titles like 'Note' or 'Conversation' — be specific.\n\n");
+    s.push_str(&format!(
+        "Return JSON object {{\"results\":[{{idx, memory_id, title}}]}} with exactly {} entries in input order.\n\nMemories:\n",
+        memories.len()
+    ));
+    for (i, (mid, content)) in memories.iter().enumerate() {
+        let truncated: String = content.chars().take(300).collect();
+        s.push_str(&format!(
+            "[{}] memory_id={}\n{}\n\n",
+            i, mid, truncated
+        ));
+    }
+    s
+}
+
+fn parse_entity_envelope(stdout: &str) -> Option<Vec<(usize, String, Vec<EntityRecordCli>)>> {
+    use crate::eval::cli_batch::strip_markdown_fence;
+    let trimmed = stdout.trim();
+    let env: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+
+    let extract = |arr: &[serde_json::Value]| -> Vec<(usize, String, Vec<EntityRecordCli>)> {
+        arr.iter()
+            .filter_map(|v| {
+                let idx = v.get("idx").and_then(|x| x.as_u64())? as usize;
+                let memory_id = v.get("memory_id").and_then(|x| x.as_str())?.to_string();
+                let entities = v
+                    .get("entities")
+                    .and_then(|x| x.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| {
+                                let name = e.get("name").and_then(|x| x.as_str())?.to_string();
+                                let entity_type = e
+                                    .get("type")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("other")
+                                    .to_string();
+                                let confidence =
+                                    e.get("confidence").and_then(|x| x.as_f64()).map(|v| v as f32);
+                                Some(EntityRecordCli {
+                                    name,
+                                    entity_type,
+                                    confidence,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some((idx, memory_id, entities))
+            })
+            .collect()
+    };
+
+    if let Some(results) = env
+        .get("structured_output")
+        .and_then(|v| v.get("results"))
+        .and_then(|v| v.as_array())
+    {
+        if !results.is_empty() {
+            return Some(extract(results));
+        }
+    }
+    if let Some(result_str) = env.get("result").and_then(|v| v.as_str()) {
+        let stripped = strip_markdown_fence(result_str);
+        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&stripped) {
+            if let Some(results) = inner.get("results").and_then(|v| v.as_array()) {
+                if !results.is_empty() {
+                    return Some(extract(results));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_title_envelope(stdout: &str) -> Option<Vec<(usize, String, String)>> {
+    use crate::eval::cli_batch::strip_markdown_fence;
+    let trimmed = stdout.trim();
+    let env: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+
+    let extract = |arr: &[serde_json::Value]| -> Vec<(usize, String, String)> {
+        arr.iter()
+            .filter_map(|v| {
+                let idx = v.get("idx").and_then(|x| x.as_u64())? as usize;
+                let memory_id = v.get("memory_id").and_then(|x| x.as_str())?.to_string();
+                let title = v.get("title").and_then(|x| x.as_str())?.to_string();
+                Some((idx, memory_id, title))
+            })
+            .collect()
+    };
+
+    if let Some(results) = env
+        .get("structured_output")
+        .and_then(|v| v.get("results"))
+        .and_then(|v| v.as_array())
+    {
+        if !results.is_empty() {
+            return Some(extract(results));
+        }
+    }
+    if let Some(result_str) = env.get("result").and_then(|v| v.as_str()) {
+        let stripped = strip_markdown_fence(result_str);
+        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&stripped) {
+            if let Some(results) = inner.get("results").and_then(|v| v.as_array()) {
+                if !results.is_empty() {
+                    return Some(extract(results));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// CLI-batched entity extraction. Batched + --resume + persistence + retry.
+pub async fn run_entity_extraction_for_eval_cli(
+    db: &MemoryDB,
+    model: &str,
+    batch_size: usize,
+    rotation_calls: usize,
+    max_retries: u32,
+    cost_cap_usd: f64,
+) -> Result<usize, OriginError> {
+    use crate::eval::cli_batch::run_cli_batch_subprocess;
+    use std::collections::{HashMap, HashSet};
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    let all_unlinked = db.get_unlinked_memories(100_000).await?;
+    if all_unlinked.is_empty() {
+        eprintln!("[enrich-cli-entities] no unlinked memories");
+        let _ = db.mark_all_memories_enriched_for_eval().await?;
+        return Ok(0);
+    }
+
+    let cache_path =
+        std::path::PathBuf::from("app/eval/baselines/_enrichment_entities_cli.jsonl");
+
+    // Load cached records.
+    let mut cached: HashMap<String, Vec<EntityRecordCli>> = HashMap::new();
+    let mut bad_lines = 0usize;
+    if cache_path.exists() {
+        if let Ok(f) = std::fs::File::open(&cache_path) {
+            for line in BufReader::new(f).lines().map_while(|l| l.ok()) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<EntityCacheRecord>(&line) {
+                    Ok(rec) if rec.schema_version == ENRICH_SCHEMA_VERSION => {
+                        cached.insert(rec.memory_id, rec.entities);
+                    }
+                    Ok(_) => {}
+                    Err(_) => bad_lines += 1,
+                }
+            }
+        }
+    }
+    if bad_lines > 0 {
+        eprintln!(
+            "[enrich-cli-entities] WARN: skipped {} corrupt JSONL lines",
+            bad_lines
+        );
+    }
+    eprintln!(
+        "[enrich-cli-entities] cache: {} existing | total memories: {}",
+        cached.len(),
+        all_unlinked.len()
+    );
+
+    // Filter: skip already-cached.
+    let cached_ids: HashSet<&str> = cached.keys().map(|s| s.as_str()).collect();
+    let todo: Vec<(String, String)> = all_unlinked
+        .iter()
+        .filter(|(mid, _)| !cached_ids.contains(mid.as_str()))
+        .cloned()
+        .collect();
+    eprintln!(
+        "[enrich-cli-entities] cache hits: {} | to call: {}",
+        all_unlinked.len() - todo.len(),
+        todo.len()
+    );
+
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut cache_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cache_path)
+        .ok();
+
+    let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"idx":{"type":"integer"},"memory_id":{"type":"string"},"entities":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"type":{"type":"string"},"confidence":{"type":"number"}},"required":["name","type"]}}},"required":["idx","memory_id","entities"]}}},"required":["results"]}"#;
+
+    let total_batches = if todo.is_empty() { 0 } else { todo.len().div_ceil(batch_size) };
+    let mut session_id: Option<String> = None;
+    let mut calls_in_session = 0usize;
+    let mut total_cost = 0.0f64;
+    let mut succ_batches = 0usize;
+    let mut fail_batches = 0usize;
+    let mut retries = 0usize;
+    let mut total_entities_cached: HashMap<String, Vec<EntityRecordCli>> = cached.clone();
+    let mut aborted = false;
+
+    for (batch_i, chunk) in todo.chunks(batch_size).enumerate() {
+        if total_cost > cost_cap_usd {
+            eprintln!(
+                "[enrich-cli-entities] ABORT: cumulative cost ${:.4} > cap ${:.2}",
+                total_cost, cost_cap_usd
+            );
+            aborted = true;
+            break;
+        }
+        let prompt = strict_batch_entity_prompt(chunk);
+        if calls_in_session >= rotation_calls {
+            session_id = None;
+            calls_in_session = 0;
+        }
+
+        let mut parsed_opt: Option<Vec<(usize, String, Vec<EntityRecordCli>)>> = None;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..=max_retries {
+            match run_cli_batch_subprocess(&prompt, model, json_schema, session_id.as_deref()).await
+            {
+                Ok((stdout, cost, sid)) => {
+                    if let Some(c) = cost {
+                        total_cost += c.cost_usd;
+                    }
+                    match parse_entity_envelope(&stdout) {
+                        Some(parsed) if parsed.len() == chunk.len() => {
+                            parsed_opt = Some(parsed);
+                            if session_id.is_none() {
+                                session_id = sid;
+                                calls_in_session = 1;
+                            } else {
+                                calls_in_session += 1;
+                            }
+                            break;
+                        }
+                        _ => {
+                            last_err = Some("parse mismatch or empty".into());
+                            if attempt < max_retries {
+                                retries += 1;
+                                session_id = None;
+                                calls_in_session = 0;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    500u64 * (1 << attempt),
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < max_retries {
+                        retries += 1;
+                        session_id = None;
+                        calls_in_session = 0;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500u64 * (1 << attempt),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        match parsed_opt {
+            Some(parsed) => {
+                succ_batches += 1;
+                for (i, (_idx, memory_id, entities)) in parsed.iter().enumerate() {
+                    // Defensive: prefer the position-based memory_id from the chunk over
+                    // the model's claimed memory_id, which may rarely drift.
+                    let mid = chunk
+                        .get(i)
+                        .map(|t| t.0.clone())
+                        .unwrap_or_else(|| memory_id.clone());
+                    if let Some(file) = cache_file.as_mut() {
+                        let rec = EntityCacheRecord {
+                            schema_version: ENRICH_SCHEMA_VERSION,
+                            memory_id: mid.clone(),
+                            entities: entities.clone(),
+                        };
+                        if let Ok(line) = serde_json::to_string(&rec) {
+                            let _ = writeln!(file, "{}", line);
+                            let _ = file.flush();
+                        }
+                    }
+                    total_entities_cached.insert(mid, entities.clone());
+                }
+                eprintln!(
+                    "[enrich-cli-entities] batch {}/{} ok | call_in_session={} | cost ${:.4}",
+                    batch_i + 1,
+                    total_batches,
+                    calls_in_session,
+                    total_cost
+                );
+            }
+            None => {
+                fail_batches += 1;
+                eprintln!(
+                    "[enrich-cli-entities] batch {}/{} FAILED: {}",
+                    batch_i + 1,
+                    total_batches,
+                    last_err.unwrap_or_else(|| "?".into())
+                );
+                session_id = None;
+                calls_in_session = 0;
+            }
+        }
+    }
+
+    // Apply cached entities to DB.
+    let mut entity_cache: HashMap<String, String> = HashMap::new();
+    let mut total_linked = 0usize;
+    let mut total_entities_count = 0usize;
+    for (memory_id, entities) in &total_entities_cached {
+        let mut first_id: Option<String> = None;
+        for ent in entities {
+            let extracted = crate::extract::ExtractedEntity {
+                name: ent.name.clone(),
+                entity_type: ent.entity_type.clone(),
+            };
+            match crate::importer::resolve_or_create_entity(
+                db,
+                &mut entity_cache,
+                &extracted,
+                "cli_eval",
+            )
+            .await
+            {
+                Ok((id, _)) => {
+                    total_entities_count += 1;
+                    if first_id.is_none() {
+                        first_id = Some(id);
+                    }
+                }
+                Err(e) => log::warn!("[enrich-cli-entities] entity create failed: {e}"),
+            }
+        }
+        if let Some(eid) = first_id {
+            let _ = db.update_memory_entity_id(memory_id, &eid).await;
+            total_linked += 1;
+        }
+    }
+
+    let _ = db.mark_all_memories_enriched_for_eval().await?;
+    eprintln!(
+        "[enrich-cli-entities] DONE: {} batches succ, {} failed, {} retries | aborted={} | total_cost=${:.4} | linked={} entities={}",
+        succ_batches, fail_batches, retries, aborted, total_cost, total_linked, total_entities_count
+    );
+
+    Ok(total_linked)
+}
+
+/// CLI-batched title enrichment. Batched + --resume + persistence + retry.
+pub async fn run_title_enrichment_for_eval_cli(
+    db: &MemoryDB,
+    model: &str,
+    batch_size: usize,
+    rotation_calls: usize,
+    max_retries: u32,
+    cost_cap_usd: f64,
+) -> Result<usize, OriginError> {
+    use crate::eval::cli_batch::run_cli_batch_subprocess;
+    use std::collections::{HashMap, HashSet};
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    let candidates = db.get_memories_needing_title_enrichment().await?;
+    if candidates.is_empty() {
+        eprintln!("[enrich-cli-titles] no candidates");
+        return Ok(0);
+    }
+
+    let cache_path = std::path::PathBuf::from("app/eval/baselines/_enrichment_titles_cli.jsonl");
+    let mut cached: HashMap<String, String> = HashMap::new();
+    let mut bad_lines = 0usize;
+    if cache_path.exists() {
+        if let Ok(f) = std::fs::File::open(&cache_path) {
+            for line in BufReader::new(f).lines().map_while(|l| l.ok()) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<TitleCacheRecord>(&line) {
+                    Ok(rec) if rec.schema_version == ENRICH_SCHEMA_VERSION => {
+                        cached.insert(rec.memory_id, rec.title);
+                    }
+                    Ok(_) => {}
+                    Err(_) => bad_lines += 1,
+                }
+            }
+        }
+    }
+    if bad_lines > 0 {
+        eprintln!(
+            "[enrich-cli-titles] WARN: skipped {} corrupt JSONL lines",
+            bad_lines
+        );
+    }
+
+    let cached_ids: HashSet<&str> = cached.keys().map(|s| s.as_str()).collect();
+    let todo: Vec<(String, String)> = candidates
+        .iter()
+        .filter(|(mid, _)| !cached_ids.contains(mid.as_str()))
+        .cloned()
+        .collect();
+    eprintln!(
+        "[enrich-cli-titles] cache hits: {} | to call: {} | total: {}",
+        cached.len(),
+        todo.len(),
+        candidates.len()
+    );
+
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut cache_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cache_path)
+        .ok();
+
+    let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"idx":{"type":"integer"},"memory_id":{"type":"string"},"title":{"type":"string"}},"required":["idx","memory_id","title"]}}},"required":["results"]}"#;
+
+    let total_batches = if todo.is_empty() { 0 } else { todo.len().div_ceil(batch_size) };
+    let mut session_id: Option<String> = None;
+    let mut calls_in_session = 0usize;
+    let mut total_cost = 0.0f64;
+    let mut succ = 0usize;
+    let mut fail_batches = 0usize;
+    let mut retries = 0usize;
+    let mut new_titles: HashMap<String, String> = cached.clone();
+    let mut aborted = false;
+
+    for (batch_i, chunk) in todo.chunks(batch_size).enumerate() {
+        if total_cost > cost_cap_usd {
+            eprintln!(
+                "[enrich-cli-titles] ABORT: cumulative cost ${:.4} > cap ${:.2}",
+                total_cost, cost_cap_usd
+            );
+            aborted = true;
+            break;
+        }
+        let prompt = strict_batch_title_prompt(chunk);
+        if calls_in_session >= rotation_calls {
+            session_id = None;
+            calls_in_session = 0;
+        }
+
+        let mut parsed_opt: Option<Vec<(usize, String, String)>> = None;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..=max_retries {
+            match run_cli_batch_subprocess(&prompt, model, json_schema, session_id.as_deref()).await
+            {
+                Ok((stdout, cost, sid)) => {
+                    if let Some(c) = cost {
+                        total_cost += c.cost_usd;
+                    }
+                    match parse_title_envelope(&stdout) {
+                        Some(parsed) if parsed.len() == chunk.len() => {
+                            parsed_opt = Some(parsed);
+                            if session_id.is_none() {
+                                session_id = sid;
+                                calls_in_session = 1;
+                            } else {
+                                calls_in_session += 1;
+                            }
+                            break;
+                        }
+                        _ => {
+                            last_err = Some("parse mismatch or empty".into());
+                            if attempt < max_retries {
+                                retries += 1;
+                                session_id = None;
+                                calls_in_session = 0;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    500u64 * (1 << attempt),
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < max_retries {
+                        retries += 1;
+                        session_id = None;
+                        calls_in_session = 0;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500u64 * (1 << attempt),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        match parsed_opt {
+            Some(parsed) => {
+                for (i, (_idx, _claimed_id, title)) in parsed.iter().enumerate() {
+                    let mid = chunk
+                        .get(i)
+                        .map(|t| t.0.clone())
+                        .unwrap_or_default();
+                    if let Some(file) = cache_file.as_mut() {
+                        let rec = TitleCacheRecord {
+                            schema_version: ENRICH_SCHEMA_VERSION,
+                            memory_id: mid.clone(),
+                            title: title.clone(),
+                        };
+                        if let Ok(line) = serde_json::to_string(&rec) {
+                            let _ = writeln!(file, "{}", line);
+                            let _ = file.flush();
+                        }
+                    }
+                    new_titles.insert(mid, title.clone());
+                }
+                eprintln!(
+                    "[enrich-cli-titles] batch {}/{} ok | cost ${:.4}",
+                    batch_i + 1,
+                    total_batches,
+                    total_cost
+                );
+            }
+            None => {
+                fail_batches += 1;
+                eprintln!(
+                    "[enrich-cli-titles] batch {}/{} FAILED: {}",
+                    batch_i + 1,
+                    total_batches,
+                    last_err.unwrap_or_else(|| "?".into())
+                );
+                session_id = None;
+                calls_in_session = 0;
+            }
+        }
+    }
+
+    // Apply new titles to DB.
+    for (memory_id, title) in &new_titles {
+        match db.update_title(memory_id, title).await {
+            Ok(_) => succ += 1,
+            Err(e) => log::warn!("[enrich-cli-titles] update_title({memory_id}) failed: {e}"),
+        }
+    }
+
+    eprintln!(
+        "[enrich-cli-titles] DONE: {} titles applied | {} batches failed | {} retries | aborted={} | total_cost=${:.4}",
+        succ, fail_batches, retries, aborted, total_cost
+    );
+    Ok(succ)
 }
 
 /// On-device title enrichment via production code path.

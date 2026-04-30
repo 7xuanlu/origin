@@ -49,15 +49,10 @@ pub struct JudgmentResult {
     pub context_tokens: usize,
 }
 
-/// Cost telemetry extracted from `claude -p` JSON envelope.
-#[derive(Debug, Clone, Default)]
-pub struct JudgeCostInfo {
-    pub cost_usd: f64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
-}
+// Cost telemetry has been moved to `cli_batch::CliCostInfo` and is shared across
+// all CLI batched eval routes. Keep `JudgeCostInfo` as an alias for backward compat
+// with any external caller; new code should use `CliCostInfo` directly.
+pub use crate::eval::cli_batch::CliCostInfo as JudgeCostInfo;
 
 /// Per-approach aggregated result in a judged E2E report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,7 +276,7 @@ pub async fn judge_with_claude_model_persistent(
             }
 
             let done = prog.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 50 == 0 || done == total {
+            if done.is_multiple_of(50) || done == total {
                 eprintln!(
                     "[judge] progress {}/{} (succ={}, fail={}, retries={})",
                     done,
@@ -555,22 +550,8 @@ pub fn strict_batch_judge_prompt(tuples: &[JudgmentTuple]) -> String {
     s
 }
 
-/// Strip markdown code fence (```json ... ``` or ``` ... ```) wrapping JSON.
-fn strip_markdown_fence(text: &str) -> String {
-    let t = text.trim();
-    let after_open = if let Some(rest) = t.strip_prefix("```json\n").or_else(|| t.strip_prefix("```\n")) {
-        rest
-    } else if let Some(rest) = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")) {
-        rest
-    } else {
-        return t.to_string();
-    };
-    after_open
-        .trim_end_matches("```")
-        .trim_end_matches('\n')
-        .trim()
-        .to_string()
-}
+// Markdown fence stripper has moved to `cli_batch::strip_markdown_fence`.
+use crate::eval::cli_batch::strip_markdown_fence;
 
 /// Defensive parser for batch judge envelope. Returns Vec<(score, reason)> or None.
 ///
@@ -638,91 +619,12 @@ async fn run_batch_judge_subprocess(
     ),
     OriginError,
 > {
-    use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
+    use crate::eval::cli_batch::run_cli_batch_subprocess;
 
     let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"score":{"type":"integer","enum":[0,1]},"reason":{"type":"string"}},"required":["score","reason"]}}},"required":["results"]}"#;
 
-    let mut args: Vec<String> = vec![
-        "-p".into(),
-        "--model".into(),
-        model.into(),
-        "--output-format".into(),
-        "json".into(),
-        "--json-schema".into(),
-        json_schema.into(),
-        "--allowedTools".into(),
-        "".into(),
-    ];
-    if let Some(sid) = session_id {
-        args.push("--resume".into());
-        args.push(sid.into());
-    }
-
-    let mut child = Command::new("claude")
-        .env_remove("ANTHROPIC_API_KEY")
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| OriginError::Generic(format!("claude -p failed to start: {}", e)))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .map_err(|e| OriginError::Generic(format!("write to claude stdin failed: {}", e)))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| OriginError::Generic(format!("claude -p wait failed: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(OriginError::Generic(format!(
-            "claude -p exited with error: {}",
-            stderr.trim()
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Cost telemetry from envelope
-    let env: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
-    let cost = env.as_ref().map(|e| {
-        let usage = e.get("usage");
-        JudgeCostInfo {
-            cost_usd: e
-                .get("total_cost_usd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            input_tokens: usage
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            output_tokens: usage
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            cache_creation_tokens: usage
-                .and_then(|u| u.get("cache_creation_input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            cache_read_tokens: usage
-                .and_then(|u| u.get("cache_read_input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-        }
-    });
-
-    let new_sid = env
-        .as_ref()
-        .and_then(|e| e.get("session_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let (stdout, cost, new_sid) =
+        run_cli_batch_subprocess(prompt, model, json_schema, session_id).await?;
 
     let results = parse_batch_judge_envelope(&stdout).ok_or_else(|| {
         OriginError::Generic(format!(
@@ -827,6 +729,7 @@ pub async fn judge_with_claude_model_batched_persistent(
             calls_in_session = 0;
         }
 
+        #[allow(clippy::type_complexity)]
         let mut batch_result: Option<(Vec<(u8, String)>, Option<JudgeCostInfo>, Option<String>)> =
             None;
         let mut last_err: Option<String> = None;
