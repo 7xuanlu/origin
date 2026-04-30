@@ -2773,6 +2773,46 @@ async fn smoke_per_scenario_locomo() {
     );
 }
 
+/// End-to-end smoke that verifies EVAL_BASELINES_DIR wires through to a real
+/// DB-open code path. Builds the scenario path via the helper + `scenario_db_dir`,
+/// opens a `MemoryDB` at that path, and asserts the DB file lands where expected.
+///
+/// Avoids `open_or_seed_scenario_db` to keep the test light: no enrichment,
+/// no embedder warmup beyond what `MemoryDB::new` does on its own.
+#[tokio::test]
+#[ignore]
+async fn smoke_eval_baselines_dir_e2e() {
+    use origin_core::db::MemoryDB;
+    use origin_core::events::NoopEmitter;
+    use origin_lib::eval::shared::{eval_baselines_dir_override, scenario_db_dir};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("EVAL_BASELINES_DIR", tmp.path());
+
+    let baselines = eval_baselines_dir_override().expect("override should resolve");
+    assert_eq!(baselines, tmp.path());
+
+    let scope = scenario_db_dir(&baselines, "smoketest", "id-1");
+    std::fs::create_dir_all(&scope).unwrap();
+
+    let db = MemoryDB::new(&scope, Arc::new(NoopEmitter))
+        .await
+        .expect("MemoryDB should open at override path");
+
+    let count = db.list_memories(None, None, None, None, 1).await.map(|v| v.len()).unwrap_or(0);
+    assert_eq!(count, 0, "fresh DB should have 0 memories");
+
+    let expected_db_path = scope.join("origin_memory.db");
+    assert!(
+        expected_db_path.exists(),
+        "DB not at expected EVAL_BASELINES_DIR path: {}",
+        expected_db_path.display()
+    );
+
+    std::env::remove_var("EVAL_BASELINES_DIR");
+}
+
 /// Manual smoke for per-scenario enrichment using Claude CLI provider (D2).
 ///
 /// Validates that `EnrichmentMode::OnDevice(ClaudeCliProvider)` works end-to-end:
