@@ -4011,3 +4011,28 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
         sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
     }
 }
+
+#[test]
+fn eval_baselines_dir_override_env_var() {
+    use origin_lib::eval::shared::eval_baselines_dir_override;
+
+    // Unset → None.
+    temp_env::with_var("EVAL_BASELINES_DIR", None::<&str>, || {
+        assert_eq!(eval_baselines_dir_override(), None);
+    });
+
+    // Set → Some(PathBuf).
+    let tmp = tempfile::tempdir().unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    temp_env::with_var("EVAL_BASELINES_DIR", Some(&path_str), || {
+        assert_eq!(
+            eval_baselines_dir_override().as_deref(),
+            Some(tmp.path())
+        );
+    });
+
+    // Empty string → None.
+    temp_env::with_var("EVAL_BASELINES_DIR", Some(""), || {
+        assert_eq!(eval_baselines_dir_override(), None);
+    });
+}
