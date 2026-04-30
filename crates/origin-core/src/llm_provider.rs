@@ -148,6 +148,57 @@ struct InferenceRequest {
     response_tx: tokio::sync::oneshot::Sender<Result<String, LlmError>>,
 }
 
+const MAX_LLM_WORKERS: usize = 8;
+const MAX_LLM_PARALLEL_SEQS: usize = 8;
+const DEFAULT_BATCH_COALESCE_MS: u64 = 0;
+const MAX_BATCH_COALESCE_MS: u64 = 25;
+const MIN_CONTINUOUS_BATCH_PROMPT_RESERVE_TOKENS: usize = 256;
+
+fn parse_clamped_usize_env(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn parse_clamped_u64_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn continuous_batch_per_seq_budget(ctx_size: u32, seq_capacity: usize) -> usize {
+    (ctx_size as usize) / seq_capacity.max(1)
+}
+
+fn continuous_batch_eligible(ctx_size: u32, max_tokens: i32, seq_capacity: usize) -> bool {
+    if seq_capacity <= 1 || max_tokens <= 0 {
+        return false;
+    }
+    let per_seq_budget = continuous_batch_per_seq_budget(ctx_size, seq_capacity);
+    let max_tokens = max_tokens as usize;
+
+    // Continuous batching splits one KV context across sequence slots. Keep
+    // high-output synthesis/distillation calls on the single-seq path; they
+    // need the whole context and should not become queue-timing dependent.
+    max_tokens.saturating_add(MIN_CONTINUOUS_BATCH_PROMPT_RESERVE_TOKENS) <= per_seq_budget
+}
+
+fn request_continuous_batch_eligible(req: &InferenceRequest, seq_capacity: usize) -> bool {
+    continuous_batch_eligible(req.ctx_size, req.max_tokens, seq_capacity)
+}
+
+fn context_seq_max_for_batch(batch_len: usize, parallel_seqs: usize) -> u32 {
+    if batch_len > 1 {
+        parallel_seqs.max(1) as u32
+    } else {
+        1
+    }
+}
+
 /// On-device LLM provider that runs inference on a dedicated `std::thread`.
 ///
 /// Construction downloads the model (cached), loads it via Metal GPU, and
@@ -283,19 +334,18 @@ impl OnDeviceProvider {
         //
         // GGML_METAL_NO_RESIDENCY (set above) mitigates Metal command queue
         // exhaustion from multiple simultaneous contexts.
-        let n_workers = std::env::var("ORIGIN_LLM_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 8);
-        let parallel_seqs = std::env::var("ORIGIN_LLM_PARALLEL_SEQS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 8);
+        let n_workers = parse_clamped_usize_env("ORIGIN_LLM_WORKERS", 1, 1, MAX_LLM_WORKERS);
+        let parallel_seqs =
+            parse_clamped_usize_env("ORIGIN_LLM_PARALLEL_SEQS", 1, 1, MAX_LLM_PARALLEL_SEQS);
+        let coalesce_ms = parse_clamped_u64_env(
+            "ORIGIN_LLM_COALESCE_MS",
+            DEFAULT_BATCH_COALESCE_MS,
+            0,
+            MAX_BATCH_COALESCE_MS,
+        );
         log::info!(
             "[on_device_provider] {n_workers} worker(s) x {parallel_seqs} seq(s) each \
-             (max concurrent = {})",
+             (max concurrent = {}, coalesce_ms={coalesce_ms})",
             n_workers * parallel_seqs
         );
 
@@ -317,10 +367,13 @@ impl OnDeviceProvider {
             let engine = Arc::clone(&engine);
             let thread_available = Arc::clone(&available);
             let m = parallel_seqs;
+            let coalesce_wait = std::time::Duration::from_millis(coalesce_ms);
 
             std::thread::Builder::new()
                 .name(format!("llm-provider-worker-{i}"))
                 .spawn(move || {
+                    let mut deferred_reqs: std::collections::VecDeque<InferenceRequest> =
+                        std::collections::VecDeque::new();
                     log::info!(
                         "[on_device_provider] worker {i} thread started (parallel_seqs={m})"
                     );
@@ -331,35 +384,43 @@ impl OnDeviceProvider {
                     // `new_context()` (KV cache allocation + Metal pipeline
                     // rebuild) which was the dominant overhead under serial
                     // inference. If a request arrives with a different
-                    // ctx_size, the context is rebuilt.
+                    // ctx_size or n_seq_max requirement, the context is rebuilt.
                     //
-                    // At M>1 the context is built with n_seq_max=M so the
-                    // continuous-batching scheduler can slot up to M sequences
-                    // simultaneously.
+                    // True multi-request batches use n_seq_max=M so the
+                    // continuous-batching scheduler can slot up to M sequences.
+                    // Singleton requests use n_seq_max=1, including high-output
+                    // synthesis/distillation calls, so they retain the full
+                    // context window.
                     let mut persistent_ctx: Option<llama_cpp_2::context::LlamaContext<'_>> = None;
                     let mut persistent_ctx_size: u32 = 0;
+                    let mut persistent_ctx_seq_max: u32 = 0;
 
                     loop {
                         // Block on the first request, then opportunistically
-                        // pull up to M-1 more if M>1. The first recv() may
-                        // sleep; subsequent try_recv() calls return Empty
-                        // immediately so a single in-flight request is never
-                        // delayed waiting for siblings.
-                        let first_req = match rx_arc.lock().unwrap().recv() {
-                            Ok(r) => r,
-                            Err(_) => break, // channel closed — sender dropped
+                        // pull up to M-1 more if M>1. By default, the follow-up
+                        // drain is immediate so isolated calls do not wait for
+                        // siblings; ORIGIN_LLM_COALESCE_MS can opt into a tiny
+                        // wait for trickle workloads.
+                        let first_req = match deferred_reqs.pop_front() {
+                            Some(r) => r,
+                            None => match rx_arc.lock().unwrap().recv() {
+                                Ok(r) => r,
+                                Err(_) => break, // channel closed — sender dropped
+                            },
                         };
 
                         let mut batch_reqs: Vec<InferenceRequest> = Vec::with_capacity(m);
+                        let batch_eligible = request_continuous_batch_eligible(&first_req, m);
                         batch_reqs.push(first_req);
 
-                        if m > 1 {
+                        if m > 1 && batch_eligible {
                             // Short coalescing window: try to drain up to M-1
-                            // additional pending requests without blocking.
-                            // Bounded by `coalesce_attempts` * `coalesce_sleep`
-                            // so a lone request doesn't sit waiting for siblings.
-                            let coalesce_attempts: u32 = 3;
-                            let coalesce_sleep = std::time::Duration::from_millis(5);
+                            // additional pending requests. By default this is
+                            // an immediate drain (0ms wait) so isolated calls
+                            // pay no artificial latency. Operators can set
+                            // ORIGIN_LLM_COALESCE_MS for trickle workloads.
+                            let coalesce_attempts: u32 =
+                                if coalesce_wait.is_zero() { 1 } else { 3 };
                             for _ in 0..coalesce_attempts {
                                 if batch_reqs.len() >= m {
                                     break;
@@ -369,7 +430,13 @@ impl OnDeviceProvider {
                                     let mut local = Vec::new();
                                     while batch_reqs.len() + local.len() < m {
                                         match rx.try_recv() {
-                                            Ok(r) => local.push(r),
+                                            Ok(r) if request_continuous_batch_eligible(&r, m) => {
+                                                local.push(r)
+                                            }
+                                            Ok(r) => {
+                                                deferred_reqs.push_back(r);
+                                                break;
+                                            }
                                             Err(_) => break,
                                         }
                                     }
@@ -377,8 +444,10 @@ impl OnDeviceProvider {
                                 };
                                 let did_drain = !drained.is_empty();
                                 batch_reqs.extend(drained);
-                                if !did_drain {
-                                    std::thread::sleep(coalesce_sleep);
+                                if !did_drain && !coalesce_wait.is_zero() {
+                                    std::thread::sleep(coalesce_wait);
+                                } else if coalesce_wait.is_zero() {
+                                    break;
                                 }
                             }
                         }
@@ -386,23 +455,25 @@ impl OnDeviceProvider {
                         // The required ctx_size is the max across the batched
                         // requests (callers normally use a single value, but be
                         // defensive). Rebuild context if it changes.
-                        let target_ctx_size = batch_reqs
-                            .iter()
-                            .map(|r| r.ctx_size)
-                            .max()
-                            .unwrap_or(0);
+                        let target_ctx_size =
+                            batch_reqs.iter().map(|r| r.ctx_size).max().unwrap_or(0);
+                        let target_seq_max = context_seq_max_for_batch(batch_reqs.len(), m);
 
-                        if persistent_ctx.is_none() || persistent_ctx_size != target_ctx_size {
+                        if persistent_ctx.is_none()
+                            || persistent_ctx_size != target_ctx_size
+                            || persistent_ctx_seq_max != target_seq_max
+                        {
                             let _ = persistent_ctx.take();
                             persistent_ctx = engine.build_persistent_context_with_seq_max(
                                 target_ctx_size,
-                                m as u32,
+                                target_seq_max,
                             );
                             if persistent_ctx.is_some() {
                                 persistent_ctx_size = target_ctx_size;
+                                persistent_ctx_seq_max = target_seq_max;
                                 log::info!(
                                     "[on_device_provider] worker {i} persistent context built \
-                                     (ctx_size={target_ctx_size}, n_seq_max={m})"
+                                     (ctx_size={target_ctx_size}, n_seq_max={target_seq_max})"
                                 );
                             }
                         }
@@ -412,10 +483,8 @@ impl OnDeviceProvider {
                         // single-request latency must not regress.
                         if m == 1 || batch_reqs.len() == 1 {
                             let req = batch_reqs.pop().expect("batch has at least 1 req");
-                            let full_prompt = format_chatml_prompt(
-                                req.system_prompt.as_deref(),
-                                &req.prompt,
-                            );
+                            let full_prompt =
+                                format_chatml_prompt(req.system_prompt.as_deref(), &req.prompt);
                             let (timeout_secs, strip_think) = match req.timeout_secs {
                                 Some(secs) => (secs, false),
                                 None => (30, true),
@@ -471,32 +540,31 @@ impl OnDeviceProvider {
                         // M>1 with multiple coalesced requests: run continuous
                         // batching. Each request gets a distinct seq_id slot.
                         // Outputs are demultiplexed back to per-request channels.
-                        let prompts: Vec<(String, i32, f32, u64, bool, Option<String>)> = batch_reqs
-                            .iter()
-                            .map(|req| {
-                                let prompt = format_chatml_prompt(
-                                    req.system_prompt.as_deref(),
-                                    &req.prompt,
-                                );
-                                let (timeout_secs, strip_think) = match req.timeout_secs {
-                                    Some(secs) => (secs, false),
-                                    None => (30, true),
-                                };
-                                (
-                                    prompt,
-                                    req.max_tokens,
-                                    req.temperature,
-                                    timeout_secs,
-                                    strip_think,
-                                    req.label.clone(),
-                                )
-                            })
-                            .collect();
+                        let prompts: Vec<(String, i32, f32, u64, bool, Option<String>)> =
+                            batch_reqs
+                                .iter()
+                                .map(|req| {
+                                    let prompt = format_chatml_prompt(
+                                        req.system_prompt.as_deref(),
+                                        &req.prompt,
+                                    );
+                                    let (timeout_secs, strip_think) = match req.timeout_secs {
+                                        Some(secs) => (secs, false),
+                                        None => (30, true),
+                                    };
+                                    (
+                                        prompt,
+                                        req.max_tokens,
+                                        req.temperature,
+                                        timeout_secs,
+                                        strip_think,
+                                        req.label.clone(),
+                                    )
+                                })
+                                .collect();
 
                         let outputs: Vec<Option<String>> = match persistent_ctx.as_mut() {
-                            Some(ctx) => {
-                                engine.run_inference_continuous_batch(ctx, &prompts)
-                            }
+                            Some(ctx) => engine.run_inference_continuous_batch(ctx, &prompts, m),
                             None => {
                                 log::warn!(
                                     "[on_device_provider] worker {i} persistent multi-seq \
@@ -508,8 +576,10 @@ impl OnDeviceProvider {
                                 prompts
                                     .iter()
                                     .zip(batch_reqs.iter())
-                                    .map(|((p, max_t, temp, timeout, _strip, label), req)| {
-                                        match req.timeout_secs {
+                                    .map(
+                                        |((p, max_t, temp, timeout, _strip, label), req)| match req
+                                            .timeout_secs
+                                        {
                                             Some(_) => engine.run_inference_raw(
                                                 p,
                                                 *max_t,
@@ -524,8 +594,8 @@ impl OnDeviceProvider {
                                                 req.ctx_size,
                                                 label.as_deref(),
                                             ),
-                                        }
-                                    })
+                                        },
+                                    )
                                     .collect()
                             }
                         };
@@ -1159,9 +1229,39 @@ mod tests {
             let parsed = input
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1)
-                .clamp(1, 8);
-            assert_eq!(parsed, expected, "input {input:?} should clamp to {expected}");
+                .clamp(1, MAX_LLM_PARALLEL_SEQS);
+            assert_eq!(
+                parsed, expected,
+                "input {input:?} should clamp to {expected}"
+            );
         }
+    }
+
+    #[test]
+    fn test_continuous_batch_eligibility_keeps_long_outputs_single_seq() {
+        // 8K context / 8 seq slots = 1024 tokens per seq. Entity extraction
+        // style calls fit; distillation/chat synthesis calls keep the full
+        // single-seq context instead of being silently budget-truncated.
+        assert!(continuous_batch_eligible(8192, 128, 8));
+        assert!(continuous_batch_eligible(8192, 512, 8));
+        assert!(!continuous_batch_eligible(8192, 1024, 8));
+        assert!(!continuous_batch_eligible(8192, 2048, 8));
+        assert!(!continuous_batch_eligible(8192, 128, 1));
+    }
+
+    #[test]
+    fn test_continuous_batch_budget_uses_configured_capacity() {
+        assert_eq!(continuous_batch_per_seq_budget(8192, 8), 1024);
+        assert_eq!(continuous_batch_per_seq_budget(8192, 4), 2048);
+        assert_eq!(continuous_batch_per_seq_budget(8192, 0), 8192);
+    }
+
+    #[test]
+    fn test_singleton_requests_use_single_seq_context() {
+        assert_eq!(context_seq_max_for_batch(0, 8), 1);
+        assert_eq!(context_seq_max_for_batch(1, 8), 1);
+        assert_eq!(context_seq_max_for_batch(2, 8), 8);
+        assert_eq!(context_seq_max_for_batch(8, 8), 8);
     }
 
     #[test]

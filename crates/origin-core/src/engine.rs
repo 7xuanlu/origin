@@ -591,6 +591,7 @@ impl LlmEngine {
         let mut output = String::new();
         let mut n_cur = batch.n_tokens();
         let max_pos = n_cur + max_output_tokens;
+        let mut failed = false;
 
         while n_cur < max_pos {
             if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
@@ -610,20 +611,35 @@ impl LlmEngine {
 
             match self.model.token_to_piece(token, &mut decoder, true, None) {
                 Ok(piece) => output.push_str(&piece),
-                Err(_) => break,
+                Err(e) => {
+                    log::warn!("[llm_engine] persistent token decode failed: {e}");
+                    failed = true;
+                    break;
+                }
             }
 
             batch.clear();
             if batch.add(token, n_cur, &[0], true).is_err() {
+                failed = true;
                 break;
             }
             if ctx.decode(&mut batch).is_err() {
+                failed = true;
                 break;
             }
             n_cur += 1;
         }
 
         let label_suffix = label.map(|l| format!(" [{}]", l)).unwrap_or_default();
+        if failed {
+            log::warn!(
+                "[llm_engine] persistent inference{} failed after {} partial chars in {:?}",
+                label_suffix,
+                output.len(),
+                start.elapsed()
+            );
+            return None;
+        }
 
         if strip_think {
             let cleaned = strip_think_tags(&output);
@@ -663,10 +679,10 @@ impl LlmEngine {
     /// per-prompt output strings.
     ///
     /// Inputs:
-    /// - `ctx`: a context built with `build_persistent_context_with_seq_max`
-    ///   where `n_seq_max >= prompts.len()`.
+    /// - `ctx`: a context built with `build_persistent_context_with_seq_max`.
     /// - `prompts`: list of (prompt, max_output_tokens, temperature, timeout_secs,
     ///   strip_think, label) tuples — one per sequence.
+    /// - `seq_capacity`: the configured `n_seq_max` for the context.
     ///
     /// Returns a vector aligned with `prompts`: each element is `Some(output)`
     /// if that sequence finished successfully, `None` if it timed out or was
@@ -674,14 +690,15 @@ impl LlmEngine {
     /// entry so previous decodes do not leak into this batch.
     ///
     /// Per-seq budget math: each prompt's token count is capped at
-    /// `(ctx_size / n_seq_max) - max_output_tokens` so the total KV usage
-    /// stays under the context window. Callers should size `ctx_size`
-    /// accordingly (`OnDeviceProvider` does this).
+    /// `(ctx_size / seq_capacity) - max_output_tokens`. This intentionally uses
+    /// configured capacity, not current batch size, so truncation behavior does
+    /// not depend on queue timing.
     #[allow(clippy::type_complexity)]
     pub fn run_inference_continuous_batch(
         &self,
         ctx: &mut LlamaContext<'_>,
         prompts: &[(String, i32, f32, u64, bool, Option<String>)],
+        seq_capacity: usize,
     ) -> Vec<Option<String>> {
         let batch_start = Instant::now();
         let n_seqs = prompts.len();
@@ -693,12 +710,13 @@ impl LlmEngine {
         ctx.clear_kv_cache();
 
         let ctx_size = ctx.n_ctx();
+        let seq_capacity = seq_capacity.max(n_seqs).max(1);
         // Per-seq context budget: divide context window by number of slots,
         // then subtract per-seq output reserve. Defensive saturating math
         // prevents underflow when callers configure aggressive M values.
-        let max_per_seq = (ctx_size as usize) / n_seqs;
+        let max_per_seq = (ctx_size as usize) / seq_capacity;
         log::debug!(
-            "[llm_engine] continuous batch: {n_seqs} seqs, ctx_size={ctx_size}, \
+            "[llm_engine] continuous batch: {n_seqs} seqs, seq_capacity={seq_capacity}, ctx_size={ctx_size}, \
              per-seq budget={max_per_seq}"
         );
 
@@ -709,9 +727,13 @@ impl LlmEngine {
         let mut timeouts: Vec<u64> = Vec::with_capacity(n_seqs);
         let mut strip_think_flags: Vec<bool> = Vec::with_capacity(n_seqs);
         let mut labels: Vec<Option<String>> = Vec::with_capacity(n_seqs);
+        let mut failed: Vec<bool> = vec![false; n_seqs];
 
-        for (prompt, max_out, temp, timeout_secs, strip_think, label) in prompts.iter() {
-            let max_prompt_tokens = max_per_seq.saturating_sub(*max_out as usize);
+        for (seq_id, (prompt, max_out, temp, timeout_secs, strip_think, label)) in
+            prompts.iter().enumerate()
+        {
+            let max_out_usize = (*max_out).max(0) as usize;
+            let max_prompt_tokens = max_per_seq.saturating_sub(max_out_usize);
             if max_prompt_tokens == 0 {
                 log::warn!(
                     "[llm_engine] continuous: max_output_tokens={} >= per-seq budget={}, \
@@ -725,12 +747,14 @@ impl LlmEngine {
                 timeouts.push(*timeout_secs);
                 strip_think_flags.push(*strip_think);
                 labels.push(label.clone());
+                failed[seq_id] = true;
                 continue;
             }
             let tokens = match self.model.str_to_token(prompt, AddBos::Always) {
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!("[llm_engine] continuous tokenize failed: {e}");
+                    failed[seq_id] = true;
                     Vec::new()
                 }
             };
@@ -786,6 +810,7 @@ impl LlmEngine {
                 if let Err(e) = batch.add(*token, i as i32, &[seq_id as i32], is_last) {
                     log::warn!("[llm_engine] continuous prefill batch.add failed: {e}");
                     active[seq_id] = false;
+                    failed[seq_id] = true;
                     break;
                 }
                 if is_last {
@@ -848,6 +873,14 @@ impl LlmEngine {
                         timeouts[seq_id]
                     );
                     active[seq_id] = false;
+                    failed[seq_id] = true;
+                    continue;
+                }
+
+                if logits_idx[seq_id] < 0 {
+                    log::warn!("[llm_engine] continuous seq {seq_id} has no logits row");
+                    active[seq_id] = false;
+                    failed[seq_id] = true;
                     continue;
                 }
 
@@ -870,6 +903,7 @@ impl LlmEngine {
                     Ok(piece) => outputs[seq_id].push_str(&piece),
                     Err(_) => {
                         active[seq_id] = false;
+                        failed[seq_id] = true;
                         continue;
                     }
                 }
@@ -886,6 +920,7 @@ impl LlmEngine {
                         "[llm_engine] continuous decode batch.add failed (seq {seq_id}): {e}"
                     );
                     active[seq_id] = false;
+                    failed[seq_id] = true;
                     continue;
                 }
                 next_logits_idx[seq_id] = batch_pos;
@@ -901,8 +936,11 @@ impl LlmEngine {
             if let Err(e) = ctx.decode(&mut batch) {
                 log::warn!("[llm_engine] continuous decode failed: {e}");
                 // All remaining active seqs are unrecoverable.
-                for s in active.iter_mut() {
-                    *s = false;
+                for (seq_id, is_active) in active.iter_mut().enumerate() {
+                    if *is_active {
+                        failed[seq_id] = true;
+                        *is_active = false;
+                    }
                 }
                 break;
             }
@@ -919,6 +957,22 @@ impl LlmEngine {
         }
 
         // Apply strip_think + trimming per seq, mirroring run_inference_persistent.
+        Self::finalize_continuous_batch_outputs(
+            outputs,
+            &failed,
+            &strip_think_flags,
+            &labels,
+            batch_start,
+        )
+    }
+
+    fn finalize_continuous_batch_outputs(
+        outputs: Vec<String>,
+        failed: &[bool],
+        strip_think_flags: &[bool],
+        labels: &[Option<String>],
+        batch_start: Instant,
+    ) -> Vec<Option<String>> {
         outputs
             .into_iter()
             .enumerate()
@@ -927,6 +981,17 @@ impl LlmEngine {
                     .as_deref()
                     .map(|l| format!(" [{}]", l))
                     .unwrap_or_default();
+
+                if failed.get(seq_id).copied().unwrap_or(false) {
+                    log::warn!(
+                        "[llm_engine] continuous inference{} failed (seq={}, partial_chars={}, batch={:?})",
+                        label_suffix,
+                        seq_id,
+                        raw.len(),
+                        batch_start.elapsed()
+                    );
+                    return None;
+                }
 
                 if strip_think_flags[seq_id] {
                     let cleaned = strip_think_tags(&raw);
@@ -1424,6 +1489,28 @@ mod tests {
             strip_think_tags("<think>a</think>mid<think>b</think>end"),
             "midend"
         );
+    }
+
+    #[test]
+    fn test_finalize_continuous_batch_outputs_marks_failed_partial_none() {
+        let outputs = vec![
+            "partial json".to_string(),
+            "<think>x</think> ok ".to_string(),
+        ];
+        let failed = vec![true, false];
+        let strip = vec![true, true];
+        let labels = vec![Some("failed".to_string()), Some("ok".to_string())];
+
+        let result = LlmEngine::finalize_continuous_batch_outputs(
+            outputs,
+            &failed,
+            &strip,
+            &labels,
+            Instant::now(),
+        );
+
+        assert_eq!(result[0], None);
+        assert_eq!(result[1].as_deref(), Some("ok"));
     }
 
     #[test]
