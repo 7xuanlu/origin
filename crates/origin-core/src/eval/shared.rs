@@ -714,6 +714,9 @@ pub enum EnrichmentMode {
         rotation: usize,
         retries: u32,
         cost_cap_usd: f64,
+        /// Directory for JSONL cache files. Tests pass a tempdir; production
+        /// callers pass the eval baselines directory.
+        cache_dir: PathBuf,
     },
 }
 
@@ -770,9 +773,12 @@ impl EnrichmentMode {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(5.0);
+                let cache_dir: PathBuf = std::env::var("EVAL_ENRICHMENT_CACHE_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("eval/baselines"));
                 eprintln!(
-                    "[enrichment] mode=cli model={} batch_entities={} batch_titles={} rotation={} retries={} cost_cap=${:.2}",
-                    model, batch_entities, batch_titles, rotation, retries, cli_cost_cap
+                    "[enrichment] mode=cli model={} batch_entities={} batch_titles={} rotation={} retries={} cost_cap=${:.2} cache_dir={}",
+                    model, batch_entities, batch_titles, rotation, retries, cli_cost_cap, cache_dir.display()
                 );
                 Ok(Self::Cli {
                     model,
@@ -781,6 +787,7 @@ impl EnrichmentMode {
                     rotation,
                     retries,
                     cost_cap_usd: cli_cost_cap,
+                    cache_dir,
                 })
             }
             _ => {
@@ -838,17 +845,32 @@ pub async fn enrich_db_for_eval(
             rotation,
             retries,
             cost_cap_usd,
+            cache_dir,
         } => {
             // Run entity extraction first (Phase A), then titles (Phase B). They use
             // separate sessions so the schema doesn't switch mid-conversation (the
             // model can drift if entity-schema and title-schema interleave under
             // --resume — same root cause as judge schema drift).
-            let entities =
-                run_entity_extraction_for_eval_cli(db, model, *batch_entities, *rotation, *retries, *cost_cap_usd)
-                    .await?;
-            let titles =
-                run_title_enrichment_for_eval_cli(db, model, *batch_titles, *rotation, *retries, *cost_cap_usd)
-                    .await?;
+            let entities = run_entity_extraction_for_eval_cli(
+                db,
+                model,
+                *batch_entities,
+                *rotation,
+                *retries,
+                *cost_cap_usd,
+                cache_dir,
+            )
+            .await?;
+            let titles = run_title_enrichment_for_eval_cli(
+                db,
+                model,
+                *batch_titles,
+                *rotation,
+                *retries,
+                *cost_cap_usd,
+                cache_dir,
+            )
+            .await?;
             // Concept distillation: not yet ported to CLI. Skip for now; user can
             // separately run on-device or Batch API distillation if needed.
             // TODO: add Cli concept distillation in a follow-up if usage warrants.
@@ -1043,6 +1065,7 @@ fn parse_title_envelope(stdout: &str) -> Option<Vec<(usize, String, String)>> {
 }
 
 /// CLI-batched entity extraction. Batched + --resume + persistence + retry.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_entity_extraction_for_eval_cli(
     db: &MemoryDB,
     model: &str,
@@ -1050,6 +1073,7 @@ pub async fn run_entity_extraction_for_eval_cli(
     rotation_calls: usize,
     max_retries: u32,
     cost_cap_usd: f64,
+    cache_dir: &Path,
 ) -> Result<usize, OriginError> {
     use crate::eval::cli_batch::run_cli_batch_subprocess;
     use std::collections::{HashMap, HashSet};
@@ -1063,8 +1087,7 @@ pub async fn run_entity_extraction_for_eval_cli(
         return Ok(0);
     }
 
-    let cache_path =
-        std::path::PathBuf::from("app/eval/baselines/_enrichment_entities_cli.jsonl");
+    let cache_path = cache_dir.join("_enrichment_entities_cli.jsonl");
 
     // Load cached records.
     let mut cached: HashMap<String, Vec<EntityRecordCli>> = HashMap::new();
@@ -1284,6 +1307,7 @@ pub async fn run_entity_extraction_for_eval_cli(
 }
 
 /// CLI-batched title enrichment. Batched + --resume + persistence + retry.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_title_enrichment_for_eval_cli(
     db: &MemoryDB,
     model: &str,
@@ -1291,6 +1315,7 @@ pub async fn run_title_enrichment_for_eval_cli(
     rotation_calls: usize,
     max_retries: u32,
     cost_cap_usd: f64,
+    cache_dir: &Path,
 ) -> Result<usize, OriginError> {
     use crate::eval::cli_batch::run_cli_batch_subprocess;
     use std::collections::{HashMap, HashSet};
@@ -1303,7 +1328,7 @@ pub async fn run_title_enrichment_for_eval_cli(
         return Ok(0);
     }
 
-    let cache_path = std::path::PathBuf::from("app/eval/baselines/_enrichment_titles_cli.jsonl");
+    let cache_path = cache_dir.join("_enrichment_titles_cli.jsonl");
     let mut cached: HashMap<String, String> = HashMap::new();
     let mut bad_lines = 0usize;
     if cache_path.exists() {

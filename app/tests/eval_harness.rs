@@ -1780,7 +1780,12 @@ async fn generate_fullpipeline_locomo() {
         return;
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let cli_mode = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) => k,
+        Err(_) if cli_mode => String::new(), // CLI path doesn't use the key (Batch API bypassed)
+        Err(_) => panic!("ANTHROPIC_API_KEY required (or set EVAL_PHASE3_CLI=1 for CLI path)"),
+    };
     let answer_model =
         std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
     let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
@@ -1793,8 +1798,8 @@ async fn generate_fullpipeline_locomo() {
     let output_path = baselines.join("fullpipeline_locomo_tuples.json");
 
     eprintln!(
-        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
-        answer_model, cost_cap, output_path,
+        "[fullpipeline] LoCoMo\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}\n  cli_mode: {}",
+        answer_model, cost_cap, output_path, cli_mode,
     );
 
     let enrichment = origin_lib::eval::shared::EnrichmentMode::from_env(&answer_model, cost_cap)
@@ -1831,7 +1836,12 @@ async fn generate_fullpipeline_lme() {
         return;
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let cli_mode = std::env::var("EVAL_PHASE3_CLI").as_deref() == Ok("1");
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) => k,
+        Err(_) if cli_mode => String::new(),
+        Err(_) => panic!("ANTHROPIC_API_KEY required (or set EVAL_PHASE3_CLI=1 for CLI path)"),
+    };
     let answer_model =
         std::env::var("EVAL_ANSWER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
     let cost_cap: f64 = std::env::var("EVAL_COST_CAP")
@@ -1844,8 +1854,8 @@ async fn generate_fullpipeline_lme() {
     let output_path = baselines.join("fullpipeline_lme_tuples.json");
 
     eprintln!(
-        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}",
-        answer_model, cost_cap, output_path,
+        "[fullpipeline] LME\n  model: {}\n  cost cap: ${:.2}\n  output: {:?}\n  cli_mode: {}",
+        answer_model, cost_cap, output_path, cli_mode,
     );
 
     let enrichment = origin_lib::eval::shared::EnrichmentMode::from_env(&answer_model, cost_cap)
@@ -2915,6 +2925,145 @@ async fn smoke_per_scenario_locomo_cli() {
     eprintln!("  CLI enrichment (concurrency=4): ✓");
     eprintln!("  mem={} enriched={}: ✓", mem_count, enriched);
     eprintln!("  retrieval scoped to own conv: ✓");
+}
+
+/// Smoke for new `EnrichmentMode::Cli` (batched + persistent CLI enrichment).
+///
+/// Distinct from `smoke_per_scenario_locomo_cli` above which exercises the
+/// per-memory `OnDevice(ClaudeCliProvider)` route (one subprocess per memory).
+/// This test exercises the new batched route with `--resume`, session rotation,
+/// JSONL persistence, retry, and cost telemetry.
+///
+/// ```bash
+/// EVAL_ENRICHMENT_BATCH_SIZE_ENTITIES=5 EVAL_ENRICHMENT_BATCH_SIZE_TITLES=10 \
+///   cargo test -p origin --test eval_harness smoke_per_scenario_locomo_cli_batched -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn smoke_per_scenario_locomo_cli_batched() {
+    use origin_lib::eval::locomo::{extract_observations, load_locomo};
+    use origin_lib::eval::shared::{
+        eval_shared_embedder, open_or_seed_scenario_db, scenario_db_dir, EnrichmentMode,
+    };
+    use origin_lib::sources::RawDocument;
+
+    let probe = std::process::Command::new("claude").arg("--version").output();
+    match probe {
+        Ok(out) if out.status.success() => {
+            eprintln!(
+                "[smoke-cli-batched] claude binary: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        _ => {
+            eprintln!("SKIP: `claude` binary not in PATH");
+            return;
+        }
+    }
+
+    let locomo_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/data/locomo10.json");
+    if !locomo_path.exists() {
+        eprintln!("SKIP: locomo10.json not found");
+        return;
+    }
+
+    let samples = load_locomo(&locomo_path).unwrap();
+    assert!(!samples.is_empty(), "need at least 1 LoCoMo sample");
+
+    let batch_entities: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE_ENTITIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let batch_titles: usize = std::env::var("EVAL_ENRICHMENT_BATCH_SIZE_TITLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let rotation: usize = std::env::var("EVAL_ENRICHMENT_ROTATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let cost_cap: f64 = std::env::var("EVAL_ENRICHMENT_COST_CAP_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.0);
+    let max_obs: usize = std::env::var("SMOKE_MAX_OBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    let cache_subdir = tempfile::tempdir().unwrap();
+    let enrichment = EnrichmentMode::Cli {
+        model: std::env::var("EVAL_ENRICHMENT_CLI_MODEL").unwrap_or_else(|_| "haiku".into()),
+        batch_entities,
+        batch_titles,
+        rotation,
+        retries: 3,
+        cost_cap_usd: cost_cap,
+        cache_dir: cache_subdir.path().to_path_buf(),
+    };
+    let shared_embedder = eval_shared_embedder();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let baselines_dir = tmp.path().to_path_buf();
+    eprintln!(
+        "[smoke-cli-batched] baselines: {} | batch_entities={} batch_titles={} cost_cap=${:.2} max_obs={}",
+        baselines_dir.display(),
+        batch_entities,
+        batch_titles,
+        cost_cap,
+        max_obs,
+    );
+
+    let sample = &samples[0];
+    let mut memories = extract_observations(sample);
+    memories.truncate(max_obs);
+
+    let scope_dir = scenario_db_dir(&baselines_dir, "locomo", &sample.sample_id);
+    let sample_id = sample.sample_id.clone();
+    let memories_owned = memories.clone();
+    let t0 = std::time::Instant::now();
+
+    let db = open_or_seed_scenario_db(
+        &scope_dir,
+        shared_embedder.clone(),
+        move || {
+            memories_owned
+                .iter()
+                .enumerate()
+                .map(|(i, mem)| RawDocument {
+                    content: mem.content.clone(),
+                    source_id: format!("locomo_{}_obs_{}", sample_id, i),
+                    source: "memory".to_string(),
+                    title: format!("{} session {}", mem.speaker, mem.session_num),
+                    memory_type: Some("fact".to_string()),
+                    domain: Some("conversation".to_string()),
+                    last_modified: chrono::Utc::now().timestamp(),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &enrichment,
+    )
+    .await
+    .expect("open_or_seed_scenario_db CLI batched");
+
+    let elapsed = t0.elapsed().as_secs_f32();
+    let mem_count = db.memory_count().await.unwrap_or(0);
+    let enriched = db.enriched_memory_count().await.unwrap_or(0);
+
+    eprintln!(
+        "[smoke-cli-batched] done in {:.1}s | mem={} enriched={}",
+        elapsed, mem_count, enriched
+    );
+
+    assert!(mem_count > 0);
+    assert_eq!(mem_count, enriched, "should be fully enriched");
+
+    eprintln!(
+        "\n=== smoke_per_scenario_locomo_cli_batched PASSED in {:.1}s ===",
+        elapsed
+    );
 }
 
 /// Manual smoke for LME per-scenario DB refactor (T3).
