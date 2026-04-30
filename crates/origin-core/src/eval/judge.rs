@@ -252,10 +252,7 @@ pub async fn judge_with_claude_model_persistent(
                 match judge_single_tuple_model_with_cost(&tuple, &model).await {
                     Ok((r, cost)) => {
                         if let Some(c) = cost {
-                            cost_us.fetch_add(
-                                (c.cost_usd * 1_000_000.0) as u64,
-                                Ordering::Relaxed,
-                            );
+                            cost_us.fetch_add((c.cost_usd * 1_000_000.0) as u64, Ordering::Relaxed);
                             in_tok.fetch_add(c.input_tokens as usize, Ordering::Relaxed);
                             out_tok.fetch_add(c.output_tokens as usize, Ordering::Relaxed);
                             cc_tok.fetch_add(c.cache_creation_tokens as usize, Ordering::Relaxed);
@@ -611,14 +608,7 @@ async fn run_batch_judge_subprocess(
     prompt: &str,
     model: &str,
     session_id: Option<&str>,
-) -> Result<
-    (
-        Vec<(u8, String)>,
-        Option<JudgeCostInfo>,
-        Option<String>,
-    ),
-    OriginError,
-> {
+) -> Result<(Vec<(u8, String)>, Option<JudgeCostInfo>, Option<String>), OriginError> {
     use crate::eval::cli_batch::run_cli_batch_subprocess;
 
     let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"score":{"type":"integer","enum":[0,1]},"reason":{"type":"string"}},"required":["score","reason"]}}},"required":["results"]}"#;
@@ -730,8 +720,11 @@ pub async fn judge_with_claude_model_batched_persistent(
         }
 
         #[allow(clippy::type_complexity)]
-        let mut batch_result: Option<(Vec<(u8, String)>, Option<JudgeCostInfo>, Option<String>)> =
-            None;
+        let mut batch_result: Option<(
+            Vec<(u8, String)>,
+            Option<JudgeCostInfo>,
+            Option<String>,
+        )> = None;
         let mut last_err: Option<String> = None;
 
         for attempt in 0..=max_retries {

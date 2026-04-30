@@ -937,10 +937,7 @@ fn strict_batch_entity_prompt(memories: &[(String, String)]) -> String {
     ));
     for (i, (mid, content)) in memories.iter().enumerate() {
         let truncated: String = content.chars().take(500).collect();
-        s.push_str(&format!(
-            "[{}] memory_id={}\n{}\n\n",
-            i, mid, truncated
-        ));
+        s.push_str(&format!("[{}] memory_id={}\n{}\n\n", i, mid, truncated));
     }
     s
 }
@@ -958,10 +955,7 @@ fn strict_batch_title_prompt(memories: &[(String, String)]) -> String {
     ));
     for (i, (mid, content)) in memories.iter().enumerate() {
         let truncated: String = content.chars().take(300).collect();
-        s.push_str(&format!(
-            "[{}] memory_id={}\n{}\n\n",
-            i, mid, truncated
-        ));
+        s.push_str(&format!("[{}] memory_id={}\n{}\n\n", i, mid, truncated));
     }
     s
 }
@@ -988,8 +982,10 @@ fn parse_entity_envelope(stdout: &str) -> Option<Vec<(usize, String, Vec<EntityR
                                     .and_then(|x| x.as_str())
                                     .unwrap_or("other")
                                     .to_string();
-                                let confidence =
-                                    e.get("confidence").and_then(|x| x.as_f64()).map(|v| v as f32);
+                                let confidence = e
+                                    .get("confidence")
+                                    .and_then(|x| x.as_f64())
+                                    .map(|v| v as f32);
                                 Some(EntityRecordCli {
                                     name,
                                     entity_type,
@@ -1144,7 +1140,11 @@ pub async fn run_entity_extraction_for_eval_cli(
 
     let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"idx":{"type":"integer"},"memory_id":{"type":"string"},"entities":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"type":{"type":"string"},"confidence":{"type":"number"}},"required":["name","type"]}}},"required":["idx","memory_id","entities"]}}},"required":["results"]}"#;
 
-    let total_batches = if todo.is_empty() { 0 } else { todo.len().div_ceil(batch_size) };
+    let total_batches = if todo.is_empty() {
+        0
+    } else {
+        todo.len().div_ceil(batch_size)
+    };
     let mut session_id: Option<String> = None;
     let mut calls_in_session = 0usize;
     let mut total_cost = 0.0f64;
@@ -1378,7 +1378,11 @@ pub async fn run_title_enrichment_for_eval_cli(
 
     let json_schema = r#"{"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"idx":{"type":"integer"},"memory_id":{"type":"string"},"title":{"type":"string"}},"required":["idx","memory_id","title"]}}},"required":["results"]}"#;
 
-    let total_batches = if todo.is_empty() { 0 } else { todo.len().div_ceil(batch_size) };
+    let total_batches = if todo.is_empty() {
+        0
+    } else {
+        todo.len().div_ceil(batch_size)
+    };
     let mut session_id: Option<String> = None;
     let mut calls_in_session = 0usize;
     let mut total_cost = 0.0f64;
@@ -1455,10 +1459,7 @@ pub async fn run_title_enrichment_for_eval_cli(
         match parsed_opt {
             Some(parsed) => {
                 for (i, (_idx, _claimed_id, title)) in parsed.iter().enumerate() {
-                    let mid = chunk
-                        .get(i)
-                        .map(|t| t.0.clone())
-                        .unwrap_or_default();
+                    let mid = chunk.get(i).map(|t| t.0.clone()).unwrap_or_default();
                     if let Some(file) = cache_file.as_mut() {
                         let rec = TitleCacheRecord {
                             schema_version: ENRICH_SCHEMA_VERSION,

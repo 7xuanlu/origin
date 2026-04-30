@@ -2947,7 +2947,9 @@ async fn smoke_per_scenario_locomo_cli_batched() {
     };
     use origin_lib::sources::RawDocument;
 
-    let probe = std::process::Command::new("claude").arg("--version").output();
+    let probe = std::process::Command::new("claude")
+        .arg("--version")
+        .output();
     match probe {
         Ok(out) if out.status.success() => {
             eprintln!(
