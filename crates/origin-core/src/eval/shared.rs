@@ -774,8 +774,11 @@ impl EnrichmentMode {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(5.0);
                 let cache_dir: PathBuf = std::env::var("EVAL_ENRICHMENT_CACHE_DIR")
+                    .ok()
+                    .filter(|s| !s.is_empty())
                     .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("eval/baselines"));
+                    .or_else(eval_baselines_dir_override)
+                    .unwrap_or_else(|| PathBuf::from("eval/baselines"));
                 eprintln!(
                     "[enrichment] mode=cli model={} batch_entities={} batch_titles={} rotation={} retries={} cost_cap=${:.2} cache_dir={}",
                     model, batch_entities, batch_titles, rotation, retries, cli_cost_cap, cache_dir.display()
