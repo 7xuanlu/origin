@@ -774,8 +774,11 @@ impl EnrichmentMode {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(5.0);
                 let cache_dir: PathBuf = std::env::var("EVAL_ENRICHMENT_CACHE_DIR")
+                    .ok()
+                    .filter(|s| !s.is_empty())
                     .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("eval/baselines"));
+                    .or_else(eval_baselines_dir_override)
+                    .unwrap_or_else(|| PathBuf::from("eval/baselines"));
                 eprintln!(
                     "[enrichment] mode=cli model={} batch_entities={} batch_titles={} rotation={} retries={} cost_cap=${:.2} cache_dir={}",
                     model, batch_entities, batch_titles, rotation, retries, cli_cost_cap, cache_dir.display()
@@ -809,6 +812,30 @@ impl EnrichmentMode {
             }
         }
     }
+}
+
+/// Override for the eval baselines directory. When set, takes precedence over
+/// the per-test default (`{CARGO_MANIFEST_DIR}/eval/baselines`).
+///
+/// Use case: keep the per-scenario DB cache (and chained Phase 1 / Phase 3 / judge
+/// JSONL caches) outside any single worktree so it survives `git worktree remove`
+/// and parallel sessions can share it.
+///
+/// Recommended location: `~/.cache/origin-eval` (XDG-style).
+///
+/// Returns `None` if the variable is unset or empty (an empty string is treated
+/// as unset, since `PathBuf::from("")` resolves to cwd which is rarely intended).
+///
+/// # Example
+/// ```bash
+/// export EVAL_BASELINES_DIR=$HOME/.cache/origin-eval
+/// cargo test -p origin --test eval_harness generate_fullpipeline_locomo -- --ignored
+/// ```
+pub fn eval_baselines_dir_override() -> Option<std::path::PathBuf> {
+    std::env::var("EVAL_BASELINES_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Enrich a freshly-seeded eval DB: entity extraction + title enrichment + concept distillation.

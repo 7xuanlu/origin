@@ -103,6 +103,16 @@ Earlier versions of `.githooks/pre-push` enforced a 90% `cargo llvm-cov` gate. T
 
 The current pre-push runs only clippy + non-instrumented tests. Coverage is L5 (informational on PR) or L7 (manual command on laptop).
 
+### Eval baselines cache
+
+The per-scenario DB cache (Phase 1 enrichment + Phase 3 answer cache + judge JSONLs) lives at `<baselines_dir>/`, where `baselines_dir` defaults to `app/eval/baselines/` per worktree. Override with `EVAL_BASELINES_DIR=<path>` to point at a shared, worktree-agnostic location:
+
+```bash
+export EVAL_BASELINES_DIR=$HOME/.cache/origin-eval
+```
+
+Path must be writable and local (network mounts not recommended). When set, also chains `EVAL_ENRICHMENT_CACHE_DIR` default to the same dir unless explicitly overridden. Migration: `bash scripts/migrate-eval-cache.sh <source-baselines>`.
+
 ## Releasing (release-please)
 
 Releases are automated via [release-please](https://github.com/googleapis/release-please). The workflow runs on every push to `main`.
