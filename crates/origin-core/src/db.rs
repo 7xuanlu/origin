@@ -22757,34 +22757,30 @@ pub(crate) mod tests {
     async fn test_migration_44_backfills_concept_sources_from_json() {
         let (db, _dir) = test_db().await;
 
-        // 1. insert_concept only writes source_memory_ids JSON; no concept_sources row.
+        // 1. Simulate the pre-fix bug: write the concepts row directly, with
+        //    `source_memory_ids` JSON populated but no matching `concept_sources`
+        //    rows. This mirrors the state of any concept that was written by
+        //    insert_concept before the source-side dual-write fix landed.
+        //    (insert_concept now dual-writes; using raw SQL here is the only way
+        //    to reach the legacy state migration 44 is meant to backfill.)
         let now = chrono::Utc::now().to_rfc3339();
-        db.insert_concept(
-            "concept_test_a",
-            "Concept A",
-            Some("summary"),
-            "content",
-            None,
-            None,
-            &["mem-1", "mem-2", "mem-3"],
-            &now,
-        )
-        .await
-        .unwrap();
-        db.insert_concept(
-            "concept_test_b",
-            "Concept B",
-            None,
-            "content",
-            None,
-            None,
-            &["mem-2", "mem-4"],
-            &now,
-        )
-        .await
-        .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            for (id, json) in [
+                ("concept_test_a", r#"["mem-1","mem-2","mem-3"]"#),
+                ("concept_test_b", r#"["mem-2","mem-4"]"#),
+            ] {
+                conn.execute(
+                    "INSERT INTO concepts (id, title, summary, content, source_memory_ids, version, status, created_at, last_compiled, last_modified)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 'active', ?6, ?6, ?6)",
+                    libsql::params![id, "Test", Option::<&str>::None, "content", json, now.as_str()],
+                )
+                .await
+                .unwrap();
+            }
+        }
 
-        // 2. Verify the bug: JSON populated, join table empty for these concepts.
+        // 2. Verify the simulated legacy state: JSON populated, join empty.
         {
             let conn = db.conn.lock().await;
             let mut rows = conn
@@ -22796,7 +22792,10 @@ pub(crate) mod tests {
                 .unwrap();
             let row = rows.next().await.unwrap().unwrap();
             let count: i64 = row.get(0).unwrap();
-            assert_eq!(count, 0, "insert_concept should not write join rows (bug)");
+            assert_eq!(
+                count, 0,
+                "raw INSERT into concepts must not produce concept_sources rows"
+            );
         }
 
         // 3. Roll back user_version below 44 and re-run migrations to fire backfill.
