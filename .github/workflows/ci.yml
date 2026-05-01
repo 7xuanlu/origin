@@ -70,8 +70,21 @@ jobs:
       - name: Run Rust tests (types + server)
         run: cargo test -p origin-types -p origin-server
 
+      # SIGSEGV flake on macos-latest only (not reproduced locally on M-series
+      # in 3 sequential runs; small sample). Confirmed in CI runs 24963231079,
+      # 25093639841, 25150741261/attempt 1 (2026-04-26 -> 2026-04-30). The
+      # process aborts with `signal: 11, SIGSEGV` near the end of the
+      # origin-core db::tests batch, and the test-runner summary line never
+      # prints. Two plausible causes: (a) a concurrent FFI race between tests
+      # in fastembed/ONNX/libsql, or (b) an ONNX runtime atexit handler in
+      # ort 2.0.0-rc.11. The eval path already mitigates (b) via
+      # `std::mem::forget` on the shared embedder (see
+      # crates/origin-core/src/eval/shared.rs:19-33), but the test path uses a
+      # plain `OnceLock`. `--test-threads=1` only addresses (a). Keep until
+      # we either upgrade to a fixed `ort` release or adopt cargo nextest
+      # (process-per-test would cover both causes).
       - name: Run Rust tests (core)
-        run: cargo test -p origin-core
+        run: cargo test -p origin-core -- --test-threads=1
 
       # Eval benchmarks (#[ignore]) — slow embedding-heavy tests, run on main only.
       - name: Run eval benchmarks
