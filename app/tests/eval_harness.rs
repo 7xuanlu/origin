@@ -4090,3 +4090,270 @@ fn eval_baselines_dir_override_env_var() {
         assert_eq!(eval_baselines_dir_override(), None);
     });
 }
+
+/// Re-distill cached LoCoMo per-conversation DBs to populate the new
+/// `concept_sources` join table on DBs built before PR #4.
+///
+/// Pre-conditions:
+/// - 10 cached per-conv DBs exist at `<baselines>/fullpipeline/locomo/conv-*/origin_memory.db`,
+///   where `<baselines>` resolves from `EVAL_BASELINES_DIR` (or defaults to
+///   `app/eval/baselines/`). Each DB has memories + entities populated, no concept_sources.
+/// - `EVAL_ALLOW_WIPE=1` set (defense-in-depth from prior 5901-memory wipe incident).
+/// - On-device LLM available (Metal GPU). Run with sandbox disabled. Cloud
+///   fallback selected via `EVAL_ENRICHMENT=cloud`.
+///
+/// What it does, per DB:
+///   1. Backup → `origin_memory.db.backup_<unix_ts>`.
+///   2. Open via `MemoryDB::new_with_shared_embedder` (no cache check, no re-seed).
+///   3. Delete every existing concept (status active + archived) via the public
+///      `delete_concept` API. concept_sources cascades via FK.
+///   4. Call `refinery::distill_concepts` directly. Cluster threshold honored.
+///   5. Verify: new concepts > 0; first concept has at least one row in
+///      `concept_sources` via `get_concept_sources`.
+///
+/// Run:
+///   EVAL_BASELINES_DIR=/Users/lucian/Repos/origin/.worktrees/eval-per-scenario/app/eval/baselines \
+///     EVAL_ALLOW_WIPE=1 \
+///     cargo test -p origin --test eval_harness redistill_cached_locomo_concepts \
+///       -- --ignored --nocapture
+///
+/// Probe a single conv first to validate the path before running all 10:
+///   EVAL_REDISTILL_CONVS=conv-26 EVAL_BASELINES_DIR=... EVAL_ALLOW_WIPE=1 \
+///     cargo test ... -- --ignored --nocapture
+///
+/// Comma-separated to scope to a subset:
+///   EVAL_REDISTILL_CONVS=conv-26,conv-30 ...
+#[tokio::test]
+#[ignore]
+async fn redistill_cached_locomo_concepts() {
+    use origin_lib::eval::shared::{
+        eval_baselines_dir_override, eval_shared_embedder, EnrichmentMode,
+    };
+    use origin_lib::prompts::PromptRegistry;
+    use origin_lib::tuning::DistillationConfig;
+
+    if std::env::var("EVAL_ALLOW_WIPE").as_deref() != Ok("1") {
+        eprintln!("SKIP: set EVAL_ALLOW_WIPE=1 to permit clearing concepts on cached DBs");
+        return;
+    }
+
+    let baselines = eval_baselines_dir_override().unwrap_or_else(|| {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("eval/baselines")
+    });
+    let locomo_dir = baselines.join("fullpipeline").join("locomo");
+    if !locomo_dir.exists() {
+        eprintln!(
+            "SKIP: {} not found (set EVAL_BASELINES_DIR)",
+            locomo_dir.display()
+        );
+        return;
+    }
+
+    let enrichment = EnrichmentMode::from_env("claude-haiku-4-5-20251001", 1.0)
+        .expect("EnrichmentMode::from_env");
+    let llm = match &enrichment {
+        EnrichmentMode::OnDevice(p) => p.clone(),
+        _ => {
+            eprintln!(
+                "SKIP: redistill requires EnrichmentMode::OnDevice (got {:?}); unset EVAL_ENRICHMENT or set to local",
+                std::any::type_name_of_val(&enrichment)
+            );
+            return;
+        }
+    };
+    if !llm.is_available() {
+        eprintln!("SKIP: on-device LLM unavailable (Metal/ggml init failed)");
+        return;
+    }
+
+    let embedder = eval_shared_embedder();
+    let prompts = PromptRegistry::default();
+    let tuning = DistillationConfig::default();
+
+    // Optional filter: comma-separated conv names (e.g. "conv-26,conv-30")
+    // for scoped probe runs. Unset = process every cached DB.
+    let filter: Option<std::collections::HashSet<String>> = std::env::var("EVAL_REDISTILL_CONVS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        });
+
+    let mut conv_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&locomo_dir)
+        .expect("read locomo dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("origin_memory.db").exists())
+        .filter(
+            |p| match (&filter, p.file_name().and_then(|n| n.to_str())) {
+                (Some(set), Some(name)) => set.contains(name),
+                _ => true,
+            },
+        )
+        .collect();
+    conv_dirs.sort();
+    if conv_dirs.is_empty() {
+        eprintln!(
+            "SKIP: no per-conv DBs found under {} (filter={:?})",
+            locomo_dir.display(),
+            filter
+        );
+        return;
+    }
+    eprintln!(
+        "[redistill] found {} cached LoCoMo conv DBs (filter={:?})",
+        conv_dirs.len(),
+        filter
+    );
+
+    let started = std::time::Instant::now();
+    let ts = chrono::Utc::now().timestamp();
+    let pid = std::process::id();
+
+    // Phase 1: back up every DB BEFORE touching any. Atomic guarantee: if any
+    // backup fails (collision, IO), abort before destruction starts. Refusing
+    // to overwrite an existing backup protects a prior partial run from
+    // losing its recovery copy on re-run within the same second.
+    let mut backups: Vec<std::path::PathBuf> = Vec::with_capacity(conv_dirs.len());
+    for conv_dir in &conv_dirs {
+        let db_file = conv_dir.join("origin_memory.db");
+        let backup = conv_dir.join(format!("origin_memory.db.backup_{}_{}", ts, pid));
+        if backup.exists() {
+            panic!(
+                "refuse to overwrite existing backup: {} (rename or delete the prior backup before retrying)",
+                backup.display()
+            );
+        }
+        std::fs::copy(&db_file, &backup).expect("backup");
+        backups.push(backup);
+    }
+    eprintln!(
+        "[redistill] backed up {} DBs (suffix _{}_{}); to roll back: \
+         for f in <conv>/origin_memory.db.backup_{}_{}; do mv $f ${{f%.backup_*}}; done",
+        backups.len(),
+        ts,
+        pid,
+        ts,
+        pid
+    );
+
+    // Phase 2: per-DB clear + redistill. Failures log and continue (other
+    // DBs unaffected) so one bad conv doesn't strand the rest.
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+    for conv_dir in &conv_dirs {
+        let conv_name = conv_dir.file_name().unwrap().to_string_lossy().to_string();
+        match redistill_one_conv(
+            conv_dir,
+            &conv_name,
+            &llm,
+            &prompts,
+            &tuning,
+            embedder.clone(),
+        )
+        .await
+        {
+            Ok(()) => ok_count += 1,
+            Err(e) => {
+                eprintln!("[redistill] {}: FAILED — {}", conv_name, e);
+                fail_count += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "\n=== redistill_cached_locomo_concepts: {} ok / {} failed in {:.1}s ===",
+        ok_count,
+        fail_count,
+        started.elapsed().as_secs_f32()
+    );
+    assert_eq!(
+        fail_count, 0,
+        "{} conv(s) failed redistill; backups remain at <conv>/origin_memory.db.backup_{}_{}",
+        fail_count, ts, pid
+    );
+}
+
+#[cfg(test)]
+async fn redistill_one_conv(
+    conv_dir: &std::path::Path,
+    conv_name: &str,
+    llm: &std::sync::Arc<dyn origin_lib::llm_provider::LlmProvider>,
+    prompts: &origin_lib::prompts::PromptRegistry,
+    tuning: &origin_lib::tuning::DistillationConfig,
+    embedder: origin_lib::memory_db::SharedEmbedder,
+) -> Result<(), String> {
+    use origin_lib::memory_db::MemoryDB;
+    use origin_lib::refinery::distill_concepts;
+    use std::sync::Arc;
+
+    let emitter: Arc<dyn origin_core::events::EventEmitter> = Arc::new(origin_core::NoopEmitter);
+    let db = MemoryDB::new_with_shared_embedder(conv_dir, emitter, embedder)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+
+    let active = db
+        .list_concepts("active", 100_000, 0)
+        .await
+        .map_err(|e| format!("list_concepts active: {e}"))?;
+    let archived = db
+        .list_concepts("archived", 100_000, 0)
+        .await
+        .map_err(|e| format!("list_concepts archived: {e}"))?;
+    let total_existing = active.len() + archived.len();
+    for c in active.iter().chain(archived.iter()) {
+        db.delete_concept(&c.id)
+            .await
+            .map_err(|e| format!("delete_concept {}: {e}", c.id))?;
+    }
+    eprintln!(
+        "[redistill] {}: cleared {} concepts (active={}, archived={})",
+        conv_name,
+        total_existing,
+        active.len(),
+        archived.len()
+    );
+
+    let conv_t0 = std::time::Instant::now();
+    let created = distill_concepts(&db, Some(llm), prompts, tuning, None)
+        .await
+        .map_err(|e| format!("distill_concepts: {e}"))?;
+    let conv_secs = conv_t0.elapsed().as_secs_f32();
+
+    let new_active = db
+        .list_concepts("active", 100_000, 0)
+        .await
+        .map_err(|e| format!("post list_concepts: {e}"))?;
+    let mut sources_total = 0usize;
+    let mut concepts_with_sources = 0usize;
+    for c in &new_active {
+        let s = db
+            .get_concept_sources(&c.id)
+            .await
+            .map_err(|e| format!("get_concept_sources {}: {e}", c.id))?;
+        sources_total += s.len();
+        if !s.is_empty() {
+            concepts_with_sources += 1;
+        }
+    }
+    eprintln!(
+        "[redistill] {}: created={} active_now={} concept_sources_rows={} ({}/{} concepts have sources) in {:.1}s",
+        conv_name,
+        created,
+        new_active.len(),
+        sources_total,
+        concepts_with_sources,
+        new_active.len(),
+        conv_secs
+    );
+    if !new_active.is_empty() && concepts_with_sources == 0 {
+        return Err(format!(
+            "expected concept_sources rows after redistill (created {} concepts, none have sources)",
+            new_active.len()
+        ));
+    }
+    Ok(())
+}
