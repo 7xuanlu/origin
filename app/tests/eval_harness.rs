@@ -4116,6 +4116,13 @@ fn eval_baselines_dir_override_env_var() {
 ///     EVAL_ALLOW_WIPE=1 \
 ///     cargo test -p origin --test eval_harness redistill_cached_locomo_concepts \
 ///       -- --ignored --nocapture
+///
+/// Probe a single conv first to validate the path before running all 10:
+///   EVAL_REDISTILL_CONVS=conv-26 EVAL_BASELINES_DIR=... EVAL_ALLOW_WIPE=1 \
+///     cargo test ... -- --ignored --nocapture
+///
+/// Comma-separated to scope to a subset:
+///   EVAL_REDISTILL_CONVS=conv-26,conv-30 ...
 #[tokio::test]
 #[ignore]
 async fn redistill_cached_locomo_concepts() {
@@ -4163,20 +4170,43 @@ async fn redistill_cached_locomo_concepts() {
     let prompts = PromptRegistry::default();
     let tuning = DistillationConfig::default();
 
+    // Optional filter: comma-separated conv names (e.g. "conv-26,conv-30")
+    // for scoped probe runs. Unset = process every cached DB.
+    let filter: Option<std::collections::HashSet<String>> = std::env::var("EVAL_REDISTILL_CONVS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        });
+
     let mut conv_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&locomo_dir)
         .expect("read locomo dir")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_dir() && p.join("origin_memory.db").exists())
+        .filter(
+            |p| match (&filter, p.file_name().and_then(|n| n.to_str())) {
+                (Some(set), Some(name)) => set.contains(name),
+                _ => true,
+            },
+        )
         .collect();
     conv_dirs.sort();
     if conv_dirs.is_empty() {
-        eprintln!("SKIP: no per-conv DBs found under {}", locomo_dir.display());
+        eprintln!(
+            "SKIP: no per-conv DBs found under {} (filter={:?})",
+            locomo_dir.display(),
+            filter
+        );
         return;
     }
     eprintln!(
-        "[redistill] found {} cached LoCoMo conv DBs",
-        conv_dirs.len()
+        "[redistill] found {} cached LoCoMo conv DBs (filter={:?})",
+        conv_dirs.len(),
+        filter
     );
 
     let started = std::time::Instant::now();
