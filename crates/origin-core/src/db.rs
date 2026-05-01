@@ -4110,6 +4110,84 @@ impl MemoryDB {
 
                 log::info!("[migration] Migration 43 applied: enrichment_steps table, needs_reembed column, memory_enrichment_summary view");
             }
+
+            // Migration 44: re-run the migration 40 backfill of `concept_sources`
+            // from `source_memory_ids` JSON. Migration 40 only fired the backfill
+            // when the version was below 40, so any concept created later that
+            // went through `insert_concept` (which writes only the JSON column,
+            // not the join row) leaves `concept_sources` empty for that concept.
+            // The eval per-scenario DBs at version 43 with PR #4 distillation are
+            // the concrete trigger: search_concepts dual-path falls back to JSON
+            // today, but anything that depends on the join (cascade delete,
+            // reverse lookup, staleness signals, redistill_changed_concepts)
+            // silently no-ops. INSERT OR IGNORE is idempotent: existing join
+            // rows survive untouched.
+            if version < 44 {
+                let conn = self.conn.lock().await;
+                conn.execute("BEGIN", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m44 begin: {e}")))?;
+
+                let mut rows = conn
+                    .query(
+                        "SELECT id, source_memory_ids, created_at FROM concepts \
+                         WHERE source_memory_ids IS NOT NULL AND source_memory_ids != '[]'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m44 query: {e}")))?;
+
+                let mut backfill_rows: Vec<(String, String, String)> = Vec::new();
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m44 next: {e}")))?
+                {
+                    let concept_id: String = row
+                        .get(0)
+                        .map_err(|e| OriginError::VectorDb(format!("m44 id: {e}")))?;
+                    let json_str: String = row.get(1).unwrap_or_else(|_| "[]".to_string());
+                    let created_at_str: String = row
+                        .get(2)
+                        .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
+                    backfill_rows.push((concept_id, json_str, created_at_str));
+                }
+
+                let mut inserted = 0usize;
+                for (concept_id, json_str, created_at_str) in backfill_rows {
+                    let linked_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                        .map(|dt| dt.timestamp())
+                        .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+                    let source_ids: Vec<String> =
+                        serde_json::from_str(&json_str).unwrap_or_default();
+                    for sid in &source_ids {
+                        let res = conn
+                            .execute(
+                                "INSERT OR IGNORE INTO concept_sources \
+                                 (concept_id, memory_source_id, linked_at, link_reason) \
+                                 VALUES (?1, ?2, ?3, 'm44_backfill')",
+                                libsql::params![concept_id.clone(), sid.clone(), linked_at],
+                            )
+                            .await;
+                        if let Ok(rows) = res {
+                            inserted += rows as usize;
+                        }
+                    }
+                }
+
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m44 commit: {e}")))?;
+
+                conn.execute("PRAGMA user_version = 44", ())
+                    .await
+                    .map_err(|e| OriginError::VectorDb(format!("m44 bump: {e}")))?;
+
+                log::info!(
+                    "[migration] Migration 44 applied: backfilled {} concept_sources rows from source_memory_ids JSON",
+                    inserted
+                );
+            }
         }
 
         Ok(())
@@ -22573,6 +22651,112 @@ pub(crate) mod tests {
         drop(_rows);
 
         drop(conn);
+    }
+
+    #[tokio::test]
+    async fn test_migration_44_backfills_concept_sources_from_json() {
+        let (db, _dir) = test_db().await;
+
+        // 1. insert_concept only writes source_memory_ids JSON; no concept_sources row.
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_concept(
+            "concept_test_a",
+            "Concept A",
+            Some("summary"),
+            "content",
+            None,
+            None,
+            &["mem-1", "mem-2", "mem-3"],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.insert_concept(
+            "concept_test_b",
+            "Concept B",
+            None,
+            "content",
+            None,
+            None,
+            &["mem-2", "mem-4"],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // 2. Verify the bug: JSON populated, join table empty for these concepts.
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT count(*) FROM concept_sources WHERE concept_id IN ('concept_test_a','concept_test_b')",
+                    (),
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            let count: i64 = row.get(0).unwrap();
+            assert_eq!(count, 0, "insert_concept should not write join rows (bug)");
+        }
+
+        // 3. Roll back user_version below 44 and re-run migrations to fire backfill.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("PRAGMA user_version = 43", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .unwrap();
+
+        // 4. Backfill ran: every JSON id is now a join row.
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT concept_id, memory_source_id FROM concept_sources \
+                     WHERE concept_id IN ('concept_test_a','concept_test_b') \
+                     ORDER BY concept_id, memory_source_id",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut got: Vec<(String, String)> = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                got.push((row.get(0).unwrap(), row.get(1).unwrap()));
+            }
+            assert_eq!(
+                got,
+                vec![
+                    ("concept_test_a".into(), "mem-1".into()),
+                    ("concept_test_a".into(), "mem-2".into()),
+                    ("concept_test_a".into(), "mem-3".into()),
+                    ("concept_test_b".into(), "mem-2".into()),
+                    ("concept_test_b".into(), "mem-4".into()),
+                ]
+            );
+        }
+
+        // 5. Idempotent: rolling back + re-running again must not duplicate or error.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("PRAGMA user_version = 43", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT count(*) FROM concept_sources WHERE concept_id IN ('concept_test_a','concept_test_b')",
+                    (),
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            let count: i64 = row.get(0).unwrap();
+            assert_eq!(count, 5, "INSERT OR IGNORE preserves existing rows");
+        }
     }
 
     #[tokio::test]
