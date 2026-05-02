@@ -162,14 +162,39 @@ pub fn run() {
                 };
 
                 if !user_opted_out() {
-                    let needs_install = !app_plist_path()
-                        .map(|p| p.exists())
-                        .unwrap_or(false)
-                        || !server_plist_path()
-                            .map(|p| p.exists())
-                            .unwrap_or(false);
+                    // Detect: missing plists OR plist path mismatch (e.g., app moved)
+                    let exe_canonical = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| std::fs::canonicalize(&p).ok());
 
-                    if needs_install {
+                    let app_plist_stale = app_plist_path()
+                        .ok()
+                        .and_then(|p| std::fs::read_to_string(&p).ok())
+                        .map(|content| {
+                            if let Some(exe) = &exe_canonical {
+                                !content.contains(exe.to_string_lossy().as_ref())
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(true); // missing plist = stale
+
+                    let server_plist_stale = server_plist_path()
+                        .ok()
+                        .and_then(|p| std::fs::read_to_string(&p).ok())
+                        .map(|content| {
+                            if let Some(exe) = &exe_canonical {
+                                let expected_server = exe.parent()
+                                    .map(|p| p.join("origin-server").to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                !content.contains(&expected_server)
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(true);
+
+                    if app_plist_stale || server_plist_stale {
                         let launchctl = SystemLaunchctl;
                         // Best-effort; failures fall through to fallback mode (existing
                         // sidecar spawn at the bottom of setup()).
