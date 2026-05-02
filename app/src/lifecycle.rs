@@ -198,6 +198,18 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
         return Ok(());
     }
 
+    // Spec lifecycle invariant #4: "Quit Origin = full off; both plists
+    // unloaded, both processes exit, no auto-restart on reboot." (H2)
+    // Order matters: uninstall plists FIRST so launchd won't respawn after
+    // the daemon dies, then shut the daemon down cleanly.
+    let launchctl = SystemLaunchctl;
+    if let Err(e) = uninstall_app_plist(&launchctl) {
+        log::warn!("[quit] uninstall_app_plist failed: {e}");
+    }
+    if let Err(e) = uninstall_server_plist_via_subprocess() {
+        log::warn!("[quit] uninstall_server_plist failed: {e}");
+    }
+
     // 1. Tell daemon to shut down cleanly
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -210,8 +222,7 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
     // 2. Wait briefly for daemon to flush
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // 3. Tauri-graceful exit. KeepAlive.SuccessfulExit=false means
-    //    launchd does NOT respawn after clean exit.
+    // 3. Tauri-graceful exit.
     app_handle.exit(0);
     Ok(())
 }
@@ -409,5 +420,18 @@ mod tests {
         );
         // Cleanup so other tests start fresh.
         reset_quitting_flag_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn uninstall_app_plist_is_idempotent_when_file_absent() {
+        // H2: Quit Origin calls uninstall_app_plist; the sequence must be
+        // idempotent because the plist may already have been removed by an
+        // earlier toggle.
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let mock = MockLaunchctl::default();
+        // No file present → succeed without error.
+        uninstall_app_plist(&mock).unwrap();
     }
 }
