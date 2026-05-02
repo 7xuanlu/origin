@@ -113,7 +113,15 @@ pub fn run() {
 
     let app_state = AppState::new();
 
-    let builder = tauri::Builder::default();
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }));
 
     #[cfg(debug_assertions)]
     let builder = builder.plugin(tauri_plugin_mcp::init_with_config(
