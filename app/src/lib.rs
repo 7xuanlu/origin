@@ -157,6 +157,26 @@ pub fn run() {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
 
+            // Tray-app pattern: red-X on the main window hides instead of closing.
+            // Without this handler the default Tauri close-button behavior destroys
+            // the window, after which the tray "Show" menu's get_webview_window
+            // returns None and silently no-ops — leaving a tray icon with no way
+            // to bring the window back. prevent_close + hide() keeps the window
+            // alive (cheap — it's just hidden), so subsequent show()+set_focus()
+            // calls from the tray work.
+            {
+                use tauri::{Manager, WindowEvent};
+                if let Some(main_window) = app.get_webview_window("main") {
+                    let win = main_window.clone();
+                    main_window.on_window_event(move |event| {
+                        if let WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = win.hide();
+                        }
+                    });
+                }
+            }
+
             // First-run silent install — H6: run on a blocking task so we
             // don't block setup() (which delays Tauri start by hundreds of ms).
             {
