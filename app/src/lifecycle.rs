@@ -69,9 +69,96 @@ pub fn set_user_opted_out(opted_out: bool) -> Result<()> {
     Ok(())
 }
 
+fn home_dir() -> Result<PathBuf> {
+    dirs::home_dir().context("HOME not set")
+}
+
+pub fn app_plist_path() -> Result<PathBuf> {
+    Ok(home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", APP_PLIST_LABEL)))
+}
+
+pub fn server_plist_path() -> Result<PathBuf> {
+    Ok(home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", SERVER_PLIST_LABEL)))
+}
+
+fn log_dir() -> Result<PathBuf> {
+    Ok(dirs::data_local_dir()
+        .context("data_local_dir unavailable")?
+        .join("origin")
+        .join("logs"))
+}
+
+fn current_app_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    std::fs::canonicalize(&exe).context("canonicalize current_exe")
+}
+
+pub fn install_app_plist(launchctl: &dyn LaunchctlExec) -> Result<()> {
+    let plist = app_plist_path()?;
+    let logs = log_dir()?;
+    std::fs::create_dir_all(&logs)?;
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let app_path = current_app_path()?;
+    let content = APP_PLIST_TEMPLATE
+        .replace("__ORIGIN_APP_PATH__", &app_path.to_string_lossy())
+        .replace("__LOG_PATH__", &logs.to_string_lossy());
+
+    if plist.exists() {
+        let _ = launchctl.run(&["unload", &plist.to_string_lossy()]);
+    }
+    std::fs::write(&plist, content)?;
+
+    let out = launchctl.run(&["load", &plist.to_string_lossy()])?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "launchctl load failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub fn uninstall_app_plist(launchctl: &dyn LaunchctlExec) -> Result<()> {
+    let plist = app_plist_path()?;
+    if !plist.exists() {
+        return Ok(());
+    }
+    let _ = launchctl.run(&["unload", &plist.to_string_lossy()]);
+    std::fs::remove_file(&plist)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockLaunchctl {
+        calls: Mutex<Vec<Vec<String>>>,
+        next_status: Mutex<i32>,
+    }
+    impl LaunchctlExec for MockLaunchctl {
+        fn run(&self, args: &[&str]) -> io::Result<Output> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(*self.next_status.lock().unwrap()),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
 
     #[test]
     fn opt_out_flag_round_trip() {
@@ -89,5 +176,44 @@ mod tests {
         // Set false → readback false
         set_user_opted_out(false).unwrap();
         assert!(!user_opted_out());
+    }
+
+    #[test]
+    fn install_app_plist_writes_file_and_calls_launchctl_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let mock = MockLaunchctl::default();
+        install_app_plist(&mock).unwrap();
+
+        let plist = tmp
+            .path()
+            .join("Library/LaunchAgents/com.origin.desktop.plist");
+        assert!(plist.exists(), "plist file written");
+        let content = std::fs::read_to_string(&plist).unwrap();
+        assert!(content.contains("<key>Label</key>"));
+        assert!(
+            !content.contains("__ORIGIN_APP_PATH__"),
+            "placeholder substituted"
+        );
+
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c[0] == "load"));
+    }
+
+    #[test]
+    fn uninstall_app_plist_removes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let plist_dir = tmp.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&plist_dir).unwrap();
+        let plist = plist_dir.join("com.origin.desktop.plist");
+        std::fs::write(&plist, "<plist/>").unwrap();
+
+        let mock = MockLaunchctl::default();
+        uninstall_app_plist(&mock).unwrap();
+
+        assert!(!plist.exists(), "plist file removed");
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c[0] == "unload"));
     }
 }
