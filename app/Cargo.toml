@@ -18,7 +18,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Tauri
-tauri = { version = "2", features = ["protocol-asset", "tray-icon", "macos-private-api"] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "macos-private-api", "image-png"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-clipboard-x = "2"
 tauri-plugin-fs = "2"

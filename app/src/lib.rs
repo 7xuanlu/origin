@@ -16,6 +16,9 @@ mod search;
 mod sensor;
 pub mod sources;
 pub mod state;
+// Public surface consumed by tray_menu (Task 15); suppress dead_code until then.
+#[allow(dead_code)]
+pub(crate) mod tray_health;
 mod trigger;
 mod updater;
 
