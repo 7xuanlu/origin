@@ -6,8 +6,13 @@ use anyhow::{Context, Result};
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::AppHandle;
+
+/// Process-wide guard that prevents `quit_origin` from running twice. Set on
+/// first entry; never cleared (the process is exiting).
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 pub const SERVER_PLIST_LABEL: &str = "com.origin.server";
 pub const APP_PLIST_LABEL: &str = "com.origin.desktop";
@@ -187,6 +192,12 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
 }
 
 pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
+    // Debounce: tray menu Quit Origin item stays clickable during the 500ms
+    // shutdown sleep; double-click would otherwise spawn 2× POSTs (H1).
+    if QUITTING.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+
     // 1. Tell daemon to shut down cleanly
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -203,6 +214,18 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
     //    launchd does NOT respawn after clean exit.
     app_handle.exit(0);
     Ok(())
+}
+
+/// Test-only — checks the debounce flag without invoking the full quit flow
+/// (which needs a real `AppHandle`).
+#[cfg(test)]
+pub(crate) fn try_begin_quit() -> bool {
+    !QUITTING.swap(true, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_quitting_flag_for_test() {
+    QUITTING.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -369,5 +392,22 @@ mod tests {
         }
         let only_server = MockListed(format!("123\t0\t{}\n", SERVER_PLIST_LABEL));
         assert!(!is_run_at_login_enabled(&only_server));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn quit_origin_debounces_concurrent_calls() {
+        // H1: tray menu Quit Origin item stays clickable during the 500ms
+        // shutdown sleep — second click must not re-enter the shutdown flow.
+        reset_quitting_flag_for_test();
+        // First call wins — flag flips to true.
+        assert!(try_begin_quit(), "first call should be allowed to proceed");
+        // Second call is rejected — flag is already true.
+        assert!(
+            !try_begin_quit(),
+            "second concurrent call should be rejected"
+        );
+        // Cleanup so other tests start fresh.
+        reset_quitting_flag_for_test();
     }
 }
