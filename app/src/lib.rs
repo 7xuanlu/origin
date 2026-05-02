@@ -8,6 +8,7 @@ mod ambient;
 pub mod api;
 pub mod events;
 mod indexer;
+mod lifecycle;
 pub mod mcp_config;
 pub mod remote_access;
 mod router;
