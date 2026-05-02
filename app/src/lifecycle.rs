@@ -166,6 +166,32 @@ pub fn uninstall_server_plist_via_subprocess() -> Result<()> {
     Ok(())
 }
 
+/// Returns true iff BOTH plists are loaded in launchctl.
+pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
+    let out = match launchctl.run(&["list"]) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let server = stdout.lines().any(|l| l.contains(SERVER_PLIST_LABEL));
+    let app = stdout.lines().any(|l| l.contains(APP_PLIST_LABEL));
+    server && app
+}
+
+/// Toggle "Run at login". Mutex-guarded at the caller via app state.
+pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> Result<()> {
+    if enabled {
+        set_user_opted_out(false)?;
+        install_server_plist_via_subprocess()?;
+        install_app_plist(launchctl)?;
+    } else {
+        set_user_opted_out(true)?;
+        uninstall_app_plist(launchctl)?;
+        uninstall_server_plist_via_subprocess()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +272,44 @@ mod tests {
         assert!(!plist.exists(), "plist file removed");
         let calls = mock.calls.lock().unwrap();
         assert!(calls.iter().any(|c| c[0] == "unload"));
+    }
+
+    #[test]
+    fn is_run_at_login_enabled_returns_true_when_both_labels_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+
+        struct MockListed(String);
+        impl LaunchctlExec for MockListed {
+            fn run(&self, _args: &[&str]) -> io::Result<Output> {
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: self.0.as_bytes().to_vec(),
+                    stderr: vec![],
+                })
+            }
+        }
+        let label_line = format!(
+            "123\t0\t{}\n456\t0\t{}\n",
+            SERVER_PLIST_LABEL, APP_PLIST_LABEL
+        );
+        let listed = MockListed(label_line);
+        assert!(is_run_at_login_enabled(&listed));
+    }
+
+    #[test]
+    fn is_run_at_login_enabled_returns_false_when_one_missing() {
+        struct MockListed(String);
+        impl LaunchctlExec for MockListed {
+            fn run(&self, _args: &[&str]) -> io::Result<Output> {
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: self.0.as_bytes().to_vec(),
+                    stderr: vec![],
+                })
+            }
+        }
+        let only_server = MockListed(format!("123\t0\t{}\n", SERVER_PLIST_LABEL));
+        assert!(!is_run_at_login_enabled(&only_server));
     }
 }
