@@ -787,6 +787,16 @@ pub async fn handle_recent_concepts(
     Ok(Json(items))
 }
 
+/// POST /api/shutdown — exits the daemon process cleanly.
+/// Returns 200 OK, then exits 0 after a brief delay so the response is delivered.
+pub async fn handle_shutdown() -> &'static str {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(0);
+    });
+    "shutting down"
+}
+
 #[cfg(test)]
 mod recent_endpoints_tests {
     use axum::body::Body;

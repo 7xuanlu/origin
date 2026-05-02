@@ -18,7 +18,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Tauri
-tauri = { version = "2", features = ["protocol-asset", "tray-icon", "macos-private-api"] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "macos-private-api", "image-png"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-clipboard-x = "2"
 tauri-plugin-fs = "2"
@@ -26,6 +26,7 @@ tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
 
 # Dev-only: gives Claude Code / MCP clients control over the running app
 # (screenshots, DOM, click/type). Excluded from release builds via debug_assertions.
@@ -83,6 +84,7 @@ origin-core = { workspace = true }
 
 [dev-dependencies]
 temp-env = { version = "0.3", features = ["async_closure"] }
+serial_test = "3"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy", "closed-core-eval"))'] }

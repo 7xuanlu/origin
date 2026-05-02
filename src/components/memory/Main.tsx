@@ -298,7 +298,7 @@ export default function Main({ initialMemoryId, initialView, onBackFromDetail }:
         {view.kind === "settings" ? (
           <SettingsSidebar
             collapsed={sidebarCollapsed}
-            active={view.section ?? "intelligence"}
+            active={view.section ?? "general"}
             onSelect={(section) => setView({ kind: "settings", section })}
             onNavigateHome={() => {
               setView({ kind: "home" });
@@ -454,7 +454,7 @@ export default function Main({ initialMemoryId, initialView, onBackFromDetail }:
             />
           ) : view.kind === "settings" ? (
             <SettingsPage
-              section={view.section ?? "intelligence"}
+              section={view.section ?? "general"}
               onBack={navigateBack}
               onSetupAgent={() => navigateTo({ kind: "connect-agent" })}
               onImport={() => navigateTo({ kind: "import" })}

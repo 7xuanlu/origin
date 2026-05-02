@@ -8,6 +8,7 @@ mod ambient;
 pub mod api;
 pub mod events;
 mod indexer;
+mod lifecycle;
 pub mod mcp_config;
 pub mod remote_access;
 mod router;
@@ -15,6 +16,9 @@ mod search;
 mod sensor;
 pub mod sources;
 pub mod state;
+// Public surface consumed by tray_menu (Task 15); suppress dead_code until then.
+#[allow(dead_code)]
+pub(crate) mod tray_health;
 mod trigger;
 mod updater;
 
@@ -113,7 +117,15 @@ pub fn run() {
 
     let app_state = AppState::new();
 
-    let builder = tauri::Builder::default();
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }));
 
     #[cfg(debug_assertions)]
     let builder = builder.plugin(tauri_plugin_mcp::init_with_config(
@@ -136,6 +148,63 @@ pub fn run() {
         )))
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Hide Dock icon at runtime (belt-and-suspenders with Info.plist LSUIElement).
+            // Info.plist LSUIElement=true suppresses the icon before the process starts;
+            // this call ensures it stays hidden even if Tauri ever resets the policy.
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
+            // Tray-app pattern: red-X on the main window hides instead of closing.
+            // Without this handler the default Tauri close-button behavior destroys
+            // the window, after which the tray "Show" menu's get_webview_window
+            // returns None and silently no-ops — leaving a tray icon with no way
+            // to bring the window back. prevent_close + hide() keeps the window
+            // alive (cheap — it's just hidden), so subsequent show()+set_focus()
+            // calls from the tray work.
+            {
+                use tauri::{Manager, WindowEvent};
+                if let Some(main_window) = app.get_webview_window("main") {
+                    let win = main_window.clone();
+                    main_window.on_window_event(move |event| {
+                        if let WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = win.hide();
+                        }
+                    });
+                }
+            }
+
+            // First-run silent install — H6: run on a blocking task so we
+            // don't block setup() (which delays Tauri start by hundreds of ms).
+            {
+                use tauri::Emitter;
+                let install_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = tauri::async_runtime::spawn_blocking(|| {
+                        let launchctl = crate::lifecycle::SystemLaunchctl;
+                        crate::lifecycle::first_run_install_if_needed(&launchctl)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {
+                            log::info!("[first-run] plist install ok or unnecessary");
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!(
+                                "[first-run] plist install failed, fallback mode: {e}"
+                            );
+                            let _ = install_handle.emit("origin-fallback-mode", ());
+                        }
+                        Err(e) => {
+                            log::warn!("[first-run] install task join error: {e}");
+                            let _ = install_handle.emit("origin-fallback-mode", ());
+                        }
+                    }
+                });
+            }
 
             // Configure macOS window: rounded corners, hide traffic lights, set bg color
             #[cfg(target_os = "macos")]
@@ -613,25 +682,61 @@ pub fn run() {
                 )?;
             }
 
-            // Tray icon: left-click toggles window, right-click menu with Show/Quit
+            // Tray icon: left-click toggles window, right-click menu with Show / Status / Quit
             {
-                use tauri::Manager;
                 use tauri::menu::{MenuBuilder, MenuItemBuilder};
                 use tauri::tray::TrayIconEvent;
+                use tauri::Manager;
 
                 let show_item = MenuItemBuilder::with_id("show", "Show Origin").build(app)?;
+                let status_item = MenuItemBuilder::with_id("status", "Status: Starting…")
+                    .enabled(false)
+                    .build(app)?;
                 let quit_item = MenuItemBuilder::with_id("quit", "Quit Origin").build(app)?;
                 let tray_menu = MenuBuilder::new(app)
                     .item(&show_item)
                     .separator()
+                    .item(&status_item)
+                    .separator()
                     .item(&quit_item)
                     .build()?;
 
-                let tray = app.tray_by_id("main").or_else(|| {
-                    app.tray_by_id("default")
-                });
+                let tray = app
+                    .tray_by_id("main")
+                    .or_else(|| app.tray_by_id("default"));
                 if let Some(tray) = tray {
                     let _ = tray.set_menu(Some(tray_menu));
+
+                    // Spawn health poller; it updates the icon as state changes.
+                    let signal = crate::tray_health::spawn_poller(handle.clone());
+
+                    // Periodically refresh the status label from the signal.
+                    {
+                        let status_item = status_item.clone();
+                        let sig = signal.clone();
+                        tauri::async_runtime::spawn(async move {
+                            loop {
+                                let label = match sig.current() {
+                                    crate::tray_health::DaemonState::Up => {
+                                        "Status: Up".to_string()
+                                    }
+                                    crate::tray_health::DaemonState::Starting => {
+                                        "Status: Starting…".to_string()
+                                    }
+                                    crate::tray_health::DaemonState::Down => {
+                                        let n = sig.consecutive_down_count();
+                                        if n >= 3 {
+                                            format!("Status: Down ({}s)", n as u32 * 5)
+                                        } else {
+                                            "Status: Down".to_string()
+                                        }
+                                    }
+                                };
+                                let _ = status_item.set_text(&label);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        });
+                    }
 
                     let handle_for_tray = handle.clone();
                     tray.on_tray_icon_event(move |_tray, event| {
@@ -650,19 +755,23 @@ pub fn run() {
                     });
 
                     let handle_for_menu = handle.clone();
-                    tray.on_menu_event(move |_tray, event| {
-                        match event.id().as_ref() {
-                            "show" => {
-                                if let Some(win) = handle_for_menu.get_webview_window("main") {
-                                    let _ = win.show();
-                                    let _ = win.set_focus();
-                                }
+                    tray.on_menu_event(move |_tray, event| match event.id().as_ref() {
+                        "show" => {
+                            if let Some(win) = handle_for_menu.get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.set_focus();
                             }
-                            "quit" => {
-                                std::process::exit(0);
-                            }
-                            _ => {}
                         }
+                        "quit" => {
+                            let h = handle_for_menu.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = crate::lifecycle::quit_origin(&h).await {
+                                    log::error!("[tray] quit_origin failed: {e}");
+                                    h.exit(1);
+                                }
+                            });
+                        }
+                        _ => {}
                     });
                 }
             }
@@ -670,7 +779,24 @@ pub fn run() {
             // Launch origin-server daemon as a sidecar process.
             // If a daemon is already running on the port, the sidecar exits cleanly.
             // The shell plugin kills the child when the Tauri app exits.
-            {
+            //
+            // Skip the sidecar entirely when launchd is managing the daemon
+            // (i.e. com.origin.server.plist is on disk). Otherwise app's
+            // sidecar wins the port race against launchd's daemon, which then
+            // exits 0 ("Existing healthy daemon"), gets marked successful by
+            // KeepAlive.SuccessfulExit=false, and refuses to respawn — so a
+            // later kill of the sidecar leaves no daemon at all. The fallback
+            // path (no plist on disk) is still useful for first-run before the
+            // first-run install runs and for dev environments without launchd.
+            let launchd_managed = dirs::home_dir()
+                .map(|h| h.join("Library/LaunchAgents/com.origin.server.plist"))
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if launchd_managed {
+                log::info!(
+                    "[init] launchd-managed daemon detected, skipping sidecar spawn"
+                );
+            } else {
                 use tauri_plugin_shell::ShellExt;
                 match app.shell().sidecar("origin-server") {
                     Ok(sidecar) => match sidecar.spawn() {
@@ -1003,6 +1129,10 @@ pub fn run() {
             // On-device model commands
             search::get_on_device_model,
             search::download_on_device_model,
+            // Lifecycle commands
+            search::is_run_at_login_enabled,
+            search::set_run_at_login,
+            search::quit_origin_full,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -7,11 +7,11 @@
 // different layout loaded".
 
 export type SettingsSection =
-  | "appearance"
   | "capture"
   | "sources"
   | "agents"
-  | "intelligence";
+  | "intelligence"
+  | "general";
 
 export interface SettingsGroup {
   id: SettingsSection;
@@ -32,6 +32,17 @@ export interface SettingsGroup {
  * stacking them as siblings was just noise.
  */
 export const SETTINGS_GROUPS: SettingsGroup[] = [
+  {
+    id: "general",
+    label: "General",
+    hint: "Startup and background behavior",
+    icon: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="3" />
+        <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" />
+      </svg>
+    ),
+  },
   {
     id: "intelligence",
     label: "Intelligence",
@@ -62,16 +73,6 @@ export const SETTINGS_GROUPS: SettingsGroup[] = [
         <ellipse cx="12" cy="5" rx="9" ry="3" />
         <path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5" />
         <path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3" />
-      </svg>
-    ),
-  },
-  {
-    id: "appearance",
-    label: "Appearance",
-    hint: "Theme and display",
-    icon: (
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01" />
       </svg>
     ),
   },
