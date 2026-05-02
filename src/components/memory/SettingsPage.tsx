@@ -217,7 +217,7 @@ interface SettingsPageProps {
 }
 
 export default function SettingsPage({
-  section = "intelligence",
+  section = "general",
   onBack,
   onSetupAgent,
   onImport,
