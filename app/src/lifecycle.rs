@@ -135,6 +135,37 @@ pub fn uninstall_app_plist(launchctl: &dyn LaunchctlExec) -> Result<()> {
     Ok(())
 }
 
+/// Run `origin-server install`. Resolves the binary alongside our exe.
+pub fn install_server_plist_via_subprocess() -> Result<()> {
+    let bin = current_app_path()?
+        .parent()
+        .context("no parent dir")?
+        .join("origin-server");
+    let out = Command::new(&bin).arg("install").output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "origin-server install failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub fn uninstall_server_plist_via_subprocess() -> Result<()> {
+    let bin = current_app_path()?
+        .parent()
+        .context("no parent dir")?
+        .join("origin-server");
+    let out = Command::new(&bin).arg("uninstall").output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "origin-server uninstall failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
