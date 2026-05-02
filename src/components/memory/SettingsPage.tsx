@@ -10,6 +10,8 @@ import {
   deleteAgent,
   detectMcpClients,
   setSetupCompleted,
+  isRunAtLoginEnabled,
+  setRunAtLogin,
 } from "../../lib/tauri";
 import { type Theme, useTheme } from "../../lib/theme";
 import { describeTrustLevel, resolveAgentDisplayName, TRUST_LEVELS } from "../../lib/agents";
@@ -311,7 +313,15 @@ export default function SettingsPage({
     refetchInterval: 5000,
   });
 
-
+  // ── Run at login ───────────────────────────────────────────────────
+  const runAtLoginQuery = useQuery({
+    queryKey: ["runAtLogin"],
+    queryFn: isRunAtLoginEnabled,
+  });
+  const runAtLoginMutation = useMutation({
+    mutationFn: setRunAtLogin,
+    onSuccess: () => runAtLoginQuery.refetch(),
+  });
 
   // Filters removed — legacy ambient capture, hidden from UI
 
@@ -411,6 +421,24 @@ export default function SettingsPage({
               </div>
             </div>
           </div>
+        </div>
+      </section>
+      )}
+
+      {/* ── General ─────────────────────────────────────────────── */}
+      {section === "general" && (
+      <section className="mem-fade-up" style={{ animationDelay: "0ms" }}>
+        <SectionHeader
+          label="General"
+          icon={<svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" /></svg>}
+        />
+        <div className="bg-[var(--mem-surface)] rounded-xl overflow-hidden border border-[var(--mem-border)]">
+          <SettingRow
+            title="Run Origin in background at login"
+            description="Keeps the daemon and tray icon running even when the app window is closed. Quit from the tray menu to stop everything."
+            enabled={runAtLoginQuery.data ?? false}
+            onToggle={() => runAtLoginMutation.mutate(!(runAtLoginQuery.data ?? false))}
+          />
         </div>
       </section>
       )}
