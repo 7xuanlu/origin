@@ -27,47 +27,39 @@ impl LaunchctlExec for SystemLaunchctl {
     }
 }
 
-/// Path to the user-opted-out flag in config.json.
-fn config_path() -> Result<PathBuf> {
-    Ok(dirs::data_dir()
-        .context("HOME not set")?
-        .join("origin")
-        .join("config.json"))
+/// Resolve the data directory for the auto-start flag. Honors `ORIGIN_DATA_DIR`
+/// for isolated testing per CLAUDE.md.
+fn data_dir() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var("ORIGIN_DATA_DIR") {
+        return Ok(PathBuf::from(custom));
+    }
+    Ok(dirs::data_dir().context("HOME not set")?.join("origin"))
 }
 
-/// Read auto_start_disabled flag from config.json. False if file/key missing.
+/// Path to the auto-start opt-out sentinel file. Owned by the app, not the
+/// daemon's typed `Config` (which would AGPL-contaminate origin-core).
+/// Touch = opted out, absent = opted in.
+fn opt_out_flag_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("auto_start_disabled.flag"))
+}
+
+/// Returns true iff the opt-out sentinel file exists.
 pub fn user_opted_out() -> bool {
-    let path = match config_path() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let json: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    json.get("auto_start_disabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    opt_out_flag_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// Write auto_start_disabled flag to config.json. Creates file if absent.
+/// Set or clear the opt-out sentinel file.
 pub fn set_user_opted_out(opted_out: bool) -> Result<()> {
-    let path = config_path()?;
+    let path = opt_out_flag_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut json: serde_json::Value = if path.exists() {
-        let raw = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&raw).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    json["auto_start_disabled"] = serde_json::Value::Bool(opted_out);
-    std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+    if opted_out {
+        // Touch the file (idempotent — overwrite empty)
+        std::fs::write(&path, b"")?;
+    } else if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
     Ok(())
 }
 
@@ -247,6 +239,7 @@ mod tests {
         // Override HOME so dirs::data_dir() returns the tempdir on macOS.
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("ORIGIN_DATA_DIR");
 
         // Default = false
         assert!(!user_opted_out());
@@ -258,6 +251,43 @@ mod tests {
         // Set false → readback false
         set_user_opted_out(false).unwrap();
         assert!(!user_opted_out());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opt_out_flag_does_not_touch_typed_config_json() {
+        // The opt-out sentinel must NOT live inside the daemon's typed
+        // `config.json` — otherwise unrelated `Config::save` calls overwrite
+        // the file and silently drop the user's opt-out preference (C1).
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("ORIGIN_DATA_DIR");
+
+        // Pre-populate config.json without the flag
+        let config_path = tmp.path().join("origin").join("config.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, r#"{"some_other_key":"value"}"#).unwrap();
+
+        set_user_opted_out(true).unwrap();
+
+        // Typed config.json must be untouched by the opt-out write.
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(raw, r#"{"some_other_key":"value"}"#);
+        assert!(user_opted_out());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opt_out_honors_origin_data_dir_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ORIGIN_DATA_DIR", tmp.path());
+
+        assert!(!user_opted_out());
+        set_user_opted_out(true).unwrap();
+        assert!(tmp.path().join("auto_start_disabled.flag").exists());
+        assert!(user_opted_out());
+
+        std::env::remove_var("ORIGIN_DATA_DIR");
     }
 
     #[test]
