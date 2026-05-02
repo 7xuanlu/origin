@@ -84,6 +84,7 @@ origin-core = { workspace = true }
 
 [dev-dependencies]
 temp-env = { version = "0.3", features = ["async_closure"] }
+serial_test = "3"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy", "closed-core-eval"))'] }

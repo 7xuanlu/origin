@@ -238,7 +238,11 @@ mod tests {
         }
     }
 
+    // Tests that mutate `HOME` env var must run serially — std::env::set_var is
+    // !Sync (Rust 2024 will mark it unsafe). #[serial] forces these to one-at-a-time.
+
     #[test]
+    #[serial_test::serial]
     fn opt_out_flag_round_trip() {
         // Override HOME so dirs::data_dir() returns the tempdir on macOS.
         let tmp = tempfile::tempdir().unwrap();
@@ -257,6 +261,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn install_app_plist_writes_file_and_calls_launchctl_load() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -279,6 +284,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn uninstall_app_plist_removes_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -296,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn is_run_at_login_enabled_returns_true_when_both_labels_present() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
