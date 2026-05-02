@@ -1570,3 +1570,17 @@ export async function listDecisions(
 export async function listDecisionDomains(): Promise<string[]> {
   return invoke("list_decision_domains_cmd", {});
 }
+
+// ── Lifecycle / Run-at-login ───────────────────────────────────────
+
+export async function isRunAtLoginEnabled(): Promise<boolean> {
+  return invoke("is_run_at_login_enabled");
+}
+
+export async function setRunAtLogin(enabled: boolean): Promise<void> {
+  return invoke("set_run_at_login", { enabled });
+}
+
+export async function quitOriginFull(): Promise<void> {
+  return invoke("quit_origin_full");
+}
