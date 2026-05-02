@@ -166,14 +166,22 @@ pub fn uninstall_server_plist_via_subprocess() -> Result<()> {
 }
 
 /// Returns true iff BOTH plists are loaded in launchctl.
+///
+/// `launchctl list` output is `PID\tStatus\tLabel`. We must compare the third
+/// whitespace-separated field with `==`; a substring match would treat
+/// `com.origin.server.staging` as `com.origin.server` (H4).
 pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
     let out = match launchctl.run(&["list"]) {
         Ok(o) => o,
         Err(_) => return false,
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let server = stdout.lines().any(|l| l.contains(SERVER_PLIST_LABEL));
-    let app = stdout.lines().any(|l| l.contains(APP_PLIST_LABEL));
+    let server = stdout
+        .lines()
+        .any(|line| line.split_whitespace().nth(2) == Some(SERVER_PLIST_LABEL));
+    let app = stdout
+        .lines()
+        .any(|line| line.split_whitespace().nth(2) == Some(APP_PLIST_LABEL));
     server && app
 }
 
@@ -403,6 +411,32 @@ mod tests {
         }
         let only_server = MockListed(format!("123\t0\t{}\n", SERVER_PLIST_LABEL));
         assert!(!is_run_at_login_enabled(&only_server));
+    }
+
+    #[test]
+    fn is_run_at_login_enabled_does_not_match_label_substring() {
+        // H4: `launchctl list` output where a different label has our label
+        // as a prefix (e.g. `com.origin.server.staging`) must not be treated
+        // as our service being present.
+        struct MockListed(String);
+        impl LaunchctlExec for MockListed {
+            fn run(&self, _args: &[&str]) -> io::Result<Output> {
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: self.0.as_bytes().to_vec(),
+                    stderr: vec![],
+                })
+            }
+        }
+        // Note: only the `.staging` suffixed labels appear. Real labels are absent.
+        let staging_only = MockListed(format!(
+            "123\t0\t{}.staging\n456\t0\t{}.staging\n",
+            SERVER_PLIST_LABEL, APP_PLIST_LABEL
+        ));
+        assert!(
+            !is_run_at_login_enabled(&staging_only),
+            ".staging suffixed labels must not satisfy exact-label match"
+        );
     }
 
     #[test]
