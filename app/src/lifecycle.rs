@@ -194,6 +194,58 @@ pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
     server && app
 }
 
+/// First-run install of both plists. Detects stale paths (e.g. app moved)
+/// and re-installs when the embedded path doesn't match the current binary.
+/// Returns Ok(()) if the install completed or was unnecessary.
+pub fn first_run_install_if_needed(launchctl: &dyn LaunchctlExec) -> Result<()> {
+    if user_opted_out() {
+        return Ok(());
+    }
+
+    let exe_canonical = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(&p).ok());
+
+    let app_plist_stale = app_plist_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .map(|content| {
+            if let Some(exe) = &exe_canonical {
+                !content.contains(exe.to_string_lossy().as_ref())
+            } else {
+                false
+            }
+        })
+        .unwrap_or(true); // missing plist = stale
+
+    let server_plist_stale = server_plist_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .map(|content| {
+            if let Some(exe) = &exe_canonical {
+                let expected_server = exe
+                    .parent()
+                    .map(|p| p.join("origin-server").to_string_lossy().to_string())
+                    .unwrap_or_default();
+                !content.contains(&expected_server)
+            } else {
+                false
+            }
+        })
+        .unwrap_or(true);
+
+    if !app_plist_stale && !server_plist_stale {
+        return Ok(());
+    }
+
+    if let Err(e) = install_server_plist_via_subprocess() {
+        log::warn!("[first-run] origin-server install failed: {e}");
+    }
+    install_app_plist(launchctl)?;
+    log::info!("[first-run] LaunchAgents installed");
+    Ok(())
+}
+
 /// Toggle "Run at login". Mutex-guarded at the caller via app state.
 pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> Result<()> {
     if enabled {

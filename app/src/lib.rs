@@ -157,60 +157,33 @@ pub fn run() {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
 
-            // First-run silent install — gated by opt-out flag.
+            // First-run silent install — H6: run on a blocking task so we
+            // don't block setup() (which delays Tauri start by hundreds of ms).
             {
-                use crate::lifecycle::{
-                    app_plist_path, install_app_plist, install_server_plist_via_subprocess,
-                    server_plist_path, user_opted_out, SystemLaunchctl,
-                };
-
-                if !user_opted_out() {
-                    // Detect: missing plists OR plist path mismatch (e.g., app moved)
-                    let exe_canonical = std::env::current_exe()
-                        .ok()
-                        .and_then(|p| std::fs::canonicalize(&p).ok());
-
-                    let app_plist_stale = app_plist_path()
-                        .ok()
-                        .and_then(|p| std::fs::read_to_string(&p).ok())
-                        .map(|content| {
-                            if let Some(exe) = &exe_canonical {
-                                !content.contains(exe.to_string_lossy().as_ref())
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(true); // missing plist = stale
-
-                    let server_plist_stale = server_plist_path()
-                        .ok()
-                        .and_then(|p| std::fs::read_to_string(&p).ok())
-                        .map(|content| {
-                            if let Some(exe) = &exe_canonical {
-                                let expected_server = exe.parent()
-                                    .map(|p| p.join("origin-server").to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                !content.contains(&expected_server)
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(true);
-
-                    if app_plist_stale || server_plist_stale {
-                        let launchctl = SystemLaunchctl;
-                        // Best-effort; failures fall through to fallback mode (existing
-                        // sidecar spawn at the bottom of setup()).
-                        if let Err(e) = install_server_plist_via_subprocess() {
-                            log::warn!("[first-run] origin-server install failed: {e}");
+                use tauri::Emitter;
+                let install_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = tauri::async_runtime::spawn_blocking(|| {
+                        let launchctl = crate::lifecycle::SystemLaunchctl;
+                        crate::lifecycle::first_run_install_if_needed(&launchctl)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {
+                            log::info!("[first-run] plist install ok or unnecessary");
                         }
-                        if let Err(e) = install_app_plist(&launchctl) {
-                            log::warn!("[first-run] install_app_plist failed: {e}");
-                        } else {
-                            log::info!("[first-run] LaunchAgents installed");
+                        Ok(Err(e)) => {
+                            log::warn!(
+                                "[first-run] plist install failed, fallback mode: {e}"
+                            );
+                            let _ = install_handle.emit("origin-fallback-mode", ());
+                        }
+                        Err(e) => {
+                            log::warn!("[first-run] install task join error: {e}");
+                            let _ = install_handle.emit("origin-fallback-mode", ());
                         }
                     }
-                }
+                });
             }
 
             // Configure macOS window: rounded corners, hide traffic lights, set bg color
