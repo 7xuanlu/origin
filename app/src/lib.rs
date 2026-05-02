@@ -137,6 +137,14 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            // Hide Dock icon at runtime (belt-and-suspenders with Info.plist LSUIElement).
+            // Info.plist LSUIElement=true suppresses the icon before the process starts;
+            // this call ensures it stays hidden even if Tauri ever resets the policy.
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
             // Configure macOS window: rounded corners, hide traffic lights, set bg color
             #[cfg(target_os = "macos")]
             #[allow(deprecated, unexpected_cfgs)]
