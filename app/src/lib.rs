@@ -154,6 +154,37 @@ pub fn run() {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
 
+            // First-run silent install — gated by opt-out flag.
+            {
+                use crate::lifecycle::{
+                    app_plist_path, install_app_plist, install_server_plist_via_subprocess,
+                    server_plist_path, user_opted_out, SystemLaunchctl,
+                };
+
+                if !user_opted_out() {
+                    let needs_install = !app_plist_path()
+                        .map(|p| p.exists())
+                        .unwrap_or(false)
+                        || !server_plist_path()
+                            .map(|p| p.exists())
+                            .unwrap_or(false);
+
+                    if needs_install {
+                        let launchctl = SystemLaunchctl;
+                        // Best-effort; failures fall through to fallback mode (existing
+                        // sidecar spawn at the bottom of setup()).
+                        if let Err(e) = install_server_plist_via_subprocess() {
+                            log::warn!("[first-run] origin-server install failed: {e}");
+                        }
+                        if let Err(e) = install_app_plist(&launchctl) {
+                            log::warn!("[first-run] install_app_plist failed: {e}");
+                        } else {
+                            log::info!("[first-run] LaunchAgents installed");
+                        }
+                    }
+                }
+            }
+
             // Configure macOS window: rounded corners, hide traffic lights, set bg color
             #[cfg(target_os = "macos")]
             #[allow(deprecated, unexpected_cfgs)]
