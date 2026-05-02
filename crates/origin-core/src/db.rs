@@ -13672,6 +13672,14 @@ impl MemoryDB {
 
     /// Insert a new concept. Generates an embedding from `title + summary` if available.
     /// Embedding failures are logged but do not prevent insertion.
+    ///
+    /// Dual-writes the concept row and one `concept_sources` row per
+    /// `source_memory_id` inside a single BEGIN/COMMIT so the join table is
+    /// always consistent with the legacy `source_memory_ids` JSON column at
+    /// creation time. The pre-existing fallback path (`update_concept_content`
+    /// dual-writes on edit) only fires when a concept is updated, so without
+    /// this dual-write at insert, brand-new concepts left the join table empty
+    /// until migration 44 backfilled them retroactively.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_concept(
         &self,
@@ -13704,23 +13712,59 @@ impl MemoryDB {
             }
         };
 
+        // Parse `now` (RFC 3339) to a unix timestamp for the join rows. Mirror
+        // migration 44's pattern: parse, fall back to `Utc::now().timestamp()`.
+        let linked_at = chrono::DateTime::parse_from_rfc3339(now)
+            .map(|dt| dt.timestamp())
+            .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+
         let conn = self.conn.lock().await;
-        match &embedding_sql {
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("insert_concept begin: {e}")))?;
+
+        let concept_result = match &embedding_sql {
             Some(emb) => {
                 conn.execute(
                     "INSERT INTO concepts (id, title, summary, content, entity_id, domain, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9)",
                     libsql::params![id, title, summary, content, entity_id, domain, source_ids_json, emb.as_str(), now],
-                ).await.map_err(|e| OriginError::VectorDb(format!("insert_concept: {e}")))?;
+                ).await
             }
             None => {
                 conn.execute(
                     "INSERT INTO concepts (id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8)",
                     libsql::params![id, title, summary, content, entity_id, domain, source_ids_json, now],
-                ).await.map_err(|e| OriginError::VectorDb(format!("insert_concept: {e}")))?;
+                ).await
+            }
+        };
+        if let Err(e) = concept_result {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(OriginError::VectorDb(format!("insert_concept: {e}")));
+        }
+
+        // Idempotent join writes. INSERT OR IGNORE protects against a row that
+        // migration 44 may have already inserted with `link_reason='m44_backfill'`
+        // for the same `(concept_id, memory_source_id)` PK on a re-distill.
+        for sid in source_memory_ids {
+            if let Err(e) = conn
+                .execute(
+                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, 'distill')",
+                    libsql::params![id, *sid, linked_at],
+                )
+                .await
+            {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(OriginError::VectorDb(format!(
+                    "insert_concept concept_sources: {e}"
+                )));
             }
         }
+
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("insert_concept commit: {e}")))?;
         Ok(())
     }
 
@@ -21004,6 +21048,62 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn test_insert_concept_writes_concept_sources() {
+        // Source-side fix verification: insert_concept must populate the
+        // concept_sources join table at creation, not leave it empty for
+        // migration 44 to backfill later.
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = "concept_dualwrite";
+        db.insert_concept(
+            id,
+            "Dual Write Test",
+            Some("Tests that concept_sources is populated at insert time"),
+            "## Content\n- point 1",
+            None,
+            Some("test"),
+            &["src_a", "src_b", "src_c"],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        let sources = db.get_concept_sources(id).await.unwrap();
+        assert_eq!(
+            sources.len(),
+            3,
+            "insert_concept must write one concept_sources row per source_memory_id"
+        );
+
+        let mut mem_ids: Vec<&str> = sources
+            .iter()
+            .map(|s| s.memory_source_id.as_str())
+            .collect();
+        mem_ids.sort();
+        assert_eq!(mem_ids, vec!["src_a", "src_b", "src_c"]);
+
+        for s in &sources {
+            assert_eq!(
+                s.link_reason.as_deref(),
+                Some("distill"),
+                "all rows from insert_concept should have link_reason='distill'"
+            );
+        }
+
+        let expected_ts = chrono::DateTime::parse_from_rfc3339(&now)
+            .unwrap()
+            .timestamp();
+        for s in &sources {
+            assert!(
+                (s.linked_at - expected_ts).abs() <= 2,
+                "linked_at ({}) should match the now timestamp ({})",
+                s.linked_at,
+                expected_ts
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_update_concept_content() {
         let (db, _dir) = test_db().await;
         let now = chrono::Utc::now().to_rfc3339();
@@ -22657,34 +22757,30 @@ pub(crate) mod tests {
     async fn test_migration_44_backfills_concept_sources_from_json() {
         let (db, _dir) = test_db().await;
 
-        // 1. insert_concept only writes source_memory_ids JSON; no concept_sources row.
+        // 1. Simulate the pre-fix bug: write the concepts row directly, with
+        //    `source_memory_ids` JSON populated but no matching `concept_sources`
+        //    rows. This mirrors the state of any concept that was written by
+        //    insert_concept before the source-side dual-write fix landed.
+        //    (insert_concept now dual-writes; using raw SQL here is the only way
+        //    to reach the legacy state migration 44 is meant to backfill.)
         let now = chrono::Utc::now().to_rfc3339();
-        db.insert_concept(
-            "concept_test_a",
-            "Concept A",
-            Some("summary"),
-            "content",
-            None,
-            None,
-            &["mem-1", "mem-2", "mem-3"],
-            &now,
-        )
-        .await
-        .unwrap();
-        db.insert_concept(
-            "concept_test_b",
-            "Concept B",
-            None,
-            "content",
-            None,
-            None,
-            &["mem-2", "mem-4"],
-            &now,
-        )
-        .await
-        .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            for (id, json) in [
+                ("concept_test_a", r#"["mem-1","mem-2","mem-3"]"#),
+                ("concept_test_b", r#"["mem-2","mem-4"]"#),
+            ] {
+                conn.execute(
+                    "INSERT INTO concepts (id, title, summary, content, source_memory_ids, version, status, created_at, last_compiled, last_modified)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 'active', ?6, ?6, ?6)",
+                    libsql::params![id, "Test", Option::<&str>::None, "content", json, now.as_str()],
+                )
+                .await
+                .unwrap();
+            }
+        }
 
-        // 2. Verify the bug: JSON populated, join table empty for these concepts.
+        // 2. Verify the simulated legacy state: JSON populated, join empty.
         {
             let conn = db.conn.lock().await;
             let mut rows = conn
@@ -22696,7 +22792,10 @@ pub(crate) mod tests {
                 .unwrap();
             let row = rows.next().await.unwrap().unwrap();
             let count: i64 = row.get(0).unwrap();
-            assert_eq!(count, 0, "insert_concept should not write join rows (bug)");
+            assert_eq!(
+                count, 0,
+                "raw INSERT into concepts must not produce concept_sources rows"
+            );
         }
 
         // 3. Roll back user_version below 44 and re-run migrations to fire backfill.
