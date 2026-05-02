@@ -114,12 +114,21 @@ pub fn install_app_plist(launchctl: &dyn LaunchctlExec) -> Result<()> {
     }
     std::fs::write(&plist, content)?;
 
-    let out = launchctl.run(&["load", &plist.to_string_lossy()])?;
+    // H5: roll back the file write if the load fails — otherwise a broken
+    // plist sticks around and stale-plist detection on next startup will
+    // consider it valid, never retrying.
+    let load_result = launchctl.run(&["load", &plist.to_string_lossy()]);
+    let out = match load_result {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&plist);
+            return Err(anyhow::Error::from(e));
+        }
+    };
     if !out.status.success() {
-        anyhow::bail!(
-            "launchctl load failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let _ = std::fs::remove_file(&plist);
+        anyhow::bail!("launchctl load failed: {}", stderr);
     }
     Ok(())
 }
@@ -256,7 +265,8 @@ mod tests {
     #[derive(Default)]
     struct MockLaunchctl {
         calls: Mutex<Vec<Vec<String>>>,
-        next_status: Mutex<i32>,
+        /// Status code to return for load/start subcommands. Default 0 = ok.
+        load_status: Mutex<i32>,
     }
     impl LaunchctlExec for MockLaunchctl {
         fn run(&self, args: &[&str]) -> io::Result<Output> {
@@ -264,8 +274,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(args.iter().map(|s| s.to_string()).collect());
+            // Only `load` honors the configurable status — other subcommands
+            // (unload, list) always succeed so test setup is simpler.
+            let status_code = if args.first().copied() == Some("load") {
+                *self.load_status.lock().unwrap()
+            } else {
+                0
+            };
             Ok(Output {
-                status: std::process::ExitStatus::from_raw(*self.next_status.lock().unwrap()),
+                status: std::process::ExitStatus::from_raw(status_code),
                 stdout: vec![],
                 stderr: vec![],
             })
@@ -330,6 +347,35 @@ mod tests {
         assert!(user_opted_out());
 
         std::env::remove_var("ORIGIN_DATA_DIR");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_app_plist_rolls_back_file_when_launchctl_load_fails() {
+        // H5: when `launchctl load` reports non-zero status, the plist file
+        // must be removed so stale-plist detection on next startup does not
+        // consider the broken file valid.
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+
+        let mock = MockLaunchctl {
+            // ExitStatus::from_raw(256) => exit code 1 (not success).
+            load_status: Mutex::new(256),
+            ..Default::default()
+        };
+        let err = install_app_plist(&mock).expect_err("install should fail when load fails");
+        assert!(
+            err.to_string().contains("launchctl load failed"),
+            "unexpected error: {err}"
+        );
+
+        let plist = tmp
+            .path()
+            .join("Library/LaunchAgents/com.origin.desktop.plist");
+        assert!(
+            !plist.exists(),
+            "broken plist must be rolled back after load failure"
+        );
     }
 
     #[test]
