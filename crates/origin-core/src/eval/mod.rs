@@ -3,6 +3,7 @@
 
 pub mod anthropic;
 pub mod cli_batch;
+pub mod dates;
 pub mod judge;
 pub mod shared;
 

@@ -838,6 +838,17 @@ CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE OF content, title 
 END;
 ";
 
+// ===== AnchorField =====
+
+/// Selects the timestamp column for the recency-decay term in `search_memory`.
+/// `EventDate` falls back to `LastModified` when `event_date` is `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnchorField {
+    #[default]
+    LastModified,
+    EventDate,
+}
+
 // ===== MemoryDB =====
 
 pub struct MemoryDB {
@@ -4110,84 +4121,31 @@ impl MemoryDB {
 
                 log::info!("[migration] Migration 43 applied: enrichment_steps table, needs_reembed column, memory_enrichment_summary view");
             }
+        }
 
-            // Migration 44: re-run the migration 40 backfill of `concept_sources`
-            // from `source_memory_ids` JSON. Migration 40 only fired the backfill
-            // when the version was below 40, so any concept created later that
-            // went through `insert_concept` (which writes only the JSON column,
-            // not the join row) leaves `concept_sources` empty for that concept.
-            // The eval per-scenario DBs at version 43 with PR #4 distillation are
-            // the concrete trigger: search_concepts dual-path falls back to JSON
-            // today, but anything that depends on the join (cascade delete,
-            // reverse lookup, staleness signals, redistill_changed_concepts)
-            // silently no-ops. INSERT OR IGNORE is idempotent: existing join
-            // rows survive untouched.
-            if version < 44 {
-                let conn = self.conn.lock().await;
-                conn.execute("BEGIN", ())
+        // Migration 44: event_date column on memories — when the event the memory
+        // describes actually happened, distinct from last_modified (ingestion time).
+        // Necessary so importing old content (email archives, conversation backfills,
+        // benchmark seeds) doesn't get penalised by recency decay scoring, while still
+        // letting the LLM see real dates in retrieved context.
+        if version < 44 {
+            let chunk_cols = self.get_table_columns("memories").await?;
+            let conn = self.conn.lock().await;
+
+            if !chunk_cols.contains("event_date") {
+                conn.execute("ALTER TABLE memories ADD COLUMN event_date INTEGER", ())
                     .await
-                    .map_err(|e| OriginError::VectorDb(format!("m44 begin: {e}")))?;
-
-                let mut rows = conn
-                    .query(
-                        "SELECT id, source_memory_ids, created_at FROM concepts \
-                         WHERE source_memory_ids IS NOT NULL AND source_memory_ids != '[]'",
-                        (),
-                    )
-                    .await
-                    .map_err(|e| OriginError::VectorDb(format!("m44 query: {e}")))?;
-
-                let mut backfill_rows: Vec<(String, String, String)> = Vec::new();
-                while let Some(row) = rows
-                    .next()
-                    .await
-                    .map_err(|e| OriginError::VectorDb(format!("m44 next: {e}")))?
-                {
-                    let concept_id: String = row
-                        .get(0)
-                        .map_err(|e| OriginError::VectorDb(format!("m44 id: {e}")))?;
-                    let json_str: String = row.get(1).unwrap_or_else(|_| "[]".to_string());
-                    let created_at_str: String = row
-                        .get(2)
-                        .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
-                    backfill_rows.push((concept_id, json_str, created_at_str));
-                }
-
-                let mut inserted = 0usize;
-                for (concept_id, json_str, created_at_str) in backfill_rows {
-                    let linked_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                        .map(|dt| dt.timestamp())
-                        .unwrap_or_else(|_| chrono::Utc::now().timestamp());
-                    let source_ids: Vec<String> =
-                        serde_json::from_str(&json_str).unwrap_or_default();
-                    for sid in &source_ids {
-                        let res = conn
-                            .execute(
-                                "INSERT OR IGNORE INTO concept_sources \
-                                 (concept_id, memory_source_id, linked_at, link_reason) \
-                                 VALUES (?1, ?2, ?3, 'm44_backfill')",
-                                libsql::params![concept_id.clone(), sid.clone(), linked_at],
-                            )
-                            .await;
-                        if let Ok(rows) = res {
-                            inserted += rows as usize;
-                        }
-                    }
-                }
-
-                conn.execute("COMMIT", ())
-                    .await
-                    .map_err(|e| OriginError::VectorDb(format!("m44 commit: {e}")))?;
-
-                conn.execute("PRAGMA user_version = 44", ())
-                    .await
-                    .map_err(|e| OriginError::VectorDb(format!("m44 bump: {e}")))?;
-
+                    .map_err(|e| {
+                        OriginError::VectorDb(format!("migration 44 add event_date: {e}"))
+                    })?;
                 log::info!(
-                    "[migration] Migration 44 applied: backfilled {} concept_sources rows from source_memory_ids JSON",
-                    inserted
+                    "[memory_db] migration 44: added memories.event_date (NULL-able, no backfill)"
                 );
             }
+
+            conn.execute("PRAGMA user_version = 44", ())
+                .await
+                .map_err(|e| OriginError::VectorDb(format!("set user_version=44: {e}")))?;
         }
 
         Ok(())
@@ -5145,7 +5103,8 @@ impl MemoryDB {
     /// 11=byte_start, 12=byte_end, 13=semantic_unit, 14=memory_type, 15=domain,
     /// 16=source_agent, 17=confidence, 18=confirmed, 19=stability, 20=supersedes,
     /// 21=entity_id, 22=quality, 23=is_recap, 24=supersede_mode,
-    /// 25=structured_fields, 26=retrieval_cue, 27=source_text, 28=score/distance/rank
+    /// 25=structured_fields, 26=retrieval_cue, 27=source_text, 28=created_at,
+    /// 29=event_date, 30=score/distance/rank
     fn row_to_search_result(row: &libsql::Row, score: f32) -> Result<SearchResult, OriginError> {
         Ok(SearchResult {
             id: row
@@ -5189,6 +5148,8 @@ impl MemoryDB {
             structured_fields: row.get::<Option<String>>(25).unwrap_or(None),
             retrieval_cue: row.get::<Option<String>>(26).unwrap_or(None),
             source_text: row.get::<Option<String>>(27).unwrap_or(None),
+            created_at: row.get::<i64>(28).unwrap_or(0),
+            event_date: row.get::<Option<i64>>(29).unwrap_or(None),
             raw_score: 0.0, // Set later during normalization
         })
     }
@@ -5212,6 +5173,7 @@ impl MemoryDB {
             url: Option<String>,
             chunk_index: i32,
             last_modified: i64,
+            event_date: Option<i64>,
             chunk_type: String,
             language: Option<String>,
             byte_start: Option<i64>,
@@ -5301,6 +5263,7 @@ impl MemoryDB {
                     url: doc.url.clone(),
                     chunk_index: i as i32,
                     last_modified: doc.last_modified,
+                    event_date: doc.event_date,
                     chunk_type: chunk.chunk_type.clone(),
                     language: chunk.language.clone(),
                     byte_start: chunk.byte_range.map(|(s, _)| s as i64),
@@ -5434,6 +5397,11 @@ impl MemoryDB {
                 .map(|s| s.into())
                 .unwrap_or(libsql::Value::Null);
 
+            let event_date_val = row
+                .event_date
+                .map(libsql::Value::Integer)
+                .unwrap_or(libsql::Value::Null);
+
             conn.execute(
                 "INSERT INTO memories (id, content, source, source_id, title, summary, url,
                     chunk_index, last_modified, chunk_type, language, byte_start, byte_end,
@@ -5441,12 +5409,12 @@ impl MemoryDB {
                     stability, supersedes, pending_revision, word_count,
                     entity_id, enrichment_status, quality, is_recap, supersede_mode,
                     structured_fields, retrieval_cue, source_text,
-                    embedding, created_at)
+                    embedding, created_at, event_date)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
                     ?24, ?25, ?26, ?27, ?28,
                     ?29, ?30, ?31,
-                    vector32(?32), ?33)",
+                    vector32(?32), ?33, ?34)",
                 libsql::params![
                     row.id,
                     row.content,
@@ -5480,7 +5448,8 @@ impl MemoryDB {
                     retrieval_cue_val,
                     source_text_val,
                     vec_str,
-                    row.last_modified // created_at = last_modified at insert time
+                    row.last_modified, // created_at = last_modified at insert time
+                    event_date_val
                 ],
             )
             .await
@@ -5532,6 +5501,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5543,6 +5514,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5562,7 +5535,7 @@ impl MemoryDB {
             match rows_result {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(28).unwrap_or(1.0);
+                        let distance: f64 = row.get(30).unwrap_or(1.0);
                         if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
                             vector_results.push(result);
                         }
@@ -5588,6 +5561,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5601,6 +5576,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5623,7 +5600,7 @@ impl MemoryDB {
             match fts_result {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let rank: f64 = row.get(30).unwrap_or(0.0);
                         if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
                             fts_results.push(result);
                         }
@@ -5688,9 +5665,9 @@ impl MemoryDB {
             .join(",")
     }
 
-    /// Hybrid search (vector + FTS + RRF) with memory-specific filters.
+    /// Hybrid search (vector + FTS + RRF). See [`AnchorField`] for the recency-anchor parameter.
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_memory(
+    pub async fn search_memory_with_anchor(
         &self,
         query: &str,
         limit: usize,
@@ -5700,6 +5677,7 @@ impl MemoryDB {
         confirmation_boost: Option<f32>,
         recap_penalty: Option<f32>,
         scoring: Option<&crate::tuning::SearchScoringConfig>,
+        recency_anchor: AnchorField,
     ) -> Result<Vec<SearchResult>, OriginError> {
         let t_embed = std::time::Instant::now();
         let embedding = self.get_or_compute_embedding(query)?;
@@ -5796,6 +5774,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -5812,7 +5792,7 @@ impl MemoryDB {
             match conn.query(&sql, params).await {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(28).unwrap_or(1.0);
+                        let distance: f64 = row.get(30).unwrap_or(1.0);
                         if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
                             vector_results.push(result);
                         }
@@ -5855,6 +5835,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         fts.rank
                  FROM memories_fts fts
                  JOIN memories c ON fts.rowid = c.rowid
@@ -5879,7 +5861,7 @@ impl MemoryDB {
                 match conn.query(&fts_sql, params).await {
                     Ok(mut rows) => {
                         while let Ok(Some(row)) = rows.next().await {
-                            let rank: f64 = row.get(28).unwrap_or(0.0);
+                            let rank: f64 = row.get(30).unwrap_or(0.0);
                             if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
                                 fts_results.push(result);
                             }
@@ -5953,16 +5935,19 @@ impl MemoryDB {
             .map(|mut r| {
                 let rrf = *score_map.get(&r.id).unwrap_or(&0.0);
 
-                // Tiered retrieval: weight by confidence and recency decay
+                // Tiered retrieval: weight by confidence and recency decay.
+                // Decay anchored to last_modified (ingestion/edit time), NOT event_date —
+                // an old email imported today should rank as freshly ingested. event_date
+                // is for display only.
                 let conf = r.confidence.unwrap_or(0.5);
                 let tier = stability_tier(r.memory_type.as_deref());
-                // Inline decay rates (match TuningConfig defaults) — search doesn't hold config ref
-                let dr = match tier {
-                    crate::sources::StabilityTier::Protected => 0.001,
-                    crate::sources::StabilityTier::Standard => 0.01,
-                    crate::sources::StabilityTier::Ephemeral => 0.05,
+                let decay_cfg = crate::tuning::ConfidenceConfig::default();
+                let dr = crate::sources::decay_rate(&tier, &decay_cfg);
+                let anchor_ts = match recency_anchor {
+                    AnchorField::LastModified => r.last_modified,
+                    AnchorField::EventDate => r.event_date.unwrap_or(r.last_modified),
                 };
-                let age_days = ((now - r.last_modified) as f64 / 86400.0).max(0.0);
+                let age_days = ((now - anchor_ts) as f64 / 86400.0).max(0.0);
                 let recency = (-dr * age_days).exp() as f32;
 
                 // Quality multiplier: low=0.7, medium/NULL=0.9, high=1.0
@@ -6202,6 +6187,33 @@ impl MemoryDB {
         }
 
         Ok(final_results)
+    }
+
+    /// Equivalent to `search_memory_with_anchor(.., AnchorField::LastModified)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_memory(
+        &self,
+        query: &str,
+        limit: usize,
+        memory_type: Option<&str>,
+        domain: Option<&str>,
+        source_agent: Option<&str>,
+        confirmation_boost: Option<f32>,
+        recap_penalty: Option<f32>,
+        scoring: Option<&crate::tuning::SearchScoringConfig>,
+    ) -> Result<Vec<SearchResult>, OriginError> {
+        self.search_memory_with_anchor(
+            query,
+            limit,
+            memory_type,
+            domain,
+            source_agent,
+            confirmation_boost,
+            recap_penalty,
+            scoring,
+            AnchorField::LastModified,
+        )
+        .await
     }
 
     /// Hybrid search with graph augmentation and optional LLM reranking.
@@ -6551,6 +6563,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -6570,6 +6584,8 @@ impl MemoryDB {
                         c.confidence, c.confirmed, c.stability, c.supersedes,
                         c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                         c.structured_fields, c.retrieval_cue, c.source_text,
+                        c.created_at,
+                        c.event_date,
                         vector_distance_cos(c.embedding, vector32(?1))
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt
                  JOIN memories c ON c.rowid = vt.id
@@ -6586,7 +6602,7 @@ impl MemoryDB {
         match conn.query(&sql, params).await {
             Ok(mut rows) => {
                 while let Ok(Some(row)) = rows.next().await {
-                    let distance: f64 = row.get(28).unwrap_or(1.0);
+                    let distance: f64 = row.get(30).unwrap_or(1.0);
                     let score = (1.0 - distance).max(0.0) as f32;
                     if let Ok(result) = Self::row_to_search_result(&row, score) {
                         results.push(result);
@@ -6642,6 +6658,8 @@ impl MemoryDB {
                     c.confidence, c.confirmed, c.stability, c.supersedes,
                     c.entity_id, c.quality, c.is_recap, c.supersede_mode,
                     c.structured_fields, c.retrieval_cue, c.source_text,
+                    c.created_at,
+                    c.event_date,
                     fts.rank
              FROM memories_fts fts
              JOIN memories c ON fts.rowid = c.rowid
@@ -6669,7 +6687,7 @@ impl MemoryDB {
                 Ok(mut rows) => {
                     while let Ok(Some(row)) = rows.next().await {
                         // FTS5 rank is negative BM25; negate so higher = better
-                        let rank: f64 = row.get(28).unwrap_or(0.0);
+                        let rank: f64 = row.get(30).unwrap_or(0.0);
                         let score = (-rank) as f32;
                         if let Ok(result) = Self::row_to_search_result(&row, score) {
                             results.push(result);
@@ -6925,6 +6943,8 @@ impl MemoryDB {
                 structured_fields: None,
                 retrieval_cue: None,
                 source_text: None,
+                created_at,
+                event_date: None,
                 raw_score: 0.0,
             });
         }
@@ -12229,6 +12249,74 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Count memories where `event_date IS NULL`.
+    /// Used by eval backfill to decide whether stale rows need event_date populated.
+    pub async fn count_memories_with_null_event_date(&self) -> Result<usize, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memories WHERE event_date IS NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("count event_date NULLs: {e}")))?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get::<i64>(0).unwrap_or(0) as usize),
+            _ => Ok(0),
+        }
+    }
+
+    /// Return distinct `source_id`s of memories with NULL `event_date`.
+    /// Used by eval backfill to derive event timestamps from source_id metadata.
+    pub async fn list_memory_source_ids_with_null_event_date(
+        &self,
+    ) -> Result<Vec<String>, OriginError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT source_id FROM memories WHERE event_date IS NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("list null-event_date ids: {e}")))?;
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            if let Ok(s) = row.get::<String>(0) {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Set `event_date` to the supplied timestamp for every memory matching
+    /// `source_id`. Wrapped in a transaction. Returns the count of input pairs
+    /// applied (not the number of rows affected, since one source_id may map
+    /// to several chunks).
+    pub async fn bulk_update_event_date_by_source_id(
+        &self,
+        updates: &[(String, i64)],
+    ) -> Result<usize, OriginError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", libsql::params![])
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("backfill begin: {e}")))?;
+        for (sid, ts) in updates {
+            conn.execute(
+                "UPDATE memories SET event_date = ? WHERE source_id = ?",
+                libsql::params![*ts, sid.clone()],
+            )
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("backfill update {sid}: {e}")))?;
+        }
+        conn.execute("COMMIT", libsql::params![])
+            .await
+            .map_err(|e| OriginError::VectorDb(format!("backfill commit: {e}")))?;
+        Ok(updates.len())
+    }
+
     /// Quick count of memories in the DB (for resume detection).
     pub async fn memory_count(&self) -> Result<usize, OriginError> {
         let conn = self.conn.lock().await;
@@ -13672,14 +13760,6 @@ impl MemoryDB {
 
     /// Insert a new concept. Generates an embedding from `title + summary` if available.
     /// Embedding failures are logged but do not prevent insertion.
-    ///
-    /// Dual-writes the concept row and one `concept_sources` row per
-    /// `source_memory_id` inside a single BEGIN/COMMIT so the join table is
-    /// always consistent with the legacy `source_memory_ids` JSON column at
-    /// creation time. The pre-existing fallback path (`update_concept_content`
-    /// dual-writes on edit) only fires when a concept is updated, so without
-    /// this dual-write at insert, brand-new concepts left the join table empty
-    /// until migration 44 backfilled them retroactively.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_concept(
         &self,
@@ -13712,59 +13792,23 @@ impl MemoryDB {
             }
         };
 
-        // Parse `now` (RFC 3339) to a unix timestamp for the join rows. Mirror
-        // migration 44's pattern: parse, fall back to `Utc::now().timestamp()`.
-        let linked_at = chrono::DateTime::parse_from_rfc3339(now)
-            .map(|dt| dt.timestamp())
-            .unwrap_or_else(|_| chrono::Utc::now().timestamp());
-
         let conn = self.conn.lock().await;
-        conn.execute("BEGIN", ())
-            .await
-            .map_err(|e| OriginError::VectorDb(format!("insert_concept begin: {e}")))?;
-
-        let concept_result = match &embedding_sql {
+        match &embedding_sql {
             Some(emb) => {
                 conn.execute(
                     "INSERT INTO concepts (id, title, summary, content, entity_id, domain, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9)",
                     libsql::params![id, title, summary, content, entity_id, domain, source_ids_json, emb.as_str(), now],
-                ).await
+                ).await.map_err(|e| OriginError::VectorDb(format!("insert_concept: {e}")))?;
             }
             None => {
                 conn.execute(
                     "INSERT INTO concepts (id, title, summary, content, entity_id, domain, source_memory_ids, version, status, created_at, last_compiled, last_modified)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8)",
                     libsql::params![id, title, summary, content, entity_id, domain, source_ids_json, now],
-                ).await
-            }
-        };
-        if let Err(e) = concept_result {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            return Err(OriginError::VectorDb(format!("insert_concept: {e}")));
-        }
-
-        // Idempotent join writes. INSERT OR IGNORE protects against a row that
-        // migration 44 may have already inserted with `link_reason='m44_backfill'`
-        // for the same `(concept_id, memory_source_id)` PK on a re-distill.
-        for sid in source_memory_ids {
-            if let Err(e) = conn
-                .execute(
-                    "INSERT OR IGNORE INTO concept_sources (concept_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, ?3, 'distill')",
-                    libsql::params![id, *sid, linked_at],
-                )
-                .await
-            {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                return Err(OriginError::VectorDb(format!(
-                    "insert_concept concept_sources: {e}"
-                )));
+                ).await.map_err(|e| OriginError::VectorDb(format!("insert_concept: {e}")))?;
             }
         }
-
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| OriginError::VectorDb(format!("insert_concept commit: {e}")))?;
         Ok(())
     }
 
@@ -21048,62 +21092,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_insert_concept_writes_concept_sources() {
-        // Source-side fix verification: insert_concept must populate the
-        // concept_sources join table at creation, not leave it empty for
-        // migration 44 to backfill later.
-        let (db, _dir) = test_db().await;
-        let now = chrono::Utc::now().to_rfc3339();
-        let id = "concept_dualwrite";
-        db.insert_concept(
-            id,
-            "Dual Write Test",
-            Some("Tests that concept_sources is populated at insert time"),
-            "## Content\n- point 1",
-            None,
-            Some("test"),
-            &["src_a", "src_b", "src_c"],
-            &now,
-        )
-        .await
-        .unwrap();
-
-        let sources = db.get_concept_sources(id).await.unwrap();
-        assert_eq!(
-            sources.len(),
-            3,
-            "insert_concept must write one concept_sources row per source_memory_id"
-        );
-
-        let mut mem_ids: Vec<&str> = sources
-            .iter()
-            .map(|s| s.memory_source_id.as_str())
-            .collect();
-        mem_ids.sort();
-        assert_eq!(mem_ids, vec!["src_a", "src_b", "src_c"]);
-
-        for s in &sources {
-            assert_eq!(
-                s.link_reason.as_deref(),
-                Some("distill"),
-                "all rows from insert_concept should have link_reason='distill'"
-            );
-        }
-
-        let expected_ts = chrono::DateTime::parse_from_rfc3339(&now)
-            .unwrap()
-            .timestamp();
-        for s in &sources {
-            assert!(
-                (s.linked_at - expected_ts).abs() <= 2,
-                "linked_at ({}) should match the now timestamp ({})",
-                s.linked_at,
-                expected_ts
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn test_update_concept_content() {
         let (db, _dir) = test_db().await;
         let now = chrono::Utc::now().to_rfc3339();
@@ -22751,111 +22739,6 @@ pub(crate) mod tests {
         drop(_rows);
 
         drop(conn);
-    }
-
-    #[tokio::test]
-    async fn test_migration_44_backfills_concept_sources_from_json() {
-        let (db, _dir) = test_db().await;
-
-        // 1. Simulate the pre-fix bug: write the concepts row directly, with
-        //    `source_memory_ids` JSON populated but no matching `concept_sources`
-        //    rows. This mirrors the state of any concept that was written by
-        //    insert_concept before the source-side dual-write fix landed.
-        //    (insert_concept now dual-writes; using raw SQL here is the only way
-        //    to reach the legacy state migration 44 is meant to backfill.)
-        let now = chrono::Utc::now().to_rfc3339();
-        {
-            let conn = db.conn.lock().await;
-            for (id, json) in [
-                ("concept_test_a", r#"["mem-1","mem-2","mem-3"]"#),
-                ("concept_test_b", r#"["mem-2","mem-4"]"#),
-            ] {
-                conn.execute(
-                    "INSERT INTO concepts (id, title, summary, content, source_memory_ids, version, status, created_at, last_compiled, last_modified)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 'active', ?6, ?6, ?6)",
-                    libsql::params![id, "Test", Option::<&str>::None, "content", json, now.as_str()],
-                )
-                .await
-                .unwrap();
-            }
-        }
-
-        // 2. Verify the simulated legacy state: JSON populated, join empty.
-        {
-            let conn = db.conn.lock().await;
-            let mut rows = conn
-                .query(
-                    "SELECT count(*) FROM concept_sources WHERE concept_id IN ('concept_test_a','concept_test_b')",
-                    (),
-                )
-                .await
-                .unwrap();
-            let row = rows.next().await.unwrap().unwrap();
-            let count: i64 = row.get(0).unwrap();
-            assert_eq!(
-                count, 0,
-                "raw INSERT into concepts must not produce concept_sources rows"
-            );
-        }
-
-        // 3. Roll back user_version below 44 and re-run migrations to fire backfill.
-        {
-            let conn = db.conn.lock().await;
-            conn.execute("PRAGMA user_version = 43", ()).await.unwrap();
-        }
-        db.run_migrations(&crate::events::NoopEmitter)
-            .await
-            .unwrap();
-
-        // 4. Backfill ran: every JSON id is now a join row.
-        {
-            let conn = db.conn.lock().await;
-            let mut rows = conn
-                .query(
-                    "SELECT concept_id, memory_source_id FROM concept_sources \
-                     WHERE concept_id IN ('concept_test_a','concept_test_b') \
-                     ORDER BY concept_id, memory_source_id",
-                    (),
-                )
-                .await
-                .unwrap();
-            let mut got: Vec<(String, String)> = Vec::new();
-            while let Some(row) = rows.next().await.unwrap() {
-                got.push((row.get(0).unwrap(), row.get(1).unwrap()));
-            }
-            assert_eq!(
-                got,
-                vec![
-                    ("concept_test_a".into(), "mem-1".into()),
-                    ("concept_test_a".into(), "mem-2".into()),
-                    ("concept_test_a".into(), "mem-3".into()),
-                    ("concept_test_b".into(), "mem-2".into()),
-                    ("concept_test_b".into(), "mem-4".into()),
-                ]
-            );
-        }
-
-        // 5. Idempotent: rolling back + re-running again must not duplicate or error.
-        {
-            let conn = db.conn.lock().await;
-            conn.execute("PRAGMA user_version = 43", ()).await.unwrap();
-        }
-        db.run_migrations(&crate::events::NoopEmitter)
-            .await
-            .unwrap();
-        {
-            let conn = db.conn.lock().await;
-            let mut rows = conn
-                .query(
-                    "SELECT count(*) FROM concept_sources WHERE concept_id IN ('concept_test_a','concept_test_b')",
-                    (),
-                )
-                .await
-                .unwrap();
-            let row = rows.next().await.unwrap().unwrap();
-            let count: i64 = row.get(0).unwrap();
-            assert_eq!(count, 5, "INSERT OR IGNORE preserves existing rows");
-        }
     }
 
     #[tokio::test]
@@ -24566,5 +24449,208 @@ pub(crate) mod tests {
             "concept_sources should be empty after concept delete (FK cascade): {:?}",
             sources_after
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_result_exposes_created_at() {
+        let (db, _dir) = test_db().await;
+
+        // Seed a chunk with a known historical timestamp (2023-01-01 00:00:00 UTC = 1672531200).
+        let known_ts: i64 = 1_672_531_200;
+        let docs = vec![crate::sources::RawDocument {
+            content: "Alice met Bob in Tokyo".to_string(),
+            source_id: "doc1".to_string(),
+            source: "memory".to_string(),
+            title: "test".to_string(),
+            last_modified: known_ts,
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            ..Default::default()
+        }];
+        db.upsert_documents(docs).await.unwrap();
+
+        let results = db
+            .search_memory(
+                "Tokyo",
+                5,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "search returned no results");
+        let r = &results[0];
+        assert_eq!(r.last_modified, known_ts, "last_modified mismatch");
+        assert_eq!(
+            r.created_at, known_ts,
+            "created_at mismatch (upsert_documents mirrors last_modified -> created_at on INSERT)"
+        );
+    }
+
+    /// Regression: search ranking must depend on `last_modified` (recency anchor),
+    /// not on `event_date` (display-only). A chunk with a 3-year-old event_date
+    /// but a fresh last_modified (think: imported old email, benchmark seed)
+    /// must score meaningfully — the recency multiplier should not crush it
+    /// to ~0 just because the *event* is old.
+    /// Guards against the recency-decay-eats-old-content regression that was
+    /// caught when an earlier change made `last_modified` carry the event time.
+    #[tokio::test]
+    async fn test_search_ranking_uses_last_modified_not_event_date() {
+        let (db, _dir) = test_db().await;
+        let now_ts = chrono::Utc::now().timestamp();
+        let three_years_ago = now_ts - 3 * 365 * 86400;
+
+        // Single row with old event_date + fresh last_modified (mirrors
+        // benchmark seeds and old-archive imports).
+        let docs = vec![crate::sources::RawDocument {
+            content: "Alice met Bob in Tokyo".to_string(),
+            source_id: "old_event_fresh_import".to_string(),
+            source: "memory".to_string(),
+            title: "test".to_string(),
+            last_modified: now_ts,
+            event_date: Some(three_years_ago),
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            ..Default::default()
+        }];
+        db.upsert_documents(docs).await.unwrap();
+
+        let results = db
+            .search_memory(
+                "Tokyo",
+                10,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "expected one result: {results:?}");
+        let r = &results[0];
+        assert_eq!(r.last_modified, now_ts);
+        assert_eq!(r.event_date, Some(three_years_ago));
+        // Score must be meaningful. Realistic LoCoMo retrievals score in
+        // [0.04, 0.08] post-fix (recency=1.0 because last_modified=now). The
+        // 0.02 threshold is firmly below that range but well above what any
+        // partial recency leak would yield: a hypothetical bug halving recency
+        // would still give ~0.025 for this RRF setup; a wrong-tier (Standard
+        // -> Ephemeral, decay 0.05 instead of 0.01) bug would give ~1.7e-25.
+        // Pre-fix, recency was exp(-0.01 * 1095) ≈ 1.7e-5, crushing scores to ~0.
+        assert!(
+            r.score > 0.02,
+            "score depressed despite fresh last_modified — recency leak suspected: {}",
+            r.score
+        );
+    }
+
+    /// Verifies that `search_memory_with_anchor` honours `AnchorField::EventDate`:
+    /// a memory with `last_modified=now` but `event_date=3 years ago` should rank
+    /// much lower when the anchor is `EventDate` than when it is `LastModified`.
+    #[tokio::test]
+    async fn test_search_memory_anchor_event_date_uses_event_date_for_decay() {
+        let (db, _dir) = test_db().await;
+        let now_ts = chrono::Utc::now().timestamp();
+        let three_years_ago = now_ts - 3 * 365 * 86400;
+
+        let docs = vec![crate::sources::RawDocument {
+            content: "shared anchor test memory".to_string(),
+            source_id: "anchor-test".to_string(),
+            source: "memory".to_string(),
+            title: "anchor-test".to_string(),
+            last_modified: now_ts,
+            event_date: Some(three_years_ago),
+            memory_type: Some("fact".to_string()),
+            ..Default::default()
+        }];
+        db.upsert_documents(docs).await.unwrap();
+
+        let results_lm = db
+            .search_memory_with_anchor(
+                "shared anchor test memory",
+                5,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                AnchorField::LastModified,
+            )
+            .await
+            .unwrap();
+        let score_lm = results_lm
+            .iter()
+            .find(|r| r.source_id == "anchor-test")
+            .map(|r| r.score)
+            .unwrap_or(0.0);
+
+        let results_ed = db
+            .search_memory_with_anchor(
+                "shared anchor test memory",
+                5,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                AnchorField::EventDate,
+            )
+            .await
+            .unwrap();
+        let score_ed = results_ed
+            .iter()
+            .find(|r| r.source_id == "anchor-test")
+            .map(|r| r.score)
+            .unwrap_or(0.0);
+
+        assert!(
+            score_ed > 0.0,
+            "EventDate-anchored search should still return the matching row, just with decayed score"
+        );
+        assert!(
+            score_lm > score_ed * 10.0,
+            "LastModified-anchored score ({score_lm}) should be much higher than \
+             EventDate-anchored score ({score_ed}) for a 3-year-old event with last_modified=now"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_memories_with_null_event_date() {
+        let (db, _tmp) = test_db().await;
+        // Returns 0 on empty DB.
+        assert_eq!(db.count_memories_with_null_event_date().await.unwrap(), 0);
+        // Seed one with event_date=Some, one with event_date=None.
+        let now_ts = chrono::Utc::now().timestamp();
+        let docs = vec![
+            crate::sources::RawDocument {
+                content: "with event_date".to_string(),
+                source_id: "with-ed".to_string(),
+                source: "memory".to_string(),
+                last_modified: now_ts,
+                event_date: Some(now_ts - 86400),
+                memory_type: Some("fact".to_string()),
+                ..Default::default()
+            },
+            crate::sources::RawDocument {
+                content: "without event_date".to_string(),
+                source_id: "without-ed".to_string(),
+                source: "memory".to_string(),
+                last_modified: now_ts,
+                event_date: None,
+                memory_type: Some("fact".to_string()),
+                ..Default::default()
+            },
+        ];
+        db.upsert_documents(docs).await.unwrap();
+        let stale = db.count_memories_with_null_event_date().await.unwrap();
+        assert!(stale > 0, "expected at least one stale memory; got {stale}");
     }
 }
