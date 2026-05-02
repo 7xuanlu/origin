@@ -246,6 +246,7 @@ mod tests {
             content: content.into(),
             url: None,
             last_modified: 0,
+            event_date: None,
             metadata: HashMap::new(),
             memory_type: Some("fact".into()),
             domain: None,

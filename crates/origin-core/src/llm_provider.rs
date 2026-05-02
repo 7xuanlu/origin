@@ -1090,12 +1090,14 @@ impl LlmProvider for ClaudeCliProvider {
             args.push(sys.clone());
         }
 
-        // Strip ANTHROPIC_API_KEY so claude CLI uses Max plan OAuth instead of
-        // routing through an API account that may have a low credit balance.
-        // The eval harness intentionally chose CLI over Batch API to avoid API costs.
+        // Scrub ANTHROPIC_API_KEY from the child's env: when present, the CLI
+        // routes through pay-as-you-go API instead of the user's Max OAuth, so
+        // a Max-plan eval would silently burn API credits (and fail with "Credit
+        // balance is too low" when the API key has none). The CLI provider's
+        // whole purpose is to use Max OAuth, so always remove the override.
         let mut child = Command::new("claude")
-            .env_remove("ANTHROPIC_API_KEY")
             .args(&args)
+            .env_remove("ANTHROPIC_API_KEY")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

@@ -30,6 +30,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+// Bring date helpers into scope for use within this module.
+use crate::eval::dates::seed_event_date;
+// Re-export so external callers using `crate::eval::longmemeval::parse_lme_date` still compile.
+pub use crate::eval::dates::parse_lme_date;
+
 // ---------------------------------------------------------------------------
 // Data structures (matches the JSON schema from HuggingFace)
 // ---------------------------------------------------------------------------
@@ -74,6 +79,8 @@ pub struct LongMemEvalMemory {
     pub turn_idx: usize,
     pub has_answer: bool,
     pub question_id: String,
+    /// Raw date string from the dataset (e.g. "2023/04/10 (Mon) 23:07"). None for samples missing dates.
+    pub session_date: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +115,7 @@ pub fn extract_memories(sample: &LongMemEvalSample) -> Vec<LongMemEvalMemory> {
         .zip(sample.haystack_sessions.iter())
         .enumerate()
     {
+        let session_date = sample.haystack_dates.get(sess_idx).cloned();
         for (turn_idx, turn) in session.iter().enumerate() {
             // Always include user turns (they contain the personal facts).
             // Include assistant turns only if they have answer evidence,
@@ -121,6 +129,7 @@ pub fn extract_memories(sample: &LongMemEvalSample) -> Vec<LongMemEvalMemory> {
                     turn_idx,
                     has_answer: turn.has_answer,
                     question_id: sample.question_id.clone(),
+                    session_date: session_date.clone(),
                 });
             }
         }
@@ -423,6 +432,7 @@ pub async fn run_longmemeval_eval(path: &Path) -> Result<LongMemEvalReport, Orig
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
                     last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -534,6 +544,7 @@ pub async fn run_longmemeval_eval_reranked(
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
                     last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -645,6 +656,7 @@ pub async fn run_longmemeval_eval_expanded(
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
                     last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -870,6 +882,7 @@ pub async fn run_longmemeval_eval_with_gate(
                     memory_type: Some(memory_type.to_string()),
                     domain: Some("conversation".to_string()),
                     last_modified: chrono::Utc::now().timestamp(),
+                    event_date: seed_event_date(mem.session_date.as_deref(), parse_lme_date),
                     ..Default::default()
                 }
             })
@@ -1380,5 +1393,61 @@ mod tests {
         assert!(text.contains("Baseline comparison:"));
         assert!(text.contains("->"));
         assert!(text.contains("single-session-user"));
+    }
+
+    #[tokio::test]
+    async fn test_lme_seed_propagates_session_date() {
+        use crate::sources::RawDocument;
+
+        // Mimic what the runner builds for a single memory.
+        let mem = super::LongMemEvalMemory {
+            content: "I moved to Tokyo last summer.".to_string(),
+            role: "user".to_string(),
+            session_id: "s1".to_string(),
+            session_idx: 0,
+            turn_idx: 0,
+            has_answer: true,
+            question_id: "q1".to_string(),
+            session_date: Some("2023/04/10 (Mon) 23:07".to_string()),
+        };
+        let event_date =
+            crate::eval::dates::seed_event_date(mem.session_date.as_deref(), super::parse_lme_date);
+        let now_ts = chrono::Utc::now().timestamp();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db =
+            crate::db::MemoryDB::new(tmp.path(), std::sync::Arc::new(crate::events::NoopEmitter))
+                .await
+                .unwrap();
+        db.upsert_documents(vec![RawDocument {
+            content: mem.content.clone(),
+            source_id: "lme/q1/s1/0".to_string(),
+            source: "memory".to_string(),
+            title: "test".to_string(),
+            last_modified: now_ts,
+            event_date,
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+
+        let results = db
+            .search_memory(
+                "Tokyo",
+                5,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].last_modified, now_ts);
+        assert_eq!(results[0].event_date, Some(1_681_168_020));
     }
 }

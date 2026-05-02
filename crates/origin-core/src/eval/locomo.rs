@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+// Bring date helpers into scope for use within this module.
+use crate::eval::dates::seed_event_date;
+// Re-export so external callers using `crate::eval::locomo::parse_locomo_date` still compile.
+pub use crate::eval::dates::parse_locomo_date;
+
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
@@ -53,6 +58,8 @@ pub struct LocomoMemory {
     pub session_num: usize,
     pub dia_id: String,
     pub sample_id: String,
+    /// Raw "h:mm am/pm on D Month, YYYY" string for this session, when present.
+    pub session_date: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,12 +119,20 @@ pub fn extract_observations(sample: &LocomoSample) -> Vec<LocomoMemory> {
                     None => continue,
                 };
 
+                let session_date_key = session_key.replace("_observation", "_date_time");
+                let session_date = sample
+                    .conversation
+                    .get(&session_date_key)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
                 memories.push(LocomoMemory {
                     content,
                     speaker: speaker.clone(),
                     session_num,
                     dia_id,
                     sample_id: sample.sample_id.clone(),
+                    session_date,
                 });
             }
         }
@@ -418,6 +433,7 @@ pub async fn run_locomo_eval(path: &Path) -> Result<LocomoReport, OriginError> {
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -549,6 +565,7 @@ pub async fn run_locomo_eval_reranked(
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -674,6 +691,7 @@ pub async fn run_locomo_eval_expanded(
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -940,6 +958,7 @@ pub async fn run_locomo_eval_with_gate(
                 memory_type: Some("fact".to_string()),
                 domain: Some("conversation".to_string()),
                 last_modified: chrono::Utc::now().timestamp(),
+                event_date: seed_event_date(mem.session_date.as_deref(), parse_locomo_date),
                 ..Default::default()
             })
             .collect();
@@ -1414,5 +1433,48 @@ mod tests {
         assert!(text.contains("open-domain"));
         // Verify delta printing is present
         assert!(text.contains("->"));
+    }
+
+    #[tokio::test]
+    async fn test_locomo_seed_propagates_session_date() {
+        use crate::sources::RawDocument;
+
+        let last_modified = super::parse_locomo_date("1:56 pm on 8 May, 2023").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db =
+            crate::db::MemoryDB::new(tmp.path(), std::sync::Arc::new(crate::events::NoopEmitter))
+                .await
+                .unwrap();
+
+        db.upsert_documents(vec![RawDocument {
+            content: "Alice told Bob she moved to Tokyo".to_string(),
+            source_id: "locomo/sample1/dia1".to_string(),
+            source: "memory".to_string(),
+            title: "test".to_string(),
+            last_modified,
+            memory_type: Some("fact".to_string()),
+            domain: Some("conversation".to_string()),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+
+        let results = db
+            .search_memory(
+                "Tokyo",
+                5,
+                None,
+                Some("conversation"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].last_modified, 1_683_554_160);
+        assert_eq!(results[0].created_at, 1_683_554_160);
     }
 }

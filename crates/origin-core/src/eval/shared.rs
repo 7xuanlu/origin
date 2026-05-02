@@ -52,6 +52,10 @@ pub fn count_tokens(text: &str) -> usize {
     BPE.encode_with_special_tokens(text).len()
 }
 
+/// Format a unix-seconds timestamp as ISO-8601 calendar date "YYYY-MM-DD" in UTC.
+/// Re-exported from [`crate::eval::dates`] for backward compatibility.
+pub use crate::eval::dates::{format_event_or_unknown, format_ymd};
+
 /// Probe on-device batch extraction at different batch sizes.
 /// Returns vec of (batch_size, input_tokens, response_len, entities_found, observations_found).
 pub async fn probe_extraction_batch_sizes(
@@ -588,16 +592,52 @@ pub async fn run_entity_extraction_for_eval_batched(
     Ok(total_linked)
 }
 
-/// Resolve the per-scenario DB directory under `baselines/fullpipeline/{benchmark}/{scenario_id}/`.
+/// Resolve the per-scenario DB directory.
 ///
-/// `benchmark` is the short name (`"lme"` or `"locomo"`). The function prepends `"fullpipeline/"`,
-/// so the result is `baselines_dir/fullpipeline/{benchmark}/{scenario_id}`.
+/// `benchmark` is the short name (`"lme"` or `"locomo"`). The result is
+/// `baselines_dir/fullpipeline/{benchmark}/{scenario_id}`.
 /// `MemoryDB::new_with_shared_embedder` will create `origin_memory.db` inside the returned dir.
 pub fn scenario_db_dir(baselines_dir: &Path, benchmark: &str, scenario_id: &str) -> PathBuf {
     baselines_dir
         .join("fullpipeline")
         .join(benchmark)
         .join(scenario_id)
+}
+
+/// Backfill `event_date` for any memories where it's NULL. The caller supplies
+/// `id_to_event_date`, which maps a `source_id` (e.g. `locomo_conv-26_obs_42`)
+/// to the event timestamp. Caches with NULL `event_date` come from
+/// pre-temporal-metadata seed runs; this populates them in place so variant
+/// B's EventDate anchor resolves to the actual session date instead of
+/// falling back to `last_modified`.
+///
+/// Returns the number of rows updated. Idempotent: a second call after the
+/// first finds no NULL rows and returns 0.
+pub async fn backfill_event_dates<F>(
+    db: &MemoryDB,
+    mut id_to_event_date: F,
+) -> Result<usize, OriginError>
+where
+    F: FnMut(&str) -> Option<i64>,
+{
+    let stale_count = db.count_memories_with_null_event_date().await?;
+    if stale_count == 0 {
+        return Ok(0);
+    }
+    let null_ids = db.list_memory_source_ids_with_null_event_date().await?;
+    let mut updates: Vec<(String, i64)> = Vec::with_capacity(null_ids.len());
+    for sid in &null_ids {
+        if let Some(ts) = id_to_event_date(sid) {
+            updates.push((sid.clone(), ts));
+        }
+    }
+    let updated = db.bulk_update_event_date_by_source_id(&updates).await?;
+    log::info!(
+        "[backfill] event_date populated for {}/{} stale rows",
+        updated,
+        stale_count
+    );
+    Ok(updated)
 }
 
 /// Open existing per-scenario DB if fully enriched; otherwise seed and enrich, then return.
@@ -1973,4 +2013,76 @@ pub async fn run_concept_distillation_batch_api(
 
     eprintln!("[batch_distill] Distilled {} concepts", distilled);
     Ok(distilled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scenario_db_dir_canonical_layout() {
+        let base = std::path::PathBuf::from("/tmp/eval-baselines");
+        let p = scenario_db_dir(&base, "locomo", "conv-26");
+        assert!(p.ends_with("fullpipeline/locomo/conv-26"));
+    }
+
+    #[tokio::test]
+    async fn test_backfill_event_dates_populates_null_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_dir = tmp.path();
+        std::fs::create_dir_all(db_dir).unwrap();
+
+        let embedder = eval_shared_embedder();
+        let db = crate::db::MemoryDB::new_with_shared_embedder(
+            db_dir,
+            std::sync::Arc::new(crate::events::NoopEmitter),
+            embedder,
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let docs = vec![
+            crate::sources::RawDocument {
+                content: "with event_date".to_string(),
+                source_id: "with-ed".to_string(),
+                source: "memory".to_string(),
+                last_modified: now,
+                event_date: Some(now - 86400),
+                memory_type: Some("fact".to_string()),
+                ..Default::default()
+            },
+            crate::sources::RawDocument {
+                content: "stale seed".to_string(),
+                source_id: "stale-ed".to_string(),
+                source: "memory".to_string(),
+                last_modified: now,
+                event_date: None,
+                memory_type: Some("fact".to_string()),
+                ..Default::default()
+            },
+        ];
+        db.upsert_documents(docs).await.unwrap();
+
+        // Pre: one stale row.
+        assert_eq!(db.count_memories_with_null_event_date().await.unwrap(), 1);
+
+        // Backfill: map "stale-ed" -> a known timestamp; ignore others.
+        let backfill_ts = now - 365 * 86400;
+        let updated = backfill_event_dates(&db, |sid| {
+            if sid == "stale-ed" {
+                Some(backfill_ts)
+            } else {
+                None
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(updated, 1, "should have updated exactly one row");
+        assert_eq!(db.count_memories_with_null_event_date().await.unwrap(), 0);
+
+        // Idempotent: second call no-ops.
+        let updated2 = backfill_event_dates(&db, |_sid| Some(now)).await.unwrap();
+        assert_eq!(updated2, 0, "second backfill should be no-op");
+    }
 }
