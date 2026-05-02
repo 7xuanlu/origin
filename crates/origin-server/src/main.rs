@@ -499,6 +499,20 @@ async fn run_daemon() -> anyhow::Result<()> {
             let url = format!("http://127.0.0.1:{}/api/health", port);
             match reqwest::get(&url).await {
                 Ok(resp) if resp.status().is_success() => {
+                    // Port already taken by a healthy daemon. If launchd is the
+                    // parent (XPC_SERVICE_NAME set), exit non-zero so launchd
+                    // retries after ThrottleInterval — otherwise launchd marks
+                    // this attempt as a clean exit and refuses to respawn even
+                    // after the winning daemon dies (KeepAlive.SuccessfulExit
+                    // = false treats exit-0 as success). For sidecar invocation
+                    // by the app, exit 0 is the right answer.
+                    if std::env::var_os("XPC_SERVICE_NAME").is_some() {
+                        tracing::info!(
+                            "Existing healthy daemon on port {} — exiting 75 (launchd retry)",
+                            port
+                        );
+                        std::process::exit(75);
+                    }
                     tracing::info!("Existing healthy daemon on port {} — exiting cleanly", port);
                     return Ok(());
                 }

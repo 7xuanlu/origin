@@ -759,7 +759,24 @@ pub fn run() {
             // Launch origin-server daemon as a sidecar process.
             // If a daemon is already running on the port, the sidecar exits cleanly.
             // The shell plugin kills the child when the Tauri app exits.
-            {
+            //
+            // Skip the sidecar entirely when launchd is managing the daemon
+            // (i.e. com.origin.server.plist is on disk). Otherwise app's
+            // sidecar wins the port race against launchd's daemon, which then
+            // exits 0 ("Existing healthy daemon"), gets marked successful by
+            // KeepAlive.SuccessfulExit=false, and refuses to respawn — so a
+            // later kill of the sidecar leaves no daemon at all. The fallback
+            // path (no plist on disk) is still useful for first-run before the
+            // first-run install runs and for dev environments without launchd.
+            let launchd_managed = dirs::home_dir()
+                .map(|h| h.join("Library/LaunchAgents/com.origin.server.plist"))
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if launchd_managed {
+                log::info!(
+                    "[init] launchd-managed daemon detected, skipping sidecar spawn"
+                );
+            } else {
                 use tauri_plugin_shell::ShellExt;
                 match app.shell().sidecar("origin-server") {
                     Ok(sidecar) => match sidecar.spawn() {
