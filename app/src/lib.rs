@@ -689,25 +689,61 @@ pub fn run() {
                 )?;
             }
 
-            // Tray icon: left-click toggles window, right-click menu with Show/Quit
+            // Tray icon: left-click toggles window, right-click menu with Show / Status / Quit
             {
-                use tauri::Manager;
                 use tauri::menu::{MenuBuilder, MenuItemBuilder};
                 use tauri::tray::TrayIconEvent;
+                use tauri::Manager;
 
                 let show_item = MenuItemBuilder::with_id("show", "Show Origin").build(app)?;
+                let status_item = MenuItemBuilder::with_id("status", "Status: Starting…")
+                    .enabled(false)
+                    .build(app)?;
                 let quit_item = MenuItemBuilder::with_id("quit", "Quit Origin").build(app)?;
                 let tray_menu = MenuBuilder::new(app)
                     .item(&show_item)
                     .separator()
+                    .item(&status_item)
+                    .separator()
                     .item(&quit_item)
                     .build()?;
 
-                let tray = app.tray_by_id("main").or_else(|| {
-                    app.tray_by_id("default")
-                });
+                let tray = app
+                    .tray_by_id("main")
+                    .or_else(|| app.tray_by_id("default"));
                 if let Some(tray) = tray {
                     let _ = tray.set_menu(Some(tray_menu));
+
+                    // Spawn health poller; it updates the icon as state changes.
+                    let signal = crate::tray_health::spawn_poller(handle.clone());
+
+                    // Periodically refresh the status label from the signal.
+                    {
+                        let status_item = status_item.clone();
+                        let sig = signal.clone();
+                        tauri::async_runtime::spawn(async move {
+                            loop {
+                                let label = match sig.current() {
+                                    crate::tray_health::DaemonState::Up => {
+                                        "Status: Up".to_string()
+                                    }
+                                    crate::tray_health::DaemonState::Starting => {
+                                        "Status: Starting…".to_string()
+                                    }
+                                    crate::tray_health::DaemonState::Down => {
+                                        let n = sig.consecutive_down_count();
+                                        if n >= 3 {
+                                            format!("Status: Down ({}s)", n as u32 * 5)
+                                        } else {
+                                            "Status: Down".to_string()
+                                        }
+                                    }
+                                };
+                                let _ = status_item.set_text(&label);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        });
+                    }
 
                     let handle_for_tray = handle.clone();
                     tray.on_tray_icon_event(move |_tray, event| {
@@ -726,19 +762,23 @@ pub fn run() {
                     });
 
                     let handle_for_menu = handle.clone();
-                    tray.on_menu_event(move |_tray, event| {
-                        match event.id().as_ref() {
-                            "show" => {
-                                if let Some(win) = handle_for_menu.get_webview_window("main") {
-                                    let _ = win.show();
-                                    let _ = win.set_focus();
-                                }
+                    tray.on_menu_event(move |_tray, event| match event.id().as_ref() {
+                        "show" => {
+                            if let Some(win) = handle_for_menu.get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.set_focus();
                             }
-                            "quit" => {
-                                std::process::exit(0);
-                            }
-                            _ => {}
                         }
+                        "quit" => {
+                            let h = handle_for_menu.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = crate::lifecycle::quit_origin(&h).await {
+                                    log::error!("[tray] quit_origin failed: {e}");
+                                    h.exit(1);
+                                }
+                            });
+                        }
+                        _ => {}
                     });
                 }
             }
