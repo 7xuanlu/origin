@@ -3308,3 +3308,26 @@ pub async fn list_recent_relations(
     };
     client.list_recent_relations(limit, since_ms).await
 }
+
+// ── Lifecycle commands ─────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn is_run_at_login_enabled() -> Result<bool, String> {
+    use crate::lifecycle::{is_run_at_login_enabled as inner, SystemLaunchctl};
+    Ok(inner(&SystemLaunchctl))
+}
+
+#[tauri::command]
+pub async fn set_run_at_login(enabled: bool) -> Result<(), String> {
+    use crate::lifecycle::{set_run_at_login as inner, SystemLaunchctl};
+    inner(enabled, &SystemLaunchctl)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn quit_origin_full(app_handle: tauri::AppHandle) -> Result<(), String> {
+    crate::lifecycle::quit_origin(&app_handle)
+        .await
+        .map_err(|e| e.to_string())
+}

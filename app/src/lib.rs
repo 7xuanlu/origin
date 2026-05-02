@@ -1119,6 +1119,10 @@ pub fn run() {
             // On-device model commands
             search::get_on_device_model,
             search::download_on_device_model,
+            // Lifecycle commands
+            search::is_run_at_login_enabled,
+            search::set_run_at_login,
+            search::quit_origin_full,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
