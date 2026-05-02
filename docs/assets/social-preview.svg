@@ -1,0 +1,65 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Origin social preview</title>
+  <desc id="desc">Origin: self-evolving memory for AI work.</desc>
+
+  <rect width="1280" height="640" rx="44" fill="#101024"/>
+
+  <g opacity="0.22">
+    <path d="M0 514C161 458 258 447 398 475C564 508 639 523 790 469C943 414 1053 401 1280 456V640H0V514Z" fill="#26345F"/>
+    <path d="M0 103C199 149 310 155 461 120C618 84 731 71 884 115C1030 157 1116 164 1280 130V0H0V103Z" fill="#172A4A"/>
+  </g>
+
+  <g opacity="0.17" stroke="#BFD8FF" stroke-width="1">
+    <path d="M88 96H1192"/>
+    <path d="M88 168H1192"/>
+    <path d="M88 240H1192"/>
+    <path d="M88 312H1192"/>
+    <path d="M88 384H1192"/>
+    <path d="M88 456H1192"/>
+    <path d="M88 528H1192"/>
+    <path d="M160 64V576"/>
+    <path d="M304 64V576"/>
+    <path d="M448 64V576"/>
+    <path d="M592 64V576"/>
+    <path d="M736 64V576"/>
+    <path d="M880 64V576"/>
+    <path d="M1024 64V576"/>
+    <path d="M1168 64V576"/>
+  </g>
+
+  <rect x="64" y="64" width="1152" height="512" rx="36" fill="#14142B" fill-opacity="0.78" stroke="#2F3769"/>
+
+  <g transform="translate(118 164)">
+    <rect width="312" height="312" rx="72" fill="#1A1A2E"/>
+    <circle cx="156" cy="156" r="98" stroke="url(#ring)" stroke-width="48"/>
+    <circle cx="197" cy="97" r="26" fill="url(#orb)"/>
+  </g>
+
+  <g transform="translate(506 151)">
+    <text x="0" y="0" fill="#93E3F2" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="26" font-weight="700" letter-spacing="3">
+      ORIGIN
+    </text>
+    <text x="0" y="97" fill="#F7F8FF" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="72" font-weight="760">
+      Self-evolving memory
+    </text>
+    <text x="0" y="181" fill="#F7F8FF" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="72" font-weight="760">
+      for AI work
+    </text>
+    <text x="0" y="255" fill="#BFC6E8" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="30" font-weight="500">
+      Local-first context across chats, projects, and time.
+    </text>
+  </g>
+
+  <defs>
+    <linearGradient id="ring" x1="58" y1="156" x2="254" y2="156" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6C63FF"/>
+      <stop offset="0.48" stop-color="#5BA3E6"/>
+      <stop offset="1" stop-color="#4AC8E8"/>
+    </linearGradient>
+    <radialGradient id="orb" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(189 87) rotate(52) scale(47)">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.45" stop-color="#A5C4F7"/>
+      <stop offset="1" stop-color="#4AC8E8"/>
+    </radialGradient>
+  </defs>
+</svg>

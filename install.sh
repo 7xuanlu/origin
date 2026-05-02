@@ -203,8 +203,8 @@ else
   printf '     That replaces the stable com.origin.server LaunchAgent.\n'
   printf '\n'
 fi
-printf '\033[1;33mNote:\033[0m On first run, origin-server downloads the on-device AI model\n'
-printf '      (~2.7 GB). This happens once and runs in the background.\n'
+printf '\033[1;33mNote:\033[0m Origin can store and retrieve memories without downloading an on-device model.\n'
+printf '      Local synthesis models are opt-in from the desktop app settings.\n'
 if [[ -n "${REQUESTED_TAG}" ]]; then
   printf '      Manual release page for this install: %s\n' "${RELEASE_PAGE}"
 fi
