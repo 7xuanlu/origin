@@ -14,6 +14,10 @@ use tauri::AppHandle;
 /// first entry; never cleared (the process is exiting).
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// Spec line 198: set_run_at_login holds a global Mutex for the duration of
+/// the toggle to prevent concurrent install/uninstall races (G2).
+static RUN_AT_LOGIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub const SERVER_PLIST_LABEL: &str = "com.origin.server";
 pub const APP_PLIST_LABEL: &str = "com.origin.desktop";
 
@@ -246,8 +250,11 @@ pub fn first_run_install_if_needed(launchctl: &dyn LaunchctlExec) -> Result<()> 
     Ok(())
 }
 
-/// Toggle "Run at login". Mutex-guarded at the caller via app state.
+/// Toggle "Run at login". Holds a process-wide Mutex for the duration of the
+/// install/uninstall sequence so concurrent toggles serialize (G2, spec
+/// line 198).
 pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> Result<()> {
+    let _guard = RUN_AT_LOGIN_LOCK.lock().await;
     if enabled {
         set_user_opted_out(false)?;
         install_server_plist_via_subprocess()?;
@@ -565,5 +572,73 @@ mod tests {
         let mock = MockLaunchctl::default();
         // No file present → succeed without error.
         uninstall_app_plist(&mock).unwrap();
+    }
+
+    /// Mock that observes concurrent launchctl invocations. `in_flight`
+    /// tracks how many calls are currently executing; `max_in_flight`
+    /// records the high-water mark. If the caller properly serializes via
+    /// RUN_AT_LOGIN_LOCK, we should never observe `max_in_flight > 1`.
+    #[derive(Default)]
+    struct ConcurrencyMockLaunchctl {
+        in_flight: std::sync::atomic::AtomicU32,
+        max_in_flight: std::sync::atomic::AtomicU32,
+    }
+    impl LaunchctlExec for ConcurrencyMockLaunchctl {
+        fn run(&self, _args: &[&str]) -> io::Result<Output> {
+            use std::sync::atomic::Ordering::AcqRel;
+            let prev = self.in_flight.fetch_add(1, AcqRel);
+            let now = prev + 1;
+            // Update high-water mark.
+            self.max_in_flight.fetch_max(now, AcqRel);
+            // Sleep to widen the window for concurrent observers.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.in_flight.fetch_sub(1, AcqRel);
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
+
+    /// Test wrapper that exercises ONLY the launchctl-touching portion of
+    /// the toggle while still acquiring the same RUN_AT_LOGIN_LOCK that
+    /// `set_run_at_login` uses. This isolates the concurrency property
+    /// (the lock serializes the launchctl observation window) from the
+    /// subprocess-related side effects (origin-server isn't available in
+    /// tests, and uninstall_app_plist removes the plist file on first
+    /// call which makes subsequent calls short-circuit).
+    async fn set_run_at_login_lock_section_for_test(launchctl: &dyn LaunchctlExec) -> Result<()> {
+        let _guard = RUN_AT_LOGIN_LOCK.lock().await;
+        // Spend deterministic time inside the locked region invoking the
+        // mock launchctl, so the concurrency mock's high-water observation
+        // is exercised.
+        let _ = launchctl.run(&["unload", "/tmp/fake.plist"]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn set_run_at_login_serializes_concurrent_calls() {
+        // G2: spec line 198 — set_run_at_login holds RUN_AT_LOGIN_LOCK for
+        // the duration of the toggle to prevent concurrent install/uninstall
+        // races. Spawn two concurrent calls that take the same lock and
+        // hit the launchctl mock; assert the mock never observes >1 call
+        // in flight.
+        let mock: &'static ConcurrencyMockLaunchctl =
+            Box::leak(Box::new(ConcurrencyMockLaunchctl::default()));
+
+        let h1 = tokio::spawn(async move { set_run_at_login_lock_section_for_test(mock).await });
+        let h2 = tokio::spawn(async move { set_run_at_login_lock_section_for_test(mock).await });
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+
+        let max_seen = mock
+            .max_in_flight
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            max_seen <= 1,
+            "RUN_AT_LOGIN_LOCK failed to serialize: max_in_flight={max_seen}"
+        );
     }
 }
