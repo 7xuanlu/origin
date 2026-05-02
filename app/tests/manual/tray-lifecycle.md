@@ -34,7 +34,7 @@ sudo xattr -cr /Applications/Origin.app
 | 6 | Settings → toggle "Run at login" off | App exits within 2s; daemon dies; plists removed from `~/Library/LaunchAgents/` |
 | 7 | Open Origin.app from /Applications (after Step 6) | App runs; setup() detects `auto_start_disabled.flag` exists, skips silent install; daemon spawned as Tauri child (fallback mode) |
 | 8 | Settings → toggle "Run at login" on | Daemon up; tray active; plists re-installed; `auto_start_disabled.flag` removed |
-| 9 | `kill -9 $(lsof -ti :7878)` | Tray icon dim ~5s, then active again (launchd respawn) |
+| 9 | `pkill -9 -f origin-server` (do NOT use `kill $(lsof -ti :7878)` — `lsof` returns the app's keep-alive client too, so it kills both) | Tray icon dim ~5s, then active again (launchd respawn) |
 | 10 | Force-quit Origin.app via Activity Monitor | Tray gone ~5s, then back (launchd respawn) |
 | 11 | Open Origin.app from Dock when LaunchAgent already started it | Existing instance focused via single-instance plugin (no duplicate process; check `pgrep -c -f "MacOS/origin"`) |
 | 12 | First run with `chmod -w ~/Library/LaunchAgents/` (perms denied) | Toast: "Origin background mode unavailable…"; app works in fallback mode |
