@@ -26,6 +26,7 @@ tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
 
 # Dev-only: gives Claude Code / MCP clients control over the running app
 # (screenshots, DOM, click/type). Excluded from release builds via debug_assertions.
