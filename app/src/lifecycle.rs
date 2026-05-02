@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::Duration;
+use tauri::AppHandle;
 
 pub const SERVER_PLIST_LABEL: &str = "com.origin.server";
 pub const APP_PLIST_LABEL: &str = "com.origin.desktop";
@@ -189,6 +191,25 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
         uninstall_app_plist(launchctl)?;
         uninstall_server_plist_via_subprocess()?;
     }
+    Ok(())
+}
+
+pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
+    // 1. Tell daemon to shut down cleanly
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let _ = client
+        .post("http://127.0.0.1:7878/api/shutdown")
+        .send()
+        .await;
+
+    // 2. Wait briefly for daemon to flush
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 3. Tauri-graceful exit. KeepAlive.SuccessfulExit=false means
+    //    launchd does NOT respawn after clean exit.
+    app_handle.exit(0);
     Ok(())
 }
 
