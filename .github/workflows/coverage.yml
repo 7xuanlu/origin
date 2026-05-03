@@ -29,7 +29,8 @@ jobs:
     name: Coverage report
     runs-on: macos-latest
     if: >-
-      !startsWith(github.event.head_commit.message, 'chore(main): release')
+      github.event_name != 'pull_request' ||
+      !startsWith(github.head_ref, 'release-please--branches--')
     # Informational: never blocks merges. Failing this job is a warning, not a
     # gate. Required-status-checks should NOT include this job.
     continue-on-error: true
