@@ -28,6 +28,7 @@ import IdentityDetail from "./components/memory/IdentityDetail";
 import Main from "./components/memory/Main";
 import SetupWizard from "./components/SetupWizard";
 import { MilestoneToaster } from "./components/onboarding/MilestoneToaster";
+import UpdaterDialog from "./components/UpdaterDialog";
 
 const MEMORY_WIDTH = 1280;
 const MEMORY_HEIGHT = 720;
@@ -258,6 +259,7 @@ export default function App() {
         />
       )}
       <MilestoneToaster />
+      <UpdaterDialog />
     </div>
   );
 }

@@ -6,6 +6,9 @@
 // transition feels like "the sidebar switched modes" rather than "a
 // different layout loaded".
 
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+
 export type SettingsSection =
   | "capture"
   | "sources"
@@ -104,6 +107,10 @@ export default function SettingsSidebar({
   onSelect,
   onNavigateHome,
 }: SettingsSidebarProps) {
+  const [appVersion, setAppVersion] = useState<string>("");
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(""));
+  }, []);
   return (
     <aside
       className="flex-shrink-0 flex flex-col transition-[width] duration-200 ease-out"
@@ -252,6 +259,21 @@ export default function SettingsSidebar({
               }}
             >
               Local-only. Your data never leaves this machine.
+              {appVersion && (
+                <>
+                  <span aria-hidden style={{ margin: "0 5px", opacity: 0.55 }}>·</span>
+                  <span
+                    style={{
+                      fontFamily: "var(--mem-font-mono)",
+                      fontSize: "9.5px",
+                      letterSpacing: "0.02em",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    v{appVersion}
+                  </span>
+                </>
+              )}
             </span>
           </div>
         </div>
