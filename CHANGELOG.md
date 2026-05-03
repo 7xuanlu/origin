@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0](https://github.com/7xuanlu/origin/compare/v0.1.4...v0.2.0) (2026-05-03)
+
+
+### Features
+
+* Tauri auto-updater + pnpm update-all + UX polish ([#30](https://github.com/7xuanlu/origin/issues/30)) ([d898d6b](https://github.com/7xuanlu/origin/commit/d898d6b901ee85c2adbb7d31dbc4624dd2f016a2))
+* tray + lifecycle decoupling (LSUIElement + launchd) ([#39](https://github.com/7xuanlu/origin/issues/39)) ([b185967](https://github.com/7xuanlu/origin/commit/b185967cf17e1b1f49824aa93bc358f528616c03))
+
+
+### Bug Fixes
+
+* **ci:** use RELEASE_TOKEN for version-sync push in release-please ([#24](https://github.com/7xuanlu/origin/issues/24)) ([585b7b0](https://github.com/7xuanlu/origin/commit/585b7b02549ce4b3aeaf9f30bb62d0e3d4f72dd0))
+* **db:** insert_concept dual-writes concept_sources at creation ([#37](https://github.com/7xuanlu/origin/issues/37)) ([239fe35](https://github.com/7xuanlu/origin/commit/239fe35bbc96782cbff3eb79d1cf28f529030111))
+* **db:** migration 44 backfills concept_sources from source_memory_ids JSON ([#36](https://github.com/7xuanlu/origin/issues/36)) ([7791811](https://github.com/7xuanlu/origin/commit/77918111791f124569e0d11b974e209dd001ed20))
+* eval module restructure + Batch API integration ([#27](https://github.com/7xuanlu/origin/issues/27)) ([2ca12c1](https://github.com/7xuanlu/origin/commit/2ca12c1d10a2880bcf8056a7afd3d9b8fcefdc6e))
+* **eval:** default enrichment to on-device, drop dead token_efficiency.rs ([b23f0bd](https://github.com/7xuanlu/origin/commit/b23f0bda7fbebeffde5b4a49af92e0a30ba4cd17))
+* **eval:** EVAL_BASELINES_DIR env var for worktree-agnostic cache sharing ([#33](https://github.com/7xuanlu/origin/issues/33)) ([f855932](https://github.com/7xuanlu/origin/commit/f855932a761858372d7242fa4007833173efadbc))
+* **eval:** per-scenario DBs in full-pipeline eval (LoCoMo + LME) ([#32](https://github.com/7xuanlu/origin/issues/32)) ([2566c61](https://github.com/7xuanlu/origin/commit/2566c612e5eae5c3dbcd491c3ac9b44dd543b57f))
+* full-pipeline eval + source overlap concept gate + 3 production bugs ([#29](https://github.com/7xuanlu/origin/issues/29)) ([e8923b7](https://github.com/7xuanlu/origin/commit/e8923b720750de434e257378f829ddcc0d16bf79))
+* **hooks:** pre-push skips clippy + tests + coverage on docs-only changes ([#26](https://github.com/7xuanlu/origin/issues/26)) ([e3c0124](https://github.com/7xuanlu/origin/commit/e3c0124831ffd446121c942bb37dc40a275cc480))
+* **updater:** in-app toast overlay + Settings version footer ([#40](https://github.com/7xuanlu/origin/issues/40)) ([b51d244](https://github.com/7xuanlu/origin/commit/b51d24477b5668f615c849149c4a663d5e4ffb20))
+
 ## [0.1.4](https://github.com/7xuanlu/origin/compare/v0.1.3...v0.1.4) (2026-04-26)
 
 
