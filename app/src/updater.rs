@@ -1,18 +1,12 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-use tauri_plugin_notification::NotificationExt;
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
-/// How long a "Later" dismissal of a given version suppresses re-prompts.
 const SUPPRESS_TTL: Duration = Duration::from_secs(24 * 3600);
-
-/// Delay before the first update check so the main app window has time to
-/// paint — otherwise the dialog can appear before the window, leaving the
-/// user unsure which app is asking.
 const STARTUP_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -60,9 +54,40 @@ fn record_dismissal(app: &AppHandle, version: &str) {
     }
 }
 
+/// Emit `updater://available` to the main webview and wait for the user's
+/// choice via the `updater://action` event. The actual UI is rendered by
+/// `UpdaterDialog` inside the main window's React tree (see
+/// `src/components/UpdaterDialog.tsx`), so the dialog stays attached to the
+/// app window and travels with it.
+async fn prompt_via_overlay(app: &AppHandle, version: &str) -> bool {
+    let _ = app.emit(
+        "updater://available",
+        serde_json::json!({ "version": version }),
+    );
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+
+    let tx_action = Arc::clone(&tx);
+    let action_id = app.listen("updater://action", move |event| {
+        let payload = event.payload();
+        let install = payload.contains("install");
+        if let Ok(mut g) = tx_action.lock() {
+            if let Some(sender) = g.take() {
+                let _ = sender.send(install);
+            }
+        }
+    });
+
+    let accepted = rx.await.unwrap_or(false);
+    app.unlisten(action_id);
+    accepted
+}
+
 /// Check for an update on startup. If one exists and the user hasn't dismissed
-/// it within the last 24 hours, prompt the user; on accept, download + install
-/// + relaunch. Failures are logged, never blocking.
+/// it within the last 24 hours, prompt via an in-app overlay; on accept,
+/// download + install + relaunch with progress events. Failures are logged
+/// and surfaced in the overlay, never blocking.
 pub async fn check_and_prompt(app: AppHandle) {
     tokio::time::sleep(STARTUP_DELAY).await;
 
@@ -90,55 +115,37 @@ pub async fn check_and_prompt(app: AppHandle) {
         return;
     }
 
-    // OkCancelCustom: clicking the red X / pressing Esc returns false (Cancel).
-    let accepted = app
-        .dialog()
-        .message(format!(
-            "Origin {version} is available. Download and install now?"
-        ))
-        .kind(MessageDialogKind::Info)
-        .title("Update available")
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Install".into(),
-            "Later".into(),
-        ))
-        .blocking_show();
+    let accepted = prompt_via_overlay(&app, &version).await;
 
     if !accepted {
         record_dismissal(&app, &version);
         return;
     }
 
-    // The Tauri dialog disappears when the user clicks Install, but
-    // download_and_install can take 5-60s for a multi-MB bundle. Use system
-    // notifications to keep the user informed instead of leaving them staring
-    // at a vanished dialog wondering if the app is frozen.
-    let _ = app
-        .notification()
-        .builder()
-        .title("Origin")
-        .body(format!("Downloading update v{version}…"))
-        .show();
+    let app_chunk = app.clone();
+    let on_chunk = move |chunk_len: usize, total: Option<u64>| {
+        let _ = app_chunk.emit(
+            "updater://progress",
+            serde_json::json!({
+                "chunk": chunk_len,
+                "total": total,
+            }),
+        );
+    };
+    let app_done = app.clone();
+    let on_done = move || {
+        let _ = app_done.emit("updater://progress", serde_json::json!({ "done": true }));
+    };
 
-    if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+    if let Err(e) = update.download_and_install(on_chunk, on_done).await {
         log::error!("update install failed: {e}");
-        let _ = app
-            .notification()
-            .builder()
-            .title("Origin update failed")
-            .body(format!("{e}. The current version will keep running."))
-            .show();
+        let _ = app.emit(
+            "updater://progress",
+            serde_json::json!({ "error": format!("{e}") }),
+        );
         return;
     }
 
-    let _ = app
-        .notification()
-        .builder()
-        .title("Origin")
-        .body(format!("Update v{version} installed. Restarting…"))
-        .show();
-    // Brief pause so the notification has time to appear before the process exits.
     tokio::time::sleep(Duration::from_millis(800)).await;
-
     app.restart();
 }
