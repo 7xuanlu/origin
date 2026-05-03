@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/7xuanlu/origin/compare/v0.2.0...v0.2.1) (2026-05-03)
+
+
+### Bug Fixes
+
+* **updater:** emit release updater metadata ([#43](https://github.com/7xuanlu/origin/issues/43)) ([ceedde4](https://github.com/7xuanlu/origin/commit/ceedde4a82979838b0f56e586e77722e0c0b16f0))
+
 ## [0.2.0](https://github.com/7xuanlu/origin/compare/v0.1.4...v0.2.0) (2026-05-03)
 
 
