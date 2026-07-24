@@ -1561,6 +1561,28 @@ fn edges_reconcile_enabled_value(value: Option<&str>) -> bool {
     })
 }
 
+/// Gate for the background entity/page-parity reconcile sweep (M3 PR-2,
+/// stage a). Opt-in: default OFF; enable with
+/// WENLAN_ENABLE_ENTITY_PAGE_RECONCILE=1/true/yes. The sweep is read-only
+/// apart from the single `entity_page_parity_watermark` UPSERT that
+/// [`MemoryDB::reconcile_entity_page_parity`] stamps; it never flips a reader
+/// (that is stage b's manual cutover lever). No LLM. It remains opt-in until
+/// the full-store scan has a measured foreground-latency and memory ceiling,
+/// mirroring [`edges_reconcile_enabled`].
+pub fn entity_page_reconcile_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_ENTITY_PAGE_RECONCILE").ok();
+    entity_page_reconcile_enabled_value(value.as_deref())
+}
+
+fn entity_page_reconcile_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 /// True iff `WENLAN_RERANK_SKIP_PREFERENCE` is truthy. OPT-IN, default OFF.
 ///
 /// When ON, preference/recommendation-seeking queries (per
@@ -73093,6 +73115,29 @@ pub(crate) mod tests {
         for value in [Some("1"), Some("true"), Some("yes"), Some(" TRUE ")] {
             assert!(
                 edges_reconcile_enabled_value(value),
+                "{value:?} must enable"
+            );
+        }
+    }
+
+    #[test]
+    fn entity_page_reconcile_enabled_is_explicit_opt_in() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !entity_page_reconcile_enabled_value(value),
+                "{value:?} must not enable an unbounded full-store background scan"
+            );
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), Some(" TRUE ")] {
+            assert!(
+                entity_page_reconcile_enabled_value(value),
                 "{value:?} must enable"
             );
         }
