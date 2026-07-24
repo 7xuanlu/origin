@@ -573,7 +573,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 93;
+pub const SCHEMA_VERSION: u32 = 94;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8079,6 +8079,18 @@ impl MemoryDB {
             if version < 93 {
                 self.migrate_93_page_aliases(version).await?;
             }
+
+            // Migration 94 (M3 PR-2, stage a): the entity<->page reader-
+            // cutover control plane -- `entity_reader_cutover` (per-consumer
+            // intent, wired by stage b, not this PR) and
+            // `entity_page_parity_watermark` (the stage-a reconciliation
+            // proof this PR stamps via `reconcile_entity_page_parity`). Pure
+            // `CREATE TABLE IF NOT EXISTS`, no data mutation, no behavior
+            // change -- mirrors migration 82 (M2 PR-2). See
+            // ensure_entity_cutover_tables.
+            if version < 94 {
+                self.migrate_94_entity_reader_cutover(version).await?;
+            }
         }
 
         Ok(())
@@ -9990,6 +10002,89 @@ impl MemoryDB {
         log::info!("[migration] Migration 93 applied: pages.aliases added + entity shadows backfilled, M3 PR-1 item C");
         Ok(())
     }
+
+    // Migration 94 (M3 PR-2, stage a). Adds the entity<->page reader-cutover
+    // control plane on top of PR-1's write-only `kind='entity'` shadow:
+    //
+    //   * `entity_reader_cutover` -- one row per named READER (a "consumer",
+    //     mirroring `edges_reader_cutover`). `enabled=0` keeps the consumer
+    //     on the legacy `entities` store; a flip to `1` is REVERSIBLE. Default
+    //     is empty/OFF, so this migration changes NO read behavior. Stage b
+    //     (not this PR) wires the actual gating predicate that reads it; this
+    //     migration only creates the table so PR-2 ships as ONE schema bump.
+    //   * `entity_page_parity_watermark` -- the durable proof from this
+    //     stage's reconciliation sweep (`reconcile_entity_page_parity`): the
+    //     epoch it was proven under, the drift count (0 == every `entities`
+    //     row has a byte-identical, live `kind='entity'` shadow page), and a
+    //     report. A single row (`id=1`).
+    //
+    // The dual-write EPOCH already lives on
+    // `entity_page_migration_state.epoch` (M3 PR-1, migration 92).
+    //
+    // Replay-safe: pure `CREATE TABLE IF NOT EXISTS` inside one BEGIN/COMMIT,
+    // no backfill, no data mutation -- kill/rerun converges trivially.
+    async fn ensure_entity_cutover_tables(conn: &libsql::Connection) -> Result<(), WenlanError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entity_reader_cutover (
+                consumer TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+                cutover_epoch INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_page_parity_watermark (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                proven_epoch INTEGER,
+                drift_count INTEGER,
+                checked_at INTEGER,
+                report_json TEXT
+            );",
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("entity cutover DDL: {e}")))?;
+        Ok(())
+    }
+
+    async fn migrate_94_entity_reader_cutover(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        // §6.9: pre-migration online backup + integrity receipt BEFORE any
+        // DDL, mirroring migration 82.
+        self.backup_before_migration(94, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m94 begin: {e}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            Self::ensure_entity_cutover_tables(&conn).await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m94 commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+        drop(conn);
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 94", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m94 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 94 applied: entity reader-cutover control plane (M3 PR-2 stage a)"
+        );
+        Ok(())
+    }
 }
 
 /// Per-store backfill tally for the M2 PR-1 migration report (spec §2
@@ -10064,6 +10159,45 @@ pub struct ParityReport {
 }
 
 impl ParityReport {
+    const SAMPLE_CAP: usize = 20;
+}
+
+/// Stage-a reconciliation result (M3 PR-2): the parity proof that every
+/// `entities` row has a byte-identical, live `kind='entity'` shadow page --
+/// the invariant M3 PR-1's dual-write established. `drift_count == 0` means
+/// the invariant holds. Mirrors [`ParityReport`] for M2's `edges`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EntityPageParityReport {
+    /// Dual-write epoch the sweep ran under (stamped into the watermark).
+    pub epoch: i64,
+    /// Total `entities` rows (the expected set size).
+    pub expected_active: usize,
+    /// Live (`status='active'`) `kind='entity'` pages (the actual set size).
+    pub actual_active: usize,
+    /// An entity with no live shadow: no map row, its mapped page is gone,
+    /// or its mapped page is not `kind='entity'`/no longer live.
+    pub missing_count: usize,
+    /// A structural artifact with no valid counterpart: an orphan
+    /// `entity_page_map` row (entity or page side missing) or a live
+    /// `kind='entity'` page absent from the map.
+    pub extra_count: usize,
+    /// Same entity present and mapped to a live shadow, but the shadow's
+    /// mirrored fields (name, entity_type, confidence, space semantics,
+    /// aliases) disagree with the live `entities` row.
+    pub corrupt_count: usize,
+    /// `missing_count + extra_count + corrupt_count`; the single number a
+    /// future reader gate would read.
+    pub drift_count: usize,
+    /// Up to `SAMPLE_CAP` missing entity ids (sorted), for debugging a drift.
+    pub missing_sample: Vec<String>,
+    /// Up to `SAMPLE_CAP` extra ids (sorted) -- entity ids for orphan map
+    /// rows, page ids for orphan pages.
+    pub extra_sample: Vec<String>,
+    /// Up to `SAMPLE_CAP` corrupt entity ids (sorted).
+    pub corrupt_sample: Vec<String>,
+}
+
+impl EntityPageParityReport {
     const SAMPLE_CAP: usize = 20;
 }
 
@@ -10824,6 +10958,248 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("reconcile report json: {e}")))?;
         conn.execute(
             "INSERT INTO edges_parity_watermark (id, proven_epoch, drift_count, checked_at, report_json)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 proven_epoch = excluded.proven_epoch,
+                 drift_count = excluded.drift_count,
+                 checked_at = excluded.checked_at,
+                 report_json = excluded.report_json",
+            libsql::params![epoch, drift_count as i64, now, report_json],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("reconcile watermark: {e}")))?;
+
+        Ok(report)
+    }
+
+    // ===== M3 PR-2 stage a: entity<->page parity reconciliation =====
+
+    /// The current entity dual-write coverage epoch (M3 PR-1, migration 92:
+    /// `entity_page_migration_state`, seeded to 1 by that migration). Mirrors
+    /// `current_dual_write_epoch` for `edges`. Returns `None` when there is
+    /// no trustworthy current epoch -- a missing state row OR an undecodable
+    /// `epoch` column -- and callers must treat that as "gate closed / cannot
+    /// prove", never fabricate a generation.
+    async fn current_entity_dual_write_epoch(
+        conn: &libsql::Connection,
+    ) -> Result<Option<i64>, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT epoch FROM entity_page_migration_state WHERE id = 1",
+                (),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0).ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Stage-a reconciliation sweep (M3 PR-2): proves every `entities` row
+    /// has a byte-identical, live `kind='entity'` shadow page -- the
+    /// dual-write invariant M3 PR-1 established. Stamps
+    /// `entity_page_parity_watermark` with the drift and the current epoch;
+    /// a future stage b's reader-cutover gate (not built in this PR) would
+    /// only flip a consumer on a clean, current watermark, mirroring
+    /// `reader_uses_edges` for M2.
+    ///
+    /// SQLite discipline (§6.3): reads only, then ONE watermark UPSERT; no
+    /// transaction spans anything (no LLM/embedding calls here). Enumerates
+    /// rows rather than trusting `COUNT(*)` -- both `entities` and `pages`
+    /// carry `F32_BLOB` vector-indexed columns, so a bare `COUNT(*)` is
+    /// subject to the same libsql vector-index COUNT bug `reconcile_edges_parity`
+    /// avoids.
+    pub async fn reconcile_entity_page_parity(
+        &self,
+    ) -> Result<EntityPageParityReport, WenlanError> {
+        let conn = self.conn.lock().await;
+        // No current epoch (missing/corrupt entity_page_migration_state) =>
+        // nothing trustworthy to stamp a watermark under; fail loud rather
+        // than proving parity against a fabricated epoch.
+        let epoch = Self::current_entity_dual_write_epoch(&conn)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("reconcile epoch: {e}")))?
+            .ok_or_else(|| {
+                WenlanError::VectorDb(
+                    "reconcile_entity_page_parity: no current dual-write epoch \
+                     (missing/corrupt entity_page_migration_state)"
+                        .to_string(),
+                )
+            })?;
+
+        // expected_active + missing/corrupt: every `entities` row, LEFT
+        // JOINed onto its live (`status='active'`, `kind='entity'`) shadow.
+        // A NULL join (no map row, the mapped page is gone, or it is no
+        // longer live) is missing; a matched row whose mirrored fields
+        // disagree is corrupt. The mirrored fields are exactly what
+        // `insert_entity_shadow_page`/`update_entity_shadow_page` write:
+        // name, entity_type, confidence, space semantics (both `space` and
+        // `workspace` carry the same unfiled-sentinel fold), and the
+        // `entity_aliases` projection (recomputed here the same way
+        // `update_entity_shadow_page` does, so a shadow whose aliases were
+        // never re-synced after an alias change is flagged corrupt).
+        let mut expected_active = 0usize;
+        let mut missing_count = 0usize;
+        let mut missing_sample: Vec<String> = Vec::new();
+        let mut corrupt_count = 0usize;
+        let mut corrupt_sample: Vec<String> = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT e.id, e.name, e.entity_type, e.confidence, e.space,
+                            p.title, p.entity_type, p.confidence, p.space, p.workspace, p.aliases,
+                            (SELECT json_group_array(alias_name) FROM (
+                                SELECT alias_name FROM entity_aliases
+                                WHERE canonical_entity_id = e.id ORDER BY alias_name
+                             )) AS expected_aliases
+                     FROM entities e
+                     LEFT JOIN entity_page_map m ON m.entity_id = e.id
+                     LEFT JOIN pages p ON p.id = m.page_id
+                         AND p.kind = 'entity' AND p.status = 'active'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile entities: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile entities row: {e}")))?
+            {
+                expected_active += 1;
+                let entity_id: String = row.get(0).unwrap_or_default();
+                let name: String = row.get(1).unwrap_or_default();
+                let entity_type: String = row.get(2).unwrap_or_default();
+                let confidence: Option<f64> = row.get(3).unwrap_or(None);
+                let space: Option<String> = row.get(4).unwrap_or(None);
+                let expected_space = space.unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
+                let expected_aliases: Option<String> = row.get(11).unwrap_or(None);
+
+                let page_title: Option<String> = row.get(5).unwrap_or(None);
+                let Some(page_title) = page_title else {
+                    missing_count += 1;
+                    if missing_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                        missing_sample.push(entity_id.clone());
+                    }
+                    continue;
+                };
+                let page_entity_type: String = row.get(6).unwrap_or_default();
+                let page_confidence: Option<f64> = row.get(7).unwrap_or(None);
+                let page_space: Option<String> = row.get(8).unwrap_or(None);
+                let page_workspace: Option<String> = row.get(9).unwrap_or(None);
+                let page_aliases: Option<String> = row.get(10).unwrap_or(None);
+
+                let matches = page_title == name
+                    && page_entity_type == entity_type
+                    && page_confidence == confidence
+                    && page_space.as_deref() == Some(expected_space.as_str())
+                    && page_workspace.as_deref() == Some(expected_space.as_str())
+                    && page_aliases == expected_aliases;
+                if !matches {
+                    corrupt_count += 1;
+                    if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                        corrupt_sample.push(entity_id.clone());
+                    }
+                }
+            }
+        }
+
+        // actual_active: live kind='entity' pages, enumerated independently
+        // of the join above (a raw population count for the report).
+        let mut actual_active = 0usize;
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM pages WHERE kind = 'entity' AND status = 'active'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile pages: {e}")))?;
+            while rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile pages row: {e}")))?
+                .is_some()
+            {
+                actual_active += 1;
+            }
+        }
+
+        // extra: (a) orphan `entity_page_map` rows -- entity or page side
+        // missing. `entity_id`/`page_id` both carry `ON DELETE CASCADE`, so
+        // this is unreachable via normal writes (mirrors the
+        // `backfill_edges_from_relations` "unknown" branch: a defensive
+        // check, not a live case on this schema); (b) a live kind='entity'
+        // page with no map row at all (an unclaimed shadow).
+        let mut extra_count = 0usize;
+        let mut extra_sample: Vec<String> = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT m.entity_id FROM entity_page_map m
+                     WHERE NOT EXISTS (SELECT 1 FROM entities e WHERE e.id = m.entity_id)
+                        OR NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = m.page_id)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan map: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan map row: {e}")))?
+            {
+                extra_count += 1;
+                if extra_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                    extra_sample.push(row.get::<String>(0).unwrap_or_default());
+                }
+            }
+        }
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT p.id FROM pages p
+                     WHERE p.kind = 'entity' AND p.status = 'active'
+                       AND NOT EXISTS (SELECT 1 FROM entity_page_map m WHERE m.page_id = p.id)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan pages: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan pages row: {e}")))?
+            {
+                extra_count += 1;
+                if extra_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                    extra_sample.push(row.get::<String>(0).unwrap_or_default());
+                }
+            }
+        }
+
+        missing_sample.sort();
+        extra_sample.sort();
+        corrupt_sample.sort();
+        let drift_count = missing_count + extra_count + corrupt_count;
+
+        let report = EntityPageParityReport {
+            epoch,
+            expected_active,
+            actual_active,
+            missing_count,
+            extra_count,
+            corrupt_count,
+            drift_count,
+            missing_sample,
+            extra_sample,
+            corrupt_sample,
+        };
+
+        // Stamp the watermark: proven_epoch is always the epoch we scanned
+        // under, drift_count is the result.
+        let now = chrono::Utc::now().timestamp();
+        let report_json = serde_json::to_string(&report)
+            .map_err(|e| WenlanError::VectorDb(format!("reconcile report json: {e}")))?;
+        conn.execute(
+            "INSERT INTO entity_page_parity_watermark (id, proven_epoch, drift_count, checked_at, report_json)
              VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
                  proven_epoch = excluded.proven_epoch,
@@ -76555,6 +76931,274 @@ pub(crate) mod tests {
         assert_eq!(
             et, "person",
             "the canonical shadow must reflect the promoted entity_type"
+        );
+    }
+
+    // -- M3 PR-2 stage a: entity<->page parity reconciliation + watermark
+    // (migration 94) --
+
+    #[tokio::test]
+    async fn migration_94_creates_entity_cutover_control_plane() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        for table in ["entity_reader_cutover", "entity_page_parity_watermark"] {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(present, 1, "{table} must exist after migration 94");
+        }
+        let uv: i64 = {
+            let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(uv as u32, crate::db::SCHEMA_VERSION);
+    }
+
+    /// Fresh-DB (via `test_db`, above) vs upgraded-from-93 must agree: rewind
+    /// `user_version` to 93 (simulating a real pre-PR-2 database) and re-fire
+    /// migrations; replay-safety (`CREATE TABLE IF NOT EXISTS`) means the
+    /// tables must still be present afterward with no error, mirroring
+    /// `rerun_migration_89`.
+    #[tokio::test]
+    async fn migration_94_replay_safe_from_93() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("PRAGMA user_version = 93", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("migration 94 re-fires cleanly from a v93 database");
+
+        let conn = db.conn.lock().await;
+        for table in ["entity_reader_cutover", "entity_page_parity_watermark"] {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(
+                present, 1,
+                "{table} must exist after replaying migration 94"
+            );
+        }
+        let uv: i64 = {
+            let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(uv as u32, crate::db::SCHEMA_VERSION);
+    }
+
+    /// Read the `(proven_epoch, drift_count)` off the entity-page parity
+    /// watermark. Mirrors `parity_watermark_row` for `edges_parity_watermark`.
+    async fn entity_page_parity_watermark_row(
+        conn: &libsql::Connection,
+    ) -> Option<(Option<i64>, Option<i64>)> {
+        let mut rows = conn
+            .query(
+                "SELECT proven_epoch, drift_count FROM entity_page_parity_watermark WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .map(|row| (row.get(0).unwrap(), row.get(1).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn reconcile_clean_dual_write_reports_zero_drift_and_stamps_watermark() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.store_entity("Bob", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert_eq!(
+            report.drift_count, 0,
+            "live dual-write must reconcile clean (report={report:?})"
+        );
+        assert_eq!(report.expected_active, 2);
+        assert_eq!(report.actual_active, 2);
+
+        let conn = db.conn.lock().await;
+        let (proven, drift) = entity_page_parity_watermark_row(&conn).await.unwrap();
+        assert_eq!((proven, drift), (Some(1), Some(0)));
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_entity_with_no_map_row() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Unmapped", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params![eid.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.missing_count >= 1,
+            "an entity with no map row is missing (report={report:?})"
+        );
+        assert!(report.missing_sample.contains(&eid));
+        assert!(report.drift_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_map_row_whose_page_is_not_live() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Archived Shadow", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET status = 'archived' WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.missing_count >= 1,
+            "a map row whose page is no longer live is missing its shadow (report={report:?})"
+        );
+        assert!(report.missing_sample.contains(&eid));
+        assert!(report.drift_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_extra_entity_page_not_in_map() {
+        let (db, _dir) = test_db().await;
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO pages (
+                    id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                    space, workspace, source_memory_ids, version, status,
+                    created_at, last_compiled, last_modified, creation_kind, review_status
+                 ) VALUES (
+                    'orphan_shadow', 'Orphan', NULL, '', 'entity', 'person', NULL, 0,
+                    ?1, ?1, '[]', 1, 'active',
+                    '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'entity', 'unconfirmed'
+                 )",
+                libsql::params![UNFILED_SPACE_ID],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.extra_count >= 1,
+            "a live kind='entity' page absent from the map is extra (report={report:?})"
+        );
+        assert!(report.extra_sample.contains(&"orphan_shadow".to_string()));
+        assert!(report.drift_count >= 1);
+    }
+
+    /// The parity oracle must be STRUCTURAL: a shadow page that stays mapped
+    /// and live but whose mirrored field was edited out-of-band must be
+    /// flagged corrupt, not clean -- a set-membership-only oracle would miss
+    /// this (mirrors `reconcile_detects_corrupt_endpoint` for edges).
+    #[tokio::test]
+    async fn reconcile_detects_field_mismatch_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Type Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_type = 'organization' WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "an edited shadow field is corrupt, not clean (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow is still present and mapped"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// Epoch FAIL-CLOSED: a missing/corrupt `entity_page_migration_state` row
+    /// is an ERROR, never a fabricated drift-0 proof, and the watermark must
+    /// NOT be stamped. Mirrors `missing_migration_state_closes_reader_gate`'s
+    /// epoch discipline for edges.
+    #[tokio::test]
+    async fn reconcile_errors_and_does_not_stamp_when_migration_state_missing() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Someone", "person", None, None, None)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM entity_page_migration_state", ())
+                .await
+                .unwrap();
+        }
+        let err = db.reconcile_entity_page_parity().await.unwrap_err();
+        assert!(
+            format!("{err}").contains("entity_page_migration_state"),
+            "must fail loud naming the missing state, got: {err}"
+        );
+
+        let conn = db.conn.lock().await;
+        let watermark = entity_page_parity_watermark_row(&conn).await;
+        assert!(
+            watermark.is_none(),
+            "watermark must NOT be stamped when the epoch cannot be proven"
         );
     }
 
