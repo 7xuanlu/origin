@@ -1,0 +1,68 @@
+name: Main Canary
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  main-canary:
+    name: embedding eval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Enable sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: test
+          cache-all-crates: "true"
+          cache-targets: "false"
+          save-if: "false"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
+        with:
+          tool: cargo-nextest
+      - name: Restore fastembed model
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-bge-base-en-v1.5-q-v2
+          restore-keys: |
+            fastembed-bge-base-en-v1.5-q-
+      - name: Run embedding-only eval
+        env:
+          EVAL_BASELINES_DIR: ${{ runner.temp }}/origin-eval-canary
+        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
+      - name: Upload eval canary baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-canary-baseline-${{ github.sha }}
+          path: ${{ runner.temp }}/origin-eval-canary/*.json
+          retention-days: 30
+          if-no-files-found: warn

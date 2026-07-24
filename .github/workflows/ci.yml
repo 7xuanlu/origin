@@ -17,8 +17,8 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # PRs: cancel superseded pushes to save runner time. main: never cancel, so
-  # every code-push's L6 eval canary runs to completion. A cancelled canary plus
-  # a release commit that skips the test job left 0.9.1 with no canary run.
+  # every full-platform backstop runs to completion. The L6 eval canary has its
+  # own non-cancelling workflow and never extends this required critical path.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -71,6 +71,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.config/nextest.toml'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/main-canary.yml'
               - '.github/workflows/coverage.yml'
               - '.github/workflows/release.yml'
               - 'docker/**'
@@ -342,9 +343,8 @@ jobs:
     needs: [detect-changes]
     if: "needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || github.event_name != 'pull_request'"
     runs-on: ${{ matrix.os }}
-    # Pull requests keep a hard wall-clock budget. Non-PR runs add the
-    # main-only canary/full-platform backstop, so they need a proof budget
-    # large enough to finish rather than being cancelled at the PR boundary.
+    # Pull requests keep a hard wall-clock budget. Non-PR runs add the full
+    # platform backstop, so they retain enough proof budget to finish.
     timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
     strategy:
       # Cancel the rest of the matrix when one OS fails. Saves ~20-30min
@@ -562,19 +562,6 @@ jobs:
         # compile to 0 tests and pass silently. Explicit --test selection
         # keeps eval_harness.rs (needs ANTHROPIC_API_KEY) out of the build.
         run: cargo nextest run -p wenlan-core --features eval-harness --test chat_import_e2e --test distillation_quality --test provenance_p2 --test provenance_p3 --test space_scoping_e2e --test folder_ingest_e2e --test doc_reconcile_e2e --test page_citations_e2e --test build_env --test eval_cost_caps --test eval_report_paths --test eval_report_roundtrip --test eval_save_guards
-      - name: Run embedding-only eval (main only, Linux)
-        if: matrix.os == 'ubuntu-24.04' && github.ref == 'refs/heads/main'
-        env:
-          EVAL_BASELINES_DIR: ${{ runner.temp }}/origin-eval-canary
-        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
-      - name: Upload eval canary baseline (with env schema)
-        if: always() && matrix.os == 'ubuntu-24.04'
-        uses: actions/upload-artifact@v4
-        with:
-          name: eval-canary-baseline-${{ github.sha }}
-          path: ${{ runner.temp }}/origin-eval-canary/*.json
-          retention-days: 30
-          if-no-files-found: warn
       - name: E2E wenlan background on/off (Linux user-systemd)
         if: matrix.os == 'ubuntu-24.04'
         run: |

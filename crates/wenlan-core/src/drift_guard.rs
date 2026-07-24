@@ -2161,6 +2161,331 @@ jobs:
     }
 }
 
+// ── Teeth #9: the main eval canary stays off the required CI path ──
+
+fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let canary: serde_yaml::Value =
+        serde_yaml::from_str(canary_workflow).unwrap_or(serde_yaml::Value::Null);
+    let mut violations = Vec::new();
+
+    let mut required_jobs = BTreeSet::new();
+    let mut pending_jobs = vec!["conclusion".to_string()];
+    while let Some(job_name) = pending_jobs.pop() {
+        if required_jobs.insert(job_name.clone()) {
+            pending_jobs.extend(job_needs(&ci, &job_name));
+        }
+    }
+    for job_name in &required_jobs {
+        for step in ci["jobs"][job_name]["steps"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+        {
+            let run = step["run"].as_str().unwrap_or_default();
+            if run.contains("eval::retrieval") && run.contains("--run-ignored=only") {
+                violations.push(format!(
+                    "required CI test critical path contains the embedding eval in job {job_name}"
+                ));
+            }
+        }
+    }
+    for step_name in [
+        "Run embedding-only eval (main only, Linux)",
+        "Upload eval canary baseline (with env schema)",
+    ] {
+        if job_step(&ci, "test", step_name).is_some() {
+            violations.push(format!(
+                "{step_name} still extends the required CI test critical path"
+            ));
+        }
+    }
+    if job_needs(&ci, "conclusion")
+        .iter()
+        .any(|job| job == "main-canary")
+    {
+        violations.push("conclusion.needs includes the non-blocking main canary".into());
+    }
+    if !detect_change_filter_paths(&ci, "rust").contains(".github/workflows/main-canary.yml") {
+        violations.push("Rust routing omits the main canary workflow contract".into());
+    }
+
+    let push_branches = canary["on"]["push"]["branches"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    if push_branches != ["main"] {
+        violations.push(format!(
+            "main canary push trigger is not limited to main: {push_branches:?}"
+        ));
+    }
+    if !canary["on"]["workflow_dispatch"].is_null() {
+        // A null mapping value is how `workflow_dispatch:` is represented.
+    } else if canary["on"].get("workflow_dispatch").is_none() {
+        violations.push("main canary has no manual workflow_dispatch trigger".into());
+    }
+    if canary["on"].get("pull_request").is_some() {
+        violations.push("main canary runs on pull requests".into());
+    }
+    if !canary["concurrency"].is_null() {
+        violations.push(
+            "main canary uses concurrency that can discard an accepted main push proof".into(),
+        );
+    }
+
+    let job = &canary["jobs"]["main-canary"];
+    if job["runs-on"].as_str() != Some("ubuntu-24.04") {
+        violations.push("main canary does not run on the canonical Linux platform".into());
+    }
+    if job["timeout-minutes"].as_u64() != Some(60) {
+        violations.push("main canary does not retain a 60-minute cold-cache budget".into());
+    }
+    if !job_needs(&canary, "main-canary").is_empty() {
+        violations.push("main canary is not an independent job".into());
+    }
+    if job["env"]["SCCACHE_GHA_RW_MODE"].as_str() != Some("READ_ONLY") {
+        violations.push("main canary sccache is not read-only".into());
+    }
+    if job["env"]["FASTEMBED_CACHE_DIR"].as_str()
+        != Some("${{ github.workspace }}/.fastembed_cache")
+    {
+        violations.push("main canary does not pin the FastEmbed cache directory".into());
+    }
+
+    let canary_steps = job["steps"].as_sequence().into_iter().flatten();
+    let rust_cache_steps = canary_steps
+        .clone()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
+        })
+        .collect::<Vec<_>>();
+    if rust_cache_steps.len() != 1
+        || rust_cache_steps.iter().any(|step| {
+            step["with"]["shared-key"].as_str() != Some("test")
+                || step["with"]["cache-targets"].as_str() != Some("false")
+                || step["with"]["save-if"].as_str() != Some("false")
+        })
+    {
+        violations.push("main canary rust-cache is not restore-only".into());
+    }
+    if rust_cache_steps
+        .iter()
+        .any(|step| step["with"]["save-if"].as_str() != Some("false"))
+    {
+        violations.push("main canary contains a rust-cache writer".into());
+    }
+    if canary_steps.clone().any(|step| {
+        step["env"]["SCCACHE_GHA_RW_MODE"]
+            .as_str()
+            .is_some_and(|mode| mode != "READ_ONLY")
+            || step["run"].as_str().is_some_and(|run| {
+                run.contains("SCCACHE_GHA_RW_MODE") && run.contains("READ_WRITE")
+            })
+    }) {
+        violations.push("main canary step overrides sccache read-only mode".into());
+    }
+    let fastembed_restore = job_step_using(&canary, "main-canary", "actions/cache/restore");
+    if fastembed_restore
+        .and_then(|step| step["uses"].as_str())
+        .is_none_or(|uses| !uses.contains("actions/cache/restore@"))
+        || fastembed_restore.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ env.FASTEMBED_CACHE_DIR }}")
+        || fastembed_restore.and_then(|step| step["with"]["key"].as_str())
+            != Some("fastembed-bge-base-en-v1.5-q-v2")
+    {
+        violations.push("main canary FastEmbed cache is not restore-only".into());
+    }
+    if canary_steps
+        .clone()
+        .filter_map(|step| step["uses"].as_str())
+        .any(|uses| uses.starts_with("actions/cache@") || uses.contains("actions/cache/save@"))
+    {
+        violations.push("main canary contains a FastEmbed cache writer".into());
+    }
+
+    let eval = job_step(&canary, "main-canary", "Run embedding-only eval");
+    if eval.and_then(|step| step["run"].as_str())
+        != Some("cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval")
+        || eval.and_then(|step| step["env"]["EVAL_BASELINES_DIR"].as_str())
+            != Some("${{ runner.temp }}/origin-eval-canary")
+    {
+        violations.push("main canary does not run the exact embedding-only eval contract".into());
+    }
+    let upload = job_step(&canary, "main-canary", "Upload eval canary baseline");
+    if upload
+        .and_then(|step| step["uses"].as_str())
+        .is_none_or(|uses| !uses.contains("actions/upload-artifact@"))
+        || upload.and_then(|step| step["if"].as_str()) != Some("always()")
+        || upload.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ runner.temp }}/origin-eval-canary/*.json")
+        || upload.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("warn")
+    {
+        violations
+            .push("main canary does not preserve its always-uploaded baseline receipt".into());
+    }
+
+    violations
+}
+
+#[test]
+fn main_canary_is_independent_and_read_only() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let canary =
+        std::fs::read_to_string(root.join(".github/workflows/main-canary.yml")).unwrap_or_default();
+    let violations = main_canary_contract_violations(&ci, &canary);
+    assert!(
+        violations.is_empty(),
+        "main canary contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn main_canary_contract_rejects_embedded_or_writing_fixture() {
+    let ci = r#"
+jobs:
+  detect-changes:
+    steps:
+      - id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**/*.rs'
+  test:
+    steps:
+      - name: Run embedding-only eval (main only, Linux)
+        run: cargo nextest run
+      - name: Upload eval canary baseline (with env schema)
+        run: upload
+  conclusion:
+    needs: [test, main-canary]
+"#;
+    let canary = r#"
+on:
+  pull_request:
+  push:
+    branches: [feature]
+concurrency:
+  group: main-canary
+  cancel-in-progress: true
+jobs:
+  main-canary:
+    needs: test
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+      FASTEMBED_CACHE_DIR: /tmp/other
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: canary
+          cache-targets: "true"
+          save-if: "true"
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/other
+          key: mutable
+      - name: Run embedding-only eval
+        run: cargo test
+"#;
+    let violations = main_canary_contract_violations(ci, canary);
+    for expected in [
+        "required CI test critical path",
+        "conclusion.needs",
+        "Rust routing",
+        "limited to main",
+        "manual workflow_dispatch",
+        "pull requests",
+        "concurrency",
+        "canonical Linux",
+        "60-minute cold-cache budget",
+        "independent job",
+        "sccache is not read-only",
+        "FastEmbed cache directory",
+        "rust-cache is not restore-only",
+        "FastEmbed cache is not restore-only",
+        "FastEmbed cache writer",
+        "exact embedding-only eval",
+        "always-uploaded baseline receipt",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn main_canary_contract_rejects_semantic_reinsertion_and_secondary_writers() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci = ci.replace(
+        "      - name: E2E wenlan background on/off (Linux user-systemd)",
+        r#"      - name: Renamed retrieval regression suite
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
+      - name: E2E wenlan background on/off (Linux user-systemd)"#,
+    );
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml");
+    let canary = canary
+        .replace(
+            "      - name: Install cargo-nextest",
+            r#"      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hidden-writer
+          cache-targets: "true"
+          save-if: "true"
+      - name: Install cargo-nextest"#,
+        )
+        .replace(
+            "      - name: Run embedding-only eval\n        env:\n",
+            "      - name: Run embedding-only eval\n        env:\n          SCCACHE_GHA_RW_MODE: READ_WRITE\n",
+        );
+    let violations = main_canary_contract_violations(&ci, &canary);
+    for expected in [
+        "required CI test critical path",
+        "rust-cache writer",
+        "step overrides sccache read-only mode",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn main_canary_contract_rejects_eval_inside_conclusion_itself() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci = ci.replace(
+        "      - name: Aggregate expected CI results",
+        r#"      - name: Renamed canary inside the required summary
+        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
+      - name: Aggregate expected CI results"#,
+    );
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml");
+    let violations = main_canary_contract_violations(&ci, &canary);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("required CI test critical path")),
+        "fixture must reject an eval step inside conclusion itself: {violations:?}"
+    );
+}
+
 // ── Teeth #1: repo pointer/path resolver ──
 
 const REPO_TOP_DIRS: &[&str] = &["crates/", "docs/", "app/", "scripts/", ".github/"];
