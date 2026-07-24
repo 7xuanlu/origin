@@ -11247,6 +11247,137 @@ impl MemoryDB {
         Ok(report)
     }
 
+    // ===== M3 PR-2 stage b: entity reader-cutover gate =====
+    //
+    // Mirrors M2's `set_reader_cutover`/`reader_uses_edges` pair exactly,
+    // over the entity<->page control plane stage a built (migration 94:
+    // `entity_reader_cutover`, `entity_page_parity_watermark`). Stage b
+    // wires ONLY the predicate + the manual lever -- NO consumer consults
+    // `reader_uses_entity_pages` yet (the vanguard flip is stage c).
+    // Flipping a PRODUCTION consumer additionally waits on the program's
+    // D1 soak-exit.
+
+    /// Flip an entity-reader consumer's cutover ON or OFF (M3 PR-2 stage b;
+    /// mirrors `set_reader_cutover` for M2's `edges`). Idempotent upsert.
+    /// This records INTENT only; the actual read source is still decided
+    /// by `reader_uses_entity_pages` on a clean, current parity watermark,
+    /// so enabling a consumer before parity is proven does not move it off
+    /// legacy, and disabling it always moves it back (reversibility).
+    /// `cutover_epoch` records the epoch a consumer was last enabled
+    /// under, for soak audit; it is not part of the gate.
+    ///
+    /// Stage b wires the predicate; NO consumer consults it yet (the
+    /// vanguard flip is stage c). Flipping a PRODUCTION consumer
+    /// additionally waits on the program's D1 soak-exit.
+    pub async fn set_entity_reader_cutover(
+        &self,
+        consumer: &str,
+        enabled: bool,
+    ) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let now = chrono::Utc::now().timestamp();
+        // Audit-only field (not part of the gate). With no current epoch
+        // (no migration state yet) record 0: `reader_uses_entity_pages`
+        // keeps the consumer on legacy regardless, so a missing epoch
+        // must not block the lever.
+        let epoch = Self::current_entity_dual_write_epoch(&conn)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("set_entity_reader_cutover epoch: {e}")))?
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO entity_reader_cutover (consumer, enabled, cutover_epoch, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(consumer) DO UPDATE SET
+                 enabled = excluded.enabled,
+                 cutover_epoch = CASE
+                     WHEN excluded.enabled = 1 THEN excluded.cutover_epoch
+                     ELSE entity_reader_cutover.cutover_epoch
+                 END,
+                 updated_at = excluded.updated_at",
+            libsql::params![consumer, if enabled { 1i64 } else { 0i64 }, epoch, now],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("set_entity_reader_cutover: {e}")))?;
+        Ok(())
+    }
+
+    /// THE entity-reader cutover gate (M3 PR-2 stage b; mirrors
+    /// `reader_uses_edges` for M2's `edges`). Returns true iff the named
+    /// consumer may read the `kind='entity'` shadow pages instead of the
+    /// legacy `entities` store right now. All three must hold:
+    ///   1. the consumer is explicitly enabled,
+    ///   2. the parity watermark is CLEAN (`drift_count = 0`) -- the
+    ///      stage-a reconciliation proved every `entities` row has a
+    ///      byte-identical, live shadow page, so no unreconciled legacy
+    ///      row remains, and
+    ///   3. the proof is CURRENT: `proven_epoch` equals the current
+    ///      entity dual-write epoch, so no coverage lapse has invalidated
+    ///      it since.
+    ///
+    /// Any missing row (no watermark yet, unknown consumer) => false =>
+    /// legacy. This is the ONLY thing standing between a premature flip
+    /// and a wrong read; it fails safe toward legacy in every ambiguous
+    /// case.
+    ///
+    /// Stage b wires this predicate; NO consumer consults it yet (the
+    /// vanguard flip is stage c). Flipping a PRODUCTION consumer
+    /// additionally waits on the program's D1 soak-exit.
+    #[allow(dead_code)] // wired by stage c's vanguard flip; exercised directly by stage-b tests
+    async fn reader_uses_entity_pages(
+        conn: &libsql::Connection,
+        consumer: &str,
+    ) -> Result<bool, libsql::Error> {
+        // (1) consumer explicitly enabled?
+        let enabled: bool = {
+            let mut rows = conn
+                .query(
+                    "SELECT enabled FROM entity_reader_cutover WHERE consumer = ?1",
+                    libsql::params![consumer],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => row.get::<i64>(0).unwrap_or(0) == 1,
+                None => false,
+            }
+        };
+        if !enabled {
+            return Ok(false);
+        }
+        // (2)+(3) a clean, current parity watermark?
+        let (proven_epoch, drift): (Option<i64>, Option<i64>) = {
+            let mut rows = conn
+                .query(
+                    "SELECT proven_epoch, drift_count FROM entity_page_parity_watermark WHERE id = 1",
+                    (),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => (
+                    row.get::<Option<i64>>(0).unwrap_or(None),
+                    row.get::<Option<i64>>(1).unwrap_or(None),
+                ),
+                None => (None, None),
+            }
+        };
+        // Clean == drift proven and zero; any drift or an unproven
+        // watermark keeps the reader on legacy.
+        if drift != Some(0) {
+            return Ok(false);
+        }
+        let proven_epoch = match proven_epoch {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        // Current == proof taken under the epoch we are still in (no
+        // lapse). No current epoch (missing/corrupt state) => cannot
+        // prove currency => stay on legacy.
+        let current_epoch = match Self::current_entity_dual_write_epoch(conn).await? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        Ok(proven_epoch == current_epoch)
+    }
+
     /// §6.9 pre-migration online backup. A raw file copy is unsound while a WAL
     /// is live, so this first folds the WAL back into the main database and
     /// truncates it (`PRAGMA wal_checkpoint(TRUNCATE)`) under the connection
@@ -77333,6 +77464,259 @@ pub(crate) mod tests {
         assert!(
             watermark.is_none(),
             "watermark must NOT be stamped when the epoch cannot be proven"
+        );
+    }
+
+    // -- M3 PR-2 stage b: entity reader-cutover gate + manual lever
+    // (`set_entity_reader_cutover`/`reader_uses_entity_pages`), mirroring
+    // M2's `set_reader_cutover`/`reader_uses_edges` control-plane tests --
+
+    /// THE load-bearing stage-b test (mirrors
+    /// `reader_gate_blocks_flip_until_parity_proven` for M2's `edges`): an
+    /// enabled consumer with no parity proof yet MUST stay on legacy.
+    /// Flipping the flag alone (intent) never moves a reader off legacy --
+    /// only a clean, current watermark does.
+    #[tokio::test]
+    async fn entity_reader_gate_blocks_flip_until_parity_proven() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        // Operator enables the consumer (intent) -- but no reconciliation
+        // has run yet, so there is no watermark.
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "enabling a consumer must NOT flip it while parity is unproven"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_reader_flips_only_after_clean_parity_and_reverts() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+
+        // Prove parity, then the gate opens.
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert_eq!(
+            report.drift_count, 0,
+            "live dual-write must reconcile clean"
+        );
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "a clean, current watermark must open the gate for an enabled consumer"
+            );
+        }
+
+        // Reversibility: disabling moves it straight back to legacy.
+        db.set_entity_reader_cutover("test_consumer", false)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "disabling a consumer must always revert it to legacy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_reader_gate_blocked_by_nonzero_drift() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Type Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "sanity: a clean watermark opens the gate"
+            );
+        }
+
+        // Perturb a shadow out-of-band, then re-reconcile: the watermark
+        // goes dirty, so the gate must close even though the consumer is
+        // still enabled.
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_type = 'organization' WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.drift_count >= 1,
+            "sanity: reconcile must see the drift"
+        );
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "a nonzero-drift watermark must keep the reader on legacy"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_page_epoch_bump_reblocks_reader_until_reconciled() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        db.reconcile_entity_page_parity().await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap());
+        }
+
+        // A coverage-lapse bump retires the older proof -> reader
+        // re-blocked. No `bump_entity_dual_write_epoch` helper exists yet
+        // (stage b adds only the gate + lever), so the bump is a raw
+        // UPDATE, exactly what such a future helper would do.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE entity_page_migration_state SET epoch = epoch + 1 WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "a stale-epoch watermark must NOT open the gate"
+            );
+        }
+
+        // Re-proving at the new epoch reopens it.
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert_eq!(report.epoch, 2);
+        let conn = db.conn.lock().await;
+        assert!(MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+            .await
+            .unwrap());
+    }
+
+    /// Epoch FAIL-CLOSED: with a clean, current watermark the gate is open,
+    /// but the moment the `entity_page_migration_state` row is lost there
+    /// is no trustworthy current epoch -- the gate must CLOSE (a fail-open
+    /// default would flip every enabled reader onto the shadow pages the
+    /// instant the state row vanished). Mirrors
+    /// `missing_migration_state_closes_reader_gate` for edges.
+    #[tokio::test]
+    async fn missing_entity_migration_state_closes_reader_gate() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        db.reconcile_entity_page_parity().await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark opens the gate"
+            );
+        }
+
+        // Lose the epoch state row (deleted/corrupt). The watermark is
+        // still clean, but its epoch can no longer be proven current.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM entity_page_migration_state", ())
+                .await
+                .unwrap();
+        }
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "a missing entity_page_migration_state row must CLOSE the gate, not open it"
+        );
+    }
+
+    /// `set_entity_reader_cutover` must record `cutover_epoch = 0` (never
+    /// fabricate a generation) when there is no trustworthy current epoch,
+    /// and the predicate must stay closed -- mirrors `set_reader_cutover`'s
+    /// "no current epoch -> record 0" discipline for edges.
+    #[tokio::test]
+    async fn set_entity_reader_cutover_with_missing_state_records_epoch_zero() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM entity_page_migration_state", ())
+                .await
+                .unwrap();
+        }
+
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT cutover_epoch FROM entity_reader_cutover WHERE consumer = ?1",
+                libsql::params!["test_consumer"],
+            )
+            .await
+            .unwrap();
+        let epoch: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            epoch, 0,
+            "a missing migration-state row must record cutover_epoch 0, not fabricate one"
+        );
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "the predicate must stay false with no trustworthy epoch"
         );
     }
 
