@@ -72,6 +72,8 @@ jobs:
               - '.config/nextest.toml'
               - '.github/workflows/ci.yml'
               - '.github/workflows/main-canary.yml'
+              - '.github/workflows/ci-observer.yml'
+              - '.github/workflows/ci-benchmark.yml'
               - '.github/workflows/coverage.yml'
               - '.github/workflows/release.yml'
               - 'docker/**'
@@ -536,11 +538,9 @@ jobs:
       # NOT use `--workspace --tests` because that pulls in wenlan-core's
       # `eval_harness.rs` which requires `ANTHROPIC_API_KEY` (not in CI).
       # wenlan-core integration tests run via the Linux-only nextest step
-      # below (chat_import_e2e + distillation_quality + provenance_p2 +
-      # provenance_p3 + space_scoping_e2e + folder_ingest_e2e — the middle
-      # three carry the cross-workspace-leak security tests and the P3
-      # demotion regression; folder_ingest_e2e covers the full folder
-      # sync/enrich/delete lifecycle in-process).
+      # below. The drift guard inventories crates/wenlan-core/tests/*.rs so a
+      # newly added integration target fails closed into this canonical lane
+      # unless it is explicitly classified as manual-only with a reason.
       - name: Integration tests wenlan-cli + wenlan-server (shared integration only)
         if: matrix.os != 'windows-2022'
         run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'
@@ -561,7 +561,7 @@ jobs:
         # behind #![cfg(feature = "eval-harness")] — without the flag they
         # compile to 0 tests and pass silently. Explicit --test selection
         # keeps eval_harness.rs (needs ANTHROPIC_API_KEY) out of the build.
-        run: cargo nextest run -p wenlan-core --features eval-harness --test chat_import_e2e --test distillation_quality --test provenance_p2 --test provenance_p3 --test space_scoping_e2e --test folder_ingest_e2e --test doc_reconcile_e2e --test page_citations_e2e --test build_env --test eval_cost_caps --test eval_report_paths --test eval_report_roundtrip --test eval_save_guards
+        run: cargo nextest run -p wenlan-core --features eval-harness --test build_env --test chat_import_e2e --test distill_redesign_e2e --test distillation_quality --test doc_reconcile_e2e --test eval_cost_caps --test eval_report_paths --test eval_report_roundtrip --test eval_save_guards --test folder_ingest_e2e --test lint_maintenance_probe_e2e --test page_citations_e2e --test pdf_ordered_text --test provenance_p2 --test provenance_p3 --test read_scope --test space_scoping_e2e
       - name: E2E wenlan background on/off (Linux user-systemd)
         if: matrix.os == 'ubuntu-24.04'
         run: |

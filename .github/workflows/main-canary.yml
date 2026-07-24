@@ -3,10 +3,6 @@ name: Main Canary
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/pull_request_template.md'
-      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
