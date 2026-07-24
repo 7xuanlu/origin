@@ -89,6 +89,19 @@ class CiObserverTests(unittest.TestCase):
         payload = json.loads(output.read_text()) if output.exists() else None
         return result, payload
 
+    def assert_error_receipt(self, receipt, message):
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["schema_version"], 1)
+        self.assertEqual(receipt["status"], "invalid")
+        self.assertIn(message, receipt["error"]["message"])
+        self.assertEqual(
+            set(receipt["raw_refs"]),
+            {"event", "jobs_pages", "cache_usage", "cache_limit"},
+        )
+        for raw_ref in receipt["raw_refs"].values():
+            self.assertTrue(raw_ref["exists"])
+            self.assertGreater(raw_ref["size_bytes"], 0)
+
     def test_stable_receipt_preserves_untrusted_names_as_json_data(self):
         conclusion = job(102, "conclusion")
         conclusion["completed_at"] = "2026-07-24T01:20:30Z"
@@ -132,7 +145,7 @@ class CiObserverTests(unittest.TestCase):
             {"max_cache_size_gb": 10},
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIsNone(receipt)
+        self.assert_error_receipt(receipt, "head SHA")
 
         mismatched = job()
         mismatched["run_attempt"] = 3
@@ -143,7 +156,7 @@ class CiObserverTests(unittest.TestCase):
             {"max_cache_size_gb": 10},
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIsNone(receipt)
+        self.assert_error_receipt(receipt, "different run or attempt")
 
     def test_rejects_duplicate_jobs_and_inverted_timestamps(self):
         duplicate = job()
@@ -154,7 +167,7 @@ class CiObserverTests(unittest.TestCase):
             {"max_cache_size_gb": 10},
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIsNone(receipt)
+        self.assert_error_receipt(receipt, "unique integers")
 
         inverted = job()
         inverted["completed_at"] = "2026-07-24T00:59:00Z"
@@ -165,7 +178,26 @@ class CiObserverTests(unittest.TestCase):
             {"max_cache_size_gb": 10},
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIsNone(receipt)
+        self.assert_error_receipt(receipt, "completion timestamp precedes")
+
+    def test_invalid_json_shapes_write_error_receipts(self):
+        result, receipt = self.run_observer(
+            [],
+            [{"total_count": 1, "jobs": [job(102, "conclusion")]}],
+            {"active_caches_size_in_bytes": 1, "active_caches_count": 1},
+            {"max_cache_size_gb": 10},
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assert_error_receipt(receipt, "event payload must be a JSON object")
+
+        result, receipt = self.run_observer(
+            event(),
+            [42],
+            {"active_caches_size_in_bytes": 1, "active_caches_count": 1},
+            {"max_cache_size_gb": 10},
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assert_error_receipt(receipt, "jobs page must be a JSON object")
 
     def test_clamps_small_github_clock_skew_on_skipped_jobs(self):
         skipped = job()

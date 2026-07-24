@@ -2214,7 +2214,10 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     for (name, expected) in [
         ("CARGO_PROFILE_DEV_DEBUG", "0"),
         ("CARGO_PROFILE_TEST_DEBUG", "0"),
-        ("SCCACHE_GHA_RW_MODE", "READ_ONLY"),
+        (
+            "SCCACHE_GHA_RW_MODE",
+            "${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}",
+        ),
         (
             "FASTEMBED_CACHE_DIR",
             "${{ github.workspace }}/.fastembed_cache",
@@ -2472,6 +2475,10 @@ fn linux_acceptance_contract_rejects_semantic_noops_and_secondary_writers() {
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let ci = ci
         .replace(
+            "      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}",
+            "      SCCACHE_GHA_RW_MODE: READ_ONLY",
+        )
+        .replace(
             "        run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'",
             "        run: \"true\"",
         )
@@ -2493,6 +2500,7 @@ fn linux_acceptance_contract_rejects_semantic_noops_and_secondary_writers() {
         );
     let violations = linux_acceptance_contract_violations(&ci);
     for expected in [
+        "SCCACHE_GHA_RW_MODE",
         "CLI/server integration command",
         "folder ingest smoke",
         "systemd acceptance command",
@@ -3079,12 +3087,39 @@ fn ci_observer_contract_violations(ci_workflow: &str, observer_workflow: &str) -
     if required_job_closure(&ci)
         .iter()
         .any(|job| job.contains("observer"))
-        || required_jobs_contain(&ci, "ci-observer")
+        || required_jobs_contain(&ci, ".github/workflows/ci-observer.yml")
+        || required_jobs_contain(&ci, "scripts/ci-observer.py")
     {
         violations.push("required CI closure depends on the out-of-band CI observer".into());
     }
     if !detect_change_filter_paths(&ci, "rust").contains(".github/workflows/ci-observer.yml") {
         violations.push("Rust routing omits the CI observer contract".into());
+    }
+    let required_script_step = job_step(&ci, "test", "Verify ort-sys source pin");
+    let required_script_lines = required_script_step
+        .and_then(|step| step["run"].as_str())
+        .into_iter()
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let expected_script_lines = [
+        "python3 scripts/ci-observer.test.py",
+        "python3 scripts/ci-timed-command.test.py",
+        "python3 scripts/verify-ort-source-pin.test.py",
+        "python3 scripts/verify-ort-source-pin.py",
+    ];
+    if !required_job_closure(&ci).contains("test")
+        || ci["jobs"]["test"].get("continue-on-error").is_some()
+        || required_script_step.and_then(|step| step["if"].as_str())
+            != Some("matrix.os == 'ubuntu-24.04'")
+        || required_script_step.is_some_and(|step| step.get("continue-on-error").is_some())
+        || required_script_lines != expected_script_lines
+    {
+        violations.push(
+            "required Linux CI measurement contracts are not in the exact executable test step"
+                .into(),
+        );
     }
 
     let observer_jobs = observer["jobs"]
@@ -3194,6 +3229,10 @@ fn ci_observer_contract_violations(ci_workflow: &str, observer_workflow: &str) -
             violations.push(format!("CI observer omits required evidence {required:?}"));
         }
     }
+    let receipt_builder = job_step(&observer, "collect", "Build timing and cache receipt");
+    if receipt_builder.and_then(|step| step["if"].as_str()) != Some("always()") {
+        violations.push("CI observer receipt builder does not run after metadata failures".into());
+    }
     let upload = steps.clone().find(|step| {
         step["uses"]
             .as_str()
@@ -3202,8 +3241,12 @@ fn ci_observer_contract_violations(ci_workflow: &str, observer_workflow: &str) -
     if upload.and_then(|step| step["if"].as_str()) != Some("always()")
         || upload.and_then(|step| step["with"]["path"].as_str())
             != Some("${{ runner.temp }}/ci-observer/receipt.json")
+        || upload.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("error")
     {
-        violations.push("CI observer receipt is not always uploaded from runner.temp".into());
+        violations.push(
+            "CI observer receipt is not always uploaded from runner.temp with missing files fatal"
+                .into(),
+        );
     }
 
     violations
@@ -3267,6 +3310,7 @@ jobs:
         "reads repository secrets",
         "required CI closure",
         "Rust routing",
+        "measurement contract",
         "single bounded collector",
         "canonical hosted runner",
         "environment or job-level permissions",
@@ -3277,7 +3321,8 @@ jobs:
         "beyond checkout and receipt upload",
         "execute or mutate untrusted state",
         "required evidence",
-        "always uploaded from runner.temp",
+        "receipt builder",
+        "missing files fatal",
     ] {
         assert!(
             violations
@@ -3286,6 +3331,45 @@ jobs:
             "observer fixture must exercise {expected:?}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn ci_observer_contract_rejects_short_circuited_or_optional_measurement_tests() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let observer =
+        std::fs::read_to_string(root.join(".github/workflows/ci-observer.yml")).unwrap_or_default();
+    let ci = ci
+        .replace(
+            "        if: matrix.os == 'ubuntu-24.04'\n        run: |\n          python3 scripts/ci-observer.test.py",
+            "        if: \"false\"\n        run: |\n          exit 0\n          python3 scripts/ci-observer.test.py",
+        );
+    let violations = ci_observer_contract_violations(&ci, &observer);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| { violation.contains("exact executable test step") }),
+        "optional or short-circuited measurement tests must fail: {violations:?}"
+    );
+}
+
+#[test]
+fn ci_observer_contract_rejects_non_blocking_measurement_tests() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let observer =
+        std::fs::read_to_string(root.join(".github/workflows/ci-observer.yml")).unwrap_or_default();
+    let ci = ci.replace(
+        "        run: |\n          python3 scripts/ci-observer.test.py",
+        "        continue-on-error: true\n        run: |\n          python3 scripts/ci-observer.test.py",
+    );
+    let violations = ci_observer_contract_violations(&ci, &observer);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("exact executable test step")),
+        "non-blocking measurement tests must fail: {violations:?}"
+    );
 }
 
 // ── Teeth #13: hosted optimization experiments stay manual and restore-only ──
@@ -3377,6 +3461,37 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
         violations.push(
             "P6 cache_mode must use both exact cold and production-restore vocabulary".into(),
         );
+    }
+    let p6_cache_receipt = job_step(&benchmark, "p6-release", "Record release cache evidence")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let active_receipt_lines = p6_cache_receipt
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let expected_cache_logic = [
+        r#"requested_mode = "${{ matrix.cache_mode }}""#,
+        r#"profile = "${{ matrix.profile }}""#,
+        "effective_cache = (",
+        r#""profile-invalidated-cold""#,
+        r#"if requested_mode == "production-restore" and profile != "current""#,
+        "else requested_mode",
+        ")",
+    ];
+    let has_exact_cache_logic = active_receipt_lines
+        .windows(expected_cache_logic.len())
+        .any(|window| window == expected_cache_logic);
+    let effective_cache_assignments = active_receipt_lines
+        .iter()
+        .filter(|line| line.starts_with("effective_cache ="))
+        .count();
+    if !has_exact_cache_logic
+        || effective_cache_assignments != 1
+        || !active_receipt_lines.contains(&r#""effective_cache": effective_cache,"#)
+    {
+        violations
+            .push("P6 cache receipt does not expose profile-invalidated restores as cold".into());
     }
     let drives = benchmark["jobs"]["p5-windows-drive"]["strategy"]["matrix"]["drive"]
         .as_sequence()
@@ -3523,6 +3638,7 @@ jobs:
         "required CI closure",
         "Rust routing",
         "omits experiment control",
+        "profile-invalidated restores",
         "four orthogonal suites",
         "environment or job-level permissions",
         "sccache writes in env",
@@ -3551,14 +3667,139 @@ fn ci_benchmark_contract_requires_read_only_sccache_and_truthful_restore_modes()
         .expect("read benchmark workflow");
     let benchmark = benchmark
         .replace("      SCCACHE_GHA_RW_MODE: READ_ONLY\n", "")
-        .replace("cache_mode: production-restore", "cache_mode: warm");
+        .replace("cache_mode: production-restore", "cache_mode: warm")
+        .replace("profile-invalidated-cold", "production-restore");
     let violations = ci_benchmark_contract_violations(&ci, &benchmark);
-    for expected in ["read-only sccache", "production-restore"] {
+    for expected in [
+        "read-only sccache",
+        "production-restore",
+        "profile-invalidated restores",
+    ] {
         assert!(
             violations
                 .iter()
                 .any(|violation| violation.contains(expected)),
             "benchmark guard must reject missing {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_dead_profile_cache_logic() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        "if requested_mode == \"production-restore\" and profile != \"current\"",
+        "if False",
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("profile-invalidated restores")),
+        "dead truthfulness logic must fail the benchmark contract: {violations:?}"
+    );
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_unused_effective_cache_value() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        r#""effective_cache": effective_cache,"#,
+        r#""effective_cache": requested_mode,"#,
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("profile-invalidated restores")),
+        "unused effective cache logic must fail the benchmark contract: {violations:?}"
+    );
+}
+
+fn workflow_action_pin_violations(workflow_name: &str, workflow: &str) -> Vec<String> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse workflow");
+    let action_pin = regex::Regex::new(r"^[^@\s]+@[0-9a-f]{40}$").unwrap();
+    let mut violations = Vec::new();
+    for (job_name, job) in parsed["jobs"].as_mapping().into_iter().flatten() {
+        let job_name = job_name.as_str().unwrap_or("<non-string>");
+        let mut check = |location: &str, uses: Option<&str>| {
+            if let Some(uses) = uses {
+                if !uses.starts_with("./") && !action_pin.is_match(uses) {
+                    violations.push(format!(
+                        "{workflow_name} {location} uses action {uses:?} without an immutable SHA pin"
+                    ));
+                }
+            }
+        };
+        check(
+            &format!("job {job_name}"),
+            job.get("uses").and_then(serde_yaml::Value::as_str),
+        );
+        for (index, step) in job["steps"].as_sequence().into_iter().flatten().enumerate() {
+            let step_name = step["name"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{index}"));
+            check(
+                &format!("job {job_name} step {step_name}"),
+                step.get("uses").and_then(serde_yaml::Value::as_str),
+            );
+        }
+    }
+    violations
+}
+
+#[test]
+fn ci_evidence_workflows_pin_every_action_by_sha() {
+    let root = repo_root();
+    let mut violations = Vec::new();
+    for path in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/main-canary.yml",
+        ".github/workflows/ci-observer.yml",
+        ".github/workflows/ci-benchmark.yml",
+    ] {
+        let workflow = std::fs::read_to_string(root.join(path)).expect("read workflow");
+        violations.extend(workflow_action_pin_violations(path, &workflow));
+    }
+    assert!(
+        violations.is_empty(),
+        "CI evidence workflow action pin drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn ci_evidence_action_pin_contract_rejects_mutable_refs() {
+    let workflow = r#"
+on: push
+jobs:
+  reusable:
+    uses: owner/repo/.github/workflows/reusable.yml@main
+  test:
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/upload-artifact@v4
+      - uses: ./local-action
+"#;
+    let violations = workflow_action_pin_violations("fixture.yml", workflow);
+    assert_eq!(
+        violations.len(),
+        2,
+        "mutable job and step action refs must fail while SHA and local refs pass: {violations:?}"
+    );
+    for mutable_ref in ["@main", "@v4"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(mutable_ref)),
+            "missing violation for {mutable_ref}: {violations:?}"
         );
     }
 }

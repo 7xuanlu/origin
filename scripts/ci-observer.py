@@ -14,6 +14,12 @@ MAX_GITHUB_CLOCK_SKEW_MS = 5_000
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
+def require_object(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--event", type=Path, required=True)
@@ -34,6 +40,8 @@ def load_json(path):
 def parse_time(value):
     if value is None:
         return None
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be an ISO-8601 string or null")
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
@@ -51,6 +59,7 @@ def duration_ms(started_at, completed_at):
 
 
 def validate_run(run):
+    run = require_object(run, "workflow_run")
     if run.get("name") != "CI" or run.get("status") != "completed":
         raise ValueError("observer input is not a completed CI workflow run")
     if not isinstance(run.get("id"), int) or not isinstance(run.get("run_attempt"), int):
@@ -61,6 +70,7 @@ def validate_run(run):
 
 
 def normalize_step(step):
+    step = require_object(step, "job step")
     return {
         "number": step.get("number"),
         "name": step.get("name"),
@@ -74,24 +84,33 @@ def normalize_step(step):
 def normalize_jobs(pages, run):
     if not isinstance(pages, list) or not pages:
         raise ValueError("jobs pages must be a non-empty JSON array")
-    expected_total = pages[0].get("total_count")
+    first_page = require_object(pages[0], "jobs page")
+    expected_total = first_page.get("total_count")
     if not isinstance(expected_total, int):
         raise ValueError("jobs response has no integer total_count")
 
     jobs = []
     seen_ids = set()
     for page in pages:
+        page = require_object(page, "jobs page")
         if page.get("total_count") != expected_total:
             raise ValueError("jobs pages disagree on total_count")
-        for job in page.get("jobs", []):
+        page_jobs = page.get("jobs", [])
+        if not isinstance(page_jobs, list):
+            raise ValueError("jobs page jobs must be a JSON array")
+        for job in page_jobs:
+            job = require_object(job, "job")
             if job.get("run_id") != run["id"] or job.get("run_attempt") != run["run_attempt"]:
                 raise ValueError("job belongs to a different run or attempt")
             job_id = job.get("id")
             if not isinstance(job_id, int) or job_id in seen_ids:
                 raise ValueError("job ids must be unique integers")
             seen_ids.add(job_id)
+            job_steps = job.get("steps", [])
+            if not isinstance(job_steps, list):
+                raise ValueError("job steps must be a JSON array")
             steps = sorted(
-                (normalize_step(step) for step in job.get("steps", [])),
+                (normalize_step(step) for step in job_steps),
                 key=lambda step: (step["number"] or 0, step["name"] or ""),
             )
             jobs.append(
@@ -118,6 +137,9 @@ def normalize_jobs(pages, run):
 
 
 def build_receipt(event_payload, pages, usage, limit):
+    event_payload = require_object(event_payload, "event payload")
+    usage = require_object(usage, "cache usage")
+    limit = require_object(limit, "cache limit")
     run = event_payload.get("workflow_run", {})
     validate_run(run)
     jobs = normalize_jobs(pages, run)
@@ -160,6 +182,48 @@ def build_receipt(event_payload, pages, usage, limit):
     }
 
 
+def raw_input_ref(path):
+    try:
+        stat = path.stat()
+    except OSError as error:
+        return {
+            "path": str(path),
+            "exists": False,
+            "error": str(error),
+        }
+    return {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": stat.st_size,
+    }
+
+
+def error_receipt(args, error):
+    return {
+        "schema_version": 1,
+        "status": "invalid",
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+        },
+        "raw_refs": {
+            "event": raw_input_ref(args.event),
+            "jobs_pages": raw_input_ref(args.jobs_pages),
+            "cache_usage": raw_input_ref(args.cache_usage),
+            "cache_limit": raw_input_ref(args.cache_limit),
+        },
+    }
+
+
+def write_receipt(output, receipt):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    os.replace(temporary, output)
+
+
 def main():
     args = parse_args()
     try:
@@ -171,14 +235,10 @@ def main():
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"ci-observer: invalid input: {error}", file=sys.stderr)
+        write_receipt(args.output, error_receipt(args, error))
         raise SystemExit(1)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.output.with_suffix(args.output.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
-    )
-    os.replace(temporary, args.output)
+    write_receipt(args.output, receipt)
     raise SystemExit(2 if receipt["cache"]["status"] == "over_budget" else 0)
 
 

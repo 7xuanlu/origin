@@ -422,8 +422,17 @@ jobs:
           python3 - <<'PY'
           import json, os
           from pathlib import Path
+          requested_mode = "${{ matrix.cache_mode }}"
+          profile = "${{ matrix.profile }}"
+          effective_cache = (
+              "profile-invalidated-cold"
+              if requested_mode == "production-restore" and profile != "current"
+              else requested_mode
+          )
           Path("benchmark-receipts/cache.json").write_text(json.dumps({
-              "requested_mode": "${{ matrix.cache_mode }}",
+              "requested_mode": requested_mode,
+              "effective_cache": effective_cache,
+              "profile": profile,
               "rust_cache_hit": os.environ.get("RUST_CACHE_HIT", ""),
               "rust_cache_shared_key": "${{ runner.os == 'Windows' && 'windows-release' || format('release-{0}', matrix.target) }}",
           }, sort_keys=True) + "\n")

@@ -54,6 +54,7 @@ jobs:
             "/repos/$GITHUB_REPOSITORY/actions/cache/storage-limit" \
             > "$out/cache-limit.json"
       - name: Build timing and cache receipt
+        if: always()
         run: |
           python3 scripts/ci-observer.py \
             --event "$GITHUB_EVENT_PATH" \
@@ -68,4 +69,4 @@ jobs:
           name: ci-observer-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           path: ${{ runner.temp }}/ci-observer/receipt.json
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: error

@@ -418,6 +418,8 @@ jobs:
       - name: Verify ort-sys source pin
         if: matrix.os == 'ubuntu-24.04'
         run: |
+          python3 scripts/ci-observer.test.py
+          python3 scripts/ci-timed-command.test.py
           python3 scripts/verify-ort-source-pin.test.py
           python3 scripts/verify-ort-source-pin.py
       # Windows needs sqlite3.lib for libsql linking (libsql does not bundle
@@ -504,7 +506,7 @@ jobs:
           if ($gateCode -ne 0) { throw "Windows functional scale gate failed" }
       - name: Upload Page lint scale receipt (Windows)
         if: always() && matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: task-19-lint-scale-${{ matrix.os }}-${{ github.sha }}
           path: ${{ runner.temp }}/task-19-memory-lint-debugger-*.txt
@@ -659,7 +661,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_RW_MODE: READ_ONLY
+      # Main warms the eval-harness and integration variants owned only by this
+      # lane. Pull requests restore those outputs but never write ref-local keys.
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
       RUSTC_WRAPPER: sccache
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
@@ -667,7 +671,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
-      - name: Set up read-only sccache
+      - name: Set up sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Restore compiler inputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

@@ -56,7 +56,7 @@ jobs:
         run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
       - name: Upload eval canary baseline
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: eval-canary-baseline-${{ github.sha }}
           path: ${{ runner.temp }}/origin-eval-canary/*.json
