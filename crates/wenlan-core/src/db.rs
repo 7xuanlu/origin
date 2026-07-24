@@ -11055,11 +11055,15 @@ impl MemoryDB {
         // longer live) is missing; a matched row whose mirrored fields
         // disagree is corrupt. The mirrored fields are exactly what
         // `insert_entity_shadow_page`/`update_entity_shadow_page` write:
-        // name, entity_type, confidence, space semantics (both `space` and
-        // `workspace` carry the same unfiled-sentinel fold), and the
-        // `entity_aliases` projection (recomputed here the same way
-        // `update_entity_shadow_page` does, so a shadow whose aliases were
-        // never re-synced after an alias change is flagged corrupt).
+        // name, entity_type, confidence, confirmed (-> `entity_confirmed`),
+        // embedding, space semantics (both `space` and `workspace` carry the
+        // same unfiled-sentinel fold), and the `entity_aliases` projection
+        // (recomputed here the same way `update_entity_shadow_page` does, so
+        // a shadow whose aliases were never re-synced after an alias change
+        // is flagged corrupt). Embedding compares raw blob bytes -- NULL vs
+        // NULL (never embedded on either side) is equal via `unwrap_or_default`
+        // folding both to an empty Vec; a genuine F32_BLOB(768) is never
+        // empty, so no false match against an unset embedding.
         let mut expected_active = 0usize;
         let mut missing_count = 0usize;
         let mut missing_sample: Vec<String> = Vec::new();
@@ -11073,7 +11077,8 @@ impl MemoryDB {
                             (SELECT json_group_array(alias_name) FROM (
                                 SELECT alias_name FROM entity_aliases
                                 WHERE canonical_entity_id = e.id ORDER BY alias_name
-                             )) AS expected_aliases
+                             )) AS expected_aliases,
+                            e.confirmed, e.embedding, p.entity_confirmed, p.embedding
                      FROM entities e
                      LEFT JOIN entity_page_map m ON m.entity_id = e.id
                      LEFT JOIN pages p ON p.id = m.page_id
@@ -11095,6 +11100,8 @@ impl MemoryDB {
                 let space: Option<String> = row.get(4).unwrap_or(None);
                 let expected_space = space.unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
                 let expected_aliases: Option<String> = row.get(11).unwrap_or(None);
+                let confirmed: Option<i64> = row.get(12).unwrap_or(None);
+                let embedding: Vec<u8> = row.get::<Vec<u8>>(13).unwrap_or_default();
 
                 let page_title: Option<String> = row.get(5).unwrap_or(None);
                 let Some(page_title) = page_title else {
@@ -11109,13 +11116,17 @@ impl MemoryDB {
                 let page_space: Option<String> = row.get(8).unwrap_or(None);
                 let page_workspace: Option<String> = row.get(9).unwrap_or(None);
                 let page_aliases: Option<String> = row.get(10).unwrap_or(None);
+                let page_confirmed: Option<i64> = row.get(14).unwrap_or(None);
+                let page_embedding: Vec<u8> = row.get::<Vec<u8>>(15).unwrap_or_default();
 
                 let matches = page_title == name
                     && page_entity_type == entity_type
                     && page_confidence == confidence
                     && page_space.as_deref() == Some(expected_space.as_str())
                     && page_workspace.as_deref() == Some(expected_space.as_str())
-                    && page_aliases == expected_aliases;
+                    && page_aliases == expected_aliases
+                    && page_confirmed == confirmed
+                    && page_embedding == embedding;
                 if !matches {
                     corrupt_count += 1;
                     if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
@@ -77208,6 +77219,84 @@ pub(crate) mod tests {
         assert!(
             report.corrupt_count >= 1,
             "an edited shadow field is corrupt, not clean (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow is still present and mapped"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// The comparator must include `confirmed` (-> `entity_confirmed`), not
+    /// just the descriptive fields -- `confirm_entity` mirrors this column
+    /// into the shadow, so a shadow that silently kept the old value is a
+    /// real drift the dual-writer promises never happens.
+    #[tokio::test]
+    async fn reconcile_detects_confirmed_mismatch_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Confirmed Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_confirmed = 1 WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "an edited entity_confirmed is corrupt, not clean (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow is still present and mapped"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// The comparator must include `embedding`, not just the descriptive
+    /// fields -- `refresh_entity_embedding` mirrors this column into the
+    /// shadow, so a shadow that silently kept a stale (or NULL'd) vector is
+    /// a real drift the dual-writer promises never happens.
+    #[tokio::test]
+    async fn reconcile_detects_embedding_mismatch_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Embedding Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET embedding = NULL WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "a NULL'd shadow embedding is corrupt, not clean (report={report:?})"
         );
         assert!(report.corrupt_sample.contains(&eid));
         assert_eq!(
