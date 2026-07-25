@@ -114,12 +114,16 @@ SELECT invalid FROM (
  UNION ALL SELECT 'space:'||id, CASE WHEN TRIM(name)='' OR updated_at<created_at THEN 1 ELSE 0 END FROM spaces
 ) ORDER BY key";
 
+// M3 PR-1 stage e: memories.space is NOT NULL as of migration 91, so an
+// unscoped memory carries the reserved sentinel id rather than NULL --
+// `!=sentinel` (was `IS NOT NULL`) keeps the "claims a real space name that
+// isn't registered" check from false-flagging every unfiled memory.
 const MEMORY_SQL: &str = "
 SELECT CASE WHEN (m.confirmed IS NOT NULL AND m.confirmed NOT IN (0,1)) OR COALESCE(m.pinned,-1) NOT IN (0,1)
  OR COALESCE(m.pending_revision,-1) NOT IN (0,1) OR (m.pinned=1 AND COALESCE(m.confirmed,0)!=1)
  OR m.stability NOT IN ('new','learned','confirmed') OR m.supersedes=m.source_id
  OR (m.pending_revision=1 AND (m.supersedes IS NULL OR NOT EXISTS(SELECT 1 FROM memories prior WHERE prior.source='memory' AND prior.source_id=m.supersedes)))
- OR (m.space IS NOT NULL AND NOT EXISTS(SELECT 1 FROM spaces s WHERE s.name=m.space))
+ OR (m.space!='00000000-0000-4000-8000-000000000001' AND NOT EXISTS(SELECT 1 FROM spaces s WHERE s.name=m.space))
  OR (m.source_agent IS NOT NULL AND TRIM(m.source_agent)='')
  THEN 1 ELSE 0 END
 FROM memories m WHERE m.source='memory' AND m.chunk_index=0{scope} ORDER BY m.source_id";
@@ -218,7 +222,10 @@ fn memory_scope(scope: &ScopeFilter) -> (String, libsql::params::Params) {
             " AND m.space=?1".into(),
             libsql::params::Params::Positional(vec![libsql::Value::Text(space.clone())]),
         ),
-        ScopeFilter::Uncategorized => (" AND m.space IS NULL".into(), libsql::params::Params::None),
+        ScopeFilter::Uncategorized => (
+            " AND m.space='00000000-0000-4000-8000-000000000001'".into(),
+            libsql::params::Params::None,
+        ),
     }
 }
 

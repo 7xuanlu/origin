@@ -310,9 +310,17 @@ pub async fn find_duplicates(db: &MemoryDB, memories: &[ParsedMemory]) -> HashSe
 }
 
 /// Returns (entity_id, was_newly_created).
-/// Bulk-import variant: raw 4-step resolution without post-write enrichment.
-/// Use `post_write::create_entity` for single-entity writes that should fire
-/// the full enrichment ring (verify, activity log, refinery enqueue).
+/// Bulk-import variant: an in-batch cache in front of the canonical
+/// `MemoryDB::resolve_or_create_entity` resolve-then-write cascade (M3 PR-1
+/// stage d), skipping the single-entity post-write enrichment ring (verify,
+/// activity log, refinery enqueue) that path doesn't need at bulk volume. Use
+/// `post_write::create_entity` for single-entity writes that should fire that
+/// ring. NOTE (behavior change from the pre-collapse version): resolution-step
+/// errors now propagate instead of being swallowed-and-fallen-through, so a
+/// transient DB error skips this entity for the round (existing call site
+/// `if let Ok((_id, true)) = ...` already discards `Err` uniformly) rather
+/// than risking a duplicate create -- matching `post_write::create_entity`'s
+/// existing stricter semantics now that both share one cascade.
 pub(crate) async fn resolve_entity_bulk(
     db: &MemoryDB,
     entity_cache: &mut HashMap<String, String>,
@@ -321,70 +329,16 @@ pub(crate) async fn resolve_entity_bulk(
 ) -> Result<(String, bool), WenlanError> {
     let name_lower = entity.name.to_lowercase();
 
-    // Step 0: In-batch cache (case-insensitive)
+    // Step 0: In-batch cache (case-insensitive) -- bulk-specific, stays here.
     if let Some(id) = entity_cache.get(&name_lower) {
         return Ok((id.clone(), false));
     }
 
-    // Step 1: Alias lookup (exact, case-insensitive)
-    if let Some(id) = db.resolve_entity_by_alias(&name_lower).await? {
-        entity_cache.insert(name_lower, id.clone());
-        return Ok((id, false));
-    }
-
-    // Step 2: Entity name lookup (exact, case-insensitive)
-    if let Ok(results) = db.search_entities_by_name(&entity.name).await {
-        if let Some(existing) = results.first() {
-            entity_cache.insert(name_lower.clone(), existing.id.clone());
-            db.add_entity_alias(&name_lower, &existing.id, "auto")
-                .await
-                .ok();
-            return Ok((existing.id.clone(), false));
-        }
-    }
-
-    // Step 2.5: deterministic MinHash/LSH near-dedup (T16, opt-in). Mirrors
-    // post_write::create_entity lockstep via the shared db helper so the agent
-    // and bulk paths never diverge (Risk #4). Same-type-only; Jaccard >= 0.9.
-    if crate::db::entity_minhash_enabled() {
-        if let Ok(Some(cand_id)) = db
-            .minhash_resolve_candidate(&entity.name, &entity.entity_type)
-            .await
-        {
-            entity_cache.insert(name_lower.clone(), cand_id.clone());
-            db.add_entity_alias(&name_lower, &cand_id, "minhash")
-                .await
-                .ok();
-            return Ok((cand_id, false));
-        }
-    }
-
-    // Step 3: Vector similarity (distance < 0.1)
-    if let Ok(results) = db.search_entities_by_vector(&entity.name, 1).await {
-        if let Some(result) = results.first() {
-            if result.distance < 0.1 {
-                entity_cache.insert(name_lower.clone(), result.entity.id.clone());
-                db.add_entity_alias(&name_lower, &result.entity.id, "auto")
-                    .await
-                    .ok();
-                return Ok((result.entity.id.clone(), false));
-            }
-        }
-    }
-
-    // Step 4: Create new entity + self-alias (store_entity auto-creates alias now)
-    let id = db
-        .store_entity(&entity.name, &entity.entity_type, None, Some(source), None)
+    let (id, created) = db
+        .resolve_or_create_entity(&entity.name, &entity.entity_type, None, Some(source), None)
         .await?;
-    // T16: index high-entropy band keys on the bulk create path too (lockstep
-    // with create_entity). Best-effort; only fires when the flag is on.
-    if crate::db::entity_minhash_enabled() {
-        if let Err(e) = db.index_entity_minhash_if_eligible(&id, &entity.name).await {
-            log::warn!("[resolve_entity_bulk] minhash band index failed for {id}: {e}");
-        }
-    }
     entity_cache.insert(name_lower, id.clone());
-    Ok((id, true))
+    Ok((id, created))
 }
 
 /// Import memories without LLM enrichment (for testing and fast-path).

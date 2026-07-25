@@ -1,8 +1,8 @@
 name: Coverage (informational)
 
-# Non-blocking coverage report posted to PRs. Pre-push and the main CI lane
-# both skip coverage; this workflow exists to give visibility without slowing
-# the merge gate. See AGENTS.md "Local vs CI test responsibilities".
+# Non-blocking coverage report for main and manual runs. Pre-push and the main
+# CI lane both skip instrumentation; this workflow keeps visibility without
+# slowing the merge gate. See AGENTS.md "Local vs CI test responsibilities".
 
 on:
   # Coverage was running on every PR (~7 min). Coverage is informational
@@ -21,8 +21,7 @@ on:
 permissions:
   contents: read
 
-# Don't run on every push — only PRs and manual triggers.
-# Cancel in-flight runs when a new commit lands on the PR.
+# Cancel a superseded manual/main run for the same ref.
 concurrency:
   group: coverage-${{ github.ref }}
   cancel-in-progress: true
@@ -40,6 +39,10 @@ jobs:
     # Informational: never blocks merges. Failing this job is a warning, not a
     # gate. Required-status-checks should NOT include this job.
     continue-on-error: true
+    env:
+      # Match ci.yml exactly so actions/cache computes the same cache version;
+      # a cache miss may download the model but never changes correctness.
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -56,14 +59,14 @@ jobs:
           # Coverage builds with `-C instrument-coverage`, so artifacts are not
           # interchangeable with the `clippy` or `test` caches in ci.yml.
           shared-key: coverage
+          # Manual feature-branch runs may restore main's cache but must not
+          # create branch-scoped entries that no other ref can reuse.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache FastEmbed ONNX model
+      - name: Cache fastembed model (Linux)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          # Wenlan's `resolve_fastembed_cache_dir` writes to
-          # `dirs::data_dir()/wenlan/memorydb/fastembed_cache` on Linux when
-          # no per-DB path or WENLAN_TEST_FASTEMBED_CACHE override is given.
-          path: ~/.local/share/wenlan/memorydb/fastembed_cache
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-bge-base-en-v1.5-q-v2
           restore-keys: |
             fastembed-bge-base-en-v1.5-q-
@@ -76,9 +79,10 @@ jobs:
       - name: Run Rust coverage (wenlan-core + wenlan-server)
         run: |
           cargo llvm-cov --package wenlan-core --package wenlan-server \
+            --no-report
+          cargo llvm-cov report \
             --summary-only --json --output-path rust-coverage.json
-          cargo llvm-cov --package wenlan-core --package wenlan-server \
-            --summary-only
+          cargo llvm-cov report
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

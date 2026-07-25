@@ -211,6 +211,9 @@ async fn fingerprint(db: &crate::db::MemoryDB) -> DbSemanticFingerprint {
 }
 
 async fn insert_memory(db: &crate::db::MemoryDB, id: &str, space: Option<&str>) {
+    // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91, so
+    // "no space" must bind the reserved sentinel id, not NULL.
+    let space = space.unwrap_or(crate::db::UNFILED_SPACE_ID);
     db.conn.lock().await.execute(
         "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, stability, supersede_mode, needs_reembed, memory_type, space) VALUES (?1, 'eligible body', 'memory', ?1, ?1, 0, 1, 'text', 'new', 'hide', 1, 'fact', ?2)",
         libsql::params![id, space],

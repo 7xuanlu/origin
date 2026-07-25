@@ -22,7 +22,11 @@ pub(super) async fn load(context: &LintContext<'_, '_>) -> Result<Counts, ()> {
             libsql::params::Params::Positional(vec![libsql::Value::Text(scope.clone())]),
         ),
         ScopeFilter::Uncategorized => (
-            " AND m.space IS NULL",
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91,
+            // same honest-columns treatment pages.workspace already got in M1
+            // (see the page_filter arm above) -- an unscoped memory now
+            // carries the reserved sentinel id, never NULL.
+            " AND m.space='00000000-0000-4000-8000-000000000001'",
             " WHERE p.status='active' AND p.workspace='00000000-0000-4000-8000-000000000001'",
             libsql::params::Params::None,
         ),
@@ -65,7 +69,10 @@ async fn load_episode_eligible(context: &LintContext<'_, '_>) -> Result<u64, ()>
             " AND m.space=?1",
             libsql::params::Params::Positional(vec![libsql::Value::Text(scope.clone())]),
         ),
-        ScopeFilter::Uncategorized => (" AND m.space IS NULL", libsql::params::Params::None),
+        ScopeFilter::Uncategorized => (
+            " AND m.space='00000000-0000-4000-8000-000000000001'",
+            libsql::params::Params::None,
+        ),
     };
     let sql = format!(
         "SELECT m.source_id,m.source_text,m.content FROM memories m WHERE m.source='memory' AND m.chunk_index=0{filter} ORDER BY m.source_id"

@@ -199,7 +199,13 @@ async fn seed_spaces(db: &crate::db::MemoryDB) {
 }
 
 async fn seed_invalid_memory(db: &crate::db::MemoryDB, id: &str, space: &str) {
-    let space = (space != "uncategorized").then_some(space);
+    // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91, so
+    // "uncategorized" must bind the reserved sentinel id, not NULL.
+    let space = if space == "uncategorized" {
+        crate::db::UNFILED_SPACE_ID
+    } else {
+        space
+    };
     db.conn.lock().await.execute(
         "INSERT INTO memories (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,confirmed,pinned,pending_revision,stability,supersede_mode,memory_type,space) VALUES (?1,'secret body','memory',?1,'secret title',0,1,'text',0,1,1,'impossible','hide','decision',?2)",
         libsql::params![id, space],

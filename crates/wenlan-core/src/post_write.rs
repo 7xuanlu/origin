@@ -2138,10 +2138,18 @@ pub async fn create_entity(
         }
     }
 
-    let name_lower = name.to_lowercase();
-
-    // Step 1: Alias lookup
-    if let Some(id) = db.resolve_entity_by_alias(&name_lower).await? {
+    // Resolve-then-write: the canonical cascade (M3 PR-1 stage d) shared with
+    // `importer::resolve_entity_bulk`, terminating in `store_entity`.
+    let (id, created) = db
+        .resolve_or_create_entity(
+            name,
+            entity_type,
+            req.space.as_deref(),
+            req.source_agent.as_deref(),
+            req.confidence,
+        )
+        .await?;
+    if !created {
         return Ok(WriteResult {
             id,
             attached_to: None,
@@ -2154,85 +2162,9 @@ pub async fn create_entity(
         });
     }
 
-    // Step 2: Exact name search
-    let name_results = db.search_entities_by_name(name).await?;
-    if let Some(existing) = name_results.first() {
-        let _ = db.add_entity_alias(&name_lower, &existing.id, "auto").await;
-        return Ok(WriteResult {
-            id: existing.id.clone(),
-            attached_to: None,
-            warnings: vec![],
-            wrote: false,
-            revision_card_id: None,
-            gated: false,
-            outcome: WriteOutcome::Unchanged,
-            acknowledged: false,
-        });
-    }
-
-    // Step 2.5: deterministic MinHash/LSH near-dedup (T16, opt-in).
-    // Catches char-level near-dups like "PostgreSQL"/"Postgres" that exact-name
-    // match misses and that the vector step may also miss. Gated behind
-    // WENLAN_ENABLE_ENTITY_MINHASH; the entropy gate inside
-    // minhash_resolve_candidate punts short/low-entropy names to the vector
-    // step. Same-type-only; auto-merge requires exact Jaccard >= 0.9.
-    if crate::db::entity_minhash_enabled() {
-        if let Some(cand_id) = db.minhash_resolve_candidate(name, entity_type).await? {
-            let _ = db.add_entity_alias(&name_lower, &cand_id, "minhash").await;
-            return Ok(WriteResult {
-                id: cand_id,
-                attached_to: None,
-                warnings: vec![],
-                wrote: false,
-                revision_card_id: None,
-                gated: false,
-                outcome: WriteOutcome::Unchanged,
-                acknowledged: false,
-            });
-        }
-    }
-
-    // Step 3: Vector similarity (distance < 0.1 => sim > 0.9)
-    let vec_results = db.search_entities_by_vector(name, 1).await?;
-    if let Some(result) = vec_results.first() {
-        if result.distance < 0.1 {
-            let _ = db
-                .add_entity_alias(&name_lower, &result.entity.id, "auto")
-                .await;
-            return Ok(WriteResult {
-                id: result.entity.id.clone(),
-                attached_to: None,
-                warnings: vec![],
-                wrote: false,
-                revision_card_id: None,
-                gated: false,
-                outcome: WriteOutcome::Unchanged,
-                acknowledged: false,
-            });
-        }
-    }
-
-    // Step 4: Create new
-    let id = db
-        .store_entity(
-            name,
-            entity_type,
-            req.space.as_deref(),
-            req.source_agent.as_deref(),
-            req.confidence,
-        )
-        .await?;
-
-    // T16: index the new entity's LSH bands so future high-entropy names can
-    // find it via Step 2.5. Only fires when the flag is on; the helper skips
-    // short/low-entropy names so the band table stays small. Best-effort.
-    if crate::db::entity_minhash_enabled() {
-        if let Err(e) = db.index_entity_minhash_if_eligible(&id, name).await {
-            log::warn!("[create_entity] minhash band index failed for {id}: {e}");
-        }
-    }
-
-    // Post-write enrichment (LLM-free, non-blocking)
+    // Post-write enrichment (LLM-free, non-blocking) -- only for a genuinely
+    // new entity; a resolved match already went through this ring when it
+    // was first created.
     let mut warnings: Vec<String> = Vec::new();
 
     // 1. Self-retrieval verification
@@ -2761,6 +2693,9 @@ async fn create_page_impl(
         citations: citations_json
             .and_then(|raw| serde_json::from_str(raw).ok())
             .unwrap_or_default(),
+        // `insert_page` never sets `kind` explicitly, so the row lands with the
+        // schema DEFAULT ('concept') -- mirror that here for consistency.
+        kind: "concept".to_string(),
     };
 
     // md-first write (only if a knowledge_path was provided)

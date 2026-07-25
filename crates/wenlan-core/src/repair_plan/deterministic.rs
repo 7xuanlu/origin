@@ -361,9 +361,13 @@ async fn entity_extraction_target_still_actionable(
             "repair_target_assertion_unsupported".to_string(),
         ));
     }
-    let mut rows = snapshot
-        .query(
-            "SELECT 1
+    // memories.space is NOT NULL since migration 91 — an unscoped memory
+    // carries the reserved sentinel id, which the RepairScope above translates
+    // back to None. So for an unscoped target ?2 is NULL while the row's space
+    // column is the sentinel: match NULL and sentinel both, else an unscoped
+    // entity-extraction repair reads as non-actionable and is dropped as stale.
+    let actionable_sql = format!(
+        "SELECT 1
                FROM memories m
                JOIN enrichment_steps s
                  ON s.source_id=m.source_id
@@ -371,8 +375,13 @@ async fn entity_extraction_target_still_actionable(
                 AND s.status='failed'
               WHERE m.source='memory'
                 AND m.source_id=?1
-                AND ((?2 IS NULL AND m.space IS NULL) OR m.space=?2)
+                AND ((?2 IS NULL AND (m.space IS NULL OR m.space = '{sentinel}')) OR m.space=?2)
               LIMIT 2",
+        sentinel = crate::db::UNFILED_SPACE_ID
+    );
+    let mut rows = snapshot
+        .query(
+            &actionable_sql,
             libsql::params::Params::Positional(vec![
                 libsql::Value::Text(memory_id.clone()),
                 target_scope
@@ -773,7 +782,13 @@ fn scoped_memory_clause(scope: &RepairLintScope) -> (&'static str, libsql::param
             " AND m.space=?1",
             libsql::params::Params::Positional(vec![libsql::Value::Text(space.clone())]),
         ),
-        RepairLintScope::Uncategorized => (" AND m.space IS NULL", libsql::params::Params::None),
+        RepairLintScope::Uncategorized => (
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration
+            // 85, so an unscoped memory carries the reserved sentinel id
+            // rather than NULL.
+            " AND m.space='00000000-0000-4000-8000-000000000001'",
+            libsql::params::Params::None,
+        ),
     }
 }
 
@@ -782,6 +797,11 @@ async fn resolve_memories(
     scope: &RepairLintScope,
 ) -> Result<Vec<DeterministicResolution>, WenlanError> {
     let (scope_clause, params) = scoped_memory_clause(scope);
+    // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91, so an
+    // unscoped memory carries the reserved sentinel id rather than NULL --
+    // the sentinel check below (was `m.space IS NULL`) keeps space_exists
+    // from false-flagging every unfiled memory as "references a missing
+    // Space" (see the `!space_exists` check further down).
     let sql = format!(
         "SELECT m.source_id,m.version,m.space,m.source_agent,m.supersedes,
                 m.confirmed,m.pinned,m.pending_revision,m.stability,
@@ -789,7 +809,7 @@ async fn resolve_memories(
                     SELECT 1 FROM memories prior
                      WHERE prior.source='memory' AND prior.source_id=m.supersedes
                 ) THEN 1 ELSE 0 END AS target_exists,
-                CASE WHEN m.space IS NULL OR EXISTS(
+                CASE WHEN m.space='00000000-0000-4000-8000-000000000001' OR EXISTS(
                     SELECT 1 FROM spaces s WHERE s.name=m.space
                 ) THEN 1 ELSE 0 END AS space_exists
            FROM memories m
@@ -839,7 +859,11 @@ async fn resolve_memories(
     {
         let target = RepairTarget::memory(
             source_id.clone(),
-            match space.clone() {
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration
+            // 85 -- translate the reserved sentinel id back to None so an
+            // unscoped memory still resolves to RepairScope::Uncategorized
+            // instead of a bogus RepairScope::Registered(sentinel).
+            match space.clone().filter(|s| s != crate::db::UNFILED_SPACE_ID) {
                 Some(space) => RepairScope::registered(space),
                 None => Ok(RepairScope::uncategorized()),
             }
@@ -968,7 +992,9 @@ fn scoped_memory_entity_clause(scope: &RepairLintScope) -> (&'static str, libsql
             libsql::params::Params::Positional(vec![libsql::Value::Text(space.clone())]),
         ),
         RepairLintScope::Uncategorized => (
-            " AND m.space IS NULL AND m.source_id IS NOT NULL",
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration
+            // 85, same sentinel treatment as scoped_memory_clause above.
+            " AND m.space='00000000-0000-4000-8000-000000000001' AND m.source_id IS NOT NULL",
             libsql::params::Params::None,
         ),
     }
@@ -1009,6 +1035,11 @@ async fn resolve_memory_entity_links(
     values
         .into_iter()
         .map(|(memory_id, entity_id, memory_owner, memory_space)| {
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration
+            // 85 -- translate the reserved sentinel id back to None so an
+            // unscoped owner still resolves to RepairScope::Uncategorized
+            // instead of a bogus RepairScope::Registered(sentinel).
+            let memory_space = memory_space.filter(|s| s != crate::db::UNFILED_SPACE_ID);
             let target_scope = match (memory_owner, memory_space) {
                 (Some(_), Some(space)) => RepairScope::registered(space),
                 (Some(_), None) => Ok(RepairScope::uncategorized()),

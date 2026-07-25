@@ -14,7 +14,9 @@ impl ReadScope {
         match self {
             Self::Global => true,
             Self::Space(space) => binding == Some(space.as_str()),
-            Self::Uncategorized => binding.is_none(),
+            Self::Uncategorized => {
+                binding.is_none() || binding == Some(crate::db::UNFILED_SPACE_ID)
+            }
         }
     }
 }

@@ -37,6 +37,8 @@ futures = { workspace = true }
 sysinfo = { workspace = true }
 fs2 = { workspace = true }
 sha2 = "0.10"
+file-rotate = "0.8"
+tracing-throttle = "0.4"
 # Pulls openssl-sys with the vendored feature (declared at workspace level).
 # wenlan-server doesn't call openssl_sys directly, but the dep needs to land
 # in at least one workspace-member's tree for cargo feature unification to

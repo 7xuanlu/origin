@@ -177,6 +177,7 @@ mod tests {
             review_status: review_status.to_string(),
             workspace: None,
             citations: Vec::new(),
+            kind: "concept".to_string(),
         }
     }
 

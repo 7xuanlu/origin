@@ -37,7 +37,13 @@ fn page_scope_clause(
             format!(" AND {column} = ?{parameter}"),
             Some(libsql::Value::Text(space.clone())),
         ),
-        ReadScope::Uncategorized => (format!(" AND {column} IS NULL"), None),
+        ReadScope::Uncategorized => (
+            format!(
+                " AND ({column} IS NULL OR {column} = '{}')",
+                super::UNFILED_SPACE_ID
+            ),
+            None,
+        ),
     }
 }
 
@@ -71,10 +77,10 @@ impl MemoryDB {
                       COALESCE(c.sources_updated_count, 0), c.stale_reason, \
                       COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
                       COALESCE(c.creation_kind, 'distilled'), \
-                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations";
+                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
         let mut conditions = vec!["c.status = 'active'".to_string()];
         let mut values = Vec::new();
-        super::push_read_scope_filter(scope, "c.workspace", &mut conditions, &mut values);
+        super::push_read_scope_filter_folded(scope, "c.workspace", &mut conditions, &mut values);
         if let Some(page_type) = page_type {
             conditions.push("c.space = ?".to_string());
             values.push(libsql::Value::Text(page_type.to_string()));
@@ -104,7 +110,7 @@ impl MemoryDB {
                     let page = Self::row_to_page(&row).map_err(|error| {
                         WenlanError::VectorDb(format!("search_pages_scoped vector decode: {error}"))
                     })?;
-                    let distance = row.get::<f64>(20).map_err(|error| {
+                    let distance = row.get::<f64>(21).map_err(|error| {
                         WenlanError::VectorDb(format!(
                             "search_pages_scoped vector distance: {error}"
                         ))
@@ -193,7 +199,14 @@ impl MemoryDB {
         for score in scores.values_mut() {
             *score = (*score / theoretical_max).min(1.0);
         }
-        let mut results: Vec<Page> = pages.into_values().collect();
+        // Fence (M3 PR-1 stage f): mirrors the `search_pages` exclusion --
+        // this is the scoped RRF page channel used both by `handle_search_pages`
+        // and, more importantly, by `search_memory_cross_rerank_cued`'s direct
+        // page channel, neither of which routes through `select_visible_pages`.
+        let mut results: Vec<Page> = pages
+            .into_values()
+            .filter(|page| page.kind != "entity")
+            .collect();
         results.sort_by(|left, right| {
             scores
                 .get(&right.id)
@@ -221,7 +234,16 @@ impl MemoryDB {
 
         use wenlan_types::{ActivityBadge, ActivityKind, RecentActivityItem};
 
-        let pages = self.list_pages_scoped("active", limit, 0, scope).await?;
+        // Fence (M3 PR-1 stage f): `list_pages_scoped` is a general-purpose
+        // listing (also used by callers that legitimately want every kind), so
+        // the exclusion lives here at the recent-activity surface specifically,
+        // mirroring `list_recent_pages_with_badges`'s SQL-level exclusion.
+        let pages: Vec<Page> = self
+            .list_pages_scoped("active", limit, 0, scope)
+            .await?
+            .into_iter()
+            .filter(|page| page.kind != "entity")
+            .collect();
         let all_source_ids = pages
             .iter()
             .flat_map(|page| page.source_memory_ids.iter().cloned())
@@ -326,7 +348,8 @@ impl MemoryDB {
         let (scope_sql, scope_value) = page_scope_clause(scope, "c.workspace", 2);
         let sql = format!(
             "SELECT c.id, c.title, c.version, c.created_at, c.last_modified \
-             FROM pages c WHERE c.status = 'active'{scope_sql} \
+             FROM pages c WHERE c.status = 'active' \
+               AND COALESCE(c.kind, 'concept') != 'entity'{scope_sql} \
              ORDER BY c.last_modified DESC LIMIT ?1"
         );
         let mut params = vec![libsql::Value::Integer(limit)];
@@ -379,12 +402,12 @@ impl MemoryDB {
                       COALESCE(c.sources_updated_count, 0), c.stale_reason, \
                       COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
                       COALESCE(c.creation_kind, 'distilled'), \
-                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations";
+                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
         let (sql, params) = match scope {
             ReadScope::Space(workspace) => (
                 format!(
                     "SELECT {select} FROM pages c \
-                     WHERE c.status = ?1 AND c.workspace = ?2 \
+                     WHERE c.status = ?1 AND COALESCE(c.kind, 'concept') != 'entity' AND c.workspace = ?2 \
                      ORDER BY c.last_modified DESC LIMIT ?3 OFFSET ?4"
                 ),
                 vec![
@@ -397,7 +420,7 @@ impl MemoryDB {
             ReadScope::Uncategorized => (
                 format!(
                     "SELECT {select} FROM pages c \
-                     WHERE c.status = ?1 AND c.workspace = '00000000-0000-4000-8000-000000000001' \
+                     WHERE c.status = ?1 AND COALESCE(c.kind, 'concept') != 'entity' AND c.workspace = '00000000-0000-4000-8000-000000000001' \
                      ORDER BY c.last_modified DESC LIMIT ?2 OFFSET ?3"
                 ),
                 vec![
@@ -474,9 +497,10 @@ impl MemoryDB {
                       COALESCE(c.sources_updated_count, 0), c.stale_reason, \
                       COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
                       COALESCE(c.creation_kind, 'distilled'), \
-                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations";
+                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
         let (scope_sql, scope_value) = page_scope_clause(scope, "c.workspace", 2);
-        let sql = format!("SELECT {select} FROM pages c WHERE c.id = ?1{scope_sql}");
+        let sql =
+            format!("SELECT {select} FROM pages c WHERE c.id = ?1 AND COALESCE(c.kind, 'concept') != 'entity'{scope_sql}");
         let mut params = vec![libsql::Value::Text(id.to_string())];
         if let Some(value) = scope_value {
             params.push(value);
@@ -505,7 +529,7 @@ impl MemoryDB {
         let sql = format!(
             "SELECT c.id, ps.page_id, ps.memory_source_id, ps.linked_at, ps.link_reason \
              FROM pages c LEFT JOIN page_sources ps ON ps.page_id = c.id \
-             WHERE c.id = ?1{scope_sql} ORDER BY ps.linked_at ASC"
+             WHERE c.id = ?1 AND COALESCE(c.kind, 'concept') != 'entity'{scope_sql} ORDER BY ps.linked_at ASC"
         );
         let mut params = vec![libsql::Value::Text(page_id.to_string())];
         if let Some(value) = scope_value {
@@ -549,7 +573,7 @@ impl MemoryDB {
         let sql = format!(
             "SELECT c.id, pl.target_page_id, pl.label FROM pages c \
              LEFT JOIN page_links pl ON pl.source_page_id = c.id \
-             WHERE c.id = ?1{scope_sql} ORDER BY pl.label_key"
+             WHERE c.id = ?1 AND COALESCE(c.kind, 'concept') != 'entity'{scope_sql} ORDER BY pl.label_key"
         );
         let mut params = vec![libsql::Value::Text(source_page_id.to_string())];
         if let Some(value) = scope_value {
@@ -595,7 +619,7 @@ impl MemoryDB {
              LEFT JOIN page_links pl ON pl.target_page_id = target.id \
              LEFT JOIN pages source ON source.id = pl.source_page_id \
                AND source.status = 'active'{source_scope_sql} \
-             WHERE target.id = ?1{target_scope_sql} \
+             WHERE target.id = ?1 AND COALESCE(target.kind, 'concept') != 'entity'{target_scope_sql} \
              ORDER BY source.last_modified DESC, source.id ASC"
         );
         let mut params = vec![libsql::Value::Text(target_page_id.to_string())];
@@ -636,7 +660,7 @@ impl MemoryDB {
         let (scope_sql, scope_value) = page_scope_clause(scope, "c.workspace", 2);
         let sql = format!(
             "SELECT COALESCE(c.changelog, '[]') FROM pages c \
-             WHERE c.id = ?1{scope_sql}"
+             WHERE c.id = ?1 AND COALESCE(c.kind, 'concept') != 'entity'{scope_sql}"
         );
         let mut params = vec![libsql::Value::Text(page_id.to_string())];
         if let Some(value) = scope_value {

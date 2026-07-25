@@ -4515,7 +4515,13 @@ async fn validate_entity_extraction_evidence_on_snapshot(
             ]),
         ),
         RepairLintScope::Uncategorized => (
-            " AND space IS NULL".to_string(),
+            // memories.space is NOT NULL since migration 91 — an unscoped
+            // memory carries the reserved sentinel id, not NULL. Match both so
+            // a not-yet-folded legacy NULL row still resolves.
+            format!(
+                " AND (space IS NULL OR space = '{}')",
+                crate::db::UNFILED_SPACE_ID
+            ),
             libsql::params::Params::Positional(vec![libsql::Value::Text(memory_id.to_string())]),
         ),
     };
@@ -5521,7 +5527,16 @@ async fn validate_memory_entity_scope_on_connection(
                 .map_err(database_error)?;
             let mut seen = 0_u64;
             while let Some(row) = rows.next().await.map_err(database_error)? {
-                let actual = row.get::<Option<String>>(0).map_err(database_error)?;
+                // M3 PR-1 stage e: memories.space is NOT NULL as of migration
+                // 85, so an unscoped memory carries the reserved sentinel id
+                // rather than NULL -- translate it back to None here so it
+                // still matches an Uncategorized scope's `scope.space() ==
+                // None`, the same translation prepare-time scope resolution
+                // already applies (see repair_plan/deterministic.rs).
+                let actual = row
+                    .get::<Option<String>>(0)
+                    .map_err(database_error)?
+                    .filter(|s| s != crate::db::UNFILED_SPACE_ID);
                 if actual.as_deref() != scope.space() {
                     return Err(WenlanError::Conflict("repair_target_stale".to_string()));
                 }
@@ -5579,7 +5594,16 @@ pub(crate) async fn validate_target_space_on_connection(
         .map_err(database_error)?;
     let mut seen = 0_u64;
     while let Some(row) = rows.next().await.map_err(database_error)? {
-        let actual: Option<String> = row.get(0).map_err(database_error)?;
+        // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91, so
+        // an unscoped memory carries the reserved sentinel id rather than
+        // NULL -- translate it back to None here so it still matches an
+        // Uncategorized target's `expected_space == None`, the same
+        // translation prepare-time scope resolution already applies (see
+        // repair_plan/deterministic.rs).
+        let actual: Option<String> = row
+            .get::<Option<String>>(0)
+            .map_err(database_error)?
+            .filter(|s| s != crate::db::UNFILED_SPACE_ID);
         if actual.as_deref() != expected_space {
             return Err(WenlanError::Conflict("repair_target_stale".to_string()));
         }
@@ -5677,7 +5701,13 @@ async fn resolve_target(
             libsql::params::Params::Positional(vec![libsql::Value::Text(space.clone())]),
         ),
         RepairLintScope::Uncategorized => (
-            " AND m.space IS NULL".to_string(),
+            // memories.space is NOT NULL since migration 91 — an unscoped
+            // memory carries the reserved sentinel id, not NULL. Match both so
+            // a not-yet-folded legacy NULL row still resolves.
+            format!(
+                " AND (m.space IS NULL OR m.space = '{}')",
+                crate::db::UNFILED_SPACE_ID
+            ),
             libsql::params::Params::None,
         ),
     };

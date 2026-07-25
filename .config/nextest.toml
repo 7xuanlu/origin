@@ -3,20 +3,6 @@
 #
 # https://nexte.st/docs/configuration/
 
-# Serialize all wenlan-core tests. Many of them instantiate the fastembed
-# embedder which holds a process-level lock on
-# `<cache>/models--Qdrant--bge-base-en-v1.5-onnx-Q/blobs/*.lock`. nextest
-# defaults to one process per test, so without serialization parallel tests
-# race on the cache lock and panic with "Lock acquisition failed". Serial
-# execution mirrors cargo test's in-process behavior and gives the embedder
-# init a clean window.
-[test-groups]
-wenlan-core = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'package(wenlan-core)'
-test-group = 'wenlan-core'
-
 # The folder-ingest pipeline is normally well under a minute (23s in the
 # focused local run). If its queue stops making progress, fail with evidence
 # instead of occupying a CI runner for an hour.

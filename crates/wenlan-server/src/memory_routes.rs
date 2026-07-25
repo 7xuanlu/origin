@@ -3672,6 +3672,7 @@ pub async fn handle_refresh_page(
         // Content update without fresh citations resets citations to []
         // (Global Constraints: stale claim-maps must not survive a content edit).
         citations: Vec::new(),
+        kind: existing.kind.clone(),
     };
 
     // 1. md-first

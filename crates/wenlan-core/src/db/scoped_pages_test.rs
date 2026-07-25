@@ -54,6 +54,7 @@ fn page(id: &str, workspace: Option<&str>) -> Page {
         review_status: "confirmed".to_string(),
         workspace: workspace.map(str::to_string),
         citations: Vec::new(),
+        kind: "concept".to_string(),
     }
 }
 

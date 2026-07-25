@@ -48,6 +48,27 @@ fn push_read_scope_filter(
     }
 }
 
+/// Same as `push_read_scope_filter`, but for columns migrated by the space-sentinel
+/// fold (`memories.space`, `chunks.space`, `pages.workspace`): unfiled rows are
+/// stored as `UNFILED_SPACE_ID`, not SQL NULL, so `Uncategorized` must match either.
+fn push_read_scope_filter_folded(
+    scope: &ReadScope,
+    column: &str,
+    conditions: &mut Vec<String>,
+    values: &mut Vec<libsql::Value>,
+) {
+    match scope {
+        ReadScope::Global => {}
+        ReadScope::Space(space) => {
+            conditions.push(format!("{column} = ?"));
+            values.push(libsql::Value::Text(space.clone()));
+        }
+        ReadScope::Uncategorized => conditions.push(format!(
+            "({column} IS NULL OR {column} = '{UNFILED_SPACE_ID}')"
+        )),
+    }
+}
+
 fn legacy_read_scope(space: Option<&str>) -> ReadScope {
     match space {
         None => ReadScope::Global,
@@ -505,6 +526,20 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("fold_entity_type: {e}")))?;
 
+            // Mirror the fold into the entity shadows (M3 PR-1 item C). This
+            // fold only touches `entity_type`, so a set-based UPDATE of every
+            // `kind='entity'` page still carrying `old_type` is exact parity
+            // with the entities UPDATE above -- and self-heals any drift --
+            // without needing to iterate the captured id list.
+            let now_iso = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE pages SET entity_type = ?1, last_modified = ?2 \
+                 WHERE kind = 'entity' AND entity_type = ?3",
+                libsql::params![canonical.to_string(), now_iso, old_type.to_string()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("fold_entity_type shadow: {e}")))?;
+
             let ledger_id = format!("vheal-{}", uuid::Uuid::new_v4());
             let now = chrono::Utc::now().timestamp();
             conn.execute(
@@ -538,7 +573,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 88;
+pub const SCHEMA_VERSION: u32 = 94;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -662,6 +697,24 @@ fn acquire_embedder_init_file_lock(cache_dir: Option<&std::path::Path>) -> Optio
         .ok()?;
     file.lock().ok()?;
     Some(file)
+}
+
+/// Construct a FastEmbed text model behind the shared process + filesystem
+/// locks. Every `TextEmbedding` initializer in this crate must use this seam:
+/// nextest runs tests in separate processes, so a process-local singleton does
+/// not protect a cold shared model cache.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn init_text_embedding(options: InitOptions) -> anyhow::Result<TextEmbedding> {
+    // fastembed 5.13.1 gives HF_HOME precedence over options.cache_dir in
+    // pull_from_hf(). Derive the lock domain from the same inputs here so a
+    // caller cannot accidentally lock one directory while hf-hub mutates
+    // another.
+    let effective_cache_dir = std::env::var_os("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| options.cache_dir.clone());
+    let _file_lock = acquire_embedder_init_file_lock(Some(&effective_cache_dir));
+    let _guard = EMBEDDER_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    TextEmbedding::try_new(options)
 }
 
 /// Known-client registry — maps canonical technical IDs (what clients send in
@@ -1508,6 +1561,28 @@ fn edges_reconcile_enabled_value(value: Option<&str>) -> bool {
     })
 }
 
+/// Gate for the background entity/page-parity reconcile sweep (M3 PR-2,
+/// stage a). Opt-in: default OFF; enable with
+/// WENLAN_ENABLE_ENTITY_PAGE_RECONCILE=1/true/yes. The sweep is read-only
+/// apart from the single `entity_page_parity_watermark` UPSERT that
+/// [`MemoryDB::reconcile_entity_page_parity`] stamps; it never flips a reader
+/// (that is stage b's manual cutover lever). No LLM. It remains opt-in until
+/// the full-store scan has a measured foreground-latency and memory ceiling,
+/// mirroring [`edges_reconcile_enabled`].
+pub fn entity_page_reconcile_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_ENTITY_PAGE_RECONCILE").ok();
+    entity_page_reconcile_enabled_value(value.as_deref())
+}
+
+fn entity_page_reconcile_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 /// True iff `WENLAN_RERANK_SKIP_PREFERENCE` is truthy. OPT-IN, default OFF.
 ///
 /// When ON, preference/recommendation-seeking queries (per
@@ -2010,7 +2085,12 @@ fn cluster_distillation_rows(
 
             for (i, mem) in memories.iter().enumerate() {
                 match mem.space.as_deref() {
-                    Some(space) if !space.is_empty() => {
+                    // M3 PR-1 stage e: `space` is NOT NULL as of migration
+                    // 85, so "no declared space" now reads as the reserved
+                    // `UNFILED_SPACE_ID` sentinel rather than NULL/empty --
+                    // it must still land in the unlinked bucket, not its own
+                    // space group.
+                    Some(space) if !space.is_empty() && space != UNFILED_SPACE_ID => {
                         space_groups.entry(space.to_string()).or_default().push(i);
                     }
                     _ => unlinked.push(i),
@@ -2913,23 +2993,16 @@ impl MemoryDB {
                 .unwrap_or_else(|| "<default>".into())
         );
         let (embed_tx, embed_rx) = tokio::sync::oneshot::channel();
-        let embed_cache_for_lock = embed_cache_dir.clone();
         std::thread::Builder::new()
             .name("embedder-init".into())
             .spawn(move || {
-                // Cross-process serialization first (covers nextest forked test
-                // processes). Process-local mutex second (covers parallel inits
-                // within the same process). Lock-ordering: outer file lock,
-                // inner process mutex — both protect the same try_new call.
-                let _file_lock = acquire_embedder_init_file_lock(embed_cache_for_lock.as_deref());
-                let _guard = EMBEDDER_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                 log::info!("[memory_db] embedder thread: loading ONNX model...");
                 let mut opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
                 if let Some(cache) = embed_cache_dir {
                     opts = opts.with_cache_dir(cache);
                 }
-                let result = TextEmbedding::try_new(opts);
+                let result = init_text_embedding(opts);
                 let _ = embed_tx.send(result);
             })
             .map_err(|e| WenlanError::Embedding(format!("spawn embedder thread: {}", e)))?;
@@ -3049,15 +3122,9 @@ impl MemoryDB {
         std::thread::Builder::new()
             .name("embedder-init-shared".into())
             .spawn(move || {
-                // Cross-process serialization first (covers nextest forked test
-                // processes). Process-local mutex second. No `embed_cache_dir`
-                // here — caller doesn't supply one, so the lock falls back to
-                // `dirs::data_dir()/wenlan/memorydb/.embedder_init.lock`.
-                let _file_lock = acquire_embedder_init_file_lock(None);
-                let _guard = EMBEDDER_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                 let opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(true);
-                let result = TextEmbedding::try_new(opts);
+                let result = init_text_embedding(opts);
                 let _ = tx.send(result);
             })
             .map_err(|e| WenlanError::Embedding(format!("spawn embedder: {}", e)))?;
@@ -4899,6 +4966,27 @@ impl MemoryDB {
                             {
                                 log::warn!(
                                     "[memory_db] null entity embed recovery id={}: {}",
+                                    id,
+                                    e
+                                );
+                            }
+                            // Mirror the recovered embedding onto the entity's
+                            // kind='entity' shadow page (M3 PR-1 dual-write
+                            // parity), in the SAME tx, so a boot that recovers
+                            // entity embeddings never leaves the shadow's
+                            // embedding stale/NULL. A no-op for an entity that
+                            // has no mapped shadow.
+                            if let Err(e) = conn
+                                .execute(
+                                    "UPDATE pages SET embedding = vector32(?1) \
+                                     WHERE kind = 'entity' \
+                                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?2)",
+                                    libsql::params![Self::vec_to_sql(&embeddings[idx]), id.clone()],
+                                )
+                                .await
+                            {
+                                log::warn!(
+                                    "[memory_db] null entity embed recovery shadow id={}: {}",
                                     id,
                                     e
                                 );
@@ -7956,6 +8044,76 @@ impl MemoryDB {
                     .map_err(|e| WenlanError::VectorDb(format!("migration 88 bump: {e}")))?;
                 log::info!("[migration] Migration 88 applied: operation_receipts table");
             }
+
+            // Migration 89 (M3 PR-1, stage b; 83 pre-merge — renumbered when
+            // main's ambient-enrichment chain claimed 83-88): `pages.kind` --
+            // the unified page-kind discriminator (spec v3: entity | concept |
+            // source | overview | authored), M3's first producer
+            // (`kind='entity'` lands with the dual-write shadow-page stage
+            // later in PR-1). Backfills the existing corpus honestly from
+            // `creation_kind` (migration 61) plus a title-based special case
+            // for the reserved Overview singleton, whose `creation_kind` is
+            // indistinguishably 'research'. See migrate_89_page_kind_fold and
+            // docs/plans/2026-07-22-m3-pr1-caller-inventory.md.
+            if version < 89 {
+                self.migrate_89_page_kind_fold(version).await?;
+            }
+
+            // Migration 90 (M3 PR-1, stage c; 84 pre-merge): `entity_page_map`
+            // -- the durable `entity_id <-> page_id` id-map the spec's expand-
+            // contract program requires (PR-2's wire-freeze adapters
+            // translate old `entity_id`s through it). Brand-new empty table,
+            // no backfill (stage f populates it alongside the dual-write
+            // shadow-page backfill). See migrate_90_entity_page_map.
+            if version < 90 {
+                self.migrate_90_entity_page_map(version).await?;
+            }
+
+            // Migration 91 (M3 PR-1, stage e; 85 pre-merge): the symmetric
+            // memory-side `unfiled` fold -- `memories.space` carries the same
+            // pre-M1 tell `pages.space`/`workspace` had before migration 80
+            // (`idx_memories_space ... WHERE space IS NOT NULL`, db.rs:6360).
+            // Unlike the pages fold there is no second scope axis to merge:
+            // every NULL folds straight to the reserved `UNFILED_SPACE_ID`
+            // sentinel, the same rule migration 80 uses for its "both NULL"
+            // case. See migrate_91_memory_space_fold.
+            if version < 91 {
+                self.migrate_91_memory_space_fold(version).await?;
+            }
+
+            // Migration 92 (M3 PR-1, stage f; 86 pre-merge): dual-write
+            // entities as `kind='entity'` page shadows. Adds
+            // `pages.entity_type`/`confidence`/`entity_confirmed`, widens
+            // `pages.creation_kind`'s CHECK to admit 'entity', creates
+            // `entity_page_migration_state`, and backfills every existing
+            // entity a shadow page + `entity_page_map` row via the same
+            // helper `store_entity`'s live dual-write now uses. See
+            // migrate_92_entity_shadow_pages.
+            if version < 92 {
+                self.migrate_92_entity_shadow_pages(version).await?;
+            }
+
+            // Migration 93 (M3 PR-1, item C; 87 pre-merge): add
+            // `pages.aliases` (a JSON array of the entity's alias names) so
+            // the update-path shadow re-sync (`update_entity_shadow_page`)
+            // has a column to mirror into, then backfill it for the shadows
+            // migration 92 created. See migrate_93_page_aliases.
+            if version < 93 {
+                self.migrate_93_page_aliases(version).await?;
+            }
+
+            // Migration 94 (M3 PR-2, stage a): the entity<->page reader-
+            // cutover control plane -- `entity_reader_cutover` (per-consumer
+            // intent, wired by stage b's `reader_uses_entity_pages`
+            // predicate and `set_entity_reader_cutover` lever) and
+            // `entity_page_parity_watermark` (the stage-a reconciliation
+            // proof this PR stamps via `reconcile_entity_page_parity`). Pure
+            // `CREATE TABLE IF NOT EXISTS`, no data mutation, no behavior
+            // change -- mirrors migration 82 (M2 PR-2). See
+            // ensure_entity_cutover_tables.
+            if version < 94 {
+                self.migrate_94_entity_reader_cutover(version).await?;
+            }
         }
 
         Ok(())
@@ -8550,6 +8708,20 @@ impl MemoryDB {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         let dest = dir.join(format!("pre_migration_{migration}_backup.db"));
+        // Preserve the ORIGINAL restore point across retries. A migration runs
+        // once (user_version gate), so a pre-existing `dest` can only come from
+        // an earlier failed/killed attempt at THIS same migration. Re-snapshotting
+        // would have `online_backup` delete that pristine file and copy the
+        // now-partially-migrated live DB over it -- destroying the very
+        // pre-migration state this backup exists to provide. Skip instead.
+        if dest.exists() {
+            log::info!(
+                "[migration] pre-migration {migration} backup already exists at {}; preserving \
+                 the original restore point (skipping re-snapshot)",
+                dest.display()
+            );
+            return Ok(());
+        }
         let receipt = self.online_backup(&dest).await?;
         if !receipt.integrity_ok {
             return Err(WenlanError::VectorDb(format!(
@@ -8653,6 +8825,1291 @@ impl MemoryDB {
         log::info!("[migration] Migration 82 applied: edge reader-cutover control plane (M2 PR-2)");
         Ok(())
     }
+
+    // Migration 89 (M3 PR-1, stage b): `pages.kind` -- the unified page-kind
+    // discriminator (spec v3: pages carry `entity | concept | source |
+    // overview | authored`). M3 is the first producer (`kind = 'entity'`,
+    // added by the dual-write shadow-page stage later in PR-1); this
+    // migration only backfills the *existing* corpus honestly from
+    // `creation_kind` (migration 61, `db.rs:6862`) plus one title-based
+    // special case for the reserved Overview singleton
+    // (`synthesis::overview::OVERVIEW_PAGE_TITLE`), whose `creation_kind` is
+    // indistinguishably 'research' like any other research page.
+    //
+    // Unlike M1's `space`/`workspace` fold (existing NULLABLE columns
+    // retrofitted NOT NULL via the writable_schema text-patch trick,
+    // migration 80), `kind` is a BRAND NEW column: `ALTER TABLE ... ADD
+    // COLUMN ... NOT NULL DEFAULT 'concept' CHECK(...)` is valid SQLite for a
+    // fresh column (the same mechanism migration 61 used for `creation_kind`
+    // itself), so no writable_schema patch or NULL-lie assertion is needed --
+    // the column can never be NULL from the moment it exists. The ALTER
+    // TABLE is still guarded by a `pragma_table_info` existence check (the
+    // migration-61/62 idiom) so a crash-and-resume mid-migration -- backfill
+    // batch N fails, `user_version` stays 88, next startup re-fires this
+    // function -- doesn't hit "duplicate column name" on the second attempt.
+    //
+    // `page_kind_fold_ledger` mirrors `page_space_fold_ledger` (migration
+    // 80): freezes each page's pre-fold `creation_kind` + the assigned kind +
+    // which rule fired, populated before any row's `kind` is touched, so a
+    // category-carrying DB stays auditable/recoverable the same way M1's
+    // ledger did for space.
+    async fn migrate_89_page_kind_fold(&self, prior_version: i64) -> Result<(), WenlanError> {
+        // §6.9: pre-migration online backup + integrity receipt BEFORE any
+        // DDL, mirroring migration 82 -- this migration ALTERs `pages` and
+        // batch-UPDATEs every row, so a botched run has a restore point.
+        self.backup_before_migration(89, prior_version).await?;
+
+        // Measured lock-duration budget mirrors migration 80's (same table,
+        // same per-row UPDATE cost class).
+        const BATCH_SIZE: i64 = 10_000;
+
+        // Step 1: add the column (guarded, resumable) + create the fold-ledger
+        // table, together in one transaction, before any backfill batch runs.
+        // The ledger is POPULATED in the Step-2 batch loop (per rowid range,
+        // one commit per batch) rather than in a single unbatched
+        // `INSERT ... FROM pages`, so a large table's ledger populate does not
+        // hold the write lock for the whole scan -- mirroring the same
+        // lock-duration budget the kind backfill already respects. The ledger
+        // reads only `creation_kind`/`title`/`status`, which the backfill never
+        // mutates, so populating it alongside the backfill still records
+        // pre-backfill state. The Overview title check comes FIRST in the CASE
+        // so it wins over creation_kind='research' (Overview is indistinguishable
+        // from any other research page by creation_kind alone).
+        {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 begin setup: {e}")))?;
+            let result: Result<(), WenlanError> = async {
+                let has_col: bool = {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = 'kind'",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m89 col check: {e}")))?;
+                    match rows.next().await {
+                        Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+                        _ => false,
+                    }
+                };
+                if !has_col {
+                    conn.execute(
+                        "ALTER TABLE pages ADD COLUMN kind TEXT NOT NULL DEFAULT 'concept' \
+                         CHECK(kind IN ('entity','concept','source','overview','authored'))",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m89 add kind column: {e}")))?;
+                }
+
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS page_kind_fold_ledger (
+                        page_id TEXT PRIMARY KEY,
+                        prior_creation_kind TEXT NOT NULL,
+                        assigned_kind TEXT NOT NULL CHECK(assigned_kind IN ('entity','concept','source','overview','authored')),
+                        rule TEXT NOT NULL CHECK(rule IN ('overview_title','authored','source','concept')),
+                        migrated_at TEXT NOT NULL
+                    );",
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 create ledger: {e}")))?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m89 commit setup: {e}")))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Step 2: populate the fold ledger AND backfill `kind` in rowid-range
+        // batches, one commit per batch, mirroring migration 80's lock-duration
+        // budget. Each batch inserts the ledger rows for its range (INSERT OR
+        // IGNORE -- idempotent on resume) then applies the identical CASE to
+        // `kind` over the same range, in one transaction. Every row is already
+        // NOT NULL 'concept' from the column DEFAULT the moment step 1 commits,
+        // so a kill mid-run never leaves a lying/uncovered row; resuming
+        // re-inserts the same ledger rows (no-op) and re-applies the same CASE
+        // to already-folded rows (no-op). One `migrated_at` for the whole run.
+        let migrated_at = chrono::Utc::now().to_rfc3339();
+        let mut cursor: i64 = i64::MIN;
+        loop {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 begin batch: {e}")))?;
+            let result: Result<Option<i64>, WenlanError> = async {
+                let hi: Option<i64> =
+                    {
+                        let mut rows = conn
+                            .query(
+                                "SELECT MAX(rowid) FROM \
+                             (SELECT rowid FROM pages WHERE rowid > ?1 ORDER BY rowid LIMIT ?2)",
+                                libsql::params![cursor, BATCH_SIZE],
+                            )
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m89 batch bound: {e}")))?;
+                        match rows.next().await.map_err(|e| {
+                            WenlanError::VectorDb(format!("m89 batch bound row: {e}"))
+                        })? {
+                            Some(row) => row.get::<Option<i64>>(0).map_err(|e| {
+                                WenlanError::VectorDb(format!("m89 batch bound col: {e}"))
+                            })?,
+                            None => None,
+                        }
+                    };
+                let Some(hi) = hi else {
+                    return Ok(None);
+                };
+                conn.execute(
+                    "INSERT OR IGNORE INTO page_kind_fold_ledger \
+                        (page_id, prior_creation_kind, assigned_kind, rule, migrated_at) \
+                     SELECT id, creation_kind, \
+                        CASE WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview' \
+                             WHEN creation_kind = 'authored' THEN 'authored' \
+                             WHEN creation_kind = 'imported' THEN 'source' \
+                             ELSE 'concept' END, \
+                        CASE WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview_title' \
+                             WHEN creation_kind = 'authored' THEN 'authored' \
+                             WHEN creation_kind = 'imported' THEN 'source' \
+                             ELSE 'concept' END, \
+                        ?3 \
+                     FROM pages WHERE rowid > ?1 AND rowid <= ?2",
+                    libsql::params![cursor, hi, migrated_at.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 populate ledger: {e}")))?;
+                conn.execute(
+                    "UPDATE pages SET kind = CASE \
+                        WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview' \
+                        WHEN creation_kind = 'authored' THEN 'authored' \
+                        WHEN creation_kind = 'imported' THEN 'source' \
+                        ELSE 'concept' END \
+                     WHERE rowid > ?1 AND rowid <= ?2",
+                    libsql::params![cursor, hi],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 backfill kind: {e}")))?;
+                Ok(Some(hi))
+            }
+            .await;
+            match result {
+                Ok(Some(hi)) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m89 commit batch: {e}")))?;
+                    cursor = hi;
+                }
+                Ok(None) => {
+                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("m89 commit final batch: {e}"))
+                    })?;
+                    break;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Step 3: assert the mirror invariant (pages.kind == ledger's
+        // assigned_kind for every page), then create the (non-partial --
+        // `kind` is never NULL) index.
+        {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 begin assert: {e}")))?;
+            let result: Result<(), WenlanError> = async {
+                Self::assert_pages_kind_matches_ledger(&conn).await?;
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pages_kind ON pages(kind)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 create idx kind: {e}")))?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m89 commit assert: {e}")))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 89", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m89 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 89 applied: pages.kind column + honest backfill from creation_kind (M3 PR-1)"
+        );
+        Ok(())
+    }
+
+    /// Mirror-invariant check for migration 89 (analogous to
+    /// `assert_pages_scope_columns_backfilled` for M1): every page's `kind`
+    /// must equal its fold ledger's `assigned_kind`. `kind` can never be NULL
+    /// (NOT NULL DEFAULT from birth), so a surviving divergence here means a
+    /// batch silently skipped rows, not that the column lied about being NOT
+    /// NULL.
+    async fn assert_pages_kind_matches_ledger(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        let unresolved: bool = {
+            let mut rows = conn
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM pages p \
+                     JOIN page_kind_fold_ledger l ON p.id = l.page_id \
+                     WHERE p.kind <> l.assigned_kind)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 assert query: {e}")))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m89 assert row: {e}")))?
+            {
+                Some(row) => {
+                    row.get::<i64>(0)
+                        .map_err(|e| WenlanError::VectorDb(format!("m89 assert col: {e}")))?
+                        != 0
+                }
+                None => false,
+            }
+        };
+        if unresolved {
+            return Err(WenlanError::VectorDb(
+                "m89: a pages row's kind diverges from its fold ledger's assigned_kind after \
+                 backfill -- a batch must have silently skipped rows"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    // Migration 90 (M3 PR-1, stage c): the durable `entity_id <-> page_id`
+    // id-map (spec v3's expand-contract program: PR-2's per-consumer wire
+    // adapters translate old `entity_id`s through this table rather than the
+    // frozen wire shape itself changing). `UNIQUE(entity_id)` (the PRIMARY
+    // KEY) + `UNIQUE(page_id)` -- both directions are 1:1, matching the
+    // "every entity upsert also writes/updates its `kind=entity` page"
+    // dual-write invariant stage (f) wires. Both FKs are `ON DELETE CASCADE`
+    // (mirrors `observations`/`relations` -> `entities`): `delete_entity`
+    // already does a plain `DELETE FROM entities WHERE id = ?1` under
+    // `PRAGMA foreign_keys = ON`, so a map row cascades away for free, no
+    // code change needed there.
+    //
+    // Brand-new empty table, no data to touch -- pure `CREATE TABLE IF NOT
+    // EXISTS` inside one BEGIN/COMMIT, replay-safe by construction (mirrors
+    // migration 82's edges-control-plane tables). Backfilling existing
+    // entities into shadow pages + this map is stage (f)'s job, once the
+    // canonical entity-upsert service (stage d) exists for the backfill to
+    // reuse.
+    async fn migrate_90_entity_page_map(&self, prior_version: i64) -> Result<(), WenlanError> {
+        // §6.9: pre-migration online backup + integrity receipt, mirroring
+        // migrations 82 and 89.
+        self.backup_before_migration(90, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m90 begin: {e}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS entity_page_map (
+                    entity_id TEXT NOT NULL PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+                    page_id TEXT NOT NULL UNIQUE REFERENCES pages(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m90 DDL: {e}")))?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m90 commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+        drop(conn);
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 90", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m90 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 90 applied: entity_id <-> page_id map (M3 PR-1, stage c)"
+        );
+        Ok(())
+    }
+
+    // Migration 91 (M3 PR-1, stage e): mirrors M1's page-side fold
+    // (migration 80) for `memories.space`. `space` has been nullable since
+    // migration 24 (created that way; migration 50 only renamed
+    // `domain`->`space`, it did not touch nullability) and
+    // `idx_memories_space` has carried a `WHERE space IS NOT NULL` partial
+    // predicate since that same rename -- the identical tell migration 80
+    // read off `pages` before its fold. There is only one resolution rule
+    // here (no `workspace` axis to reconcile the way pages had): every NULL
+    // folds straight to the reserved `UNFILED_SPACE_ID` sentinel.
+    async fn migrate_91_memory_space_fold(&self, prior_version: i64) -> Result<(), WenlanError> {
+        // §6.9: pre-migration online backup + integrity receipt, mirroring
+        // migrations 82/89/90.
+        self.backup_before_migration(91, prior_version).await?;
+
+        // Measured 2026-07-19 on this machine (migration 80's own benchmark;
+        // this fold is a single-column UPDATE over the same table shape, so
+        // the same batch size holds the ~50ms/batch lock-duration budget).
+        const BATCH_SIZE: i64 = 10_000;
+
+        // Pre-migration audit: how many rows actually need folding. Read-only,
+        // no lock held beyond the query itself.
+        let null_count: i64 = {
+            let conn = self.conn.lock().await;
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM memories WHERE space IS NULL", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 audit count: {e}")))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 audit row: {e}")))?
+            {
+                Some(row) => row
+                    .get::<i64>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("m91 audit col: {e}")))?,
+                None => 0,
+            }
+        };
+        log::info!(
+            "[migration] Migration 91 pre-fold audit: {null_count} memories row(s) with NULL space"
+        );
+
+        // Backfill in rowid-range batches, one commit per batch, so a kill
+        // mid-run resumes from the lowest rowid rather than restarting a
+        // half-open transaction -- mirrors migration 80's steps 3-4. The
+        // UPDATE only touches rows that are still NULL, so a resumed run
+        // re-touches already-folded rows as a cheap no-op. The cursor starts
+        // at i64::MIN (not 0) so a row at a non-positive rowid is folded too.
+        let mut cursor: i64 = i64::MIN;
+        loop {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 begin batch: {e}")))?;
+            let result: Result<Option<i64>, WenlanError> = async {
+                let hi: Option<i64> =
+                    {
+                        let mut rows = conn
+                            .query(
+                                "SELECT MAX(rowid) FROM \
+                             (SELECT rowid FROM memories WHERE rowid > ?1 ORDER BY rowid LIMIT ?2)",
+                                libsql::params![cursor, BATCH_SIZE],
+                            )
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m91 batch bound: {e}")))?;
+                        match rows.next().await.map_err(|e| {
+                            WenlanError::VectorDb(format!("m91 batch bound row: {e}"))
+                        })? {
+                            Some(row) => row.get::<Option<i64>>(0).map_err(|e| {
+                                WenlanError::VectorDb(format!("m91 batch bound col: {e}"))
+                            })?,
+                            None => None,
+                        }
+                    };
+                let Some(hi) = hi else {
+                    return Ok(None);
+                };
+                conn.execute(
+                    "UPDATE memories SET space = ?3 \
+                     WHERE space IS NULL AND rowid > ?1 AND rowid <= ?2",
+                    libsql::params![cursor, hi, UNFILED_SPACE_ID],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 backfill space: {e}")))?;
+                Ok(Some(hi))
+            }
+            .await;
+            match result {
+                Ok(Some(hi)) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m91 commit batch: {e}")))?;
+                    cursor = hi;
+                }
+                Ok(None) => {
+                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("m91 commit final batch: {e}"))
+                    })?;
+                    break;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Assert every row resolved, then rebuild the space index without
+        // its now-vacuous partial predicate.
+        {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 begin assert: {e}")))?;
+            let result: Result<(), WenlanError> = async {
+                Self::assert_memories_space_backfilled(&conn).await?;
+                conn.execute("DROP INDEX IF EXISTS idx_memories_space", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m91 drop idx: {e}")))?;
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_space ON memories(space)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 create idx: {e}")))?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m91 commit assert: {e}")))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Stamp NOT NULL via the migration-67/80 writable_schema pattern
+        // rather than rebuilding `memories` (a full rebuild would need to
+        // rewire `memories_fts` and its 3 rowid-coupled triggers, plus every
+        // vector-index-bearing statement, for no benefit over the text
+        // patch). Bare autocommit statements, matching migration 80. The
+        // DEFAULT is the reserved sentinel id, so a bare INSERT that omits
+        // space lands the sentinel, never NULL.
+        let conn = self.conn.lock().await;
+        let current_sql: Option<String> = {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 read memories sql: {e}")))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 memories sql row: {e}")))?
+            {
+                Some(row) => Some(
+                    row.get::<String>(0)
+                        .map_err(|e| WenlanError::VectorDb(format!("m91 memories sql col: {e}")))?,
+                ),
+                None => None,
+            }
+        };
+        if let Some(sql) = current_sql {
+            let patched = sql.replacen(
+                "space TEXT,",
+                &format!("space TEXT NOT NULL DEFAULT '{UNFILED_SPACE_ID}',"),
+                1,
+            );
+            if patched != sql {
+                conn.execute("PRAGMA writable_schema=ON", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m91 writable on: {e}")))?;
+                // Always turn writable_schema back OFF, even if the patch fails:
+                // the shared process-lifetime connection must never be left in
+                // the schema-writable state (a later write could corrupt the
+                // schema). Capture the patch result, RESET unconditionally, then
+                // propagate the patch error.
+                let patch = conn
+                    .execute(
+                        "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='memories'",
+                        libsql::params![patched],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m91 patch schema: {e}")));
+                conn.execute("PRAGMA writable_schema=RESET", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m91 writable reset: {e}")))?;
+                patch?;
+            }
+        }
+
+        conn.execute("PRAGMA user_version = 91", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m91 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 91 applied: memories.space unfiled fold + NOT NULL (M3 PR-1, stage e)"
+        );
+        Ok(())
+    }
+
+    /// Extracted so it is directly testable, mirroring
+    /// `assert_pages_scope_columns_backfilled` -- the writable_schema NOT
+    /// NULL patch validates nothing on its own, so this EXISTS check is the
+    /// only thing standing between a surviving NULL and a column that lies
+    /// about itself. `SELECT COUNT(*)` is used for the pre-fold audit log
+    /// above (established precedent elsewhere in this file), but the hard-fail
+    /// assertion uses EXISTS per the known libSQL vector-index COUNT bug note.
+    async fn assert_memories_space_backfilled(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        let unresolved: bool = {
+            let mut rows = conn
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM memories WHERE space IS NULL)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 assert query: {e}")))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m91 assert row: {e}")))?
+            {
+                Some(row) => {
+                    row.get::<i64>(0)
+                        .map_err(|e| WenlanError::VectorDb(format!("m91 assert col: {e}")))?
+                        != 0
+                }
+                None => false,
+            }
+        };
+        if unresolved {
+            return Err(WenlanError::VectorDb(
+                "m91: a memories row still has NULL space after backfill -- refusing to stamp \
+                 NOT NULL over a lie"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Insert a `kind='entity'` page shadow for an existing `entities` row
+    /// (M3 PR-1 stage f) + its `entity_page_map` row, inside the caller's
+    /// already-open transaction. Every field is read straight off `entities`
+    /// (`SELECT ... FROM entities WHERE id = ?4`), so `store_entity`'s
+    /// live create-time dual-write and migration 92's backfill loop -- the
+    /// two callers -- produce byte-identical shadow-page shapes without
+    /// either keeping its own copy of the entity's fields in sync. `space`
+    /// is nullable on `entities` but `pages.space`/`pages.workspace` are
+    /// NOT NULL (M1 honest columns), so a NULL entity space folds to the
+    /// reserved `UNFILED_SPACE_ID` sentinel, matching migration 80/91's rule
+    /// for the same case. `content` is the empty string: PR-1 shadow pages
+    /// are write-only, never surfaced to a reader (fenced out of every
+    /// `select_visible_pages`-family surface), so there is no prose to hold.
+    async fn insert_entity_shadow_page(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        page_id: &str,
+        now_iso: &str,
+    ) -> Result<(), WenlanError> {
+        conn.execute(
+            "INSERT INTO pages (
+                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                embedding, space, workspace, source_memory_ids, version, status,
+                created_at, last_compiled, last_modified, creation_kind, review_status
+             )
+             SELECT ?1, name, NULL, '', 'entity', entity_type, confidence, confirmed,
+                    embedding, COALESCE(space, ?2), COALESCE(space, ?2), '[]', 1, 'active',
+                    ?3, ?3, ?3, 'entity', 'unconfirmed'
+             FROM entities WHERE id = ?4",
+            libsql::params![page_id, UNFILED_SPACE_ID, now_iso, entity_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("insert_entity_shadow_page pages: {e}")))?;
+
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, ?2, ?3)",
+            libsql::params![entity_id, page_id, now_iso],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("insert_entity_shadow_page map: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Re-sync a `kind='entity'` page shadow's mirrored columns from its live
+    /// `entities` row (M3 PR-1 item C, update-path parity). Every entity
+    /// mutator that changes a shadowed field (`store_entity`, `add_entity_alias`,
+    /// `confirm_entity`, `refresh_entity_embedding`, `merge_entities`) calls
+    /// this inside its own transaction after the `entities` write, so the
+    /// shadow never drifts from the row it mirrors. Unlike
+    /// `insert_entity_shadow_page`, this also refreshes `aliases` -- the
+    /// `entity_aliases` JSON array added to `pages` in migration 93 -- which
+    /// the insert path deliberately leaves untouched: migration 92's backfill
+    /// calls `insert_entity_shadow_page` BEFORE migration 93 adds the
+    /// `pages.aliases` column, so the insert SQL cannot reference it. A no-op
+    /// when the entity has no mapped shadow (the `WHERE` finds no row).
+    async fn update_entity_shadow_page(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        now_iso: &str,
+    ) -> Result<(), WenlanError> {
+        conn.execute(
+            "UPDATE pages SET
+                title = (SELECT name FROM entities WHERE id = ?1),
+                entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
+                confidence = (SELECT confidence FROM entities WHERE id = ?1),
+                entity_confirmed = (SELECT confirmed FROM entities WHERE id = ?1),
+                embedding = (SELECT embedding FROM entities WHERE id = ?1),
+                space = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                workspace = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                aliases = (SELECT json_group_array(alias_name)
+                           FROM (SELECT alias_name FROM entity_aliases
+                                 WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                last_modified = ?3
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id, UNFILED_SPACE_ID, now_iso],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("update_entity_shadow_page: {e}")))?;
+
+        Ok(())
+    }
+
+    // Migration 92 (M3 PR-1, stage f): dual-write entities as `kind='entity'`
+    // page shadows. Adds `pages.entity_type`/`pages.confidence`/
+    // `pages.entity_confirmed` (mirroring the matching `entities` columns),
+    // widens `pages.creation_kind`'s CHECK to admit 'entity' (migration 67's
+    // writable_schema technique), creates `entity_page_migration_state`
+    // (mirrors `edges_migration_state`, db.rs `edges_migration_state`
+    // CREATE), and backfills every existing entity a shadow page +
+    // `entity_page_map` row via `insert_entity_shadow_page` -- the SAME
+    // helper `store_entity`'s live dual-write uses, so a freshly created
+    // entity and a backfilled one are byte-identical in shape. Shadow pages
+    // are write-only in PR-1: `select_visible_pages` and every other
+    // page-reading surface fence out `kind='entity'` (their own stage-f
+    // change + regression test), so this migration cannot leak them to a
+    // reader on its own.
+    async fn migrate_92_entity_shadow_pages(&self, prior_version: i64) -> Result<(), WenlanError> {
+        // §6.9: pre-migration online backup + integrity receipt, mirroring
+        // migrations 82/89/90/91.
+        self.backup_before_migration(92, prior_version).await?;
+
+        // Same table-size class as migrations 89/91 (one row of work per
+        // entity/page); same lock-duration budget.
+        const BATCH_SIZE: i64 = 10_000;
+
+        // Step 1: add the columns (guarded, resumable) + create and seed the
+        // durable migration-state row, together in one transaction, before
+        // any backfill batch runs.
+        {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 begin setup: {e}")))?;
+            let result: Result<(), WenlanError> = async {
+                for (col, ddl) in [
+                    ("entity_type", "ALTER TABLE pages ADD COLUMN entity_type TEXT"),
+                    ("confidence", "ALTER TABLE pages ADD COLUMN confidence REAL"),
+                    (
+                        "entity_confirmed",
+                        "ALTER TABLE pages ADD COLUMN entity_confirmed INTEGER CHECK(entity_confirmed IN (0,1))",
+                    ),
+                ] {
+                    let has_col: bool = {
+                        let mut rows = conn
+                            .query(
+                                "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = ?1",
+                                libsql::params![col],
+                            )
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m92 col check {col}: {e}")))?;
+                        match rows.next().await {
+                            Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+                            _ => false,
+                        }
+                    };
+                    if !has_col {
+                        conn.execute(ddl, ())
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m92 add {col}: {e}")))?;
+                    }
+                }
+
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS entity_page_migration_state (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        stage TEXT NOT NULL,
+                        cursor TEXT,
+                        epoch INTEGER NOT NULL DEFAULT 1,
+                        completed_at INTEGER,
+                        report_json TEXT
+                    );",
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 create state: {e}")))?;
+
+                conn.execute(
+                    "INSERT INTO entity_page_migration_state (id, stage, epoch) VALUES (1, 'backfilling', 1)
+                     ON CONFLICT(id) DO NOTHING",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 state seed: {e}")))?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 commit setup: {e}")))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Step 2: widen `pages.creation_kind`'s CHECK to admit 'entity', via
+        // the migration-67 writable_schema text-patch technique (SQLite
+        // cannot ALTER a CHECK in place; a full table rebuild would have to
+        // recreate the FTS mirror/vector index/triggers for a value-list
+        // widening -- not worth the risk). Idempotent: no-op once 'entity'
+        // is already present.
+        {
+            let conn = self.conn.lock().await;
+            let current_sql: Option<String> =
+                {
+                    let mut rows = conn
+                        .query(
+                            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pages'",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 read pages sql: {e}")))?;
+                    match rows
+                        .next()
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 pages sql row: {e}")))?
+                    {
+                        Some(row) => Some(row.get::<String>(0).map_err(|e| {
+                            WenlanError::VectorDb(format!("m92 pages sql col: {e}"))
+                        })?),
+                        None => None,
+                    }
+                };
+            if let Some(sql) = current_sql {
+                let patched = sql.replace(
+                    "creation_kind IN ('distilled','authored','research','imported','source')",
+                    "creation_kind IN ('distilled','authored','research','imported','source','entity')",
+                );
+                if patched != sql {
+                    conn.execute("PRAGMA writable_schema=ON", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 writable on: {e}")))?;
+                    // Always turn writable_schema back OFF, even if the patch
+                    // fails: the shared process-lifetime connection must never be
+                    // left schema-writable (a later write could corrupt the
+                    // schema). Capture the patch result, RESET unconditionally,
+                    // then propagate the patch error.
+                    let patch = conn
+                        .execute(
+                            "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='pages'",
+                            libsql::params![patched],
+                        )
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 patch schema: {e}")));
+                    conn.execute("PRAGMA writable_schema=RESET", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 writable reset: {e}")))?;
+                    patch?;
+                }
+            }
+        }
+
+        // Step 3: backfill in rowid-range batches, one commit per batch,
+        // mirroring migrations 89/91's lock-duration budget. The
+        // `entity_page_map` NOT EXISTS guard makes a resumed run (after a
+        // kill mid-batch) a cheap no-op over already-mapped entities rather
+        // than a duplicate insert -- the same idempotent-rescan pattern 89
+        // and 91 use, backed here by `entity_page_map.page_id` being UNIQUE.
+        //
+        // Resume from the durable cursor so a restart after a mid-migration
+        // kill picks up the un-committed tail instead of re-scanning the whole
+        // `entities` table from rowid 0. The cursor is stamped in the SAME
+        // transaction as its batch's inserts (below), so a stored value is
+        // always a safe lower bound -- every rowid <= cursor was durably
+        // mapped. Absent / NULL / unparseable (a fresh run) falls back to
+        // i64::MIN. The NOT-EXISTS guard still protects the boundary row.
+        let mut cursor: i64 = {
+            let conn = self.conn.lock().await;
+            let stored: Option<String> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT cursor FROM entity_page_migration_state WHERE id = 1",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m92 read cursor: {e}")))?;
+                match rows.next().await {
+                    Ok(Some(row)) => row.get::<Option<String>>(0).unwrap_or(None),
+                    _ => None,
+                }
+            };
+            stored
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(i64::MIN)
+        };
+        let mut total_created: i64 = 0;
+        loop {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 begin batch: {e}")))?;
+            let result: Result<Option<(i64, i64)>, WenlanError> = async {
+                let batch: Vec<(i64, String)> = {
+                    let mut rows = conn
+                        .query(
+                            "SELECT rowid, id FROM entities WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                            libsql::params![cursor, BATCH_SIZE],
+                        )
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 batch fetch: {e}")))?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows
+                        .next()
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 batch row: {e}")))?
+                    {
+                        let rid: i64 = row
+                            .get(0)
+                            .map_err(|e| WenlanError::VectorDb(format!("m92 batch rowid: {e}")))?;
+                        let eid: String = row
+                            .get(1)
+                            .map_err(|e| WenlanError::VectorDb(format!("m92 batch id: {e}")))?;
+                        out.push((rid, eid));
+                    }
+                    out
+                };
+                let Some(&(hi, _)) = batch.last() else {
+                    return Ok(None);
+                };
+                let now_iso = chrono::Utc::now().to_rfc3339();
+                let mut created = 0i64;
+                for (_, entity_id) in &batch {
+                    let already_mapped: bool = {
+                        let mut rows = conn
+                            .query(
+                                "SELECT EXISTS(SELECT 1 FROM entity_page_map WHERE entity_id = ?1)",
+                                libsql::params![entity_id.as_str()],
+                            )
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m92 mapped check: {e}")))?;
+                        match rows.next().await {
+                            Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) != 0,
+                            _ => false,
+                        }
+                    };
+                    if already_mapped {
+                        continue;
+                    }
+                    let page_id = crate::pages::new_page_id();
+                    Self::insert_entity_shadow_page(&conn, entity_id, &page_id, &now_iso).await?;
+                    created += 1;
+                }
+                conn.execute(
+                    "UPDATE entity_page_migration_state SET cursor = ?1 WHERE id = 1",
+                    libsql::params![hi.to_string()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 cursor stamp: {e}")))?;
+                Ok(Some((hi, created)))
+            }
+            .await;
+            match result {
+                Ok(Some((hi, created))) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 commit batch: {e}")))?;
+                    cursor = hi;
+                    total_created += created;
+                }
+                Ok(None) => {
+                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("m92 commit final batch: {e}"))
+                    })?;
+                    break;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Step 4: assert every entity now has a shadow page, then stamp the
+        // migration-state row complete with a summary report.
+        {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 begin assert: {e}")))?;
+            let result: Result<(), WenlanError> = async {
+                Self::assert_entities_have_shadow_pages(&conn).await?;
+                let report = serde_json::json!({
+                    "shadow_pages_created": total_created,
+                });
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE entity_page_migration_state SET stage='backfilled', completed_at=?1, report_json=?2 WHERE id=1",
+                    libsql::params![now, report.to_string()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 state complete: {e}")))?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 commit assert: {e}")))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 92", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m92 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 92 applied: entity shadow pages backfilled ({total_created} created), M3 PR-1 stage f"
+        );
+        Ok(())
+    }
+
+    /// Mirror-invariant check for migration 92: every `entities` row must
+    /// have a corresponding `entity_page_map` row. `entity_page_map.entity_id`
+    /// has an FK to `entities`, so this only needs to check the forward
+    /// direction (an entity missing its shadow page), mirroring
+    /// `assert_pages_kind_matches_ledger`'s "refuse to mark complete over a
+    /// lie" shape.
+    async fn assert_entities_have_shadow_pages(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        let unresolved: bool = {
+            let mut rows = conn
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM entities e \
+                     WHERE NOT EXISTS (SELECT 1 FROM entity_page_map m WHERE m.entity_id = e.id))",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 assert query: {e}")))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m92 assert row: {e}")))?
+            {
+                Some(row) => {
+                    row.get::<i64>(0)
+                        .map_err(|e| WenlanError::VectorDb(format!("m92 assert col: {e}")))?
+                        != 0
+                }
+                None => false,
+            }
+        };
+        if unresolved {
+            return Err(WenlanError::VectorDb(
+                "m92: an entities row still has no entity_page_map row after backfill -- \
+                 refusing to mark the migration complete"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    // Migration 93 (M3 PR-1, item C): the update-path shadow re-sync
+    // (`update_entity_shadow_page`) mirrors every shadowed entity field into
+    // its `kind='entity'` page, INCLUDING the alias set. Migration 92's
+    // backfill could not populate aliases because it runs before this
+    // migration exists (its `insert_entity_shadow_page` helper is shared with
+    // the live create path and must stay column-agnostic), so this migration
+    // adds `pages.aliases` (a JSON array of `entity_aliases.alias_name`, the
+    // same shape `update_entity_shadow_page` writes) and backfills it for the
+    // shadows migration 92 created. `aliases` is left NULL on non-entity
+    // pages -- it is an entity-shadow-only column, fenced from every reader in
+    // PR-1 like the rest of the shadow.
+    async fn migrate_93_page_aliases(&self, prior_version: i64) -> Result<(), WenlanError> {
+        // §6.9: pre-migration online backup + integrity receipt BEFORE any
+        // DDL, mirroring migrations 89/91/92 -- this migration ALTERs `pages`
+        // and batch-UPDATEs its entity shadows, so a botched run has a restore
+        // point.
+        self.backup_before_migration(93, prior_version).await?;
+
+        // Same table + per-row UPDATE cost class as migration 89's `pages`
+        // backfill; same lock-duration budget.
+        const BATCH_SIZE: i64 = 10_000;
+
+        // Step 1: add the column (guarded, resumable -- a crash before the
+        // user_version bump re-fires this function, and the guard skips the
+        // ALTER so it does not hit "duplicate column name"). Nullable: only
+        // entity shadows carry an alias array; the backfill fills them, and
+        // future shadows get theirs from `update_entity_shadow_page`.
+        {
+            let conn = self.conn.lock().await;
+            let has_col: bool = {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = 'aliases'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m93 col check: {e}")))?;
+                match rows.next().await {
+                    Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+                    _ => false,
+                }
+            };
+            if !has_col {
+                conn.execute("ALTER TABLE pages ADD COLUMN aliases TEXT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m93 add aliases column: {e}")))?;
+            }
+        }
+
+        // Step 2: backfill `aliases` for every entity shadow in rowid-range
+        // batches, one commit per batch, mirroring migration 89's lock budget.
+        // The UPDATE is idempotent (it recomputes the same JSON array from the
+        // current `entity_aliases`), so `cursor` restarts at `i64::MIN` each
+        // run -- a kill mid-run just re-does already-correct rows on resume.
+        // `json_group_array` over an empty alias set yields '[]' (never NULL),
+        // and a `kind='entity'` page with no map row (orphan) resolves the
+        // correlated `entity_id` subquery to NULL -> matches no alias -> '[]',
+        // so no entity shadow is left NULL. Only `kind='entity'` rows are
+        // touched; concept/source/overview/authored pages keep `aliases` NULL.
+        let mut cursor: i64 = i64::MIN;
+        loop {
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m93 begin batch: {e}")))?;
+            let result: Result<Option<i64>, WenlanError> = async {
+                let hi: Option<i64> =
+                    {
+                        let mut rows = conn
+                            .query(
+                                "SELECT MAX(rowid) FROM \
+                             (SELECT rowid FROM pages WHERE rowid > ?1 ORDER BY rowid LIMIT ?2)",
+                                libsql::params![cursor, BATCH_SIZE],
+                            )
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m93 batch bound: {e}")))?;
+                        match rows.next().await.map_err(|e| {
+                            WenlanError::VectorDb(format!("m93 batch bound row: {e}"))
+                        })? {
+                            Some(row) => row.get::<Option<i64>>(0).map_err(|e| {
+                                WenlanError::VectorDb(format!("m93 batch bound col: {e}"))
+                            })?,
+                            None => None,
+                        }
+                    };
+                let Some(hi) = hi else {
+                    return Ok(None);
+                };
+                conn.execute(
+                    "UPDATE pages SET aliases = (
+                        SELECT json_group_array(alias_name) FROM (
+                            SELECT alias_name FROM entity_aliases
+                            WHERE canonical_entity_id =
+                                (SELECT entity_id FROM entity_page_map WHERE page_id = pages.id)
+                            ORDER BY alias_name
+                        )
+                     )
+                     WHERE kind = 'entity' AND rowid > ?1 AND rowid <= ?2",
+                    libsql::params![cursor, hi],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m93 backfill aliases: {e}")))?;
+                Ok(Some(hi))
+            }
+            .await;
+            match result {
+                Ok(Some(hi)) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m93 commit batch: {e}")))?;
+                    cursor = hi;
+                }
+                Ok(None) => {
+                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("m93 commit final batch: {e}"))
+                    })?;
+                    break;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Step 3: refuse to mark complete over a lie -- every `kind='entity'`
+        // page must carry a non-NULL alias array after the backfill (mirroring
+        // migration 92's `assert_entities_have_shadow_pages` shape).
+        let conn = self.conn.lock().await;
+        let unresolved: bool = {
+            let mut rows = conn
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM pages WHERE kind = 'entity' AND aliases IS NULL)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m93 assert query: {e}")))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m93 assert row: {e}")))?
+            {
+                Some(row) => {
+                    row.get::<i64>(0)
+                        .map_err(|e| WenlanError::VectorDb(format!("m93 assert col: {e}")))?
+                        != 0
+                }
+                None => false,
+            }
+        };
+        if unresolved {
+            return Err(WenlanError::VectorDb(
+                "m93: a kind='entity' page still has NULL aliases after backfill -- \
+                 refusing to mark the migration complete"
+                    .to_string(),
+            ));
+        }
+        conn.execute("PRAGMA user_version = 93", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m93 bump: {e}")))?;
+        log::info!("[migration] Migration 93 applied: pages.aliases added + entity shadows backfilled, M3 PR-1 item C");
+        Ok(())
+    }
+
+    // Migration 94 (M3 PR-2, stage a). Adds the entity<->page reader-cutover
+    // control plane on top of PR-1's write-only `kind='entity'` shadow:
+    //
+    //   * `entity_reader_cutover` -- one row per named READER (a "consumer",
+    //     mirroring `edges_reader_cutover`). `enabled=0` keeps the consumer
+    //     on the legacy `entities` store; a flip to `1` is REVERSIBLE. Default
+    //     is empty/OFF, so this migration changes NO read behavior. Stage b
+    //     wires the actual gating predicate that reads it
+    //     (`reader_uses_entity_pages` + the `set_entity_reader_cutover`
+    //     lever); this migration only creates the table so PR-2 ships as ONE
+    //     schema bump.
+    //   * `entity_page_parity_watermark` -- the durable proof from this
+    //     stage's reconciliation sweep (`reconcile_entity_page_parity`): the
+    //     epoch it was proven under, the drift count (0 == every `entities`
+    //     row has a byte-identical, live `kind='entity'` shadow page), and a
+    //     report. A single row (`id=1`).
+    //
+    // The dual-write EPOCH already lives on
+    // `entity_page_migration_state.epoch` (M3 PR-1, migration 92).
+    //
+    // Replay-safe: pure `CREATE TABLE IF NOT EXISTS` inside one BEGIN/COMMIT,
+    // no backfill, no data mutation -- kill/rerun converges trivially.
+    async fn ensure_entity_cutover_tables(conn: &libsql::Connection) -> Result<(), WenlanError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entity_reader_cutover (
+                consumer TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+                cutover_epoch INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_page_parity_watermark (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                proven_epoch INTEGER,
+                drift_count INTEGER,
+                checked_at INTEGER,
+                report_json TEXT
+            );",
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("entity cutover DDL: {e}")))?;
+        Ok(())
+    }
+
+    async fn migrate_94_entity_reader_cutover(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        // §6.9: pre-migration online backup + integrity receipt BEFORE any
+        // DDL, mirroring migration 82.
+        self.backup_before_migration(94, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m94 begin: {e}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            Self::ensure_entity_cutover_tables(&conn).await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m94 commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+        drop(conn);
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 94", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m94 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 94 applied: entity reader-cutover control plane (M3 PR-2 stage a)"
+        );
+        Ok(())
+    }
 }
 
 /// Per-store backfill tally for the M2 PR-1 migration report (spec §2
@@ -8727,6 +10184,45 @@ pub struct ParityReport {
 }
 
 impl ParityReport {
+    const SAMPLE_CAP: usize = 20;
+}
+
+/// Stage-a reconciliation result (M3 PR-2): the parity proof that every
+/// `entities` row has a byte-identical, live `kind='entity'` shadow page --
+/// the invariant M3 PR-1's dual-write established. `drift_count == 0` means
+/// the invariant holds. Mirrors [`ParityReport`] for M2's `edges`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EntityPageParityReport {
+    /// Dual-write epoch the sweep ran under (stamped into the watermark).
+    pub epoch: i64,
+    /// Total `entities` rows (the expected set size).
+    pub expected_active: usize,
+    /// Live (`status='active'`) `kind='entity'` pages (the actual set size).
+    pub actual_active: usize,
+    /// An entity with no live shadow: no map row, its mapped page is gone,
+    /// or its mapped page is not `kind='entity'`/no longer live.
+    pub missing_count: usize,
+    /// A structural artifact with no valid counterpart: an orphan
+    /// `entity_page_map` row (entity or page side missing) or a live
+    /// `kind='entity'` page absent from the map.
+    pub extra_count: usize,
+    /// Same entity present and mapped to a live shadow, but the shadow's
+    /// mirrored fields (name, entity_type, confidence, space semantics,
+    /// aliases) disagree with the live `entities` row.
+    pub corrupt_count: usize,
+    /// `missing_count + extra_count + corrupt_count`; the single number a
+    /// future reader gate would read.
+    pub drift_count: usize,
+    /// Up to `SAMPLE_CAP` missing entity ids (sorted), for debugging a drift.
+    pub missing_sample: Vec<String>,
+    /// Up to `SAMPLE_CAP` extra ids (sorted) -- entity ids for orphan map
+    /// rows, page ids for orphan pages.
+    pub extra_sample: Vec<String>,
+    /// Up to `SAMPLE_CAP` corrupt entity ids (sorted).
+    pub corrupt_sample: Vec<String>,
+}
+
+impl EntityPageParityReport {
     const SAMPLE_CAP: usize = 20;
 }
 
@@ -9087,6 +10583,14 @@ impl MemoryDB {
     /// Any missing row (no watermark yet, unknown consumer) => false => legacy.
     /// This is the ONLY thing standing between a premature flip and a wrong
     /// read; it fails safe toward legacy in every ambiguous case.
+    ///
+    /// D6 obligation (M2 review fork-#2 verdict (a)): this predicate only
+    /// gates WHETHER a consumer may flip -- it does not itself exclude
+    /// cross-space legacy rows. Any consumer that flips onto this gate MUST
+    /// strictly exclude `lineage='legacy'` edges whose endpoints are
+    /// cross-space from its OWN flipped read (read-side exclusion only,
+    /// never a row mutation -- see `detect_communities`'s `adjacency_sql`
+    /// for the pattern this obligation inherits).
     async fn reader_uses_edges(
         conn: &libsql::Connection,
         consumer: &str,
@@ -9501,6 +11005,486 @@ impl MemoryDB {
         Ok(report)
     }
 
+    // ===== M3 PR-2 stage a: entity<->page parity reconciliation =====
+
+    /// The current entity dual-write coverage epoch (M3 PR-1, migration 92:
+    /// `entity_page_migration_state`, seeded to 1 by that migration). Mirrors
+    /// `current_dual_write_epoch` for `edges`. Returns `None` when there is
+    /// no trustworthy current epoch -- a missing state row, an undecodable
+    /// `epoch` column, or a non-positive epoch -- 0 is the recorded "no
+    /// trustworthy epoch" sentinel (see
+    /// `set_entity_reader_cutover_with_missing_state_records_epoch_zero`) --
+    /// and callers must treat that as "gate closed / cannot prove", never
+    /// fabricate a generation.
+    async fn current_entity_dual_write_epoch(
+        conn: &libsql::Connection,
+    ) -> Result<Option<i64>, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT epoch FROM entity_page_migration_state WHERE id = 1",
+                (),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0).ok().filter(|epoch| *epoch > 0)),
+            None => Ok(None),
+        }
+    }
+
+    /// Stage-a reconciliation sweep (M3 PR-2): proves every `entities` row
+    /// has a byte-identical, live `kind='entity'` shadow page -- the
+    /// dual-write invariant M3 PR-1 established. Stamps
+    /// `entity_page_parity_watermark` with the drift and the current epoch;
+    /// stage b's reader-cutover gate (`reader_uses_entity_pages`) only flips
+    /// a consumer on a clean, current watermark, mirroring
+    /// `reader_uses_edges` for M2.
+    ///
+    /// SQLite discipline (§6.3): reads only, then ONE watermark UPSERT; no
+    /// transaction spans anything (no LLM/embedding calls here). Enumerates
+    /// rows rather than trusting `COUNT(*)` -- both `entities` and `pages`
+    /// carry `F32_BLOB` vector-indexed columns, so a bare `COUNT(*)` is
+    /// subject to the same libsql vector-index COUNT bug `reconcile_edges_parity`
+    /// avoids.
+    pub async fn reconcile_entity_page_parity(
+        &self,
+    ) -> Result<EntityPageParityReport, WenlanError> {
+        let conn = self.conn.lock().await;
+        // No current epoch (missing/corrupt entity_page_migration_state) =>
+        // nothing trustworthy to stamp a watermark under; fail loud rather
+        // than proving parity against a fabricated epoch.
+        let epoch = Self::current_entity_dual_write_epoch(&conn)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("reconcile epoch: {e}")))?
+            .ok_or_else(|| {
+                WenlanError::VectorDb(
+                    "reconcile_entity_page_parity: no current dual-write epoch \
+                     (missing/corrupt entity_page_migration_state)"
+                        .to_string(),
+                )
+            })?;
+
+        // expected_active + missing/corrupt: every `entities` row, LEFT
+        // JOINed onto its live (`status='active'`, `kind='entity'`) shadow.
+        // A NULL join (no map row, the mapped page is gone, or it is no
+        // longer live) is missing; a matched row whose mirrored fields
+        // disagree is corrupt. The mirrored fields are exactly what
+        // `insert_entity_shadow_page`/`update_entity_shadow_page` write:
+        // name, entity_type, confidence, confirmed (-> `entity_confirmed`),
+        // embedding, space semantics (both `space` and `workspace` carry the
+        // same unfiled-sentinel fold), and the `entity_aliases` projection
+        // (recomputed here the same way `update_entity_shadow_page` does, so
+        // a shadow whose aliases were never re-synced after an alias change
+        // is flagged corrupt). Embedding compares raw blob bytes -- NULL vs
+        // NULL (never embedded on either side) is equal via the `Option`
+        // fold to an empty Vec; a genuine F32_BLOB(768) is never empty, so no
+        // false match against an unset embedding. An undecodable mirrored
+        // column -- wrong SQLite storage class on either side, which the
+        // shadow writer's mirror-copy can produce identically on BOTH sides
+        // -- is drift, never equality: it always counts as corrupt, so a
+        // symmetric decode failure can never fold to a false match.
+        let mut expected_active = 0usize;
+        let mut missing_count = 0usize;
+        let mut missing_sample: Vec<String> = Vec::new();
+        let mut corrupt_count = 0usize;
+        let mut corrupt_sample: Vec<String> = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT e.id, e.name, e.entity_type, e.confidence, e.space,
+                            p.title, p.entity_type, p.confidence, p.space, p.workspace, p.aliases,
+                            (SELECT json_group_array(alias_name) FROM (
+                                SELECT alias_name FROM entity_aliases
+                                WHERE canonical_entity_id = e.id ORDER BY alias_name
+                             )) AS expected_aliases,
+                            e.confirmed, e.embedding, p.entity_confirmed, p.embedding
+                     FROM entities e
+                     LEFT JOIN entity_page_map m ON m.entity_id = e.id
+                     LEFT JOIN pages p ON p.id = m.page_id
+                         AND p.kind = 'entity' AND p.status = 'active'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile entities: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile entities row: {e}")))?
+            {
+                expected_active += 1;
+                // The id itself is not a mirrored field; a failure to decode
+                // it only degrades the sample label, it does not by itself
+                // decide missing/corrupt below.
+                let entity_id: String = row
+                    .get::<String>(0)
+                    .unwrap_or_else(|_| "<undecodable>".to_string());
+
+                let entity_side: Result<_, libsql::Error> = (|| {
+                    let name: String = row.get(1)?;
+                    let entity_type: String = row.get(2)?;
+                    let confidence: Option<f64> = row.get(3)?;
+                    let space: Option<String> = row.get(4)?;
+                    let expected_aliases: Option<String> = row.get(11)?;
+                    let confirmed: Option<i64> = row.get(12)?;
+                    let embedding: Vec<u8> = row.get::<Option<Vec<u8>>>(13)?.unwrap_or_default();
+                    Ok((
+                        name,
+                        entity_type,
+                        confidence,
+                        space,
+                        expected_aliases,
+                        confirmed,
+                        embedding,
+                    ))
+                })();
+                let Ok((
+                    name,
+                    entity_type,
+                    confidence,
+                    space,
+                    expected_aliases,
+                    confirmed,
+                    embedding,
+                )) = entity_side
+                else {
+                    corrupt_count += 1;
+                    if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                        corrupt_sample.push(entity_id.clone());
+                    }
+                    continue;
+                };
+                let expected_space = space.unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
+
+                // NULL (no live shadow joined) stays missing; an undecodable
+                // non-NULL title is a corrupt row, not a missing one.
+                let page_title = match row.get::<Option<String>>(5) {
+                    Ok(Some(title)) => title,
+                    Ok(None) => {
+                        missing_count += 1;
+                        if missing_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                            missing_sample.push(entity_id.clone());
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        corrupt_count += 1;
+                        if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                            corrupt_sample.push(entity_id.clone());
+                        }
+                        continue;
+                    }
+                };
+
+                let page_side: Result<_, libsql::Error> = (|| {
+                    let page_entity_type: String = row.get(6)?;
+                    let page_confidence: Option<f64> = row.get(7)?;
+                    let page_space: Option<String> = row.get(8)?;
+                    let page_workspace: Option<String> = row.get(9)?;
+                    let page_aliases: Option<String> = row.get(10)?;
+                    let page_confirmed: Option<i64> = row.get(14)?;
+                    let page_embedding: Vec<u8> =
+                        row.get::<Option<Vec<u8>>>(15)?.unwrap_or_default();
+                    Ok((
+                        page_entity_type,
+                        page_confidence,
+                        page_space,
+                        page_workspace,
+                        page_aliases,
+                        page_confirmed,
+                        page_embedding,
+                    ))
+                })();
+                let Ok((
+                    page_entity_type,
+                    page_confidence,
+                    page_space,
+                    page_workspace,
+                    page_aliases,
+                    page_confirmed,
+                    page_embedding,
+                )) = page_side
+                else {
+                    corrupt_count += 1;
+                    if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                        corrupt_sample.push(entity_id.clone());
+                    }
+                    continue;
+                };
+
+                let matches = page_title == name
+                    && page_entity_type == entity_type
+                    && page_confidence == confidence
+                    && page_space.as_deref() == Some(expected_space.as_str())
+                    && page_workspace.as_deref() == Some(expected_space.as_str())
+                    && page_aliases == expected_aliases
+                    && page_confirmed == confirmed
+                    && page_embedding == embedding;
+                if !matches {
+                    corrupt_count += 1;
+                    if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                        corrupt_sample.push(entity_id.clone());
+                    }
+                }
+            }
+        }
+
+        // actual_active: live kind='entity' pages, enumerated independently
+        // of the join above (a raw population count for the report).
+        let mut actual_active = 0usize;
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM pages WHERE kind = 'entity' AND status = 'active'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile pages: {e}")))?;
+            while rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile pages row: {e}")))?
+                .is_some()
+            {
+                actual_active += 1;
+            }
+        }
+
+        // extra: (a) orphan `entity_page_map` rows -- entity or page side
+        // missing. `entity_id`/`page_id` both carry `ON DELETE CASCADE`, so
+        // this is unreachable via normal writes (mirrors the
+        // `backfill_edges_from_relations` "unknown" branch: a defensive
+        // check, not a live case on this schema); (b) a live kind='entity'
+        // page with no map row at all (an unclaimed shadow).
+        let mut extra_count = 0usize;
+        let mut extra_sample: Vec<String> = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT m.entity_id FROM entity_page_map m
+                     WHERE NOT EXISTS (SELECT 1 FROM entities e WHERE e.id = m.entity_id)
+                        OR NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = m.page_id)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan map: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan map row: {e}")))?
+            {
+                extra_count += 1;
+                if extra_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                    extra_sample.push(row.get::<String>(0).unwrap_or_default());
+                }
+            }
+        }
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT p.id FROM pages p
+                     WHERE p.kind = 'entity' AND p.status = 'active'
+                       AND NOT EXISTS (SELECT 1 FROM entity_page_map m WHERE m.page_id = p.id)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan pages: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("reconcile orphan pages row: {e}")))?
+            {
+                extra_count += 1;
+                if extra_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                    extra_sample.push(row.get::<String>(0).unwrap_or_default());
+                }
+            }
+        }
+
+        missing_sample.sort();
+        extra_sample.sort();
+        corrupt_sample.sort();
+        let drift_count = missing_count + extra_count + corrupt_count;
+
+        let report = EntityPageParityReport {
+            epoch,
+            expected_active,
+            actual_active,
+            missing_count,
+            extra_count,
+            corrupt_count,
+            drift_count,
+            missing_sample,
+            extra_sample,
+            corrupt_sample,
+        };
+
+        // Stamp the watermark: proven_epoch is always the epoch we scanned
+        // under, drift_count is the result.
+        let now = chrono::Utc::now().timestamp();
+        let report_json = serde_json::to_string(&report)
+            .map_err(|e| WenlanError::VectorDb(format!("reconcile report json: {e}")))?;
+        conn.execute(
+            "INSERT INTO entity_page_parity_watermark (id, proven_epoch, drift_count, checked_at, report_json)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 proven_epoch = excluded.proven_epoch,
+                 drift_count = excluded.drift_count,
+                 checked_at = excluded.checked_at,
+                 report_json = excluded.report_json",
+            libsql::params![epoch, drift_count as i64, now, report_json],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("reconcile watermark: {e}")))?;
+
+        Ok(report)
+    }
+
+    // ===== M3 PR-2 stage b: entity reader-cutover gate =====
+    //
+    // Mirrors M2's `set_reader_cutover`/`reader_uses_edges` pair exactly,
+    // over the entity<->page control plane stage a built (migration 94:
+    // `entity_reader_cutover`, `entity_page_parity_watermark`). Stage b
+    // wired ONLY the predicate + the manual lever -- stage c flips the
+    // vanguard `scoped_entities` consumer onto `reader_uses_entity_pages`
+    // (`crates/wenlan-core/src/db/scoped_entities.rs`). Flipping a
+    // PRODUCTION consumer additionally waits on the program's D1
+    // soak-exit.
+
+    /// M3 PR-2 stage c: the single consumer key the `scoped_entities`
+    /// vanguard flip checks the gate under. Mirrors M2's `detect_communities`
+    /// literal `"communities"` key, named as a const per the stage-c
+    /// contract so every `scoped_entities.rs` call site shares one source
+    /// of truth.
+    pub(crate) const SCOPED_ENTITIES_CONSUMER: &str = "scoped_entities";
+
+    /// Flip an entity-reader consumer's cutover ON or OFF (M3 PR-2 stage b;
+    /// mirrors `set_reader_cutover` for M2's `edges`). Idempotent upsert.
+    /// This records INTENT only; the actual read source is still decided
+    /// by `reader_uses_entity_pages` on a clean, current parity watermark,
+    /// so enabling a consumer before parity is proven does not move it off
+    /// legacy, and disabling it always moves it back (reversibility).
+    /// `cutover_epoch` records the epoch a consumer was last enabled
+    /// under, for soak audit; it is not part of the gate.
+    ///
+    /// Stage b wired the lever with no live caller; stage c flips the
+    /// vanguard `scoped_entities` consumer onto it. Flipping a PRODUCTION
+    /// consumer additionally waits on the program's D1 soak-exit.
+    pub async fn set_entity_reader_cutover(
+        &self,
+        consumer: &str,
+        enabled: bool,
+    ) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let now = chrono::Utc::now().timestamp();
+        // Audit-only field (not part of the gate). With no current epoch
+        // (no migration state yet) record 0: `reader_uses_entity_pages`
+        // keeps the consumer on legacy regardless, so a missing epoch
+        // must not block the lever.
+        let epoch = Self::current_entity_dual_write_epoch(&conn)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("set_entity_reader_cutover epoch: {e}")))?
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO entity_reader_cutover (consumer, enabled, cutover_epoch, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(consumer) DO UPDATE SET
+                 enabled = excluded.enabled,
+                 cutover_epoch = CASE
+                     WHEN excluded.enabled = 1 THEN excluded.cutover_epoch
+                     ELSE entity_reader_cutover.cutover_epoch
+                 END,
+                 updated_at = excluded.updated_at",
+            libsql::params![consumer, if enabled { 1i64 } else { 0i64 }, epoch, now],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("set_entity_reader_cutover: {e}")))?;
+        Ok(())
+    }
+
+    /// THE entity-reader cutover gate (M3 PR-2 stage b; mirrors
+    /// `reader_uses_edges` for M2's `edges`). Returns true iff the named
+    /// consumer may read the `kind='entity'` shadow pages instead of the
+    /// legacy `entities` store right now. All three must hold:
+    ///   1. the consumer is explicitly enabled,
+    ///   2. the parity watermark is CLEAN (`drift_count = 0`) -- the
+    ///      stage-a reconciliation proved every `entities` row has a
+    ///      byte-identical, live shadow page, so no unreconciled legacy
+    ///      row remains, and
+    ///   3. the proof is CURRENT: `proven_epoch` equals the current
+    ///      entity dual-write epoch, so no coverage lapse has invalidated
+    ///      it since.
+    ///
+    /// Any missing row (no watermark yet, unknown consumer) => false =>
+    /// legacy. This is the ONLY thing standing between a premature flip
+    /// and a wrong read; it fails safe toward legacy in every ambiguous
+    /// case.
+    ///
+    /// Stage b wired this predicate with no live caller; stage c flips the
+    /// vanguard `scoped_entities` consumer onto it
+    /// (`crates/wenlan-core/src/db/scoped_entities.rs`). Flipping a
+    /// PRODUCTION consumer additionally waits on the program's D1
+    /// soak-exit.
+    ///
+    /// D6 obligation (M2 review fork-#2 verdict (a), mirrored from
+    /// `reader_uses_edges`): this predicate only gates WHETHER a consumer
+    /// may flip -- it does not itself exclude cross-space legacy rows. Any
+    /// consumer that flips onto this gate MUST strictly exclude
+    /// cross-space legacy rows from its OWN flipped read (read-side
+    /// exclusion only, never a row mutation).
+    async fn reader_uses_entity_pages(
+        conn: &libsql::Connection,
+        consumer: &str,
+    ) -> Result<bool, libsql::Error> {
+        // (1) consumer explicitly enabled?
+        let enabled: bool = {
+            let mut rows = conn
+                .query(
+                    "SELECT enabled FROM entity_reader_cutover WHERE consumer = ?1",
+                    libsql::params![consumer],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => row.get::<i64>(0).unwrap_or(0) == 1,
+                None => false,
+            }
+        };
+        if !enabled {
+            return Ok(false);
+        }
+        // (2)+(3) a clean, current parity watermark?
+        let (proven_epoch, drift): (Option<i64>, Option<i64>) = {
+            let mut rows = conn
+                .query(
+                    "SELECT proven_epoch, drift_count FROM entity_page_parity_watermark WHERE id = 1",
+                    (),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => (
+                    row.get::<Option<i64>>(0).unwrap_or(None),
+                    row.get::<Option<i64>>(1).unwrap_or(None),
+                ),
+                None => (None, None),
+            }
+        };
+        // Clean == drift proven and zero; any drift or an unproven
+        // watermark keeps the reader on legacy.
+        if drift != Some(0) {
+            return Ok(false);
+        }
+        let proven_epoch = match proven_epoch {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        // Current == proof taken under the epoch we are still in (no
+        // lapse). No current epoch (missing/corrupt state) => cannot
+        // prove currency => stay on legacy.
+        let current_epoch = match Self::current_entity_dual_write_epoch(conn).await? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        Ok(proven_epoch == current_epoch)
+    }
+
     /// §6.9 pre-migration online backup. A raw file copy is unsound while a WAL
     /// is live, so this first folds the WAL back into the main database and
     /// truncates it (`PRAGMA wal_checkpoint(TRUNCATE)`) under the connection
@@ -9519,17 +11503,23 @@ impl MemoryDB {
         dest: &std::path::Path,
     ) -> Result<BackupReceipt, WenlanError> {
         let dest_str = dest.to_string_lossy().to_string();
-        let sidecar = |suffix: &str| {
-            let mut s = dest.as_os_str().to_os_string();
+        let sidecar = |base: &std::path::Path, suffix: &str| {
+            let mut s = base.as_os_str().to_os_string();
             s.push(suffix);
             std::path::PathBuf::from(s)
         };
+        // Stage the physical copy here and publish it onto `dest` with a single
+        // atomic rename, only once it is complete AND integrity-clean. A crash
+        // mid-copy then leaves this partial `.tmp` -- never a truncated `dest`
+        // that a retry (`backup_before_migration`'s exists()-skip) would trust.
+        let tmp = sidecar(dest, ".tmp");
+        let tmp_str = tmp.to_string_lossy().to_string();
 
         let source_pages = {
             let conn = self.conn.lock().await;
 
             // Resolve the live source FIRST and refuse to back up onto it: the
-            // cleanup below deletes `dest`, so a caller passing the db path (or a
+            // rename below replaces `dest`, so a caller passing the db path (or a
             // symlink to it) as `dest` would otherwise destroy the live database.
             // Canonicalize both so a symlink / relative-vs-absolute alias is
             // caught. ponytail: canonical-path compare, not dev+ino -- covers the
@@ -9550,13 +11540,12 @@ impl MemoryDB {
                 }
             }
 
-            // Start from a clean destination -- a stale main file or WAL/SHM
-            // sidecar would make the fresh copy inconsistent. Safe now that dest
-            // is proven distinct from the source.
-            for p in [dest.to_path_buf(), sidecar("-wal"), sidecar("-shm")] {
+            // Discard any stale staging file (+ WAL/SHM sidecars) left by a
+            // crashed prior attempt -- the fresh copy below must start clean.
+            for p in [tmp.clone(), sidecar(&tmp, "-wal"), sidecar(&tmp, "-shm")] {
                 if p.exists() {
                     std::fs::remove_file(&p).map_err(|e| {
-                        WenlanError::VectorDb(format!("online_backup rm dest: {e}"))
+                        WenlanError::VectorDb(format!("online_backup rm stale tmp: {e}"))
                     })?;
                 }
             }
@@ -9585,21 +11574,22 @@ impl MemoryDB {
             }
             // ponytail: synchronous copy while holding the conn mutex -- fine for
             // an admin backup on the single-writer daemon; nothing can interleave.
-            std::fs::copy(&source_path, dest)
+            std::fs::copy(&source_path, &tmp)
                 .map_err(|e| WenlanError::VectorDb(format!("online_backup copy: {e}")))?;
             Self::pragma_i64(&conn, "PRAGMA page_count").await?
         };
 
-        // Open the snapshot on its own connection and verify it.
-        let backup = libsql::Builder::new_local(&dest_str)
-            .build()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("online_backup open: {e}")))?;
-        let bconn = backup
-            .connect()
-            .map_err(|e| WenlanError::VectorDb(format!("online_backup connect: {e}")))?;
-        let integrity_ok =
-            {
+        // Open the STAGED snapshot on its own connection and verify it BEFORE
+        // publishing. The connection is scoped so it drops before the rename.
+        let (integrity_ok, backup_pages) = {
+            let backup = libsql::Builder::new_local(&tmp_str)
+                .build()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("online_backup open: {e}")))?;
+            let bconn = backup
+                .connect()
+                .map_err(|e| WenlanError::VectorDb(format!("online_backup connect: {e}")))?;
+            let integrity_ok = {
                 let mut rows = bconn
                     .query("PRAGMA integrity_check", ())
                     .await
@@ -9611,7 +11601,36 @@ impl MemoryDB {
                     None => false,
                 }
             };
-        let backup_pages = Self::pragma_i64(&bconn, "PRAGMA page_count").await?;
+            let backup_pages = Self::pragma_i64(&bconn, "PRAGMA page_count").await?;
+            (integrity_ok, backup_pages)
+        };
+        // The verify connection is dropped now; clear its (read-only, empty)
+        // WAL/SHM sidecars so the published snapshot carries none.
+        for p in [sidecar(&tmp, "-wal"), sidecar(&tmp, "-shm")] {
+            if p.exists() {
+                std::fs::remove_file(&p).map_err(|e| {
+                    WenlanError::VectorDb(format!("online_backup rm tmp sidecar: {e}"))
+                })?;
+            }
+        }
+
+        if integrity_ok {
+            // Publish atomically. A stale WAL/SHM beside a prior `dest` would be
+            // replayed onto the freshly renamed file and corrupt it, so clear
+            // them first; `dest` itself is replaced by the rename.
+            for p in [sidecar(dest, "-wal"), sidecar(dest, "-shm")] {
+                if p.exists() {
+                    std::fs::remove_file(&p).map_err(|e| {
+                        WenlanError::VectorDb(format!("online_backup rm dest sidecar: {e}"))
+                    })?;
+                }
+            }
+            std::fs::rename(&tmp, dest)
+                .map_err(|e| WenlanError::VectorDb(format!("online_backup publish rename: {e}")))?;
+        } else {
+            // Never publish an unverified snapshot; discard the staged copy.
+            let _ = std::fs::remove_file(&tmp);
+        }
 
         Ok(BackupReceipt {
             dest: dest_str,
@@ -9725,44 +11744,109 @@ impl MemoryDB {
         resolved_dst_space != Some(edge_space)
     }
 
+    /// Whether `page_sources` or `page_evidence` still backs a `cites` edge
+    /// for `(page_id, locator)` at the given destination kind ("memory" |
+    /// "external"). `dual_write_page_citations` checks this before it
+    /// retracts one of ITS OWN dropped citations, so a still-active
+    /// `page_sources`/`page_evidence` row keeps the shared edge alive (D7
+    /// refcount, spec v3 M3).
+    async fn cites_backed_outside_page_citations(
+        conn: &libsql::Connection,
+        page_id: &str,
+        dst_kind: &str,
+        locator: &str,
+    ) -> Result<bool, libsql::Error> {
+        let sql = if dst_kind == "memory" {
+            "SELECT EXISTS(SELECT 1 FROM page_sources WHERE page_id = ?1 AND memory_source_id = ?2)
+                OR EXISTS(SELECT 1 FROM page_evidence WHERE page_id = ?1 AND source_kind = 'memory' AND locator = ?2)"
+        } else {
+            "SELECT EXISTS(SELECT 1 FROM page_evidence WHERE page_id = ?1 AND source_kind != 'memory' AND locator = ?2)"
+        };
+        let mut rows = conn.query(sql, libsql::params![page_id, locator]).await?;
+        Ok(rows
+            .next()
+            .await?
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or(0)
+            != 0)
+    }
+
     /// Dual-write (M2 PR-1) for a `pages.citations` blob write: reasserts
     /// one `cites` edge per citation in the new blob, mirroring
-    /// `backfill_edges_from_page_citations`'s classification exactly. Does
-    /// NOT invalidate edges for citations that dropped out of the blob --
-    /// `page_evidence` can independently back the same (page, locator) pair
-    /// and computes the identical content-addressed edge_id, so blindly
-    /// invalidating "this store's" edges here risks retracting one still
-    /// backed by an active `page_evidence` row. Reads stay legacy in PR-1
-    /// (dual-write is shadow-only), so this conservative "never wrongly
-    /// retract" choice costs nothing today; re-derivation semantics are a
-    /// PR-2 (reader cutover) concern.
+    /// `backfill_edges_from_page_citations`'s classification exactly, and
+    /// (D7, spec v3 M3) retracts a citation dropped from the blob -- but
+    /// ONLY when no other legacy store still backs the identical
+    /// content-addressed edge_id. `page_sources`/`page_evidence` can
+    /// independently back the same (page, locator) pair, so a dropped
+    /// citation's edge is invalidated only when neither backs it either --
+    /// this is what makes removal from any one store order-independent with
+    /// removal from the others: never over-retract, and never leave a
+    /// genuinely-unbacked citation's edge dangling active (round-2 item #2's
+    /// "returns without cleanup for NULL/malformed JSON" gap -- a `None`/
+    /// unparseable new blob is treated as dropping every OLD citation, same
+    /// as an explicit `[]`). Callers invoke this BEFORE their own `UPDATE
+    /// pages SET citations = ...` in the same transaction, so the "old" blob
+    /// this reads is still the row's live value.
     async fn dual_write_page_citations(
         conn: &libsql::Connection,
         page_id: &str,
         citations_json: Option<&str>,
     ) -> Result<(), libsql::Error> {
-        let Some(citations_json) = citations_json else {
-            return Ok(());
-        };
-        let Ok(citations) =
-            serde_json::from_str::<Vec<wenlan_types::pages::PageCitation>>(citations_json)
-        else {
-            return Ok(());
-        };
-        let mut space_rows = conn
+        let mut rows = conn
             .query(
-                "SELECT space FROM pages WHERE id = ?1",
+                "SELECT space, citations FROM pages WHERE id = ?1",
                 libsql::params![page_id],
             )
             .await?;
-        let space: Option<String> = match space_rows.next().await? {
-            Some(row) => row.get(0).unwrap_or(None),
-            None => None,
-        };
-        drop(space_rows);
+        let (space, old_citations_json): (Option<String>, Option<String>) =
+            match rows.next().await? {
+                Some(row) => (row.get(0).unwrap_or(None), row.get(1).unwrap_or(None)),
+                None => (None, None),
+            };
+        drop(rows);
         let Some(space) = space else {
             return Ok(());
         };
+
+        let citations: Vec<wenlan_types::pages::PageCitation> = citations_json
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        let old_citations: Vec<wenlan_types::pages::PageCitation> = old_citations_json
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+
+        let new_keys: HashSet<(&str, &str)> = citations
+            .iter()
+            .map(|c| (c.source_kind.as_str(), c.locator.as_str()))
+            .collect();
+        for dropped in old_citations
+            .iter()
+            .filter(|c| !new_keys.contains(&(c.source_kind.as_str(), c.locator.as_str())))
+        {
+            let dst_kind = if dropped.source_kind == "memory" {
+                "memory"
+            } else {
+                "external"
+            };
+            let still_backed = Self::cites_backed_outside_page_citations(
+                conn,
+                page_id,
+                dst_kind,
+                &dropped.locator,
+            )
+            .await?;
+            if !still_backed {
+                let edge_id = crate::provenance::compute_edge_id(
+                    "cites",
+                    "page",
+                    page_id,
+                    dst_kind,
+                    &dropped.locator,
+                    &dropped.locator,
+                );
+                Self::dual_write_invalidate_edge(conn, &edge_id, None).await?;
+            }
+        }
 
         for citation in citations {
             let (dst_kind, lineage, cross_space_downgrade) = match citation.source_kind.as_str() {
@@ -11203,17 +13287,37 @@ impl MemoryDB {
         match memory_action {
             "keep" => { /* do nothing — orphan memories with space tag intact */ }
             "unassign" => {
+                // memories.space is NOT NULL since migration 91 (DEFAULT is the
+                // reserved sentinel). Unassigning must fold to the sentinel, not
+                // NULL — a `SET space = NULL` here fails the NOT NULL constraint.
                 tx.execute(
                     "UPDATE memories
-                     SET space = NULL, version = version + 1,
+                     SET space = ?2, version = version + 1,
                          last_modified = CASE
-                             WHEN last_modified >= ?2 THEN last_modified + 1 ELSE ?2 END
+                             WHEN last_modified >= ?3 THEN last_modified + 1 ELSE ?3 END
                      WHERE space = ?1",
-                    libsql::params![name, now_ts],
+                    libsql::params![name, UNFILED_SPACE_ID, now_ts],
                 )
                 .await
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("delete_space unassign memories: {}", e))
+                })?;
+                // Fold the mapped entity shadows' space columns to the sentinel
+                // (M3 PR-1 dual-write parity). MUST run BEFORE the entities.space
+                // clear below so the join still sees the deleted space. entities
+                // themselves stay NULL (entities never fold -- only the NOT NULL
+                // pages shadow columns fold, matching insert_entity_shadow_page).
+                tx.execute(
+                    "UPDATE pages SET space = ?2, workspace = ?2 \
+                     WHERE kind = 'entity' \
+                       AND id IN (SELECT page_id FROM entity_page_map m \
+                                  JOIN entities e ON e.id = m.entity_id \
+                                  WHERE e.space = ?1)",
+                    libsql::params![name, UNFILED_SPACE_ID],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space unassign shadow fold: {}", e))
                 })?;
                 tx.execute(
                     "UPDATE entities SET space = NULL WHERE space = ?1",
@@ -11271,6 +13375,65 @@ impl MemoryDB {
                 for (source, source_id) in &deleted_sources {
                     Self::delete_by_source_id_in_transaction(&tx, source, source_id, true).await?;
                 }
+                // Tear the space's entities down the SAME way the single-entity
+                // `delete_entity` does (M3 PR-1), scoped to the space, BEFORE the
+                // `DELETE FROM entities` below. Two reasons this is the full
+                // mirror, not just a shadow delete:
+                //  * entity_aliases.canonical_entity_id references entities(id)
+                //    WITHOUT ON DELETE CASCADE (db.rs migration 41 DDL), and
+                //    store_entity auto-creates a self-alias, so a bare
+                //    `DELETE FROM entities` FK-fails for any real entity -- the
+                //    whole delete would roll back. Clear the aliases first.
+                //  * the kind='entity' shadow pages are orphaned otherwise: the
+                //    entity_page_map row's entity-side cascade drops only the map
+                //    row on entity delete, never the shadow page. Delete the
+                //    shadows here (their map rows then cascade on the page side).
+                // memories/pages entity_id references are nulled to match
+                // delete_entity exactly (no dangling link to a removed entity).
+                tx.execute(
+                    "UPDATE memories SET entity_id = NULL \
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!(
+                        "delete_space delete null memories entity_id: {}",
+                        e
+                    ))
+                })?;
+                tx.execute(
+                    "UPDATE pages SET entity_id = NULL \
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!(
+                        "delete_space delete null pages entity_id: {}",
+                        e
+                    ))
+                })?;
+                tx.execute(
+                    "DELETE FROM entity_aliases \
+                     WHERE canonical_entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space delete aliases: {}", e))
+                })?;
+                tx.execute(
+                    "DELETE FROM pages WHERE kind = 'entity' \
+                     AND id IN (SELECT page_id FROM entity_page_map m \
+                                JOIN entities e ON e.id = m.entity_id \
+                                WHERE e.space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space delete shadow pages: {}", e))
+                })?;
                 tx.execute(
                     "DELETE FROM entities WHERE space = ?1",
                     libsql::params![name],
@@ -11838,12 +14001,13 @@ impl MemoryDB {
                             SELECT 1 FROM memories m
                              WHERE m.source = dt.source
                                AND m.source_id = dt.source_id
-                               AND m.space IS NULL
+                               AND (m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001')
                                AND NOT EXISTS (
                                    SELECT 1 FROM memories other
                                     WHERE other.source = dt.source
                                       AND other.source_id = dt.source_id
                                       AND other.space IS NOT NULL
+                                      AND other.space != '00000000-0000-4000-8000-000000000001'
                                )
                         ))
                      OR (dt.source = 'page' AND EXISTS (
@@ -12017,7 +14181,16 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
             let memory_type: Option<String> = row.get(0).ok();
-            let space: Option<String> = row.get(1).ok();
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration
+            // 85, so an unscoped memory carries the reserved sentinel id
+            // rather than NULL -- translate it back to None here so callers
+            // (test-only; see caller inventory) that treat None as
+            // "no space" keep working.
+            let space: Option<String> = row
+                .get::<Option<String>>(1)
+                .ok()
+                .flatten()
+                .filter(|s| s != UNFILED_SPACE_ID);
             Ok((memory_type, space))
         } else {
             Ok((None, None))
@@ -12047,6 +14220,9 @@ impl MemoryDB {
         source_id: &str,
         space: Option<&str>,
     ) -> Result<(), WenlanError> {
+        // memories.space is NOT NULL since migration 91 — unfiled folds to the
+        // reserved UNFILED_SPACE_ID sentinel rather than SQL NULL.
+        let space = Some(space.unwrap_or(UNFILED_SPACE_ID));
         self.apply_memory_update(source_id, None, Some(space), false, None, None)
             .await
     }
@@ -12830,10 +15006,16 @@ impl MemoryDB {
                     .memory_type
                     .map(|s| s.into())
                     .unwrap_or(libsql::Value::Null);
+                // M3 PR-1 stage e: `space` is NOT NULL as of migration 91 --
+                // an unset doc.space folds to the reserved sentinel here
+                // rather than landing NULL. Covers both source='memory' rows
+                // and their co-written source='episode' rows (both flow
+                // through this one loop; see `memory_rows.extend(episode_rows)`
+                // above).
                 let space_val: libsql::Value = row
                     .space
-                    .map(|s| s.into())
-                    .unwrap_or(libsql::Value::Null);
+                    .unwrap_or_else(|| UNFILED_SPACE_ID.to_string())
+                    .into();
                 let source_agent_val: libsql::Value = row
                     .source_agent
                     .map(|s| s.into())
@@ -12993,15 +15175,18 @@ impl MemoryDB {
             for doc in &docs {
                 if let Some(ref superseded_id) = doc.supersedes {
                     if !doc.pending_revision {
+                        // M3 PR-1 stage e: `space` is NOT NULL as of migration
+                        // 85 -- match the same fold the row insert above
+                        // applies (an unset doc.space lands as the sentinel,
+                        // never NULL), so this comparison still matches the
+                        // superseded row.
                         let superseder_space = doc
                             .space
                             .clone()
-                            .map(libsql::Value::Text)
-                            .unwrap_or(libsql::Value::Null);
+                            .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
                         conn.execute(
                             "UPDATE memories SET confirmed = 0
-                              WHERE source_id = ?1 AND source = 'memory'
-                                AND ((space = ?2) OR (space IS NULL AND ?2 IS NULL))",
+                              WHERE source_id = ?1 AND source = 'memory' AND space = ?2",
                             libsql::params![superseded_id.to_string(), superseder_space],
                         )
                         .await
@@ -13083,7 +15268,7 @@ impl MemoryDB {
             filter_conditions.push("c.source = ?".to_string());
             filter_values.push(libsql::Value::Text(filter.to_string()));
         }
-        push_read_scope_filter(scope, "c.space", &mut filter_conditions, &mut filter_values);
+        push_read_scope_filter_folded(scope, "c.space", &mut filter_conditions, &mut filter_values);
 
         // Mirror search_memory: hide supersede_mode='hide' targets; archive-mode
         // memories stay visible. Subquery is restricted to memory rows, so
@@ -13414,7 +15599,7 @@ impl MemoryDB {
                 }
             }
         }
-        push_read_scope_filter(scope, "c.space", &mut filter_conditions, &mut filter_values);
+        push_read_scope_filter_folded(scope, "c.space", &mut filter_conditions, &mut filter_values);
         if let Some(sa) = source_agent {
             filter_conditions.push("c.source_agent = ?".to_string());
             filter_values.push(libsql::Value::Text(sa.to_string()));
@@ -13694,7 +15879,10 @@ impl MemoryDB {
                 ReadScope::Space(space) => {
                     ("AND space = ?1", vec![libsql::Value::Text(space.clone())])
                 }
-                ReadScope::Uncategorized => ("AND space IS NULL", Vec::new()),
+                ReadScope::Uncategorized => (
+                    "AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')",
+                    Vec::new(),
+                ),
             };
             let sql = format!(
                 "SELECT supersedes FROM memories \
@@ -14297,7 +16485,8 @@ impl MemoryDB {
                 ReadScope::Uncategorized => (
                     format!(
                         "{projection} FROM memories c WHERE c.source = 'episode' \
-                         AND c.embedding IS NOT NULL AND c.space IS NULL \
+                         AND c.embedding IS NOT NULL \
+                         AND (c.space IS NULL OR c.space = '00000000-0000-4000-8000-000000000001') \
                          ORDER BY vector_distance_cos(c.embedding, vector32(?1)) ASC LIMIT ?2"
                     ),
                     vec![
@@ -14333,7 +16522,10 @@ impl MemoryDB {
                 ReadScope::Space(space) => {
                     ("AND c.space = ?3", Some(libsql::Value::Text(space.clone())))
                 }
-                ReadScope::Uncategorized => ("AND c.space IS NULL", None),
+                ReadScope::Uncategorized => (
+                    "AND (c.space IS NULL OR c.space = '00000000-0000-4000-8000-000000000001')",
+                    None,
+                ),
             };
             let fts_sql = format!(
                 "{projection} FROM memories_fts fts \
@@ -14483,7 +16675,7 @@ impl MemoryDB {
                        JOIN memories m ON m.source_id = cv.parent_id
                                       AND m.source = 'memory' AND m.chunk_index = 0
                        WHERE cv.parent_kind = 'memory' AND cv.embedding IS NOT NULL
-                         AND m.space IS NULL
+                         AND (m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001')
                          AND COALESCE(m.pending_revision, 0) = 0
                          AND NOT EXISTS (
                              SELECT 1 FROM memories superseder
@@ -14532,7 +16724,11 @@ impl MemoryDB {
                 format!("AND c.space = ?{}", parent_ids.len() + 1),
                 Some(libsql::Value::Text(space.clone())),
             ),
-            ReadScope::Uncategorized => ("AND c.space IS NULL".to_string(), None),
+            ReadScope::Uncategorized => (
+                "AND (c.space IS NULL OR c.space = '00000000-0000-4000-8000-000000000001')"
+                    .to_string(),
+                None,
+            ),
         };
         let sql = format!(
             "SELECT c.id, c.content, c.source, c.source_id, c.title, c.summary, c.url,
@@ -15967,7 +18163,7 @@ impl MemoryDB {
             ),
             ReadScope::Uncategorized => (
                 "JOIN memories m ON m.source_id = me.memory_id AND m.source = 'memory' AND m.chunk_index = 0",
-                "AND m.space IS NULL".to_string(),
+                "AND (m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001')".to_string(),
                 None,
             ),
         };
@@ -17027,7 +19223,8 @@ impl MemoryDB {
 
         // Root node (always included, not vector-gated).
         let mut root: Option<SummaryNode> = None;
-        let summary_source_guard = |parameter: usize| match scope {
+        let summary_source_guard = |parameter: usize| {
+            match scope {
             ReadScope::Global => String::new(),
             ReadScope::Space(_) => format!(
                 "AND EXISTS (SELECT 1 FROM summary_node_sources sns WHERE sns.node_id = s.id) \
@@ -17047,11 +19244,13 @@ impl MemoryDB {
                      WHERE sns.node_id = s.id AND NOT EXISTS ( \
                          SELECT 1 FROM memories m \
                          WHERE m.source_id = sns.memory_source_id \
-                           AND m.source = 'memory' AND m.space IS NULL \
+                           AND m.source = 'memory' \
+                           AND (m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001') \
                      ) \
                  )"
                 .to_string()
             }
+        }
         };
         let root_guard = summary_source_guard(1);
         let root_sql = format!(
@@ -18393,7 +20592,7 @@ impl MemoryDB {
     ) -> Result<Vec<IndexedFileInfo>, WenlanError> {
         let mut conditions = vec!["source != 'episode'".to_string()];
         let mut values = Vec::new();
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT source_id, MAX(title) as title, MAX(source) as source,
                     MAX(url) as url, COUNT(*) as chunk_count,
@@ -18489,7 +20688,7 @@ impl MemoryDB {
             "source IN ('memory', 'file')".to_string(),
         ];
         let mut values = vec![libsql::Value::Text(source_id.to_string())];
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "WITH scoped AS (
                 SELECT source, id, content, title, source_id, chunk_index, chunk_type,
@@ -18550,7 +20749,7 @@ impl MemoryDB {
             libsql::Value::Text(source.to_string()),
             libsql::Value::Text(source_id.to_string()),
         ];
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT id, content, title, source_id, chunk_index, chunk_type, language,
                     semantic_unit, byte_start, byte_end, summary
@@ -19100,9 +21299,13 @@ impl MemoryDB {
             requested_space.map(|space| space.map(std::string::ToString::to_string));
         let requested_memory_type = requested_memory_type.map(str::to_string);
         let requested_structured_fields = requested_structured_fields.map(str::to_string);
+        // M3 PR-1 stage e: `space` is NOT NULL as of migration 91. A caller
+        // explicitly clearing space (`requested_space = Some(None)`) or an
+        // unset head row folds to the reserved sentinel rather than NULL.
         let effective_space = requested_space
             .clone()
-            .unwrap_or_else(|| head.space.clone());
+            .unwrap_or_else(|| head.space.clone())
+            .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
         let effective_memory_type = requested_memory_type
             .clone()
             .or_else(|| head.memory_type.clone());
@@ -19283,6 +21486,9 @@ impl MemoryDB {
             }
 
             if let Some(space) = requested_space {
+                // M3 PR-1 stage e: explicit clear folds to the reserved
+                // sentinel, matching `effective_space` above.
+                let space = space.unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
                 conn.execute(
                     "UPDATE memories SET space = ?1 WHERE source_id = ?2",
                     libsql::params![space, source_id],
@@ -19689,7 +21895,8 @@ impl MemoryDB {
                 params.push(space.clone().into());
                 sql.push_str(&format!(" AND space = ?{}", params.len()));
             }
-            ReadScope::Uncategorized => sql.push_str(" AND space IS NULL"),
+            ReadScope::Uncategorized => sql
+                .push_str(" AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')"),
         }
         if let Some(mt) = memory_type {
             params.push(mt.into());
@@ -19975,7 +22182,7 @@ impl MemoryDB {
             .cloned()
             .map(libsql::Value::Text)
             .collect::<Vec<_>>();
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT source_id, title,
                 GROUP_CONCAT(content, '\n') as content,
@@ -20091,7 +22298,9 @@ impl MemoryDB {
         let space_clause = match scope {
             ReadScope::Global => "",
             ReadScope::Space(_) => "AND space = ?3",
-            ReadScope::Uncategorized => "AND space IS NULL",
+            ReadScope::Uncategorized => {
+                "AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')"
+            }
         };
 
         let sql = format!(
@@ -20381,7 +22590,9 @@ impl MemoryDB {
                 params.push(space.clone().into());
                 idx += 1;
             }
-            ReadScope::Uncategorized => conditions.push("space IS NULL".to_string()),
+            ReadScope::Uncategorized => conditions.push(
+                "(space IS NULL OR space = '00000000-0000-4000-8000-000000000001')".to_string(),
+            ),
         }
         if let Some(c) = confirmed {
             if c {
@@ -20500,7 +22711,11 @@ impl MemoryDB {
         Ok(id)
     }
 
-    /// Store a new entity in the knowledge graph.
+    /// Store a new entity in the knowledge graph. Also dual-writes its
+    /// `kind='entity'` page shadow (M3 PR-1 stage f) + `entity_page_map` row
+    /// via `insert_entity_shadow_page`, all inside one transaction, so the
+    /// entity and its shadow page can never diverge -- a failed shadow write
+    /// rolls back the entity write, and vice versa.
     pub async fn store_entity(
         &self,
         name: &str,
@@ -20511,44 +22726,148 @@ impl MemoryDB {
     ) -> Result<String, WenlanError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
+        let now_iso = chrono::Utc::now().to_rfc3339();
 
         let embedding = self.get_or_compute_embedding(name)?;
         let vec_str = Self::vec_to_sql(&embedding);
 
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO entities (id, name, entity_type, space, source_agent, confidence,
-                confirmed, created_at, updated_at, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7, vector32(?8))",
-            libsql::params![
-                id.clone(),
-                name.to_string(),
-                entity_type.to_string(),
-                space
-                    .map(|s| libsql::Value::Text(s.to_string()))
-                    .unwrap_or(libsql::Value::Null),
-                source_agent
-                    .map(|s| libsql::Value::Text(s.to_string()))
-                    .unwrap_or(libsql::Value::Null),
-                confidence
-                    .map(|v| libsql::Value::Real(v as f64))
-                    .unwrap_or(libsql::Value::Null),
-                now,
-                vec_str
-            ],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("store_entity: {}", e)))?;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("store_entity begin: {}", e)))?;
 
-        // Auto-create a self-alias for the entity name (lowercase).
-        conn.execute(
-            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), 'auto')",
-            libsql::params![name.to_lowercase(), id.clone()],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("store_entity alias: {}", e)))?;
+        let result: Result<(), WenlanError> = async {
+            conn.execute(
+                "INSERT INTO entities (id, name, entity_type, space, source_agent, confidence,
+                    confirmed, created_at, updated_at, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7, vector32(?8))",
+                libsql::params![
+                    id.clone(),
+                    name.to_string(),
+                    entity_type.to_string(),
+                    space
+                        .map(|s| libsql::Value::Text(s.to_string()))
+                        .unwrap_or(libsql::Value::Null),
+                    source_agent
+                        .map(|s| libsql::Value::Text(s.to_string()))
+                        .unwrap_or(libsql::Value::Null),
+                    confidence
+                        .map(|v| libsql::Value::Real(v as f64))
+                        .unwrap_or(libsql::Value::Null),
+                    now,
+                    vec_str
+                ],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("store_entity: {}", e)))?;
+
+            // Auto-create a self-alias for the entity name (lowercase).
+            conn.execute(
+                "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), 'auto')",
+                libsql::params![name.to_lowercase(), id.clone()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("store_entity alias: {}", e)))?;
+
+            let page_id = crate::pages::new_page_id();
+            Self::insert_entity_shadow_page(&conn, &id, &page_id, &now_iso).await?;
+            // The insert path leaves `aliases` NULL (it is shared with
+            // migration 92, which predates the `pages.aliases` column); the
+            // self-alias inserted just above is now visible, so re-sync the
+            // shadow to fold it in. Same transaction -> the shadow never
+            // observes a NULL-aliases state.
+            Self::update_entity_shadow_page(&conn, &id, &now_iso).await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("store_entity commit: {}", e)))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
 
         Ok(id)
+    }
+
+    /// The canonical resolve-then-write cascade (M3 PR-1 stage d, spec's "one
+    /// canonical entity-upsert service" gate): exact-name -> minhash ->
+    /// vector-sim -> `store_entity`. Both `post_write::create_entity` (the
+    /// agent/MCP/HTTP path) and `importer::resolve_entity_bulk` (the
+    /// bulk-import path) delegate their resolution to this one function
+    /// instead of each re-implementing it -- previously the two cascades were
+    /// "kept hand-in-sync by comment" (a real divergence risk); collapsing
+    /// them here removes that risk by construction. Returns
+    /// `(entity_id, was_newly_created)`. Callers keep their own
+    /// caller-specific concerns on top: `resolve_entity_bulk` layers its
+    /// in-batch cache, `create_entity` layers input validation, its richer
+    /// `WriteResult` wrapping, and post-write enrichment (verify, refinery
+    /// enqueue, activity log) gated on `was_newly_created`.
+    pub async fn resolve_or_create_entity(
+        &self,
+        name: &str,
+        entity_type: &str,
+        space: Option<&str>,
+        source_agent: Option<&str>,
+        confidence: Option<f32>,
+    ) -> Result<(String, bool), WenlanError> {
+        let name_lower = name.to_lowercase();
+
+        // Step 1: alias lookup (exact, case-insensitive).
+        if let Some(id) = self.resolve_entity_by_alias(&name_lower).await? {
+            return Ok((id, false));
+        }
+
+        // Step 2: exact name search.
+        if let Some(existing) = self.search_entities_by_name(name).await?.into_iter().next() {
+            let _ = self
+                .add_entity_alias(&name_lower, &existing.id, "auto")
+                .await;
+            return Ok((existing.id, false));
+        }
+
+        // Step 2.5: deterministic MinHash/LSH near-dedup (T16, opt-in).
+        if crate::db::entity_minhash_enabled() {
+            if let Some(cand_id) = self.minhash_resolve_candidate(name, entity_type).await? {
+                let _ = self
+                    .add_entity_alias(&name_lower, &cand_id, "minhash")
+                    .await;
+                return Ok((cand_id, false));
+            }
+        }
+
+        // Step 3: vector similarity (distance < 0.1 => sim > 0.9).
+        if let Some(result) = self
+            .search_entities_by_vector(name, 1)
+            .await?
+            .into_iter()
+            .next()
+        {
+            if result.distance < 0.1 {
+                let _ = self
+                    .add_entity_alias(&name_lower, &result.entity.id, "auto")
+                    .await;
+                return Ok((result.entity.id, false));
+            }
+        }
+
+        // Step 4: create new.
+        let id = self
+            .store_entity(name, entity_type, space, source_agent, confidence)
+            .await?;
+        if crate::db::entity_minhash_enabled() {
+            if let Err(e) = self.index_entity_minhash_if_eligible(&id, name).await {
+                log::warn!("[resolve_or_create_entity] minhash band index failed for {id}: {e}");
+            }
+        }
+        Ok((id, true))
     }
 
     /// Persist the LSH band keys for an entity into `entity_minhash_bands`
@@ -20761,14 +23080,37 @@ impl MemoryDB {
         entity_id: &str,
         source: &str,
     ) -> Result<(), WenlanError> {
+        let now_iso = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), ?3)",
-            libsql::params![alias.to_lowercase(), entity_id.to_string(), source.to_string()],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("add alias: {}", e)))?;
-        Ok(())
+        // Transaction so the alias insert and the shadow-page alias re-sync
+        // (M3 PR-1 item C) commit atomically -- the shadow's `aliases` array
+        // never lags the `entity_aliases` table.
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add alias begin: {}", e)))?;
+        let result: Result<(), WenlanError> = async {
+            conn.execute(
+                "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), ?3)",
+                libsql::params![alias.to_lowercase(), entity_id.to_string(), source.to_string()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add alias: {}", e)))?;
+            Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("add alias commit: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Resolve a relation type string against the vocabulary (case-insensitive).
@@ -20974,14 +23316,37 @@ impl MemoryDB {
         }
         let vec_str = Self::vec_to_sql(&embeddings[0]);
         let now = chrono::Utc::now().timestamp();
+        let now_iso = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE entities SET embedding = vector32(?1), embedding_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
-            libsql::params![vec_str, now, entity_id.to_string()],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding: {}", e)))?;
-        Ok(())
+        // Transaction so the entity embedding update and the shadow-page
+        // re-sync (M3 PR-1 item C -- the shadow mirrors `embedding`) commit
+        // atomically.
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding begin: {}", e)))?;
+        let result: Result<(), WenlanError> = async {
+            conn.execute(
+                "UPDATE entities SET embedding = vector32(?1), embedding_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+                libsql::params![vec_str, now, entity_id.to_string()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding: {}", e)))?;
+            Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await.map_err(|e| {
+                    WenlanError::VectorDb(format!("refresh_entity_embedding commit: {}", e))
+                })?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Add an observation to an entity.
@@ -21143,6 +23508,7 @@ impl MemoryDB {
             )
         };
         let should_promote = is_generic(&canonical_type) && !is_generic(&alias_type);
+        let now_iso = chrono::Utc::now().to_rfc3339();
 
         conn.execute("BEGIN TRANSACTION", ())
             .await
@@ -21247,12 +23613,30 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities alias cleanup: {e}")))?;
 
+            // M3 PR-1 item C (beyond Sol's enumerated list): the loser's shadow
+            // page would otherwise be orphaned by the entity delete below (the
+            // map row cascades on the entity FK, never the page). Delete it
+            // first so its own ON DELETE CASCADE drops the map row.
+            conn.execute(
+                "DELETE FROM pages WHERE kind = 'entity' \
+                 AND id IN (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                libsql::params![alias_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities loser shadow: {e}")))?;
+
             conn.execute(
                 "DELETE FROM entities WHERE id = ?1",
                 libsql::params![alias_id],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities delete alias: {e}")))?;
+
+            // The canonical's shadowed fields drifted in this merge: aliases
+            // were redirected + the loser's name registered, and its
+            // entity_type may have been promoted. Re-sync the canonical shadow
+            // to the final entity state (M3 PR-1 item C).
+            Self::update_entity_shadow_page(&conn, canonical_id, &now_iso).await?;
 
             Ok(())
         }
@@ -21804,6 +24188,20 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity aliases: {e}")))?;
+
+            // Delete the entity's shadow page (M3 PR-1 item C). The
+            // `entity_page_map` row has an ON DELETE CASCADE FK to `pages`, so
+            // deleting the shadow removes the map row too; the subsequent
+            // `DELETE FROM entities` then finds no dangling map row. Without
+            // this the shadow would be orphaned (the map's entity-side cascade
+            // drops the map row on entity delete, but never the page itself).
+            conn.execute(
+                "DELETE FROM pages WHERE kind = 'entity' \
+                 AND id IN (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
 
             conn.execute(
                 "DELETE FROM entities WHERE id = ?1",
@@ -23089,7 +25487,7 @@ impl MemoryDB {
                 "chunk_index = 0".to_string(),
             ];
             let mut values = vec![libsql::Value::Text(source_id.to_string())];
-            push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+            push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
             let sql = format!(
                 "SELECT 1 FROM memories WHERE {} LIMIT 1",
                 conditions.join(" AND ")
@@ -23412,14 +25810,37 @@ impl MemoryDB {
         entity_id: &str,
         confirmed: bool,
     ) -> Result<(), WenlanError> {
+        let now_iso = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE entities SET confirmed = ?1 WHERE id = ?2",
-            libsql::params![if confirmed { 1i64 } else { 0i64 }, entity_id],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("confirm_entity: {}", e)))?;
-        Ok(())
+        // Transaction so the entity confirm and the shadow-page re-sync
+        // (M3 PR-1 item C -- the shadow mirrors `entity_confirmed`) commit
+        // atomically.
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("confirm_entity begin: {}", e)))?;
+        let result: Result<(), WenlanError> = async {
+            conn.execute(
+                "UPDATE entities SET confirmed = ?1 WHERE id = ?2",
+                libsql::params![if confirmed { 1i64 } else { 0i64 }, entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("confirm_entity: {}", e)))?;
+            Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("confirm_entity commit: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn confirm_observation(
@@ -23470,18 +25891,35 @@ impl MemoryDB {
         // the `relates` adjacency from `edges` instead of the legacy
         // `relations` store ONLY when `reader_uses_edges` says parity is
         // proven-clean and current -- otherwise it stays on legacy. The two
-        // sources are byte-identical under clean parity: `relations` has a
-        // UNIQUE(from_entity,to_entity,relation_type) index, so each row maps
-        // to exactly one distinct `relates` edge_id and the (from,to) multiset
-        // matches. The gate defaults OFF, so production behavior is unchanged
-        // until a cutover is explicitly enabled AND a clean watermark exists;
-        // the byte-identical guarantee is regression-locked by the paired test
-        // `detect_communities_edges_path_matches_legacy`.
+        // sources are byte-identical under clean parity for SAME-SPACE rows:
+        // `relations` has a UNIQUE(from_entity,to_entity,relation_type) index,
+        // so each row maps to exactly one distinct `relates` edge_id and the
+        // (from,to) multiset matches. D6 (M2 review fork-#2 verdict (a),
+        // deferred to "an explicit M3 reader-cutover gate"): a
+        // `lineage='legacy'` edge whose endpoints are cross-space is EXCLUDED
+        // below once flipped -- read-side only, never a row mutation (would
+        // register as parity drift and freeze every cutover) -- so the two
+        // paths diverge exactly on cross-space legacy rows. The gate defaults
+        // OFF, so production behavior is unchanged until a cutover is
+        // explicitly enabled AND a clean watermark exists; regression-locked
+        // by `detect_communities_edges_path_matches_legacy` (same-space
+        // parity) and `detect_communities_flipped_excludes_cross_space_legacy_edge`
+        // (the cross-space carve-out).
         let adjacency_sql = if Self::reader_uses_edges(&conn, "communities")
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            "SELECT src_id, dst_id FROM edges WHERE edge_type = 'relates' AND valid_until IS NULL"
+            // Endpoint-space predicate reused verbatim from
+            // `audit_legacy_cross_space_links`'s `relations` tally
+            // (NULL-safe: an indeterminate-space endpoint is `null_space`,
+            // not `cross_space`, so it is not excluded here either).
+            "SELECT e.src_id, e.dst_id FROM edges e \
+             LEFT JOIN entities se ON se.id = e.src_id \
+             LEFT JOIN entities de ON de.id = e.dst_id \
+             WHERE e.edge_type = 'relates' AND e.valid_until IS NULL \
+             AND NOT (e.lineage = 'legacy' \
+                      AND se.space IS NOT NULL AND de.space IS NOT NULL \
+                      AND se.space != de.space)"
         } else {
             "SELECT from_entity, to_entity FROM relations"
         };
@@ -24230,7 +26668,7 @@ impl MemoryDB {
         let week_start = now - 7 * 86400;
         let mut conditions = vec!["source = 'memory'".to_string()];
         let mut values = Vec::new();
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         values.extend([
             libsql::Value::Integer(today_start),
             libsql::Value::Integer(today_start),
@@ -24313,7 +26751,7 @@ impl MemoryDB {
 
         let mut top_conditions = vec!["source = 'memory'".to_string()];
         let mut top_values = Vec::new();
-        push_read_scope_filter(scope, "space", &mut top_conditions, &mut top_values);
+        push_read_scope_filter_folded(scope, "space", &mut top_conditions, &mut top_values);
         top_values.push(libsql::Value::Integer(week_start));
         let top_sql = format!(
             "WITH scoped AS (
@@ -24357,7 +26795,7 @@ impl MemoryDB {
                 "chunk_index = 0".to_string(),
             ];
             let mut fallback_values = Vec::new();
-            push_read_scope_filter(
+            push_read_scope_filter_folded(
                 scope,
                 "space",
                 &mut fallback_conditions,
@@ -24525,7 +26963,10 @@ impl MemoryDB {
         let (scope_sql, scope_value) = match scope {
             ReadScope::Global => ("", None),
             ReadScope::Space(space) => ("AND space = ?2", Some(libsql::Value::Text(space.clone()))),
-            ReadScope::Uncategorized => ("AND space IS NULL", None),
+            ReadScope::Uncategorized => (
+                "AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')",
+                None,
+            ),
         };
         let conn = self.conn.lock().await;
 
@@ -25215,7 +27656,10 @@ impl MemoryDB {
     pub async fn count_active_pages(&self) -> Result<i64, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
-            .query("SELECT COUNT(*) FROM pages WHERE status = 'active'", ())
+            .query(
+                "SELECT COUNT(*) FROM pages WHERE status = 'active' AND COALESCE(kind, 'concept') != 'entity'",
+                (),
+            )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("count_active_pages query: {}", e)))?;
         let row = rows
@@ -25303,8 +27747,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
-                 FROM pages WHERE status = 'active' ORDER BY created_at ASC LIMIT 1",
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE status = 'active' AND COALESCE(kind, 'concept') != 'entity' ORDER BY created_at ASC LIMIT 1",
                 (),
             )
             .await
@@ -25514,6 +27958,15 @@ impl MemoryDB {
         if !crate::router::classify::tier_allowed(caller_trust, 2) {
             return Vec::new();
         }
+        // Fence (M3 PR-1 stage f, mandatory): `kind='entity'` dual-write shadow
+        // pages mirror `entities` rows for the id-map backfill only -- they are
+        // write-only in PR-1 and must never reach a reader through the ONE
+        // shared gate. `select_visible_pages_scoped` delegates here, so this
+        // covers it too.
+        let raw_pages: Vec<Page> = raw_pages
+            .into_iter()
+            .filter(|p| p.kind != "entity")
+            .collect();
         let scoped = crate::pages::scope_filter_pages(raw_pages, caller_space, memory_source_ids);
         let mut tier_ok = Vec::with_capacity(scoped.len());
         for page in scoped {
@@ -25544,7 +27997,16 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            Ok(row.get::<Option<String>>(0).unwrap_or(None))
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration
+            // 85, so an unscoped memory carries the reserved sentinel id
+            // rather than NULL -- translate it back to None here so callers
+            // (spaces_for_sources's cross-space discovery, page_growth's
+            // growth_space) keep treating "no real space" as None instead
+            // of collecting/growing against the literal sentinel id.
+            Ok(row
+                .get::<Option<String>>(0)
+                .unwrap_or(None)
+                .filter(|s| s != UNFILED_SPACE_ID))
         } else {
             Ok(None)
         }
@@ -25635,7 +28097,9 @@ impl MemoryDB {
         let space_clause = match scope {
             ReadScope::Global => "",
             ReadScope::Space(_) => "AND c.space = ?2",
-            ReadScope::Uncategorized => "AND c.space IS NULL",
+            ReadScope::Uncategorized => {
+                "AND (c.space IS NULL OR c.space = '00000000-0000-4000-8000-000000000001')"
+            }
         };
         let hidden_by_superseder =
             superseder_not_exists(scope, "c", "superseder.source = 'memory'");
@@ -26042,13 +28506,13 @@ impl MemoryDB {
                 ],
             ),
             ReadScope::Uncategorized => (
-                "AND r.space IS NULL
+                "AND (r.space IS NULL OR r.space = '00000000-0000-4000-8000-000000000001')
                  AND EXISTS (
                      SELECT 1 FROM memories target
                      WHERE target.source_id = r.supersedes
                        AND target.source = 'memory'
                        AND target.chunk_index = 0
-                       AND target.space IS NULL
+                       AND (target.space IS NULL OR target.space = '00000000-0000-4000-8000-000000000001')
                  )",
                 vec![libsql::Value::Text(target_source_id.to_string())],
             ),
@@ -26183,13 +28647,13 @@ impl MemoryDB {
                 ],
             ),
             ReadScope::Uncategorized => (
-                "AND revision.space IS NULL
+                "AND (revision.space IS NULL OR revision.space = '00000000-0000-4000-8000-000000000001')
                  AND EXISTS (
                      SELECT 1 FROM memories target
                      WHERE target.source_id = revision.supersedes
                        AND target.source = 'memory'
                        AND target.chunk_index = 0
-                       AND target.space IS NULL
+                       AND (target.space IS NULL OR target.space = '00000000-0000-4000-8000-000000000001')
                  )",
                 vec![libsql::Value::Integer(limit as i64)],
             ),
@@ -26460,7 +28924,7 @@ impl MemoryDB {
              FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt \
              JOIN memories c ON c.rowid = vt.id \
              WHERE {side_predicate} \
-               AND ((?3 IS NULL AND c.space IS NULL) OR c.space = ?3) \
+               AND ((?3 IS NULL AND (c.space IS NULL OR c.space = '00000000-0000-4000-8000-000000000001')) OR c.space = ?3) \
                AND c.source_id != ?4 \
              ORDER BY dist ASC"
         );
@@ -26712,7 +29176,7 @@ impl MemoryDB {
 
         let mut conditions = vec!["cr.snapshot_id = ?".to_string()];
         let mut values = vec![libsql::Value::Text(snapshot_id.to_string())];
-        push_read_scope_filter(scope, "m.space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "m.space", &mut conditions, &mut values);
         match scope {
             ReadScope::Space(space) => {
                 conditions.push(
@@ -26732,6 +29196,7 @@ impl MemoryDB {
                       WHERE other.source = m.source
                         AND other.source_id = m.source_id
                         AND other.space IS NOT NULL
+                        AND other.space != '00000000-0000-4000-8000-000000000001'
                  )"
                 .to_string(),
             ),
@@ -26809,7 +29274,7 @@ impl MemoryDB {
             libsql::Value::Text(source.to_string()),
             libsql::Value::Text(source_id.to_string()),
         ];
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT content FROM memories WHERE {} ORDER BY chunk_index ASC LIMIT 10000",
             conditions.join(" AND ")
@@ -27306,7 +29771,7 @@ impl MemoryDB {
             "chunk_index = 0".to_string(),
         ];
         let mut values = vec![libsql::Value::Integer(today_start)];
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT COUNT(DISTINCT source_id) FROM memories WHERE {}",
             conditions.join(" AND ")
@@ -27336,7 +29801,7 @@ impl MemoryDB {
             "space != ''".to_string(),
         ];
         let mut values = vec![libsql::Value::Integer(cutoff)];
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT space, COUNT(*) AS cnt FROM memories WHERE {} \
              GROUP BY space ORDER BY cnt DESC LIMIT 1",
@@ -27366,7 +29831,7 @@ impl MemoryDB {
             "source_agent != ''".to_string(),
         ];
         let mut values = vec![libsql::Value::Integer(cutoff)];
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT source_agent, COUNT(*) AS cnt FROM memories WHERE {} \
              GROUP BY source_agent ORDER BY cnt DESC LIMIT 1",
@@ -27452,7 +29917,7 @@ impl MemoryDB {
             "is_recap = 0".to_string(),
         ];
         let mut values = vec![libsql::Value::Integer(cutoff)];
-        push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         values.push(libsql::Value::Integer(limit as i64));
         let sql = format!(
             "SELECT title, content, COALESCE(memory_type, 'observation'), space, last_modified
@@ -27691,7 +30156,8 @@ impl MemoryDB {
         } else {
             (
                 "SELECT source_id, structured_fields, content FROM memories
-                 WHERE source = 'memory' AND memory_type = ?1 AND space IS NULL
+                 WHERE source = 'memory' AND memory_type = ?1
+                 AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')
                  AND source_id != ?2 AND is_recap = 0
                  AND chunk_index = 0
                  ORDER BY last_modified DESC LIMIT ?3"
@@ -28192,7 +30658,24 @@ impl MemoryDB {
                 .get(1)
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
             let entity_id: Option<String> = row.get(2).unwrap_or(None);
-            let space: Option<String> = row.get(3).unwrap_or(None);
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91,
+            // so an unscoped memory carries the reserved UNFILED_SPACE_ID
+            // sentinel rather than NULL -- translate it back to None here so
+            // cluster_distillation_rows's SpaceScoped unlinked-bucket match
+            // and per_space_cluster_stats's NO_SPACE_KEY fallback still see
+            // "no space" as None instead of a bogus space group keyed by the
+            // sentinel id.
+            // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91,
+            // so an unscoped memory carries the reserved UNFILED_SPACE_ID
+            // sentinel rather than NULL -- translate it back to None here so
+            // cluster_distillation_rows's SpaceScoped unlinked-bucket match
+            // and per_space_cluster_stats's NO_SPACE_KEY fallback still see
+            // "no space" as None instead of a bogus space group keyed by the
+            // sentinel id.
+            let space: Option<String> = row
+                .get::<Option<String>>(3)
+                .unwrap_or(None)
+                .filter(|s| s != UNFILED_SPACE_ID);
             let emb_bytes: Vec<u8> = row
                 .get(4)
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
@@ -29644,7 +32127,12 @@ impl MemoryDB {
             content: row.get::<String>(1).unwrap_or_default(),
             version: row.get::<i64>(2).unwrap_or(1),
             memory_type: row.get::<Option<String>>(3).unwrap_or(None),
-            space: row.get::<Option<String>>(4).unwrap_or(None),
+            // memories.space is NOT NULL since migration 91; the unfiled sentinel
+            // means "unscoped", so enrichment consumers see it as no space.
+            space: row
+                .get::<Option<String>>(4)
+                .unwrap_or(None)
+                .filter(|space| space != UNFILED_SPACE_ID),
             origin: EnrichmentOrigin {
                 memory_type_explicit: row.get::<i64>(5).unwrap_or(1) != 0,
                 structured_fields_explicit: row.get::<i64>(6).unwrap_or(1) != 0,
@@ -29727,7 +32215,12 @@ impl MemoryDB {
             content: row.get::<String>(1).unwrap_or_default(),
             version: row.get::<i64>(2).unwrap_or(1),
             memory_type: row.get::<Option<String>>(3).unwrap_or(None),
-            space: row.get::<Option<String>>(4).unwrap_or(None),
+            // memories.space is NOT NULL since migration 91; the unfiled sentinel
+            // means "unscoped", so enrichment consumers see it as no space.
+            space: row
+                .get::<Option<String>>(4)
+                .unwrap_or(None)
+                .filter(|space| space != UNFILED_SPACE_ID),
             origin: EnrichmentOrigin {
                 memory_type_explicit: row.get::<i64>(5).unwrap_or(1) != 0,
                 structured_fields_explicit: row.get::<i64>(6).unwrap_or(1) != 0,
@@ -30695,7 +33188,10 @@ impl MemoryDB {
                     ReadScope::Space(space) => {
                         ("AND m.space = ?", Some(libsql::Value::Text(space.clone())))
                     }
-                    ReadScope::Uncategorized => ("AND m.space IS NULL", None),
+                    ReadScope::Uncategorized => (
+                        "AND (m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001')",
+                        None,
+                    ),
                     ReadScope::Global => unreachable!(),
                 };
                 let snippet_sql = format!(
@@ -30790,6 +33286,7 @@ impl MemoryDB {
                 "SELECT id, title, version, created_at, last_modified
                  FROM pages
                  WHERE status = 'active'
+                   AND COALESCE(kind, 'concept') != 'entity'
                  ORDER BY last_modified DESC LIMIT ?1",
                 libsql::params![limit],
             )
@@ -30867,7 +33364,10 @@ impl MemoryDB {
                 ReadScope::Space(space) => {
                     ("AND space = ?2", Some(libsql::Value::Text(space.clone())))
                 }
-                ReadScope::Uncategorized => ("AND space IS NULL", None),
+                ReadScope::Uncategorized => (
+                    "AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')",
+                    None,
+                ),
             };
             let sql = format!(
                     "SELECT source_id, title, summary, content, \
@@ -31009,7 +33509,10 @@ impl MemoryDB {
         let (scope_sql, scope_value) = match scope {
             ReadScope::Global => ("", None),
             ReadScope::Space(space) => ("AND space = ?2", Some(libsql::Value::Text(space.clone()))),
-            ReadScope::Uncategorized => ("AND space IS NULL", None),
+            ReadScope::Uncategorized => (
+                "AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')",
+                None,
+            ),
         };
         let sql = format!(
             "SELECT source_id, title, summary, content, \
@@ -31099,7 +33602,7 @@ impl MemoryDB {
                     "SELECT id, title, COALESCE(summary, ''), COALESCE(source_memory_ids, '[]'), \
                             version, created_at, last_modified \
                      FROM pages \
-                     WHERE status = 'active' \
+                     WHERE status = 'active' AND kind != 'entity' \
                      ORDER BY last_modified DESC \
                      LIMIT ?1",
                     libsql::params![limit],
@@ -31558,7 +34061,10 @@ impl MemoryDB {
                     ReadScope::Space(space) => {
                         ("AND space = ?", Some(libsql::Value::Text(space.clone())))
                     }
-                    ReadScope::Uncategorized => ("AND space IS NULL", None),
+                    ReadScope::Uncategorized => (
+                        "AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')",
+                        None,
+                    ),
                     ReadScope::Global => unreachable!(),
                 };
                 let title_sql = format!(
@@ -32626,8 +35132,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
-                 FROM pages WHERE id = ?1",
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE id = ?1 AND COALESCE(kind, 'concept') != 'entity'",
                 libsql::params![id],
             )
             .await
@@ -32644,8 +35150,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
-                 FROM pages WHERE entity_id = ?1 AND status = 'active' LIMIT 1",
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE entity_id = ?1 AND status = 'active' AND COALESCE(kind, 'concept') != 'entity' LIMIT 1",
                 libsql::params![entity_id],
             )
             .await
@@ -32695,8 +35201,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
-                 FROM pages WHERE status = ?1 ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3",
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3",
                 libsql::params![status, limit, offset],
             )
             .await
@@ -32720,9 +35226,10 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
                  FROM pages
                  WHERE status = ?1
+                   AND COALESCE(kind, 'concept') != 'entity'
                    AND stale_reason IS NOT NULL
                    AND COALESCE(user_edited, 0) = 0
                  ORDER BY COALESCE(sources_updated_count, 0) DESC, last_modified ASC
@@ -32765,8 +35272,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let (sql, params): (String, Vec<libsql::Value>) = match space {
             Some("uncategorized") => (
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
-                 FROM pages WHERE status = ?1 AND space = '00000000-0000-4000-8000-000000000001' ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' AND space = '00000000-0000-4000-8000-000000000001' ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
                     libsql::Value::Integer(limit as i64),
@@ -32774,8 +35281,8 @@ impl MemoryDB {
                 ],
             ),
             Some(d) => (
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
-                 FROM pages WHERE status = ?1 AND space = ?2 ORDER BY last_modified DESC LIMIT ?3 OFFSET ?4".to_string(),
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' AND space = ?2 ORDER BY last_modified DESC LIMIT ?3 OFFSET ?4".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
                     libsql::Value::Text(d.to_string()),
@@ -32784,8 +35291,8 @@ impl MemoryDB {
                 ],
             ),
             None => (
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
-                 FROM pages WHERE status = ?1 ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
                     libsql::Value::Integer(limit as i64),
@@ -33837,7 +36344,7 @@ impl MemoryDB {
                         c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
                         COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0),
                         COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'),
-                        c.workspace, c.citations,
+                        c.workspace, c.citations, COALESCE(c.kind, 'concept'),
                         vector_distance_cos(c.embedding, vector32(?1)) as dist
                  FROM pages c
                  WHERE c.status = 'active' AND c.embedding IS NOT NULL
@@ -33852,7 +36359,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            let dist: f64 = row.get(20).unwrap_or(1.0);
+            let dist: f64 = row.get(21).unwrap_or(1.0);
             let similarity = 1.0 - dist;
             if similarity >= similarity_threshold {
                 return Ok(Some(Self::row_to_page(&row)?));
@@ -33886,7 +36393,7 @@ impl MemoryDB {
             let conn = self.conn.lock().await;
             let mut rows = conn
                 .query(
-                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
+                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
                      FROM pages
                      WHERE entity_id = ?1 AND status = 'active'
                        AND COALESCE(review_status, 'confirmed') = 'confirmed'
@@ -33915,7 +36422,7 @@ impl MemoryDB {
                         c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
                         COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0),
                         COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'),
-                        c.workspace, c.citations,
+                        c.workspace, c.citations, COALESCE(c.kind, 'concept'),
                         vector_distance_cos(c.embedding, vector32(?1)) as dist
                  FROM pages c
                  WHERE c.status = 'active' AND c.embedding IS NOT NULL
@@ -33932,7 +36439,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            let dist: f64 = row.get(20).unwrap_or(1.0);
+            let dist: f64 = row.get(21).unwrap_or(1.0);
             if 1.0 - dist >= threshold {
                 let page = Self::row_to_page(&row)?;
                 if !allow_user_edited && (page.user_edited || page.creation_kind == "authored") {
@@ -34291,7 +36798,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, source_memory_ids FROM pages WHERE status = 'active' LIMIT 1000",
+                "SELECT id, title, source_memory_ids FROM pages WHERE status = 'active' AND COALESCE(kind, 'concept') != 'entity' LIMIT 1000",
                 (),
             )
             .await
@@ -34422,6 +36929,7 @@ impl MemoryDB {
         let (sql, params): (&str, Vec<libsql::Value>) = match workspace {
             Some(workspace) => (
                 "SELECT title FROM pages WHERE status = 'active'
+                   AND COALESCE(kind, 'concept') != 'entity'
                    AND COALESCE(workspace, space) = ?1
                  ORDER BY last_modified DESC LIMIT ?2",
                 vec![
@@ -34431,6 +36939,7 @@ impl MemoryDB {
             ),
             None => (
                 "SELECT title FROM pages WHERE status = 'active'
+                   AND COALESCE(kind, 'concept') != 'entity'
                  ORDER BY last_modified DESC LIMIT ?1",
                 vec![libsql::Value::Integer(limit as i64)],
             ),
@@ -34471,6 +36980,7 @@ impl MemoryDB {
             Some(workspace) => (
                 "SELECT title FROM pages \
                  WHERE status = 'active' \
+                   AND COALESCE(kind, 'concept') != 'entity' \
                    AND embedding IS NOT NULL \
                    AND space = ?2 \
                  ORDER BY vector_distance_cos(embedding, vector32(?1)) ASC \
@@ -34485,6 +36995,7 @@ impl MemoryDB {
             None => (
                 "SELECT title FROM pages \
                  WHERE status = 'active' \
+                   AND COALESCE(kind, 'concept') != 'entity' \
                    AND embedding IS NOT NULL \
                  ORDER BY vector_distance_cos(embedding, vector32(?1)) ASC \
                  LIMIT ?2"
@@ -34528,6 +37039,7 @@ impl MemoryDB {
             .query(
                 "SELECT id FROM pages \
                  WHERE LOWER(title) = LOWER(?1) AND status = 'active' \
+                   AND COALESCE(kind, 'concept') != 'entity' \
                  LIMIT 1",
                 libsql::params![trimmed],
             )
@@ -34563,6 +37075,7 @@ impl MemoryDB {
             .query(
                 "SELECT id FROM pages
                  WHERE LOWER(title) = LOWER(?1) AND status = 'active'
+                   AND COALESCE(kind, 'concept') != 'entity'
                    AND space = COALESCE(?2, '00000000-0000-4000-8000-000000000001')
                  ORDER BY id ASC LIMIT 2",
                 libsql::params![trimmed, scope],
@@ -34907,7 +37420,7 @@ impl MemoryDB {
                               c.source_memory_ids, c.version, c.status, c.created_at, \
                               c.last_compiled, c.last_modified, \
                               COALESCE(c.sources_updated_count, 0), c.stale_reason, \
-                              COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations";
+                              COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
 
         // Optional page_type clause: pages store their category in `space`.
         // When Some("recap") is passed, only pages with space='recap' are returned.
@@ -34941,7 +37454,7 @@ impl MemoryDB {
                 while let Ok(Some(row)) = rows.next().await {
                     match Self::row_to_page(&row) {
                         Ok(page) => {
-                            let distance: f64 = row.get(20).unwrap_or(1.0);
+                            let distance: f64 = row.get(21).unwrap_or(1.0);
                             let id = page.id.clone();
                             vector_results.push((id, distance, page));
                         }
@@ -35041,8 +37554,15 @@ impl MemoryDB {
             *score = (*score / theoretical_max_rrf).min(1.0);
         }
 
-        // Sort by combined RRF score, attach to pages, return top limit
-        let mut final_results: Vec<Page> = concept_map.into_values().collect();
+        // Sort by combined RRF score, attach to pages, return top limit.
+        // Fence (M3 PR-1 stage f): `kind='entity'` dual-write shadow pages are
+        // write-only in PR-1 -- `search_pages` bypasses the shared
+        // `select_visible_pages` gate (it's a direct index search, not a
+        // context-assembly call), so it needs its own exclusion.
+        let mut final_results: Vec<Page> = concept_map
+            .into_values()
+            .filter(|p| p.kind != "entity")
+            .collect();
         final_results.sort_by(|a, b| {
             let sa = score_map.get(&a.id).unwrap_or(&0.0);
             let sb = score_map.get(&b.id).unwrap_or(&0.0);
@@ -35125,8 +37645,10 @@ impl MemoryDB {
     /// column 16 is COALESCE(creation_kind,'distilled'); column 17 is COALESCE(review_status,'confirmed');
     /// column 18 is workspace (P3 dedicated scope axis, may be NULL); column 19 is
     /// citations (JSON array of `wenlan_types::pages::PageCitation`, may be NULL —
-    /// NULL and unparseable both default to an empty Vec).
-    /// In ranking SELECTs (find_matching_page, search_pages vector branch), dist is at column 20.
+    /// NULL and unparseable both default to an empty Vec); column 20 is
+    /// COALESCE(kind,'concept') (migration 83 page-kind discriminator).
+    /// In ranking SELECTs (find_matching_page, search_pages vector branch), dist
+    /// moves to column 21 to make room for kind.
     pub(crate) fn row_to_page(row: &libsql::Row) -> Result<Page, WenlanError> {
         let source_ids_json: String = row.get::<String>(6).unwrap_or_else(|_| "[]".to_string());
         let source_memory_ids: Vec<String> =
@@ -35198,6 +37720,9 @@ impl MemoryDB {
                 .unwrap_or(None)
                 .filter(|s| s != UNFILED_SPACE_ID),
             citations,
+            kind: row
+                .get::<String>(20)
+                .unwrap_or_else(|_| "concept".to_string()),
         })
     }
 
@@ -35734,7 +38259,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id FROM pages WHERE status = 'active' AND citations IS NULL ORDER BY last_modified ASC LIMIT ?1",
+                "SELECT id FROM pages WHERE status = 'active' AND COALESCE(kind, 'concept') != 'entity' AND citations IS NULL ORDER BY last_modified ASC LIMIT ?1",
                 libsql::params![limit as i64],
             )
             .await
@@ -35778,12 +38303,12 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set_page_citations begin: {e}")))?;
         let exec = async {
+            Self::dual_write_page_citations(&conn, page_id, citations_json).await?;
             conn.execute(
                 "UPDATE pages SET citations = ?1 WHERE id = ?2",
                 libsql::params![citations_json, page_id],
             )
             .await?;
-            Self::dual_write_page_citations(&conn, page_id, citations_json).await?;
             Ok::<_, libsql::Error>(())
         }
         .await;
@@ -35820,12 +38345,12 @@ impl MemoryDB {
             WenlanError::VectorDb(format!("set_page_citations_with_changelog begin: {e}"))
         })?;
         let exec = async {
+            Self::dual_write_page_citations(&conn, page_id, citations_json).await?;
             conn.execute(
                 "UPDATE pages SET citations = ?1, changelog = ?2 WHERE id = ?3",
                 libsql::params![citations_json, changelog_json, page_id],
             )
             .await?;
-            Self::dual_write_page_citations(&conn, page_id, citations_json).await?;
             Ok::<_, libsql::Error>(())
         }
         .await;
@@ -36143,10 +38668,11 @@ impl MemoryDB {
                         c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
                         COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0),
                         COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'),
-                        c.workspace, c.citations
+                        c.workspace, c.citations, COALESCE(c.kind, 'concept')
                  FROM pages c
                  INNER JOIN page_sources cs ON c.id = cs.page_id
-                 WHERE cs.memory_source_id = ?1 AND c.status = 'active'",
+                 WHERE cs.memory_source_id = ?1 AND c.status = 'active'
+                   AND COALESCE(c.kind, 'concept') != 'entity'",
                 libsql::params![memory_source_id],
             )
             .await
@@ -36160,6 +38686,39 @@ impl MemoryDB {
             result.push(Self::row_to_page(&row)?);
         }
         Ok(result)
+    }
+
+    /// Whether `pages.citations` still backs a `cites` edge for
+    /// `(page_id, locator)` (memory-kind only -- `cleanup_orphaned_page_sources`
+    /// only ever prunes memory-backed rows). Checked before an orphan-cleanup
+    /// invalidate so a `page_sources`/`page_evidence` row pruned for a
+    /// since-deleted memory does not retract an edge `pages.citations` still
+    /// independently cites (D7 refcount, spec v3 M3).
+    async fn cites_backed_by_page_citations(
+        conn: &libsql::Connection,
+        page_id: &str,
+        locator: &str,
+    ) -> Result<bool, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pages p, json_each(
+                        CASE WHEN json_valid(p.citations) AND json_type(p.citations) = 'array'
+                             THEN p.citations ELSE '[]' END
+                    ) c
+                    WHERE p.id = ?1
+                      AND json_extract(c.value, '$.source_kind') = 'memory'
+                      AND json_extract(c.value, '$.locator') = ?2
+                 )",
+                libsql::params![page_id, locator],
+            )
+            .await?;
+        Ok(rows
+            .next()
+            .await?
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or(0)
+            != 0)
     }
 
     /// Remove unique orphaned memory locators from page_sources and the legacy
@@ -36274,9 +38833,24 @@ impl MemoryDB {
             // deletes above just orphaned. Both `page_sources` and
             // `page_evidence` dual-write onto the identical content-addressed
             // edge_id for the same (page, memory) pair, so one invalidation
-            // pass covers whichever store originally produced the edge.
+            // pass covers whichever store originally produced the edge --
+            // but ONLY when `pages.citations` (the third legacy store) does
+            // not independently still back the same (page, locator) pair
+            // (D7 refcount, spec v3 M3): pruning a since-deleted memory's
+            // provenance row here must not retract an edge that store still
+            // cites.
             for (page_id, removed_locators) in &affected_pages {
                 for locator in removed_locators {
+                    if Self::cites_backed_by_page_citations(&conn, page_id, locator)
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "cleanup_orphaned_page_sources citations check: {e}"
+                            ))
+                        })?
+                    {
+                        continue;
+                    }
                     let edge_id = crate::provenance::compute_edge_id(
                         "cites", "page", page_id, "memory", locator, locator,
                     );
@@ -36991,7 +39565,8 @@ impl MemoryDB {
         let mut sql = String::from(
             "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
              FROM pages
-             WHERE stale_reason = ? AND status = 'active'",
+             WHERE stale_reason = ? AND status = 'active'
+               AND COALESCE(kind, 'concept') != 'entity'",
         );
         let mut bind = vec![libsql::Value::Text(reason.to_string())];
         if let Some(cursor) = cursor {
@@ -37026,8 +39601,8 @@ impl MemoryDB {
     ) -> Result<Vec<crate::pages::Page>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut sql = String::from(
-            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations \
-             FROM pages WHERE stale_reason = ?1 AND status = 'active'",
+            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept') \
+             FROM pages WHERE stale_reason = ?1 AND status = 'active' AND COALESCE(kind, 'concept') != 'entity'",
         );
         let mut bind: Vec<libsql::Value> = vec![libsql::Value::Text(reason.to_string())];
         if let Some(eid) = entity_id_filter {
@@ -37062,9 +39637,10 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
                  FROM pages
                  WHERE status = 'archived'
+                   AND COALESCE(kind, 'concept') != 'entity'
                    AND entity_id IS NULL
                    AND space = '00000000-0000-4000-8000-000000000001'
                    AND COALESCE(user_edited, 0) = 0
@@ -39006,10 +41582,10 @@ impl MemoryDB {
                 ],
             ),
             ReadScope::Uncategorized => (
-                "AND anchor.space IS NULL",
-                "AND current.space IS NULL",
-                "AND predecessor.space IS NULL",
-                "AND memory.space IS NULL",
+                "AND (anchor.space IS NULL OR anchor.space = '00000000-0000-4000-8000-000000000001')",
+                "AND (current.space IS NULL OR current.space = '00000000-0000-4000-8000-000000000001')",
+                "AND (predecessor.space IS NULL OR predecessor.space = '00000000-0000-4000-8000-000000000001')",
+                "AND (memory.space IS NULL OR memory.space = '00000000-0000-4000-8000-000000000001')",
                 vec![
                     libsql::Value::Text(source_id.to_string()),
                     libsql::Value::Integer(MAX_DEPTH),
@@ -39652,12 +42228,12 @@ pub(crate) mod tests {
                 // empty) and walk the env + shared-host candidates.
                 let mut opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
                     .with_show_download_progress(false);
-                if let Some(cache) =
-                    resolve_fastembed_cache_dir(std::path::Path::new(".nonexistent"))
-                {
-                    opts = opts.with_cache_dir(cache);
+                let cache_dir =
+                    resolve_fastembed_cache_dir(std::path::Path::new(".nonexistent"));
+                if let Some(cache) = &cache_dir {
+                    opts = opts.with_cache_dir(cache.clone());
                 }
-                let emb = TextEmbedding::try_new(opts).expect(
+                let emb = init_text_embedding(opts).expect(
                     "failed to init embedder for tests (set WENLAN_TEST_FASTEMBED_CACHE or run the daemon once to populate the shared cache)",
                 );
                 Arc::new(std::sync::Mutex::new(emb))
@@ -40300,6 +42876,7 @@ pub(crate) mod tests {
             review_status: "confirmed".to_string(),
             workspace: workspace.map(|w| w.to_string()),
             citations: Vec::new(),
+            kind: "concept".to_string(),
         }
     }
 
@@ -44102,6 +46679,103 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(!id.is_empty());
+    }
+
+    // ==================== Knowledge Graph: resolve_or_create_entity ====================
+    // M3 PR-1 stage (d): the canonical resolve-then-write cascade both
+    // `post_write::create_entity` and `importer::resolve_entity_bulk`
+    // delegate to (spec's "one canonical entity-upsert service" gate).
+
+    #[tokio::test]
+    async fn resolve_or_create_entity_creates_new_when_no_match() {
+        let (db, _dir) = test_db().await;
+        let (id, created) = db
+            .resolve_or_create_entity("Rust", "language", None, Some("test"), None)
+            .await
+            .unwrap();
+        assert!(created, "no existing entity -- must create");
+        let detail = db.get_entity_detail(&id).await.unwrap();
+        assert_eq!(detail.entity.name, "Rust");
+    }
+
+    #[tokio::test]
+    async fn resolve_or_create_entity_resolves_existing_by_exact_name() {
+        let (db, _dir) = test_db().await;
+        let existing_id = db
+            .store_entity("Rust", "language", None, None, None)
+            .await
+            .unwrap();
+
+        let (id, created) = db
+            .resolve_or_create_entity("Rust", "language", None, Some("test"), None)
+            .await
+            .unwrap();
+
+        assert!(!created, "exact-name match must resolve, not create");
+        assert_eq!(id, existing_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_or_create_entity_resolves_existing_by_alias() {
+        let (db, _dir) = test_db().await;
+        let existing_id = db
+            .store_entity("Rust Language", "language", None, None, None)
+            .await
+            .unwrap();
+        db.add_entity_alias("rustlang", &existing_id, "manual")
+            .await
+            .unwrap();
+
+        let (id, created) = db
+            .resolve_or_create_entity("rustlang", "language", None, Some("test"), None)
+            .await
+            .unwrap();
+
+        assert!(!created, "alias match must resolve, not create");
+        assert_eq!(id, existing_id);
+    }
+
+    /// Differential oracle (discipline floor): both real callers must mint
+    /// the SAME entity id for the SAME input now that they share one
+    /// resolve-then-write core -- the exact divergence risk the goal prompt
+    /// flags ("kept hand-in-sync by comment") that a shared function removes
+    /// by construction instead of by discipline.
+    #[tokio::test]
+    async fn resolve_or_create_entity_agrees_across_both_real_callers() {
+        let (db, _dir) = test_db().await;
+
+        // Caller A: post_write::create_entity (agent/MCP/HTTP path).
+        let req = wenlan_types::requests::CreateEntityRequest {
+            name: "Convergence Test Entity".to_string(),
+            entity_type: "concept".to_string(),
+            space: None,
+            source_agent: Some("test".to_string()),
+            confidence: None,
+        };
+        let result_a = crate::post_write::create_entity(&db, req, "test-agent")
+            .await
+            .unwrap();
+
+        // Caller B: importer::resolve_entity_bulk (bulk-import path) resolving
+        // the SAME name -- must land on caller A's id, not mint a second one.
+        let extracted = crate::extract::ExtractedEntity {
+            name: "Convergence Test Entity".to_string(),
+            entity_type: "concept".to_string(),
+        };
+        let mut cache = std::collections::HashMap::new();
+        let (id_b, created_b) =
+            crate::importer::resolve_entity_bulk(&db, &mut cache, &extracted, "test-import")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result_a.id, id_b,
+            "both callers must converge on one entity id"
+        );
+        assert!(
+            !created_b,
+            "second caller must resolve, not mint a duplicate"
+        );
     }
 
     // ==================== Knowledge Graph: add_observation ====================
@@ -50823,7 +53497,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let memory = memory_rows.next().await.unwrap().unwrap();
-        assert_eq!(memory.get::<Option<String>>(0).unwrap(), None);
+        // memories.space is NOT NULL since migration 91: unassign folds to the sentinel.
+        assert_eq!(
+            memory.get::<Option<String>>(0).unwrap(),
+            Some(UNFILED_SPACE_ID.to_string())
+        );
         assert_eq!(memory.get::<i64>(1).unwrap(), 2);
         drop(memory_rows);
 
@@ -50953,6 +53631,108 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn delete_space_unassign_folds_memories_to_sentinel_not_null() {
+        // Regression (M3 PR-1 stage e straggler): memories.space is NOT NULL
+        // since migration 91, so `UPDATE memories SET space = NULL` on unassign
+        // would fail the constraint. Unassign must fold to the reserved
+        // sentinel, and the operation must succeed.
+        let (db, _dir) = test_db().await;
+        db.create_space("old", None, false).await.unwrap();
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_unassign",
+            "a fact filed under old",
+            "fact",
+            "old",
+            "claude-code",
+        )])
+        .await
+        .unwrap();
+
+        db.delete_space("old", "unassign")
+            .await
+            .expect("unassign must not fail the memories.space NOT NULL constraint");
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT space FROM memories WHERE source_id = 'mem_unassign' AND source = 'memory'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("memory row must survive");
+        let space: String = row.get(0).unwrap();
+        assert_eq!(
+            space, UNFILED_SPACE_ID,
+            "unassigned memory must carry the sentinel, never NULL"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_space_unassign_folds_entity_shadow_space_to_sentinel() {
+        // rework2 ITEM 2 (M3 PR-1): unassign clears entities.space to NULL
+        // (entities never fold), but the mapped kind='entity' shadow's NOT NULL
+        // space/workspace must fold to the sentinel -- not keep the deleted
+        // space name -- matching insert_entity_shadow_page's fold rule.
+        let (db, _dir) = test_db().await;
+        db.create_space("old", None, false).await.unwrap();
+        let id = db
+            .store_entity(
+                "Katherine Johnson",
+                "person",
+                Some("old"),
+                Some("test"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        db.delete_space("old", "unassign").await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let entity_space_null: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT space IS NULL FROM entities WHERE id = ?1",
+                    libsql::params![id.clone()],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            entity_space_null, 1,
+            "entities.space must be NULL after unassign (entities never fold)"
+        );
+
+        let (space, workspace): (String, String) = {
+            let mut rows = conn
+                .query(
+                    "SELECT p.space, p.workspace FROM pages p \
+                     JOIN entity_page_map m ON m.page_id = p.id \
+                     WHERE m.entity_id = ?1 AND p.kind = 'entity'",
+                    libsql::params![id],
+                )
+                .await
+                .unwrap();
+            let row = rows
+                .next()
+                .await
+                .unwrap()
+                .expect("shadow page must survive unassign");
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        };
+        assert_eq!(
+            space, UNFILED_SPACE_ID,
+            "shadow space must fold to the sentinel, not keep the deleted space name"
+        );
+        assert_eq!(
+            workspace, UNFILED_SPACE_ID,
+            "shadow workspace must fold to the sentinel"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_space_delete_invalidates_all_page_locator_forms_once() {
         let (db, _dir) = test_db().await;
         db.create_space("doomed", None, false).await.unwrap();
@@ -50978,6 +53758,90 @@ pub(crate) mod tests {
             .unwrap()
             .is_empty());
         assert_pages_invalidated_once(&db, &pages, "source_removed").await;
+    }
+
+    #[tokio::test]
+    async fn delete_space_delete_removes_entity_shadow_pages() {
+        // rework2 ITEM 3 (M3 PR-1): delete_space("delete") cascades the entities
+        // (and their entity_page_map rows) away, but must ALSO delete the mapped
+        // kind='entity' shadow pages -- mirroring delete_entity -- so none is
+        // left orphaned when the entities go.
+        let (db, _dir) = test_db().await;
+        db.create_space("doomed", None, false).await.unwrap();
+        let id = db
+            .store_entity("Doomed Dan", "person", Some("doomed"), Some("test"), None)
+            .await
+            .unwrap();
+        let page_id: String = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
+                    libsql::params![id.clone()],
+                )
+                .await
+                .unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .expect("shadow must exist before delete")
+                .get(0)
+                .unwrap()
+        };
+
+        db.delete_space("doomed", "delete").await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let entity_count: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                    libsql::params![id.clone()],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        let map_count: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
+                    libsql::params![id.clone()],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        // The self-alias store_entity created must be gone too -- its FK to
+        // entities(id) has no ON DELETE CASCADE, so leaving it would have
+        // FK-failed the whole delete.
+        let alias_count: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entity_aliases WHERE canonical_entity_id = ?1",
+                    libsql::params![id],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        let page_count: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM pages WHERE id = ?1",
+                    libsql::params![page_id],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(entity_count, 0, "entity must be deleted");
+        assert_eq!(map_count, 0, "entity_page_map row must be gone");
+        assert_eq!(alias_count, 0, "the entity's aliases must be deleted");
+        assert_eq!(
+            page_count, 0,
+            "the shadow page must be deleted, not orphaned"
+        );
     }
 
     #[tokio::test]
@@ -64516,6 +67380,7 @@ pub(crate) mod tests {
             review_status: "confirmed".to_string(),
             workspace: None,
             citations: Vec::new(),
+            kind: "concept".to_string(),
         };
         let r = MemoryDB::search_result_from_page(page);
         assert_eq!(r.source, "page");
@@ -70521,6 +73386,29 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn entity_page_reconcile_enabled_is_explicit_opt_in() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !entity_page_reconcile_enabled_value(value),
+                "{value:?} must not enable an unbounded full-store background scan"
+            );
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), Some(" TRUE ")] {
+            assert!(
+                entity_page_reconcile_enabled_value(value),
+                "{value:?} must enable"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn migration_68_adds_citations_column_null_for_legacy() {
         let (db, _dir) = test_db().await;
@@ -72540,6 +75428,2625 @@ pub(crate) mod tests {
         assert_eq!(uv as u32, crate::db::SCHEMA_VERSION);
     }
 
+    async fn rerun_migration_89(db: &MemoryDB) {
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("PRAGMA user_version = 88", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("migration 89 re-fires");
+    }
+
+    #[tokio::test]
+    async fn migration_89_adds_kind_column_not_null_check_constrained() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let sql: String = {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='pages'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert!(
+            sql.contains(
+                "kind TEXT NOT NULL DEFAULT 'concept' CHECK(kind IN ('entity','concept','source','overview','authored'))"
+            ),
+            "pages DDL must declare kind NOT NULL DEFAULT 'concept' CHECK-constrained: {sql}"
+        );
+
+        // CHECK is real, not just textually present.
+        let bogus = conn
+            .execute(
+                "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, kind) \
+                 VALUES ('page_bogus', 'title', 'content', '2024-01-01T00:00:00Z', \
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'bogus')",
+                (),
+            )
+            .await;
+        assert!(
+            bogus.is_err(),
+            "kind CHECK must reject an out-of-enum value"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_89_creates_kind_index() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_pages_kind'",
+                (),
+            )
+            .await
+            .unwrap();
+        let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(present, 1, "idx_pages_kind must exist after migration 89");
+    }
+
+    #[tokio::test]
+    async fn migration_89_kind_backfill_classifies_by_creation_kind_and_overview_title() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            for (id, creation_kind, title) in [
+                ("page_authored", "authored", "An authored page"),
+                ("page_imported", "imported", "An imported page"),
+                ("page_distilled", "distilled", "A distilled page"),
+                ("page_research", "research", "A research page"),
+            ] {
+                conn.execute(
+                    "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, creation_kind) \
+                     VALUES (?1, ?2, 'content', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', \
+                             '2024-01-01T00:00:00Z', ?3)",
+                    libsql::params![id, title, creation_kind],
+                )
+                .await
+                .unwrap();
+            }
+            // Overview singleton: creation_kind='research', indistinguishable
+            // from `page_research` above by creation_kind alone -- only the
+            // title special case can tell them apart.
+            conn.execute(
+                "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, creation_kind) \
+                 VALUES ('page_overview', 'Overview', 'content', '2024-01-01T00:00:00Z', \
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'research')",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        // Every row above already sits at kind='concept' (the ALTER TABLE
+        // DEFAULT). Re-firing the migration proves the backfill -- not just
+        // the DEFAULT -- produced the honest per-row classification, and
+        // exercises the crash-resume path (ALTER TABLE skipped via the
+        // has_col guard, ledger/backfill/assert re-run cleanly).
+        rerun_migration_89(&db).await;
+
+        let conn = db.conn.lock().await;
+        for (id, expected_kind) in [
+            ("page_authored", "authored"),
+            ("page_imported", "source"),
+            ("page_distilled", "concept"),
+            ("page_research", "concept"),
+            ("page_overview", "overview"),
+        ] {
+            let mut rows = conn
+                .query("SELECT kind FROM pages WHERE id = ?1", libsql::params![id])
+                .await
+                .unwrap();
+            let kind: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(
+                kind, expected_kind,
+                "{id} must backfill to kind={expected_kind}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_89_kind_fold_ledger_records_assignment_rule() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, creation_kind) \
+                 VALUES ('page_overview', 'Overview', 'content', '2024-01-01T00:00:00Z', \
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'research')",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        rerun_migration_89(&db).await;
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT prior_creation_kind, assigned_kind, rule \
+                 FROM page_kind_fold_ledger WHERE page_id = 'page_overview'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let prior_creation_kind: String = row.get(0).unwrap();
+        let assigned_kind: String = row.get(1).unwrap();
+        let rule: String = row.get(2).unwrap();
+        assert_eq!(prior_creation_kind, "research");
+        assert_eq!(assigned_kind, "overview");
+        assert_eq!(
+            rule, "overview_title",
+            "title special case must win over creation_kind='research'"
+        );
+    }
+
+    async fn insert_test_page(conn: &libsql::Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified) \
+             VALUES (?1, 'Test Page', 'content', '2024-01-01T00:00:00Z', \
+                     '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            libsql::params![id],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_90_creates_entity_page_map_table() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let sql: String = {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_page_map'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert!(sql.contains("entity_id"), "must carry entity_id: {sql}");
+        assert!(sql.contains("page_id"), "must carry page_id: {sql}");
+        assert!(sql.contains("UNIQUE"), "page_id must be UNIQUE: {sql}");
+    }
+
+    #[tokio::test]
+    async fn migration_90_entity_page_map_enforces_unique_entity_and_page() {
+        let (db, _dir) = test_db().await;
+        let e1 = db.create_entity("Alice", "person", None).await.unwrap();
+        let e2 = db.create_entity("Bob", "person", None).await.unwrap();
+        let conn = db.conn.lock().await;
+        insert_test_page(&conn, "page_1").await;
+        insert_test_page(&conn, "page_2").await;
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
+            libsql::params![e1.clone()],
+        )
+        .await
+        .unwrap();
+
+        // Same entity_id, different page_id -> UNIQUE(entity_id) violation.
+        let dup_entity = conn
+            .execute(
+                "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_2', '2024-01-01T00:00:00Z')",
+                libsql::params![e1],
+            )
+            .await;
+        assert!(dup_entity.is_err(), "duplicate entity_id must be rejected");
+
+        // Different entity_id, same page_id -> UNIQUE(page_id) violation.
+        let dup_page = conn
+            .execute(
+                "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
+                libsql::params![e2],
+            )
+            .await;
+        assert!(dup_page.is_err(), "duplicate page_id must be rejected");
+    }
+
+    #[tokio::test]
+    async fn migration_90_entity_page_map_cascades_on_entity_delete() {
+        let (db, _dir) = test_db().await;
+        let e1 = db.create_entity("Alice", "person", None).await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            insert_test_page(&conn, "page_1").await;
+            conn.execute(
+                "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
+                libsql::params![e1.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        db.delete_entity(&e1).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let remaining: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
+                    libsql::params![e1],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(remaining, 0, "map row must cascade away with its entity");
+    }
+
+    #[tokio::test]
+    async fn migration_90_entity_page_map_cascades_on_page_delete() {
+        let (db, _dir) = test_db().await;
+        let e1 = db.create_entity("Alice", "person", None).await.unwrap();
+        let conn = db.conn.lock().await;
+        insert_test_page(&conn, "page_1").await;
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
+            libsql::params![e1.clone()],
+        )
+        .await
+        .unwrap();
+
+        conn.execute("DELETE FROM pages WHERE id = 'page_1'", ())
+            .await
+            .unwrap();
+
+        let remaining: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
+                    libsql::params![e1],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(remaining, 0, "map row must cascade away with its page");
+    }
+
+    // -- M3 PR-1 migration 91: memories.space unfiled fold --
+
+    /// Test-only inverse of migration 91's writable_schema NOT NULL patch --
+    /// restores `memories.space` to nullable so a test can seed pre-fold
+    /// data. Mirrors `relax_pages_scope_columns_to_nullable`.
+    async fn relax_memories_space_to_nullable(conn: &libsql::Connection) {
+        let sql: String = {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        let patched = sql.replacen(
+            &format!("space TEXT NOT NULL DEFAULT '{UNFILED_SPACE_ID}',"),
+            "space TEXT,",
+            1,
+        );
+        assert_ne!(
+            patched, sql,
+            "expected memories.space to already be NOT NULL before relaxing"
+        );
+        conn.execute("PRAGMA writable_schema=ON", ()).await.unwrap();
+        conn.execute(
+            "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='memories'",
+            libsql::params![patched],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA writable_schema=RESET", ())
+            .await
+            .unwrap();
+    }
+
+    /// Minimal raw memory insert for migration-91 tests: supplies every NOT
+    /// NULL column without a DEFAULT and leaves `space` to the caller.
+    /// Caller must have relaxed the schema to nullable first if `space` is
+    /// `None`.
+    async fn insert_raw_memory_for_m91_test(
+        conn: &libsql::Connection,
+        id: &str,
+        source_id: &str,
+        space: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                                    last_modified, chunk_type, space) \
+             VALUES (?1, 'content', 'memory', ?2, 'title', 0, 1712707200, 'text', ?3)",
+            libsql::params![id, source_id, space],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_91_backfills_null_space_to_unfiled() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            relax_memories_space_to_nullable(&conn).await;
+            insert_raw_memory_for_m91_test(&conn, "mem_null_space", "src_null", None).await;
+            conn.execute("PRAGMA user_version = 90", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query("SELECT space FROM memories WHERE id = 'mem_null_space'", ())
+            .await
+            .unwrap();
+        let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(space, UNFILED_SPACE_ID);
+    }
+
+    #[tokio::test]
+    async fn migration_91_not_null_constraint_rejects_null_space_insert() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let result = conn
+            .execute(
+                "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                                        last_modified, chunk_type, space) \
+                 VALUES ('mem_reject', 'c', 'memory', 'src_reject', 't', 0, 1712707200, 'text', NULL)",
+                (),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "inserting a NULL space must be rejected once migration 91 has run"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_91_raw_insert_omitting_space_lands_unfiled() {
+        // Proves the DEFAULT half of the fix: a raw INSERT that omits
+        // `space` entirely (exactly what `store_raw_import_memory` /
+        // `store_raw_import_memories_batch` do) must land 'unfiled' rather
+        // than tripping the NOT NULL constraint -- the companion
+        // `migration_91_not_null_constraint_rejects_null_space_insert` proves
+        // an EXPLICIT NULL bind is still rejected, since a column DEFAULT
+        // only fires when the column is omitted.
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                                    last_modified, chunk_type) \
+             VALUES ('mem_omitted', 'c', 'memory', 'src_omitted', 't', 0, 1712707200, 'text')",
+            (),
+        )
+        .await
+        .expect("omitting space must fall back to the column DEFAULT, not error");
+
+        let mut rows = conn
+            .query("SELECT space FROM memories WHERE id = 'mem_omitted'", ())
+            .await
+            .unwrap();
+        let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(space, UNFILED_SPACE_ID);
+    }
+
+    #[tokio::test]
+    async fn migration_91_rebuilds_index_without_partial_predicate() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let sql: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(
+            !sql.contains("WHERE"),
+            "idx_memories_space must drop its now-vacuous partial predicate: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_91_assertion_detects_unresolved_space() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        relax_memories_space_to_nullable(&conn).await;
+        insert_raw_memory_for_m91_test(&conn, "mem_unresolved", "src_unresolved", None).await;
+
+        let result = MemoryDB::assert_memories_space_backfilled(&conn).await;
+        let err = result.expect_err("assertion must detect the NULL survivor");
+        assert!(
+            err.to_string().contains("m91"),
+            "error should identify migration 91: {err}"
+        );
+    }
+
+    // -- M3 PR-1 migration 92: entity shadow-page dual-write --
+
+    async fn rerun_migration_92(db: &MemoryDB) {
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("PRAGMA user_version = 91", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("migration 92 re-fires");
+    }
+
+    /// Raw pre-92-style entity insert -- bypasses `store_entity`'s dual-write
+    /// entirely, simulating an entity that existed before this migration so
+    /// the backfill loop has something to do.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_raw_entity_for_m92_test(
+        conn: &libsql::Connection,
+        id: &str,
+        name: &str,
+        entity_type: &str,
+        space: Option<&str>,
+        confidence: Option<f64>,
+        confirmed: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, space, confidence, confirmed, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch(), unixepoch())",
+            libsql::params![id, name, entity_type, space, confidence, confirmed],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_92_adds_pages_entity_columns() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        for col in ["entity_type", "confidence", "entity_confirmed"] {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = ?1",
+                    libsql::params![col],
+                )
+                .await
+                .unwrap();
+            let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(present, 1, "pages.{col} must exist after migration 92");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_92_widens_creation_kind_check_to_admit_entity() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let result = conn
+            .execute(
+                "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, creation_kind) \
+                 VALUES ('page_entity_check', 'Entity Check', '', '2024-01-01T00:00:00Z', \
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'entity')",
+                (),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "creation_kind='entity' must be admitted after migration 92: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_92_creates_entity_page_migration_state_backfilled() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT stage FROM entity_page_migration_state WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        let stage: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(stage, "backfilled");
+    }
+
+    #[tokio::test]
+    async fn migration_92_backfills_preexisting_entities_into_shadow_pages() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            insert_raw_entity_for_m92_test(
+                &conn,
+                "e_pre1",
+                "Pre-existing Alice",
+                "person",
+                Some("work"),
+                Some(0.9),
+                1,
+            )
+            .await;
+            insert_raw_entity_for_m92_test(
+                &conn,
+                "e_pre2",
+                "Pre-existing Bob",
+                "person",
+                None,
+                None,
+                0,
+            )
+            .await;
+        }
+        rerun_migration_92(&db).await;
+
+        let conn = db.conn.lock().await;
+        for (eid, expect_space, expect_confirmed) in
+            [("e_pre1", "work", 1i64), ("e_pre2", UNFILED_SPACE_ID, 0i64)]
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
+                    libsql::params![eid],
+                )
+                .await
+                .unwrap();
+            let page_id: String = rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{eid} must have an entity_page_map row"))
+                .get(0)
+                .unwrap();
+
+            let mut prows = conn
+                .query(
+                    "SELECT kind, entity_type, space, workspace, content, creation_kind, \
+                            review_status, entity_confirmed \
+                     FROM pages WHERE id = ?1",
+                    libsql::params![page_id],
+                )
+                .await
+                .unwrap();
+            let row = prows.next().await.unwrap().expect("shadow page must exist");
+            let kind: String = row.get(0).unwrap();
+            let entity_type: String = row.get(1).unwrap();
+            let space: String = row.get(2).unwrap();
+            let workspace: String = row.get(3).unwrap();
+            let content: String = row.get(4).unwrap();
+            let creation_kind: String = row.get(5).unwrap();
+            let review_status: String = row.get(6).unwrap();
+            let entity_confirmed: i64 = row.get(7).unwrap();
+            assert_eq!(kind, "entity");
+            assert_eq!(entity_type, "person");
+            assert_eq!(
+                space, expect_space,
+                "{eid} shadow page space must mirror the entity (NULL folds to unfiled)"
+            );
+            assert_eq!(
+                workspace, expect_space,
+                "M1 mirror invariant: workspace must equal space"
+            );
+            assert_eq!(content, "");
+            assert_eq!(creation_kind, "entity");
+            assert_eq!(review_status, "unconfirmed");
+            assert_eq!(entity_confirmed, expect_confirmed);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_92_backfill_report_records_created_count() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            insert_raw_entity_for_m92_test(&conn, "e_r1", "Report Alice", "person", None, None, 0)
+                .await;
+            insert_raw_entity_for_m92_test(&conn, "e_r2", "Report Bob", "person", None, None, 0)
+                .await;
+        }
+        rerun_migration_92(&db).await;
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT report_json FROM entity_page_migration_state WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        let report_json: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&report_json).unwrap();
+        assert_eq!(report["shadow_pages_created"].as_i64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn migration_92_assertion_detects_entity_missing_shadow_page() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        insert_raw_entity_for_m92_test(&conn, "e_orphan", "Orphan Dave", "person", None, None, 0)
+            .await;
+
+        let result = MemoryDB::assert_entities_have_shadow_pages(&conn).await;
+        let err = result.expect_err("assertion must detect the entity with no shadow page");
+        assert!(
+            err.to_string().contains("m92"),
+            "error should identify migration 92: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_92_resume_reads_stored_cursor_and_skips_below_range() {
+        // Resume teeth (M3 PR-1 stage e): a restart must READ the durable
+        // cursor and treat every entity at/below it as already processed,
+        // fetching only the un-committed tail. Proven by leaving an UNMAPPED
+        // entity below a seeded cursor: with cursor-resume that entity is never
+        // fetched, stays unmapped, and the Step-4 completeness assertion fails
+        // loud; a from-scratch (i64::MIN) rescan would instead pick it up and
+        // let the migration wrongly succeed. The tail entity above the cursor
+        // is backfilled either way. (Integration of resume + the
+        // `assert_entities_have_shadow_pages` guard.)
+        let (db, _dir) = test_db().await;
+        let (r_below, r_tail) = {
+            let conn = db.conn.lock().await;
+            insert_raw_entity_for_m92_test(
+                &conn,
+                "e_below",
+                "Below Cursor",
+                "person",
+                None,
+                None,
+                0,
+            )
+            .await;
+            insert_raw_entity_for_m92_test(&conn, "e_tail", "Tail", "person", None, None, 0).await;
+            // Both entities must be unmapped so the backfill has real work and
+            // the completeness assertion has teeth: clear any shadow pages the
+            // initial test_db migration minted, plus the map.
+            conn.execute("DELETE FROM entity_page_map", ())
+                .await
+                .unwrap();
+            conn.execute("DELETE FROM pages WHERE kind = 'entity'", ())
+                .await
+                .unwrap();
+            let mut rows = conn
+                .query("SELECT id, rowid FROM entities", ())
+                .await
+                .unwrap();
+            let (mut below, mut tail) = (0i64, 0i64);
+            while let Some(row) = rows.next().await.unwrap() {
+                let id: String = row.get(0).unwrap();
+                let rid: i64 = row.get(1).unwrap();
+                match id.as_str() {
+                    "e_below" => below = rid,
+                    "e_tail" => tail = rid,
+                    _ => {}
+                }
+            }
+            (below, tail)
+        };
+        assert!(
+            r_below < r_tail,
+            "insertion order must give e_below the lower rowid"
+        );
+
+        // Seed a mid-range cursor at e_below's rowid: `WHERE rowid > ?1` then
+        // excludes e_below and includes e_tail.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE entity_page_migration_state SET stage = 'backfilling', cursor = ?1 WHERE id = 1",
+                libsql::params![r_below.to_string()],
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 91", ()).await.unwrap();
+        }
+
+        let result = db.run_migrations(&crate::events::NoopEmitter).await;
+        assert!(
+            result.is_err(),
+            "resume must honor the stored cursor: e_below sits at/under it and is never \
+             re-fetched, so the completeness assertion must fail -- a from-scratch rescan \
+             would wrongly map it and let the migration succeed"
+        );
+
+        let conn = db.conn.lock().await;
+        let mapped = |entity_id: &'static str| {
+            let conn = &conn;
+            async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
+                        libsql::params![entity_id],
+                    )
+                    .await
+                    .unwrap();
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+            }
+        };
+        assert_eq!(
+            mapped("e_tail").await,
+            1,
+            "the tail entity above the cursor must be backfilled"
+        );
+        assert_eq!(
+            mapped("e_below").await,
+            0,
+            "the entity at/below the stored cursor must be skipped by resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_before_migration_publishes_a_valid_restore_point() {
+        // M3 PR-1 (ITEM 4): a pre-migration backup at `dest` must only ever be a
+        // real, integrity-clean snapshot -- never arbitrary bytes a crashed prior
+        // attempt left behind. `online_backup` stages the copy into `<dest>.tmp`
+        // and publishes it with a single atomic rename, only after the staged copy
+        // passes integrity_check. Two teeth:
+        //   (a) a stale `.tmp` from a crash is discarded (not renamed onto `dest`
+        //       as if valid), and a fresh verified snapshot is published; and
+        //   (b) once a valid `dest` exists, a retried migration skips re-snapshot
+        //       and preserves it byte-for-byte.
+        let (db, dir) = test_db().await;
+        let dest = dir.path().join("pre_migration_92_backup.db");
+        let tmp = {
+            let mut s = dest.clone().into_os_string();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        // A crashed prior attempt's partial staging file -- must be discarded, and
+        // never renamed onto `dest` as if it were a valid backup.
+        std::fs::write(&tmp, b"CRASHED partial staging -- must be discarded").unwrap();
+
+        // (a) direct backup: stale staging discarded, fresh snapshot published.
+        let receipt = db.online_backup(&dest).await.unwrap();
+        assert!(
+            receipt.integrity_ok,
+            "the published snapshot must pass integrity_check"
+        );
+        assert!(
+            !tmp.exists(),
+            "the staging file must be consumed by the atomic rename, not left behind"
+        );
+        {
+            // `dest` is a real, integrity-clean database -- not the planted garbage.
+            let backup = libsql::Builder::new_local(dest.to_string_lossy().to_string())
+                .build()
+                .await
+                .unwrap();
+            let bconn = backup.connect().unwrap();
+            let mut rows = bconn.query("PRAGMA integrity_check", ()).await.unwrap();
+            let integ: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(integ, "ok", "the published dest must open as a valid db");
+        }
+
+        // (b) a retried migration must NOT re-snapshot over the now-valid restore
+        // point -- `backup_before_migration` skips when `dest` already exists.
+        let before = std::fs::read(&dest).unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("PRAGMA user_version = 91", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("migration 92 re-fires");
+        let after = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            before, after,
+            "an existing valid pre-migration backup must be preserved across a retry, not re-snapshotted"
+        );
+    }
+
+    // -- M3 PR-1 stage f: store_entity dual-write + fence coverage --
+
+    #[tokio::test]
+    async fn store_entity_dual_writes_shadow_page() {
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity(
+                "Ada Lovelace",
+                "person",
+                Some("work"),
+                Some("test"),
+                Some(0.75),
+            )
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params![id.clone()],
+            )
+            .await
+            .unwrap();
+        let page_id: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("shadow page must be mapped")
+            .get(0)
+            .unwrap();
+
+        let mut prows = conn
+            .query(
+                "SELECT title, kind, entity_type, confidence, entity_confirmed, space, workspace, \
+                        content, creation_kind, review_status, source_memory_ids \
+                 FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .unwrap();
+        let row = prows
+            .next()
+            .await
+            .unwrap()
+            .expect("shadow page row must exist");
+        let title: String = row.get(0).unwrap();
+        let kind: String = row.get(1).unwrap();
+        let entity_type: String = row.get(2).unwrap();
+        let confidence: f64 = row.get(3).unwrap();
+        let entity_confirmed: i64 = row.get(4).unwrap();
+        let space: String = row.get(5).unwrap();
+        let workspace: String = row.get(6).unwrap();
+        let content: String = row.get(7).unwrap();
+        let creation_kind: String = row.get(8).unwrap();
+        let review_status: String = row.get(9).unwrap();
+        let source_memory_ids: String = row.get(10).unwrap();
+
+        assert_eq!(title, "Ada Lovelace");
+        assert_eq!(kind, "entity");
+        assert_eq!(entity_type, "person");
+        assert!((confidence - 0.75).abs() < 1e-6);
+        assert_eq!(entity_confirmed, 0, "freshly created entity is unconfirmed");
+        assert_eq!(space, "work");
+        assert_eq!(workspace, "work");
+        assert_eq!(content, "");
+        assert_eq!(creation_kind, "entity");
+        assert_eq!(review_status, "unconfirmed");
+        assert_eq!(source_memory_ids, "[]");
+    }
+
+    #[tokio::test]
+    async fn store_entity_dual_write_folds_null_space_to_unfiled() {
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity("No Space Bob", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT p.space, p.workspace FROM pages p \
+                 JOIN entity_page_map m ON m.page_id = p.id \
+                 WHERE m.entity_id = ?1",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let space: String = row.get(0).unwrap();
+        let workspace: String = row.get(1).unwrap();
+        assert_eq!(space, UNFILED_SPACE_ID);
+        assert_eq!(workspace, UNFILED_SPACE_ID);
+    }
+
+    #[tokio::test]
+    async fn null_entity_embed_recovery_mirrors_shadow_embedding() {
+        // rework2 ITEM 1 (M3 PR-1): the startup crash-recovery pass re-embeds
+        // entities whose embedding is NULL. It must ALSO re-embed the mapped
+        // kind='entity' shadow page in the same batch tx -- otherwise every
+        // boot that recovers an entity embedding leaves its shadow's embedding
+        // stale/NULL, drifting the dual-write.
+        let (db, _dir) = test_db().await;
+        let id = db
+            .store_entity("Grace Hopper", "person", Some("work"), Some("test"), None)
+            .await
+            .unwrap();
+
+        // Drive both the entity and its shadow to a NULL embedding, as a crash
+        // mid re-embed would leave them, and capture the shadow's page id.
+        let page_id: String = {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE entities SET embedding = NULL WHERE id = ?1",
+                libsql::params![id.clone()],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
+                    libsql::params![id.clone()],
+                )
+                .await
+                .unwrap();
+            let pid: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            conn.execute(
+                "UPDATE pages SET embedding = NULL WHERE id = ?1",
+                libsql::params![pid.clone()],
+            )
+            .await
+            .unwrap();
+            pid
+        };
+
+        // Re-run migrations: the unconditional entity crash-recovery pass fires
+        // because an entity now has a NULL embedding.
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("crash-recovery pass runs");
+
+        let conn = db.conn.lock().await;
+        // Both the entity and its shadow are re-embedded and byte-equal.
+        let (entity_emb_null, shadow_emb_null, equal): (i64, i64, i64) = {
+            let mut rows = conn
+                .query(
+                    "SELECT \
+                        (SELECT embedding IS NULL FROM entities WHERE id = ?1), \
+                        (SELECT embedding IS NULL FROM pages WHERE id = ?2), \
+                        COALESCE((SELECT (SELECT embedding FROM entities WHERE id = ?1) \
+                                = (SELECT embedding FROM pages WHERE id = ?2)), 0)",
+                    libsql::params![id.clone(), page_id.clone()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            (
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            )
+        };
+        assert_eq!(entity_emb_null, 0, "entity embedding must be recovered");
+        assert_eq!(
+            shadow_emb_null, 0,
+            "shadow page embedding must be recovered, not left NULL"
+        );
+        assert_eq!(
+            equal, 1,
+            "the shadow embedding must equal the entity's recovered embedding"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_entity_dual_write_rolls_back_atomically_on_shadow_write_failure() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DROP TABLE entity_page_map", ())
+                .await
+                .unwrap();
+        }
+
+        let result = db
+            .store_entity("Doomed Carol", "person", None, None, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "store_entity must fail when the shadow-page map write fails"
+        );
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM entities WHERE name = 'Doomed Carol'",
+                (),
+            )
+            .await
+            .unwrap();
+        let entity_count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            entity_count, 0,
+            "the entity row must roll back along with its failed shadow write"
+        );
+
+        let mut prows = conn
+            .query(
+                "SELECT COUNT(*) FROM pages WHERE title = 'Doomed Carol'",
+                (),
+            )
+            .await
+            .unwrap();
+        let page_count: i64 = prows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            page_count, 0,
+            "no orphaned shadow page may survive the rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_visible_pages_excludes_entity_kind_pages() {
+        let (db, _dir) = test_db().await;
+        let mut entity_page = confirmed_page("p_entity_shadow", Some("work"), &[]);
+        entity_page.kind = "entity".to_string();
+        let no_overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let visible = db
+            .select_visible_pages(vec![entity_page], Some("work"), &no_overlap, "full", 10)
+            .await;
+        assert!(
+            visible.is_empty(),
+            "kind='entity' shadow pages must never reach a reader through select_visible_pages, \
+             even at full trust"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_pages_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Unique Zephyrine Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let results = db
+            .search_pages("Unique Zephyrine Marker", 10, None)
+            .await
+            .unwrap();
+        assert!(
+            !results.iter().any(|p| p.title == "Unique Zephyrine Marker"),
+            "search_pages must not surface the entity's own kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_pages_scoped_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Unique Quorlath Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+
+        let results = db
+            .search_pages_scoped(
+                "Unique Quorlath Marker",
+                10,
+                None,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !results.iter().any(|p| p.title == "Unique Quorlath Marker"),
+            "the scoped RRF page channel must not surface the entity's shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recent_pages_with_badges_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Recent Activity Entity Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let items = db.list_recent_pages_with_badges(50, None).await.unwrap();
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.title == "Recent Activity Entity Marker"),
+            "list_recent_pages_with_badges must not surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recent_pages_with_badges_scoped_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "Scoped Recent Entity Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let items = db
+            .list_recent_pages_with_badges_scoped(
+                50,
+                None,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.title == "Scoped Recent Entity Marker"),
+            "the scoped recent-activity surface must not surface a kind='entity' shadow page"
+        );
+    }
+
+    // -- M3 PR-1 rework wave 1 (item A): SQL-level visibility fences. Each test
+    // is constructed so the shadow WOULD surface without its fence (non-vacuous):
+    // store_entity dual-writes an active, embedded, space-bound shadow page, then
+    // the reader is asserted to exclude it. Mirrors the stage-f Rust-level fence
+    // tests above.
+
+    /// Helper: the shadow page id dual-written for an entity.
+    async fn shadow_page_id(db: &MemoryDB, entity_id: &str) -> String {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params![entity_id.to_string()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("entity must have a mapped shadow page")
+            .get(0)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_page_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Get Page Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let page = db.get_page(&pid).await.unwrap();
+        assert!(
+            page.is_none(),
+            "get_page must return None for a kind='entity' shadow id (fail-closed by ID)"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_scoped_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Get Page Scoped Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        // Space scope exercises the scoped SQL (Global delegates to get_page).
+        let page = db
+            .get_page_scoped(
+                &pid,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            page.is_none(),
+            "get_page_scoped must return None for a kind='entity' shadow id"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("List Pages Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+
+        let pages = db.list_pages("active", 50, 0).await.unwrap();
+        assert!(
+            !pages.iter().any(|p| p.title == "List Pages Marker"),
+            "list_pages must not surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_scoped_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "List Pages Scoped Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pages = db
+            .list_pages_scoped(
+                "active",
+                50,
+                0,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !pages.iter().any(|p| p.title == "List Pages Scoped Marker"),
+            "list_pages_scoped (Space arm) must not surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_by_space_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        // One shadow in "work", one with no space (folds to UNFILED) -- covers
+        // all three arms (Some(d), Some("uncategorized"), None) non-vacuously.
+        db.store_entity("Space Bound Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+        db.store_entity("Unfiled Bound Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let by_space = db
+            .list_pages_by_space("active", Some("work"), 50, 0)
+            .await
+            .unwrap();
+        assert!(
+            !by_space.iter().any(|p| p.title == "Space Bound Marker"),
+            "list_pages_by_space(Some(space)) must exclude the shadow"
+        );
+
+        let uncategorized = db
+            .list_pages_by_space("active", Some("uncategorized"), 50, 0)
+            .await
+            .unwrap();
+        assert!(
+            !uncategorized
+                .iter()
+                .any(|p| p.title == "Unfiled Bound Marker"),
+            "list_pages_by_space(uncategorized) must exclude the UNFILED shadow"
+        );
+
+        let all = db.list_pages_by_space("active", None, 50, 0).await.unwrap();
+        assert!(
+            !all.iter()
+                .any(|p| p.title == "Space Bound Marker" || p.title == "Unfiled Bound Marker"),
+            "list_pages_by_space(None) must exclude every shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recent_changes_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Recent Changes Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let changes = db.list_recent_changes(50).await.unwrap();
+        assert!(
+            !changes.iter().any(|c| c.title == "Recent Changes Marker"),
+            "list_recent_changes must not surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recent_changes_scoped_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "Recent Changes Scoped Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let changes = db
+            .list_recent_changes_scoped(
+                50,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.title == "Recent Changes Scoped Marker"),
+            "list_recent_changes_scoped (Space arm) must not surface a shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_active_page_titles_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Active Titles Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let titles = db.list_active_page_titles(50).await.unwrap();
+        assert!(
+            !titles.iter().any(|t| t == "Active Titles Marker"),
+            "list_active_page_titles must not surface a kind='entity' shadow title"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_relevant_active_page_titles_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "Relevant Titles Zephyr Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Both branches: no-workspace (None) and workspace-scoped (Some).
+        let unscoped = db
+            .list_relevant_active_page_titles("Relevant Titles Zephyr Marker", None, 10)
+            .await
+            .unwrap();
+        assert!(
+            !unscoped
+                .iter()
+                .any(|t| t == "Relevant Titles Zephyr Marker"),
+            "list_relevant_active_page_titles(None) must not surface a shadow title"
+        );
+
+        let scoped = db
+            .list_relevant_active_page_titles("Relevant Titles Zephyr Marker", Some("work"), 10)
+            .await
+            .unwrap();
+        assert!(
+            !scoped.iter().any(|t| t == "Relevant Titles Zephyr Marker"),
+            "list_relevant_active_page_titles(Some(space)) must not surface a shadow title"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_active_page_id_by_title_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Find By Title Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let found = db
+            .find_active_page_id_by_title("Find By Title Marker")
+            .await
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "find_active_page_id_by_title must not resolve a wikilink to a shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_unique_active_page_id_by_title_scoped_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "Find Unique By Title Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let found = db
+            .find_unique_active_page_id_by_title_scoped("Find Unique By Title Marker", Some("work"))
+            .await
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "find_unique_active_page_id_by_title_scoped must not resolve to a shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_active_pages_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Count Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let count = db.count_active_pages().await.unwrap();
+        assert_eq!(
+            count, 0,
+            "count_active_pages must not count kind='entity' shadow pages (milestone honesty)"
+        );
+    }
+
+    #[tokio::test]
+    async fn oldest_active_page_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Oldest Page Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let oldest = db.oldest_active_page().await.unwrap();
+        assert!(
+            oldest.is_none(),
+            "oldest_active_page must skip kind='entity' shadow pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_page_source_index_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Source Index Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let index = db.load_page_source_index().await.unwrap();
+        assert!(
+            !index.iter().any(|e| e.page_title == "Source Index Marker"),
+            "load_page_source_index must not include a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_pages_missing_citations_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Missing Citations Marker", "person", None, None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        // Shadow pages are born with NULL citations, so without the fence this
+        // annotate-only backfill sweep would pick them up.
+        let ids = db.get_pages_missing_citations(50).await.unwrap();
+        assert!(
+            !ids.contains(&pid),
+            "get_pages_missing_citations must not enqueue a shadow page for citation backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_sources_scoped_rejects_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Sources Marker", "person", None, None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let result = db
+            .get_page_sources_scoped(&pid, &crate::read_scope::ReadScope::Global)
+            .await;
+        assert!(
+            result.is_err(),
+            "get_page_sources_scoped must 404 (not Ok([])) for a shadow id (fail-closed by ID)"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_outbound_links_scoped_rejects_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Outbound Links Marker", "person", None, None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let result = db
+            .get_page_outbound_links_scoped(&pid, &crate::read_scope::ReadScope::Global)
+            .await;
+        assert!(
+            result.is_err(),
+            "get_page_outbound_links_scoped must 404 for a shadow id"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_inbound_links_scoped_rejects_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Inbound Links Marker", "person", None, None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let result = db
+            .get_page_inbound_links_scoped(&pid, &crate::read_scope::ReadScope::Global)
+            .await;
+        assert!(
+            result.is_err(),
+            "get_page_inbound_links_scoped must 404 for a shadow id"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_changelog_scoped_rejects_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Changelog Marker", "person", None, None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let result = db
+            .get_page_changelog_scoped(&pid, &crate::read_scope::ReadScope::Global)
+            .await;
+        assert!(
+            result.is_err(),
+            "get_page_changelog_scoped must 404 for a shadow id"
+        );
+    }
+
+    // -- M3 PR-1 item C: update-path shadow parity (migration 93 + mutators) --
+
+    /// Read the `aliases` JSON array off an entity's shadow page (NULL -> None).
+    async fn shadow_aliases(db: &MemoryDB, entity_id: &str) -> Option<String> {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT p.aliases FROM pages p \
+                 JOIN entity_page_map m ON m.page_id = p.id WHERE m.entity_id = ?1",
+                libsql::params![entity_id],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .and_then(|r| r.get::<Option<String>>(0).unwrap())
+    }
+
+    #[tokio::test]
+    async fn migration_93_adds_pages_aliases_column() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = 'aliases'",
+                (),
+            )
+            .await
+            .unwrap();
+        let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(present, 1, "pages.aliases must exist after migration 93");
+    }
+
+    #[tokio::test]
+    async fn migration_93_backfills_null_shadow_aliases() {
+        // Backfill + Step-3 assertion teeth: a `kind='entity'` shadow whose
+        // `aliases` is NULL (a migration-92 shadow, which predates the column)
+        // must be backfilled from `entity_aliases`, and the migration refuses
+        // to complete if any entity shadow is still NULL. Simulate a pre-93
+        // shadow by NULLing aliases + rewinding user_version, then re-firing.
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Backfill Target", "person", None, None, None)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("UPDATE pages SET aliases = NULL WHERE kind = 'entity'", ())
+                .await
+                .unwrap();
+            conn.execute("PRAGMA user_version = 92", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("migration 93 re-fires and backfills");
+
+        let aliases = shadow_aliases(&db, &eid)
+            .await
+            .expect("aliases must be backfilled non-null");
+        let parsed: Vec<String> = serde_json::from_str(&aliases).unwrap();
+        assert!(
+            parsed.contains(&"backfill target".to_string()),
+            "the entity's self-alias must be backfilled into the shadow: {aliases}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_entity_shadow_carries_self_alias() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Ada Lovelace", "person", None, None, None)
+            .await
+            .unwrap();
+        let aliases = shadow_aliases(&db, &eid)
+            .await
+            .expect("a freshly stored entity's shadow must carry a non-null alias array");
+        let parsed: Vec<String> = serde_json::from_str(&aliases).unwrap();
+        assert_eq!(
+            parsed,
+            vec!["ada lovelace".to_string()],
+            "store_entity must fold the self-alias into the shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_entity_alias_syncs_shadow_aliases() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Ada Lovelace", "person", None, None, None)
+            .await
+            .unwrap();
+        db.add_entity_alias("Countess Lovelace", &eid, "manual")
+            .await
+            .unwrap();
+
+        let aliases = shadow_aliases(&db, &eid).await.unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&aliases).unwrap();
+        assert!(
+            parsed.contains(&"countess lovelace".to_string()),
+            "add_entity_alias must re-sync the shadow's alias array: {aliases}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_entity_syncs_shadow_confirmed() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Confirm Me", "person", None, None, None)
+            .await
+            .unwrap();
+        db.confirm_entity(&eid, true).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT p.entity_confirmed FROM pages p \
+                 JOIN entity_page_map m ON m.page_id = p.id WHERE m.entity_id = ?1",
+                libsql::params![eid],
+            )
+            .await
+            .unwrap();
+        let confirmed: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            confirmed, 1,
+            "confirm_entity must mirror confirmed into the shadow's entity_confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_entity_embedding_syncs_shadow_embedding() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Embedding Target", "person", None, None, None)
+            .await
+            .unwrap();
+        // Refresh from text DIFFERENT from the name so the entity embedding
+        // changes off its store-time value: if the shadow did not re-sync, the
+        // two blobs would now differ.
+        db.refresh_entity_embedding(&eid, "a completely different descriptive phrase")
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT (e.embedding = p.embedding) FROM entities e \
+                 JOIN entity_page_map m ON m.entity_id = e.id \
+                 JOIN pages p ON p.id = m.page_id WHERE e.id = ?1",
+                libsql::params![eid],
+            )
+            .await
+            .unwrap();
+        let equal: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            equal, 1,
+            "refresh_entity_embedding must mirror the new embedding into the shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_entity_type_syncs_shadow_entity_type() {
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .store_entity("Folder One", "org", None, None, None)
+            .await
+            .unwrap();
+        let e2 = db
+            .store_entity("Folder Two", "org", None, None, None)
+            .await
+            .unwrap();
+        let n = db.fold_entity_type("org", "organization").await.unwrap();
+        assert_eq!(n, 2, "both entities of the folded type must be counted");
+
+        let conn = db.conn.lock().await;
+        for eid in [&e1, &e2] {
+            let mut rows = conn
+                .query(
+                    "SELECT p.entity_type FROM pages p \
+                     JOIN entity_page_map m ON m.page_id = p.id WHERE m.entity_id = ?1",
+                    libsql::params![eid.as_str()],
+                )
+                .await
+                .unwrap();
+            let et: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(
+                et, "organization",
+                "fold_entity_type must mirror the new type into the shadow"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_entity_deletes_shadow_page() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Delete Shadow Target", "person", None, None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+        db.delete_entity(&eid).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT \
+                    (SELECT COUNT(*) FROM pages WHERE id = ?1), \
+                    (SELECT COUNT(*) FROM entity_page_map WHERE page_id = ?1)",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            0,
+            "delete_entity must delete the entity's shadow page"
+        );
+        assert_eq!(
+            row.get::<i64>(1).unwrap(),
+            0,
+            "the entity_page_map row must be gone (ON DELETE CASCADE on the page)"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entities_deletes_loser_shadow_and_resyncs_canonical() {
+        let (db, _dir) = test_db().await;
+        let canonical = db
+            .store_entity("Canonical Name", "entity", None, None, None)
+            .await
+            .unwrap();
+        let loser = db
+            .store_entity("Loser Name", "person", None, None, None)
+            .await
+            .unwrap();
+        let loser_pid = shadow_page_id(&db, &loser).await;
+
+        db.merge_entities(&canonical, &loser).await.unwrap();
+
+        // Loser shadow gone.
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM pages WHERE id = ?1",
+                    libsql::params![loser_pid],
+                )
+                .await
+                .unwrap();
+            let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(n, 0, "merge_entities must delete the loser's shadow page");
+        }
+
+        // Canonical shadow re-synced: the loser's name is now one of its
+        // aliases, and its type was promoted from the generic 'entity' to the
+        // loser's concrete 'person'.
+        let aliases = shadow_aliases(&db, &canonical).await.unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&aliases).unwrap();
+        assert!(
+            parsed.contains(&"loser name".to_string()),
+            "the canonical shadow must fold in the merged-in alias: {aliases}"
+        );
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT p.entity_type FROM pages p \
+                 JOIN entity_page_map m ON m.page_id = p.id WHERE m.entity_id = ?1",
+                libsql::params![canonical],
+            )
+            .await
+            .unwrap();
+        let et: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            et, "person",
+            "the canonical shadow must reflect the promoted entity_type"
+        );
+    }
+
+    // -- M3 PR-2 stage a: entity<->page parity reconciliation + watermark
+    // (migration 94) --
+
+    #[tokio::test]
+    async fn migration_94_creates_entity_cutover_control_plane() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        for table in ["entity_reader_cutover", "entity_page_parity_watermark"] {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(present, 1, "{table} must exist after migration 94");
+        }
+        let uv: i64 = {
+            let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(uv as u32, crate::db::SCHEMA_VERSION);
+    }
+
+    /// Fresh-DB (via `test_db`, above) vs upgraded-from-93 must agree: rewind
+    /// `user_version` to 93 (simulating a real pre-PR-2 database) and re-fire
+    /// migrations; replay-safety (`CREATE TABLE IF NOT EXISTS`) means the
+    /// tables must still be present afterward with no error, mirroring
+    /// `rerun_migration_89`.
+    #[tokio::test]
+    async fn migration_94_replay_safe_from_93() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("PRAGMA user_version = 93", ()).await.unwrap();
+        }
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("migration 94 re-fires cleanly from a v93 database");
+
+        let conn = db.conn.lock().await;
+        for table in ["entity_reader_cutover", "entity_page_parity_watermark"] {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(
+                present, 1,
+                "{table} must exist after replaying migration 94"
+            );
+        }
+        let uv: i64 = {
+            let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(uv as u32, crate::db::SCHEMA_VERSION);
+    }
+
+    /// Read the `(proven_epoch, drift_count)` off the entity-page parity
+    /// watermark. Mirrors `parity_watermark_row` for `edges_parity_watermark`.
+    async fn entity_page_parity_watermark_row(
+        conn: &libsql::Connection,
+    ) -> Option<(Option<i64>, Option<i64>)> {
+        let mut rows = conn
+            .query(
+                "SELECT proven_epoch, drift_count FROM entity_page_parity_watermark WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .map(|row| (row.get(0).unwrap(), row.get(1).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn reconcile_clean_dual_write_reports_zero_drift_and_stamps_watermark() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.store_entity("Bob", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert_eq!(
+            report.drift_count, 0,
+            "live dual-write must reconcile clean (report={report:?})"
+        );
+        assert_eq!(report.expected_active, 2);
+        assert_eq!(report.actual_active, 2);
+
+        let conn = db.conn.lock().await;
+        let (proven, drift) = entity_page_parity_watermark_row(&conn).await.unwrap();
+        assert_eq!((proven, drift), (Some(1), Some(0)));
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_entity_with_no_map_row() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Unmapped", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params![eid.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.missing_count >= 1,
+            "an entity with no map row is missing (report={report:?})"
+        );
+        assert!(report.missing_sample.contains(&eid));
+        assert!(report.drift_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_map_row_whose_page_is_not_live() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Archived Shadow", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET status = 'archived' WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.missing_count >= 1,
+            "a map row whose page is no longer live is missing its shadow (report={report:?})"
+        );
+        assert!(report.missing_sample.contains(&eid));
+        assert!(report.drift_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_extra_entity_page_not_in_map() {
+        let (db, _dir) = test_db().await;
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO pages (
+                    id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                    space, workspace, source_memory_ids, version, status,
+                    created_at, last_compiled, last_modified, creation_kind, review_status
+                 ) VALUES (
+                    'orphan_shadow', 'Orphan', NULL, '', 'entity', 'person', NULL, 0,
+                    ?1, ?1, '[]', 1, 'active',
+                    '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'entity', 'unconfirmed'
+                 )",
+                libsql::params![UNFILED_SPACE_ID],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.extra_count >= 1,
+            "a live kind='entity' page absent from the map is extra (report={report:?})"
+        );
+        assert!(report.extra_sample.contains(&"orphan_shadow".to_string()));
+        assert!(report.drift_count >= 1);
+    }
+
+    /// The parity oracle must be STRUCTURAL: a shadow page that stays mapped
+    /// and live but whose mirrored field was edited out-of-band must be
+    /// flagged corrupt, not clean -- a set-membership-only oracle would miss
+    /// this (mirrors `reconcile_detects_corrupt_endpoint` for edges).
+    #[tokio::test]
+    async fn reconcile_detects_field_mismatch_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Type Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_type = 'organization' WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "an edited shadow field is corrupt, not clean (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow is still present and mapped"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// The comparator must include `confirmed` (-> `entity_confirmed`), not
+    /// just the descriptive fields -- `confirm_entity` mirrors this column
+    /// into the shadow, so a shadow that silently kept the old value is a
+    /// real drift the dual-writer promises never happens.
+    #[tokio::test]
+    async fn reconcile_detects_confirmed_mismatch_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Confirmed Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_confirmed = 1 WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "an edited entity_confirmed is corrupt, not clean (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow is still present and mapped"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// The comparator must include `embedding`, not just the descriptive
+    /// fields -- `refresh_entity_embedding` mirrors this column into the
+    /// shadow, so a shadow that silently kept a stale (or NULL'd) vector is
+    /// a real drift the dual-writer promises never happens.
+    #[tokio::test]
+    async fn reconcile_detects_embedding_mismatch_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Embedding Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET embedding = NULL WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "a NULL'd shadow embedding is corrupt, not clean (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow is still present and mapped"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// Fail-open regression: a decode failure on a mirrored column must
+    /// never fold to a false equality.
+    ///
+    /// NOTE on column choice: the obvious way to force a "wrong storage
+    /// class" decode failure -- e.g. `UPDATE entities SET entity_type = 42`
+    /// or a BLOB into the REAL `confidence` column -- does not exercise a
+    /// recoverable decode failure on this pinned libsql (0.9.30): a
+    /// TEXT-affinity column silently coerces the integer to text at WRITE
+    /// time (no failure at all), and every other cross-type mismatch panics
+    /// inside libsql's own `FromValue` impls (`unreachable!("invalid value
+    /// type")`, e.g. `f64::from_sql`/`Vec<u8>::from_sql` on a non-matching,
+    /// non-NULL value) rather than returning `Err` -- unrecoverable by the
+    /// `Result`-returning closures this fix adds. `pages.entity_type` is the
+    /// one mirrored column with no NOT NULL constraint (unlike
+    /// `entities.entity_type`, `name`, and `title`, which all reject a NULL
+    /// write outright), so it is the one column where a genuine,
+    /// non-panicking `Err(NullValue)` decode failure is reachable via plain
+    /// SQL. Old code's `row.get(6).unwrap_or_default()` folds that `Err` to
+    /// `""`; pairing it with a legitimately EMPTY `entities.entity_type`
+    /// reproduces exactly the hazard the review flagged: a decode-failure
+    /// default colliding with an unrelated real value and reading as equal.
+    #[tokio::test]
+    async fn reconcile_treats_page_side_decode_failure_as_corrupt_never_equality() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Decode Drift", "person", None, None, Some(0.9))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            // A legitimate (not a decode failure) empty string on the
+            // entities side -- the exact value old code's
+            // `unwrap_or_default` would produce from a page-side decode
+            // failure.
+            conn.execute(
+                "UPDATE entities SET entity_type = '' WHERE id = ?1",
+                libsql::params![eid.clone()],
+            )
+            .await
+            .unwrap();
+            // `pages.entity_type` carries no NOT NULL constraint, so this
+            // NULL is a genuine decode failure once read as a non-`Option`
+            // `String` -- the page row still exists and joins, so it is not
+            // "no live shadow".
+            conn.execute(
+                "UPDATE pages SET entity_type = NULL WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "a page-side decode failure must count as corrupt, never fold to \
+             a false equality against an unrelated real value (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow page still exists and joins -- this is a decode \
+             failure, not a missing shadow"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// A decode failure on only the page side (the entity-side value left
+    /// intact) must also count as corrupt.
+    #[tokio::test]
+    async fn reconcile_treats_one_sided_decode_failure_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("One Sided Decode Drift", "person", None, None, Some(0.9))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_type = NULL WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "a one-sided decode failure must count as corrupt (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(report.missing_count, 0);
+        assert!(report.drift_count >= 1);
+    }
+
+    /// Epoch FAIL-CLOSED: a missing/corrupt `entity_page_migration_state` row
+    /// is an ERROR, never a fabricated drift-0 proof, and the watermark must
+    /// NOT be stamped. Mirrors `missing_migration_state_closes_reader_gate`'s
+    /// epoch discipline for edges.
+    #[tokio::test]
+    async fn reconcile_errors_and_does_not_stamp_when_migration_state_missing() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Someone", "person", None, None, None)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM entity_page_migration_state", ())
+                .await
+                .unwrap();
+        }
+        let err = db.reconcile_entity_page_parity().await.unwrap_err();
+        assert!(
+            format!("{err}").contains("entity_page_migration_state"),
+            "must fail loud naming the missing state, got: {err}"
+        );
+
+        let conn = db.conn.lock().await;
+        let watermark = entity_page_parity_watermark_row(&conn).await;
+        assert!(
+            watermark.is_none(),
+            "watermark must NOT be stamped when the epoch cannot be proven"
+        );
+    }
+
+    // -- M3 PR-2 stage b: entity reader-cutover gate + manual lever
+    // (`set_entity_reader_cutover`/`reader_uses_entity_pages`), mirroring
+    // M2's `set_reader_cutover`/`reader_uses_edges` control-plane tests --
+
+    /// THE load-bearing stage-b test (mirrors
+    /// `reader_gate_blocks_flip_until_parity_proven` for M2's `edges`): an
+    /// enabled consumer with no parity proof yet MUST stay on legacy.
+    /// Flipping the flag alone (intent) never moves a reader off legacy --
+    /// only a clean, current watermark does.
+    #[tokio::test]
+    async fn entity_reader_gate_blocks_flip_until_parity_proven() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        // Operator enables the consumer (intent) -- but no reconciliation
+        // has run yet, so there is no watermark.
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "enabling a consumer must NOT flip it while parity is unproven"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_reader_flips_only_after_clean_parity_and_reverts() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+
+        // Prove parity, then the gate opens.
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert_eq!(
+            report.drift_count, 0,
+            "live dual-write must reconcile clean"
+        );
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "a clean, current watermark must open the gate for an enabled consumer"
+            );
+        }
+
+        // Reversibility: disabling moves it straight back to legacy.
+        db.set_entity_reader_cutover("test_consumer", false)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "disabling a consumer must always revert it to legacy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_reader_gate_blocked_by_nonzero_drift() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Type Drift", "person", None, None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "sanity: a clean watermark opens the gate"
+            );
+        }
+
+        // Perturb a shadow out-of-band, then re-reconcile: the watermark
+        // goes dirty, so the gate must close even though the consumer is
+        // still enabled.
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_type = 'organization' WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.drift_count >= 1,
+            "sanity: reconcile must see the drift"
+        );
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "a nonzero-drift watermark must keep the reader on legacy"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_page_epoch_bump_reblocks_reader_until_reconciled() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        db.reconcile_entity_page_parity().await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap());
+        }
+
+        // A coverage-lapse bump retires the older proof -> reader
+        // re-blocked. No `bump_entity_dual_write_epoch` helper exists yet
+        // (stage b adds only the gate + lever), so the bump is a raw
+        // UPDATE, exactly what such a future helper would do.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE entity_page_migration_state SET epoch = epoch + 1 WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "a stale-epoch watermark must NOT open the gate"
+            );
+        }
+
+        // Re-proving at the new epoch reopens it.
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert_eq!(report.epoch, 2);
+        let conn = db.conn.lock().await;
+        assert!(MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+            .await
+            .unwrap());
+    }
+
+    /// Epoch FAIL-CLOSED: with a clean, current watermark the gate is open,
+    /// but the moment the `entity_page_migration_state` row is lost there
+    /// is no trustworthy current epoch -- the gate must CLOSE (a fail-open
+    /// default would flip every enabled reader onto the shadow pages the
+    /// instant the state row vanished). Mirrors
+    /// `missing_migration_state_closes_reader_gate` for edges.
+    #[tokio::test]
+    async fn missing_entity_migration_state_closes_reader_gate() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Alice", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        db.reconcile_entity_page_parity().await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark opens the gate"
+            );
+        }
+
+        // Lose the epoch state row (deleted/corrupt). The watermark is
+        // still clean, but its epoch can no longer be proven current.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM entity_page_migration_state", ())
+                .await
+                .unwrap();
+        }
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "a missing entity_page_migration_state row must CLOSE the gate, not open it"
+        );
+    }
+
+    /// `set_entity_reader_cutover` must record `cutover_epoch = 0` (never
+    /// fabricate a generation) when there is no trustworthy current epoch,
+    /// and the predicate must stay closed -- mirrors `set_reader_cutover`'s
+    /// "no current epoch -> record 0" discipline for edges.
+    #[tokio::test]
+    async fn set_entity_reader_cutover_with_missing_state_records_epoch_zero() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("DELETE FROM entity_page_migration_state", ())
+                .await
+                .unwrap();
+        }
+
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT cutover_epoch FROM entity_reader_cutover WHERE consumer = ?1",
+                libsql::params!["test_consumer"],
+            )
+            .await
+            .unwrap();
+        let epoch: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            epoch, 0,
+            "a missing migration-state row must record cutover_epoch 0, not fabricate one"
+        );
+        assert!(
+            !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                .await
+                .unwrap(),
+            "the predicate must stay false with no trustworthy epoch"
+        );
+    }
+
+    /// Epoch FAIL-CLOSED: the reader must reject the epoch-0 sentinel ("no
+    /// trustworthy epoch", `set_entity_reader_cutover`'s own convention) and
+    /// any negative epoch, not just a missing row --
+    /// `current_entity_dual_write_epoch` must treat all three as "no current
+    /// epoch".
+    #[tokio::test]
+    async fn current_epoch_rejects_zero_sentinel_and_negative_epoch() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Epoch Guard", "person", None, None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        db.reconcile_entity_page_parity().await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark opens the gate"
+            );
+        }
+
+        for bad_epoch in [0i64, -3i64] {
+            {
+                let conn = db.conn.lock().await;
+                conn.execute(
+                    "UPDATE entity_page_migration_state SET epoch = ?1 WHERE id = 1",
+                    libsql::params![bad_epoch],
+                )
+                .await
+                .unwrap();
+            }
+            let err = db.reconcile_entity_page_parity().await.unwrap_err();
+            assert!(
+                format!("{err}").contains("entity_page_migration_state"),
+                "epoch {bad_epoch} must be rejected as untrustworthy: {err}"
+            );
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "epoch {bad_epoch} must keep the reader closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_documents_defaults_missing_space_to_unfiled() {
+        // Producer fix: `upsert_documents_with_derived_channels` is the
+        // primary ingest path (source='memory' rows and their co-written
+        // source='episode' rows). A doc with no space must never bind NULL.
+        let (db, _dir) = test_db().await;
+        let doc = make_doc("memory", "src_no_space", "title", "content");
+        assert!(doc.space.is_none());
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT space FROM memories WHERE source_id = 'src_no_space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(space, UNFILED_SPACE_ID);
+    }
+
+    #[tokio::test]
+    async fn apply_memory_update_explicit_clear_folds_to_unfiled() {
+        // Producer fix: `apply_memory_update` binds an explicit
+        // `requested_space = Some(None)` (a caller clearing space) straight
+        // to NULL before this fix. Must fold to the sentinel instead.
+        let (db, _dir) = test_db().await;
+        let doc = make_memory_doc("src_clear_space", "content", "fact", "engineering", "test");
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        db.apply_memory_update("src_clear_space", None, Some(None), false, None, None)
+            .await
+            .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT space FROM memories WHERE source_id = 'src_clear_space' AND source != 'episode'",
+                (),
+            )
+            .await
+            .unwrap();
+        let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(space, UNFILED_SPACE_ID);
+    }
+
     /// THE load-bearing stage-(c) test (spec v3 §7 M2 row): an enabled
     /// consumer with an unreconciled legacy row present MUST stay on legacy
     /// until parity is proven. Absent a clean watermark the gate refuses.
@@ -73015,6 +78522,126 @@ pub(crate) mod tests {
         );
     }
 
+    /// D6 (M2 review fork-#2 verdict (a)): once the "communities" consumer
+    /// flips to reading `edges`, a `lineage='legacy'` edge whose endpoints
+    /// are cross-space must NOT contribute to adjacency -- else two spaces'
+    /// entities could merge into one community through a legacy link the
+    /// fence never validated (the fence exempts `lineage='legacy'` at write
+    /// time). The unflipped (legacy `relations`) path is untouched: it still
+    /// carries the cross-space link, since D6 is a read-side exclusion
+    /// scoped to the flipped `edges` read only. A same-space legacy edge
+    /// must still contribute when flipped -- the exclusion is
+    /// cross-space-scoped, not all-legacy.
+    #[tokio::test]
+    async fn detect_communities_flipped_excludes_cross_space_legacy_edge() {
+        let (db, _dir) = test_db().await;
+        let a = db
+            .create_entity("A", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let b = db
+            .create_entity("B", "person", Some("space_b"))
+            .await
+            .unwrap();
+
+        // Legacy `relations` row (the unflipped read source) + its
+        // `lineage='legacy'` edge twin, inserted directly via SQL (the fence
+        // exempts `lineage='legacy'`) -- mirrors what a real cross-space
+        // backfill/dual-write produces for a cross-space `relates` pair.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) \
+                 VALUES ('rel_cross', ?1, ?2, 'knows', 0)",
+                libsql::params![a.clone(), b.clone()],
+            )
+            .await
+            .unwrap();
+            MemoryDB::insert_backfilled_edge(
+                &conn, "relates", "entity", &a, "entity", &b, "knows", "legacy", "space_a", "test",
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn community_map(db: &MemoryDB) -> std::collections::BTreeMap<String, i64> {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query("SELECT id, community_id FROM entities ORDER BY id", ())
+                .await
+                .unwrap();
+            let mut m = std::collections::BTreeMap::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                m.insert(
+                    row.get::<String>(0).unwrap(),
+                    row.get::<i64>(1).unwrap_or(-1),
+                );
+            }
+            m
+        }
+
+        // Unflipped (legacy path): behavior unchanged -- the cross-space
+        // relation still contributes; A and B land in one community.
+        db.detect_communities().await.unwrap();
+        let legacy_map = community_map(&db).await;
+        assert_eq!(
+            legacy_map[&a], legacy_map[&b],
+            "legacy path must be unchanged: the cross-space relation still merges A and B"
+        );
+
+        // Flip: prove parity, enable the consumer.
+        assert_eq!(db.reconcile_edges_parity().await.unwrap().drift_count, 0);
+        db.set_reader_cutover("communities", true).await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(MemoryDB::reader_uses_edges(&conn, "communities")
+                .await
+                .unwrap());
+        }
+
+        // Flipped (edges path): the cross-space legacy edge must NOT
+        // contribute -- A and B must NOT land in one community via it.
+        db.detect_communities().await.unwrap();
+        let flipped_map = community_map(&db).await;
+        assert_ne!(
+            flipped_map[&a], flipped_map[&b],
+            "flipped read must exclude the cross-space legacy edge: A and B must not merge"
+        );
+
+        // A same-space legacy edge DOES still contribute when flipped -- the
+        // exclusion is cross-space-scoped, not all-legacy.
+        let c = db
+            .create_entity("C", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let d = db
+            .create_entity("D", "person", Some("space_a"))
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) \
+                 VALUES ('rel_same', ?1, ?2, 'knows', 0)",
+                libsql::params![c.clone(), d.clone()],
+            )
+            .await
+            .unwrap();
+            MemoryDB::insert_backfilled_edge(
+                &conn, "relates", "entity", &c, "entity", &d, "knows", "legacy", "space_a", "test",
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(db.reconcile_edges_parity().await.unwrap().drift_count, 0);
+        db.detect_communities().await.unwrap();
+        let flipped_map2 = community_map(&db).await;
+        assert_eq!(
+            flipped_map2[&c], flipped_map2[&d],
+            "a same-space legacy edge must still contribute when flipped"
+        );
+    }
+
     /// §6.9 restore drill: an online backup is a sound, INDEPENDENT restore
     /// point. Seed (including an EMBEDDED row so the DiskANN vector index carries
     /// real content -- the shadow tables a naive `VACUUM INTO` would reorder),
@@ -73258,6 +78885,312 @@ pub(crate) mod tests {
             "one cites edge per memory"
         );
         assert!(flip, "gate opens on a clean, current watermark (communities has no edges but the predicate still holds)");
+    }
+
+    /// §6.5-scale acceptance for the M3 PR-2 entity<->page reader cutover
+    /// (100k memories / 5k pages / 10k entities). Manual-only (needs
+    /// minutes + hundreds of MB); run with:
+    ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
+    ///     db::tests::bench_reconcile_entity_page_parity_at_scale -- --ignored --nocapture
+    /// Mirrors `bench_reconcile_parity_at_scale`: memories/pages are seeded
+    /// via raw batched SQL in one BEGIN/COMMIT, no embeddings (same
+    /// technique, same style). Entities go through the REAL dual-write path
+    /// (`store_entity`) instead -- the point is proving the shadow-page
+    /// invariant holds at scale, which raw SQL can't exercise. Proves three
+    /// things at scale rather than on a toy DB: (a) `reconcile_entity_page_
+    /// parity` stays exact -- drift 0 clean, drift 10 after perturbing 10
+    /// shadows; (b) the flipped (cutover-ON) read of `list_entities_scoped`/
+    /// `get_entity_detail_scoped` is byte-identical to legacy (cutover-OFF),
+    /// with both timings printed for the PR body; (c) the flipped queries
+    /// still reach the shadow through an index once the planner has real
+    /// cardinality to reason about -- stage c's EXPLAIN test runs on an
+    /// empty DB, this is the one that counts.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_reconcile_entity_page_parity_at_scale() {
+        use std::time::Instant;
+        const MEMORIES: usize = 100_000;
+        const PAGES: usize = 5_000;
+        const CITES_PER_PAGE: usize = MEMORIES / PAGES; // 20
+        const ENTITIES: usize = 10_000;
+        const PERTURB: usize = 10;
+        const DETAIL_SAMPLE: usize = 1_000;
+        const SPACE: &str = "space_a";
+
+        // Deterministic pseudo-random sample (hash-order) of `count` ids --
+        // avoids adding a `rand` dev-dependency for bench-only code.
+        fn sample_ids(ids: &[String], count: usize) -> Vec<String> {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut scored: Vec<(u64, &String)> = ids
+                .iter()
+                .map(|id| {
+                    let mut hasher = DefaultHasher::new();
+                    id.hash(&mut hasher);
+                    (hasher.finish(), id)
+                })
+                .collect();
+            scored.sort_unstable_by_key(|(h, _)| *h);
+            scored
+                .into_iter()
+                .take(count)
+                .map(|(_, id)| id.clone())
+                .collect()
+        }
+
+        let (db, _dir) = test_db().await;
+
+        // ---- seed 100k memories + 5k pages (mirrors
+        // bench_reconcile_parity_at_scale exactly) ----
+        let t_seed_mp = Instant::now();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            for i in 0..MEMORIES {
+                conn.execute(
+                    "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                        last_modified, chunk_type, source_agent, space, confidence, confirmed, \
+                        memory_type, pending_revision) \
+                     VALUES (?1, 'c', 'memory', ?1, 't', 0, 1712707200, 'text', NULL, 'space_a', 1.0, 0, 'fact', 0)",
+                    libsql::params![format!("mem_{i}")],
+                )
+                .await
+                .unwrap();
+            }
+            for p in 0..PAGES {
+                conn.execute(
+                    "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, space, workspace) \
+                     VALUES (?1, 't', 'c', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'space_a', 'space_a')",
+                    libsql::params![format!("page_{p}")],
+                )
+                .await
+                .unwrap();
+                for k in 0..CITES_PER_PAGE {
+                    let mem = p * CITES_PER_PAGE + k;
+                    conn.execute(
+                        "INSERT INTO page_sources (page_id, memory_source_id, linked_at, link_reason) \
+                         VALUES (?1, ?2, 1712707200, 'bench')",
+                        libsql::params![format!("page_{p}"), format!("mem_{mem}")],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+        let seed_mp_secs = t_seed_mp.elapsed().as_secs_f64();
+        // Phase-localization: print as soon as this phase lands, not batched
+        // with the next one -- a kill during entity seeding must still leave
+        // evidence that memories/pages seeded clean.
+        eprintln!("[bench §6.5 entity] memories={MEMORIES} pages={PAGES} entities={ENTITIES}");
+        eprintln!("[bench §6.5 entity] seed_mem_pages={seed_mp_secs:.1}s");
+
+        // ---- seed 10k entities through the REAL dual-write path; every
+        // call gets its own shadow page + entity_page_map row ----
+        let t_seed_entities = Instant::now();
+        let mut entity_ids: Vec<String> = Vec::with_capacity(ENTITIES);
+        for i in 0..ENTITIES {
+            let id = db
+                .store_entity(
+                    &format!("Bench Entity {i}"),
+                    "person",
+                    Some(SPACE),
+                    None,
+                    Some(0.7),
+                )
+                .await
+                .unwrap();
+            entity_ids.push(id);
+        }
+        let seed_entities_secs = t_seed_entities.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] seed_entities={seed_entities_secs:.1}s ({:.1} entities/sec)",
+            ENTITIES as f64 / seed_entities_secs
+        );
+
+        // ---- reconcile: clean parity must hold at scale ----
+        let t_reconcile = Instant::now();
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        let reconcile_secs = t_reconcile.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] reconcile={reconcile_secs:.2}s ({:.0} entities/sec) expected_active={} actual_active={} drift={}",
+            report.expected_active as f64 / reconcile_secs,
+            report.expected_active,
+            report.actual_active,
+            report.drift_count
+        );
+        assert_eq!(report.drift_count, 0, "parity must hold at §6.5 scale");
+        assert_eq!(
+            report.expected_active, ENTITIES,
+            "one entities row per seeded entity"
+        );
+        assert_eq!(
+            report.actual_active, ENTITIES,
+            "one live shadow page per seeded entity"
+        );
+        {
+            let conn = db.conn.lock().await;
+            let (proven_epoch, drift) = entity_page_parity_watermark_row(&conn).await.unwrap();
+            assert_eq!(drift, Some(0), "watermark must record clean drift");
+            assert!(proven_epoch.is_some(), "watermark must be stamped");
+        }
+
+        // ---- flipped-read benchmark at scale: cutover OFF (legacy) vs ON
+        // (hybrid), on the SAME seeded DB, under the clean watermark just
+        // proven above ----
+        let scope = ReadScope::Space(SPACE.to_string());
+        let detail_ids = sample_ids(&entity_ids, DETAIL_SAMPLE);
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, false)
+            .await
+            .unwrap();
+        let t_list_off = Instant::now();
+        let list_off = db.list_entities_scoped(None, &scope).await.unwrap();
+        let list_off_secs = t_list_off.elapsed().as_secs_f64();
+        let t_detail_off = Instant::now();
+        let mut detail_off = Vec::with_capacity(detail_ids.len());
+        for id in &detail_ids {
+            detail_off.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+        let detail_off_secs = t_detail_off.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] OFF leg done: list={list_off_secs:.3}s detail={detail_off_secs:.3}s"
+        );
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, MemoryDB::SCOPED_ENTITIES_CONSUMER)
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark must open the gate at scale"
+            );
+        }
+        let t_list_on = Instant::now();
+        let list_on = db.list_entities_scoped(None, &scope).await.unwrap();
+        let list_on_secs = t_list_on.elapsed().as_secs_f64();
+        let t_detail_on = Instant::now();
+        let mut detail_on = Vec::with_capacity(detail_ids.len());
+        for id in &detail_ids {
+            detail_on.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+        let detail_on_secs = t_detail_on.elapsed().as_secs_f64();
+
+        assert_eq!(
+            list_off.len(),
+            ENTITIES,
+            "sanity: full listing covers every seeded entity"
+        );
+        assert_eq!(
+            format!("{list_off:?}"),
+            format!("{list_on:?}"),
+            "flipped list_entities_scoped must be byte-identical to legacy at scale"
+        );
+        assert_eq!(
+            format!("{detail_off:?}"),
+            format!("{detail_on:?}"),
+            "flipped get_entity_detail_scoped must be byte-identical to legacy at scale"
+        );
+        eprintln!(
+            "[bench §6.5 entity] list_entities_scoped (full listing, n={ENTITIES}): off={list_off_secs:.3}s on={list_on_secs:.3}s"
+        );
+        eprintln!(
+            "[bench §6.5 entity] get_entity_detail_scoped (n={DETAIL_SAMPLE}): off={detail_off_secs:.3}s on={detail_on_secs:.3}s"
+        );
+
+        // ---- EXPLAIN QUERY PLAN at scale: the flipped queries must reach
+        // the shadow through an index, not a bare `SCAN pages` -- the
+        // stage-c EXPLAIN test runs on an empty DB where the planner can
+        // choose differently; this is the one that counts ----
+        {
+            let conn = db.conn.lock().await;
+            let list_plan = query_plan_detail(
+                &conn,
+                &format!(
+                    "SELECT e.id, p.title, p.entity_type, e.space, e.source_agent, p.confidence, \
+                            p.entity_confirmed, e.created_at, e.updated_at \
+                     FROM entities e \
+                     JOIN entity_page_map m ON m.entity_id = e.id \
+                     JOIN pages p ON p.id = m.page_id AND p.kind = 'entity' AND p.status = 'active' \
+                     WHERE e.space = '{SPACE}' ORDER BY e.updated_at DESC, e.id ASC"
+                ),
+            )
+            .await;
+            for line in list_plan.split(" | ") {
+                let upper = line.to_uppercase();
+                if upper.contains(" P ") || upper.contains("PAGES") {
+                    assert!(
+                        upper.contains("USING"),
+                        "pages access must use the entity_page_map UNIQUE index or the \
+                         pages PK, not a bare scan, at scale: {line} (full plan: {list_plan})"
+                    );
+                }
+            }
+            assert!(
+                list_plan.to_uppercase().contains("USING"),
+                "the flipped list_entities_scoped query must use at least one index at scale: {list_plan}"
+            );
+
+            let sample_id = &detail_ids[0];
+            let detail_plan = query_plan_detail(
+                &conn,
+                &format!(
+                    "SELECT e.id, p.title, p.entity_type, e.space, e.source_agent, p.confidence, \
+                            p.entity_confirmed, e.created_at, e.updated_at \
+                     FROM entities e \
+                     JOIN entity_page_map m ON m.entity_id = e.id \
+                     JOIN pages p ON p.id = m.page_id AND p.kind = 'entity' AND p.status = 'active' \
+                     WHERE e.id = '{sample_id}' AND e.space = '{SPACE}' LIMIT 1"
+                ),
+            )
+            .await;
+            for line in detail_plan.split(" | ") {
+                let upper = line.to_uppercase();
+                if upper.contains(" P ") || upper.contains("PAGES") {
+                    assert!(
+                        upper.contains("USING"),
+                        "pages access must use the entity_page_map UNIQUE index or the \
+                         pages PK, not a bare scan, at scale: {line} (full plan: {detail_plan})"
+                    );
+                }
+            }
+            assert!(
+                detail_plan.to_uppercase().contains("USING"),
+                "the flipped get_entity_detail_scoped query must use at least one index at scale: {detail_plan}"
+            );
+            eprintln!("[bench §6.5 entity] list plan: {list_plan}");
+            eprintln!("[bench §6.5 entity] detail plan: {detail_plan}");
+        }
+
+        // ---- perturb 10 shadows and re-reconcile: the oracle stays exact
+        // at scale, not just on toy DBs ----
+        let perturbed: Vec<String> = entity_ids.iter().take(PERTURB).cloned().collect();
+        {
+            let conn = db.conn.lock().await;
+            for id in &perturbed {
+                conn.execute(
+                    "UPDATE pages SET entity_type = 'organization' \
+                     WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                    libsql::params![id.as_str()],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let t_reconcile_dirty = Instant::now();
+        let dirty_report = db.reconcile_entity_page_parity().await.unwrap();
+        let reconcile_dirty_secs = t_reconcile_dirty.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] reconcile_after_perturb={reconcile_dirty_secs:.2}s (clean was {reconcile_secs:.2}s) drift={}",
+            dirty_report.drift_count
+        );
+        assert_eq!(
+            dirty_report.drift_count, PERTURB,
+            "exactly the {PERTURB} perturbed shadows must be flagged corrupt, not more or fewer"
+        );
     }
 
     #[tokio::test]
@@ -75109,6 +81042,206 @@ pub(crate) mod tests {
         assert_eq!(
             valid_until, None,
             "the edge invalidate must roll back with the legacy delete (single transaction)"
+        );
+    }
+
+    // ===== M3 PR-1 stage (g): D7 shared citation-edge refcount =====
+
+    async fn edge_valid_until(conn: &libsql::Connection, edge_id: &str) -> Option<i64> {
+        let mut rows = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![edge_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphaned_page_sources_preserves_edge_backed_by_page_citations() {
+        // D7 (spec v3 M3): pruning an orphaned page_sources row must not
+        // retract the shared `cites` edge_id when `pages.citations`
+        // independently still backs the same (page, locator) pair.
+        let (db, _dir) = test_db().await;
+        let edge_id = crate::provenance::compute_edge_id(
+            "cites", "page", "page_pc", "memory", "mem_gone", "mem_gone",
+        );
+        {
+            let conn = db.conn.lock().await;
+            insert_raw_page_for_m81_test(&conn, "page_pc", "space_a").await;
+            seed_page_source(&conn, "page_pc", "mem_gone").await;
+            let citations = serde_json::json!([
+                {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_gone",
+                 "score": 0.9, "status": "verified", "scope": "sentence"}
+            ]);
+            conn.execute(
+                "UPDATE pages SET citations = ?1 WHERE id = 'page_pc'",
+                libsql::params![citations.to_string()],
+            )
+            .await
+            .unwrap();
+            conn.execute("BEGIN", ()).await.unwrap();
+            MemoryDB::dual_write_edge(
+                &conn, "cites", "page", "page_pc", "memory", "mem_gone", "mem_gone", "legacy",
+                "space_a", true, None,
+            )
+            .await
+            .unwrap();
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+
+        let removed = db.cleanup_orphaned_page_sources().await.unwrap();
+        assert_eq!(
+            removed, 1,
+            "the orphaned page_sources row must still be pruned"
+        );
+
+        let conn = db.conn.lock().await;
+        let ps_count: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM page_sources WHERE page_id = 'page_pc'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(ps_count, 0, "the orphaned page_sources row is gone");
+        assert_eq!(
+            edge_valid_until(&conn, &edge_id).await,
+            None,
+            "pages.citations still backs mem_gone -- the shared edge must stay active"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_write_page_citations_preserves_edge_backed_by_page_evidence() {
+        // D7: dropping a citation from the `pages.citations` blob must not
+        // retract the shared edge when `page_evidence` independently still
+        // backs the same (page, locator) pair.
+        let (db, _dir) = test_db().await;
+        let edge_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_dc",
+            "memory",
+            "mem_shared",
+            "mem_shared",
+        );
+        {
+            let conn = db.conn.lock().await;
+            insert_raw_page_for_m81_test(&conn, "page_dc", "space_a").await;
+            seed_page_evidence(&conn, "page_dc", "memory", Some("mem_shared")).await;
+        }
+        let initial = serde_json::json!([
+            {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_shared",
+             "score": 0.9, "status": "verified", "scope": "sentence"}
+        ]);
+        db.set_page_citations("page_dc", Some(&initial.to_string()))
+            .await
+            .unwrap();
+
+        // Replace with an empty citation set -- mem_shared drops out of
+        // pages.citations, but page_evidence still cites it.
+        db.set_page_citations("page_dc", Some("[]")).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        assert_eq!(
+            edge_valid_until(&conn, &edge_id).await,
+            None,
+            "page_evidence still backs mem_shared -- dropping it from pages.citations alone must not retract the edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_write_page_citations_retracts_dropped_citation_when_unbacked() {
+        // D7: a citation dropped from pages.citations with NO other legacy
+        // store backing it must actually retract the edge -- including via
+        // the NULL failure-fallback write (round-2 item #2's "returns
+        // without cleanup for NULL/malformed JSON" gap) -- never leaving a
+        // removed citation's edge dangling active.
+        let (db, _dir) = test_db().await;
+        let edge_id = crate::provenance::compute_edge_id(
+            "cites", "page", "page_dc2", "memory", "mem_x", "mem_x",
+        );
+        {
+            let conn = db.conn.lock().await;
+            insert_raw_page_for_m81_test(&conn, "page_dc2", "space_a").await;
+        }
+        let initial = serde_json::json!([
+            {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_x",
+             "score": 0.9, "status": "verified", "scope": "sentence"}
+        ]);
+        db.set_page_citations("page_dc2", Some(&initial.to_string()))
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert_eq!(
+                edge_valid_until(&conn, &edge_id).await,
+                None,
+                "sanity: the edge is asserted active by the initial citation write"
+            );
+        }
+
+        // Explicit failure-fallback reset to NULL -- no other store backs
+        // mem_x, so the edge must retract.
+        db.set_page_citations("page_dc2", None).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        assert!(
+            edge_valid_until(&conn, &edge_id).await.is_some(),
+            "no legacy store backs mem_x anymore -- the edge must retract, not dangle active"
+        );
+    }
+
+    #[tokio::test]
+    async fn refcount_retracts_only_after_last_backing_store_drops_citation() {
+        // D7 order-independence: whichever legacy store (page_evidence vs
+        // pages.citations) drops its backing FIRST, the shared edge must
+        // stay active until the LAST one drops -- mirrors
+        // `dual_write_page_citations_preserves_edge_backed_by_page_evidence`
+        // (citations-first order) with the reverse order (page_evidence
+        // first, via orphan cleanup) to prove both orders converge on the
+        // same "retract only when refcount hits zero" outcome.
+        let (db, _dir) = test_db().await;
+        let edge_id = crate::provenance::compute_edge_id(
+            "cites", "page", "page_oi", "memory", "mem_oi", "mem_oi",
+        );
+        {
+            let conn = db.conn.lock().await;
+            insert_raw_page_for_m81_test(&conn, "page_oi", "space_a").await;
+            seed_page_evidence(&conn, "page_oi", "memory", Some("mem_oi")).await;
+        }
+        let citations = serde_json::json!([
+            {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_oi",
+             "score": 0.9, "status": "verified", "scope": "sentence"}
+        ]);
+        db.set_page_citations("page_oi", Some(&citations.to_string()))
+            .await
+            .unwrap();
+
+        // page_evidence's row for mem_oi is orphaned (no backing memory) --
+        // pages.citations still cites it, so the edge must stay active.
+        db.cleanup_orphaned_page_sources().await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert_eq!(
+                edge_valid_until(&conn, &edge_id).await,
+                None,
+                "pages.citations still backs mem_oi after page_evidence is pruned"
+            );
+        }
+
+        // Now pages.citations also drops it -- the last backing store is
+        // gone, so the edge must retract.
+        db.set_page_citations("page_oi", Some("[]")).await.unwrap();
+        let conn = db.conn.lock().await;
+        assert!(
+            edge_valid_until(&conn, &edge_id).await.is_some(),
+            "no legacy store backs mem_oi anymore -- the edge must retract"
         );
     }
 }

@@ -911,23 +911,23 @@ fn setup_background_status_roundtrip_isolated() {
     assert!(plist.contains("<string>com.wenlan.server</string>"));
     assert!(plist.contains("wenlan-server"));
     assert!(!plist.contains("origin</string>"));
-    // Launchd parity with the legacy embedded plist: stdout/stderr go to the
-    // data-root `logs/` dir and `RUST_LOG=info` survives across reboots.
+    // The daemon owns bounded file logging. launchd must not append an
+    // unbounded second copy of stdout/stderr across every restart.
     assert!(
         plist.contains("<key>StandardOutPath</key>"),
         "missing StandardOutPath in plist: {plist}"
     );
     assert!(
-        plist.contains("wenlan-server.stdout.log"),
-        "stdout log path not threaded into plist: {plist}"
+        plist.contains("<string>/dev/null</string>"),
+        "launchd stdout/stderr must be discarded after daemon-owned logging: {plist}"
     );
     assert!(
         plist.contains("<key>StandardErrorPath</key>"),
         "missing StandardErrorPath in plist: {plist}"
     );
     assert!(
-        plist.contains("wenlan-server.stderr.log"),
-        "stderr log path not threaded into plist: {plist}"
+        !plist.contains("wenlan-server.stdout.log") && !plist.contains("wenlan-server.stderr.log"),
+        "unbounded legacy launchd log paths remain in plist: {plist}"
     );
     assert!(
         plist.contains("<key>EnvironmentVariables</key>"),

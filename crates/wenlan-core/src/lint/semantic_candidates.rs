@@ -709,7 +709,17 @@ async fn load_memories(context: &LintContext<'_, '_>) -> Result<LoadedMemories, 
         let chunk_index: i64 = row.get(2).map_err(|_| ())?;
         let content: String = row.get(3).map_err(|_| ())?;
         let memory_type: Option<String> = row.get(4).map_err(|_| ())?;
-        let space: Option<String> = row.get(5).map_err(|_| ())?;
+        // M3 PR-1 stage e: `memories.space` is NOT NULL as of migration 91,
+        // so an unscoped memory now carries the reserved `UNFILED_SPACE_ID`
+        // sentinel rather than NULL. Translate it back to None here, same as
+        // load_pages already does for `p.workspace` (M1), so uncategorized
+        // memories keep grouping/matching against uncategorized (NULL-space)
+        // entities in build_entity_matchers/mentioned_entity_indexes and
+        // same_scope below.
+        let space: Option<String> = row
+            .get::<Option<String>>(5)
+            .map_err(|_| ())?
+            .filter(|s| s != crate::db::UNFILED_SPACE_ID);
         let last_modified: i64 = row.get(6).map_err(|_| ())?;
         digest_value(&mut digest, row_id.as_bytes());
         digest_value(&mut digest, source_id.as_bytes());

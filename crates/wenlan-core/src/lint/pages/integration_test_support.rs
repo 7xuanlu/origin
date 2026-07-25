@@ -105,5 +105,6 @@ pub(super) fn page(id: &str) -> Page {
         review_status: "confirmed".to_string(),
         workspace: None,
         citations: Vec::new(),
+        kind: "concept".to_string(),
     }
 }

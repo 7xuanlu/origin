@@ -178,9 +178,10 @@ fn origin_data_root() -> PathBuf {
 
 /// Builds a launchd plist that mirrors `service-manager`'s default output for
 /// `OnFailure` restart + user-level + autostart, with the extra keys the old
-/// embedded `com.wenlan.server.plist` template carried: `StandardOutPath`,
-/// `StandardErrorPath`, `EnvironmentVariables.RUST_LOG`, and the canonical
-/// `WENLAN_DATA_DIR` ownership marker consumed by the desktop app.
+/// embedded `com.wenlan.server.plist` template carried: stdout/stderr routing,
+/// `EnvironmentVariables.RUST_LOG`, and the canonical `WENLAN_DATA_DIR`
+/// ownership marker consumed by the desktop app. The daemon owns bounded file
+/// logging, so launchd routes its raw streams to `/dev/null`.
 ///
 /// `LaunchdInstallConfig` in service-manager 0.11 only exposes `keep_alive`;
 /// stdout/stderr paths must come through `ServiceInstallCtx.contents` as a
@@ -298,25 +299,18 @@ pub fn install() -> Result<()> {
     // exported in the user environment).
     let environment = Some(vec![("RUST_LOG".to_string(), "info".to_string())]);
 
-    // macOS: hand-roll the plist so we can keep `StandardOutPath` and
-    // `StandardErrorPath` parity with the legacy template. service-manager 0.11
-    // has no struct field for those keys, so the only honest knob is
+    // macOS: hand-roll the plist so launchd does not append an unbounded
+    // duplicate of the daemon-owned rotating log. service-manager 0.11 has no
+    // struct field for these keys, so the only honest knob is
     // `ServiceInstallCtx.contents`.
     let contents = {
         #[cfg(target_os = "macos")]
         {
             let data_root = origin_data_root();
-            let log_dir = data_root.join("logs");
-            // Best-effort: launchd creates parent dirs for log files in many
-            // builds, but creating ahead of time guarantees the daemon never
-            // racing the dir into existence on first start.
-            let _ = std::fs::create_dir_all(&log_dir);
-            let stdout_path = log_dir.join("wenlan-server.stdout.log");
-            let stderr_path = log_dir.join("wenlan-server.stderr.log");
             Some(build_launchd_plist(
                 &program,
-                &stdout_path,
-                &stderr_path,
+                Path::new("/dev/null"),
+                Path::new("/dev/null"),
                 "info",
                 &data_root,
             ))

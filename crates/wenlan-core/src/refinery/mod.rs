@@ -1164,7 +1164,9 @@ async fn run_periodic_steep_with_api_scope(
     // the SAME pass but is NEVER gated by `page_map_auto_suggest` — only this
     // background phase is. Bounded to 5 pages per pass. Always Silent (no
     // user-facing nudge; suggestions surface in the map UI, not as a toast).
-    if page_map_auto_suggest && trigger.runs_phase(Phase::PageMaps) {
+    // `runs_phase` (not `trigger.runs_phase`): a phase-sliced background turn
+    // must not leak page_maps into another phase's slice when auto-suggest is on.
+    if page_map_auto_suggest && runs_phase(Phase::PageMaps) {
         let phase = run_phase(Phase::PageMaps, || async {
             let improved = crate::page_map_improve::run_proactive_page_maps(db_ref, 5).await?;
             let (nudge, headline) = classify_backfill(improved);
@@ -2608,7 +2610,10 @@ mod tests {
 
     #[tokio::test]
     async fn background_steep_phase_slice_runs_only_the_requested_phase() {
+        let _env_serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
         let (db, _dir) = test_db().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
         db.upsert_documents(vec![make_memory(
             "phase_slice_smoke",
             "A background turn must return after one refinery phase.",
@@ -2618,22 +2623,32 @@ mod tests {
         .await
         .unwrap();
 
-        let result = run_periodic_steep_phase_with_api(
-            &db,
-            None,
-            None,
-            None,
-            None,
-            &PromptRegistry::default(),
-            &crate::tuning::RefineryConfig::default(),
-            &crate::tuning::ConfidenceConfig::default(),
-            &crate::tuning::DistillationConfig::default(),
-            None,
-            TriggerKind::Backstop,
-            Phase::Decay,
-        )
-        .await
-        .unwrap();
+        let result =
+            temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+                let config = crate::config::Config {
+                    page_map_auto_suggest: true,
+                    ..crate::config::Config::default()
+                };
+                crate::config::save_config(&config).unwrap();
+
+                run_periodic_steep_phase_with_api(
+                    &db,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &PromptRegistry::default(),
+                    &crate::tuning::RefineryConfig::default(),
+                    &crate::tuning::ConfidenceConfig::default(),
+                    &crate::tuning::DistillationConfig::default(),
+                    None,
+                    TriggerKind::Backstop,
+                    Phase::Decay,
+                )
+                .await
+            })
+            .await
+            .unwrap();
 
         let phases: Vec<&str> = result
             .result

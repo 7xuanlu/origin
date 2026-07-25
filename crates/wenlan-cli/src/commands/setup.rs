@@ -245,6 +245,8 @@ pub async fn run_doctor() -> anyhow::Result<()> {
     println!("Wenlan doctor");
     println!();
     print_daemon_health().await;
+    #[cfg(target_os = "macos")]
+    print_daemon_log_paths();
     print_key_status();
     print_model_status();
     print_reranker_status().await;
@@ -274,6 +276,38 @@ pub async fn run_doctor() -> anyhow::Result<()> {
     print_space_resolution(&cwd);
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn print_daemon_log_paths() {
+    let data_root = std::env::var_os("WENLAN_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("wenlan")
+        });
+    let fallback_root = dirs::home_dir()
+        .map(|home| home.join("Library/Logs/com.wenlan.server-fallback"))
+        .unwrap_or_else(|| std::env::temp_dir().join("wenlan-server-fallback"));
+    println!(
+        "Daemon log: {}",
+        data_root.join("logs/wenlan-server.log").display()
+    );
+    println!(
+        "Bootstrap log: {}",
+        data_root.join("logs/wenlan-server.bootstrap.log").display()
+    );
+    println!(
+        "Bootstrap fallback log: {}",
+        fallback_root
+            .join("logs/wenlan-server.bootstrap.log")
+            .display()
+    );
+    println!(
+        "Daemon fallback log: {}",
+        fallback_root.join("logs/wenlan-server.log").display()
+    );
 }
 
 pub async fn print_runtime_status() -> anyhow::Result<()> {

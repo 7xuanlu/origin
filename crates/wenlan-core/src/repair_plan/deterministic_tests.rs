@@ -830,9 +830,9 @@ async fn imported_document_owner_with_missing_entity_prepares_and_applies_in_sco
         .await
         .execute_batch(
             "INSERT INTO memories
-                 (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,space)
+                 (id,content,source,source_id,title,chunk_index,last_modified,chunk_type)
              VALUES
-                 ('row_doc','Imported Topic','local_files','/tmp/doc.md','doc',0,1,'text',NULL);
+                 ('row_doc','Imported Topic','local_files','/tmp/doc.md','doc',0,1,'text');
              PRAGMA foreign_keys=OFF;
              INSERT INTO memory_entities(memory_id,entity_id)
              VALUES ('/tmp/doc.md','entity_missing');

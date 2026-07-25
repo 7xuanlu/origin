@@ -144,12 +144,12 @@ static EVAL_EMBEDDER: LazyLock<Arc<std::sync::Mutex<fastembed::TextEmbedding>>> 
         // otherwise every git worktree starts from an empty cwd cache and re-downloads the
         // model. Mirrors the db.rs production/test embedder via `resolve_fastembed_cache_dir`;
         // the `db_path` here is a sentinel, so only the env + default tiers apply.
-        if let Some(cache) =
-            crate::db::resolve_fastembed_cache_dir(std::path::Path::new(".nonexistent"))
-        {
-            opts = opts.with_cache_dir(cache);
+        let cache_dir =
+            crate::db::resolve_fastembed_cache_dir(std::path::Path::new(".nonexistent"));
+        if let Some(cache) = &cache_dir {
+            opts = opts.with_cache_dir(cache.clone());
         }
-        let embedder = fastembed::TextEmbedding::try_new(opts)
+        let embedder = crate::db::init_text_embedding(opts)
             .expect("failed to load BGE-Base-EN-v1.5-Q ONNX model");
         let arc = Arc::new(std::sync::Mutex::new(embedder));
         // Leak one strong ref so the Arc never reaches zero and the destructor never runs.

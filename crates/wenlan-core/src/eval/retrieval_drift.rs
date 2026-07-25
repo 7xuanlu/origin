@@ -309,8 +309,8 @@ mod tests {
 
     /// The differential drift gate (L6, push to `main`). Captures live rankings and
     /// asserts top-weighted RBO vs both the current and the old-anchor goldens.
-    /// `#[ignore]`d (needs the FastEmbed model); the existing CI step
-    /// `--run-ignored=only eval::retrieval` picks it up by substring (no ci.yml change).
+    /// `#[ignore]`d (needs the FastEmbed model); the dedicated main-canary workflow's
+    /// `--run-ignored=only eval::retrieval` picks it up by substring.
     #[tokio::test]
     #[ignore] // L6 — needs FastEmbed model; runs on push to main via --run-ignored=only eval::retrieval
     async fn ranking_drift_vs_golden() {

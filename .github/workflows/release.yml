@@ -195,11 +195,6 @@ jobs:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
-      # sccache caches rustc + build-script outputs to GHA. Big win on the
-      # C/C++-heavy crates we pull (openssl-src, ring, llama-cpp-sys).
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
       # vcpkg sqlite3 for Windows — libsql 0.9 needs `sqlite3.lib` at link
       # time and does not bundle SQLite on Windows. Mirrors ci.yml's test
       # step. GitHub `windows-2022` runner ships vcpkg preinstalled.
@@ -253,9 +248,6 @@ jobs:
         run: '"CARGO_BUILD_JOBS=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
 
       - name: Build
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build --release -p wenlan -p wenlan-server -p wenlan-mcp --target ${{ matrix.target }}
 
       - name: Smoke
