@@ -119,6 +119,208 @@ fn resolve_startup_port(configured_port: u16, startup_repair_claimed: bool) -> a
     Ok(configured_port)
 }
 
+#[cfg(target_os = "macos")]
+const SERVER_LOG_MAX_BYTES: usize = 10 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const SERVER_LOG_BACKUPS: usize = 5;
+#[cfg(any(target_os = "macos", test))]
+const BOOTSTRAP_LOG_MAX_BYTES: usize = 256 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const BOOTSTRAP_LOG_BACKUPS: usize = 1;
+
+fn resolve_wenlan_root() -> std::path::PathBuf {
+    wenlan_core::env_compat::var_compat("WENLAN_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("wenlan")
+        })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn preflight_rotating_log_path(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "log path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("log path is not a regular file"));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn new_server_log_writer(
+    wenlan_root: &std::path::Path,
+    max_bytes: usize,
+    backups: usize,
+) -> std::io::Result<file_rotate::FileRotate<file_rotate::suffix::AppendCount>> {
+    let path = wenlan_root.join("logs/wenlan-server.log");
+    preflight_rotating_log_path(&path)?;
+    Ok(file_rotate::FileRotate::new(
+        path,
+        file_rotate::suffix::AppendCount::new(backups),
+        file_rotate::ContentLimit::Bytes(max_bytes),
+        file_rotate::compression::Compression::None,
+        None,
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn new_bootstrap_log_writer(
+    wenlan_root: &std::path::Path,
+    max_bytes: usize,
+    backups: usize,
+) -> std::io::Result<file_rotate::FileRotate<file_rotate::suffix::AppendCount>> {
+    let path = wenlan_root.join("logs/wenlan-server.bootstrap.log");
+    preflight_rotating_log_path(&path)?;
+    Ok(file_rotate::FileRotate::new(
+        path,
+        file_rotate::suffix::AppendCount::new(backups),
+        file_rotate::ContentLimit::Bytes(max_bytes),
+        file_rotate::compression::Compression::None,
+        None,
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn write_bootstrap_message(
+    wenlan_root: &std::path::Path,
+    fallback_root: &std::path::Path,
+    message: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+
+    let (mut writer, path) =
+        match new_bootstrap_log_writer(wenlan_root, BOOTSTRAP_LOG_MAX_BYTES, BOOTSTRAP_LOG_BACKUPS)
+        {
+            Ok(writer) => (writer, wenlan_root.join("logs/wenlan-server.bootstrap.log")),
+            Err(primary_error) => {
+                eprintln!(
+                    "Primary bootstrap log unavailable at {}: {primary_error}",
+                    wenlan_root.display()
+                );
+                (
+                    new_bootstrap_log_writer(
+                        fallback_root,
+                        BOOTSTRAP_LOG_MAX_BYTES,
+                        BOOTSTRAP_LOG_BACKUPS,
+                    )?,
+                    fallback_root.join("logs/wenlan-server.bootstrap.log"),
+                )
+            }
+        };
+    writeln!(writer, "{message}")?;
+    writer.flush()?;
+    Ok(path)
+}
+
+fn report_bootstrap_error(wenlan_root: &std::path::Path, message: &str) {
+    #[cfg(not(target_os = "macos"))]
+    let _ = wenlan_root;
+
+    eprintln!("{message}");
+    tracing::error!("{message}");
+
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("XPC_SERVICE_NAME").is_some() {
+        let fallback_root = fallback_log_root();
+        let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_bootstrap_message(wenlan_root, &fallback_root, message)
+        }));
+        if let Err(error) = write_result.unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "bootstrap log writer panicked while reporting an error",
+            ))
+        }) {
+            eprintln!("Failed to write bootstrap log: {error}");
+        }
+    }
+}
+
+fn install_bootstrap_panic_hook(wenlan_root: std::path::PathBuf) {
+    std::panic::set_hook(Box::new(move |panic| {
+        report_bootstrap_error(
+            &wenlan_root,
+            &format!("panic during daemon bootstrap: {panic}"),
+        );
+    }));
+}
+
+fn new_server_log_rate_limit() -> tracing_throttle::TracingRateLimitLayer {
+    tracing_throttle::TracingRateLimitLayer::new()
+}
+
+#[cfg(target_os = "macos")]
+fn fallback_log_root() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join("Library/Logs/com.wenlan.server-fallback"))
+        .unwrap_or_else(|| std::env::temp_dir().join("wenlan-server-fallback"))
+}
+
+fn init_logging(wenlan_root: &std::path::Path) -> anyhow::Result<()> {
+    use tracing_subscriber::prelude::*;
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = wenlan_root;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,wenlan_core=info,wenlan_server=info".into());
+
+    #[cfg(target_os = "macos")]
+    {
+        let writer = match new_server_log_writer(
+            wenlan_root,
+            SERVER_LOG_MAX_BYTES,
+            SERVER_LOG_BACKUPS,
+        ) {
+            Ok(writer) => writer,
+            Err(primary_error) => {
+                let fallback_root = fallback_log_root();
+                eprintln!(
+                    "Primary daemon log unavailable at {}: {primary_error}; using {}",
+                    wenlan_root.display(),
+                    fallback_root.display()
+                );
+                new_server_log_writer(
+                    &fallback_root,
+                    SERVER_LOG_MAX_BYTES,
+                    SERVER_LOG_BACKUPS,
+                )
+                .map_err(|fallback_error| {
+                    anyhow::anyhow!(
+                        "initialize rotating file logging: primary={primary_error}; fallback={fallback_error}"
+                    )
+                })?
+            }
+        };
+        let writer = std::sync::Mutex::new(writer);
+        let fmt = tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_filter(new_server_log_rate_limit());
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("initialize rotating file logging: {error}"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let fmt = tracing_subscriber::fmt::layer().with_filter(new_server_log_rate_limit());
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("initialize console logging: {error}"))
+    }
+}
+
 fn startup_projection_writes_allowed(repair_recovery_pending: bool) -> bool {
     !repair_recovery_pending
 }
@@ -293,6 +495,124 @@ mod bind_addr_tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var("WENLAN_BIND_ADDR");
         assert_eq!(resolve_bind_addr(7878), "127.0.0.1:7878");
+    }
+
+    #[test]
+    fn server_log_writer_rotates_at_byte_cap_and_bounds_retention() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = new_server_log_writer(root.path(), 64, 2).unwrap();
+        for index in 0..20 {
+            writeln!(writer, "bounded log line {index:02}").unwrap();
+        }
+        drop(writer);
+
+        let log_dir = root.path().join("logs");
+        let mut logs = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("wenlan-server.log"))
+            })
+            .collect::<Vec<_>>();
+        logs.sort();
+
+        assert_eq!(
+            logs.len(),
+            3,
+            "current log plus exactly two retained rotations: {logs:?}"
+        );
+        assert!(
+            logs.iter().all(|path| path.metadata().unwrap().len() <= 64),
+            "a rotated log exceeded the byte cap: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_log_writer_rotates_at_byte_cap_and_bounds_retention() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = new_bootstrap_log_writer(root.path(), 64, 1).unwrap();
+        for index in 0..20 {
+            writeln!(writer, "bootstrap failure line {index:02}").unwrap();
+        }
+        drop(writer);
+
+        let log_dir = root.path().join("logs");
+        let mut logs = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("wenlan-server.bootstrap.log"))
+            })
+            .collect::<Vec<_>>();
+        logs.sort();
+
+        assert_eq!(logs.len(), 2, "current log plus one rotation: {logs:?}");
+        assert!(
+            logs.iter().all(|path| path.metadata().unwrap().len() <= 64),
+            "a bootstrap log exceeded the byte cap: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn server_log_rate_limit_suppresses_duplicate_bursts() {
+        use tracing_subscriber::prelude::*;
+
+        let rate_limit = new_server_log_rate_limit();
+        let metrics_layer = rate_limit.clone();
+        let metrics = metrics_layer.metrics();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::sync::Mutex::new(Vec::<u8>::new()))
+                .with_filter(rate_limit),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..100 {
+                tracing::warn!("identical repeatable failure");
+            }
+        });
+
+        assert!(
+            metrics.events_suppressed() > 0,
+            "an identical 100-event burst must be throttled"
+        );
+    }
+
+    #[test]
+    fn rotating_log_construction_reports_an_unusable_directory_without_panicking() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("logs"), "not a directory").unwrap();
+
+        let result = std::panic::catch_unwind(|| new_server_log_writer(root.path(), 64, 1));
+
+        assert!(result.is_ok(), "logger construction must not panic");
+        assert!(
+            result.unwrap().is_err(),
+            "unusable log paths must fail loud"
+        );
+    }
+
+    #[test]
+    fn bootstrap_logging_falls_back_when_the_data_root_is_unwritable() {
+        let primary = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        std::fs::write(primary.path().join("logs"), "not a directory").unwrap();
+
+        let path =
+            write_bootstrap_message(primary.path(), fallback.path(), "bootstrap sentinel").unwrap();
+
+        assert!(path.starts_with(fallback.path()));
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("bootstrap sentinel"));
     }
 
     #[test]
@@ -722,15 +1042,7 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
     // instead of taking the process down through the platform default path.
     let termination_signals = install_termination_signals()
         .map_err(|error| anyhow::anyhow!("install termination signal handlers: {error}"))?;
-    // Logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,wenlan_core=info,wenlan_server=info".into()),
-        )
-        .init();
-
-    tracing::info!("wenlan-server v{}", wenlan_core::version());
+    let wenlan_root = resolve_wenlan_root();
 
     // Port (clap `--port`/`WENLAN_PORT` → env var set by main(); read here)
     let configured_port: u16 = wenlan_core::env_compat::var_compat("WENLAN_PORT")
@@ -756,7 +1068,7 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                 ));
             }
             // Check if existing daemon is healthy
-            tracing::warn!("Failed to bind {}: {}", addr, e);
+            eprintln!("Failed to bind {addr}: {e}");
             let url = format!("http://127.0.0.1:{}/api/health", port);
             // Bounded probe: a mute port-holder (accepts, never responds)
             // must not hang this process forever — under launchd KeepAlive
@@ -776,13 +1088,15 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                     // = false treats exit-0 as success). For sidecar invocation
                     // by the app, exit 0 is the right answer.
                     if std::env::var_os("XPC_SERVICE_NAME").is_some() {
-                        tracing::info!(
-                            "Existing healthy daemon on port {} — exiting 75 (launchd retry)",
-                            port
+                        report_bootstrap_error(
+                            &wenlan_root,
+                            &format!(
+                                "Existing healthy daemon on port {port} — exiting 75 (launchd retry)"
+                            ),
                         );
                         std::process::exit(75);
                     }
-                    tracing::info!("Existing healthy daemon on port {} — exiting cleanly", port);
+                    eprintln!("Existing healthy daemon on port {port} — exiting cleanly");
                     return Ok(());
                 }
                 _ => {
@@ -795,17 +1109,16 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
         }
     };
 
+    init_logging(&wenlan_root)?;
+    std::panic::set_hook(Box::new(|panic| {
+        tracing::error!("panic: {panic}");
+    }));
+    tracing::info!("wenlan-server v{}", wenlan_core::version());
+
     #[cfg(debug_assertions)]
     wait_at_startup_signal_test_barrier().await?;
     // Data directory. `WENLAN_DATA_DIR` (set by `--data-dir` flag) overrides the
     // default, enabling isolated dev/demo runs (e.g. `--data-dir /tmp/wenlan-demo`).
-    let wenlan_root = wenlan_core::env_compat::var_compat("WENLAN_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("wenlan")
-        });
     let data_dir = wenlan_root.join("memorydb");
     tracing::info!("Wenlan data root: {}", wenlan_root.display());
     let _data_root_lock = DaemonDataLock::acquire(&wenlan_root, startup_repair_claimed)?;
@@ -1830,14 +2143,6 @@ async fn ingest_batch_process(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let startup_repair_claim = StartupRepairClaim::try_new(
-        cli.repair_manifest_id.clone(),
-        cli.repair_manifest_digest.clone(),
-    )?;
-
-    if cli.command.is_some() && startup_repair_claim.is_some() {
-        anyhow::bail!("startup repair claim is only valid when running the daemon");
-    }
 
     // Propagate flags through env vars so both wenlan-server's own path logic
     // and wenlan-core's config loader (`wenlan_core::config::config_path`) see
@@ -1849,8 +2154,34 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("WENLAN_PORT", port.to_string());
     }
 
-    match cli.command {
-        Some(Command::BackfillStalePages { dry_run }) => cmd_backfill::run(dry_run).await,
-        None => run_daemon(startup_repair_claim).await,
+    // Resolving the path is read-only. Before rotating tracing is available,
+    // a bounded bootstrap file keeps launchd failures and panics observable
+    // even though the plist intentionally redirects stdout/stderr to /dev/null.
+    let wenlan_root = resolve_wenlan_root();
+    install_bootstrap_panic_hook(wenlan_root.clone());
+
+    let result = async {
+        let startup_repair_claim = StartupRepairClaim::try_new(
+            cli.repair_manifest_id.clone(),
+            cli.repair_manifest_digest.clone(),
+        )?;
+
+        if cli.command.is_some() && startup_repair_claim.is_some() {
+            anyhow::bail!("startup repair claim is only valid when running the daemon");
+        }
+
+        match cli.command {
+            Some(Command::BackfillStalePages { dry_run }) => cmd_backfill::run(dry_run).await,
+            None => run_daemon(startup_repair_claim).await,
+        }
     }
+    .await;
+
+    if let Err(error) = &result {
+        report_bootstrap_error(
+            &wenlan_root,
+            &format!("wenlan-server terminated with an error: {error:#}"),
+        );
+    }
+    result
 }

@@ -59,6 +59,9 @@ jobs:
           # Coverage builds with `-C instrument-coverage`, so artifacts are not
           # interchangeable with the `clippy` or `test` caches in ci.yml.
           shared-key: coverage
+          # Manual feature-branch runs may restore main's cache but must not
+          # create branch-scoped entries that no other ref can reuse.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache fastembed model (Linux)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -76,9 +79,10 @@ jobs:
       - name: Run Rust coverage (wenlan-core + wenlan-server)
         run: |
           cargo llvm-cov --package wenlan-core --package wenlan-server \
+            --no-report
+          cargo llvm-cov report \
             --summary-only --json --output-path rust-coverage.json
-          cargo llvm-cov --package wenlan-core --package wenlan-server \
-            --summary-only
+          cargo llvm-cov report
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

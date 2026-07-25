@@ -1,0 +1,447 @@
+name: CI Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: 'Orthogonal benchmark suite to run'
+        required: true
+        type: choice
+        default: p5-test-engine
+        options:
+          - p4-runners
+          - p5-test-engine
+          - p5-windows-drive
+          - p6-release
+          - all
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  p4-runners:
+    name: P4 runner ${{ matrix.os }}
+    if: inputs.experiment == 'p4-runners' || inputs.experiment == 'all'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-latest
+          - macos-14
+          - macos-15
+          - macos-26
+          - macos-latest
+          - windows-2022
+          - windows-2025
+          - windows-latest
+    env:
+      BENCH_REQUESTED_RUNNER: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Install sqlite3 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install sqlite3:x64-windows-static-md
+          "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Configure rust-lld (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $lld = Join-Path ((rustc --print sysroot).Trim()) `
+            "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          if (-not (Test-Path $lld)) { throw "rust-lld.exe missing at $lld" }
+          "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Fetch locked dependencies outside timed region
+        run: cargo fetch --locked
+      - name: Measure native release build
+        shell: bash
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-receipts
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          python3 scripts/ci-timed-command.py \
+            --label "p4-runners-${{ matrix.os }}" \
+            --output "benchmark-receipts/p4-${{ matrix.os }}.json" \
+            --hash "target/release/wenlan${suffix}" \
+            -- cargo build --locked --release \
+              -p wenlan -p wenlan-server -p wenlan-mcp
+      - name: Smoke native release binaries
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          "./target/release/wenlan${suffix}" --help
+          "./target/release/wenlan-server${suffix}" --help
+      - name: Upload P4 receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p4-runners-${{ matrix.os }}-${{ github.run_attempt }}
+          path: benchmark-receipts/
+          retention-days: 30
+          if-no-files-found: error
+
+  p5-test-engine:
+    name: P5 ${{ matrix.engine }} compiler-cache=${{ matrix.compiler_cache }}
+    if: inputs.experiment == 'p5-test-engine' || inputs.experiment == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [nextest, libtest]
+        compiler_cache: [cold, warm]
+    env:
+      BENCH_REQUESTED_RUNNER: ubuntu-24.04
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Install cargo-nextest
+        if: matrix.engine == 'nextest'
+        uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
+        with:
+          tool: cargo-nextest
+      - name: Set up read-only sccache
+        if: matrix.compiler_cache == 'warm'
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Enable read-only sccache
+        if: matrix.compiler_cache == 'warm'
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Restore production compiler inputs
+        if: matrix.compiler_cache == 'warm'
+        id: rust-cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: test
+          cache-all-crates: "true"
+          cache-targets: "false"
+          save-if: "false"
+      # This is held constant across both compiler-cache arms; the experiment
+      # compares test harness/compiler reuse, not model-download latency.
+      - name: Restore shared FastEmbed model prerequisite
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-bge-base-en-v1.5-q-v2
+          restore-keys: |
+            fastembed-bge-base-en-v1.5-q-
+      - name: Fetch locked dependencies outside timed region
+        run: cargo fetch --locked
+      - name: Measure nextest
+        if: matrix.engine == 'nextest'
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          mkdir -p benchmark-receipts
+          python3 scripts/ci-timed-command.py \
+            --label "p5-test-engine-nextest-compiler-${{ matrix.compiler_cache }}" \
+            --output "benchmark-receipts/p5-nextest-${{ matrix.compiler_cache }}.json" \
+            -- cargo nextest run --workspace --lib
+      - name: Measure libtest
+        if: matrix.engine == 'libtest'
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          mkdir -p benchmark-receipts
+          python3 scripts/ci-timed-command.py \
+            --label "p5-test-engine-libtest-compiler-${{ matrix.compiler_cache }}" \
+            --output "benchmark-receipts/p5-libtest-${{ matrix.compiler_cache }}.json" \
+            -- cargo test --workspace --lib --no-fail-fast
+      - name: Record cache evidence
+        if: always()
+        shell: bash
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          mkdir -p benchmark-receipts
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path("benchmark-receipts/cache.json").write_text(json.dumps({
+              "requested_compiler_cache_mode": "${{ matrix.compiler_cache }}",
+              "fastembed_model_cache": "shared-prerequisite",
+              "rust_cache_hit": os.environ.get("RUST_CACHE_HIT", ""),
+              "rust_cache_shared_key": "test",
+          }, sort_keys=True) + "\n")
+          PY
+          if command -v sccache >/dev/null; then
+            sccache --show-stats --stats-format=json \
+              > benchmark-receipts/sccache.json || true
+          fi
+      - name: Upload P5 test-engine receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p5-test-engine-${{ matrix.engine }}-${{ matrix.compiler_cache }}-${{ github.run_attempt }}
+          path: benchmark-receipts/
+          retention-days: 30
+          if-no-files-found: error
+
+  p5-windows-drive:
+    name: P5 Windows ${{ matrix.drive }} drive
+    if: inputs.experiment == 'p5-windows-drive' || inputs.experiment == 'all'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        drive: [C, D]
+    env:
+      BENCH_REQUESTED_RUNNER: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Probe and configure benchmark drive
+        id: drive
+        shell: pwsh
+        run: |
+          $drive = "${{ matrix.drive }}:"
+          New-Item -ItemType Directory -Force benchmark-receipts | Out-Null
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name, Root, Used, Free |
+            ConvertTo-Json |
+            Set-Content benchmark-receipts/drives.json
+          if (-not (Test-Path "$drive/")) {
+            @{ status = "unsupported"; requested_drive = $drive } |
+              ConvertTo-Json |
+              Set-Content "benchmark-receipts/p5-drive-${{ matrix.drive }}.json"
+            "supported=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+          $root = "$drive/wenlan-benchmark/$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $cargoHome = "$root/cargo"
+          $target = "$root/target"
+          $temp = "$root/temp"
+          New-Item -ItemType Directory -Force $cargoHome, $target, $temp | Out-Null
+          @(
+            "CARGO_HOME=$cargoHome",
+            "CARGO_TARGET_DIR=$target",
+            "TEMP=$temp",
+            "TMP=$temp",
+            "TMPDIR=$temp"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append
+          "supported=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Install sqlite3
+        if: steps.drive.outputs.supported == 'true'
+        shell: pwsh
+        run: |
+          vcpkg install sqlite3:x64-windows-static-md
+          "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Configure rust-lld
+        if: steps.drive.outputs.supported == 'true'
+        shell: pwsh
+        run: |
+          $lld = Join-Path ((rustc --print sysroot).Trim()) `
+            "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          if (-not (Test-Path $lld)) { throw "rust-lld.exe missing at $lld" }
+          "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Fetch locked dependencies outside timed region
+        if: steps.drive.outputs.supported == 'true'
+        run: cargo fetch --locked
+      - name: Measure release build on selected drive
+        if: steps.drive.outputs.supported == 'true'
+        shell: pwsh
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          python3 scripts/ci-timed-command.py `
+            --label "p5-windows-drive-${{ matrix.drive }}" `
+            --output "benchmark-receipts/p5-drive-${{ matrix.drive }}.json" `
+            --hash "$env:CARGO_TARGET_DIR/release/wenlan.exe" `
+            -- cargo build --locked --release `
+              -p wenlan -p wenlan-server -p wenlan-mcp
+      - name: Upload P5 Windows drive receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p5-windows-drive-${{ matrix.drive }}-${{ github.run_attempt }}
+          path: benchmark-receipts/
+          retention-days: 30
+          if-no-files-found: error
+
+  p6-release:
+    name: P6 ${{ matrix.os }} ${{ matrix.profile }} ${{ matrix.cache_mode }}
+    if: inputs.experiment == 'p6-release' || inputs.experiment == 'all'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, profile: current, cache_mode: cold, cgu: "16", lto: thin }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, profile: current, cache_mode: production-restore, cgu: "16", lto: thin }
+          - { os: macos-14, target: aarch64-apple-darwin, profile: current, cache_mode: cold, cgu: "16", lto: thin }
+          - { os: macos-14, target: aarch64-apple-darwin, profile: current, cache_mode: production-restore, cgu: "16", lto: thin }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: cold, cgu: "16", lto: thin }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: production-restore, cgu: "16", lto: thin }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: no-lto, cache_mode: cold, cgu: "16", lto: "off" }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: no-lto, cache_mode: production-restore, cgu: "16", lto: "off" }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: parallel-no-lto, cache_mode: cold, cgu: "256", lto: "off" }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: parallel-no-lto, cache_mode: production-restore, cgu: "256", lto: "off" }
+    env:
+      BENCH_REQUESTED_RUNNER: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Install sqlite3 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install sqlite3:x64-windows-static-md
+          "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Stabilize Windows Rust cache toolchain inputs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/stabilize-rust-cache-toolchains.sh
+      # Mirrors ci.yml's main-owned Windows release cache lookup.
+      - name: Configure rust-lld (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $lld = Join-Path ((rustc --print sysroot).Trim()) `
+            "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          if (-not (Test-Path $lld)) { throw "rust-lld.exe missing at $lld" }
+          "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Restore production release cache
+        if: matrix.cache_mode == 'production-restore'
+        id: rust-cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: ${{ runner.os == 'Windows' && 'windows-release' || format('release-{0}', matrix.target) }}
+          cache-all-crates: "true"
+          save-if: "false"
+      # Restore before setting alternate profile variables. rust-cache hashes
+      # CARGO_* inputs, so the current arm must match the production key.
+      - name: Configure alternate release profile
+        if: matrix.profile != 'current'
+        shell: bash
+        run: |
+          {
+            echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${{ matrix.cgu }}"
+            echo "CARGO_PROFILE_RELEASE_LTO=${{ matrix.lto }}"
+            echo "CARGO_PROFILE_RELEASE_STRIP=debuginfo"
+            echo "CARGO_PROFILE_RELEASE_INCREMENTAL=false"
+          } >> "$GITHUB_ENV"
+      - name: Fetch locked dependencies outside timed region
+        run: cargo fetch --locked
+      - name: Measure release profile (Linux/macOS artifact layout)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-receipts
+          python3 scripts/ci-timed-command.py \
+            --label "p6-release-${{ matrix.os }}-${{ matrix.profile }}-${{ matrix.cache_mode }}" \
+            --output "benchmark-receipts/p6-${{ matrix.os }}-${{ matrix.profile }}-${{ matrix.cache_mode }}.json" \
+            --hash "target/${{ matrix.target }}/release/wenlan" \
+            -- cargo build --locked --release \
+              -p wenlan -p wenlan-server -p wenlan-mcp \
+              --target "${{ matrix.target }}"
+      - name: Measure release profile (Windows required-proof layout)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          New-Item -ItemType Directory -Force benchmark-receipts | Out-Null
+          python3 scripts/ci-timed-command.py `
+            --label "p6-release-${{ matrix.os }}-${{ matrix.profile }}-${{ matrix.cache_mode }}" `
+            --output "benchmark-receipts/p6-${{ matrix.os }}-${{ matrix.profile }}-${{ matrix.cache_mode }}.json" `
+            --hash "target/release/wenlan.exe" `
+            -- cargo build --locked --release `
+              -p wenlan -p wenlan-server -p wenlan-mcp -p wenlan-core `
+              --bin wenlan --bin wenlan-server --bin wenlan-mcp --bin model_probe
+      - name: Smoke release binaries
+        shell: bash
+        run: |
+          suffix=""
+          root="target/${{ matrix.target }}/release"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            suffix=".exe"
+            root="target/release"
+          fi
+          "./${root}/wenlan${suffix}" --help
+          "./${root}/wenlan-server${suffix}" --help
+      - name: Stage ONNX Runtime and smoke Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\release"
+          & scripts/smoke-windows.ps1 `
+            -ExePath "target\release\wenlan-server.exe"
+      - name: Record release cache evidence
+        if: always()
+        shell: bash
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          mkdir -p benchmark-receipts
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          requested_mode = "${{ matrix.cache_mode }}"
+          profile = "${{ matrix.profile }}"
+          effective_cache = (
+              "profile-invalidated-cold"
+              if requested_mode == "production-restore" and profile != "current"
+              else requested_mode
+          )
+          Path("benchmark-receipts/cache.json").write_text(json.dumps({
+              "requested_mode": requested_mode,
+              "effective_cache": effective_cache,
+              "profile": profile,
+              "rust_cache_hit": os.environ.get("RUST_CACHE_HIT", ""),
+              "rust_cache_shared_key": "${{ runner.os == 'Windows' && 'windows-release' || format('release-{0}', matrix.target) }}",
+          }, sort_keys=True) + "\n")
+          PY
+      - name: Upload P6 receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p6-release-${{ matrix.os }}-${{ matrix.profile }}-${{ matrix.cache_mode }}-${{ github.run_attempt }}
+          path: benchmark-receipts/
+          retention-days: 30
+          if-no-files-found: error
