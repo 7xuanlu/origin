@@ -2063,7 +2063,7 @@ pub async fn handle_search_pages(
         crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
             .await?;
     let results = db
-        .search_pages_scoped(
+        .search_pages_scoped_browse(
             &req.query,
             req.limit.unwrap_or(20),
             req.page_type.as_deref(),
@@ -2138,10 +2138,17 @@ pub async fn handle_export_pages(
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let pages = db
+    // Q1 lifted `list_pages_scoped`'s entity-kind fence for browse/search, but
+    // export must stay stub-free: `kind='entity'` dual-write shadow pages
+    // carry no content and are not meant to leave the daemon. Pure
+    // retain-on-kind of an already-fetched Vec, not business logic.
+    let pages: Vec<_> = db
         .list_pages_scoped("active", 1000, 0, &scope)
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .into_iter()
+        .filter(|p| p.kind != "entity")
+        .collect();
     let vault_path = req
         .vault_path
         .unwrap_or_else(|| "~/obsidian-vault/Wenlan/pages".to_string());
@@ -2176,10 +2183,14 @@ pub async fn handle_export_page(
     };
 
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    // Q1 lifted `get_page_scoped`'s entity-kind fence for browse, but export
+    // must stay stub-free (see handle_export_pages); a stub id 404s here as
+    // it did before the lift.
     let page = db
         .get_page_scoped(&page_id, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?
+        .filter(|p| p.kind != "entity")
         .ok_or_else(|| ServerError::NotFound("page not found".to_string()))?;
 
     let expanded = if let Some(rest) = req.vault_path.strip_prefix("~/") {
