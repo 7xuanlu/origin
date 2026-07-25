@@ -2401,7 +2401,7 @@ jobs:
         "nextest config",
         "release-profile-sensitive",
         "release-sensitive",
-        "30-minute PR budget",
+        "30-minute non-Windows PR budget",
         "independent differential job",
         "rust-lld",
         "does not also schedule",
