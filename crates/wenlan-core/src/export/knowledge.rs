@@ -4513,6 +4513,63 @@ mod tests {
         );
     }
 
+    /// Q1 (stage c fix wave): the daemon startup backfill (`main.rs`, guarded
+    /// by `startup_projection_writes_allowed`) fetches its page set via
+    /// `db.list_pages("active", 10_000, 0)` and then unconditionally calls
+    /// `KnowledgeProjectionWrite::write_page` for every page returned —
+    /// `write_page` itself has no kind filter, so the guarantee that a
+    /// `kind='entity'` dual-write shadow never lands on disk lives entirely
+    /// in `list_pages` staying fenced. This mirrors that exact call sequence
+    /// (fetch, then write-loop) rather than calling `write_page` directly, so
+    /// a regression in the fence — not in this file — would fail it too.
+    #[tokio::test]
+    async fn knowledge_projection_backfill_excludes_entity_kind_shadow() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        db.insert_page_with_kind(
+            "p_q1_backfill_concept",
+            "Q1 Backfill Concept Page",
+            None,
+            "concept content",
+            None,
+            None,
+            &[],
+            "2000-01-01T00:00:00+00:00",
+            "authored",
+            "confirmed",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.store_entity("Q1 Backfill Entity Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let pages = db.list_pages("active", 10_000, 0).await.unwrap();
+        let vault = tempfile::TempDir::new().unwrap();
+        let projection = KnowledgeProjectionWrite::new(vault.path().to_path_buf(), &db);
+        for page in &pages {
+            projection.write_page(page).unwrap();
+        }
+
+        let written: Vec<_> = std::fs::read_dir(vault.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "startup backfill must write only the real page, not the entity shadow; got: {written:?}"
+        );
+        let content = std::fs::read_to_string(vault.path().join(&written[0])).unwrap();
+        assert!(
+            !content.contains("Q1 Backfill Entity Marker"),
+            "the shadow page's title must never reach a projected markdown file"
+        );
+    }
+
     #[test]
     fn test_load_state_migrates_v1_concept_keys_to_page() {
         let dir = tempfile::TempDir::new().unwrap();

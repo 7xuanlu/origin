@@ -71,9 +71,11 @@ pub struct Page {
     /// Unified page-kind discriminator (migration 89). One of:
     /// "entity" | "concept" | "source" | "overview" | "authored".
     /// `kind = "entity"` marks the M3 dual-write shadow pages that mirror
-    /// `entities` rows -- write-only in PR-1 (spec's fail-closed visibility
-    /// fence excludes them at `select_visible_pages` and every page-search/
-    /// list surface that bypasses it), never surfaced to a reader yet.
+    /// `entities` rows. Q1 contract: they are browse/search-visible through the
+    /// explicit `_browse` read surfaces (page list, search, recent,
+    /// recent-changes, get-by-id and its sub-resources), but stay excluded from
+    /// retrieval/context, export, and every page mutation (archive/delete/update
+    /// fence on a `kind='entity'` id); the entity API is the only writer.
     ///
     /// `skip_serializing` freezes the wire shape (spec M3 D4): `kind` is an
     /// internal discriminator the daemon uses for the visibility fence, but it

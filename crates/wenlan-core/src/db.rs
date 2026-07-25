@@ -18,11 +18,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 mod count;
+mod entity_page_adapter;
 mod page_drafts;
 pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
 
+#[cfg(test)]
+mod entity_page_adapter_test;
 #[cfg(test)]
 mod page_drafts_test;
 #[cfg(test)]
@@ -9429,9 +9432,10 @@ impl MemoryDB {
     /// is nullable on `entities` but `pages.space`/`pages.workspace` are
     /// NOT NULL (M1 honest columns), so a NULL entity space folds to the
     /// reserved `UNFILED_SPACE_ID` sentinel, matching migration 80/91's rule
-    /// for the same case. `content` is the empty string: PR-1 shadow pages
-    /// are write-only, never surfaced to a reader (fenced out of every
-    /// `select_visible_pages`-family surface), so there is no prose to hold.
+    /// for the same case. `content` is the empty string: entity shadow pages
+    /// hold no prose -- Q1 makes them browse/search-visible (the explicit
+    /// `_browse` surfaces) yet they stay excluded from retrieval/context,
+    /// export, and every page mutation, so there is nothing to render.
     async fn insert_entity_shadow_page(
         conn: &libsql::Connection,
         entity_id: &str,
@@ -23617,13 +23621,16 @@ impl MemoryDB {
             // page would otherwise be orphaned by the entity delete below (the
             // map row cascades on the entity FK, never the page). Delete it
             // first so its own ON DELETE CASCADE drops the map row.
-            conn.execute(
-                "DELETE FROM pages WHERE kind = 'entity' \
-                 AND id IN (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                libsql::params![alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities loser shadow: {e}")))?;
+            if let Some(loser_page_id) =
+                entity_page_adapter::page_id_for_entity(&conn, alias_id).await?
+            {
+                conn.execute(
+                    "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
+                    libsql::params![loser_page_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities loser shadow: {e}")))?;
+            }
 
             conn.execute(
                 "DELETE FROM entities WHERE id = ?1",
@@ -24195,13 +24202,16 @@ impl MemoryDB {
             // `DELETE FROM entities` then finds no dangling map row. Without
             // this the shadow would be orphaned (the map's entity-side cascade
             // drops the map row on entity delete, but never the page itself).
-            conn.execute(
-                "DELETE FROM pages WHERE kind = 'entity' \
-                 AND id IN (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
+            if let Some(shadow_page_id) =
+                entity_page_adapter::page_id_for_entity(&conn, entity_id).await?
+            {
+                conn.execute(
+                    "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
+                    libsql::params![shadow_page_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
+            }
 
             conn.execute(
                 "DELETE FROM entities WHERE id = ?1",
@@ -33286,7 +33296,6 @@ impl MemoryDB {
                 "SELECT id, title, version, created_at, last_modified
                  FROM pages
                  WHERE status = 'active'
-                   AND COALESCE(kind, 'concept') != 'entity'
                  ORDER BY last_modified DESC LIMIT ?1",
                 libsql::params![limit],
             )
@@ -33602,7 +33611,7 @@ impl MemoryDB {
                     "SELECT id, title, COALESCE(summary, ''), COALESCE(source_memory_ids, '[]'), \
                             version, created_at, last_modified \
                      FROM pages \
-                     WHERE status = 'active' AND kind != 'entity' \
+                     WHERE status = 'active' \
                      ORDER BY last_modified DESC \
                      LIMIT ?1",
                     libsql::params![limit],
@@ -35127,13 +35136,87 @@ impl MemoryDB {
         Ok(())
     }
 
+    async fn page_kind_on_conn(
+        conn: &libsql::Connection,
+        page_id: &str,
+    ) -> Result<Option<String>, WenlanError> {
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(kind, 'concept') FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("page kind: {e}")))?;
+        match rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("page kind row: {e}")))?
+        {
+            Some(row) => row
+                .get::<String>(0)
+                .map(Some)
+                .map_err(|e| WenlanError::VectorDb(format!("page kind value: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Reject a page mutation that targets a `kind='entity'` dual-write shadow
+    /// page. Entity shadow pages mirror `entities` rows and are managed through
+    /// the entity API only; the page archive/delete surface must never touch
+    /// one (deleting it would cascade away its `entity_page_map` row while
+    /// leaving the entity alive, breaking the entity<->page bijection).
+    /// An unknown id falls through (returns Ok) so archive/delete keep their
+    /// existing no-op-on-missing behavior -- only a positively identified
+    /// shadow is rejected.
+    async fn reject_entity_shadow_page_on_conn(
+        conn: &libsql::Connection,
+        page_id: &str,
+    ) -> Result<(), WenlanError> {
+        if Self::page_kind_on_conn(conn, page_id).await?.as_deref() == Some("entity") {
+            return Err(WenlanError::Validation(format!(
+                "page {page_id} is an entity shadow page; entity shadow pages are managed through the entity API"
+            )));
+        }
+        Ok(())
+    }
+
     /// Retrieve a page by id. Returns None if not found.
+    ///
+    /// Fenced: `kind='entity'` dual-write shadow pages are excluded, so every
+    /// mutation gate, page-map validation, and export consumer that resolves a
+    /// page by id sees a stub as absent (None -> 404). For the browse-facing
+    /// twin that returns stub pages by id (Q1 read surfaces), see
+    /// `get_page_browse`.
     pub async fn get_page(&self, id: &str) -> Result<Option<Page>, WenlanError> {
+        self.get_page_inner(id, true).await
+    }
+
+    /// Browse-facing twin of `get_page`: the by-id read for the Q1 page-browse
+    /// surfaces (`GET /api/pages/{id}` and its advisory revisions read), where
+    /// `kind='entity'` dual-write shadow pages must resolve. Never call this
+    /// from a mutation/validation/export path -- those must stay fenced
+    /// (`get_page`).
+    pub async fn get_page_browse(&self, id: &str) -> Result<Option<Page>, WenlanError> {
+        self.get_page_inner(id, false).await
+    }
+
+    async fn get_page_inner(
+        &self,
+        id: &str,
+        fence_entity: bool,
+    ) -> Result<Option<Page>, WenlanError> {
+        let fence_sql = if fence_entity {
+            " AND COALESCE(kind, 'concept') != 'entity'"
+        } else {
+            ""
+        };
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
-                 FROM pages WHERE id = ?1 AND COALESCE(kind, 'concept') != 'entity'",
+                &format!(
+                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE id = ?1{fence_sql}"
+                ),
                 libsql::params![id],
             )
             .await
@@ -35192,17 +35275,54 @@ impl MemoryDB {
     }
 
     /// List pages filtered by status, ordered by last_modified descending.
+    ///
+    /// Fenced: `kind='entity'` dual-write shadow pages are excluded. General-
+    /// purpose listing used by many internal non-browse callers (knowledge
+    /// projection, overview evidence set, proactive page-map sweep,
+    /// milestone/maintenance/refinery sweeps) that must never see a stub.
+    /// For the browse-facing twin that shows stub pages (Q1), see
+    /// `list_pages_browse`.
     pub async fn list_pages(
         &self,
         status: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Page>, WenlanError> {
+        self.list_pages_inner(status, limit, offset, true).await
+    }
+
+    /// Browse-facing twin of `list_pages`: the `ReadScope::Global` delegate
+    /// for `list_pages_scoped`, where Q1 rules `kind='entity'` dual-write
+    /// shadow pages must appear. Never call this from an internal
+    /// non-browse path -- those must stay fenced (`list_pages`).
+    pub async fn list_pages_browse(
+        &self,
+        status: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Page>, WenlanError> {
+        self.list_pages_inner(status, limit, offset, false).await
+    }
+
+    async fn list_pages_inner(
+        &self,
+        status: &str,
+        limit: i64,
+        offset: i64,
+        fence_entity: bool,
+    ) -> Result<Vec<Page>, WenlanError> {
+        let fence_sql = if fence_entity {
+            " AND COALESCE(kind, 'concept') != 'entity'"
+        } else {
+            ""
+        };
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
-                 FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3",
+                &format!(
+                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE status = ?1{fence_sql} ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3"
+                ),
                 libsql::params![status, limit, offset],
             )
             .await
@@ -36538,6 +36658,7 @@ impl MemoryDB {
     pub async fn archive_page(&self, id: &str) -> Result<(), WenlanError> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
+        Self::reject_entity_shadow_page_on_conn(&conn, id).await?;
         Self::reject_page_draft_on_conn(&conn, id).await?;
         conn.execute(
             "UPDATE pages
@@ -36870,6 +36991,7 @@ impl MemoryDB {
 
     pub async fn delete_page(&self, id: &str) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
+        Self::reject_entity_shadow_page_on_conn(&conn, id).await?;
         Self::reject_page_draft_on_conn(&conn, id).await?;
         conn.execute("BEGIN", ())
             .await
@@ -37403,11 +37525,40 @@ impl MemoryDB {
     /// Embeds the query, runs DiskANN vector search on page embeddings
     /// (title+summary), runs FTS5 MATCH on page content, then merges
     /// results with Reciprocal Rank Fusion (same pattern as search_memory).
+    ///
+    /// Retrieval arm: `kind='entity'` dual-write shadow pages stay fenced
+    /// out. Also the Global-scope delegate for `search_pages_scoped`'s
+    /// retrieval arm. For the browse-facing twin that shows stub pages
+    /// (Q1), see `search_pages_browse`.
     pub async fn search_pages(
         &self,
         query: &str,
         limit: usize,
         page_type: Option<&str>,
+    ) -> Result<Vec<Page>, WenlanError> {
+        self.search_pages_inner(query, limit, page_type, true).await
+    }
+
+    /// Browse-facing twin of `search_pages`: the Global-scope delegate for
+    /// `search_pages_scoped_browse`, where Q1 rules `kind='entity'`
+    /// dual-write shadow pages must appear. Never call this from a
+    /// retrieval/context channel -- those must stay fenced (`search_pages`).
+    pub async fn search_pages_browse(
+        &self,
+        query: &str,
+        limit: usize,
+        page_type: Option<&str>,
+    ) -> Result<Vec<Page>, WenlanError> {
+        self.search_pages_inner(query, limit, page_type, false)
+            .await
+    }
+
+    async fn search_pages_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        page_type: Option<&str>,
+        fence_entity: bool,
     ) -> Result<Vec<Page>, WenlanError> {
         // Embed query before acquiring conn lock (same pattern as search_memory)
         let embedding = self.get_or_compute_embedding(query)?;
@@ -37555,13 +37706,16 @@ impl MemoryDB {
         }
 
         // Sort by combined RRF score, attach to pages, return top limit.
-        // Fence (M3 PR-1 stage f): `kind='entity'` dual-write shadow pages are
-        // write-only in PR-1 -- `search_pages` bypasses the shared
-        // `select_visible_pages` gate (it's a direct index search, not a
-        // context-assembly call), so it needs its own exclusion.
+        // Fence (M3 PR-1 stage f; Q1 lift, stage c): `search_pages` bypasses
+        // the shared `select_visible_pages` gate (it's a direct index
+        // search, not a context-assembly call), so each arm carries its own
+        // `kind='entity'` exclusion. The retrieval arm (`fence_entity=true`)
+        // excludes dual-write shadow pages; the browse arm
+        // (`fence_entity=false`, `search_pages_browse`) includes them per
+        // the Q1 ruling.
         let mut final_results: Vec<Page> = concept_map
             .into_values()
-            .filter(|p| p.kind != "entity")
+            .filter(|p| !fence_entity || p.kind != "entity")
             .collect();
         final_results.sort_by(|a, b| {
             let sa = score_map.get(&a.id).unwrap_or(&0.0);
@@ -53774,19 +53928,10 @@ pub(crate) mod tests {
             .unwrap();
         let page_id: String = {
             let conn = db.conn.lock().await;
-            let mut rows = conn
-                .query(
-                    "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
-                    libsql::params![id.clone()],
-                )
-                .await
-                .unwrap();
-            rows.next()
+            entity_page_adapter::page_id_for_entity(&conn, &id)
                 .await
                 .unwrap()
                 .expect("shadow must exist before delete")
-                .get(0)
-                .unwrap()
         };
 
         db.delete_space("doomed", "delete").await.unwrap();
@@ -76475,6 +76620,37 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn select_visible_pages_scoped_excludes_entity_kind_pages() {
+        // select_visible_pages_scoped delegates to select_visible_pages after
+        // scope-filtering (unchanged by Q1); this covers the scoped wrapper
+        // explicitly rather than relying on the unscoped test above.
+        let (db, _dir) = test_db().await;
+        let mut entity_page = confirmed_page("p_entity_shadow_scoped", Some("work"), &[]);
+        entity_page.kind = "entity".to_string();
+        let no_overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let visible = db
+            .select_visible_pages_scoped(
+                vec![entity_page],
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+                &no_overlap,
+                "full",
+                10,
+            )
+            .await;
+        assert!(
+            visible.is_empty(),
+            "kind='entity' shadow pages must never reach a reader through \
+             select_visible_pages_scoped, even at full trust"
+        );
+    }
+
+    // -- Q1 lift (stage c): `search_pages`/`search_pages_scoped` split into a
+    // fenced retrieval arm (unchanged name, unchanged behavior -- the tests
+    // just above this comment) and an unfenced browse arm (`_browse`,
+    // stage-c-brief deliverable 1). --
+
+    #[tokio::test]
     async fn search_pages_excludes_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         db.store_entity("Unique Zephyrine Marker", "person", None, None, None)
@@ -76487,7 +76663,26 @@ pub(crate) mod tests {
             .unwrap();
         assert!(
             !results.iter().any(|p| p.title == "Unique Zephyrine Marker"),
-            "search_pages must not surface the entity's own kind='entity' shadow page"
+            "search_pages (retrieval arm) must not surface the entity's own kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_pages_browse_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Unique Zephyrine Browse Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let results = db
+            .search_pages_browse("Unique Zephyrine Browse Marker", 10, None)
+            .await
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|p| p.title == "Unique Zephyrine Browse Marker"),
+            "Q1: search_pages_browse must surface the entity's kind='entity' shadow page"
         );
     }
 
@@ -76509,28 +76704,115 @@ pub(crate) mod tests {
             .unwrap();
         assert!(
             !results.iter().any(|p| p.title == "Unique Quorlath Marker"),
-            "the scoped RRF page channel must not surface the entity's shadow page"
+            "search_pages_scoped (retrieval arm) must not surface the entity's shadow page"
         );
     }
 
     #[tokio::test]
-    async fn list_recent_pages_with_badges_excludes_entity_kind_shadow() {
+    async fn search_pages_scoped_browse_includes_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
-        db.store_entity("Recent Activity Entity Marker", "person", None, None, None)
+        db.store_entity(
+            "Unique Quorlath Browse Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let results = db
+            .search_pages_scoped_browse(
+                "Unique Quorlath Browse Marker",
+                10,
+                None,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|p| p.title == "Unique Quorlath Browse Marker"),
+            "Q1: the scoped RRF browse arm must surface the entity's shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_pages_scoped_browse_global_includes_entity_kind_shadow() {
+        // Global scope exercises search_pages_scoped_browse's delegation to
+        // search_pages_browse (both browse arms must agree).
+        let (db, _dir) = test_db().await;
+        db.store_entity("Unique Quorlath Global Marker", "person", None, None, None)
             .await
             .unwrap();
 
+        let results = db
+            .search_pages_scoped_browse(
+                "Unique Quorlath Global Marker",
+                10,
+                None,
+                &crate::read_scope::ReadScope::Global,
+            )
+            .await
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|p| p.title == "Unique Quorlath Global Marker"),
+            "Q1: search_pages_scoped_browse(Global) must delegate to search_pages_browse"
+        );
+    }
+
+    /// Q1 (stage c): seed one ordinary concept page stamped "2000-01-01" and
+    /// one entity dual-write shadow stamped "now" (via `store_entity`), so the
+    /// shadow is strictly more recent and deterministically sorts first in any
+    /// `last_modified DESC` listing. Returns (concept_title, shadow_title).
+    async fn seed_concept_then_shadow(db: &MemoryDB, tag: &str) -> (String, String) {
+        let concept_title = format!("Q1 {tag} Concept Page");
+        db.insert_page_with_kind(
+            &format!("p_q1_{tag}_concept"),
+            &concept_title,
+            None,
+            "concept content",
+            None,
+            None,
+            &[],
+            "2000-01-01T00:00:00+00:00",
+            "authored",
+            "confirmed",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let shadow_title = format!("Q1 {tag} Entity Marker");
+        db.store_entity(&shadow_title, "person", None, None, None)
+            .await
+            .unwrap();
+        (concept_title, shadow_title)
+    }
+
+    #[tokio::test]
+    async fn list_recent_pages_with_badges_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let (concept_title, shadow_title) = seed_concept_then_shadow(&db, "recent_badges").await;
+
         let items = db.list_recent_pages_with_badges(50, None).await.unwrap();
         assert!(
-            !items
-                .iter()
-                .any(|item| item.title == "Recent Activity Entity Marker"),
-            "list_recent_pages_with_badges must not surface a kind='entity' shadow page"
+            items.iter().any(|item| item.title == shadow_title),
+            "Q1: list_recent_pages_with_badges must surface a kind='entity' shadow page"
+        );
+        let shadow_idx = items.iter().position(|item| item.title == shadow_title);
+        let concept_idx = items.iter().position(|item| item.title == concept_title);
+        assert!(
+            shadow_idx < concept_idx,
+            "the more-recently-modified shadow must sort before the older concept page"
         );
     }
 
     #[tokio::test]
-    async fn list_recent_pages_with_badges_scoped_excludes_entity_kind_shadow() {
+    async fn list_recent_pages_with_badges_scoped_includes_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         db.store_entity(
             "Scoped Recent Entity Marker",
@@ -76551,10 +76833,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            !items
+            items
                 .iter()
                 .any(|item| item.title == "Scoped Recent Entity Marker"),
-            "the scoped recent-activity surface must not surface a kind='entity' shadow page"
+            "Q1: the scoped recent-activity surface must surface a kind='entity' shadow page"
         );
     }
 
@@ -76584,6 +76866,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_page_excludes_entity_kind_shadow() {
+        // Fix wave (sol-review, Important-1): the shared `get_page` fence was
+        // restored -- every mutation gate, page-map validation, and export
+        // consumer resolves a page by id through it, so a stub must read as
+        // absent (None). For the browse-facing twin, see `get_page_browse`.
         let (db, _dir) = test_db().await;
         let eid = db
             .store_entity("Get Page Marker", "person", Some("work"), None, None)
@@ -76594,12 +76880,33 @@ pub(crate) mod tests {
         let page = db.get_page(&pid).await.unwrap();
         assert!(
             page.is_none(),
-            "get_page must return None for a kind='entity' shadow id (fail-closed by ID)"
+            "get_page must not resolve a kind='entity' shadow page by id"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_browse_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Get Page Browse Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let page = db.get_page_browse(&pid).await.unwrap();
+        assert_eq!(
+            page.map(|p| p.title),
+            Some("Get Page Browse Marker".to_string()),
+            "Q1: get_page_browse must return a kind='entity' shadow page by id"
         );
     }
 
     #[tokio::test]
     async fn get_page_scoped_excludes_entity_kind_shadow() {
+        // Fix wave (sol-review, Important-1): `get_page_scoped`'s fence was
+        // restored on both arms; a stub reads as absent on the by-id
+        // mutation/export path. For the browse-facing twin, see
+        // `get_page_scoped_browse`.
         let (db, _dir) = test_db().await;
         let eid = db
             .store_entity("Get Page Scoped Marker", "person", Some("work"), None, None)
@@ -76617,14 +76924,51 @@ pub(crate) mod tests {
             .unwrap();
         assert!(
             page.is_none(),
-            "get_page_scoped must return None for a kind='entity' shadow id"
+            "get_page_scoped must not resolve a kind='entity' shadow page by id"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_scoped_browse_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity(
+                "Get Page Scoped Browse Marker",
+                "person",
+                Some("work"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        // Space scope exercises the scoped SQL (Global delegates to
+        // get_page_browse).
+        let page = db
+            .get_page_scoped_browse(
+                &pid,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.map(|p| p.title),
+            Some("Get Page Scoped Browse Marker".to_string()),
+            "Q1: get_page_scoped_browse must return a kind='entity' shadow page by id"
         );
     }
 
     #[tokio::test]
     async fn list_pages_excludes_entity_kind_shadow() {
+        // Fix wave (stage c review, Critical-1): list_pages has ~15 internal
+        // non-browse callers (knowledge projection, overview evidence set,
+        // proactive page-map sweep, first_active_page, maintenance/refinery
+        // sweeps, eval harness) that must never see a stub, so it stays
+        // fenced -- mirroring search_pages's retrieval arm. For the
+        // browse-facing twin, see list_pages_browse.
         let (db, _dir) = test_db().await;
-        db.store_entity("List Pages Marker", "person", Some("work"), None, None)
+        db.store_entity("List Pages Marker", "person", None, None, None)
             .await
             .unwrap();
 
@@ -76636,7 +76980,30 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn list_pages_browse_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let (concept_title, shadow_title) =
+            seed_concept_then_shadow(&db, "list_pages_browse").await;
+
+        let pages = db.list_pages_browse("active", 50, 0).await.unwrap();
+        assert!(
+            pages.iter().any(|p| p.title == shadow_title),
+            "Q1: list_pages_browse must surface a kind='entity' shadow page"
+        );
+        let shadow_idx = pages.iter().position(|p| p.title == shadow_title);
+        let concept_idx = pages.iter().position(|p| p.title == concept_title);
+        assert!(
+            shadow_idx < concept_idx,
+            "the more-recently-modified shadow must sort before the older concept page"
+        );
+    }
+
+    #[tokio::test]
     async fn list_pages_scoped_excludes_entity_kind_shadow() {
+        // Fix wave (sol-review, Important-2): `list_pages_scoped` is fully
+        // fenced again on every arm so export (which reads it, fenced in SQL
+        // before LIMIT) can never emit a stub. For the browse-facing twin, see
+        // `list_pages_scoped_browse`.
         let (db, _dir) = test_db().await;
         db.store_entity(
             "List Pages Scoped Marker",
@@ -76660,6 +77027,289 @@ pub(crate) mod tests {
         assert!(
             !pages.iter().any(|p| p.title == "List Pages Scoped Marker"),
             "list_pages_scoped (Space arm) must not surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_scoped_browse_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "List Pages Scoped Browse Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pages = db
+            .list_pages_scoped_browse(
+                "active",
+                50,
+                0,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.title == "List Pages Scoped Browse Marker"),
+            "Q1: list_pages_scoped_browse (Space arm) must surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_scoped_global_excludes_entity_kind_shadow() {
+        // Fix wave (sol-review, Important-2): the Global arm reverts to the
+        // fenced list_pages (the stage-c delegate-to-browse was the leak into
+        // export). For the browse-facing Global arm, see
+        // list_pages_scoped_browse.
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "List Pages Scoped Global Marker",
+            "person",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pages = db
+            .list_pages_scoped("active", 50, 0, &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
+        assert!(
+            !pages
+                .iter()
+                .any(|p| p.title == "List Pages Scoped Global Marker"),
+            "list_pages_scoped(Global) must delegate to the fenced list_pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_scoped_browse_global_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "List Pages Scoped Browse Global Marker",
+            "person",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pages = db
+            .list_pages_scoped_browse("active", 50, 0, &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.title == "List Pages Scoped Browse Global Marker"),
+            "Q1: list_pages_scoped_browse(Global) must delegate to list_pages_browse"
+        );
+    }
+
+    // -- Fix wave (sol-review, Critical + Important-2): page-mutation fences and
+    // export fence-before-limit. Entity shadow pages are managed only through
+    // the entity API, so the page archive/delete surface must reject a
+    // `kind='entity'` id, and the fenced list must drop stubs in SQL before
+    // LIMIT so a burst can never starve real pages out of a bounded window. --
+
+    /// The entity, its shadow page, and their `entity_page_map` row must all
+    /// still exist -- the bijection a page-side archive/delete must never break.
+    async fn assert_entity_shadow_intact(db: &MemoryDB, entity_id: &str, page_id: &str) {
+        let conn = db.conn.lock().await;
+        let entity: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                    libsql::params![entity_id],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        let page: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM pages WHERE id = ?1 AND kind = 'entity'",
+                    libsql::params![page_id],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        let map: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1 AND page_id = ?2",
+                    libsql::params![entity_id, page_id],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            entity, 1,
+            "entity row must survive a rejected page mutation"
+        );
+        assert_eq!(
+            page, 1,
+            "shadow page row must survive a rejected page mutation"
+        );
+        assert_eq!(
+            map, 1,
+            "entity_page_map row must survive a rejected page mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_page_rejects_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Archive Fence Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let result = db.archive_page(&pid).await;
+        assert!(
+            matches!(result, Err(WenlanError::Validation(_))),
+            "archive_page must reject a kind='entity' shadow page with a Validation error, got {result:?}"
+        );
+        assert_entity_shadow_intact(&db, &eid, &pid).await;
+    }
+
+    #[tokio::test]
+    async fn delete_page_rejects_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Delete Fence Marker", "person", Some("work"), None, None)
+            .await
+            .unwrap();
+        let pid = shadow_page_id(&db, &eid).await;
+
+        let result = db.delete_page(&pid).await;
+        assert!(
+            matches!(result, Err(WenlanError::Validation(_))),
+            "delete_page must reject a kind='entity' shadow page with a Validation error, got {result:?}"
+        );
+        assert_entity_shadow_intact(&db, &eid, &pid).await;
+    }
+
+    #[tokio::test]
+    async fn archive_and_delete_still_work_on_concept_pages() {
+        let (db, _dir) = test_db().await;
+        db.insert_page_with_kind(
+            "p_fence_concept_archive",
+            "Fence Concept Archive",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            "2000-01-01T00:00:00+00:00",
+            "authored",
+            "confirmed",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.archive_page("p_fence_concept_archive").await.unwrap();
+        let archived = db
+            .get_page("p_fence_concept_archive")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            archived.status, "archived",
+            "a normal concept page must still archive"
+        );
+
+        db.insert_page_with_kind(
+            "p_fence_concept_delete",
+            "Fence Concept Delete",
+            None,
+            "content",
+            None,
+            None,
+            &[],
+            "2000-01-01T00:00:00+00:00",
+            "authored",
+            "confirmed",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.delete_page("p_fence_concept_delete").await.unwrap();
+        assert!(
+            db.get_page("p_fence_concept_delete")
+                .await
+                .unwrap()
+                .is_none(),
+            "a normal concept page must still delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_scoped_fences_before_limit() {
+        // Fix wave (sol-review, Important-2): a fresh stub (newer last_modified)
+        // must not consume the single LIMIT slot -- the fence lives in SQL
+        // before LIMIT, so a fenced limit=1 list returns the older real page,
+        // not empty. Without the SQL fence, ORDER BY last_modified DESC + LIMIT
+        // 1 would return the stub and a post-fetch filter would leave nothing.
+        let (db, _dir) = test_db().await;
+        db.insert_page_with_kind(
+            "p_fence_before_limit_concept",
+            "Fence Before Limit Concept",
+            None,
+            "content",
+            None,
+            Some("work"),
+            &[],
+            "2000-01-01T00:00:00+00:00",
+            "authored",
+            "confirmed",
+            Some("work"),
+            None,
+        )
+        .await
+        .unwrap();
+        // The shadow is stamped `now`, so it sorts FIRST by last_modified DESC.
+        db.store_entity(
+            "Fence Before Limit Shadow",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pages = db
+            .list_pages_scoped(
+                "active",
+                1,
+                0,
+                &crate::read_scope::ReadScope::Space("work".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pages.len(),
+            1,
+            "the fenced limit=1 list must return exactly one page"
+        );
+        assert_eq!(
+            pages[0].title, "Fence Before Limit Concept",
+            "the fence must drop the newer stub in SQL before LIMIT, leaving the real page"
         );
     }
 
@@ -76704,21 +77354,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn list_recent_changes_excludes_entity_kind_shadow() {
+    async fn list_recent_changes_includes_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
-        db.store_entity("Recent Changes Marker", "person", None, None, None)
-            .await
-            .unwrap();
+        let (concept_title, shadow_title) = seed_concept_then_shadow(&db, "recent_changes").await;
 
         let changes = db.list_recent_changes(50).await.unwrap();
         assert!(
-            !changes.iter().any(|c| c.title == "Recent Changes Marker"),
-            "list_recent_changes must not surface a kind='entity' shadow page"
+            changes.iter().any(|c| c.title == shadow_title),
+            "Q1: list_recent_changes must surface a kind='entity' shadow page"
+        );
+        let shadow_idx = changes.iter().position(|c| c.title == shadow_title);
+        let concept_idx = changes.iter().position(|c| c.title == concept_title);
+        assert!(
+            shadow_idx < concept_idx,
+            "the more-recently-modified shadow must sort before the older concept page"
         );
     }
 
     #[tokio::test]
-    async fn list_recent_changes_scoped_excludes_entity_kind_shadow() {
+    async fn list_recent_changes_scoped_includes_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         db.store_entity(
             "Recent Changes Scoped Marker",
@@ -76738,10 +77392,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            !changes
+            changes
                 .iter()
                 .any(|c| c.title == "Recent Changes Scoped Marker"),
-            "list_recent_changes_scoped (Space arm) must not surface a shadow page"
+            "Q1: list_recent_changes_scoped (Space arm) must surface a shadow page"
         );
     }
 
@@ -76863,6 +77517,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn first_active_page_excludes_entity_kind_shadow() {
+        // Fix wave (stage c review, Critical-1 leak site 4): first_active_page
+        // routes through list_pages, ordered by last_modified DESC -- a
+        // fresh shadow (stamped `now`) would be the *first* candidate
+        // without the fence, feeding a stub into the first-page milestone.
+        let (db, _dir) = test_db().await;
+        db.store_entity("First Page Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let first = db.first_active_page().await.unwrap();
+        assert!(
+            first.is_none(),
+            "first_active_page must skip kind='entity' shadow pages, matching its \
+             oldest_active_page sibling"
+        );
+    }
+
+    #[tokio::test]
     async fn load_page_source_index_excludes_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         db.store_entity("Source Index Marker", "person", None, None, None)
@@ -76895,7 +77568,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn get_page_sources_scoped_rejects_entity_kind_shadow() {
+    async fn get_page_sources_scoped_returns_empty_for_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         let eid = db
             .store_entity("Sources Marker", "person", None, None, None)
@@ -76903,17 +77576,21 @@ pub(crate) mod tests {
             .unwrap();
         let pid = shadow_page_id(&db, &eid).await;
 
-        let result = db
+        // Q1: a stub id now matches (found=true) so the handler can 200 the
+        // page itself; it legitimately has no page_sources rows, so the
+        // LEFT JOIN degrades to Ok(vec![]) rather than 404.
+        let sources = db
             .get_page_sources_scoped(&pid, &crate::read_scope::ReadScope::Global)
-            .await;
+            .await
+            .unwrap();
         assert!(
-            result.is_err(),
-            "get_page_sources_scoped must 404 (not Ok([])) for a shadow id (fail-closed by ID)"
+            sources.is_empty(),
+            "get_page_sources_scoped must return Ok([]) for a shadow id, not synthesize sources"
         );
     }
 
     #[tokio::test]
-    async fn get_page_outbound_links_scoped_rejects_entity_kind_shadow() {
+    async fn get_page_outbound_links_scoped_returns_empty_for_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         let eid = db
             .store_entity("Outbound Links Marker", "person", None, None, None)
@@ -76921,17 +77598,18 @@ pub(crate) mod tests {
             .unwrap();
         let pid = shadow_page_id(&db, &eid).await;
 
-        let result = db
+        let links = db
             .get_page_outbound_links_scoped(&pid, &crate::read_scope::ReadScope::Global)
-            .await;
+            .await
+            .unwrap();
         assert!(
-            result.is_err(),
-            "get_page_outbound_links_scoped must 404 for a shadow id"
+            links.is_empty(),
+            "get_page_outbound_links_scoped must return Ok([]) for a shadow id"
         );
     }
 
     #[tokio::test]
-    async fn get_page_inbound_links_scoped_rejects_entity_kind_shadow() {
+    async fn get_page_inbound_links_scoped_returns_empty_for_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         let eid = db
             .store_entity("Inbound Links Marker", "person", None, None, None)
@@ -76939,17 +77617,18 @@ pub(crate) mod tests {
             .unwrap();
         let pid = shadow_page_id(&db, &eid).await;
 
-        let result = db
+        let links = db
             .get_page_inbound_links_scoped(&pid, &crate::read_scope::ReadScope::Global)
-            .await;
+            .await
+            .unwrap();
         assert!(
-            result.is_err(),
-            "get_page_inbound_links_scoped must 404 for a shadow id"
+            links.is_empty(),
+            "get_page_inbound_links_scoped must return Ok([]) for a shadow id"
         );
     }
 
     #[tokio::test]
-    async fn get_page_changelog_scoped_rejects_entity_kind_shadow() {
+    async fn get_page_changelog_scoped_returns_empty_for_entity_kind_shadow() {
         let (db, _dir) = test_db().await;
         let eid = db
             .store_entity("Changelog Marker", "person", None, None, None)
@@ -76957,12 +77636,13 @@ pub(crate) mod tests {
             .unwrap();
         let pid = shadow_page_id(&db, &eid).await;
 
-        let result = db
+        let changelog = db
             .get_page_changelog_scoped(&pid, &crate::read_scope::ReadScope::Global)
-            .await;
-        assert!(
-            result.is_err(),
-            "get_page_changelog_scoped must 404 for a shadow id"
+            .await
+            .unwrap();
+        assert_eq!(
+            changelog, "[]",
+            "get_page_changelog_scoped must return Ok(\"[]\") for a shadow id (born with no changelog)"
         );
     }
 
@@ -79008,6 +79688,27 @@ pub(crate) mod tests {
             ENTITIES as f64 / seed_entities_secs
         );
 
+        // ---- M3 stage F: the adapter round-trips entity_id <-> page_id for
+        // every seeded entity, at the same scale the parity oracle is proven
+        // at below ----
+        {
+            let conn = db.conn.lock().await;
+            for id in &entity_ids {
+                let page_id = entity_page_adapter::page_id_for_entity(&conn, id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{id} must have a mapped page_id at scale"));
+                let round_tripped = entity_page_adapter::entity_id_for_page(&conn, &page_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    round_tripped.as_deref(),
+                    Some(id.as_str()),
+                    "adapter bijection must round-trip at scale for {id}"
+                );
+            }
+        }
+
         // ---- reconcile: clean parity must hold at scale ----
         let t_reconcile = Instant::now();
         let report = db.reconcile_entity_page_parity().await.unwrap();
@@ -79190,6 +79891,105 @@ pub(crate) mod tests {
         assert_eq!(
             dirty_report.drift_count, PERTURB,
             "exactly the {PERTURB} perturbed shadows must be flagged corrupt, not more or fewer"
+        );
+    }
+
+    /// M3 stage F acceptance-box proof: with the "scoped_entities" cutover
+    /// gate OFF vs ON, `list_entities_scoped`/`get_entity_detail_scoped`
+    /// results serialize to byte-identical JSON -- the actual wire shape,
+    /// not just Rust `Debug` output -- proving the adapter's entity_id<->
+    /// page_id translation makes no app-visible shape change. Small-scale,
+    /// non-ignored sibling of `bench_reconcile_entity_page_parity_at_scale`'s
+    /// ON/OFF comparison above.
+    #[tokio::test]
+    async fn scoped_entities_cutover_flip_is_wire_invariant() {
+        const SPACE: &str = "wire_invariance_space";
+        let (db, _dir) = test_db().await;
+        let mut entity_ids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let id = db
+                .store_entity(
+                    &format!("Wire Invariance Entity {i}"),
+                    "person",
+                    Some(SPACE),
+                    Some("test"),
+                    Some(0.8),
+                )
+                .await
+                .unwrap();
+            entity_ids.push(id);
+        }
+        db.create_relation(
+            &entity_ids[0],
+            &entity_ids[1],
+            "related_to",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at) \
+                 VALUES ('wire_invariance_obs', ?1, 'observed', NULL, 0.9, 1, unixepoch())",
+                libsql::params![entity_ids[0].clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let scope = ReadScope::Space(SPACE.to_string());
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, false)
+            .await
+            .unwrap();
+        let list_off = db.list_entities_scoped(None, &scope).await.unwrap();
+        let mut detail_off = Vec::with_capacity(entity_ids.len());
+        for id in &entity_ids {
+            detail_off.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0,
+            "seed must reconcile clean before the gate can open"
+        );
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, MemoryDB::SCOPED_ENTITIES_CONSUMER)
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark must open the gate"
+            );
+        }
+        let list_on = db.list_entities_scoped(None, &scope).await.unwrap();
+        let mut detail_on = Vec::with_capacity(entity_ids.len());
+        for id in &entity_ids {
+            detail_on.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+
+        assert_eq!(list_off.len(), 5, "sanity: all seeded entities are listed");
+        assert_eq!(
+            list_off.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            list_on.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            "sanity: same entity_ids on both arms"
+        );
+        assert_eq!(
+            serde_json::to_value(&list_off).unwrap(),
+            serde_json::to_value(&list_on).unwrap(),
+            "list_entities_scoped wire shape must be byte-identical across the cutover flip"
+        );
+        assert_eq!(
+            serde_json::to_value(&detail_off).unwrap(),
+            serde_json::to_value(&detail_on).unwrap(),
+            "get_entity_detail_scoped wire shape must be byte-identical across the cutover flip"
         );
     }
 
