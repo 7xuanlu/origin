@@ -27,6 +27,7 @@ is specifically about the Qwen GGUF inference path.
 From PowerShell:
 
 ```powershell
+$env:RUSTUP_TOOLCHAIN = "1.95.0"
 winget install --id Kitware.CMake --exact
 winget install --id LLVM.LLVM --exact
 winget install --id StrawberryPerl.StrawberryPerl --exact
@@ -39,6 +40,17 @@ git clone --depth 1 --branch 2026.06.24 https://github.com/microsoft/vcpkg.git "
 & scripts\setup-vulkan-sdk-windows.ps1
 $env:LIB = "$env:LOCALAPPDATA\wenlan-build\vcpkg\installed\x64-windows-static-md\lib;$env:LIB"
 & scripts\setup-msvc-ninja-windows.ps1
+
+# Pin the linker before crossing into Git Bash. Git for Windows also ships a
+# coreutils link.exe, which is not the MSVC linker.
+$sysroot = (rustc --print sysroot).Trim()
+$lld = Join-Path $sysroot `
+  "lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe"
+Get-Item $lld
+$env:RUSTFLAGS = "-C linker=$lld -C linker-flavor=lld-link"
+
+$gitBash = Join-Path $env:ProgramFiles "Git\bin\bash.exe"
+Get-Item $gitBash
 
 # llama.cpp's nested Vulkan shader build can exceed legacy MAX_PATH when the
 # checkout is deep. Keep Cargo output on a deliberately short, fresh local
@@ -58,10 +70,14 @@ environment, selects Visual Studio's bundled Ninja, preserves the vcpkg
 Studio 2019 and 2022: llama.cpp's Vulkan ExternalProject/shader rules are not
 reliably ordered by the Visual Studio generators. Verify `perl
 -MLocale::Maketext::Simple -e "print qq(ok\n)"` before building the server.
+If the Strawberry Perl MSI requires elevation or stalls under a non-elevated
+winget session, use the official 64-bit portable ZIP instead, point
+`OPENSSL_SRC_PERL` at its `perl\bin\perl.exe`, and run the same module probe.
 
 ## Build and test
 
 ```powershell
+$target = "x86_64-pc-windows-msvc"
 $testRuntimeDir = Join-Path $env:CARGO_TARGET_DIR "test-runtime"
 & scripts\stage-onnxruntime-windows.ps1 `
   -DestinationDirectory $testRuntimeDir
@@ -74,9 +90,10 @@ cargo fmt --check --all
 cargo test -p wenlan-types
 cargo test -p wenlan-core --lib engine::tests
 cargo test -p wenlan-server status_reports_selected_vulkan_device
-cargo build --release --jobs 1 -p wenlan-core --bin model_probe
-cargo build --release --jobs 1 -p wenlan-server
-$releaseDir = Join-Path $env:CARGO_TARGET_DIR "release"
+& $gitBash scripts\build-release-binaries.sh $target
+cargo build --release --target $target --jobs 1 `
+  -p wenlan-core --bin model_probe
+$releaseDir = Join-Path $env:CARGO_TARGET_DIR "$target\release"
 & scripts\stage-onnxruntime-windows.ps1 `
   -DestinationDirectory $releaseDir
 & scripts\stage-vulkan-loader-windows.ps1 `
@@ -87,7 +104,7 @@ $releaseDir = Join-Path $env:CARGO_TARGET_DIR "release"
 & scripts\setup-msvc-ninja-windows.test.ps1
 & scripts\smoke-windows-llm.test.ps1
 python scripts\release_targets.test.py
-bash scripts\build-release-binaries.test.sh
+& $gitBash scripts\build-release-binaries.test.sh
 python scripts\ci_test_plan.test.py
 ```
 
@@ -167,12 +184,15 @@ smokes: each command loads the real model and requires it to return a valid
 `preference` classification.
 
 ```powershell
+$target = "x86_64-pc-windows-msvc"
+$releaseDir = Join-Path $env:CARGO_TARGET_DIR "$target\release"
 $model = "$env:USERPROFILE\.cache\wenlan\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+$probe = Join-Path $releaseDir "model_probe.exe"
 
 # Auto policy must select the discrete NVIDIA adapter on a mixed-GPU machine.
 & scripts\smoke-windows-llm.ps1 `
   -ModelPath $model `
-  -ProbePath target\release\model_probe.exe `
+  -ProbePath $probe `
   -Device auto `
   -ExpectedBackend vulkan `
   -ExpectedDevicePattern "NVIDIA.*RTX 3060"
@@ -180,14 +200,14 @@ $model = "$env:USERPROFILE\.cache\wenlan\models\Qwen3-4B-Instruct-2507-Q4_K_M.gg
 # CPU remains a supported, deterministic escape hatch.
 & scripts\smoke-windows-llm.ps1 `
   -ModelPath $model `
-  -ProbePath target\release\model_probe.exe `
+  -ProbePath $probe `
   -Device cpu `
   -ExpectedBackend cpu
 
 # Inject an unavailable device selection and prove visible CPU recovery.
 & scripts\smoke-windows-llm.ps1 `
   -ModelPath $model `
-  -ProbePath target\release\model_probe.exe `
+  -ProbePath $probe `
   -Device 99 `
   -ExpectedBackend cpu `
   -ExpectedFallbackPattern "requested GPU device index 99 is unavailable"
@@ -208,19 +228,19 @@ an NVIDIA GeForce RTX 3060 Laptop discrete GPU, Vulkan SDK 1.4.350.0, Visual
 Studio Build Tools, and
 `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` (2,497,281,120 bytes, SHA-256
 `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`).
-The recorded implementation baseline was backend code commit
-`b80b24f743f79c13752722a8d290bbb8a3b93432`, after merging then-current
-`origin/main`. The source-built `wenlan-server.exe` SHA-256 was
-`114b881d175398aebd2059914a4bd7ee7a53e2480185f172947310b5a82b64c4`.
+The post-`origin/main` implementation baseline was backend code commit
+`fc0e9ba` (before this documentation-only update). The source-built,
+rust-lld-linked `wenlan-server.exe` SHA-256 was
+`9391b98fa411ceb573fea0c495fbbf83083e0d979b050868e1d07d801d94e209`.
 The adjacent staged loader was the pinned LunarG `vulkan-1.dll` with SHA-256
 `0419974f00e82a3d619077ba414da265a774f8db9d45ad93bc1843f44b2c2c1f`;
 the process module inventory resolved that exact path, not a system loader.
 
 | Leg | Observed result |
 |---|---|
-| `auto`, expected Vulkan | Selected llama.cpp device `1`, `NVIDIA GeForce RTX 3060 Laptop GPU`; offloaded `37/37` layers; allocated 576 MiB KV and 301.75 MiB compute on Vulkan1; valid classification in about 1.14 seconds |
-| `cpu`, expected CPU | Offloaded `0/37` layers; all KV layers reported `dev = CPU`; Vulkan1 device compute allocation `0.0000 MiB`; valid classification in about 12.13 seconds |
-| device `99`, expected fallback | Reported `requested GPU device index 99 is unavailable`; offloaded `0/37` layers and used the same CPU-only context contract; valid classification in about 12.31 seconds |
+| `auto`, expected Vulkan | Selected llama.cpp device `1`, `NVIDIA GeForce RTX 3060 Laptop GPU`; offloaded `37/37` layers; valid classification in 1.35 seconds; 14 `nvidia-smi` samples peaked at 95% utilization and 3272 MiB |
+| `cpu`, expected CPU | Offloaded `0/37` layers; all KV layers reported `dev = CPU`; Vulkan1 device compute allocation `0.0000 MiB`; valid classification in 12.19 seconds |
+| device `99`, expected fallback | Reported `requested GPU device index 99 is unavailable`; offloaded `0/37` layers and used the same CPU-only context contract; valid classification in 11.80 seconds |
 | status route | `routes::recent_endpoints_tests::status_reports_selected_vulkan_device` passed |
 | backend daemon smoke | Stored one source, returned a vector-only semantic-search hit, and loaded the exact adjacent ONNX Runtime and Vulkan loader modules |
 | app-owned daemon | The companion `wenlan-app` PR must record its own branch-tip `result.json`; a historical app run or this model probe alone is not accepted as current app evidence |
@@ -245,6 +265,13 @@ link alone is not the release gate.
 
 - `could not find any instance of Visual Studio`: the selected generator lacks
   the C++ workload. Install it and run from a matching developer environment.
+- Plain `bash` resolves to `C:\Windows\System32\bash.exe`: that is the WSL
+  launcher, not Git Bash. Invoke
+  `C:\Program Files\Git\bin\bash.exe` explicitly for repository Bash scripts.
+- Cargo reports `C:\Program Files\Git\usr\bin\link.exe` and coreutils says
+  `missing operand`: Git Bash's `link.exe` shadowed the Windows linker. Export
+  the `rust-lld` `RUSTFLAGS` shown above before starting the Bash build. CI and
+  tag release use the same explicit linker.
 - `add_custom_command DEPFILE is not supported by this generator`, or a
   missing nested `cmake_install.cmake`: run
   `scripts\setup-msvc-ninja-windows.ps1`; do not use a Visual Studio generator
