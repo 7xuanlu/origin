@@ -515,3 +515,476 @@ async fn list_entity_suggestions_scoped_excludes_invalid_and_mixed_owner_sets() 
         assert!(global_ids.contains(id));
     }
 }
+
+// ===== M3 PR-2 stage c: `scoped_entities` vanguard flip =====
+//
+// Differential-oracle coverage for the six scoped fns' per-call gate: seed
+// a DB, run a fn with the "scoped_entities" consumer OFF (legacy
+// `entities`), flip it ON under a clean, current parity watermark
+// (`reconcile_entity_page_parity`), run again, and assert the two outputs
+// are byte-identical. None of `Entity`/`EntityDetail`/`RelationWithEntity`/
+// `RecentRelation`/`RefinementProposal`/`SearchResult` derive `PartialEq`
+// (they are `wenlan-types` wire types stage c must not touch), so `Debug`
+// string equality stands in for full struct equality -- it is exact and
+// order-sensitive the same way `assert_eq!` would be. One shared
+// gate-closure test (not per-fn) proves a shadow corrupted after the proof
+// re-reconciles dirty and the reader transparently falls back to legacy,
+// mirroring stage b's `entity_reader_gate_blocked_by_nonzero_drift`.
+
+/// Seed entities covering the edge shapes the hybrid read must reproduce:
+/// a named space + NULL space, confirmed + unconfirmed, and an entity with
+/// an added (non-self) alias. Returns (work_id, work_peer_id,
+/// uncategorized_id); `work` is confirmed and aliased, `work_peer` and
+/// `uncategorized` are not.
+async fn stage_c_seed_entities(db: &super::MemoryDB) -> (String, String, String) {
+    let work = db
+        .store_entity(
+            "Stage C Work",
+            "person",
+            Some("stage_c_work"),
+            None,
+            Some(0.8),
+        )
+        .await
+        .unwrap();
+    db.confirm_entity(&work, true).await.unwrap();
+    db.add_entity_alias("stage c nickname", &work, "test")
+        .await
+        .unwrap();
+    let work_peer = db
+        .store_entity(
+            "Stage C Work Peer",
+            "project",
+            Some("stage_c_work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let uncategorized = db
+        .store_entity("Stage C Unfiled", "person", None, None, Some(0.4))
+        .await
+        .unwrap();
+    (work, work_peer, uncategorized)
+}
+
+/// Flip the "scoped_entities" consumer on and prove the gate actually
+/// opened (a clean, current parity watermark), so a bug that silently
+/// leaves every fn on legacy can't pass a differential test vacuously.
+async fn stage_c_enable_cutover_clean(db: &super::MemoryDB) {
+    db.set_entity_reader_cutover(super::MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reconcile_entity_page_parity().await.unwrap().drift_count,
+        0,
+        "seed must reconcile clean before the gate can open"
+    );
+    let conn = db.conn.lock().await;
+    assert!(
+        super::MemoryDB::reader_uses_entity_pages(&conn, super::MemoryDB::SCOPED_ENTITIES_CONSUMER)
+            .await
+            .unwrap(),
+        "sanity: a clean, current watermark must open the gate"
+    );
+}
+
+#[tokio::test]
+async fn list_entities_scoped_hybrid_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    stage_c_seed_entities(&db).await;
+    let work_scope = ReadScope::Space("stage_c_work".to_string());
+
+    let legacy_scoped = db.list_entities_scoped(None, &work_scope).await.unwrap();
+    let legacy_typed = db
+        .list_entities_scoped(Some("person"), &work_scope)
+        .await
+        .unwrap();
+    let legacy_uncategorized = db
+        .list_entities_scoped(None, &ReadScope::Uncategorized)
+        .await
+        .unwrap();
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid_scoped = db.list_entities_scoped(None, &work_scope).await.unwrap();
+    let hybrid_typed = db
+        .list_entities_scoped(Some("person"), &work_scope)
+        .await
+        .unwrap();
+    let hybrid_uncategorized = db
+        .list_entities_scoped(None, &ReadScope::Uncategorized)
+        .await
+        .unwrap();
+
+    assert_eq!(legacy_scoped.len(), 2, "sanity: two work entities seeded");
+    assert_eq!(
+        format!("{legacy_scoped:?}"),
+        format!("{hybrid_scoped:?}"),
+        "hybrid list_entities_scoped must be byte-identical to legacy"
+    );
+    assert_eq!(
+        format!("{legacy_typed:?}"),
+        format!("{hybrid_typed:?}"),
+        "hybrid list_entities_scoped (entity_type filter) must be byte-identical to legacy"
+    );
+    assert_eq!(
+        format!("{legacy_uncategorized:?}"),
+        format!("{hybrid_uncategorized:?}"),
+        "hybrid list_entities_scoped (Uncategorized) must be byte-identical to legacy"
+    );
+}
+
+#[tokio::test]
+async fn get_entity_detail_scoped_hybrid_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    let (work, work_peer, _uncategorized) = stage_c_seed_entities(&db).await;
+    let personal = db
+        .store_entity(
+            "Stage C Personal",
+            "person",
+            Some("stage_c_personal"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.create_relation(&work, &work_peer, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&work, &personal, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at) \
+             VALUES ('stage_c_obs_1', ?1, 'confirmed observation', NULL, 0.9, 1, unixepoch())",
+            libsql::params![work.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at) \
+             VALUES ('stage_c_obs_2', ?1, 'unconfirmed observation', NULL, NULL, 0, unixepoch())",
+            libsql::params![work.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let scope = ReadScope::Space("stage_c_work".to_string());
+    let legacy = db.get_entity_detail_scoped(&work, &scope).await.unwrap();
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid = db.get_entity_detail_scoped(&work, &scope).await.unwrap();
+
+    assert_eq!(
+        legacy.observations.len(),
+        2,
+        "sanity: two observations seeded"
+    );
+    assert_eq!(
+        legacy.relations.len(),
+        1,
+        "sanity: only the in-scope relation is visible"
+    );
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid:?}"),
+        "hybrid get_entity_detail_scoped must be byte-identical to legacy"
+    );
+}
+
+#[tokio::test]
+async fn list_recent_relations_scoped_hybrid_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    let (work, work_peer, _uncategorized) = stage_c_seed_entities(&db).await;
+    let personal = db
+        .store_entity(
+            "Stage C Personal Relation",
+            "person",
+            Some("stage_c_personal"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.create_relation(&work, &work_peer, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&work, &personal, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+
+    let scope = ReadScope::Space("stage_c_work".to_string());
+    let legacy = db
+        .list_recent_relations_scoped(20, None, &scope)
+        .await
+        .unwrap();
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid = db
+        .list_recent_relations_scoped(20, None, &scope)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        legacy.len(),
+        1,
+        "sanity: only the in-scope relation is visible"
+    );
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid:?}"),
+        "hybrid list_recent_relations_scoped must be byte-identical to legacy"
+    );
+}
+
+/// `list_entity_suggestions_scoped` sources no entity/page-mirrored field
+/// (a suggestion describes an entity that does not exist yet, so its query
+/// touches only `refinement_queue`+`memories`) -- the per-call gate is
+/// still consulted for audit uniformity, but there is no hybrid branch to
+/// diverge into. This test proves the consult is genuinely a no-op:
+/// legacy SQL, byte-identical output, before and after the flip.
+#[tokio::test]
+async fn list_entity_suggestions_scoped_hybrid_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    db.upsert_documents(vec![memory_doc(
+        "stage-c-suggest-work",
+        "stage_c_suggest_work",
+    )])
+    .await
+    .unwrap();
+    let sources = vec!["stage-c-suggest-work".to_string()];
+    db.insert_refinement_proposal(
+        "stage-c-suggest",
+        "suggest_entity",
+        &sources,
+        Some("stage-c-suggest"),
+        0.9,
+    )
+    .await
+    .unwrap();
+
+    let scope = ReadScope::Space("stage_c_suggest_work".to_string());
+    let legacy = db.list_entity_suggestions_scoped(&scope).await.unwrap();
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid = db.list_entity_suggestions_scoped(&scope).await.unwrap();
+
+    assert_eq!(legacy.len(), 1, "sanity: the proposal is visible");
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid:?}"),
+        "list_entity_suggestions_scoped sources no entity/page field -- \
+         the gate must not change it"
+    );
+}
+
+#[tokio::test]
+async fn search_entities_by_vector_scoped_hybrid_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    let work_id = db
+        .store_entity(
+            "Stage C Vector Work",
+            "project",
+            Some("stage_c_vec_work"),
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+    db.confirm_entity(&work_id, true).await.unwrap();
+    db.store_entity(
+        "Stage C Vector Personal",
+        "project",
+        Some("stage_c_vec_personal"),
+        None,
+        Some(0.9),
+    )
+    .await
+    .unwrap();
+
+    let scope = ReadScope::Space("stage_c_vec_work".to_string());
+    let legacy = db
+        .search_entities_by_vector_scoped("stage c vector query", 5, &scope)
+        .await
+        .unwrap();
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid = db
+        .search_entities_by_vector_scoped("stage c vector query", 5, &scope)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        legacy.len(),
+        1,
+        "sanity: only the in-scope entity is visible"
+    );
+    assert_eq!(legacy[0].entity.id, work_id);
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid:?}"),
+        "hybrid search_entities_by_vector_scoped must be byte-identical to legacy"
+    );
+}
+
+/// `get_memories_for_entities_scoped` returns MEMORIES linked to the given
+/// entity ids (`memories`/`memory_entities` only) -- like
+/// `list_entity_suggestions_scoped`, it sources no entity/page-mirrored
+/// field, so the gate consult is a no-op here too.
+#[tokio::test]
+async fn get_memories_for_entities_scoped_hybrid_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    let entity_id = db
+        .store_entity(
+            "Stage C Memory Topic",
+            "topic",
+            Some("stage_c_mem_work"),
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+    db.upsert_documents(vec![memory_doc("stage-c-mem", "stage_c_mem_work")])
+        .await
+        .unwrap();
+    db.link_memory_entities("stage-c-mem", &[entity_id.as_str()])
+        .await
+        .unwrap();
+
+    let scope = ReadScope::Space("stage_c_mem_work".to_string());
+    let legacy = db
+        .get_memories_for_entities_scoped(std::slice::from_ref(&entity_id), 10, &scope)
+        .await
+        .unwrap();
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid = db
+        .get_memories_for_entities_scoped(std::slice::from_ref(&entity_id), 10, &scope)
+        .await
+        .unwrap();
+
+    assert_eq!(legacy.len(), 1, "sanity: the linked memory is visible");
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid:?}"),
+        "get_memories_for_entities_scoped sources no entity/page field -- \
+         the gate must not change it"
+    );
+}
+
+/// THE gate-closure test (one, not per-fn, per the stage-c contract):
+/// corrupting a shadow and re-reconciling makes the watermark dirty, so
+/// the reader must transparently fall back to legacy even though the
+/// consumer is still enabled. Mirrors stage b's
+/// `entity_reader_gate_blocked_by_nonzero_drift`; `list_entities_scoped`
+/// stands in as the representative fn.
+#[tokio::test]
+async fn scoped_entities_gate_closes_on_drift_serves_legacy_transparently() {
+    let (db, _tmp) = test_db().await;
+    let entity_id = db
+        .store_entity(
+            "Stage C Drift",
+            "person",
+            Some("stage_c_drift"),
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+    stage_c_enable_cutover_clean(&db).await;
+
+    let scope = ReadScope::Space("stage_c_drift".to_string());
+    let clean_hybrid = db.list_entities_scoped(None, &scope).await.unwrap();
+    assert_eq!(clean_hybrid.len(), 1);
+    assert_eq!(clean_hybrid[0].entity_type, "person");
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET entity_type = 'organization' \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert!(
+        report.drift_count >= 1,
+        "sanity: reconcile must see the drift"
+    );
+
+    let gated = db.list_entities_scoped(None, &scope).await.unwrap();
+    assert_eq!(
+        gated.len(),
+        1,
+        "the entity must still be visible via the legacy fallback"
+    );
+    assert_eq!(
+        gated[0].entity_type, "person",
+        "a dirty watermark must transparently serve the uncorrupted legacy \
+         value, not the drifted shadow"
+    );
+}
+
+async fn stage_c_query_plan_detail(conn: &libsql::Connection, sql: &str) -> String {
+    let mut rows = conn
+        .query(&format!("EXPLAIN QUERY PLAN {sql}"), ())
+        .await
+        .unwrap();
+    let mut details = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        let detail: String = row.get(3).unwrap_or_default();
+        details.push(detail);
+    }
+    details.join(" | ")
+}
+
+/// `list_entities_scoped`'s flipped query must reach the shadow page
+/// through the `entity_page_map` UNIQUE index / pages PK, never a bare
+/// `SCAN pages`.
+#[tokio::test]
+async fn list_entities_scoped_flipped_query_uses_index_not_pages_scan() {
+    let (db, _tmp) = test_db().await;
+    stage_c_seed_entities(&db).await;
+    stage_c_enable_cutover_clean(&db).await;
+
+    let conn = db.conn.lock().await;
+    // Mirrors exactly the flipped SELECT `list_entities_scoped` builds
+    // once `reader_uses_entity_pages` is true (Space scope, no
+    // entity_type filter).
+    let plan = stage_c_query_plan_detail(
+        &conn,
+        "SELECT e.id, p.title, p.entity_type, e.space, e.source_agent, p.confidence, \
+                p.entity_confirmed, e.created_at, e.updated_at \
+         FROM entities e \
+         JOIN entity_page_map m ON m.entity_id = e.id \
+         JOIN pages p ON p.id = m.page_id AND p.kind = 'entity' AND p.status = 'active' \
+         WHERE e.space = 'stage_c_work' ORDER BY e.updated_at DESC, e.id ASC",
+    )
+    .await;
+
+    for line in plan.split(" | ") {
+        let upper = line.to_uppercase();
+        if upper.contains(" P ") || upper.contains("PAGES") {
+            assert!(
+                upper.contains("USING"),
+                "pages access must use the entity_page_map UNIQUE index or \
+                 the pages PK, not a bare scan: {line} (full plan: {plan})"
+            );
+        }
+    }
+    assert!(
+        plan.to_uppercase().contains("USING"),
+        "the flipped query must use at least one index: {plan}"
+    );
+}

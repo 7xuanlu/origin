@@ -11252,10 +11252,18 @@ impl MemoryDB {
     // Mirrors M2's `set_reader_cutover`/`reader_uses_edges` pair exactly,
     // over the entity<->page control plane stage a built (migration 94:
     // `entity_reader_cutover`, `entity_page_parity_watermark`). Stage b
-    // wires ONLY the predicate + the manual lever -- NO consumer consults
-    // `reader_uses_entity_pages` yet (the vanguard flip is stage c).
-    // Flipping a PRODUCTION consumer additionally waits on the program's
-    // D1 soak-exit.
+    // wired ONLY the predicate + the manual lever -- stage c flips the
+    // vanguard `scoped_entities` consumer onto `reader_uses_entity_pages`
+    // (`crates/wenlan-core/src/db/scoped_entities.rs`). Flipping a
+    // PRODUCTION consumer additionally waits on the program's D1
+    // soak-exit.
+
+    /// M3 PR-2 stage c: the single consumer key the `scoped_entities`
+    /// vanguard flip checks the gate under. Mirrors M2's `detect_communities`
+    /// literal `"communities"` key, named as a const per the stage-c
+    /// contract so every `scoped_entities.rs` call site shares one source
+    /// of truth.
+    pub(crate) const SCOPED_ENTITIES_CONSUMER: &str = "scoped_entities";
 
     /// Flip an entity-reader consumer's cutover ON or OFF (M3 PR-2 stage b;
     /// mirrors `set_reader_cutover` for M2's `edges`). Idempotent upsert.
@@ -11266,9 +11274,9 @@ impl MemoryDB {
     /// `cutover_epoch` records the epoch a consumer was last enabled
     /// under, for soak audit; it is not part of the gate.
     ///
-    /// Stage b wires the predicate; NO consumer consults it yet (the
-    /// vanguard flip is stage c). Flipping a PRODUCTION consumer
-    /// additionally waits on the program's D1 soak-exit.
+    /// Stage b wired the lever with no live caller; stage c flips the
+    /// vanguard `scoped_entities` consumer onto it. Flipping a PRODUCTION
+    /// consumer additionally waits on the program's D1 soak-exit.
     pub async fn set_entity_reader_cutover(
         &self,
         consumer: &str,
@@ -11319,10 +11327,11 @@ impl MemoryDB {
     /// and a wrong read; it fails safe toward legacy in every ambiguous
     /// case.
     ///
-    /// Stage b wires this predicate; NO consumer consults it yet (the
-    /// vanguard flip is stage c). Flipping a PRODUCTION consumer
-    /// additionally waits on the program's D1 soak-exit.
-    #[allow(dead_code)] // wired by stage c's vanguard flip; exercised directly by stage-b tests
+    /// Stage b wired this predicate with no live caller; stage c flips the
+    /// vanguard `scoped_entities` consumer onto it
+    /// (`crates/wenlan-core/src/db/scoped_entities.rs`). Flipping a
+    /// PRODUCTION consumer additionally waits on the program's D1
+    /// soak-exit.
     async fn reader_uses_entity_pages(
         conn: &libsql::Connection,
         consumer: &str,
