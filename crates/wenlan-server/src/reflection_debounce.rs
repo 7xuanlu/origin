@@ -229,7 +229,7 @@ mod tests {
     use std::time::Duration;
 
     /// Settle helper: advance wall-clock so spawned delay+work tasks complete.
-    /// Used by the time-tolerant tests (single-schedule, pre-delay abort, etc.)
+    /// Used by time-tolerant tests such as the pre-delay abort cases
     /// whose assertions don't depend on a real-sleep loop finishing inside a
     /// fixed budget. The force-run / ceiling tests use the event-driven
     /// `wait_signal` / `wait_until` helpers below instead.
@@ -272,7 +272,7 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
             }
         });
-        settle(120).await;
+        wait_until(|| counter.load(Ordering::Relaxed) == 1).await;
         assert_eq!(
             counter.load(Ordering::Relaxed),
             1,
