@@ -110,7 +110,7 @@ class FiltersetExecutionTests(unittest.TestCase):
             "crates/wenlan-core/src/lint/pages/security_test.rs"
         )
         with tempfile.TemporaryDirectory() as directory:
-            fake_cargo = Path(directory) / "cargo"
+            fake_cargo = Path(directory) / "fake_cargo.py"
             run_marker = Path(directory) / "nextest-ran"
             fake_cargo.write_text(
                 """#!/usr/bin/env python3
@@ -129,9 +129,17 @@ else:
 """,
                 encoding="utf-8",
             )
-            fake_cargo.chmod(0o755)
+            if os.name == "nt":
+                fake_cargo_launcher = Path(directory) / "cargo.cmd"
+                fake_cargo_launcher.write_text(
+                    f'@echo off\n"{sys.executable}" "{fake_cargo}" %*\n',
+                    encoding="utf-8",
+                )
+            else:
+                fake_cargo_launcher = fake_cargo
+                fake_cargo_launcher.chmod(0o755)
             environment = os.environ.copy()
-            environment["PATH"] = f"{directory}{os.pathsep}{environment['PATH']}"
+            environment["CARGO"] = str(fake_cargo_launcher)
             environment["FAKE_CARGO_METADATA"] = json.dumps(cargo_metadata())
             environment["FAKE_NEXTEST_LISTING"] = json.dumps(listing)
             environment["NEXTEST_RUN_MARKER"] = str(run_marker)

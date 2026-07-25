@@ -17,6 +17,9 @@ is specifically about the Qwen GGUF inference path.
   The CI-compatible SQLite triplet is `sqlite3:x64-windows-static-md`. Git for
   Windows' trimmed Perl is not sufficient for the vendored OpenSSL build
   because it omits modules such as `Locale::Maketext::Simple`.
+- `cargo-nextest` 0.9.x for the repository's impacted-test planner. The
+  official Windows package is signed; install it through winget so local
+  planner tests exercise the same `cargo nextest list/run` boundary as CI.
 - LunarG Vulkan SDK 1.4.350.0. The repository setup script downloads the
   pinned official installer, verifies SHA-256, and uses LunarG's `copy_only=1`
   mode so it does not require Administrator access or write registry state.
@@ -27,6 +30,7 @@ From PowerShell:
 winget install --id Kitware.CMake --exact
 winget install --id LLVM.LLVM --exact
 winget install --id StrawberryPerl.StrawberryPerl --exact
+winget install --id nextest.cargo-nextest --exact
 
 git clone --depth 1 --branch 2026.06.24 https://github.com/microsoft/vcpkg.git "$env:LOCALAPPDATA\wenlan-build\vcpkg"
 & "$env:LOCALAPPDATA\wenlan-build\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
@@ -37,7 +41,9 @@ $env:LIB = "$env:LOCALAPPDATA\wenlan-build\vcpkg\installed\x64-windows-static-md
 & scripts\setup-msvc-ninja-windows.ps1
 
 # llama.cpp's nested Vulkan shader build can exceed legacy MAX_PATH when the
-# checkout is deep. Keep Cargo output on a deliberately short local path.
+# checkout is deep. Keep Cargo output on a deliberately short, fresh local
+# path. Do not reuse a target previously configured with a Visual Studio
+# generator after setup-msvc-ninja-windows.ps1 selects Ninja.
 $env:CARGO_TARGET_DIR = "C:\wl-target"
 
 # MSVC's nested Vulkan shader probes can concurrently write the same PDB.
@@ -80,6 +86,9 @@ $releaseDir = Join-Path $env:CARGO_TARGET_DIR "release"
 & scripts\stage-vulkan-loader-windows.test.ps1
 & scripts\setup-msvc-ninja-windows.test.ps1
 & scripts\smoke-windows-llm.test.ps1
+python scripts\release_targets.test.py
+bash scripts\build-release-binaries.test.sh
+python scripts\ci_test_plan.test.py
 ```
 
 The Windows CI and release jobs run the same pinned Vulkan SDK setup before any
@@ -240,6 +249,12 @@ link alone is not the release gate.
   missing nested `cmake_install.cmake`: run
   `scripts\setup-msvc-ninja-windows.ps1`; do not use a Visual Studio generator
   for the Vulkan build.
+- `CMake project was already configured` followed by
+  `MSB1009: Project file does not exist ... install.vcxproj`: the Cargo target
+  contains a CMake cache created by a different generator. Point
+  `CARGO_TARGET_DIR` at a new short directory before rebuilding (for example
+  `C:\wl-target-ninja`). Do not mix Visual Studio and Ninja artifacts in one
+  target directory.
 - `cannot open input file 'sqlite3.lib'`: install the vcpkg triplet above and
   prepend its `lib` directory to `LIB`.
 - A test executable exits with `0xc0000135` / `STATUS_DLL_NOT_FOUND` after a

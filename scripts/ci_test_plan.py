@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections import defaultdict, deque
@@ -56,6 +57,21 @@ NATIVE_SUFFIXES = {
 
 CLI_SERVER_PACKAGES = {"wenlan", "wenlan-server"}
 MANUAL_CORE_INTEGRATION = {"cached_scenario_db_check", "eval_harness"}
+
+
+def _cargo_executable() -> str:
+    """Return Cargo's executable without parsing a shell command string."""
+
+    cargo = os.environ.get("CARGO", "cargo")
+    if not cargo:
+        raise PlanError("CARGO must name a Cargo executable")
+    return cargo
+
+
+def _executable_command(command: list[str]) -> list[str]:
+    if not command or command[0] != "cargo":
+        raise PlanError(f"cannot execute non-Cargo command: {command!r}")
+    return [_cargo_executable(), *command[1:]]
 
 
 def _full_plan(reason: str) -> dict:
@@ -510,7 +526,7 @@ def _load_json_file(path: str) -> object:
 def _cargo_metadata() -> object:
     result = subprocess.run(
         [
-            "cargo",
+            _cargo_executable(),
             "metadata",
             "--format-version",
             "1",
@@ -531,7 +547,7 @@ def _require_filterset_match(command: list[str]) -> None:
     if command[:3] != ["cargo", "nextest", "run"]:
         raise PlanError(f"cannot validate non-nextest command: {command!r}")
     list_command = [
-        "cargo",
+        _cargo_executable(),
         "nextest",
         "list",
         *command[3:],
@@ -636,8 +652,9 @@ def _main(argv: list[str]) -> int:
             and suite.get("mode") == "filterset"
         ):
             _require_filterset_match(command)
-        print("+", " ".join(command), flush=True)
-        subprocess.run(command, check=True)
+        executable_command = _executable_command(command)
+        print("+", " ".join(executable_command), flush=True)
+        subprocess.run(executable_command, check=True)
     return 0
 
 
