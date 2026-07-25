@@ -254,8 +254,10 @@ pub struct CreateConceptRequest {
     pub source_memory_ids: Vec<String>,
     #[serde(default)]
     pub creation_kind: Option<String>,
-    /// Dedicated workspace axis (P3). When Some, persisted to `pages.workspace`.
-    /// Distinct from `space` (category column used for page_type filtering).
+    /// Dedicated workspace axis (P3), the authoritative axis for page
+    /// filtering. When Some, persisted to `pages.workspace`. Distinct from
+    /// `space`, the legacy scope input defaulted from the `X-Origin-Space`
+    /// header when the body omits it (see `handle_create_page`).
     #[serde(default)]
     pub workspace: Option<String>,
 }

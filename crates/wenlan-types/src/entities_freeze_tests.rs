@@ -20,6 +20,12 @@
 //! like 0.9: `serde_json::to_value` widens an `f32` to `f64` via a raw `as`
 //! cast, not a decimal round-trip, so `0.9f32` does not compare equal to
 //! `json!(0.9)` (verified empirically -- `0.9f32 as f64 == 0.8999999761581421`).
+//!
+//! Freezing a sample only proves what it covers: a NEW `Option` field added
+//! with `skip_serializing_if` and left `None` in every sample here passes
+//! silently without ever freezing its `Some` shape. When adding a field to a
+//! frozen struct, populate it (`Some(...)`) in the fully-populated sample, not
+//! just the struct literal's default.
 
 use crate::entities::{
     Entity, EntityDetail, EntitySearchResult, EntitySuggestion, Observation, RecentRelation,
@@ -39,7 +45,9 @@ use crate::responses::{
     CreateEntityResponse, ListEntitiesResponse, ProposalAction, RefinementPayload,
     SearchEntitiesResponse,
 };
+use crate::sources::RawDocument;
 use serde_json::json;
+use std::collections::HashMap;
 
 // ===== entities.rs:8-93 =====
 
@@ -900,5 +908,85 @@ fn repair_rollback_v2_complete_entity_extraction_freeze() {
     assert_eq!(
         serde_json::from_value::<RepairRollbackPayloadV2>(no_error_json).unwrap(),
         no_error
+    );
+}
+
+// ===== sources.rs:172 =====
+
+fn sample_raw_document(entity_id: Option<String>) -> RawDocument {
+    RawDocument {
+        source: "gmail".into(),
+        source_id: "msg_1".into(),
+        title: "Title".into(),
+        summary: Some("Summary".into()),
+        content: "Body".into(),
+        url: Some("https://example.com".into()),
+        last_modified: 1_700_000_000,
+        metadata: HashMap::from([("key".to_string(), "value".to_string())]),
+        memory_type: Some("fact".into()),
+        space: Some("work".into()),
+        source_agent: Some("claude-code".into()),
+        confidence: Some(0.5),
+        confirmed: Some(true),
+        stability: Some("confirmed".into()),
+        supersedes: Some("mem_0".into()),
+        pending_revision: true,
+        entity_id,
+        quality: Some("high".into()),
+        importance: Some(8),
+        is_recap: true,
+        enrichment_status: "complete".into(),
+        supersede_mode: "archive".into(),
+        structured_fields: Some("{\"claim\":\"x\"}".into()),
+        retrieval_cue: Some("cue".into()),
+        source_text: Some("original".into()),
+        content_hash: Some("abc123".into()),
+    }
+}
+
+/// `RawDocument.entity_id` (spec M3, FREEZE set).
+#[test]
+fn raw_document_entity_id_freeze() {
+    let some_json = json!({
+        "source": "gmail",
+        "source_id": "msg_1",
+        "title": "Title",
+        "summary": "Summary",
+        "content": "Body",
+        "url": "https://example.com",
+        "last_modified": 1_700_000_000,
+        "metadata": { "key": "value" },
+        "memory_type": "fact",
+        "space": "work",
+        "source_agent": "claude-code",
+        "confidence": 0.5,
+        "confirmed": true,
+        "stability": "confirmed",
+        "supersedes": "mem_0",
+        "pending_revision": true,
+        "entity_id": "entity_1",
+        "quality": "high",
+        "importance": 8,
+        "is_recap": true,
+        "enrichment_status": "complete",
+        "supersede_mode": "archive",
+        "structured_fields": "{\"claim\":\"x\"}",
+        "retrieval_cue": "cue",
+        "source_text": "original",
+        "content_hash": "abc123",
+    });
+    assert_eq!(
+        serde_json::to_value(sample_raw_document(Some("entity_1".into()))).unwrap(),
+        some_json
+    );
+    let back: RawDocument = serde_json::from_value(some_json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&back).unwrap(), some_json);
+
+    // entity_id has skip_serializing_if = Option::is_none: None omits the key.
+    let mut none_json = some_json;
+    none_json.as_object_mut().unwrap().remove("entity_id");
+    assert_eq!(
+        serde_json::to_value(sample_raw_document(None)).unwrap(),
+        none_json
     );
 }
