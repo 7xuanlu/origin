@@ -743,48 +743,6 @@ async fn list_recent_relations_scoped_hybrid_matches_legacy() {
     );
 }
 
-/// `list_entity_suggestions_scoped` sources no entity/page-mirrored field
-/// (a suggestion describes an entity that does not exist yet, so its query
-/// touches only `refinement_queue`+`memories`) -- the per-call gate is
-/// still consulted for audit uniformity, but there is no hybrid branch to
-/// diverge into. This test proves the consult is genuinely a no-op:
-/// legacy SQL, byte-identical output, before and after the flip.
-#[tokio::test]
-async fn list_entity_suggestions_scoped_hybrid_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    db.upsert_documents(vec![memory_doc(
-        "stage-c-suggest-work",
-        "stage_c_suggest_work",
-    )])
-    .await
-    .unwrap();
-    let sources = vec!["stage-c-suggest-work".to_string()];
-    db.insert_refinement_proposal(
-        "stage-c-suggest",
-        "suggest_entity",
-        &sources,
-        Some("stage-c-suggest"),
-        0.9,
-    )
-    .await
-    .unwrap();
-
-    let scope = ReadScope::Space("stage_c_suggest_work".to_string());
-    let legacy = db.list_entity_suggestions_scoped(&scope).await.unwrap();
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid = db.list_entity_suggestions_scoped(&scope).await.unwrap();
-
-    assert_eq!(legacy.len(), 1, "sanity: the proposal is visible");
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid:?}"),
-        "list_entity_suggestions_scoped sources no entity/page field -- \
-         the gate must not change it"
-    );
-}
-
 #[tokio::test]
 async fn search_entities_by_vector_scoped_hybrid_matches_legacy() {
     let (db, _tmp) = test_db().await;
@@ -832,52 +790,6 @@ async fn search_entities_by_vector_scoped_hybrid_matches_legacy() {
         format!("{legacy:?}"),
         format!("{hybrid:?}"),
         "hybrid search_entities_by_vector_scoped must be byte-identical to legacy"
-    );
-}
-
-/// `get_memories_for_entities_scoped` returns MEMORIES linked to the given
-/// entity ids (`memories`/`memory_entities` only) -- like
-/// `list_entity_suggestions_scoped`, it sources no entity/page-mirrored
-/// field, so the gate consult is a no-op here too.
-#[tokio::test]
-async fn get_memories_for_entities_scoped_hybrid_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    let entity_id = db
-        .store_entity(
-            "Stage C Memory Topic",
-            "topic",
-            Some("stage_c_mem_work"),
-            None,
-            Some(0.9),
-        )
-        .await
-        .unwrap();
-    db.upsert_documents(vec![memory_doc("stage-c-mem", "stage_c_mem_work")])
-        .await
-        .unwrap();
-    db.link_memory_entities("stage-c-mem", &[entity_id.as_str()])
-        .await
-        .unwrap();
-
-    let scope = ReadScope::Space("stage_c_mem_work".to_string());
-    let legacy = db
-        .get_memories_for_entities_scoped(std::slice::from_ref(&entity_id), 10, &scope)
-        .await
-        .unwrap();
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid = db
-        .get_memories_for_entities_scoped(std::slice::from_ref(&entity_id), 10, &scope)
-        .await
-        .unwrap();
-
-    assert_eq!(legacy.len(), 1, "sanity: the linked memory is visible");
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid:?}"),
-        "get_memories_for_entities_scoped sources no entity/page field -- \
-         the gate must not change it"
     );
 }
 

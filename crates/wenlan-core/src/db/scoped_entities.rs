@@ -414,17 +414,11 @@ impl MemoryDB {
         }
 
         let conn = self.conn.lock().await;
-        // M3 PR-2 stage c: consulted for audit uniformity across the flip
-        // set. A suggestion proposes an entity that does not exist yet, so
-        // this query sources nothing from `entities`/`pages` (it reads
-        // `refinement_queue` + `memories` only) -- the gate result cannot
-        // change it, and legacy SQL runs unconditionally below either way.
-        Self::reader_uses_entity_pages(&conn, Self::SCOPED_ENTITIES_CONSUMER)
-            .await
-            .map_err(|error| {
-                WenlanError::VectorDb(format!("list_entity_suggestions_scoped gate: {error}"))
-            })?;
-
+        // M3 PR-2 stage c: NOT a cutover consumer. A suggestion proposes an
+        // entity that does not exist yet, so this query sources nothing
+        // from `entities`/`pages` (it reads `refinement_queue` + `memories`
+        // only) -- it stays on its own substrate until the retirement rung
+        // widens the mirror.
         let safe_sources = "CASE WHEN json_valid(rq.source_ids) \
                             THEN rq.source_ids ELSE '[]' END";
         let (matching_owner, mismatching_owner, values) = match scope {
@@ -663,17 +657,11 @@ impl MemoryDB {
         }
 
         let conn = self.conn.lock().await;
-        // M3 PR-2 stage c: consulted for audit uniformity across the flip
-        // set. This query returns MEMORIES linked to the given entity ids
-        // (`c.*`/`memory_entities`), not entity rows, and sources no
-        // entity/page-mirrored field -- the gate result cannot change it,
-        // and legacy SQL runs unconditionally below either way.
-        Self::reader_uses_entity_pages(&conn, Self::SCOPED_ENTITIES_CONSUMER)
-            .await
-            .map_err(|error| {
-                WenlanError::VectorDb(format!("get_memories_for_entities_scoped gate: {error}"))
-            })?;
-
+        // M3 PR-2 stage c: NOT a cutover consumer. This query returns
+        // MEMORIES linked to the given entity ids (`c.*`/`memory_entities`),
+        // not entity rows, and sources no entity/page-mirrored field -- it
+        // stays on its own substrate until the retirement rung widens the
+        // mirror.
         let anchor_rank: HashMap<&str, usize> = ranked_anchor_ids
             .iter()
             .enumerate()
