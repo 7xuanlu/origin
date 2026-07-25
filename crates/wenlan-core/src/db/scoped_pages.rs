@@ -274,9 +274,12 @@ impl MemoryDB {
 
         use wenlan_types::{ActivityBadge, ActivityKind, RecentActivityItem};
 
-        // Q1 lift (stage c): `kind='entity'` dual-write shadow pages appear in
-        // this recent-activity listing, mirroring `list_pages_scoped`'s lift.
-        let pages: Vec<Page> = self.list_pages_scoped("active", limit, 0, scope).await?;
+        // Q1 (stage c): `kind='entity'` dual-write shadow pages appear in this
+        // recent-activity listing -- a browse surface, so it reads the unfenced
+        // `list_pages_scoped_browse` twin.
+        let pages: Vec<Page> = self
+            .list_pages_scoped_browse("active", limit, 0, scope)
+            .await?;
         let all_source_ids = pages
             .iter()
             .flat_map(|page| page.source_memory_ids.iter().cloned())
@@ -418,6 +421,12 @@ impl MemoryDB {
         Ok(changes)
     }
 
+    /// Fenced: `kind='entity'` dual-write shadow pages stay excluded on every
+    /// scope arm (Global delegates to the fenced `list_pages`). Export and
+    /// other internal consumers that must never emit a stub call this, so the
+    /// fence lands in SQL before `LIMIT` -- a burst of fresh stubs can never
+    /// crowd real pages out of a bounded window. For the browse-facing twin
+    /// (Q1 read surfaces), see `list_pages_scoped_browse`.
     pub async fn list_pages_scoped(
         &self,
         status: &str,
@@ -425,11 +434,40 @@ impl MemoryDB {
         offset: i64,
         scope: &ReadScope,
     ) -> Result<Vec<Page>, WenlanError> {
+        self.list_pages_scoped_inner(status, limit, offset, scope, true)
+            .await
+    }
+
+    /// Browse-facing twin of `list_pages_scoped`: backs `GET /api/pages` and
+    /// the recent-with-badges browse path, where Q1 rules `kind='entity'`
+    /// dual-write shadow pages must appear on every scope arm (Global delegates
+    /// to `list_pages_browse`). Never call this from export or any internal
+    /// non-browse path -- those must stay fenced (`list_pages_scoped`).
+    pub async fn list_pages_scoped_browse(
+        &self,
+        status: &str,
+        limit: i64,
+        offset: i64,
+        scope: &ReadScope,
+    ) -> Result<Vec<Page>, WenlanError> {
+        self.list_pages_scoped_inner(status, limit, offset, scope, false)
+            .await
+    }
+
+    async fn list_pages_scoped_inner(
+        &self,
+        status: &str,
+        limit: i64,
+        offset: i64,
+        scope: &ReadScope,
+        fence_entity: bool,
+    ) -> Result<Vec<Page>, WenlanError> {
         if matches!(scope, ReadScope::Global) {
-            // Q1 browse surface: this whole fn shows kind='entity' stubs on
-            // every scope arm, so the Global arm must delegate to the
-            // unfenced twin, not the internal-callers' fenced `list_pages`.
-            return self.list_pages_browse(status, limit, offset).await;
+            return if fence_entity {
+                self.list_pages(status, limit, offset).await
+            } else {
+                self.list_pages_browse(status, limit, offset).await
+            };
         }
         let select = "c.id, c.title, c.summary, c.content, c.entity_id, c.space, \
                       c.source_memory_ids, c.version, c.status, c.created_at, \
@@ -438,11 +476,16 @@ impl MemoryDB {
                       COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
                       COALESCE(c.creation_kind, 'distilled'), \
                       COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
+        let fence_sql = if fence_entity {
+            " AND COALESCE(c.kind, 'concept') != 'entity'"
+        } else {
+            ""
+        };
         let (sql, params) = match scope {
             ReadScope::Space(workspace) => (
                 format!(
                     "SELECT {select} FROM pages c \
-                     WHERE c.status = ?1 AND c.workspace = ?2 \
+                     WHERE c.status = ?1{fence_sql} AND c.workspace = ?2 \
                      ORDER BY c.last_modified DESC LIMIT ?3 OFFSET ?4"
                 ),
                 vec![
@@ -455,7 +498,7 @@ impl MemoryDB {
             ReadScope::Uncategorized => (
                 format!(
                     "SELECT {select} FROM pages c \
-                     WHERE c.status = ?1 AND c.workspace = '00000000-0000-4000-8000-000000000001' \
+                     WHERE c.status = ?1{fence_sql} AND c.workspace = '00000000-0000-4000-8000-000000000001' \
                      ORDER BY c.last_modified DESC LIMIT ?2 OFFSET ?3"
                 ),
                 vec![
@@ -518,13 +561,42 @@ impl MemoryDB {
         Ok(labels)
     }
 
+    /// Fenced: `kind='entity'` dual-write shadow pages stay excluded, so a
+    /// by-id read on a mutation/export path resolves a stub as absent (None).
+    /// For the browse-facing twin that returns stub pages by id (Q1 read
+    /// surfaces), see `get_page_scoped_browse`.
     pub async fn get_page_scoped(
         &self,
         id: &str,
         scope: &ReadScope,
     ) -> Result<Option<Page>, WenlanError> {
+        self.get_page_scoped_inner(id, scope, true).await
+    }
+
+    /// Browse-facing twin of `get_page_scoped`: backs `GET /api/pages/{id}` and
+    /// its advisory revisions read, where Q1 rules `kind='entity'` dual-write
+    /// shadow pages must resolve. Never call this from a mutation/export path --
+    /// those must stay fenced (`get_page_scoped`).
+    pub async fn get_page_scoped_browse(
+        &self,
+        id: &str,
+        scope: &ReadScope,
+    ) -> Result<Option<Page>, WenlanError> {
+        self.get_page_scoped_inner(id, scope, false).await
+    }
+
+    async fn get_page_scoped_inner(
+        &self,
+        id: &str,
+        scope: &ReadScope,
+        fence_entity: bool,
+    ) -> Result<Option<Page>, WenlanError> {
         if matches!(scope, ReadScope::Global) {
-            return self.get_page(id).await;
+            return if fence_entity {
+                self.get_page(id).await
+            } else {
+                self.get_page_browse(id).await
+            };
         }
         let select = "c.id, c.title, c.summary, c.content, c.entity_id, c.space, \
                       c.source_memory_ids, c.version, c.status, c.created_at, \
@@ -534,7 +606,12 @@ impl MemoryDB {
                       COALESCE(c.creation_kind, 'distilled'), \
                       COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
         let (scope_sql, scope_value) = page_scope_clause(scope, "c.workspace", 2);
-        let sql = format!("SELECT {select} FROM pages c WHERE c.id = ?1{scope_sql}");
+        let fence_sql = if fence_entity {
+            " AND COALESCE(c.kind, 'concept') != 'entity'"
+        } else {
+            ""
+        };
+        let sql = format!("SELECT {select} FROM pages c WHERE c.id = ?1{fence_sql}{scope_sql}");
         let mut params = vec![libsql::Value::Text(id.to_string())];
         if let Some(value) = scope_value {
             params.push(value);

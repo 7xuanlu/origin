@@ -60,6 +60,39 @@ async fn post_json(
         .unwrap()
 }
 
+async fn put_json(
+    router: &common::AppRouter,
+    uri: &str,
+    body: serde_json::Value,
+) -> axum::http::Response<Body> {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn delete(router: &common::AppRouter, uri: &str) -> axum::http::Response<Body> {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 async fn body_json<T: serde::de::DeserializeOwned>(resp: axum::http::Response<Body>) -> T {
     let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
         .await
@@ -274,5 +307,125 @@ async fn export_stays_stub_free() {
         single_resp.status(),
         StatusCode::NOT_FOUND,
         "single-page export of a shadow id must 404, matching pre-lift behavior"
+    );
+}
+
+// -- Fix wave (sol-review): Q1 makes shadow ids publicly discoverable, so the
+// page MUTATION surfaces must fence them. A shadow id obtained through the
+// public GET /api/pages listing must be rejected by archive, delete, manual
+// update, agent refresh, and page-map node create -- while the read surface
+// (GET /api/pages/{id}) stays 200. --
+
+#[tokio::test]
+async fn archive_of_shadow_id_is_rejected() {
+    let (router, _tmp, db) = common::test_app().await;
+    db.store_entity("HTTP Archive Fence Marker", "person", None, None, None)
+        .await
+        .unwrap();
+    let id = find_page_id_by_title(&router, "HTTP Archive Fence Marker").await;
+
+    let resp = post_json(
+        &router,
+        &format!("/api/pages/{id}/archive"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        resp.status().is_client_error(),
+        "POST /api/pages/{{stub}}/archive must return a 4xx, got {}",
+        resp.status()
+    );
+
+    // The stub must still resolve (archive was rejected, not partially applied).
+    let get_resp = get(&router, &format!("/api/pages/{id}")).await;
+    assert_eq!(
+        get_resp.status(),
+        StatusCode::OK,
+        "the shadow page must still resolve after a rejected archive"
+    );
+}
+
+#[tokio::test]
+async fn delete_of_shadow_id_is_rejected() {
+    let (router, _tmp, db) = common::test_app().await;
+    db.store_entity("HTTP Delete Fence Marker", "person", None, None, None)
+        .await
+        .unwrap();
+    let id = find_page_id_by_title(&router, "HTTP Delete Fence Marker").await;
+
+    let resp = delete(&router, &format!("/api/pages/{id}")).await;
+    assert!(
+        resp.status().is_client_error(),
+        "DELETE /api/pages/{{stub}} must return a 4xx, got {}",
+        resp.status()
+    );
+
+    let get_resp = get(&router, &format!("/api/pages/{id}")).await;
+    assert_eq!(
+        get_resp.status(),
+        StatusCode::OK,
+        "the shadow page must still resolve after a rejected delete"
+    );
+}
+
+#[tokio::test]
+async fn write_and_page_map_surfaces_reject_shadow_while_get_stays_200() {
+    let (router, _tmp, db) = common::test_app().await;
+    db.store_entity("HTTP Write Fence Marker", "person", None, None, None)
+        .await
+        .unwrap();
+    let id = find_page_id_by_title(&router, "HTTP Write Fence Marker").await;
+
+    // Manual update (POST /api/memory/{id}/update-page): fenced get_page →
+    // None → 404.
+    let update_resp = post_json(
+        &router,
+        &format!("/api/memory/{id}/update-page"),
+        serde_json::json!({ "content": "attempted stub edit" }),
+    )
+    .await;
+    assert_eq!(
+        update_resp.status(),
+        StatusCode::NOT_FOUND,
+        "manual update of a shadow id must 404"
+    );
+
+    // Agent refresh (PUT /api/pages/{id}): valid body, fenced get_page → None →
+    // 4xx.
+    let refresh_resp = put_json(
+        &router,
+        &format!("/api/pages/{id}"),
+        serde_json::json!({
+            "content": "attempted stub refresh",
+            "source_memory_ids": ["mem_1"],
+        }),
+    )
+    .await;
+    assert!(
+        refresh_resp.status().is_client_error(),
+        "agent refresh of a shadow id must return a 4xx, got {}",
+        refresh_resp.status()
+    );
+
+    // Page-map node create (POST /api/pages/{id}/map/nodes): ensure_page_is_active
+    // → fenced get_page → None → 404.
+    let node_resp = post_json(
+        &router,
+        &format!("/api/pages/{id}/map/nodes"),
+        serde_json::json!({ "base_revision": 0 }),
+    )
+    .await;
+    assert_eq!(
+        node_resp.status(),
+        StatusCode::NOT_FOUND,
+        "page-map node create for a shadow id must 404"
+    );
+
+    // The read surface stays 200 throughout.
+    let get_resp = get(&router, &format!("/api/pages/{id}")).await;
+    assert_eq!(
+        get_resp.status(),
+        StatusCode::OK,
+        "GET /api/pages/{{stub}} must stay 200 while the write surfaces reject it"
     );
 }

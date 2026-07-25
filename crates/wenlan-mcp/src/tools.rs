@@ -2125,8 +2125,10 @@ impl WenlanMcpServer {
         // `DeleteResponse{deleted: bool}` shape used elsewhere. No exported
         // wenlan-types struct matches it, so a local type stands in for
         // serde_json::Value -- a wire-shape drift now fails at deserialize
-        // instead of round-tripping silently as untyped JSON.
+        // instead of round-tripping silently as untyped JSON. `deny_unknown_fields`
+        // makes an ADDITIVE envelope key fail loud too, not just a renamed one.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct DeletePageResponse {
             status: String,
         }
@@ -2146,7 +2148,10 @@ impl WenlanMcpServer {
         // page-draft feature's response, not this route's), so a local type
         // stands in for serde_json::Value -- a wire-shape drift now fails at
         // deserialize instead of round-tripping silently as untyped JSON.
+        // `deny_unknown_fields` makes an ADDITIVE envelope key fail loud too
+        // (the top-level object; the inner Page keeps its own field contract).
         #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct GetPageResponse {
             page: wenlan_types::Page,
         }
