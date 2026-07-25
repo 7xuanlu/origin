@@ -11007,9 +11007,12 @@ impl MemoryDB {
     /// The current entity dual-write coverage epoch (M3 PR-1, migration 92:
     /// `entity_page_migration_state`, seeded to 1 by that migration). Mirrors
     /// `current_dual_write_epoch` for `edges`. Returns `None` when there is
-    /// no trustworthy current epoch -- a missing state row OR an undecodable
-    /// `epoch` column -- and callers must treat that as "gate closed / cannot
-    /// prove", never fabricate a generation.
+    /// no trustworthy current epoch -- a missing state row, an undecodable
+    /// `epoch` column, or a non-positive epoch -- 0 is the recorded "no
+    /// trustworthy epoch" sentinel (see
+    /// `set_entity_reader_cutover_with_missing_state_records_epoch_zero`) --
+    /// and callers must treat that as "gate closed / cannot prove", never
+    /// fabricate a generation.
     async fn current_entity_dual_write_epoch(
         conn: &libsql::Connection,
     ) -> Result<Option<i64>, libsql::Error> {
@@ -11020,7 +11023,7 @@ impl MemoryDB {
             )
             .await?;
         match rows.next().await? {
-            Some(row) => Ok(row.get::<i64>(0).ok()),
+            Some(row) => Ok(row.get::<i64>(0).ok().filter(|epoch| *epoch > 0)),
             None => Ok(None),
         }
     }
@@ -77942,6 +77945,56 @@ pub(crate) mod tests {
                 .unwrap(),
             "the predicate must stay false with no trustworthy epoch"
         );
+    }
+
+    /// Epoch FAIL-CLOSED: the reader must reject the epoch-0 sentinel ("no
+    /// trustworthy epoch", `set_entity_reader_cutover`'s own convention) and
+    /// any negative epoch, not just a missing row --
+    /// `current_entity_dual_write_epoch` must treat all three as "no current
+    /// epoch".
+    #[tokio::test]
+    async fn current_epoch_rejects_zero_sentinel_and_negative_epoch() {
+        let (db, _dir) = test_db().await;
+        db.store_entity("Epoch Guard", "person", None, None, None)
+            .await
+            .unwrap();
+        db.set_entity_reader_cutover("test_consumer", true)
+            .await
+            .unwrap();
+        db.reconcile_entity_page_parity().await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark opens the gate"
+            );
+        }
+
+        for bad_epoch in [0i64, -3i64] {
+            {
+                let conn = db.conn.lock().await;
+                conn.execute(
+                    "UPDATE entity_page_migration_state SET epoch = ?1 WHERE id = 1",
+                    libsql::params![bad_epoch],
+                )
+                .await
+                .unwrap();
+            }
+            let err = db.reconcile_entity_page_parity().await.unwrap_err();
+            assert!(
+                format!("{err}").contains("entity_page_migration_state"),
+                "epoch {bad_epoch} must be rejected as untrustworthy: {err}"
+            );
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::reader_uses_entity_pages(&conn, "test_consumer")
+                    .await
+                    .unwrap(),
+                "epoch {bad_epoch} must keep the reader closed"
+            );
+        }
     }
 
     #[tokio::test]
