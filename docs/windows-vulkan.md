@@ -149,19 +149,28 @@ an NVIDIA GeForce RTX 3060 Laptop discrete GPU, Vulkan SDK 1.4.350.0, Visual
 Studio Build Tools 2019, and
 `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` (2,497,281,120 bytes, SHA-256
 `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`).
-The final verification ran backend commit
-`f3edbfe4b51ac3406597463dbfd9ad3632fad141`.
+The latest verification ran backend code commit
+`b4677e277e70613585e37e99fa29721426b2a179`, after merging current
+`origin/main`. The source-built `wenlan-server.exe` SHA-256 was
+`a38b6c682ea6750ac1802ded0517c6ffe7a3bf2538c1b517e2c6bdeda02f03bf`.
 
 | Leg | Observed result |
 |---|---|
 | `auto`, expected Vulkan | Selected llama.cpp device `1`, `NVIDIA GeForce RTX 3060 Laptop GPU`; offloaded `37/37` layers; allocated 576 MiB KV and 301.75 MiB compute on Vulkan1; valid classification |
-| `cpu`, expected CPU | All 36 KV layers reported `dev = CPU`; graph splits `1`; Vulkan1 device compute allocation `0.0000 MiB`; valid classification in about 11.45 seconds |
-| device `99`, expected fallback | Reported `requested GPU device index 99 is unavailable`; used the same CPU-only context contract; valid classification in about 11.28 seconds |
-| warm Vulkan inference | Valid classification in about 1.10 seconds; an earlier cold Vulkan run also paid shader/pipeline setup and took about 20.56 seconds |
+| `cpu`, expected CPU | All 36 KV layers reported `dev = CPU`; graph splits `1`; Vulkan1 device compute allocation `0.0000 MiB`; valid classification in about 11.56 seconds |
+| device `99`, expected fallback | Reported `requested GPU device index 99 is unavailable`; used the same CPU-only context contract; valid classification in about 11.95 seconds |
+| warm Vulkan inference | Valid classification in about 1.16 seconds; an earlier cold Vulkan run also paid shader/pipeline setup and took about 20.56 seconds |
 | status route | `routes::recent_endpoints_tests::status_reports_selected_vulkan_device` passed |
+| app-owned daemon | `wenlan-app` native WebView2 smoke reported `vulkan`, device `1`, RTX 3060, and `gpu_layers=99`; all 35 evidence assertions passed and guarded quit removed both processes |
 
 These timings are smoke evidence, not a benchmark. Compare warmed, repeated
 runs before making performance claims.
+
+The synchronized Windows build used a short `C:\wl-target-ninja` Cargo target,
+Ninja, and one build job. It completed without Rust warnings after making
+Unix-only projection parameters explicitly consumed on non-Unix targets. Keep
+Windows warning-free because CI runs Clippy with warnings denied; a successful
+link alone is not the release gate.
 
 ## Troubleshooting
 
