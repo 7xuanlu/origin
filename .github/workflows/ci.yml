@@ -892,6 +892,27 @@ jobs:
           }
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Select native Perl for vendored OpenSSL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $nativePerl = $null
+          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
+            if ($candidate.Source -match '[\\/]Git[\\/]') {
+              continue
+            }
+            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
+            if ($LASTEXITCODE -eq 0) {
+              $nativePerl = $candidate.Source
+              break
+            }
+          }
+          if (-not $nativePerl) {
+            throw "No native Perl can load Locale::Maketext::Simple"
+          }
+          "OPENSSL_SRC_PERL=$nativePerl" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "OPENSSL_SRC_PERL=$nativePerl"
       - name: Cache release artifacts (main-owned)
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:

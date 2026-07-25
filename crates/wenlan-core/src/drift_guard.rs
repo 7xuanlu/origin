@@ -2485,6 +2485,49 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     {
         violations.push("release-preflight does not link the Windows sqlite dependency".into());
     }
+    for (workflow, job_name) in [(&ci, "release-preflight"), (&release, "release")] {
+        let native_perl = job_step(
+            workflow,
+            job_name,
+            "Select native Perl for vendored OpenSSL",
+        );
+        let native_perl_run = native_perl
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if native_perl.and_then(|step| step["if"].as_str()) != Some(windows_condition)
+            || native_perl.and_then(|step| step["shell"].as_str()) != Some("pwsh")
+            || !native_perl_run.contains("Get-Command perl.exe")
+            || !native_perl_run.contains("-All")
+            || !native_perl_run.contains("candidate.Source -match")
+            || !native_perl_run.contains("[\\\\/]Git[\\\\/]")
+            || !native_perl_run.contains("Locale::Maketext::Simple")
+            || !native_perl_run.contains("OPENSSL_SRC_PERL=")
+            || !native_perl_run.contains("$env:GITHUB_ENV")
+        {
+            violations.push(format!(
+                "{job_name} does not select and validate native Windows Perl before vendored OpenSSL"
+            ));
+        }
+        let steps = workflow["jobs"][job_name]["steps"].as_sequence();
+        let native_perl_index = steps.and_then(|items| {
+            items.iter().position(|step| {
+                step["name"].as_str() == Some("Select native Perl for vendored OpenSSL")
+            })
+        });
+        let build_index = steps.and_then(|items| {
+            items.iter().position(|step| {
+                step["name"].as_str() == Some("Build and smoke shipped release binaries")
+            })
+        });
+        if !matches!(
+            (native_perl_index, build_index),
+            (Some(native_perl_index), Some(build_index)) if native_perl_index < build_index
+        ) {
+            violations.push(format!(
+                "{job_name} selects native Windows Perl after the release build"
+            ));
+        }
+    }
     let cache = job_step_using(&ci, "release-preflight", "Swatinem/rust-cache");
     if cache.and_then(|step| step["with"]["shared-key"].as_str())
         != Some("release-${{ matrix.target }}")
@@ -2599,6 +2642,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace(
             "      - name: Native ORT smoke (Windows release preflight)",
             "      - name: Native ORT smoke removed",
+        )
+        .replace(
+            "      - name: Select native Perl for vendored OpenSSL",
+            "      - name: Native Perl removed",
         );
     let release = release.replace(
         "      matrix: ${{ fromJSON(needs.prepare-release.outputs.release-targets) }}",
@@ -2612,6 +2659,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "shared shipped-binary",
         "target-scoped, capacity-bounded, and main-owned",
         "truncated PR file inventory",
+        "native Windows Perl",
         "native ORT smoke",
         "publishing or packaging side effect",
         "conclusion does not fail closed",

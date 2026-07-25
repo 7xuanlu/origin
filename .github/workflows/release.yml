@@ -245,6 +245,28 @@ jobs:
           "RUSTFLAGS=$rustflags" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "RUSTFLAGS=$rustflags"
 
+      - name: Select native Perl for vendored OpenSSL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $nativePerl = $null
+          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
+            if ($candidate.Source -match '[\\/]Git[\\/]') {
+              continue
+            }
+            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
+            if ($LASTEXITCODE -eq 0) {
+              $nativePerl = $candidate.Source
+              break
+            }
+          }
+          if (-not $nativePerl) {
+            throw "No native Perl can load Locale::Maketext::Simple"
+          }
+          "OPENSSL_SRC_PERL=$nativePerl" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "OPENSSL_SRC_PERL=$nativePerl"
+
       # CI release-preflight and the authoritative tag build share this exact
       # shipped-binary build/smoke contract. Packaging and publishing remain
       # release-only below.
