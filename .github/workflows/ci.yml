@@ -678,12 +678,12 @@ jobs:
             $global:LASTEXITCODE = 0
           }
 
-  # Linux acceptance runs beside the long workspace-lib lane. On PR #384,
+  # Canonical acceptance runs beside the long workspace-lib lane. On PR #384,
   # these steps occupied ~9 minutes after workspace lib tests had already
   # finished; keeping them independent removes that serialization without
   # transferring a target directory or making correctness depend on cache hits.
-  linux-acceptance:
-    name: linux-acceptance
+  canonical-acceptance:
+    name: canonical-acceptance (ubuntu)
     needs: [detect-changes]
     if: "needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || github.event_name != 'pull_request'"
     runs-on: ubuntu-24.04
@@ -906,7 +906,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, fmt, lint, test, linux-acceptance, windows-release-proof, docs, plugin, npm]
+    needs: [detect-changes, fmt, lint, test, canonical-acceptance, windows-release-proof, docs, plugin, npm]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -937,7 +937,7 @@ jobs:
           expect_job fmt "$run_rust" '${{ needs.fmt.result }}'
           expect_job lint "$run_rust" '${{ needs.lint.result }}'
           expect_job test "$run_rust" '${{ needs.test.result }}'
-          expect_job linux-acceptance "$run_rust" '${{ needs.linux-acceptance.result }}'
+          expect_job canonical-acceptance "$run_rust" '${{ needs.canonical-acceptance.result }}'
           expect_job windows-release-proof '${{ github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-release == 'true' }}' '${{ needs.windows-release-proof.result }}'
           expect_job docs '${{ needs.detect-changes.outputs.docs == 'true' }}' '${{ needs.docs.result }}'
           expect_job plugin '${{ needs.detect-changes.outputs.plugin == 'true' }}' '${{ needs.plugin.result }}'

@@ -114,7 +114,7 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
             ],
         ),
         (
-            "linux-acceptance",
+            "canonical-acceptance",
             &["Integration tests wenlan-cli + wenlan-server (Linux)"],
         ),
         (
@@ -661,7 +661,7 @@ jobs:
         with:
           path: ~/.local/share/wenlan/memorydb/fastembed_cache
           key: stale
-  linux-acceptance:
+  canonical-acceptance:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
@@ -2094,7 +2094,7 @@ fn ci_routing_contract_violations(
     }
     let linux_integration = job_step(
         &ci,
-        "linux-acceptance",
+        "canonical-acceptance",
         "Integration tests wenlan-cli + wenlan-server (Linux)",
     );
     let macos_integration = job_step(
@@ -2282,25 +2282,26 @@ jobs:
     }
 }
 
-// ── Teeth #9: Linux acceptance runs beside the long workspace-lib lane ──
+// ── Teeth #9: canonical acceptance runs beside the long workspace-lib lane ──
 
-fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
+fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let mut violations = Vec::new();
-    let job = &ci["jobs"]["linux-acceptance"];
+    let job = &ci["jobs"]["canonical-acceptance"];
 
-    if job_needs(&ci, "linux-acceptance") != ["detect-changes"] {
-        violations.push("Linux acceptance is serialized behind another required job".into());
+    if job_needs(&ci, "canonical-acceptance") != ["detect-changes"] {
+        violations.push("Canonical acceptance is serialized behind another required job".into());
     }
     if job["if"].as_str() != ci["jobs"]["test"]["if"].as_str() {
-        violations
-            .push("Linux acceptance does not share the fail-closed Rust routing condition".into());
+        violations.push(
+            "Canonical acceptance does not share the fail-closed Rust routing condition".into(),
+        );
     }
     if job["runs-on"].as_str() != Some("ubuntu-24.04")
         || job["timeout-minutes"].as_str()
             != Some("${{ github.event_name == 'pull_request' && 30 || 60 }}")
     {
-        violations.push("Linux acceptance is not bounded on the canonical Linux runner".into());
+        violations.push("Canonical acceptance is not bounded on the canonical Linux runner".into());
     }
     for (name, expected) in [
         ("CARGO_PROFILE_DEV_DEBUG", "0"),
@@ -2316,7 +2317,7 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     ] {
         if job["env"][name].as_str() != Some(expected) {
             violations.push(format!(
-                "Linux acceptance env {name} is not pinned to {expected}"
+                "Canonical acceptance env {name} is not pinned to {expected}"
             ));
         }
     }
@@ -2329,9 +2330,9 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         "E2E wenlan background on/off (Linux user-systemd)",
         "E2E folder ingest over HTTP (Linux)",
     ] {
-        if job_step(&ci, "linux-acceptance", step_name).is_none() {
+        if job_step(&ci, "canonical-acceptance", step_name).is_none() {
             violations.push(format!(
-                "Linux acceptance does not own required step {step_name}"
+                "Canonical acceptance does not own required step {step_name}"
             ));
         }
         if job_step(&ci, "test", step_name).is_some() {
@@ -2344,20 +2345,20 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         (
             "Page lint scale gate (Linux time + RSS)",
             r#"bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt""#,
-            "Linux acceptance page lint command is not executable",
+            "Canonical acceptance page lint command is not executable",
         ),
         (
             "Integration tests wenlan-cli + wenlan-server (Linux)",
             "cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'",
-            "Linux acceptance CLI/server integration command is not executable",
+            "Canonical acceptance CLI/server integration command is not executable",
         ),
         (
             "E2E folder ingest over HTTP (Linux)",
             "bash scripts/smoke-folder-ingest.sh",
-            "Linux acceptance folder ingest smoke is not unconditional",
+            "Canonical acceptance folder ingest smoke is not unconditional",
         ),
     ] {
-        let step = job_step(&ci, "linux-acceptance", step_name);
+        let step = job_step(&ci, "canonical-acceptance", step_name);
         if step.and_then(|step| step["run"].as_str()) != Some(expected_run)
             || step.is_some_and(|step| step.get("if").is_some())
         {
@@ -2366,7 +2367,7 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     }
     let core_integration = job_step(
         &ci,
-        "linux-acceptance",
+        "canonical-acceptance",
         "Run integration tests (core) (Linux)",
     );
     if core_integration.is_some_and(|step| step.get("if").is_some()) {
@@ -2374,7 +2375,7 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     }
     let systemd = job_step(
         &ci,
-        "linux-acceptance",
+        "canonical-acceptance",
         "E2E wenlan background on/off (Linux user-systemd)",
     );
     let systemd_run = systemd
@@ -2402,7 +2403,7 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     }
     let lint_upload = job_step(
         &ci,
-        "linux-acceptance",
+        "canonical-acceptance",
         "Upload Page lint scale receipt (Linux)",
     );
     if lint_upload.and_then(|step| step["if"].as_str()) != Some("always()")
@@ -2441,7 +2442,8 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         || rust_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some("false")
         || rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
     {
-        violations.push("Linux acceptance needs exactly one restore-only rust-cache action".into());
+        violations
+            .push("Canonical acceptance needs exactly one restore-only rust-cache action".into());
     }
     let sccache_actions = acceptance_steps
         .iter()
@@ -2452,7 +2454,7 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         })
         .count();
     if sccache_actions != 1 {
-        violations.push("Linux acceptance needs exactly one read-only sccache action".into());
+        violations.push("Canonical acceptance needs exactly one read-only sccache action".into());
     }
     let fastembed_restores = acceptance_steps
         .iter()
@@ -2470,48 +2472,48 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         || fastembed.and_then(|step| step["with"]["enableCrossOsArchive"].as_str()) != Some("true")
         || fastembed.and_then(|step| step["with"]["fail-on-cache-miss"].as_str()) != Some("true")
     {
-        violations.push("Linux acceptance FastEmbed cache is not restore-only".into());
+        violations.push("Canonical acceptance FastEmbed cache is not restore-only".into());
     }
     if acceptance_steps
         .iter()
         .filter_map(|step| step["uses"].as_str())
         .any(|uses| uses.starts_with("actions/cache@") || uses.contains("actions/cache/save@"))
     {
-        violations.push("Linux acceptance contains a FastEmbed cache writer".into());
+        violations.push("Canonical acceptance contains a FastEmbed cache writer".into());
     }
 
     if !job_needs(&ci, "conclusion")
         .iter()
-        .any(|need| need == "linux-acceptance")
+        .any(|need| need == "canonical-acceptance")
     {
-        violations.push("conclusion.needs omits Linux acceptance".into());
+        violations.push("conclusion.needs omits canonical acceptance".into());
     }
     let conclusion = workflow_step_run(&ci, "Aggregate expected CI results").unwrap_or_default();
     if !conclusion.lines().map(str::trim).any(|line| {
-        line.starts_with("expect_job linux-acceptance ")
+        line.starts_with("expect_job canonical-acceptance ")
             && line.contains("\"$run_rust\"")
-            && line.contains("needs.linux-acceptance.result")
+            && line.contains("needs.canonical-acceptance.result")
     }) {
-        violations.push("conclusion does not fail closed on Linux acceptance".into());
+        violations.push("conclusion does not fail closed on canonical acceptance".into());
     }
 
     violations
 }
 
 #[test]
-fn linux_acceptance_is_parallel_required_and_restore_only() {
+fn canonical_acceptance_is_parallel_required_and_restore_only() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
-    let violations = linux_acceptance_contract_violations(&ci);
+    let violations = canonical_acceptance_contract_violations(&ci);
     assert!(
         violations.is_empty(),
-        "Linux acceptance critical-path contract drift:\n{}",
+        "Canonical acceptance critical-path contract drift:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn linux_acceptance_contract_rejects_serialized_or_optional_fixture() {
+fn canonical_acceptance_contract_rejects_serialized_or_optional_fixture() {
     let ci = r#"
 jobs:
   test:
@@ -2519,7 +2521,7 @@ jobs:
     steps:
       - name: E2E folder ingest over HTTP (Linux)
         run: old
-  linux-acceptance:
+  canonical-acceptance:
     needs: [test]
     if: other
     runs-on: windows-2022
@@ -2537,7 +2539,7 @@ jobs:
       - name: Aggregate expected CI results
         run: echo success
 "#;
-    let violations = linux_acceptance_contract_violations(ci);
+    let violations = canonical_acceptance_contract_violations(ci);
     for expected in [
         "serialized",
         "fail-closed Rust routing",
@@ -2562,7 +2564,7 @@ jobs:
 }
 
 #[test]
-fn linux_acceptance_contract_rejects_semantic_noops_and_secondary_writers() {
+fn canonical_acceptance_contract_rejects_semantic_noops_and_secondary_writers() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let ci = ci
@@ -2587,10 +2589,10 @@ fn linux_acceptance_contract_rejects_semantic_noops_and_secondary_writers() {
             "      - uses: Swatinem/rust-cache@v2\n        with:\n          save-if: \"true\"\n      - name: Install cargo-nextest",
         )
         .replace(
-            "          expect_job linux-acceptance \"$run_rust\" '${{ needs.linux-acceptance.result }}'",
-            "          # expect_job linux-acceptance \"$run_rust\" '${{ needs.linux-acceptance.result }}'",
+            "          expect_job canonical-acceptance \"$run_rust\" '${{ needs.canonical-acceptance.result }}'",
+            "          # expect_job canonical-acceptance \"$run_rust\" '${{ needs.canonical-acceptance.result }}'",
         );
-    let violations = linux_acceptance_contract_violations(&ci);
+    let violations = canonical_acceptance_contract_violations(&ci);
     for expected in [
         "SCCACHE_GHA_RW_MODE",
         "CLI/server integration command",
@@ -2628,7 +2630,7 @@ fn core_integration_contract_violations(
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let Some(run) = job_step(
         &ci,
-        "linux-acceptance",
+        "canonical-acceptance",
         "Run integration tests (core) (Linux)",
     )
     .and_then(|step| step["run"].as_str()) else {
@@ -2734,7 +2736,7 @@ fn every_core_integration_target_has_a_required_or_manual_owner() {
 fn core_integration_inventory_fails_closed_for_an_unknown_target() {
     let ci = r#"
 jobs:
-  linux-acceptance:
+  canonical-acceptance:
     steps:
       - name: Run integration tests (core) (Linux)
         run: cargo nextest run -p wenlan-core --features eval-harness --test known
@@ -2756,7 +2758,7 @@ jobs:
 fn core_integration_inventory_rejects_dead_text_coverage() {
     let ci = r#"
 jobs:
-  linux-acceptance:
+  canonical-acceptance:
     steps:
       - name: Run integration tests (core) (Linux)
         run: |
@@ -2787,7 +2789,7 @@ fn core_integration_inventory_rejects_shell_operator_dead_text() {
         let ci = format!(
             r#"
 jobs:
-  linux-acceptance:
+  canonical-acceptance:
     steps:
       - name: Run integration tests (core) (Linux)
         run: cargo nextest run -p wenlan-core --features eval-harness --test actually_run {operator} echo --test {dead_target}
