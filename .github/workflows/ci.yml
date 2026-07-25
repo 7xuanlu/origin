@@ -37,17 +37,43 @@ jobs:
       macos:   ${{ steps.filter.outputs.macos }}
       windows: ${{ steps.filter.outputs.windows }}
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
-      windows-release: ${{ steps.filter.outputs.windows-release }}
+      release-preflight: ${{ steps.filter.outputs.release-preflight }}
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
+      test-plan: ${{ steps.test-plan.outputs.test-plan }}
+      release-targets: ${{ steps.release-targets.outputs.release-targets }}
       # Test matrix OSes as a JSON array. On PRs, Windows is included only when
       # Windows-affecting files changed. Non-PR runs keep the full backstop.
       test-oses: ${{ steps.matrix.outputs.json }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # dorny/paths-filter reads pull-request files through the REST API, whose
+      # response is capped at 3,000 files. Reject a larger PR before routing a
+      # silently truncated inventory.
+      - name: Reject truncated PR file inventory
+        if: github.event_name == 'pull_request'
+        env:
+          CHANGED_FILE_COUNT: ${{ github.event.pull_request.changed_files }}
+        run: |
+          case "$CHANGED_FILE_COUNT" in
+            ''|*[!0-9]*)
+              echo "invalid pull-request changed_files count: $CHANGED_FILE_COUNT"
+              exit 1
+              ;;
+          esac
+          if [ "$CHANGED_FILE_COUNT" -gt 3000 ]; then
+            echo "$CHANGED_FILE_COUNT changed files exceed the REST API limit; cannot route fail-closed"
+            exit 1
+          fi
       - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
         id: filter
         with:
+          list-files: json
           filters: |
+            # Complete changed-file inventory for fail-closed test planning.
+            # Specific filters below decide whether jobs run; this catch-all
+            # decides which tests those already-scheduled jobs execute.
+            impact:
+              - '**'
             rust:
               # Positive-only globs. With dorny/paths-filter's default
               # `some` quantifier, a negative glob like `!crates/*/npm/**`
@@ -155,6 +181,10 @@ jobs:
               - 'crates/wenlan-server/tests/**'
               - 'scripts/install-macos-app.sh'
               - 'scripts/test-install-macos-app.sh'
+              - 'scripts/release_targets.py'
+              - 'scripts/release_targets.test.py'
+              - 'scripts/build-release-binaries.sh'
+              - 'scripts/build-release-binaries.test.sh'
               - 'install.sh'
               - '.config/nextest.toml'
               - 'crates/**/Cargo.toml'
@@ -203,6 +233,10 @@ jobs:
               - 'scripts/smoke-windows-llm.test.ps1'
               - 'scripts/stabilize-rust-cache-toolchains.sh'
               - 'scripts/stabilize-rust-cache-toolchains.test.sh'
+              - 'scripts/release_targets.py'
+              - 'scripts/release_targets.test.py'
+              - 'scripts/build-release-binaries.sh'
+              - 'scripts/build-release-binaries.test.sh'
               - 'scripts/lint-scale-gate.sh'
               - 'crates/wenlan-core/src/lint/**'
               - '.config/nextest.toml'
@@ -229,10 +263,10 @@ jobs:
               # its implementation or harness changes.
               - 'crates/wenlan-core/src/lint/**'
               - 'scripts/lint-scale-gate.sh'
-            windows-release:
-              # Expensive release-profile proof is required only when a PR can
+            release-preflight:
+              # The four shipped release targets build only when a PR can
               # change native linkage, Cargo/build inputs, or packaged output.
-              # Non-PR backstops run it regardless of this filter.
+              # Non-PR backstops run the full matrix regardless of this filter.
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -257,6 +291,10 @@ jobs:
               - 'scripts/smoke-windows.ps1'
               - 'scripts/smoke-windows-llm.ps1'
               - 'scripts/smoke-windows-llm.test.ps1'
+              - 'scripts/release_targets.py'
+              - 'scripts/release_targets.test.py'
+              - 'scripts/build-release-binaries.sh'
+              - 'scripts/build-release-binaries.test.sh'
               - 'version.txt'
               - '.release-please-manifest.json'
               - 'CHANGELOG.md'
@@ -291,6 +329,34 @@ jobs:
           else
             echo 'json=["ubuntu-24.04"]' >> "$GITHUB_OUTPUT"
           fi
+      - name: Set up Rust for affected-test planning
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Test CI impact planner
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        run: python3 scripts/ci_test_plan.test.py
+      - name: Plan affected Rust tests
+        id: test-plan
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        env:
+          CHANGED_FILES_JSON: ${{ steps.filter.outputs.impact_files }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          cargo metadata --format-version 1 --locked --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
+          python3 scripts/ci_test_plan.py plan \
+            --changed-files-json "$CHANGED_FILES_JSON" \
+            --metadata-file "$RUNNER_TEMP/cargo-metadata.json" \
+            --event-name "$CI_EVENT_NAME" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Test release target inventory
+        run: |
+          python3 scripts/release_targets.test.py
+          bash scripts/build-release-binaries.test.sh
+      - name: Emit release target matrix
+        id: release-targets
+        run: python3 scripts/release_targets.py matrix --github-output "$GITHUB_OUTPUT"
       - name: Test FastEmbed cache preparation
         run: python3 scripts/prepare-fastembed-cache.test.py
       - name: Restore portable FastEmbed model
@@ -498,13 +564,17 @@ jobs:
       # round-trip E2E further down.
       - name: Workspace lib tests (Linux)
         if: matrix.os == 'ubuntu-24.04'
-        run: cargo nextest run --workspace --lib
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite workspace-lib --plan-json "$CI_TEST_PLAN"
       - name: Workspace lib tests (macOS)
         if: matrix.os == 'macos-14'
         # nextest spawns one process per test by default — sidesteps the
         # ONNX atexit FFI race that required --test-threads=1 with cargo test.
         # FastEmbed initialization has its own cross-process file lock.
-        run: cargo nextest run --workspace --lib
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite workspace-lib --plan-json "$CI_TEST_PLAN"
       - name: Page lint scale gate (Windows functional)
         if: matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
         shell: pwsh
@@ -678,12 +748,12 @@ jobs:
             $global:LASTEXITCODE = 0
           }
 
-  # Linux acceptance runs beside the long workspace-lib lane. On PR #384,
+  # Canonical acceptance runs beside the long workspace-lib lane. On PR #384,
   # these steps occupied ~9 minutes after workspace lib tests had already
   # finished; keeping them independent removes that serialization without
   # transferring a target directory or making correctness depend on cache hits.
-  linux-acceptance:
-    name: linux-acceptance
+  canonical-acceptance:
+    name: canonical-acceptance (ubuntu)
     needs: [detect-changes]
     if: "needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || github.event_name != 'pull_request'"
     runs-on: ubuntu-24.04
@@ -733,12 +803,16 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Integration tests wenlan-cli + wenlan-server (Linux)
-        run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-json "$CI_TEST_PLAN"
       - name: Run integration tests (core) (Linux)
         # --features eval-harness: selected eval_* targets compile to zero
         # tests without it. eval_harness.rs itself remains manual-only because
         # it requires external data or API credentials.
-        run: cargo nextest run -p wenlan-core --features eval-harness --test build_env --test chat_import_e2e --test distill_redesign_e2e --test distillation_quality --test doc_reconcile_e2e --test eval_cost_caps --test eval_report_paths --test eval_report_roundtrip --test eval_save_guards --test folder_ingest_e2e --test lint_maintenance_probe_e2e --test page_citations_e2e --test pdf_ordered_text --test provenance_p2 --test provenance_p3 --test read_scope --test space_scoping_e2e
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite core-integration --plan-json "$CI_TEST_PLAN"
       - name: E2E wenlan background on/off (Linux user-systemd)
         run: |
           set -euo pipefail
@@ -781,26 +855,34 @@ jobs:
       - name: E2E folder ingest over HTTP (Linux)
         run: bash scripts/smoke-folder-ingest.sh
 
-  # Release-profile proof runs beside the ordinary Windows contract instead of
-  # adding ~25-30 minutes to its critical path. It is required for native,
-  # Cargo/build, packaging, and release workflow diffs, plus every non-PR
-  # backstop. PRs restore the cache produced by the latest non-PR backstop;
-  # correctness never depends on a warm restore.
-  windows-release-proof:
-    name: windows-release-proof
+  # Build-only preflight for every shipped release target. Ordinary PRs never
+  # pay this release-profile cost; native, Cargo/build, packaging, and release
+  # diffs do, as does every non-PR backstop. The tag-triggered release workflow
+  # remains authoritative for packaging and publishing.
+  release-preflight:
+    name: release-preflight (${{ matrix.target }})
     needs: [detect-changes]
-    if: "github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-release == 'true'"
-    runs-on: windows-2022
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
+    if: "github.event_name != 'pull_request' || needs.detect-changes.outputs.release-preflight == 'true'"
+    runs-on: ${{ matrix.os }}
+    # 30 minutes is the performance target, not a correctness timeout. The
+    # larger PR ceiling keeps a cold Windows cache miss from becoming an
+    # infrastructure failure while live hosted-run data is collected.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 45 || 60 }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.detect-changes.outputs.release-targets) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
+          targets: ${{ matrix.target }}
       - name: Stabilize Windows Rust cache toolchain inputs
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: bash scripts/stabilize-rust-cache-toolchains.sh
-      - name: Configure rust-lld linker (Windows release)
+      - name: Configure rust-lld linker (Windows release preflight)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           $sysroot = (rustc --print sysroot).Trim()
@@ -810,28 +892,55 @@ jobs:
           }
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Cache Windows release artifacts (main-owned)
+      - name: Select native Perl for vendored OpenSSL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $nativePerl = $null
+          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
+            if ($candidate.Source -match '[\\/]Git[\\/]') {
+              continue
+            }
+            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
+            if ($LASTEXITCODE -eq 0) {
+              $nativePerl = $candidate.Source
+              break
+            }
+          }
+          if (-not $nativePerl) {
+            throw "No native Perl can load Locale::Maketext::Simple"
+          }
+          "OPENSSL_SRC_PERL=$nativePerl" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "OPENSSL_SRC_PERL=$nativePerl"
+      - name: Cache release artifacts (main-owned)
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: windows-release
+          shared-key: release-${{ matrix.target }}
           cache-all-crates: "true"
+          # The repository cache is already at its 10 GB ceiling. Preserve the
+          # expensive Windows release target only; other legs cache dependency
+          # inputs without adding three more large target archives.
+          cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install sqlite3 (Windows only)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           vcpkg install sqlite3:x64-windows-static-md
           "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" |
             Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Build Windows release binaries
-        shell: pwsh
-        run: cargo build --release -p wenlan -p wenlan-server -p wenlan-mcp -p wenlan-core --bin wenlan --bin wenlan-server --bin wenlan-mcp --bin model_probe
-      - name: Native ORT smoke (Windows; release profile)
+      - name: Build and smoke shipped release binaries
+        shell: bash
+        run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
+      - name: Native ORT smoke (Windows release preflight)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           & scripts/stage-onnxruntime-windows.ps1 `
-            -DestinationDirectory "target\release"
+            -DestinationDirectory "target\${{ matrix.target }}\release"
           & scripts/smoke-windows.ps1 `
-            -ExePath "target\release\wenlan-server.exe"
+            -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
 
   # Quarantine lane: exercises test files present in the tree but not wired
   # into the required `test` job (dormant wenlan-mcp / wenlan-types
@@ -906,7 +1015,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, fmt, lint, test, linux-acceptance, windows-release-proof, docs, plugin, npm]
+    needs: [detect-changes, fmt, lint, test, canonical-acceptance, release-preflight, docs, plugin, npm]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -937,8 +1046,8 @@ jobs:
           expect_job fmt "$run_rust" '${{ needs.fmt.result }}'
           expect_job lint "$run_rust" '${{ needs.lint.result }}'
           expect_job test "$run_rust" '${{ needs.test.result }}'
-          expect_job linux-acceptance "$run_rust" '${{ needs.linux-acceptance.result }}'
-          expect_job windows-release-proof '${{ github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-release == 'true' }}' '${{ needs.windows-release-proof.result }}'
+          expect_job canonical-acceptance "$run_rust" '${{ needs.canonical-acceptance.result }}'
+          expect_job release-preflight '${{ github.event_name != 'pull_request' || needs.detect-changes.outputs.release-preflight == 'true' }}' '${{ needs.release-preflight.result }}'
           expect_job docs '${{ needs.detect-changes.outputs.docs == 'true' }}' '${{ needs.docs.result }}'
           expect_job plugin '${{ needs.detect-changes.outputs.plugin == 'true' }}' '${{ needs.plugin.result }}'
           expect_job npm '${{ needs.detect-changes.outputs.npm == 'true' }}' '${{ needs.npm.result }}'
