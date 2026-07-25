@@ -3005,6 +3005,8 @@ fn write_state_atomically(
     bytes: &[u8],
     mode: ProjectionStateMode,
 ) -> Result<(), WenlanError> {
+    #[cfg(not(unix))]
+    let _ = mode;
     let sequence = PROJECTION_STATE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temporary = format!(".projection-state-{}-{sequence}.tmp", std::process::id());
     let mut options = OpenOptions::new();
@@ -3205,6 +3207,8 @@ fn sync_projection_dirs(
     source_parent: &Dir,
     orphaned: &Dir,
 ) -> Result<(), WenlanError> {
+    #[cfg(not(unix))]
+    let _ = (root, wenlan, source_parent, orphaned);
     #[cfg(unix)]
     {
         sync_dir_capability(orphaned)?;
