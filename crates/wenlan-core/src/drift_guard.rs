@@ -100,22 +100,33 @@ fn version_sync_detects_mismatch() {
 // ── Teeth #5: FastEmbed CI cache contract ──
 
 fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
-    const CACHE_STEP: &str = "Cache fastembed model (Linux)";
+    const CACHE_STEP: &str = "Restore portable FastEmbed model";
     const CACHE_DIR: &str = "${{ github.workspace }}/.fastembed_cache";
-    const CACHE_PATH: &str = "${{ env.FASTEMBED_CACHE_DIR }}";
-    const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v2";
-    const JOBS: &[(&str, &str)] = &[
-        ("test", "Workspace lib tests (Linux)"),
+    const CACHE_PATH: &str = ".fastembed_cache";
+    const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v3-portable";
+    const JOBS: &[(&str, &[&str])] = &[
+        (
+            "test",
+            &[
+                "Workspace lib tests (Linux)",
+                "Workspace lib tests (macOS)",
+                "Integration tests wenlan-cli + wenlan-server (Windows)",
+            ],
+        ),
+        (
+            "linux-acceptance",
+            &["Integration tests wenlan-cli + wenlan-server (Linux)"],
+        ),
         (
             "test-quarantine",
-            "Quarantined tests (wenlan-mcp + wenlan-types)",
+            &["Quarantined tests (wenlan-mcp + wenlan-types)"],
         ),
     ];
 
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse ci.yml");
     let mut violations = Vec::new();
 
-    for (job_name, consumer_name) in JOBS {
+    for (job_name, consumer_names) in JOBS {
         let actual_cache_dir = parsed["jobs"][*job_name]["env"]["FASTEMBED_CACHE_DIR"].as_str();
         if actual_cache_dir != Some(CACHE_DIR) {
             violations.push(format!(
@@ -164,18 +175,81 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 "job {job_name} uses FastEmbed cache key {actual_key:?}, expected {CACHE_KEY:?}"
             ));
         }
+        if steps[cache_index]["with"]["enableCrossOsArchive"].as_str() != Some("true")
+            || steps[cache_index]["with"]["fail-on-cache-miss"].as_str() != Some("true")
+        {
+            violations.push(format!(
+                "job {job_name} does not restore the portable cache cross-OS and fail closed"
+            ));
+        }
+        if *job_name == "test" && !steps[cache_index]["if"].is_null() {
+            violations.push("test restores the model only on a subset of matrix OSes".into());
+        }
 
-        let consumer_index = steps
+        for consumer_name in *consumer_names {
+            let consumer_index = steps
+                .iter()
+                .position(|step| step["name"].as_str() == Some(consumer_name));
+            match consumer_index {
+                Some(index) if cache_index < index => {}
+                Some(index) => violations.push(format!(
+                    "job {job_name} restores FastEmbed at step {cache_index} after consumer step {index}"
+                )),
+                None => violations.push(format!(
+                    "job {job_name} is missing consumer step {consumer_name:?}"
+                )),
+            }
+        }
+    }
+
+    let detect_steps = parsed["jobs"]["detect-changes"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let detect_index = |name: &str| {
+        detect_steps
             .iter()
-            .position(|step| step["name"].as_str() == Some(consumer_name));
-        match consumer_index {
-            Some(index) if cache_index < index => {}
-            Some(index) => violations.push(format!(
-                "job {job_name} restores FastEmbed at step {cache_index} after consumer step {index}"
-            )),
-            None => violations.push(format!(
-                "job {job_name} is missing consumer step {consumer_name:?}"
-            )),
+            .position(|step| step["name"].as_str() == Some(name))
+    };
+    let prep_order = [
+        detect_index("Test FastEmbed cache preparation"),
+        detect_index("Restore portable FastEmbed model"),
+        detect_index("Restore legacy Linux FastEmbed model"),
+        detect_index("Prepare portable FastEmbed model"),
+        detect_index("Save portable FastEmbed model"),
+    ];
+    if prep_order.iter().any(Option::is_none)
+        || !prep_order
+            .windows(2)
+            .all(|pair| pair[0].is_some_and(|left| pair[1].is_some_and(|right| left < right)))
+    {
+        violations.push(
+            "detect-changes does not test, restore, prepare, then save the portable model".into(),
+        );
+    }
+    let prepare = detect_index("Prepare portable FastEmbed model")
+        .and_then(|index| detect_steps.get(index).copied());
+    if prepare.and_then(|step| step["run"].as_str())
+        != Some("python3 scripts/prepare-fastembed-cache.py")
+    {
+        violations.push("detect-changes does not run the pinned FastEmbed preparer".into());
+    }
+    for name in [
+        "Restore portable FastEmbed model",
+        "Save portable FastEmbed model",
+    ] {
+        let Some(step) = detect_index(name).and_then(|index| detect_steps.get(index).copied())
+        else {
+            continue;
+        };
+        if step["with"]["path"].as_str() != Some(CACHE_PATH)
+            || step["with"]["key"].as_str() != Some(CACHE_KEY)
+            || step["with"]["enableCrossOsArchive"].as_str() != Some("true")
+        {
+            violations.push(format!(
+                "detect-changes {name:?} does not use the portable cache contract"
+            ));
         }
     }
 
@@ -583,16 +657,27 @@ jobs:
     steps:
       - name: Workspace lib tests (Linux)
         run: export WENLAN_TEST_FASTEMBED_CACHE=/tmp/stale-cache
-      - name: Cache fastembed model (Linux)
+      - name: Restore portable FastEmbed model
         with:
           path: ~/.local/share/wenlan/memorydb/fastembed_cache
+          key: stale
+  linux-acceptance:
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - name: Restore portable FastEmbed model
+        with:
+          path: .fastembed_cache
+          key: stale
+      - name: Integration tests wenlan-cli + wenlan-server (Linux)
   test-quarantine:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - name: Cache fastembed model (Linux)
+      - name: Restore portable FastEmbed model
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: stale
       - name: Quarantined tests (wenlan-mcp + wenlan-types)
 "#;
     let violations = fastembed_ci_cache_violations(workflow);
@@ -2379,10 +2464,11 @@ fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         .collect::<Vec<_>>();
     let fastembed = fastembed_restores.first().copied();
     if fastembed_restores.len() != 1
-        || fastembed.and_then(|step| step["with"]["path"].as_str())
-            != Some("${{ env.FASTEMBED_CACHE_DIR }}")
+        || fastembed.and_then(|step| step["with"]["path"].as_str()) != Some(".fastembed_cache")
         || fastembed.and_then(|step| step["with"]["key"].as_str())
-            != Some("fastembed-bge-base-en-v1.5-q-v2")
+            != Some("fastembed-bge-base-en-v1.5-q-v3-portable")
+        || fastembed.and_then(|step| step["with"]["enableCrossOsArchive"].as_str()) != Some("true")
+        || fastembed.and_then(|step| step["with"]["fail-on-cache-miss"].as_str()) != Some("true")
     {
         violations.push("Linux acceptance FastEmbed cache is not restore-only".into());
     }

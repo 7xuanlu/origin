@@ -27,6 +27,8 @@ env:
 jobs:
   detect-changes:
     runs-on: ubuntu-24.04
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     outputs:
       rust:    ${{ steps.filter.outputs.rust }}
       docs:    ${{ steps.filter.outputs.docs }}
@@ -289,6 +291,32 @@ jobs:
           else
             echo 'json=["ubuntu-24.04"]' >> "$GITHUB_OUTPUT"
           fi
+      - name: Test FastEmbed cache preparation
+        run: python3 scripts/prepare-fastembed-cache.test.py
+      - name: Restore portable FastEmbed model
+        id: fastembed-portable-restore
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+      - name: Restore legacy Linux FastEmbed model
+        if: "(steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request') && steps.fastembed-portable-restore.outputs.cache-hit != 'true'"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-bge-base-en-v1.5-q-v2
+      - name: Prepare portable FastEmbed model
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        run: python3 scripts/prepare-fastembed-cache.py
+      - name: Save portable FastEmbed model
+        if: "(steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request') && steps.fastembed-portable-restore.outputs.cache-hit != 'true'"
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
 
   # On PRs, Rust fmt + lint only run when Rust-affecting paths changed.
   # Docs/image-only PRs should still get the required aggregate `conclusion`
@@ -453,16 +481,16 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
-      # Pin FastEmbed's cache independently of its upstream default and restore
-      # it before the first model-consuming test.
-      - name: Cache fastembed model (Linux)
-        if: matrix.os == 'ubuntu-24.04'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # detect-changes prepares one revision- and SHA-pinned archive before the
+      # matrix starts. Every OS restores that same portable snapshot, so a
+      # cold cache adds one bounded fetch instead of concurrent model races.
+      - name: Restore portable FastEmbed model
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ env.FASTEMBED_CACHE_DIR }}
-          key: fastembed-bge-base-en-v1.5-q-v2
-          restore-keys: |
-            fastembed-bge-base-en-v1.5-q-
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
       # Workspace lib tests skipped on Windows — Linux + macOS catch the
       # same cross-platform unit logic in ~5-15min vs 25min on Windows.
       # Windows-specific behavior (paths, mcp_add, schtasks) is covered
@@ -687,13 +715,13 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
-      - name: Restore FastEmbed model
+      - name: Restore portable FastEmbed model
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ env.FASTEMBED_CACHE_DIR }}
-          key: fastembed-bge-base-en-v1.5-q-v2
-          restore-keys: |
-            fastembed-bge-base-en-v1.5-q-
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
       - name: Page lint scale gate (Linux time + RSS)
         run: bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
       - name: Upload Page lint scale receipt (Linux)
@@ -841,16 +869,15 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
-      # real_router.rs boots a real MemoryDB, which loads the FastEmbed ONNX
-      # model (network fetch if uncached). Reuse the cache from any previous
-      # successful Linux consumer so this job normally skips the cold fetch.
-      - name: Cache fastembed model (Linux)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # real_router.rs boots a real MemoryDB. detect-changes owns the only cold
+      # fetch; this lane must fail closed if the prepared snapshot is absent.
+      - name: Restore portable FastEmbed model
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ env.FASTEMBED_CACHE_DIR }}
-          key: fastembed-bge-base-en-v1.5-q-v2
-          restore-keys: |
-            fastembed-bge-base-en-v1.5-q-
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
       - name: Quarantined tests (wenlan-mcp + wenlan-types)
         run: cargo nextest run -p wenlan-mcp -p wenlan-types
 
