@@ -960,9 +960,58 @@ fn windows_ort_distribution_violations(
         }
     }
 
+    for (workflow, job, required_condition, required_destination, owner) in [
+        (
+            &ci,
+            "test",
+            "matrix.os == 'windows-2022'",
+            "$env:RUNNER_TEMP",
+            "Windows test CI",
+        ),
+        (
+            &ci,
+            "windows-release-proof",
+            "",
+            r#"target\release"#,
+            "Windows release proof",
+        ),
+        (
+            &release,
+            "release",
+            "matrix.os == 'windows-2022'",
+            r#"target\${{ matrix.target }}\release"#,
+            "Windows release workflow",
+        ),
+    ] {
+        let step = job_step(workflow, job, "Set up Vulkan SDK (Windows only)");
+        let condition = step
+            .and_then(|candidate| candidate["if"].as_str())
+            .unwrap_or_default();
+        let run = step
+            .and_then(|candidate| candidate["run"].as_str())
+            .unwrap_or_default();
+        if (!required_condition.is_empty() && !condition.contains(required_condition))
+            || !run.contains("scripts/setup-vulkan-sdk-windows.ps1")
+            || !run.contains("scripts/stage-vulkan-loader-windows.ps1")
+            || !run.contains(required_destination)
+            || run.contains("SkipAuthenticodeValidationForFixture")
+        {
+            violations.push(format!(
+                "{owner} does not stage the pinned Vulkan loader in its required scope"
+            ));
+        }
+    }
+
     let package = workflow_step_run(&release, "Package").unwrap_or_default();
-    if !package.contains("wenlan-server.exe") || !package.contains("onnxruntime.dll") {
-        violations.push("release archive does not include the server and ORT DLL together".into());
+    if !package.contains("wenlan-server.exe")
+        || !package.contains("onnxruntime.dll")
+        || !package.contains("vulkan-1.dll")
+        || !package.contains("VulkanRT-License.txt")
+    {
+        violations.push(
+            "release archive does not include the server, runtimes, and Vulkan license together"
+                .into(),
+        );
     }
 
     let packaged_smoke =
@@ -970,6 +1019,8 @@ fn windows_ort_distribution_violations(
     if !packaged_smoke.contains("Expand-Archive")
         || !packaged_smoke.contains("Test-Path")
         || !packaged_smoke.contains("scripts/smoke-windows.ps1")
+        || !packaged_smoke.contains("vulkan-1.dll")
+        || !packaged_smoke.contains("VulkanRT-License.txt")
     {
         violations.push("release workflow does not smoke the extracted Windows archive".into());
     }
@@ -1043,6 +1094,7 @@ fn windows_ort_distribution_violations(
 
     if !smoke_script.contains("Get-Process -Id $proc.Id -Module")
         || !smoke_script.contains("onnxruntime.dll")
+        || !smoke_script.contains("vulkan-1.dll")
         || !smoke_script.contains("Resolve-Path")
         || !smoke_script.contains("/api/memory/store")
         || !smoke_script.contains("chunks_created")
@@ -1095,6 +1147,12 @@ jobs:
             .iter()
             .any(|violation| violation.contains("DLL search path")),
         "fixture must reject Windows tests that can load a runner DLL: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("Vulkan loader")),
+        "fixture must reject a release without a scoped Vulkan loader: {violations:?}"
     );
     assert!(
         violations
@@ -1653,6 +1711,8 @@ fn ci_routing_contract_violations(
     for path in [
         "scripts/setup-vulkan-sdk-windows.ps1",
         "scripts/setup-vulkan-sdk-windows.test.ps1",
+        "scripts/stage-vulkan-loader-windows.ps1",
+        "scripts/stage-vulkan-loader-windows.test.ps1",
         "scripts/setup-msvc-ninja-windows.ps1",
         "scripts/setup-msvc-ninja-windows.test.ps1",
     ] {
@@ -1752,6 +1812,8 @@ fn ci_routing_contract_violations(
     for path in [
         "crates/wenlan-core/src/lint/**",
         "scripts/lint-scale-gate.sh",
+        "scripts/stage-vulkan-loader-windows.ps1",
+        "scripts/stage-vulkan-loader-windows.test.ps1",
     ] {
         if !windows_lint.contains(path) {
             violations.push(format!(

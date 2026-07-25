@@ -205,6 +205,8 @@ jobs:
               - 'scripts/stabilize-rust-cache-toolchains.test.sh'
               - 'scripts/setup-vulkan-sdk-windows.ps1'
               - 'scripts/setup-vulkan-sdk-windows.test.ps1'
+              - 'scripts/stage-vulkan-loader-windows.ps1'
+              - 'scripts/stage-vulkan-loader-windows.test.ps1'
               - 'scripts/setup-msvc-ninja-windows.ps1'
               - 'scripts/setup-msvc-ninja-windows.test.ps1'
               - 'scripts/lint-scale-gate.sh'
@@ -233,6 +235,8 @@ jobs:
               # its implementation or harness changes.
               - 'crates/wenlan-core/src/lint/**'
               - 'scripts/lint-scale-gate.sh'
+              - 'scripts/stage-vulkan-loader-windows.ps1'
+              - 'scripts/stage-vulkan-loader-windows.test.ps1'
             windows-release:
               # Expensive release-profile proof is required only when a PR can
               # change native linkage, Cargo/build inputs, or packaged output.
@@ -263,6 +267,8 @@ jobs:
               - 'scripts/smoke-windows-llm.test.ps1'
               - 'scripts/setup-vulkan-sdk-windows.ps1'
               - 'scripts/setup-vulkan-sdk-windows.test.ps1'
+              - 'scripts/stage-vulkan-loader-windows.ps1'
+              - 'scripts/stage-vulkan-loader-windows.test.ps1'
               - 'scripts/setup-msvc-ninja-windows.ps1'
               - 'scripts/setup-msvc-ninja-windows.test.ps1'
               - 'version.txt'
@@ -476,6 +482,10 @@ jobs:
         run: |
           & scripts/setup-vulkan-sdk-windows.test.ps1
           & scripts/setup-vulkan-sdk-windows.ps1
+          & scripts/stage-vulkan-loader-windows.test.ps1
+          $loaderDir = Join-Path $env:RUNNER_TEMP "wenlan-test-vulkan-loader"
+          & scripts/stage-vulkan-loader-windows.ps1 `
+            -DestinationDirectory $loaderDir
       - name: Configure MSVC Ninja (Windows tests)
         if: matrix.os == 'windows-2022'
         shell: pwsh
@@ -485,8 +495,8 @@ jobs:
       # The hosted runner currently exposes an unrelated onnxruntime.dll on
       # its default DLL search path. Dynamic-ORT tests must never pick that up:
       # stage the SHA-verified runtime before any inference-capable test and
-      # pin both the build-time absolute path and the process-start DLL search
-      # directory for all later Windows test steps.
+      # pin both the dynamic loader's absolute path and a job-scoped fallback
+      # search directory for all later Windows test steps.
       - name: Stage ONNX Runtime for Windows tests
         if: matrix.os == 'windows-2022'
         shell: pwsh
@@ -849,6 +859,10 @@ jobs:
         run: |
           & scripts/setup-vulkan-sdk-windows.test.ps1
           & scripts/setup-vulkan-sdk-windows.ps1
+          & scripts/stage-vulkan-loader-windows.test.ps1
+          $loaderDir = "target\release"
+          & scripts/stage-vulkan-loader-windows.ps1 `
+            -DestinationDirectory $loaderDir
       - name: Configure MSVC Ninja (Windows release proof)
         shell: pwsh
         run: |

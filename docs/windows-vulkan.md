@@ -56,24 +56,70 @@ reliably ordered by the Visual Studio generators. Verify `perl
 ## Build and test
 
 ```powershell
+$testRuntimeDir = Join-Path $env:CARGO_TARGET_DIR "test-runtime"
+& scripts\stage-onnxruntime-windows.ps1 `
+  -DestinationDirectory $testRuntimeDir
+& scripts\stage-vulkan-loader-windows.ps1 `
+  -DestinationDirectory $testRuntimeDir
+$env:ORT_DYLIB_PATH = Join-Path $testRuntimeDir "onnxruntime.dll"
+$env:PATH = "$testRuntimeDir;$env:PATH"
+
 cargo fmt --check --all
 cargo test -p wenlan-types
 cargo test -p wenlan-core --lib engine::tests
 cargo test -p wenlan-server status_reports_selected_vulkan_device
 cargo build --release --jobs 1 -p wenlan-core --bin model_probe
 cargo build --release --jobs 1 -p wenlan-server
+$releaseDir = Join-Path $env:CARGO_TARGET_DIR "release"
+& scripts\stage-onnxruntime-windows.ps1 `
+  -DestinationDirectory $releaseDir
+& scripts\stage-vulkan-loader-windows.ps1 `
+  -DestinationDirectory $releaseDir
 
 & scripts\setup-vulkan-sdk-windows.test.ps1
+& scripts\stage-vulkan-loader-windows.test.ps1
 & scripts\setup-msvc-ninja-windows.test.ps1
 & scripts\smoke-windows-llm.test.ps1
 ```
 
 The Windows CI and release jobs run the same pinned Vulkan SDK setup before any
-Cargo build. The Vulkan SDK is a build-time prerequisite; end users need a
-working Vulkan-capable GPU driver, not the SDK. The Vulkan-enabled Windows
-executables have a process-start dependency on `vulkan-1.dll`; a missing
-Vulkan loader fails before Rust can select CPU. Install a current vendor GPU
-driver or Vulkan runtime even when using `WENLAN_LLM_DEVICE=cpu`.
+Cargo build. The Vulkan SDK is a build-time prerequisite; end users do not need
+the SDK. Vulkan-enabled Windows executables have a process-start dependency on
+`vulkan-1.dll`, so the Windows release archive ships the verified official
+loader beside `wenlan-server.exe` and includes `VulkanRT-License.txt`. A
+driverless machine can therefore start and select CPU; actual GPU execution
+still requires a working vendor ICD from the GPU driver.
+
+GitHub's hosted Windows runner has no vendor GPU driver and therefore cannot be
+assumed to have the loader. CI downloads LunarG's pinned
+`vulkan-runtime-components.zip` for `1.4.350.0`, verifies archive SHA-256
+`23ce69f32cef3e2799617e2b1776cd0c71030d23a91f8375821cc40d76b185b9`
+and x64 loader SHA-256
+`0419974f00e82a3d619077ba414da265a774f8db9d45ad93bc1843f44b2c2c1f`,
+checks the loader's LunarG Authenticode signer, and copies its accompanying
+license. Test jobs put only that extracted directory on the job-scoped `PATH`;
+release jobs stage the loader beside the executables and include both files in
+the zip. Nothing writes `System32` or the registry. This lets CPU-only tests and
+released binaries start on a vendorless machine; it is not GPU evidence. The
+physical smoke below remains the Vulkan execution proof.
+
+The implementation and CI contract were checked against these primary sources:
+
+- [LunarG Windows SDK guide](https://vulkan.lunarg.com/doc/view/latest/windows/getting_started.html)
+  for the SDK/driver/loader boundary;
+- [Khronos Vulkan Loader](https://github.com/KhronosGroup/Vulkan-Loader)
+  for the loader's role between an application and ICDs, and its
+  [Apache-2.0 redistribution terms](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/LICENSE.txt);
+- [Microsoft DLL search order](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order)
+  and [GitHub `GITHUB_PATH`](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#adding-a-system-path)
+  for process-start lookup and job scoping;
+- [Microsoft command-line MSVC setup](https://learn.microsoft.com/en-us/cpp/build/building-on-the-command-line)
+  and [CMake generators](https://cmake.org/cmake/help/latest/manual/cmake-generators.7.html)
+  for the imported x64 developer environment and Ninja;
+- [llama.cpp Vulkan build instructions](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#vulkan)
+  for `GGML_VULKAN` and GPU-layer verification; and
+- [ONNX Runtime Windows deployment](https://onnxruntime.ai/docs/get-started/with-c.html#deployment)
+  for keeping the verified runtime adjacent to shipped executables.
 
 ## Device policy and observability
 
@@ -187,17 +233,28 @@ link alone is not the release gate.
 - `cannot open input file 'sqlite3.lib'`: install the vcpkg triplet above and
   prepend its `lib` directory to `LIB`.
 - A test executable exits with `0xc0000135` / `STATUS_DLL_NOT_FOUND` after a
-  successful link: add the directory containing the staged `onnxruntime.dll`
-  to `PATH`. `ORT_DYLIB_PATH` pins the build/runtime choice but cannot satisfy
-  a Windows process-start DLL import by itself.
+  successful link: do not infer the missing DLL from the exit code. Run
+  `dumpbin /DEPENDENTS <test.exe>`. The Vulkan-enabled test binary imports
+  `vulkan-1.dll` before Rust starts; vendorless CI must run
+  `scripts\stage-vulkan-loader-windows.ps1`. `ORT_DYLIB_PATH` separately pins
+  the verified ONNX Runtime, whose directory is also job-scoped in CI.
+- `ort ... is not compatible ... expected version >= '1.23.x'`: the process
+  found a stale `onnxruntime.dll` (for example 1.17.1). Run
+  `scripts\stage-onnxruntime-windows.ps1`, set `ORT_DYLIB_PATH` to that exact
+  1.23.2 DLL, and put the staged directory first on the current process
+  `PATH` before invoking Cargo. Keep the full MSVC/LLVM/Vulkan environment in
+  that same shell because changing runtime environment inputs can make Cargo
+  rerun native build scripts.
 - `Command 'perl' not found` or `Can't locate Locale/Maketext/Simple.pm` while
   building `openssl-sys`: install full Strawberry Perl, put its `perl\bin`
   before Git's `usr\bin`, and run the module probe above.
 - `Unable to find Vulkan`: run `scripts\setup-vulkan-sdk-windows.ps1` in the
   same PowerShell session and verify `$env:VULKAN_SDK`.
-- `vulkan-1.dll was not found` at process start: install or update the vendor
-  GPU driver/Vulkan runtime. CPU mode cannot recover because Windows resolves
-  this DLL before `main`.
+- `vulkan-1.dll was not found` at process start: a release installation is
+  incomplete; re-extract the Windows zip and confirm `vulkan-1.dll` and
+  `VulkanRT-License.txt` sit beside `wenlan-server.exe`. For a local build, run
+  `scripts\stage-vulkan-loader-windows.ps1` against its release directory.
+  Update the vendor driver separately when Vulkan GPU enumeration fails.
 - `C1083: Cannot open compiler generated file: '': Invalid argument` inside
   `vulkan-shaders-gen`: the nested CMake path crossed legacy MAX_PATH. Set
   `CARGO_TARGET_DIR=C:\wl-target`, then rebuild; enabling Windows long paths

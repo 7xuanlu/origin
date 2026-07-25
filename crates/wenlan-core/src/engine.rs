@@ -269,7 +269,7 @@ impl InferenceBackendPlan {
         self.kind == InferenceBackendKind::Metal
     }
 
-    fn supports_cpu_fallback(&self) -> bool {
+    pub(crate) fn supports_cpu_fallback(&self) -> bool {
         matches!(
             self.kind,
             InferenceBackendKind::Cuda
@@ -2011,6 +2011,7 @@ mod tests {
         assert_eq!(plan.gpu_layers(), 99);
         assert_eq!(plan.label(), "Metal");
         assert!(plan.uses_metal_compatibility_fallback());
+        assert!(!plan.supports_cpu_fallback());
     }
 
     #[test]
@@ -2047,6 +2048,7 @@ mod tests {
         assert_eq!(plan.gpu_layers(), 99);
         assert_eq!(plan.label(), "Vulkan");
         assert!(!plan.uses_metal_compatibility_fallback());
+        assert!(plan.supports_cpu_fallback());
         assert_eq!(
             plan.context_failure_message("device lost"),
             "Vulkan context creation failed: device lost"

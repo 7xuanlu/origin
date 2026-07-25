@@ -210,6 +210,13 @@ jobs:
         shell: pwsh
         run: |
           & scripts/setup-vulkan-sdk-windows.ps1
+          # The release keeps the official loader beside wenlan-server.exe.
+          # Windows searches the application directory before system PATH, so
+          # a driverless machine can start and select the CPU backend while a
+          # GPU machine still discovers vendor ICDs through this loader.
+          $loaderDir = "target\${{ matrix.target }}\release"
+          & scripts/stage-vulkan-loader-windows.ps1 `
+            -DestinationDirectory $loaderDir
 
       - name: Configure MSVC Ninja (Windows release)
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -290,7 +297,9 @@ jobs:
               "./target/${{ matrix.target }}/release/wenlan.exe" \
               "./target/${{ matrix.target }}/release/wenlan-server.exe" \
               "./target/${{ matrix.target }}/release/wenlan-mcp.exe" \
-              "./target/${{ matrix.target }}/release/onnxruntime.dll"
+              "./target/${{ matrix.target }}/release/onnxruntime.dll" \
+              "./target/${{ matrix.target }}/release/vulkan-1.dll" \
+              "./target/${{ matrix.target }}/release/VulkanRT-License.txt"
           else
             tar -C "target/${{ matrix.target }}/release" -czf "dist/${{ matrix.artifact_name }}.tar.gz" \
               wenlan wenlan-server wenlan-mcp
@@ -306,11 +315,19 @@ jobs:
             -DestinationPath $ExtractDir
           $ServerPath = Join-Path $ExtractDir "wenlan-server.exe"
           $OrtPath = Join-Path $ExtractDir "onnxruntime.dll"
+          $VulkanLoaderPath = Join-Path $ExtractDir "vulkan-1.dll"
+          $VulkanLicensePath = Join-Path $ExtractDir "VulkanRT-License.txt"
           if (-not (Test-Path $ServerPath)) {
             throw "packaged wenlan-server.exe is missing"
           }
           if (-not (Test-Path $OrtPath)) {
             throw "packaged onnxruntime.dll is missing"
+          }
+          if (-not (Test-Path $VulkanLoaderPath)) {
+            throw "packaged vulkan-1.dll is missing"
+          }
+          if (-not (Test-Path $VulkanLicensePath)) {
+            throw "packaged VulkanRT-License.txt is missing"
           }
           & scripts/smoke-windows.ps1 `
             -ExePath $ServerPath
@@ -359,7 +376,15 @@ jobs:
               exit 1
             fi
           done
-          echo "OK: archive contains wenlan, wenlan-server, wenlan-mcp"
+          for payload in onnxruntime.dll vulkan-1.dll VulkanRT-License.txt; do
+            if ! printf '%s\n' "$contents" | grep -qE "(^|/)${payload}$"; then
+              echo "ERROR: dist/${{ matrix.artifact_name }}.${{ matrix.archive }} missing ${payload}"
+              echo "--- archive contents ---"
+              printf '%s\n' "$contents"
+              exit 1
+            fi
+          done
+          echo "OK: archive contains binaries and required Windows runtimes"
 
       - name: Upload archives to release
         uses: softprops/action-gh-release@v2

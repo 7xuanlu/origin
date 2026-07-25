@@ -472,7 +472,7 @@ impl OnDeviceProvider {
         } else {
             if let Err(cause) = engine.probe_context() {
                 let message = backend_plan.context_failure_message(&cause);
-                if backend_plan.gpu_layers() > 0 {
+                if backend_plan.supports_cpu_fallback() {
                     log::warn!("[on_device_provider] {message}; reloading the model on CPU");
                     drop(engine);
                     let fallback = LlmEngine::reload_on_cpu(&model_path, prompts, message.clone())?;
