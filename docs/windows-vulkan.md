@@ -79,6 +79,7 @@ winget session, use the official 64-bit portable ZIP instead, point
 ```powershell
 $target = "x86_64-pc-windows-msvc"
 $testRuntimeDir = Join-Path $env:CARGO_TARGET_DIR "test-runtime"
+$releaseDir = Join-Path $env:CARGO_TARGET_DIR "$target\release"
 & scripts\stage-onnxruntime-windows.ps1 `
   -DestinationDirectory $testRuntimeDir
 & scripts\stage-vulkan-loader-windows.ps1 `
@@ -90,14 +91,15 @@ cargo fmt --check --all
 cargo test -p wenlan-types
 cargo test -p wenlan-core --lib engine::tests
 cargo test -p wenlan-server status_reports_selected_vulkan_device
-& $gitBash scripts\build-release-binaries.sh $target
-cargo build --release --target $target --jobs 1 `
-  -p wenlan-core --bin model_probe
-$releaseDir = Join-Path $env:CARGO_TARGET_DIR "$target\release"
+# The shared build script launches each .exe immediately after linking. Stage
+# both runtime DLLs beside that future output path before invoking the script.
 & scripts\stage-onnxruntime-windows.ps1 `
   -DestinationDirectory $releaseDir
 & scripts\stage-vulkan-loader-windows.ps1 `
   -DestinationDirectory $releaseDir
+& $gitBash scripts\build-release-binaries.sh $target
+cargo build --release --target $target --jobs 1 `
+  -p wenlan-core --bin model_probe
 
 & scripts\setup-vulkan-sdk-windows.test.ps1
 & scripts\stage-vulkan-loader-windows.test.ps1
@@ -294,7 +296,9 @@ link alone is not the release gate.
   the verified ONNX Runtime, whose directory is also job-scoped in CI. If a
   scheduled task reports decimal result `-1073741515`, stage both verified
   runtime DLLs beside the scheduled `wenlan-server.exe`; the task's `Start In`
-  directory and inherited `PATH` are not runtime-distribution contracts.
+  directory and inherited `PATH` are not runtime-distribution contracts. CI
+  and tag release likewise stage both DLLs before the shared build script,
+  because that script launches the shipped executables immediately after link.
 - `ort ... is not compatible ... expected version >= '1.23.x'`: the process
   found a stale `onnxruntime.dll` (for example 1.17.1). Run
   `scripts\stage-onnxruntime-windows.ps1`, set `ORT_DYLIB_PATH` to that exact

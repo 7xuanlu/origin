@@ -903,9 +903,10 @@ jobs:
     if: "github.event_name != 'pull_request' || needs.detect-changes.outputs.release-preflight == 'true'"
     runs-on: ${{ matrix.os }}
     # 30 minutes is the performance target, not a correctness timeout. Keep
-    # non-Windows PR targets at 45 minutes, while a cold Windows Vulkan/native
-    # build gets the same 60-minute ceiling as the non-PR backstop.
-    timeout-minutes: ${{ (matrix.target == 'x86_64-pc-windows-msvc' || github.event_name != 'pull_request') && 60 || 45 }}
+    # non-Windows PR targets at 45 minutes and non-PR backstops at 60. Hosted
+    # Windows serial native release builds have measured over 55 minutes before
+    # their executable smoke, so retain a bounded 90-minute cold-cache ceiling.
+    timeout-minutes: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}
     strategy:
       fail-fast: true
       matrix: ${{ fromJSON(needs.detect-changes.outputs.release-targets) }}
@@ -990,22 +991,25 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: '"CARGO_BUILD_JOBS=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
-      - name: Build and smoke shipped release binaries
-        shell: bash
-        run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
-      - name: Stage verified Vulkan loader (Windows release preflight)
+      # The shared build script launches each shipped executable immediately
+      # after linking it. Stage load-time DLLs first; a later PATH update cannot
+      # rescue process startup under Git Bash or Task Scheduler.
+      - name: Stage Windows release runtimes before smoke
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           & scripts/stage-vulkan-loader-windows.test.ps1
           & scripts/stage-vulkan-loader-windows.ps1 `
             -DestinationDirectory "target\${{ matrix.target }}\release"
+          & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\${{ matrix.target }}\release"
+      - name: Build and smoke shipped release binaries
+        shell: bash
+        run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
       - name: Native ORT smoke (Windows release preflight)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          & scripts/stage-onnxruntime-windows.ps1 `
-            -DestinationDirectory "target\${{ matrix.target }}\release"
           & scripts/smoke-windows.ps1 `
             -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
 

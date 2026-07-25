@@ -307,6 +307,16 @@ jobs:
       # CI release-preflight and the authoritative tag build share this exact
       # shipped-binary build/smoke contract. Packaging and publishing remain
       # release-only below.
+      # The shared script launches each executable immediately after linking,
+      # so the dynamically loaded ORT runtime must already be adjacent. Vulkan
+      # was staged by the Windows SDK step above.
+      - name: Bundle onnxruntime.dll (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\${{ matrix.target }}\release"
+
       - name: Build and smoke shipped release binaries
         shell: bash
         env:
@@ -318,15 +328,6 @@ jobs:
         shell: bash
         run: |
           find "target/${{ matrix.target }}/release" -maxdepth 1 -mindepth 1 -print | sort | head -30
-
-      # Windows builds FastEmbed with ort-load-dynamic. The shared stager pins
-      # the ort 2.0.0-rc.11-compatible DLL and verifies the archive SHA-256.
-      - name: Bundle onnxruntime.dll (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          & scripts/stage-onnxruntime-windows.ps1 `
-            -DestinationDirectory "target\${{ matrix.target }}\release"
 
       - name: Package
         shell: bash

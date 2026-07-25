@@ -1009,7 +1009,7 @@ fn windows_ort_distribution_violations(
         (
             &ci,
             "release-preflight",
-            "Stage verified Vulkan loader (Windows release preflight)",
+            "Stage Windows release runtimes before smoke",
             "matrix.target == 'x86_64-pc-windows-msvc'",
             r#"target\${{ matrix.target }}\release"#,
             "Windows release proof",
@@ -1066,6 +1066,8 @@ fn windows_ort_distribution_violations(
 
     let pr_build =
         workflow_step_run(&ci, "Build and smoke shipped release binaries").unwrap_or_default();
+    let pr_runtime_stage =
+        workflow_step_run(&ci, "Stage Windows release runtimes before smoke").unwrap_or_default();
     let pr_smoke =
         workflow_step_run(&ci, "Native ORT smoke (Windows release preflight)").unwrap_or_default();
     let windows_test_bootstrap =
@@ -1118,7 +1120,8 @@ fn windows_ort_distribution_violations(
             .push("Windows ORT test bootstrap must run before inference-capable tests".into());
     }
     if !pr_build.contains("scripts/build-release-binaries.sh")
-        || !pr_smoke.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !pr_runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !pr_runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
         || !pr_smoke.contains("scripts/smoke-windows.ps1")
     {
         violations.push("PR CI does not build, stage, and exercise dynamic ORT on Windows".into());
@@ -2557,7 +2560,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     if job["runs-on"].as_str() != Some("${{ matrix.os }}")
         || job["timeout-minutes"].as_str()
             != Some(
-                "${{ (matrix.target == 'x86_64-pc-windows-msvc' || github.event_name != 'pull_request') && 60 || 45 }}",
+                "${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}",
             )
         || job["strategy"]["fail-fast"].as_bool() != Some(true)
         || job["strategy"]["matrix"].as_str()
@@ -2624,6 +2627,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
         "Stabilize Windows Rust cache toolchain inputs",
         "Configure rust-lld linker (Windows release preflight)",
         "Install sqlite3 (Windows only)",
+        "Stage Windows release runtimes before smoke",
         "Native ORT smoke (Windows release preflight)",
     ] {
         if job_step(&ci, "release-preflight", step_name).and_then(|step| step["if"].as_str())
@@ -2725,6 +2729,22 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             "release-preflight cache is not target-scoped, capacity-bounded, and main-owned".into(),
         );
     }
+    let windows_runtime_stage = job_step(
+        &ci,
+        "release-preflight",
+        "Stage Windows release runtimes before smoke",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !windows_runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !windows_runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
+        || !windows_runtime_stage.contains(r"target\${{ matrix.target }}\release")
+    {
+        violations.push(
+            "Windows release preflight omits adjacent runtime DLL staging before executable smoke"
+                .into(),
+        );
+    }
     let windows_smoke = job_step(
         &ci,
         "release-preflight",
@@ -2732,11 +2752,58 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     )
     .and_then(|step| step["run"].as_str())
     .unwrap_or_default();
-    if !windows_smoke.contains("scripts/stage-onnxruntime-windows.ps1")
-        || !windows_smoke.contains("scripts/smoke-windows.ps1")
+    if !windows_smoke.contains("scripts/smoke-windows.ps1")
         || !windows_smoke.contains(r"target\${{ matrix.target }}\release")
     {
         violations.push("Windows release preflight omits the native ORT smoke".into());
+    }
+    let ci_steps = job["steps"].as_sequence();
+    let runtime_stage_index = ci_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Stage Windows release runtimes before smoke")
+        })
+    });
+    let build_index = ci_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Build and smoke shipped release binaries")
+        })
+    });
+    let smoke_index = ci_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Native ORT smoke (Windows release preflight)")
+        })
+    });
+    if !matches!(
+        (runtime_stage_index, build_index, smoke_index),
+        (Some(runtime_stage_index), Some(build_index), Some(smoke_index))
+            if runtime_stage_index < build_index && build_index < smoke_index
+    ) {
+        violations.push(
+            "Windows release preflight does not stage runtime DLLs before executable smoke".into(),
+        );
+    }
+    let release_steps = release["jobs"]["release"]["steps"].as_sequence();
+    let release_ort_index = release_steps.and_then(|steps| {
+        steps
+            .iter()
+            .position(|step| step["name"].as_str() == Some("Bundle onnxruntime.dll (Windows)"))
+    });
+    let release_vulkan_index = release_steps.and_then(|steps| {
+        steps
+            .iter()
+            .position(|step| step["name"].as_str() == Some("Set up Vulkan SDK (Windows only)"))
+    });
+    let release_build_index = release_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Build and smoke shipped release binaries")
+        })
+    });
+    if !matches!(
+        (release_ort_index, release_vulkan_index, release_build_index),
+        (Some(ort_index), Some(vulkan_index), Some(build_index))
+            if ort_index < build_index && vulkan_index < build_index
+    ) {
+        violations.push("tag release does not stage runtime DLLs before executable smoke".into());
     }
 
     for step in job["steps"].as_sequence().into_iter().flatten() {
@@ -2828,6 +2895,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "      - name: Native ORT smoke removed",
         )
         .replace(
+            "      - name: Stage Windows release runtimes before smoke",
+            "      - name: Stage Windows release runtimes removed",
+        )
+        .replace(
             "      - name: Select native Perl for vendored OpenSSL",
             "      - name: Native Perl removed",
         )
@@ -2859,6 +2930,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "truncated PR file inventory",
         "native Windows Perl",
         "target and host build artifacts",
+        "runtime DLLs before executable smoke",
         "native ORT smoke",
         "publishing or packaging side effect",
         "conclusion does not fail closed",
