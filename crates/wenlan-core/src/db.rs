@@ -11069,9 +11069,13 @@ impl MemoryDB {
         // (recomputed here the same way `update_entity_shadow_page` does, so
         // a shadow whose aliases were never re-synced after an alias change
         // is flagged corrupt). Embedding compares raw blob bytes -- NULL vs
-        // NULL (never embedded on either side) is equal via `unwrap_or_default`
-        // folding both to an empty Vec; a genuine F32_BLOB(768) is never
-        // empty, so no false match against an unset embedding.
+        // NULL (never embedded on either side) is equal via the `Option`
+        // fold to an empty Vec; a genuine F32_BLOB(768) is never empty, so no
+        // false match against an unset embedding. An undecodable mirrored
+        // column -- wrong SQLite storage class on either side, which the
+        // shadow writer's mirror-copy can produce identically on BOTH sides
+        // -- is drift, never equality: it always counts as corrupt, so a
+        // symmetric decode failure can never fold to a false match.
         let mut expected_active = 0usize;
         let mut missing_count = 0usize;
         let mut missing_sample: Vec<String> = Vec::new();
@@ -11101,31 +11105,104 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("reconcile entities row: {e}")))?
             {
                 expected_active += 1;
-                let entity_id: String = row.get(0).unwrap_or_default();
-                let name: String = row.get(1).unwrap_or_default();
-                let entity_type: String = row.get(2).unwrap_or_default();
-                let confidence: Option<f64> = row.get(3).unwrap_or(None);
-                let space: Option<String> = row.get(4).unwrap_or(None);
-                let expected_space = space.unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
-                let expected_aliases: Option<String> = row.get(11).unwrap_or(None);
-                let confirmed: Option<i64> = row.get(12).unwrap_or(None);
-                let embedding: Vec<u8> = row.get::<Vec<u8>>(13).unwrap_or_default();
+                // The id itself is not a mirrored field; a failure to decode
+                // it only degrades the sample label, it does not by itself
+                // decide missing/corrupt below.
+                let entity_id: String = row
+                    .get::<String>(0)
+                    .unwrap_or_else(|_| "<undecodable>".to_string());
 
-                let page_title: Option<String> = row.get(5).unwrap_or(None);
-                let Some(page_title) = page_title else {
-                    missing_count += 1;
-                    if missing_sample.len() < EntityPageParityReport::SAMPLE_CAP {
-                        missing_sample.push(entity_id.clone());
+                let entity_side: Result<_, libsql::Error> = (|| {
+                    let name: String = row.get(1)?;
+                    let entity_type: String = row.get(2)?;
+                    let confidence: Option<f64> = row.get(3)?;
+                    let space: Option<String> = row.get(4)?;
+                    let expected_aliases: Option<String> = row.get(11)?;
+                    let confirmed: Option<i64> = row.get(12)?;
+                    let embedding: Vec<u8> = row.get::<Option<Vec<u8>>>(13)?.unwrap_or_default();
+                    Ok((
+                        name,
+                        entity_type,
+                        confidence,
+                        space,
+                        expected_aliases,
+                        confirmed,
+                        embedding,
+                    ))
+                })();
+                let Ok((
+                    name,
+                    entity_type,
+                    confidence,
+                    space,
+                    expected_aliases,
+                    confirmed,
+                    embedding,
+                )) = entity_side
+                else {
+                    corrupt_count += 1;
+                    if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                        corrupt_sample.push(entity_id.clone());
                     }
                     continue;
                 };
-                let page_entity_type: String = row.get(6).unwrap_or_default();
-                let page_confidence: Option<f64> = row.get(7).unwrap_or(None);
-                let page_space: Option<String> = row.get(8).unwrap_or(None);
-                let page_workspace: Option<String> = row.get(9).unwrap_or(None);
-                let page_aliases: Option<String> = row.get(10).unwrap_or(None);
-                let page_confirmed: Option<i64> = row.get(14).unwrap_or(None);
-                let page_embedding: Vec<u8> = row.get::<Vec<u8>>(15).unwrap_or_default();
+                let expected_space = space.unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
+
+                // NULL (no live shadow joined) stays missing; an undecodable
+                // non-NULL title is a corrupt row, not a missing one.
+                let page_title = match row.get::<Option<String>>(5) {
+                    Ok(Some(title)) => title,
+                    Ok(None) => {
+                        missing_count += 1;
+                        if missing_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                            missing_sample.push(entity_id.clone());
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        corrupt_count += 1;
+                        if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                            corrupt_sample.push(entity_id.clone());
+                        }
+                        continue;
+                    }
+                };
+
+                let page_side: Result<_, libsql::Error> = (|| {
+                    let page_entity_type: String = row.get(6)?;
+                    let page_confidence: Option<f64> = row.get(7)?;
+                    let page_space: Option<String> = row.get(8)?;
+                    let page_workspace: Option<String> = row.get(9)?;
+                    let page_aliases: Option<String> = row.get(10)?;
+                    let page_confirmed: Option<i64> = row.get(14)?;
+                    let page_embedding: Vec<u8> =
+                        row.get::<Option<Vec<u8>>>(15)?.unwrap_or_default();
+                    Ok((
+                        page_entity_type,
+                        page_confidence,
+                        page_space,
+                        page_workspace,
+                        page_aliases,
+                        page_confirmed,
+                        page_embedding,
+                    ))
+                })();
+                let Ok((
+                    page_entity_type,
+                    page_confidence,
+                    page_space,
+                    page_workspace,
+                    page_aliases,
+                    page_confirmed,
+                    page_embedding,
+                )) = page_side
+                else {
+                    corrupt_count += 1;
+                    if corrupt_sample.len() < EntityPageParityReport::SAMPLE_CAP {
+                        corrupt_sample.push(entity_id.clone());
+                    }
+                    continue;
+                };
 
                 let matches = page_title == name
                     && page_entity_type == entity_type
@@ -77475,6 +77552,112 @@ pub(crate) mod tests {
             report.missing_count, 0,
             "the shadow is still present and mapped"
         );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// Fail-open regression: a decode failure on a mirrored column must
+    /// never fold to a false equality.
+    ///
+    /// NOTE on column choice: the obvious way to force a "wrong storage
+    /// class" decode failure -- e.g. `UPDATE entities SET entity_type = 42`
+    /// or a BLOB into the REAL `confidence` column -- does not exercise a
+    /// recoverable decode failure on this pinned libsql (0.9.30): a
+    /// TEXT-affinity column silently coerces the integer to text at WRITE
+    /// time (no failure at all), and every other cross-type mismatch panics
+    /// inside libsql's own `FromValue` impls (`unreachable!("invalid value
+    /// type")`, e.g. `f64::from_sql`/`Vec<u8>::from_sql` on a non-matching,
+    /// non-NULL value) rather than returning `Err` -- unrecoverable by the
+    /// `Result`-returning closures this fix adds. `pages.entity_type` is the
+    /// one mirrored column with no NOT NULL constraint (unlike
+    /// `entities.entity_type`, `name`, and `title`, which all reject a NULL
+    /// write outright), so it is the one column where a genuine,
+    /// non-panicking `Err(NullValue)` decode failure is reachable via plain
+    /// SQL. Old code's `row.get(6).unwrap_or_default()` folds that `Err` to
+    /// `""`; pairing it with a legitimately EMPTY `entities.entity_type`
+    /// reproduces exactly the hazard the review flagged: a decode-failure
+    /// default colliding with an unrelated real value and reading as equal.
+    #[tokio::test]
+    async fn reconcile_treats_page_side_decode_failure_as_corrupt_never_equality() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("Decode Drift", "person", None, None, Some(0.9))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            // A legitimate (not a decode failure) empty string on the
+            // entities side -- the exact value old code's
+            // `unwrap_or_default` would produce from a page-side decode
+            // failure.
+            conn.execute(
+                "UPDATE entities SET entity_type = '' WHERE id = ?1",
+                libsql::params![eid.clone()],
+            )
+            .await
+            .unwrap();
+            // `pages.entity_type` carries no NOT NULL constraint, so this
+            // NULL is a genuine decode failure once read as a non-`Option`
+            // `String` -- the page row still exists and joins, so it is not
+            // "no live shadow".
+            conn.execute(
+                "UPDATE pages SET entity_type = NULL WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "a page-side decode failure must count as corrupt, never fold to \
+             a false equality against an unrelated real value (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(
+            report.missing_count, 0,
+            "the shadow page still exists and joins -- this is a decode \
+             failure, not a missing shadow"
+        );
+        assert!(report.drift_count >= 1);
+    }
+
+    /// A decode failure on only the page side (the entity-side value left
+    /// intact) must also count as corrupt.
+    #[tokio::test]
+    async fn reconcile_treats_one_sided_decode_failure_as_corrupt() {
+        let (db, _dir) = test_db().await;
+        let eid = db
+            .store_entity("One Sided Decode Drift", "person", None, None, Some(0.9))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0
+        );
+
+        let pid = shadow_page_id(&db, &eid).await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_type = NULL WHERE id = ?1",
+                libsql::params![pid],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        assert!(
+            report.corrupt_count >= 1,
+            "a one-sided decode failure must count as corrupt (report={report:?})"
+        );
+        assert!(report.corrupt_sample.contains(&eid));
+        assert_eq!(report.missing_count, 0);
         assert!(report.drift_count >= 1);
     }
 
