@@ -121,7 +121,7 @@ class CiObserverTests(unittest.TestCase):
         self.assertEqual(receipt["required_gate_elapsed_ms"], 1_230_000)
         self.assertEqual(receipt["cache"]["status"], "under_budget")
 
-    def test_over_budget_writes_receipt_then_exits_two(self):
+    def test_normal_eviction_pressure_is_recorded_without_failing(self):
         result, receipt = self.run_observer(
             event(),
             [{"total_count": 1, "jobs": [job(102, "conclusion")]}],
@@ -131,9 +131,24 @@ class CiObserverTests(unittest.TestCase):
             },
             {"max_cache_size_gb": 10},
         )
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(receipt["cache"]["over_by_bytes"], 1)
         self.assertEqual(receipt["cache"]["status"], "over_budget")
+        self.assertFalse(receipt["cache"]["alert"])
+
+    def test_sustained_cache_overshoot_writes_receipt_then_exits_two(self):
+        result, receipt = self.run_observer(
+            event(),
+            [{"total_count": 1, "jobs": [job(102, "conclusion")]}],
+            {
+                "active_caches_size_in_bytes": 11_500_000_001,
+                "active_caches_count": 21,
+            },
+            {"max_cache_size_gb": 10},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(receipt["cache"]["status"], "over_budget")
+        self.assertTrue(receipt["cache"]["alert"])
 
     def test_rejects_short_sha_and_attempt_mismatch(self):
         bad_event = event()
@@ -199,11 +214,11 @@ class CiObserverTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assert_error_receipt(receipt, "jobs page must be a JSON object")
 
-    def test_clamps_small_github_clock_skew_on_skipped_jobs(self):
+    def test_clamps_github_clock_skew_on_skipped_jobs(self):
         skipped = job()
         skipped["name"] = "skipped"
         skipped["conclusion"] = "skipped"
-        skipped["started_at"] = "2026-07-24T01:00:18Z"
+        skipped["started_at"] = "2026-07-24T01:01:18Z"
         skipped["completed_at"] = "2026-07-24T01:00:17Z"
         conclusion = job(102, "conclusion")
         result, receipt = self.run_observer(

@@ -1487,6 +1487,11 @@ fn ci_routing_contract_violations(
                 .into(),
         );
     }
+    if !rust_paths.contains("crates/**/tests/**") {
+        violations.push(
+            "Linux canonical routing omits non-Rust test fixtures under crates/**/tests/**".into(),
+        );
+    }
     if !rust_paths.contains(".github/workflows/coverage.yml") {
         violations.push(
             "coverage workflow cannot bootstrap its FastEmbed cache contract through rust".into(),
@@ -2161,6 +2166,7 @@ jobs:
         "condition omits CI scheduling trigger",
         "coverage workflow",
         "clippy configuration",
+        "non-Rust test fixtures",
         "nextest config",
         "release-profile-sensitive",
         "release-sensitive",

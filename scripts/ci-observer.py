@@ -11,6 +11,7 @@ from pathlib import Path
 
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_GITHUB_CLOCK_SKEW_MS = 5_000
+CACHE_ALERT_RATIO_PPM = 1_150_000
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -45,14 +46,14 @@ def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def duration_ms(started_at, completed_at):
+def duration_ms(started_at, completed_at, allow_negative=False):
     start = parse_time(started_at)
     end = parse_time(completed_at)
     if start is None or end is None:
         return None
     duration = int((end - start).total_seconds() * 1000)
     if duration < 0:
-        if duration >= -MAX_GITHUB_CLOCK_SKEW_MS:
+        if allow_negative or duration >= -MAX_GITHUB_CLOCK_SKEW_MS:
             return 0
         raise ValueError("completion timestamp precedes start timestamp")
     return duration
@@ -71,13 +72,18 @@ def validate_run(run):
 
 def normalize_step(step):
     step = require_object(step, "job step")
+    conclusion = step.get("conclusion")
     return {
         "number": step.get("number"),
         "name": step.get("name"),
         "started_at": step.get("started_at"),
         "completed_at": step.get("completed_at"),
-        "duration_ms": duration_ms(step.get("started_at"), step.get("completed_at")),
-        "conclusion": step.get("conclusion"),
+        "duration_ms": duration_ms(
+            step.get("started_at"),
+            step.get("completed_at"),
+            allow_negative=conclusion == "skipped",
+        ),
+        "conclusion": conclusion,
     }
 
 
@@ -106,6 +112,7 @@ def normalize_jobs(pages, run):
             if not isinstance(job_id, int) or job_id in seen_ids:
                 raise ValueError("job ids must be unique integers")
             seen_ids.add(job_id)
+            conclusion = job.get("conclusion")
             job_steps = job.get("steps", [])
             if not isinstance(job_steps, list):
                 raise ValueError("job steps must be a JSON array")
@@ -120,9 +127,11 @@ def normalize_jobs(pages, run):
                     "started_at": job.get("started_at"),
                     "completed_at": job.get("completed_at"),
                     "duration_ms": duration_ms(
-                        job.get("started_at"), job.get("completed_at")
+                        job.get("started_at"),
+                        job.get("completed_at"),
+                        allow_negative=conclusion == "skipped",
                     ),
-                    "conclusion": job.get("conclusion"),
+                    "conclusion": conclusion,
                     "runner_name": job.get("runner_name"),
                     "runner_group_name": job.get("runner_group_name"),
                     "labels": sorted(job.get("labels", [])),
@@ -153,6 +162,8 @@ def build_receipt(event_payload, pages, usage, limit):
     if budget_bytes <= 0 or usage_bytes < 0 or active_count < 0:
         raise ValueError("cache usage and limit must be non-negative")
     over_by = max(0, usage_bytes - budget_bytes)
+    ratio_ppm = usage_bytes * 1_000_000 // budget_bytes
+    alert = usage_bytes * 1_000_000 > budget_bytes * CACHE_ALERT_RATIO_PPM
 
     return {
         "schema_version": 1,
@@ -175,7 +186,9 @@ def build_receipt(event_payload, pages, usage, limit):
             "active_count": active_count,
             "limit_gb": int(limit["max_cache_size_gb"]),
             "budget_bytes": budget_bytes,
-            "ratio_ppm": usage_bytes * 1_000_000 // budget_bytes,
+            "ratio_ppm": ratio_ppm,
+            "alert_ratio_ppm": CACHE_ALERT_RATIO_PPM,
+            "alert": alert,
             "status": "over_budget" if over_by else "under_budget",
             "over_by_bytes": over_by,
         },
@@ -239,7 +252,7 @@ def main():
         raise SystemExit(1)
 
     write_receipt(args.output, receipt)
-    raise SystemExit(2 if receipt["cache"]["status"] == "over_budget" else 0)
+    raise SystemExit(2 if receipt["cache"]["alert"] else 0)
 
 
 if __name__ == "__main__":

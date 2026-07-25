@@ -51,6 +51,9 @@ jobs:
               # `some` quantifier, a negative glob like `!crates/*/npm/**`
               # makes README-only PRs match this filter.
               - 'crates/**/*.rs'
+              # Required integration tests consume non-Rust fixtures here
+              # (PDF, Markdown, and text), so fixture-only PRs must not skip.
+              - 'crates/**/tests/**'
               # Native sources bootstrap the drift guard that verifies their
               # platform route; otherwise a new file could skip its own check.
               - 'crates/**/*.c'
