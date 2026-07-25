@@ -2304,6 +2304,25 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             "detect-changes does not reject the REST API's truncated PR file inventory".into(),
         );
     }
+    let dispatch_guard = job_step(
+        &release,
+        "prepare-release",
+        "Require main workflow for manual release",
+    );
+    let dispatch_guard_run = dispatch_guard
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if dispatch_guard.and_then(|step| step["if"].as_str())
+        != Some("github.event_name == 'workflow_dispatch'")
+        || dispatch_guard.and_then(|step| step["env"]["WORKFLOW_REF"].as_str())
+            != Some("${{ github.ref }}")
+        || !dispatch_guard_run.contains("$WORKFLOW_REF")
+        || !dispatch_guard_run.contains("refs/heads/main")
+        || !dispatch_guard_run.contains("exit 1")
+    {
+        violations
+            .push("manual release dispatch does not require the current main workflow ref".into());
+    }
 
     if ci["jobs"]["detect-changes"]["outputs"]["release-targets"]
         .as_str()
@@ -2647,16 +2666,22 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "      - name: Select native Perl for vendored OpenSSL",
             "      - name: Native Perl removed",
         );
-    let release = release.replace(
-        "      matrix: ${{ fromJSON(needs.prepare-release.outputs.release-targets) }}",
-        "      matrix: {}",
-    );
+    let release = release
+        .replace(
+            "      matrix: ${{ fromJSON(needs.prepare-release.outputs.release-targets) }}",
+            "      matrix: {}",
+        )
+        .replace(
+            "      - name: Require main workflow for manual release",
+            "      - name: Manual release ref guard removed",
+        );
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
         "independent fail-closed",
         "fail-fast four-target",
         "canonical release matrix",
         "shared shipped-binary",
+        "current main workflow ref",
         "target-scoped, capacity-bounded, and main-owned",
         "truncated PR file inventory",
         "native Windows Perl",

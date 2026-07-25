@@ -27,6 +27,16 @@ jobs:
     outputs:
       release-targets: ${{ steps.release-targets.outputs.release-targets }}
     steps:
+      - name: Require main workflow for manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            echo "Manual releases must run the current workflow from main; choose the release tag through the tag input."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:

@@ -3,7 +3,13 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from ci_test_plan import PlanError, build_plan, command_groups_for
 
@@ -93,6 +99,119 @@ def plan_for(*paths: str, existing_paths: set[str] | None = None) -> dict:
         event_name="pull_request",
         existing_paths=set(paths) if existing_paths is None else existing_paths,
     )
+
+
+class FiltersetExecutionTests(unittest.TestCase):
+    def run_filterset_with_listing(
+        self,
+        listing: dict,
+    ) -> tuple[subprocess.CompletedProcess[str], bool]:
+        plan = plan_for(
+            "crates/wenlan-core/src/lint/pages/security_test.rs"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fake_cargo = Path(directory) / "cargo"
+            run_marker = Path(directory) / "nextest-ran"
+            fake_cargo.write_text(
+                """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1] == "metadata":
+    print(os.environ["FAKE_CARGO_METADATA"])
+elif sys.argv[1:3] == ["nextest", "list"]:
+    print(os.environ["FAKE_NEXTEST_LISTING"])
+elif sys.argv[1:3] == ["nextest", "run"]:
+    Path(os.environ["NEXTEST_RUN_MARKER"]).write_text("ran")
+else:
+    raise SystemExit(f"unexpected cargo arguments: {sys.argv[1:]}")
+""",
+                encoding="utf-8",
+            )
+            fake_cargo.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{directory}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_CARGO_METADATA"] = json.dumps(cargo_metadata())
+            environment["FAKE_NEXTEST_LISTING"] = json.dumps(listing)
+            environment["NEXTEST_RUN_MARKER"] = str(run_marker)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("ci_test_plan.py")),
+                    "run",
+                    "--suite",
+                    "workspace-lib",
+                    "--plan-json",
+                    json.dumps(plan),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            did_run = run_marker.exists()
+        return result, did_run
+
+    def test_zero_match_filterset_fails_before_running_tests(self) -> None:
+        result, did_run = self.run_filterset_with_listing(
+            {
+                "rust-suites": {
+                    "wenlan-core": {
+                        "testcases": {
+                            "wrong::test": {
+                                "ignored": False,
+                                "filter-match": {"status": "mismatch"},
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("selected zero tests", result.stderr)
+        self.assertFalse(did_run)
+
+    def test_ignored_only_match_fails_before_running_tests(self) -> None:
+        result, did_run = self.run_filterset_with_listing(
+            {
+                "rust-suites": {
+                    "wenlan-core": {
+                        "testcases": {
+                            "owned::ignored": {
+                                "ignored": True,
+                                "filter-match": {"status": "matches"},
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("selected zero tests", result.stderr)
+        self.assertFalse(did_run)
+
+    def test_runnable_match_executes_nextest(self) -> None:
+        result, did_run = self.run_filterset_with_listing(
+            {
+                "rust-suites": {
+                    "wenlan-core": {
+                        "testcases": {
+                            "owned::active": {
+                                "ignored": False,
+                                "filter-match": {"status": "matches"},
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(did_run)
 
 
 class PackageClosureTests(unittest.TestCase):

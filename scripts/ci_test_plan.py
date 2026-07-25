@@ -527,6 +527,50 @@ def _cargo_metadata() -> object:
         raise PlanError("cargo metadata emitted invalid JSON") from error
 
 
+def _require_filterset_match(command: list[str]) -> None:
+    if command[:3] != ["cargo", "nextest", "run"]:
+        raise PlanError(f"cannot validate non-nextest command: {command!r}")
+    list_command = [
+        "cargo",
+        "nextest",
+        "list",
+        *command[3:],
+        "--message-format",
+        "json",
+    ]
+    print("+", " ".join(list_command), flush=True)
+    result = subprocess.run(
+        list_command,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        listing = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise PlanError("cargo nextest list emitted invalid JSON") from error
+    suites = listing.get("rust-suites") if isinstance(listing, dict) else None
+    matched = 0
+    if isinstance(suites, dict):
+        for suite in suites.values():
+            testcases = suite.get("testcases") if isinstance(suite, dict) else None
+            if not isinstance(testcases, dict):
+                continue
+            matched += sum(
+                isinstance(testcase, dict)
+                and testcase.get("ignored") is False
+                and isinstance(testcase.get("filter-match"), dict)
+                and testcase["filter-match"].get("status") == "matches"
+                for testcase in testcases.values()
+            )
+    if matched == 0:
+        raise PlanError(
+            "workspace-lib filterset selected zero tests; "
+            "isolated module ownership has drifted"
+        )
+    print(f"workspace-lib filterset matched {matched} tests")
+
+
 def _write_github_output(path: str, plan_json: str) -> None:
     if "\n" in plan_json or "\r" in plan_json:
         raise PlanError("compact plan JSON unexpectedly contains a newline")
@@ -584,6 +628,14 @@ def _main(argv: list[str]) -> int:
         print(f"{arguments.suite}: no affected tests")
         return 0
     for command in commands:
+        suite_key = arguments.suite.replace("-", "_")
+        suite = plan.get(suite_key) if isinstance(plan, dict) else None
+        if (
+            arguments.suite == "workspace-lib"
+            and isinstance(suite, dict)
+            and suite.get("mode") == "filterset"
+        ):
+            _require_filterset_match(command)
         print("+", " ".join(command), flush=True)
         subprocess.run(command, check=True)
     return 0
