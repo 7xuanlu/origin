@@ -1053,6 +1053,42 @@ fn windows_ort_distribution_violations(
         );
     }
 
+    let universal_archive_verify = workflow_step_run(
+        &release,
+        "Verify release archive contains wenlan, wenlan-server, wenlan-mcp",
+    )
+    .unwrap_or_default();
+    if !universal_archive_verify.contains("for bin in wenlan wenlan-server wenlan-mcp")
+        || universal_archive_verify.contains("onnxruntime.dll")
+        || universal_archive_verify.contains("vulkan-1.dll")
+        || universal_archive_verify.contains("VulkanRT-License.txt")
+    {
+        violations.push(
+            "cross-platform archive verification mixes Windows-only runtime payloads into every target"
+                .into(),
+        );
+    }
+    let windows_archive_verify = job_step(
+        &release,
+        "release",
+        "Verify Windows release archive runtimes",
+    );
+    let windows_archive_verify_run = windows_archive_verify
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if windows_archive_verify.and_then(|step| step["if"].as_str())
+        != Some("matrix.target == 'x86_64-pc-windows-msvc'")
+        || !windows_archive_verify_run.contains("unzip -l")
+        || !windows_archive_verify_run.contains("onnxruntime.dll")
+        || !windows_archive_verify_run.contains("vulkan-1.dll")
+        || !windows_archive_verify_run.contains("VulkanRT-License.txt")
+    {
+        violations.push(
+            "Windows archive runtime verification is not restricted to the shipped Windows zip"
+                .into(),
+        );
+    }
+
     let packaged_smoke =
         workflow_step_run(&release, "Smoke packaged Windows release").unwrap_or_default();
     if !packaged_smoke.contains("Expand-Archive")
@@ -1208,6 +1244,29 @@ jobs:
             .iter()
             .any(|violation| violation.contains("vector inference")),
         "fixture must reject a smoke with no module proof: {violations:?}"
+    );
+}
+
+#[test]
+fn windows_ort_distribution_contract_rejects_unscoped_archive_payloads() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("read release.yml")
+        .replace(
+            "      - name: Verify Windows release archive runtimes\n        if: matrix.target == 'x86_64-pc-windows-msvc'",
+            "      - name: Verify Windows release archive runtimes\n        if: always()",
+        );
+    let smoke = std::fs::read_to_string(root.join("scripts/smoke-windows.ps1"))
+        .expect("read smoke-windows.ps1");
+    let violations = windows_ort_distribution_violations(&ci, &release, &smoke);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains(
+                "Windows archive runtime verification is not restricted to the shipped Windows zip",
+            )
+        }),
+        "fixture must reject Windows-only payload checks on non-Windows archives: {violations:?}"
     );
 }
 

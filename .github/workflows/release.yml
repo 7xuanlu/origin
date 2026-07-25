@@ -421,15 +421,23 @@ jobs:
               exit 1
             fi
           done
+          echo "OK: archive contains all shipped binaries"
+
+      - name: Verify Windows release archive runtimes
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -e
+          contents=$(unzip -l "dist/${{ matrix.artifact_name }}.zip" | awk '{print $NF}')
           for payload in onnxruntime.dll vulkan-1.dll VulkanRT-License.txt; do
             if ! printf '%s\n' "$contents" | grep -qE "(^|/)${payload}$"; then
-              echo "ERROR: dist/${{ matrix.artifact_name }}.${{ matrix.archive }} missing ${payload}"
+              echo "ERROR: dist/${{ matrix.artifact_name }}.zip missing ${payload}"
               echo "--- archive contents ---"
               printf '%s\n' "$contents"
               exit 1
             fi
           done
-          echo "OK: archive contains binaries and required Windows runtimes"
+          echo "OK: Windows archive contains required runtimes"
 
       - name: Upload archives to release
         uses: softprops/action-gh-release@v2
