@@ -900,3 +900,374 @@ async fn list_entities_scoped_flipped_query_uses_index_not_pages_scan() {
         "the flipped query must use at least one index: {plan}"
     );
 }
+
+// ===== M3 PR-2 stage f: tie-safe flipped reads (Sol review fix 3+4) =====
+//
+// `list_recent_relations_scoped` and `search_entities_by_vector_scoped` no
+// longer run a divergent flipped SQL arm; the flipped path replays the
+// EXACT legacy selection query, then overlays only the mirrored fields via
+// a second hydration query keyed on the selected rows' entity ids. Row set
+// and order are therefore identical to legacy by construction -- including
+// ties -- rather than by discipline between two hand-maintained queries.
+
+/// Tie-heavy differential: more relations than the LIMIT, all sharing one
+/// `created_at`, so the un-tiebroken `ORDER BY r.created_at DESC LIMIT ?2`
+/// can only stay stable OFF vs ON if both arms run the identical query.
+#[tokio::test]
+async fn list_recent_relations_scoped_tie_heavy_selection_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    let scope = ReadScope::Space("stage_f_tie_relations".to_string());
+    for index in 0..6 {
+        let from = db
+            .store_entity(
+                &format!("Tie From {index}"),
+                "person",
+                Some("stage_f_tie_relations"),
+                None,
+                Some(0.9),
+            )
+            .await
+            .unwrap();
+        let to = db
+            .store_entity(
+                &format!("Tie To {index}"),
+                "person",
+                Some("stage_f_tie_relations"),
+                None,
+                Some(0.9),
+            )
+            .await
+            .unwrap();
+        db.create_relation(&from, &to, "related_to", None, None, None, None)
+            .await
+            .unwrap();
+    }
+    {
+        // Force an exact tie on created_at so the LIMIT boundary is decided
+        // by the query plan alone, not wall-clock insertion order.
+        let conn = db.conn.lock().await;
+        conn.execute("UPDATE relations SET created_at = 1000", ())
+            .await
+            .unwrap();
+    }
+
+    let legacy = db
+        .list_recent_relations_scoped(3, None, &scope)
+        .await
+        .unwrap();
+    assert_eq!(legacy.len(), 3, "sanity: LIMIT applies under the tie");
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid_first = db
+        .list_recent_relations_scoped(3, None, &scope)
+        .await
+        .unwrap();
+    let hybrid_second = db
+        .list_recent_relations_scoped(3, None, &scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid_first:?}"),
+        "tied created_at must select and order the identical row set OFF vs ON"
+    );
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid_second:?}"),
+        "the tied row set/order must stay stable across repeated ON calls"
+    );
+}
+
+/// Tie-heavy differential: more in-scope entities than the LIMIT, all with
+/// a byte-identical embedding, so `ORDER BY distance ASC LIMIT ?2` ties on
+/// every row unless both arms run the identical ANN query.
+#[tokio::test]
+async fn search_entities_by_vector_scoped_tie_heavy_selection_matches_legacy() {
+    let (db, _tmp) = test_db().await;
+    let scope = ReadScope::Space("stage_f_tie_vector".to_string());
+    let mut ids = Vec::new();
+    for index in 0..6 {
+        ids.push(
+            db.store_entity(
+                &format!("Tie Vector {index}"),
+                "project",
+                Some("stage_f_tie_vector"),
+                None,
+                Some(0.9),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    // `refresh_entity_embedding` re-derives the embedding from `text` and
+    // re-syncs the shadow page in the same transaction (see
+    // `refresh_entity_embedding_syncs_shadow_embedding`), so every row gets
+    // a byte-identical embedding on BOTH sides and still reconciles clean.
+    for id in &ids {
+        db.refresh_entity_embedding(id, "tie vector anchor")
+            .await
+            .unwrap();
+    }
+
+    let legacy = db
+        .search_entities_by_vector_scoped("tie vector anchor", 3, &scope)
+        .await
+        .unwrap();
+    assert_eq!(legacy.len(), 3, "sanity: LIMIT applies under the tie");
+
+    stage_c_enable_cutover_clean(&db).await;
+
+    let hybrid_first = db
+        .search_entities_by_vector_scoped("tie vector anchor", 3, &scope)
+        .await
+        .unwrap();
+    let hybrid_second = db
+        .search_entities_by_vector_scoped("tie vector anchor", 3, &scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid_first:?}"),
+        "tied distances must select and order the identical row set OFF vs ON"
+    );
+    assert_eq!(
+        format!("{legacy:?}"),
+        format!("{hybrid_second:?}"),
+        "the tied row set/order must stay stable across repeated ON calls"
+    );
+}
+
+/// Positive control (review finding 6): stamping a clean watermark, then
+/// mutating a shadow page's title WITHOUT re-reconciling, must be visible
+/// through the flipped read -- proving `list_entities_scoped` reads
+/// through the mirror live, not silently through legacy. Re-reconciling
+/// (drift > 0) must fall back to legacy again.
+#[tokio::test]
+async fn list_entities_scoped_flip_serves_unreconciled_shadow_mutation() {
+    let (db, _tmp) = test_db().await;
+    let entity_id = db
+        .store_entity(
+            "Stage F List Live",
+            "person",
+            Some("stage_f_list_live"),
+            None,
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+    stage_c_enable_cutover_clean(&db).await;
+    let scope = ReadScope::Space("stage_f_list_live".to_string());
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET title = 'Mutated List Title' \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let live = db.list_entities_scoped(None, &scope).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        live[0].name, "Mutated List Title",
+        "flipped read must serve the live shadow mutation before re-reconcile"
+    );
+
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert!(
+        report.drift_count >= 1,
+        "sanity: reconcile must see the drift"
+    );
+
+    let after = db.list_entities_scoped(None, &scope).await.unwrap();
+    assert_eq!(
+        after[0].name, "Stage F List Live",
+        "a dirty watermark must serve legacy again"
+    );
+}
+
+/// Positive control for the other UNTOUCHED fn: same pattern as above, for
+/// `get_entity_detail_scoped`'s primary entity row.
+#[tokio::test]
+async fn get_entity_detail_scoped_flip_serves_unreconciled_shadow_mutation() {
+    let (db, _tmp) = test_db().await;
+    let entity_id = db
+        .store_entity(
+            "Stage F Detail Live",
+            "person",
+            Some("stage_f_detail_live"),
+            None,
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+    stage_c_enable_cutover_clean(&db).await;
+    let scope = ReadScope::Space("stage_f_detail_live".to_string());
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET title = 'Mutated Detail Title' \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let live = db
+        .get_entity_detail_scoped(&entity_id, &scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        live.entity.name, "Mutated Detail Title",
+        "flipped read must serve the live shadow mutation before re-reconcile"
+    );
+
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert!(
+        report.drift_count >= 1,
+        "sanity: reconcile must see the drift"
+    );
+
+    let after = db
+        .get_entity_detail_scoped(&entity_id, &scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.entity.name, "Stage F Detail Live",
+        "a dirty watermark must serve legacy again"
+    );
+}
+
+/// Positive control for the RESTRUCTURED relations fn: proves the
+/// hydration overlay reads live shadow state (before re-reconcile), not a
+/// cached value, and falls back to legacy once the watermark goes dirty.
+#[tokio::test]
+async fn list_recent_relations_scoped_flip_serves_unreconciled_shadow_mutation() {
+    let (db, _tmp) = test_db().await;
+    let from = db
+        .store_entity(
+            "Stage F Relation From",
+            "person",
+            Some("stage_f_relation_live"),
+            None,
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+    let to = db
+        .store_entity(
+            "Stage F Relation To",
+            "person",
+            Some("stage_f_relation_live"),
+            None,
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+    db.create_relation(&from, &to, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    stage_c_enable_cutover_clean(&db).await;
+    let scope = ReadScope::Space("stage_f_relation_live".to_string());
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET title = 'Mutated From Title' \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![from.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let live = db
+        .list_recent_relations_scoped(20, None, &scope)
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        live[0].from_entity_name, "Mutated From Title",
+        "the hydration overlay must serve the live shadow mutation before re-reconcile"
+    );
+    assert_eq!(live[0].to_entity_name, "Stage F Relation To");
+
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert!(
+        report.drift_count >= 1,
+        "sanity: reconcile must see the drift"
+    );
+
+    let after = db
+        .list_recent_relations_scoped(20, None, &scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        after[0].from_entity_name, "Stage F Relation From",
+        "a dirty watermark must fall back to legacy for the overlay too"
+    );
+}
+
+/// Positive control for the RESTRUCTURED vector fn: proves the hydration
+/// overlay reads live shadow state for every mirrored field
+/// (name/entity_type/confidence/confirmed) before re-reconcile, and falls
+/// back to legacy once the watermark goes dirty.
+#[tokio::test]
+async fn search_entities_by_vector_scoped_flip_serves_unreconciled_shadow_mutation() {
+    let (db, _tmp) = test_db().await;
+    let entity_id = db
+        .store_entity(
+            "Stage F Vector Live",
+            "project",
+            Some("stage_f_vector_live"),
+            None,
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+    stage_c_enable_cutover_clean(&db).await;
+    let scope = ReadScope::Space("stage_f_vector_live".to_string());
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET title = 'Mutated Vector Title', entity_type = 'organization', \
+                    confidence = 0.75, entity_confirmed = 1 \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let live = db
+        .search_entities_by_vector_scoped("stage f vector live query", 5, &scope)
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].entity.name, "Mutated Vector Title");
+    assert_eq!(live[0].entity.entity_type, "organization");
+    assert_eq!(live[0].entity.confidence, Some(0.75));
+    assert!(live[0].entity.confirmed);
+
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert!(
+        report.drift_count >= 1,
+        "sanity: reconcile must see the drift"
+    );
+
+    let after = db
+        .search_entities_by_vector_scoped("stage f vector live query", 5, &scope)
+        .await
+        .unwrap();
+    assert_eq!(after[0].entity.name, "Stage F Vector Live");
+    assert_eq!(after[0].entity.entity_type, "project");
+    assert_eq!(after[0].entity.confidence, Some(0.5));
+    assert!(!after[0].entity.confirmed);
+}
