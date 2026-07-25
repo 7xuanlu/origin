@@ -268,3 +268,18 @@ polling the HTTP routes above — no event/push channel to freeze or migrate.
 - **0** wire surfaces left unclassified (the repair/lint-repair wire types were the one candidate requiring investigation; resolved under D4's blanket rule, not an exception).
 - **1** confirmed dead low-level primitive (`MemoryDB::create_entity`, test-only) excluded from the canonical entity-upsert collapse.
 - **5** items noted for the record, none blocking, none requiring escalation.
+
+## Addendum -- 2026-07-24 (Stage D)
+
+FREEZE-set teeth now live in `crates/wenlan-types/src/entities_freeze_tests.rs`
+(serde-literal exact-shape asserts) plus typed MCP deserialization in
+`crates/wenlan-mcp/src/tools.rs` (fails loud on envelope-key drift; see root
+`AGENTS.md` "MCP wrappers in `wenlan-mcp` always typed-deserialize").
+
+Q1 (page-stub visibility, spec section 9) ruled by the user 2026-07-24: bare
+`kind='entity'` stub pages appear on the Lane-B browse/search set
+(`docs/superpowers/gate-logs/m3-wire-freeze/investigation.md`, "Q1"); Lane A
+(retrieval/context via `select_visible_pages`) and other internal consumers
+(wikilinks, title hints) stay fenced. The per-fn enumeration suite in
+`crates/wenlan-core/src/db.rs:76529-77256` (`*_excludes_entity_kind_shadow` /
+`*_includes_entity_kind_shadow`) is the per-fn contract for which fences stay.

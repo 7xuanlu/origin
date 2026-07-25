@@ -1927,8 +1927,11 @@ pub async fn handle_list_pages(
     let scope =
         crate::read_scope::effective_read_scope(&db, space.as_deref(), header_space.as_deref())
             .await?;
+    // Q1 browse surface: `kind='entity'` dual-write shadow pages appear here,
+    // so read the unfenced `_browse` twin (export + internal callers keep the
+    // fenced `list_pages_scoped`).
     let pages = db
-        .list_pages_scoped(status, limit as i64, offset as i64, &scope)
+        .list_pages_scoped_browse(status, limit as i64, offset as i64, &scope)
         .await
         .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
     Ok(Json(serde_json::json!({ "pages": pages })))
@@ -1945,7 +1948,9 @@ pub async fn handle_get_page(
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    match db.get_page_scoped(&id, &scope).await {
+    // Q1 browse surface: a shadow id resolves 200 here, so read the unfenced
+    // `_browse` twin (mutation/export by-id reads keep fenced `get_page_scoped`).
+    match db.get_page_scoped_browse(&id, &scope).await {
         Ok(Some(page)) => Ok(Json(serde_json::json!({ "page": page }))),
         Ok(None) => Err(ServerError::NotFound("page not found".to_string())),
         Err(e) => Err(ServerError::SearchFailed(e.to_string())),
@@ -2006,9 +2011,9 @@ pub async fn handle_archive_page(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let s = state.read().await;
     let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    db.archive_page(&id)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    // `ServerError::from` maps the entity-shadow fence's WenlanError::Validation
+    // to a 4xx (ValidationError), matching the neighboring page-write handlers.
+    db.archive_page(&id).await.map_err(ServerError::from)?;
     Ok(Json(serde_json::json!({"status": "archived"})))
 }
 
@@ -2034,9 +2039,9 @@ pub async fn handle_delete_page(
     let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
     let projection =
         wenlan_core::export::knowledge::KnowledgeProjectionWrite::new(knowledge_path, &db);
-    db.delete_page(&id)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    // `ServerError::from` maps the entity-shadow fence's WenlanError::Validation
+    // to a 4xx (ValidationError), matching the neighboring page-write handlers.
+    db.delete_page(&id).await.map_err(ServerError::from)?;
 
     if let Err(e) = projection.remove_page(&id) {
         tracing::warn!(
@@ -2063,7 +2068,7 @@ pub async fn handle_search_pages(
         crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
             .await?;
     let results = db
-        .search_pages_scoped(
+        .search_pages_scoped_browse(
             &req.query,
             req.limit.unwrap_or(20),
             req.page_type.as_deref(),
@@ -2138,6 +2143,11 @@ pub async fn handle_export_pages(
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    // Export must stay stub-free: `kind='entity'` dual-write shadow pages carry
+    // no content and are not meant to leave the daemon. The fenced
+    // `list_pages_scoped` excludes them in SQL *before* LIMIT, so a burst of
+    // fresh stubs can never crowd real pages out of the 1000-row window (the
+    // browse surfaces read the `_browse` twin instead).
     let pages = db
         .list_pages_scoped("active", 1000, 0, &scope)
         .await
@@ -2176,6 +2186,9 @@ pub async fn handle_export_page(
     };
 
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    // Export must stay stub-free (see handle_export_pages). The fenced
+    // `get_page_scoped` resolves a `kind='entity'` shadow id as absent, so a
+    // stub 404s here just as it did before the Q1 lift.
     let page = db
         .get_page_scoped(&page_id, &scope)
         .await
@@ -5442,8 +5455,10 @@ pub async fn handle_get_page_revisions(
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    // Q1 sub-resource: revisions is a read-only browse surface, so a shadow id
+    // resolves 200 (empty changelog) via the unfenced `_browse` twin.
     let page = db
-        .get_page_scoped(&id, &scope)
+        .get_page_scoped_browse(&id, &scope)
         .await?
         .ok_or_else(|| ServerError::NotFound("page not found".to_string()))?;
     let changelog_str = db.get_page_changelog_scoped(&id, &scope).await?;

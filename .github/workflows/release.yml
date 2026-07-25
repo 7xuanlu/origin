@@ -24,13 +24,49 @@ jobs:
   prepare-release:
     name: Create GitHub Release
     runs-on: ubuntu-24.04
+    outputs:
+      release-targets: ${{ steps.release-targets.outputs.release-targets }}
     steps:
+      - name: Require main workflow for manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            echo "Manual releases must run the current workflow from main; choose the release tag through the tag input."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
           fetch-tags: true
+
+      # Manual release reruns may target a tag created before these scripts
+      # existed. Pin orchestration to the commit that supplied this workflow,
+      # while the release source itself remains the exact tag checkout above.
+      - name: Checkout release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          sparse-checkout: |
+            scripts/release_targets.py
+            scripts/release_targets.test.py
+            scripts/build-release-binaries.sh
+            scripts/build-release-binaries.test.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Test release target inventory
+        run: |
+          python3 .release-tools/scripts/release_targets.test.py
+          bash .release-tools/scripts/build-release-binaries.test.sh
+
+      - name: Emit release target matrix
+        id: release-targets
+        run: python3 .release-tools/scripts/release_targets.py matrix --github-output "$GITHUB_OUTPUT"
 
       - name: Verify release checkout
         shell: bash
@@ -132,32 +168,7 @@ jobs:
     needs: prepare-release
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-14
-            archive: tar.gz
-            artifact_name: wenlan-darwin-arm64
-          # x86_64-apple-darwin dropped from v0.7.0: `ort` 2.x does not
-          # publish prebuilt ONNX Runtime binaries for Intel Mac. Adding it
-          # back requires compiling ONNX from source (~15min build) or
-          # switching to the `ort-tract` backend. Tracked as follow-up.
-          # Native ARM Linux runner is free for public repos
-          # (ubuntu-24.04-arm, 4 vCPU Cortex / 16GB). Drops cross entirely
-          # for aarch64: no Docker container, no Cross.toml, no OpenSSL
-          # version chasing. Same setup as x86 below.
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            archive: tar.gz
-            artifact_name: wenlan-linux-arm64
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
-            archive: tar.gz
-            artifact_name: wenlan-linux-x64
-          - target: x86_64-pc-windows-msvc
-            os: windows-2022
-            archive: zip
-            artifact_name: wenlan-windows-x64
+      matrix: ${{ fromJSON(needs.prepare-release.outputs.release-targets) }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -166,6 +177,16 @@ jobs:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Checkout release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          sparse-checkout: |
+            scripts/release_targets.py
+            scripts/build-release-binaries.sh
+          sparse-checkout-cone-mode: false
 
       - name: Verify release checkout
         shell: bash
@@ -229,6 +250,9 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
           cache-all-crates: "true"
+          # Keep the rare tag build from evicting ordinary CI caches. Every
+          # target still builds; only the costly Windows target is persisted.
+          cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
 
       # rust-lld shipped with the Rust toolchain (~3-5min faster link
       # than MSVC link.exe on our binary sizes). rustup does NOT proxy
@@ -250,24 +274,41 @@ jobs:
           "RUSTFLAGS=$rustflags" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "RUSTFLAGS=$rustflags"
 
-      # All targets build natively now. aarch64-unknown-linux-gnu uses the
-      # free ubuntu-24.04-arm runner, x86_64-unknown-linux-gnu uses
-      # ubuntu-24.04. No cross / zigbuild / QEMU needed. Eliminates an
-      # entire class of openssl-sys/system-OpenSSL/container-version traps
-      # that consumed several PRs for v0.7.0.
       - name: Serialize native build (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: '"CARGO_BUILD_JOBS=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
 
-      - name: Build
-        run: cargo build --release -p wenlan -p wenlan-server -p wenlan-mcp --target ${{ matrix.target }}
-
-      - name: Smoke
-        shell: bash
+      - name: Select native Perl for vendored OpenSSL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
         run: |
-          ./target/${{ matrix.target }}/release/wenlan${{ runner.os == 'Windows' && '.exe' || '' }} --help
-          ./target/${{ matrix.target }}/release/wenlan-server${{ runner.os == 'Windows' && '.exe' || '' }} --help
+          $nativePerl = $null
+          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
+            if ($candidate.Source -match '[\\/]Git[\\/]') {
+              continue
+            }
+            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
+            if ($LASTEXITCODE -eq 0) {
+              $nativePerl = $candidate.Source
+              break
+            }
+          }
+          if (-not $nativePerl) {
+            throw "No native Perl can load Locale::Maketext::Simple"
+          }
+          "OPENSSL_SRC_PERL=$nativePerl" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "OPENSSL_SRC_PERL=$nativePerl"
+
+      # CI release-preflight and the authoritative tag build share this exact
+      # shipped-binary build/smoke contract. Packaging and publishing remain
+      # release-only below.
+      - name: Build and smoke shipped release binaries
+        shell: bash
+        env:
+          WENLAN_REPO_ROOT: ${{ github.workspace }}
+        run: bash .release-tools/scripts/build-release-binaries.sh "${{ matrix.target }}"
 
       - name: List Windows build artifacts
         if: matrix.target == 'x86_64-pc-windows-msvc'

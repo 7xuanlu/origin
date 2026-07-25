@@ -854,4 +854,31 @@ mod tests {
             "unchanged page must be skipped by the generated_at watermark"
         );
     }
+
+    #[tokio::test]
+    async fn run_proactive_page_maps_excludes_entity_kind_shadow() {
+        // Fix wave (stage c review, Critical-1 leak site 3): a fresh
+        // kind='entity' dual-write shadow is always "eligible" (no
+        // page_map_generated_at watermark) and sorts first in the
+        // last_modified DESC scan window, so without the fence it would
+        // burn the improve budget on stubs before real pages.
+        let (db, _tmp) = test_db().await;
+        let real_page = seed_page(&db, "Real Proactive Page", "body", vec!["m1".to_string()]).await;
+        db.store_entity("Proactive Shadow Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let improved = run_proactive_page_maps(&db, 1).await.unwrap();
+        assert_eq!(
+            improved, 1,
+            "the single improve budget must land on the real page, not the shadow"
+        );
+        assert!(
+            db.page_map_generated_at(&real_page)
+                .await
+                .unwrap()
+                .is_some(),
+            "the real page must have been improved"
+        );
+    }
 }

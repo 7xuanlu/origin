@@ -2120,22 +2120,45 @@ impl WenlanMcpServer {
             )]));
         }
 
+        // Envelope for DELETE /api/pages/{id} (handle_delete_page,
+        // memory_routes.rs:2023): a bare `{"status": ...}`, unrelated to the
+        // `DeleteResponse{deleted: bool}` shape used elsewhere. No exported
+        // wenlan-types struct matches it, so a local type stands in for
+        // serde_json::Value -- a wire-shape drift now fails at deserialize
+        // instead of round-tripping silently as untyped JSON. `deny_unknown_fields`
+        // makes an ADDITIVE envelope key fail loud too, not just a renamed one.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DeletePageResponse {
+            status: String,
+        }
+
         let path = format!("/api/pages/{}", page_id);
-        let resp: serde_json::Value = try_call!(self.client.delete(&path), "delete_page");
-        let status = resp
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("deleted");
+        let resp: DeletePageResponse = try_call!(self.client.delete(&path), "delete_page");
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Page {} {}",
-            page_id, status
+            page_id, resp.status
         ))]))
     }
 
     pub async fn get_page_impl(&self, page_id: &str) -> Result<CallToolResult, McpError> {
+        // Envelope for GET /api/pages/{id} (handle_get_page,
+        // memory_routes.rs:1938): `{"page": Page}`. No exported wenlan-types
+        // envelope matches this shape (PageDraftResponse{page: Page} is the
+        // page-draft feature's response, not this route's), so a local type
+        // stands in for serde_json::Value -- a wire-shape drift now fails at
+        // deserialize instead of round-tripping silently as untyped JSON.
+        // `deny_unknown_fields` makes an ADDITIVE envelope key fail loud too
+        // (the top-level object; the inner Page keeps its own field contract).
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct GetPageResponse {
+            page: wenlan_types::Page,
+        }
+
         let path = format!("/api/pages/{}", page_id);
-        let resp: serde_json::Value = try_call!(self.client.get(&path), "get_page");
-        let pretty = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string());
+        let resp: GetPageResponse = try_call!(self.client.get(&path), "get_page");
+        let pretty = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| String::new());
         Ok(CallToolResult::success(vec![Content::text(pretty)]))
     }
 
