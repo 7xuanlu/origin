@@ -78648,6 +78648,312 @@ pub(crate) mod tests {
         assert!(flip, "gate opens on a clean, current watermark (communities has no edges but the predicate still holds)");
     }
 
+    /// §6.5-scale acceptance for the M3 PR-2 entity<->page reader cutover
+    /// (100k memories / 5k pages / 10k entities). Manual-only (needs
+    /// minutes + hundreds of MB); run with:
+    ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
+    ///     db::tests::bench_reconcile_entity_page_parity_at_scale -- --ignored --nocapture
+    /// Mirrors `bench_reconcile_parity_at_scale`: memories/pages are seeded
+    /// via raw batched SQL in one BEGIN/COMMIT, no embeddings (same
+    /// technique, same style). Entities go through the REAL dual-write path
+    /// (`store_entity`) instead -- the point is proving the shadow-page
+    /// invariant holds at scale, which raw SQL can't exercise. Proves three
+    /// things at scale rather than on a toy DB: (a) `reconcile_entity_page_
+    /// parity` stays exact -- drift 0 clean, drift 10 after perturbing 10
+    /// shadows; (b) the flipped (cutover-ON) read of `list_entities_scoped`/
+    /// `get_entity_detail_scoped` is byte-identical to legacy (cutover-OFF),
+    /// with both timings printed for the PR body; (c) the flipped queries
+    /// still reach the shadow through an index once the planner has real
+    /// cardinality to reason about -- stage c's EXPLAIN test runs on an
+    /// empty DB, this is the one that counts.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_reconcile_entity_page_parity_at_scale() {
+        use std::time::Instant;
+        const MEMORIES: usize = 100_000;
+        const PAGES: usize = 5_000;
+        const CITES_PER_PAGE: usize = MEMORIES / PAGES; // 20
+        const ENTITIES: usize = 10_000;
+        const PERTURB: usize = 10;
+        const DETAIL_SAMPLE: usize = 1_000;
+        const SPACE: &str = "space_a";
+
+        // Deterministic pseudo-random sample (hash-order) of `count` ids --
+        // avoids adding a `rand` dev-dependency for bench-only code.
+        fn sample_ids(ids: &[String], count: usize) -> Vec<String> {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut scored: Vec<(u64, &String)> = ids
+                .iter()
+                .map(|id| {
+                    let mut hasher = DefaultHasher::new();
+                    id.hash(&mut hasher);
+                    (hasher.finish(), id)
+                })
+                .collect();
+            scored.sort_unstable_by_key(|(h, _)| *h);
+            scored
+                .into_iter()
+                .take(count)
+                .map(|(_, id)| id.clone())
+                .collect()
+        }
+
+        let (db, _dir) = test_db().await;
+
+        // ---- seed 100k memories + 5k pages (mirrors
+        // bench_reconcile_parity_at_scale exactly) ----
+        let t_seed_mp = Instant::now();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            for i in 0..MEMORIES {
+                conn.execute(
+                    "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                        last_modified, chunk_type, source_agent, space, confidence, confirmed, \
+                        memory_type, pending_revision) \
+                     VALUES (?1, 'c', 'memory', ?1, 't', 0, 1712707200, 'text', NULL, 'space_a', 1.0, 0, 'fact', 0)",
+                    libsql::params![format!("mem_{i}")],
+                )
+                .await
+                .unwrap();
+            }
+            for p in 0..PAGES {
+                conn.execute(
+                    "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, space, workspace) \
+                     VALUES (?1, 't', 'c', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'space_a', 'space_a')",
+                    libsql::params![format!("page_{p}")],
+                )
+                .await
+                .unwrap();
+                for k in 0..CITES_PER_PAGE {
+                    let mem = p * CITES_PER_PAGE + k;
+                    conn.execute(
+                        "INSERT INTO page_sources (page_id, memory_source_id, linked_at, link_reason) \
+                         VALUES (?1, ?2, 1712707200, 'bench')",
+                        libsql::params![format!("page_{p}"), format!("mem_{mem}")],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+        let seed_mp_secs = t_seed_mp.elapsed().as_secs_f64();
+        // Phase-localization: print as soon as this phase lands, not batched
+        // with the next one -- a kill during entity seeding must still leave
+        // evidence that memories/pages seeded clean.
+        eprintln!("[bench §6.5 entity] memories={MEMORIES} pages={PAGES} entities={ENTITIES}");
+        eprintln!("[bench §6.5 entity] seed_mem_pages={seed_mp_secs:.1}s");
+
+        // ---- seed 10k entities through the REAL dual-write path; every
+        // call gets its own shadow page + entity_page_map row ----
+        let t_seed_entities = Instant::now();
+        let mut entity_ids: Vec<String> = Vec::with_capacity(ENTITIES);
+        for i in 0..ENTITIES {
+            let id = db
+                .store_entity(
+                    &format!("Bench Entity {i}"),
+                    "person",
+                    Some(SPACE),
+                    None,
+                    Some(0.7),
+                )
+                .await
+                .unwrap();
+            entity_ids.push(id);
+        }
+        let seed_entities_secs = t_seed_entities.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] seed_entities={seed_entities_secs:.1}s ({:.1} entities/sec)",
+            ENTITIES as f64 / seed_entities_secs
+        );
+
+        // ---- reconcile: clean parity must hold at scale ----
+        let t_reconcile = Instant::now();
+        let report = db.reconcile_entity_page_parity().await.unwrap();
+        let reconcile_secs = t_reconcile.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] reconcile={reconcile_secs:.2}s ({:.0} entities/sec) expected_active={} actual_active={} drift={}",
+            report.expected_active as f64 / reconcile_secs,
+            report.expected_active,
+            report.actual_active,
+            report.drift_count
+        );
+        assert_eq!(report.drift_count, 0, "parity must hold at §6.5 scale");
+        assert_eq!(
+            report.expected_active, ENTITIES,
+            "one entities row per seeded entity"
+        );
+        assert_eq!(
+            report.actual_active, ENTITIES,
+            "one live shadow page per seeded entity"
+        );
+        {
+            let conn = db.conn.lock().await;
+            let (proven_epoch, drift) = entity_page_parity_watermark_row(&conn).await.unwrap();
+            assert_eq!(drift, Some(0), "watermark must record clean drift");
+            assert!(proven_epoch.is_some(), "watermark must be stamped");
+        }
+
+        // ---- flipped-read benchmark at scale: cutover OFF (legacy) vs ON
+        // (hybrid), on the SAME seeded DB, under the clean watermark just
+        // proven above ----
+        let scope = ReadScope::Space(SPACE.to_string());
+        let detail_ids = sample_ids(&entity_ids, DETAIL_SAMPLE);
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, false)
+            .await
+            .unwrap();
+        let t_list_off = Instant::now();
+        let list_off = db.list_entities_scoped(None, &scope).await.unwrap();
+        let list_off_secs = t_list_off.elapsed().as_secs_f64();
+        let t_detail_off = Instant::now();
+        let mut detail_off = Vec::with_capacity(detail_ids.len());
+        for id in &detail_ids {
+            detail_off.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+        let detail_off_secs = t_detail_off.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] OFF leg done: list={list_off_secs:.3}s detail={detail_off_secs:.3}s"
+        );
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, MemoryDB::SCOPED_ENTITIES_CONSUMER)
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark must open the gate at scale"
+            );
+        }
+        let t_list_on = Instant::now();
+        let list_on = db.list_entities_scoped(None, &scope).await.unwrap();
+        let list_on_secs = t_list_on.elapsed().as_secs_f64();
+        let t_detail_on = Instant::now();
+        let mut detail_on = Vec::with_capacity(detail_ids.len());
+        for id in &detail_ids {
+            detail_on.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+        let detail_on_secs = t_detail_on.elapsed().as_secs_f64();
+
+        assert_eq!(
+            list_off.len(),
+            ENTITIES,
+            "sanity: full listing covers every seeded entity"
+        );
+        assert_eq!(
+            format!("{list_off:?}"),
+            format!("{list_on:?}"),
+            "flipped list_entities_scoped must be byte-identical to legacy at scale"
+        );
+        assert_eq!(
+            format!("{detail_off:?}"),
+            format!("{detail_on:?}"),
+            "flipped get_entity_detail_scoped must be byte-identical to legacy at scale"
+        );
+        eprintln!(
+            "[bench §6.5 entity] list_entities_scoped (full listing, n={ENTITIES}): off={list_off_secs:.3}s on={list_on_secs:.3}s"
+        );
+        eprintln!(
+            "[bench §6.5 entity] get_entity_detail_scoped (n={DETAIL_SAMPLE}): off={detail_off_secs:.3}s on={detail_on_secs:.3}s"
+        );
+
+        // ---- EXPLAIN QUERY PLAN at scale: the flipped queries must reach
+        // the shadow through an index, not a bare `SCAN pages` -- the
+        // stage-c EXPLAIN test runs on an empty DB where the planner can
+        // choose differently; this is the one that counts ----
+        {
+            let conn = db.conn.lock().await;
+            let list_plan = query_plan_detail(
+                &conn,
+                &format!(
+                    "SELECT e.id, p.title, p.entity_type, e.space, e.source_agent, p.confidence, \
+                            p.entity_confirmed, e.created_at, e.updated_at \
+                     FROM entities e \
+                     JOIN entity_page_map m ON m.entity_id = e.id \
+                     JOIN pages p ON p.id = m.page_id AND p.kind = 'entity' AND p.status = 'active' \
+                     WHERE e.space = '{SPACE}' ORDER BY e.updated_at DESC, e.id ASC"
+                ),
+            )
+            .await;
+            for line in list_plan.split(" | ") {
+                let upper = line.to_uppercase();
+                if upper.contains(" P ") || upper.contains("PAGES") {
+                    assert!(
+                        upper.contains("USING"),
+                        "pages access must use the entity_page_map UNIQUE index or the \
+                         pages PK, not a bare scan, at scale: {line} (full plan: {list_plan})"
+                    );
+                }
+            }
+            assert!(
+                list_plan.to_uppercase().contains("USING"),
+                "the flipped list_entities_scoped query must use at least one index at scale: {list_plan}"
+            );
+
+            let sample_id = &detail_ids[0];
+            let detail_plan = query_plan_detail(
+                &conn,
+                &format!(
+                    "SELECT e.id, p.title, p.entity_type, e.space, e.source_agent, p.confidence, \
+                            p.entity_confirmed, e.created_at, e.updated_at \
+                     FROM entities e \
+                     JOIN entity_page_map m ON m.entity_id = e.id \
+                     JOIN pages p ON p.id = m.page_id AND p.kind = 'entity' AND p.status = 'active' \
+                     WHERE e.id = '{sample_id}' AND e.space = '{SPACE}' LIMIT 1"
+                ),
+            )
+            .await;
+            for line in detail_plan.split(" | ") {
+                let upper = line.to_uppercase();
+                if upper.contains(" P ") || upper.contains("PAGES") {
+                    assert!(
+                        upper.contains("USING"),
+                        "pages access must use the entity_page_map UNIQUE index or the \
+                         pages PK, not a bare scan, at scale: {line} (full plan: {detail_plan})"
+                    );
+                }
+            }
+            assert!(
+                detail_plan.to_uppercase().contains("USING"),
+                "the flipped get_entity_detail_scoped query must use at least one index at scale: {detail_plan}"
+            );
+            eprintln!("[bench §6.5 entity] list plan: {list_plan}");
+            eprintln!("[bench §6.5 entity] detail plan: {detail_plan}");
+        }
+
+        // ---- perturb 10 shadows and re-reconcile: the oracle stays exact
+        // at scale, not just on toy DBs ----
+        let perturbed: Vec<String> = entity_ids.iter().take(PERTURB).cloned().collect();
+        {
+            let conn = db.conn.lock().await;
+            for id in &perturbed {
+                conn.execute(
+                    "UPDATE pages SET entity_type = 'organization' \
+                     WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                    libsql::params![id.as_str()],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let t_reconcile_dirty = Instant::now();
+        let dirty_report = db.reconcile_entity_page_parity().await.unwrap();
+        let reconcile_dirty_secs = t_reconcile_dirty.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench §6.5 entity] reconcile_after_perturb={reconcile_dirty_secs:.2}s (clean was {reconcile_secs:.2}s) drift={}",
+            dirty_report.drift_count
+        );
+        assert_eq!(
+            dirty_report.drift_count, PERTURB,
+            "exactly the {PERTURB} perturbed shadows must be flagged corrupt, not more or fewer"
+        );
+    }
+
     #[tokio::test]
     async fn migration_81_creates_edges_and_provenance_schema() {
         let (db, _dir) = test_db().await;
