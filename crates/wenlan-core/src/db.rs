@@ -10580,6 +10580,14 @@ impl MemoryDB {
     /// Any missing row (no watermark yet, unknown consumer) => false => legacy.
     /// This is the ONLY thing standing between a premature flip and a wrong
     /// read; it fails safe toward legacy in every ambiguous case.
+    ///
+    /// D6 obligation (M2 review fork-#2 verdict (a)): this predicate only
+    /// gates WHETHER a consumer may flip -- it does not itself exclude
+    /// cross-space legacy rows. Any consumer that flips onto this gate MUST
+    /// strictly exclude `lineage='legacy'` edges whose endpoints are
+    /// cross-space from its OWN flipped read (read-side exclusion only,
+    /// never a row mutation -- see `detect_communities`'s `adjacency_sql`
+    /// for the pattern this obligation inherits).
     async fn reader_uses_edges(
         conn: &libsql::Connection,
         consumer: &str,
@@ -11332,6 +11340,13 @@ impl MemoryDB {
     /// (`crates/wenlan-core/src/db/scoped_entities.rs`). Flipping a
     /// PRODUCTION consumer additionally waits on the program's D1
     /// soak-exit.
+    ///
+    /// D6 obligation (M2 review fork-#2 verdict (a), mirrored from
+    /// `reader_uses_edges`): this predicate only gates WHETHER a consumer
+    /// may flip -- it does not itself exclude cross-space legacy rows. Any
+    /// consumer that flips onto this gate MUST strictly exclude
+    /// cross-space legacy rows from its OWN flipped read (read-side
+    /// exclusion only, never a row mutation).
     async fn reader_uses_entity_pages(
         conn: &libsql::Connection,
         consumer: &str,
@@ -25793,18 +25808,35 @@ impl MemoryDB {
         // the `relates` adjacency from `edges` instead of the legacy
         // `relations` store ONLY when `reader_uses_edges` says parity is
         // proven-clean and current -- otherwise it stays on legacy. The two
-        // sources are byte-identical under clean parity: `relations` has a
-        // UNIQUE(from_entity,to_entity,relation_type) index, so each row maps
-        // to exactly one distinct `relates` edge_id and the (from,to) multiset
-        // matches. The gate defaults OFF, so production behavior is unchanged
-        // until a cutover is explicitly enabled AND a clean watermark exists;
-        // the byte-identical guarantee is regression-locked by the paired test
-        // `detect_communities_edges_path_matches_legacy`.
+        // sources are byte-identical under clean parity for SAME-SPACE rows:
+        // `relations` has a UNIQUE(from_entity,to_entity,relation_type) index,
+        // so each row maps to exactly one distinct `relates` edge_id and the
+        // (from,to) multiset matches. D6 (M2 review fork-#2 verdict (a),
+        // deferred to "an explicit M3 reader-cutover gate"): a
+        // `lineage='legacy'` edge whose endpoints are cross-space is EXCLUDED
+        // below once flipped -- read-side only, never a row mutation (would
+        // register as parity drift and freeze every cutover) -- so the two
+        // paths diverge exactly on cross-space legacy rows. The gate defaults
+        // OFF, so production behavior is unchanged until a cutover is
+        // explicitly enabled AND a clean watermark exists; regression-locked
+        // by `detect_communities_edges_path_matches_legacy` (same-space
+        // parity) and `detect_communities_flipped_excludes_cross_space_legacy_edge`
+        // (the cross-space carve-out).
         let adjacency_sql = if Self::reader_uses_edges(&conn, "communities")
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            "SELECT src_id, dst_id FROM edges WHERE edge_type = 'relates' AND valid_until IS NULL"
+            // Endpoint-space predicate reused verbatim from
+            // `audit_legacy_cross_space_links`'s `relations` tally
+            // (NULL-safe: an indeterminate-space endpoint is `null_space`,
+            // not `cross_space`, so it is not excluded here either).
+            "SELECT e.src_id, e.dst_id FROM edges e \
+             LEFT JOIN entities se ON se.id = e.src_id \
+             LEFT JOIN entities de ON de.id = e.dst_id \
+             WHERE e.edge_type = 'relates' AND e.valid_until IS NULL \
+             AND NOT (e.lineage = 'legacy' \
+                      AND se.space IS NOT NULL AND de.space IS NOT NULL \
+                      AND se.space != de.space)"
         } else {
             "SELECT from_entity, to_entity FROM relations"
         };
@@ -78248,6 +78280,126 @@ pub(crate) mod tests {
             distinct.len(),
             2,
             "two disjoint pairs must yield two communities"
+        );
+    }
+
+    /// D6 (M2 review fork-#2 verdict (a)): once the "communities" consumer
+    /// flips to reading `edges`, a `lineage='legacy'` edge whose endpoints
+    /// are cross-space must NOT contribute to adjacency -- else two spaces'
+    /// entities could merge into one community through a legacy link the
+    /// fence never validated (the fence exempts `lineage='legacy'` at write
+    /// time). The unflipped (legacy `relations`) path is untouched: it still
+    /// carries the cross-space link, since D6 is a read-side exclusion
+    /// scoped to the flipped `edges` read only. A same-space legacy edge
+    /// must still contribute when flipped -- the exclusion is
+    /// cross-space-scoped, not all-legacy.
+    #[tokio::test]
+    async fn detect_communities_flipped_excludes_cross_space_legacy_edge() {
+        let (db, _dir) = test_db().await;
+        let a = db
+            .create_entity("A", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let b = db
+            .create_entity("B", "person", Some("space_b"))
+            .await
+            .unwrap();
+
+        // Legacy `relations` row (the unflipped read source) + its
+        // `lineage='legacy'` edge twin, inserted directly via SQL (the fence
+        // exempts `lineage='legacy'`) -- mirrors what a real cross-space
+        // backfill/dual-write produces for a cross-space `relates` pair.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) \
+                 VALUES ('rel_cross', ?1, ?2, 'knows', 0)",
+                libsql::params![a.clone(), b.clone()],
+            )
+            .await
+            .unwrap();
+            MemoryDB::insert_backfilled_edge(
+                &conn, "relates", "entity", &a, "entity", &b, "knows", "legacy", "space_a", "test",
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn community_map(db: &MemoryDB) -> std::collections::BTreeMap<String, i64> {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query("SELECT id, community_id FROM entities ORDER BY id", ())
+                .await
+                .unwrap();
+            let mut m = std::collections::BTreeMap::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                m.insert(
+                    row.get::<String>(0).unwrap(),
+                    row.get::<i64>(1).unwrap_or(-1),
+                );
+            }
+            m
+        }
+
+        // Unflipped (legacy path): behavior unchanged -- the cross-space
+        // relation still contributes; A and B land in one community.
+        db.detect_communities().await.unwrap();
+        let legacy_map = community_map(&db).await;
+        assert_eq!(
+            legacy_map[&a], legacy_map[&b],
+            "legacy path must be unchanged: the cross-space relation still merges A and B"
+        );
+
+        // Flip: prove parity, enable the consumer.
+        assert_eq!(db.reconcile_edges_parity().await.unwrap().drift_count, 0);
+        db.set_reader_cutover("communities", true).await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            assert!(MemoryDB::reader_uses_edges(&conn, "communities")
+                .await
+                .unwrap());
+        }
+
+        // Flipped (edges path): the cross-space legacy edge must NOT
+        // contribute -- A and B must NOT land in one community via it.
+        db.detect_communities().await.unwrap();
+        let flipped_map = community_map(&db).await;
+        assert_ne!(
+            flipped_map[&a], flipped_map[&b],
+            "flipped read must exclude the cross-space legacy edge: A and B must not merge"
+        );
+
+        // A same-space legacy edge DOES still contribute when flipped -- the
+        // exclusion is cross-space-scoped, not all-legacy.
+        let c = db
+            .create_entity("C", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let d = db
+            .create_entity("D", "person", Some("space_a"))
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) \
+                 VALUES ('rel_same', ?1, ?2, 'knows', 0)",
+                libsql::params![c.clone(), d.clone()],
+            )
+            .await
+            .unwrap();
+            MemoryDB::insert_backfilled_edge(
+                &conn, "relates", "entity", &c, "entity", &d, "knows", "legacy", "space_a", "test",
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(db.reconcile_edges_parity().await.unwrap().drift_count, 0);
+        db.detect_communities().await.unwrap();
+        let flipped_map2 = community_map(&db).await;
+        assert_eq!(
+            flipped_map2[&c], flipped_map2[&d],
+            "a same-space legacy edge must still contribute when flipped"
         );
     }
 
