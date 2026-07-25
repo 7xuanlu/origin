@@ -186,6 +186,10 @@ link alone is not the release gate.
   for the Vulkan build.
 - `cannot open input file 'sqlite3.lib'`: install the vcpkg triplet above and
   prepend its `lib` directory to `LIB`.
+- A test executable exits with `0xc0000135` / `STATUS_DLL_NOT_FOUND` after a
+  successful link: add the directory containing the staged `onnxruntime.dll`
+  to `PATH`. `ORT_DYLIB_PATH` pins the build/runtime choice but cannot satisfy
+  a Windows process-start DLL import by itself.
 - `Command 'perl' not found` or `Can't locate Locale/Maketext/Simple.pm` while
   building `openssl-sys`: install full Strawberry Perl, put its `perl\bin`
   before Git's `usr\bin`, and run the module probe above.

@@ -982,9 +982,10 @@ fn windows_ort_distribution_violations(
     if !windows_test_bootstrap.contains("scripts/stage-onnxruntime-windows.ps1")
         || !windows_test_bootstrap.contains("ORT_DYLIB_PATH=")
         || !windows_test_bootstrap.contains("$env:GITHUB_ENV")
+        || !windows_test_bootstrap.contains("$env:GITHUB_PATH")
     {
         violations.push(
-            "Windows tests do not pin ORT_DYLIB_PATH to the verified runtime before inference"
+            "Windows tests do not pin the verified ORT build path and DLL search path before inference"
                 .into(),
         );
     }
@@ -1092,7 +1093,7 @@ jobs:
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("ORT_DYLIB_PATH")),
+            .any(|violation| violation.contains("DLL search path")),
         "fixture must reject Windows tests that can load a runner DLL: {violations:?}"
     );
     assert!(

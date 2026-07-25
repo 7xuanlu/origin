@@ -485,7 +485,8 @@ jobs:
       # The hosted runner currently exposes an unrelated onnxruntime.dll on
       # its default DLL search path. Dynamic-ORT tests must never pick that up:
       # stage the SHA-verified runtime before any inference-capable test and
-      # pin the exact absolute path for all later Windows test steps.
+      # pin both the build-time absolute path and the process-start DLL search
+      # directory for all later Windows test steps.
       - name: Stage ONNX Runtime for Windows tests
         if: matrix.os == 'windows-2022'
         shell: pwsh
@@ -495,6 +496,7 @@ jobs:
           & scripts/stage-onnxruntime-windows.ps1 -DestinationDirectory $ortDir
           $ortDll = (Resolve-Path (Join-Path $ortDir "onnxruntime.dll")).Path
           "ORT_DYLIB_PATH=$ortDll" | Out-File -FilePath $env:GITHUB_ENV -Append
+          (Split-Path -Parent $ortDll) | Out-File -FilePath $env:GITHUB_PATH -Append
       # nextest runs tests as separate processes in parallel; ~2x faster
       # than `cargo test` on multi-core runners. Install on all 3 OSes.
       - name: Install cargo-nextest
