@@ -205,6 +205,8 @@ jobs:
               - 'scripts/stabilize-rust-cache-toolchains.test.sh'
               - 'scripts/setup-vulkan-sdk-windows.ps1'
               - 'scripts/setup-vulkan-sdk-windows.test.ps1'
+              - 'scripts/setup-msvc-ninja-windows.ps1'
+              - 'scripts/setup-msvc-ninja-windows.test.ps1'
               - 'scripts/lint-scale-gate.sh'
               - 'crates/wenlan-core/src/lint/**'
               - '.config/nextest.toml'
@@ -259,6 +261,10 @@ jobs:
               - 'scripts/smoke-windows.ps1'
               - 'scripts/smoke-windows-llm.ps1'
               - 'scripts/smoke-windows-llm.test.ps1'
+              - 'scripts/setup-vulkan-sdk-windows.ps1'
+              - 'scripts/setup-vulkan-sdk-windows.test.ps1'
+              - 'scripts/setup-msvc-ninja-windows.ps1'
+              - 'scripts/setup-msvc-ninja-windows.test.ps1'
               - 'version.txt'
               - '.release-please-manifest.json'
               - 'CHANGELOG.md'
@@ -470,6 +476,12 @@ jobs:
         run: |
           & scripts/setup-vulkan-sdk-windows.test.ps1
           & scripts/setup-vulkan-sdk-windows.ps1
+      - name: Configure MSVC Ninja (Windows tests)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.test.ps1
+          & scripts/setup-msvc-ninja-windows.ps1
       # The hosted runner currently exposes an unrelated onnxruntime.dll on
       # its default DLL search path. Dynamic-ORT tests must never pick that up:
       # stage the SHA-verified runtime before any inference-capable test and
@@ -835,9 +847,13 @@ jobs:
         run: |
           & scripts/setup-vulkan-sdk-windows.test.ps1
           & scripts/setup-vulkan-sdk-windows.ps1
-      # llama.cpp's nested Vulkan CMake probes can race on the same MSVC PDB
-      # and legacy child tools still hit long paths. Keep this proof on the
-      # same deterministic one-job contract as the release workflow.
+      - name: Configure MSVC Ninja (Windows release proof)
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.test.ps1
+          & scripts/setup-msvc-ninja-windows.ps1
+      # Cargo remains serialized to cap peak native memory while Ninja owns
+      # dependency-correct ordering for llama.cpp's nested Vulkan build.
       - name: Serialize native build (Windows)
         shell: pwsh
         run: '"CARGO_BUILD_JOBS=1" | Out-File -FilePath $env:GITHUB_ENV -Append'

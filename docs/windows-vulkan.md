@@ -34,6 +34,7 @@ git clone --depth 1 --branch 2026.06.24 https://github.com/microsoft/vcpkg.git "
 
 & scripts\setup-vulkan-sdk-windows.ps1
 $env:LIB = "$env:LOCALAPPDATA\wenlan-build\vcpkg\installed\x64-windows-static-md\lib;$env:LIB"
+& scripts\setup-msvc-ninja-windows.ps1
 
 # llama.cpp's nested Vulkan shader build can exceed legacy MAX_PATH when the
 # checkout is deep. Keep Cargo output on a deliberately short local path.
@@ -45,9 +46,11 @@ $env:CARGO_BUILD_JOBS = "1"
 ```
 
 If libclang is not on its standard path, set `LIBCLANG_PATH` to the directory
-containing `libclang.dll`. Set `CMAKE_GENERATOR=Ninja` when using the Visual
-Studio 2019 Build Tools: llama.cpp's Vulkan shader rules use CMake `DEPFILE`,
-which the Visual Studio 16 generator cannot consume. Verify `perl
+containing `libclang.dll`. The MSVC setup script enters the x64 developer
+environment, selects Visual Studio's bundled Ninja, preserves the vcpkg
+`LIB` prefix, and serializes nested CMake builds. Use it with both Visual
+Studio 2019 and 2022: llama.cpp's Vulkan ExternalProject/shader rules are not
+reliably ordered by the Visual Studio generators. Verify `perl
 -MLocale::Maketext::Simple -e "print qq(ok\n)"` before building the server.
 
 ## Build and test
@@ -176,9 +179,10 @@ link alone is not the release gate.
 
 - `could not find any instance of Visual Studio`: the selected generator lacks
   the C++ workload. Install it and run from a matching developer environment.
-- `add_custom_command DEPFILE is not supported by this generator`: use
-  `CMAKE_GENERATOR=Ninja`; do not select `Visual Studio 16 2019` for the Vulkan
-  build.
+- `add_custom_command DEPFILE is not supported by this generator`, or a
+  missing nested `cmake_install.cmake`: run
+  `scripts\setup-msvc-ninja-windows.ps1`; do not use a Visual Studio generator
+  for the Vulkan build.
 - `cannot open input file 'sqlite3.lib'`: install the vcpkg triplet above and
   prepend its `lib` directory to `LIB`.
 - `Command 'perl' not found` or `Can't locate Locale/Maketext/Simple.pm` while

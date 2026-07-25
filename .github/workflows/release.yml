@@ -211,6 +211,12 @@ jobs:
         run: |
           & scripts/setup-vulkan-sdk-windows.ps1
 
+      - name: Configure MSVC Ninja (Windows release)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.ps1
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:

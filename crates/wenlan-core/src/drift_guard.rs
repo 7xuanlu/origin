@@ -921,6 +921,45 @@ fn windows_ort_distribution_violations(
         violations.push("release workflow does not use the pinned Windows ORT stager".into());
     }
 
+    for (workflow, job, step_name, required_condition, owner) in [
+        (
+            &ci,
+            "test",
+            "Configure MSVC Ninja (Windows tests)",
+            "matrix.os == 'windows-2022'",
+            "Windows test CI",
+        ),
+        (
+            &ci,
+            "windows-release-proof",
+            "Configure MSVC Ninja (Windows release proof)",
+            "",
+            "Windows release proof",
+        ),
+        (
+            &release,
+            "release",
+            "Configure MSVC Ninja (Windows release)",
+            "matrix.target == 'x86_64-pc-windows-msvc'",
+            "Windows release workflow",
+        ),
+    ] {
+        let step = job_step(workflow, job, step_name);
+        let condition = step
+            .and_then(|candidate| candidate["if"].as_str())
+            .unwrap_or_default();
+        let run = step
+            .and_then(|candidate| candidate["run"].as_str())
+            .unwrap_or_default();
+        if (!required_condition.is_empty() && !condition.contains(required_condition))
+            || !run.contains("scripts/setup-msvc-ninja-windows.ps1")
+        {
+            violations.push(format!(
+                "{owner} does not configure the shared x64 MSVC Ninja environment"
+            ));
+        }
+    }
+
     let package = workflow_step_run(&release, "Package").unwrap_or_default();
     if !package.contains("wenlan-server.exe") || !package.contains("onnxruntime.dll") {
         violations.push("release archive does not include the server and ORT DLL together".into());
@@ -1607,6 +1646,18 @@ fn ci_routing_contract_violations(
         if !filter_routes_path(&release_sensitive, path) {
             violations.push(format!(
                 "release-profile-sensitive source is not routed through windows-release: {path}"
+            ));
+        }
+    }
+    for path in [
+        "scripts/setup-vulkan-sdk-windows.ps1",
+        "scripts/setup-vulkan-sdk-windows.test.ps1",
+        "scripts/setup-msvc-ninja-windows.ps1",
+        "scripts/setup-msvc-ninja-windows.test.ps1",
+    ] {
+        if !release_sensitive.contains(path) {
+            violations.push(format!(
+                "Windows native-build bootstrap is not routed through windows-release: {path}"
             ));
         }
     }
