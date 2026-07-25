@@ -18,11 +18,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 mod count;
+mod entity_page_adapter;
 mod page_drafts;
 pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
 
+#[cfg(test)]
+mod entity_page_adapter_test;
 #[cfg(test)]
 mod page_drafts_test;
 #[cfg(test)]
@@ -23617,13 +23620,16 @@ impl MemoryDB {
             // page would otherwise be orphaned by the entity delete below (the
             // map row cascades on the entity FK, never the page). Delete it
             // first so its own ON DELETE CASCADE drops the map row.
-            conn.execute(
-                "DELETE FROM pages WHERE kind = 'entity' \
-                 AND id IN (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                libsql::params![alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities loser shadow: {e}")))?;
+            if let Some(loser_page_id) =
+                entity_page_adapter::page_id_for_entity(&conn, alias_id).await?
+            {
+                conn.execute(
+                    "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
+                    libsql::params![loser_page_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities loser shadow: {e}")))?;
+            }
 
             conn.execute(
                 "DELETE FROM entities WHERE id = ?1",
@@ -24195,13 +24201,16 @@ impl MemoryDB {
             // `DELETE FROM entities` then finds no dangling map row. Without
             // this the shadow would be orphaned (the map's entity-side cascade
             // drops the map row on entity delete, but never the page itself).
-            conn.execute(
-                "DELETE FROM pages WHERE kind = 'entity' \
-                 AND id IN (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
+            if let Some(shadow_page_id) =
+                entity_page_adapter::page_id_for_entity(&conn, entity_id).await?
+            {
+                conn.execute(
+                    "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
+                    libsql::params![shadow_page_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
+            }
 
             conn.execute(
                 "DELETE FROM entities WHERE id = ?1",
@@ -53774,19 +53783,10 @@ pub(crate) mod tests {
             .unwrap();
         let page_id: String = {
             let conn = db.conn.lock().await;
-            let mut rows = conn
-                .query(
-                    "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
-                    libsql::params![id.clone()],
-                )
-                .await
-                .unwrap();
-            rows.next()
+            entity_page_adapter::page_id_for_entity(&conn, &id)
                 .await
                 .unwrap()
                 .expect("shadow must exist before delete")
-                .get(0)
-                .unwrap()
         };
 
         db.delete_space("doomed", "delete").await.unwrap();
@@ -79008,6 +79008,27 @@ pub(crate) mod tests {
             ENTITIES as f64 / seed_entities_secs
         );
 
+        // ---- M3 stage F: the adapter round-trips entity_id <-> page_id for
+        // every seeded entity, at the same scale the parity oracle is proven
+        // at below ----
+        {
+            let conn = db.conn.lock().await;
+            for id in &entity_ids {
+                let page_id = entity_page_adapter::page_id_for_entity(&conn, id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{id} must have a mapped page_id at scale"));
+                let round_tripped = entity_page_adapter::entity_id_for_page(&conn, &page_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    round_tripped.as_deref(),
+                    Some(id.as_str()),
+                    "adapter bijection must round-trip at scale for {id}"
+                );
+            }
+        }
+
         // ---- reconcile: clean parity must hold at scale ----
         let t_reconcile = Instant::now();
         let report = db.reconcile_entity_page_parity().await.unwrap();
@@ -79190,6 +79211,105 @@ pub(crate) mod tests {
         assert_eq!(
             dirty_report.drift_count, PERTURB,
             "exactly the {PERTURB} perturbed shadows must be flagged corrupt, not more or fewer"
+        );
+    }
+
+    /// M3 stage F acceptance-box proof: with the "scoped_entities" cutover
+    /// gate OFF vs ON, `list_entities_scoped`/`get_entity_detail_scoped`
+    /// results serialize to byte-identical JSON -- the actual wire shape,
+    /// not just Rust `Debug` output -- proving the adapter's entity_id<->
+    /// page_id translation makes no app-visible shape change. Small-scale,
+    /// non-ignored sibling of `bench_reconcile_entity_page_parity_at_scale`'s
+    /// ON/OFF comparison above.
+    #[tokio::test]
+    async fn scoped_entities_cutover_flip_is_wire_invariant() {
+        const SPACE: &str = "wire_invariance_space";
+        let (db, _dir) = test_db().await;
+        let mut entity_ids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let id = db
+                .store_entity(
+                    &format!("Wire Invariance Entity {i}"),
+                    "person",
+                    Some(SPACE),
+                    Some("test"),
+                    Some(0.8),
+                )
+                .await
+                .unwrap();
+            entity_ids.push(id);
+        }
+        db.create_relation(
+            &entity_ids[0],
+            &entity_ids[1],
+            "related_to",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at) \
+                 VALUES ('wire_invariance_obs', ?1, 'observed', NULL, 0.9, 1, unixepoch())",
+                libsql::params![entity_ids[0].clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let scope = ReadScope::Space(SPACE.to_string());
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, false)
+            .await
+            .unwrap();
+        let list_off = db.list_entities_scoped(None, &scope).await.unwrap();
+        let mut detail_off = Vec::with_capacity(entity_ids.len());
+        for id in &entity_ids {
+            detail_off.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+
+        db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reconcile_entity_page_parity().await.unwrap().drift_count,
+            0,
+            "seed must reconcile clean before the gate can open"
+        );
+        {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::reader_uses_entity_pages(&conn, MemoryDB::SCOPED_ENTITIES_CONSUMER)
+                    .await
+                    .unwrap(),
+                "sanity: a clean, current watermark must open the gate"
+            );
+        }
+        let list_on = db.list_entities_scoped(None, &scope).await.unwrap();
+        let mut detail_on = Vec::with_capacity(entity_ids.len());
+        for id in &entity_ids {
+            detail_on.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        }
+
+        assert_eq!(list_off.len(), 5, "sanity: all seeded entities are listed");
+        assert_eq!(
+            list_off.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            list_on.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            "sanity: same entity_ids on both arms"
+        );
+        assert_eq!(
+            serde_json::to_value(&list_off).unwrap(),
+            serde_json::to_value(&list_on).unwrap(),
+            "list_entities_scoped wire shape must be byte-identical across the cutover flip"
+        );
+        assert_eq!(
+            serde_json::to_value(&detail_off).unwrap(),
+            serde_json::to_value(&detail_on).unwrap(),
+            "get_entity_detail_scoped wire shape must be byte-identical across the cutover flip"
         );
     }
 
