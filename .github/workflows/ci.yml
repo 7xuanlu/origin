@@ -456,9 +456,10 @@ jobs:
     needs: [detect-changes]
     if: "needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || github.event_name != 'pull_request'"
     runs-on: ${{ matrix.os }}
-    # Pull requests keep a hard wall-clock budget. Non-PR runs add the full
-    # platform backstop, so they retain enough proof budget to finish.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
+    # Pull requests keep a hard wall-clock budget. Windows needs the full
+    # backstop because its Vulkan/native bootstrap plus integration suite can
+    # exceed 30 minutes on a cold hosted runner; other PR platforms stay at 30.
+    timeout-minutes: ${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 30 }}
     strategy:
       # Cancel the rest of the matrix when one OS fails. Saves ~20-30min
       # per PR when a real bug breaks all platforms — Linux/macOS catch
@@ -898,10 +899,10 @@ jobs:
     needs: [detect-changes]
     if: "github.event_name != 'pull_request' || needs.detect-changes.outputs.release-preflight == 'true'"
     runs-on: ${{ matrix.os }}
-    # 30 minutes is the performance target, not a correctness timeout. The
-    # larger PR ceiling keeps a cold Windows cache miss from becoming an
-    # infrastructure failure while live hosted-run data is collected.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 45 || 60 }}
+    # 30 minutes is the performance target, not a correctness timeout. Keep
+    # non-Windows PR targets at 45 minutes, while a cold Windows Vulkan/native
+    # build gets the same 60-minute ceiling as the non-PR backstop.
+    timeout-minutes: ${{ (matrix.target == 'x86_64-pc-windows-msvc' || github.event_name != 'pull_request') && 60 || 45 }}
     strategy:
       fail-fast: true
       matrix: ${{ fromJSON(needs.detect-changes.outputs.release-targets) }}

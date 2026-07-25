@@ -1955,11 +1955,11 @@ fn ci_routing_contract_violations(
             ));
         }
     }
-    let differential_timeout = "${{ github.event_name == 'pull_request' && 30 || 60 }}";
+    let differential_timeout =
+        "${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 30 }}";
     if ci["jobs"]["test"]["timeout-minutes"].as_str() != Some(differential_timeout) {
         violations.push(
-            "test does not enforce the 30-minute PR budget while allowing a 60-minute non-PR backstop"
-                .into(),
+            "test does not enforce the 30-minute non-Windows PR budget while allowing a 60-minute Windows/non-PR backstop".into(),
         );
     }
     let release_preflight_condition = ci["jobs"]["release-preflight"]["if"]
@@ -2554,7 +2554,9 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     }
     if job["runs-on"].as_str() != Some("${{ matrix.os }}")
         || job["timeout-minutes"].as_str()
-            != Some("${{ github.event_name == 'pull_request' && 45 || 60 }}")
+            != Some(
+                "${{ (matrix.target == 'x86_64-pc-windows-msvc' || github.event_name != 'pull_request') && 60 || 45 }}",
+            )
         || job["strategy"]["fail-fast"].as_bool() != Some(true)
         || job["strategy"]["matrix"].as_str()
             != Some("${{ fromJSON(needs.detect-changes.outputs.release-targets) }}")
