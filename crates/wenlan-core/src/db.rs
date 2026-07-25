@@ -35165,9 +35165,9 @@ impl MemoryDB {
     /// the entity API only; the page archive/delete surface must never touch
     /// one (deleting it would cascade away its `entity_page_map` row while
     /// leaving the entity alive, breaking the entity<->page bijection).
-    /// Fail-closed: an unknown id falls through (returns Ok) so archive/delete
-    /// keep their existing no-op-on-missing behavior -- only a positively
-    /// identified shadow is rejected.
+    /// An unknown id falls through (returns Ok) so archive/delete keep their
+    /// existing no-op-on-missing behavior -- only a positively identified
+    /// shadow is rejected.
     async fn reject_entity_shadow_page_on_conn(
         conn: &libsql::Connection,
         page_id: &str,
