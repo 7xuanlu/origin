@@ -109,6 +109,10 @@ mod repair_tests;
 mod repair_plan_tests;
 
 #[cfg(test)]
+#[path = "entities_freeze_tests.rs"]
+mod entities_freeze_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
