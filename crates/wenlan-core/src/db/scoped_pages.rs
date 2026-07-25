@@ -426,7 +426,10 @@ impl MemoryDB {
         scope: &ReadScope,
     ) -> Result<Vec<Page>, WenlanError> {
         if matches!(scope, ReadScope::Global) {
-            return self.list_pages(status, limit, offset).await;
+            // Q1 browse surface: this whole fn shows kind='entity' stubs on
+            // every scope arm, so the Global arm must delegate to the
+            // unfenced twin, not the internal-callers' fenced `list_pages`.
+            return self.list_pages_browse(status, limit, offset).await;
         }
         let select = "c.id, c.title, c.summary, c.content, c.entity_id, c.space, \
                       c.source_memory_ids, c.version, c.status, c.created_at, \

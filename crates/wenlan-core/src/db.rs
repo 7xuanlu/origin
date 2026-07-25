@@ -35200,17 +35200,54 @@ impl MemoryDB {
     }
 
     /// List pages filtered by status, ordered by last_modified descending.
+    ///
+    /// Fenced: `kind='entity'` dual-write shadow pages are excluded. General-
+    /// purpose listing used by many internal non-browse callers (knowledge
+    /// projection, overview evidence set, proactive page-map sweep,
+    /// milestone/maintenance/refinery sweeps) that must never see a stub.
+    /// For the browse-facing twin that shows stub pages (Q1), see
+    /// `list_pages_browse`.
     pub async fn list_pages(
         &self,
         status: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Page>, WenlanError> {
+        self.list_pages_inner(status, limit, offset, true).await
+    }
+
+    /// Browse-facing twin of `list_pages`: the `ReadScope::Global` delegate
+    /// for `list_pages_scoped`, where Q1 rules `kind='entity'` dual-write
+    /// shadow pages must appear. Never call this from an internal
+    /// non-browse path -- those must stay fenced (`list_pages`).
+    pub async fn list_pages_browse(
+        &self,
+        status: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Page>, WenlanError> {
+        self.list_pages_inner(status, limit, offset, false).await
+    }
+
+    async fn list_pages_inner(
+        &self,
+        status: &str,
+        limit: i64,
+        offset: i64,
+        fence_entity: bool,
+    ) -> Result<Vec<Page>, WenlanError> {
+        let fence_sql = if fence_entity {
+            " AND COALESCE(kind, 'concept') != 'entity'"
+        } else {
+            ""
+        };
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
-                 FROM pages WHERE status = ?1 ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3",
+                &format!(
+                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                 FROM pages WHERE status = ?1{fence_sql} ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3"
+                ),
                 libsql::params![status, limit, offset],
             )
             .await
@@ -76792,14 +76829,35 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn list_pages_includes_entity_kind_shadow() {
+    async fn list_pages_excludes_entity_kind_shadow() {
+        // Fix wave (stage c review, Critical-1): list_pages has ~15 internal
+        // non-browse callers (knowledge projection, overview evidence set,
+        // proactive page-map sweep, first_active_page, maintenance/refinery
+        // sweeps, eval harness) that must never see a stub, so it stays
+        // fenced -- mirroring search_pages's retrieval arm. For the
+        // browse-facing twin, see list_pages_browse.
         let (db, _dir) = test_db().await;
-        let (concept_title, shadow_title) = seed_concept_then_shadow(&db, "list_pages").await;
+        db.store_entity("List Pages Marker", "person", None, None, None)
+            .await
+            .unwrap();
 
         let pages = db.list_pages("active", 50, 0).await.unwrap();
         assert!(
+            !pages.iter().any(|p| p.title == "List Pages Marker"),
+            "list_pages must not surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_browse_includes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+        let (concept_title, shadow_title) =
+            seed_concept_then_shadow(&db, "list_pages_browse").await;
+
+        let pages = db.list_pages_browse("active", 50, 0).await.unwrap();
+        assert!(
             pages.iter().any(|p| p.title == shadow_title),
-            "Q1: list_pages must surface a kind='entity' shadow page"
+            "Q1: list_pages_browse must surface a kind='entity' shadow page"
         );
         let shadow_idx = pages.iter().position(|p| p.title == shadow_title);
         let concept_idx = pages.iter().position(|p| p.title == concept_title);
@@ -76834,6 +76892,34 @@ pub(crate) mod tests {
         assert!(
             pages.iter().any(|p| p.title == "List Pages Scoped Marker"),
             "Q1: list_pages_scoped (Space arm) must surface a kind='entity' shadow page"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_scoped_global_includes_entity_kind_shadow() {
+        // Fix wave (stage c review, Critical-1): the Global arm must
+        // delegate to list_pages_browse, not the fenced list_pages -- this
+        // is the exact site the leak was rooted in.
+        let (db, _dir) = test_db().await;
+        db.store_entity(
+            "List Pages Scoped Global Marker",
+            "person",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pages = db
+            .list_pages_scoped("active", 50, 0, &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.title == "List Pages Scoped Global Marker"),
+            "Q1: list_pages_scoped(Global) must delegate to list_pages_browse"
         );
     }
 
@@ -77037,6 +77123,25 @@ pub(crate) mod tests {
         assert!(
             oldest.is_none(),
             "oldest_active_page must skip kind='entity' shadow pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_active_page_excludes_entity_kind_shadow() {
+        // Fix wave (stage c review, Critical-1 leak site 4): first_active_page
+        // routes through list_pages, ordered by last_modified DESC -- a
+        // fresh shadow (stamped `now`) would be the *first* candidate
+        // without the fence, feeding a stub into the first-page milestone.
+        let (db, _dir) = test_db().await;
+        db.store_entity("First Page Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let first = db.first_active_page().await.unwrap();
+        assert!(
+            first.is_none(),
+            "first_active_page must skip kind='entity' shadow pages, matching its \
+             oldest_active_page sibling"
         );
     }
 

@@ -373,6 +373,43 @@ mod tests {
         );
     }
 
+    /// Fix wave (stage c review, Critical-1 leak site 2): a fresh
+    /// kind='entity' dual-write shadow (stamped `now`, so it would sort into
+    /// the top of a `last_modified DESC` window ahead of every real page)
+    /// must never consume one of the OVERVIEW_TOP_PAGES evidence slots or
+    /// contribute its (always-empty) source_memory_ids.
+    #[tokio::test]
+    async fn top_page_source_ids_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+
+        let mut mem_ids = Vec::new();
+        for i in 1..=OVERVIEW_TOP_PAGES {
+            let mem_id = format!("mem_overview_shadow_guard_{i}");
+            let content =
+                format!("Topic{i} is a specific programming concept with unique details.");
+            create_research_page(&db, &format!("Topic{i}"), &mem_id, &content).await;
+            mem_ids.push(mem_id);
+        }
+        // Seeded after the real pages, so store_entity's `now` timestamp
+        // sorts it first without the fence.
+        db.store_entity("Overview Shadow Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let ids = top_page_source_ids(&db, None).await.unwrap();
+        for mem_id in &mem_ids {
+            assert!(
+                ids.contains(mem_id),
+                "real page source {mem_id} must not be displaced by the entity shadow, got: {ids:?}"
+            );
+        }
+        assert_eq!(
+            ids.len(),
+            mem_ids.len(),
+            "the shadow must contribute zero source ids of its own, got: {ids:?}"
+        );
+    }
+
     /// The Overview refresh must use its OWN dedicated summary prompt, not
     /// the generic `distill_page` prompt every other page refresh uses, and
     /// its synthesis input must span ALL of the wiki's current top pages at
