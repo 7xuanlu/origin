@@ -8104,7 +8104,8 @@ impl MemoryDB {
 
             // Migration 94 (M3 PR-2, stage a): the entity<->page reader-
             // cutover control plane -- `entity_reader_cutover` (per-consumer
-            // intent, wired by stage b, not this PR) and
+            // intent, wired by stage b's `reader_uses_entity_pages`
+            // predicate and `set_entity_reader_cutover` lever) and
             // `entity_page_parity_watermark` (the stage-a reconciliation
             // proof this PR stamps via `reconcile_entity_page_parity`). Pure
             // `CREATE TABLE IF NOT EXISTS`, no data mutation, no behavior
@@ -10032,8 +10033,10 @@ impl MemoryDB {
     //     mirroring `edges_reader_cutover`). `enabled=0` keeps the consumer
     //     on the legacy `entities` store; a flip to `1` is REVERSIBLE. Default
     //     is empty/OFF, so this migration changes NO read behavior. Stage b
-    //     (not this PR) wires the actual gating predicate that reads it; this
-    //     migration only creates the table so PR-2 ships as ONE schema bump.
+    //     wires the actual gating predicate that reads it
+    //     (`reader_uses_entity_pages` + the `set_entity_reader_cutover`
+    //     lever); this migration only creates the table so PR-2 ships as ONE
+    //     schema bump.
     //   * `entity_page_parity_watermark` -- the durable proof from this
     //     stage's reconciliation sweep (`reconcile_entity_page_parity`): the
     //     epoch it was proven under, the drift count (0 == every `entities`
@@ -11032,8 +11035,8 @@ impl MemoryDB {
     /// has a byte-identical, live `kind='entity'` shadow page -- the
     /// dual-write invariant M3 PR-1 established. Stamps
     /// `entity_page_parity_watermark` with the drift and the current epoch;
-    /// a future stage b's reader-cutover gate (not built in this PR) would
-    /// only flip a consumer on a clean, current watermark, mirroring
+    /// stage b's reader-cutover gate (`reader_uses_entity_pages`) only flips
+    /// a consumer on a clean, current watermark, mirroring
     /// `reader_uses_edges` for M2.
     ///
     /// SQLite discipline (§6.3): reads only, then ONE watermark UPSERT; no
