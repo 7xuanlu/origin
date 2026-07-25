@@ -194,27 +194,37 @@ buffer during teardown.
 
 ### Verified physical result
 
-The 2026-07-22 physical run used Windows 11, an Intel Iris Xe integrated GPU,
+The 2026-07-25 physical run used Windows 11, an Intel Iris Xe integrated GPU,
 an NVIDIA GeForce RTX 3060 Laptop discrete GPU, Vulkan SDK 1.4.350.0, Visual
-Studio Build Tools 2019, and
+Studio Build Tools, and
 `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` (2,497,281,120 bytes, SHA-256
 `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`).
-The latest verification ran backend code commit
-`b4677e277e70613585e37e99fa29721426b2a179`, after merging current
+The recorded implementation baseline was backend code commit
+`b80b24f743f79c13752722a8d290bbb8a3b93432`, after merging then-current
 `origin/main`. The source-built `wenlan-server.exe` SHA-256 was
-`a38b6c682ea6750ac1802ded0517c6ffe7a3bf2538c1b517e2c6bdeda02f03bf`.
+`114b881d175398aebd2059914a4bd7ee7a53e2480185f172947310b5a82b64c4`.
+The adjacent staged loader was the pinned LunarG `vulkan-1.dll` with SHA-256
+`0419974f00e82a3d619077ba414da265a774f8db9d45ad93bc1843f44b2c2c1f`;
+the process module inventory resolved that exact path, not a system loader.
 
 | Leg | Observed result |
 |---|---|
-| `auto`, expected Vulkan | Selected llama.cpp device `1`, `NVIDIA GeForce RTX 3060 Laptop GPU`; offloaded `37/37` layers; allocated 576 MiB KV and 301.75 MiB compute on Vulkan1; valid classification |
-| `cpu`, expected CPU | All 36 KV layers reported `dev = CPU`; graph splits `1`; Vulkan1 device compute allocation `0.0000 MiB`; valid classification in about 11.56 seconds |
-| device `99`, expected fallback | Reported `requested GPU device index 99 is unavailable`; used the same CPU-only context contract; valid classification in about 11.95 seconds |
-| warm Vulkan inference | Valid classification in about 1.16 seconds; an earlier cold Vulkan run also paid shader/pipeline setup and took about 20.56 seconds |
+| `auto`, expected Vulkan | Selected llama.cpp device `1`, `NVIDIA GeForce RTX 3060 Laptop GPU`; offloaded `37/37` layers; allocated 576 MiB KV and 301.75 MiB compute on Vulkan1; valid classification in about 1.14 seconds |
+| `cpu`, expected CPU | Offloaded `0/37` layers; all KV layers reported `dev = CPU`; Vulkan1 device compute allocation `0.0000 MiB`; valid classification in about 12.13 seconds |
+| device `99`, expected fallback | Reported `requested GPU device index 99 is unavailable`; offloaded `0/37` layers and used the same CPU-only context contract; valid classification in about 12.31 seconds |
 | status route | `routes::recent_endpoints_tests::status_reports_selected_vulkan_device` passed |
-| app-owned daemon | `wenlan-app` native WebView2 smoke reported `vulkan`, device `1`, RTX 3060, and `gpu_layers=99`; all 35 evidence assertions passed and guarded quit removed both processes |
+| backend daemon smoke | Stored one source, returned a vector-only semantic-search hit, and loaded the exact adjacent ONNX Runtime and Vulkan loader modules |
+| app-owned daemon | The companion `wenlan-app` PR must record its own branch-tip `result.json`; a historical app run or this model probe alone is not accepted as current app evidence |
 
 These timings are smoke evidence, not a benchmark. Compare warmed, repeated
 runs before making performance claims.
+
+Treat this dated section as a reproducible baseline, not a substitute for the
+current PR gate. Before merge, rebuild from the current backend tip and require
+the companion app sidecar manifest, daemon health commit, executable hashes,
+loaded-module paths, UI marker, and `result.json` to agree with that tip. Record
+the exact final hashes in the PR evidence instead of rewriting this runbook
+after every docs-only commit.
 
 The synchronized Windows build used a short `C:\wl-target-ninja` Cargo target,
 Ninja, and one build job. It completed without Rust warnings after making
