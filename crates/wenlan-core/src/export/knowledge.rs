@@ -27,7 +27,7 @@ const PROJECTION_STAGE_OWNER_FILE: &str = "owner.json";
 #[cfg(unix)]
 type ProjectionStateMode = u32;
 #[cfg(not(unix))]
-type ProjectionStateMode = ();
+type ProjectionStateMode = bool;
 
 /// Process-local monotonic counter, combined with the pid, so concurrent
 /// `write_page` calls for the same page never pick the same temp filename.
@@ -2901,13 +2901,50 @@ fn read_projection_state_identity_from_file(
         bytes.extend_from_slice(&buffer[..read]);
     }
     let identity = projection_file_identity(&metadata)?;
+    Ok((bytes, projection_state_mode(&metadata), identity))
+}
+
+fn projection_state_mode(metadata: &cap_std::fs::Metadata) -> ProjectionStateMode {
     #[cfg(unix)]
     {
         use cap_std::fs::PermissionsExt as _;
-        Ok((bytes, metadata.permissions().mode(), identity))
+        metadata.permissions().mode()
     }
     #[cfg(not(unix))]
-    Ok((bytes, (), identity))
+    {
+        metadata.permissions().readonly()
+    }
+}
+
+fn set_projection_state_mode(
+    file: &cap_std::fs::File,
+    mode: ProjectionStateMode,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt as _;
+        file.set_permissions(cap_std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(mode);
+        file.set_permissions(permissions)
+    }
+}
+
+fn projection_lock_is_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports ERROR_LOCK_VIOLATION when an immediately-failing
+        // byte-range lock collides; Rust does not classify code 33 as WouldBlock.
+        error.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn ensure_orphaned_private(orphaned: &Dir) -> Result<(), WenlanError> {
@@ -3005,8 +3042,6 @@ fn write_state_atomically(
     bytes: &[u8],
     mode: ProjectionStateMode,
 ) -> Result<(), WenlanError> {
-    #[cfg(not(unix))]
-    let _ = mode;
     let sequence = PROJECTION_STATE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temporary = format!(".projection-state-{}-{sequence}.tmp", std::process::id());
     let mut options = OpenOptions::new();
@@ -3016,12 +3051,8 @@ fn write_state_atomically(
         .follow(FollowSymlinks::No);
     let result = (|| {
         let mut file = wenlan.open_with(&temporary, &options)?;
-        #[cfg(unix)]
-        {
-            use cap_std::fs::PermissionsExt as _;
-            file.set_permissions(cap_std::fs::Permissions::from_mode(mode))?;
-        }
         file.write_all(bytes)?;
+        set_projection_state_mode(&file, mode)?;
         file.sync_all()?;
         let current = wenlan.open_with("state.json", &regular_read_options())?;
         if !current.metadata()?.is_file() {
@@ -3095,12 +3126,8 @@ where
         .create_new(true)
         .follow(FollowSymlinks::No);
     let mut temporary_file = wenlan.open_with(&temporary, &options)?;
-    #[cfg(unix)]
-    {
-        use cap_std::fs::PermissionsExt as _;
-        temporary_file.set_permissions(cap_std::fs::Permissions::from_mode(mode))?;
-    }
     temporary_file.write_all(replacement)?;
+    set_projection_state_mode(&temporary_file, mode)?;
     temporary_file.sync_all()?;
     let temporary_identity = projection_file_identity(&temporary_file.metadata()?)?;
     drop(temporary_file);
@@ -3366,7 +3393,7 @@ impl ProjectionCapabilities {
         let file_lock = wenlan.open_with(".projection.lock", &options)?.into_std();
         match file_lock.try_lock_exclusive() {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if projection_lock_is_contended(&error) => {
                 return Err(WenlanError::Conflict("page_projection_locked".to_string()))
             }
             Err(error) => return Err(WenlanError::Io(error)),
@@ -3472,6 +3499,44 @@ mod tests {
             citations: Vec::new(),
             kind: "concept".to_string(),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows test cleanup clears the DOS readonly attribute; the lint warns about Unix semantics"
+    )]
+    fn projection_state_mode_tracks_windows_readonly_attribute() {
+        let root = tempfile::TempDir::new().unwrap();
+        let state_path = root.path().join("state.json");
+        std::fs::write(&state_path, b"{}").unwrap();
+        let directory = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+
+        let mut budget = RepairReadBudget::new();
+        let (_, writable_mode, _) = read_projection_state_identity_nofollow(
+            &directory,
+            OsStr::new("state.json"),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(!writable_mode);
+
+        let mut permissions = std::fs::metadata(&state_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&state_path, permissions).unwrap();
+        let mut budget = RepairReadBudget::new();
+        let (_, readonly_mode, _) = read_projection_state_identity_nofollow(
+            &directory,
+            OsStr::new("state.json"),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(readonly_mode);
+
+        let mut permissions = std::fs::metadata(&state_path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&state_path, permissions).unwrap();
     }
 
     #[tokio::test]

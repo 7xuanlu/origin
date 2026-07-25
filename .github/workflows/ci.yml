@@ -506,6 +506,8 @@ jobs:
           if (-not (Test-Path $lld)) {
             throw "rust-lld.exe missing at $lld"
           }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Set up sccache
@@ -922,6 +924,10 @@ jobs:
           if (-not (Test-Path $lld)) {
             throw "rust-lld.exe missing at $lld"
           }
+          # `--target` keeps RUSTFLAGS away from host build scripts. Pin the
+          # host triple's linker too so Git Bash cannot resolve usr/bin/link.exe.
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Select native Perl for vendored OpenSSL

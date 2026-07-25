@@ -938,7 +938,7 @@ fn windows_ort_distribution_violations(
         ),
         (
             &ci,
-            "windows-release-proof",
+            "release-preflight",
             "Configure MSVC Ninja (Windows release proof)",
             "",
             "Windows release proof",
@@ -967,26 +967,18 @@ fn windows_ort_distribution_violations(
         }
     }
 
-    for (workflow, job, required_condition, required_destination, owner) in [
+    for (workflow, job, required_condition, owner) in [
         (
             &ci,
             "test",
             "matrix.os == 'windows-2022'",
-            "$env:RUNNER_TEMP",
             "Windows test CI",
         ),
-        (
-            &ci,
-            "windows-release-proof",
-            "",
-            r#"target\release"#,
-            "Windows release proof",
-        ),
+        (&ci, "release-preflight", "", "Windows release proof"),
         (
             &release,
             "release",
             "matrix.os == 'windows-2022'",
-            r#"target\${{ matrix.target }}\release"#,
             "Windows release workflow",
         ),
     ] {
@@ -999,6 +991,46 @@ fn windows_ort_distribution_violations(
             .unwrap_or_default();
         if (!required_condition.is_empty() && !condition.contains(required_condition))
             || !run.contains("scripts/setup-vulkan-sdk-windows.ps1")
+        {
+            violations.push(format!(
+                "{owner} does not configure the pinned Vulkan SDK in its required scope"
+            ));
+        }
+    }
+    for (workflow, job, step_name, required_condition, required_destination, owner) in [
+        (
+            &ci,
+            "test",
+            "Set up Vulkan SDK (Windows only)",
+            "matrix.os == 'windows-2022'",
+            "$env:RUNNER_TEMP",
+            "Windows test CI",
+        ),
+        (
+            &ci,
+            "release-preflight",
+            "Stage verified Vulkan loader (Windows release preflight)",
+            "matrix.target == 'x86_64-pc-windows-msvc'",
+            r#"target\${{ matrix.target }}\release"#,
+            "Windows release proof",
+        ),
+        (
+            &release,
+            "release",
+            "Set up Vulkan SDK (Windows only)",
+            "matrix.os == 'windows-2022'",
+            r#"target\${{ matrix.target }}\release"#,
+            "Windows release workflow",
+        ),
+    ] {
+        let step = job_step(workflow, job, step_name);
+        let condition = step
+            .and_then(|candidate| candidate["if"].as_str())
+            .unwrap_or_default();
+        let run = step
+            .and_then(|candidate| candidate["run"].as_str())
+            .unwrap_or_default();
+        if !condition.contains(required_condition)
             || !run.contains("scripts/stage-vulkan-loader-windows.ps1")
             || !run.contains(required_destination)
             || run.contains("SkipAuthenticodeValidationForFixture")
@@ -2114,6 +2146,7 @@ fn ci_routing_contract_violations(
         .unwrap_or_default();
     if !windows_linker_condition.contains("matrix.os == 'windows-2022'")
         || !windows_linker_run.contains("rust-lld.exe")
+        || !windows_linker_run.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=")
         || !windows_linker_run.contains("RUSTFLAGS=")
         || !windows_linker_run.contains("$env:GITHUB_ENV")
     {
@@ -2597,18 +2630,32 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             ));
         }
     }
-    let linker = job_step(
-        &ci,
-        "release-preflight",
-        "Configure rust-lld linker (Windows release preflight)",
-    )
-    .and_then(|step| step["run"].as_str())
-    .unwrap_or_default();
-    if !linker.contains("rust-lld.exe")
-        || !linker.contains("RUSTFLAGS=")
-        || !linker.contains("$env:GITHUB_ENV")
-    {
-        violations.push("release-preflight does not configure rust-lld on Windows".into());
+    for (workflow, job_name, step_name, owner) in [
+        (
+            &ci,
+            "release-preflight",
+            "Configure rust-lld linker (Windows release preflight)",
+            "release-preflight",
+        ),
+        (
+            &release,
+            "release",
+            "Configure rust-lld linker (Windows)",
+            "tag release",
+        ),
+    ] {
+        let linker = job_step(workflow, job_name, step_name)
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if !linker.contains("rust-lld.exe")
+            || !linker.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=")
+            || !linker.contains("RUSTFLAGS=")
+            || !linker.contains("$env:GITHUB_ENV")
+        {
+            violations.push(format!(
+                "{owner} does not configure rust-lld for target and host build artifacts on Windows"
+            ));
+        }
     }
     let sqlite = job_step(&ci, "release-preflight", "Install sqlite3 (Windows only)")
         .and_then(|step| step["run"].as_str())
@@ -2779,6 +2826,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace(
             "      - name: Select native Perl for vendored OpenSSL",
             "      - name: Native Perl removed",
+        )
+        .replace(
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=",
+            "REMOVED_WINDOWS_LINKER=",
         );
     let release = release
         .replace(
@@ -2788,6 +2839,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace(
             "      - name: Require main workflow for manual release",
             "      - name: Manual release ref guard removed",
+        )
+        .replace(
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=",
+            "REMOVED_WINDOWS_LINKER=",
         );
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
@@ -2799,6 +2854,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "target-scoped, capacity-bounded, and main-owned",
         "truncated PR file inventory",
         "native Windows Perl",
+        "target and host build artifacts",
         "native ORT smoke",
         "publishing or packaging side effect",
         "conclusion does not fail closed",
@@ -3977,6 +4033,24 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
             ));
         }
     }
+    for (job_name, step_name) in [
+        ("p4-runners", "Configure rust-lld (Windows)"),
+        ("p5-windows-drive", "Configure rust-lld"),
+        ("p6-release", "Configure rust-lld (Windows)"),
+    ] {
+        let linker = job_step(&benchmark, job_name, step_name)
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if !linker.contains("rust-lld.exe")
+            || !linker.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=")
+            || !linker.contains("RUSTFLAGS=")
+            || !linker.contains("$env:GITHUB_ENV")
+        {
+            violations.push(format!(
+                "benchmark job {job_name} does not configure rust-lld for target and host build artifacts"
+            ));
+        }
+    }
     if benchmark["jobs"]["p5-test-engine"]["env"]["SCCACHE_GHA_RW_MODE"].as_str()
         != Some("READ_ONLY")
     {
@@ -4226,6 +4300,25 @@ fn ci_benchmark_contract_requires_read_only_sccache_and_truthful_restore_modes()
             "benchmark guard must reject missing {expected}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn ci_benchmark_contract_requires_target_and_host_linkers_on_windows() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=",
+        "REMOVED_WINDOWS_LINKER=",
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("target and host build artifacts")),
+        "missing Cargo target linker must fail the benchmark contract: {violations:?}"
+    );
 }
 
 #[test]

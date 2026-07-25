@@ -257,8 +257,9 @@ jobs:
       # rust-lld shipped with the Rust toolchain (~3-5min faster link
       # than MSVC link.exe on our binary sizes). rustup does NOT proxy
       # rust-lld, so its path must be discovered via `rustc --print
-      # sysroot`. Export RUSTFLAGS via $GITHUB_ENV so the Build step
-      # picks it up.
+      # sysroot`. Export the Cargo target linker for host build scripts plus
+      # RUSTFLAGS for target artifacts via $GITHUB_ENV so the Bash build step
+      # cannot resolve Git for Windows' unrelated usr/bin/link.exe.
       - name: Configure rust-lld linker (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -271,6 +272,8 @@ jobs:
             throw "rust-lld.exe missing"
           }
           $rustflags = "-C linker=$lld -C linker-flavor=lld-link"
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=$rustflags" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "RUSTFLAGS=$rustflags"
 
