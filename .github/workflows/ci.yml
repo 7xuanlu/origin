@@ -39,6 +39,7 @@ jobs:
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
       windows-release: ${{ steps.filter.outputs.windows-release }}
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
+      test-plan: ${{ steps.test-plan.outputs.test-plan }}
       # Test matrix OSes as a JSON array. On PRs, Windows is included only when
       # Windows-affecting files changed. Non-PR runs keep the full backstop.
       test-oses: ${{ steps.matrix.outputs.json }}
@@ -47,7 +48,13 @@ jobs:
       - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
         id: filter
         with:
+          list-files: json
           filters: |
+            # Complete changed-file inventory for fail-closed test planning.
+            # Specific filters below decide whether jobs run; this catch-all
+            # decides which tests those already-scheduled jobs execute.
+            impact:
+              - '**'
             rust:
               # Positive-only globs. With dorny/paths-filter's default
               # `some` quantifier, a negative glob like `!crates/*/npm/**`
@@ -291,6 +298,27 @@ jobs:
           else
             echo 'json=["ubuntu-24.04"]' >> "$GITHUB_OUTPUT"
           fi
+      - name: Set up Rust for affected-test planning
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Test CI impact planner
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        run: python3 scripts/ci_test_plan.test.py
+      - name: Plan affected Rust tests
+        id: test-plan
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        env:
+          CHANGED_FILES_JSON: ${{ steps.filter.outputs.impact_files }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          cargo metadata --format-version 1 --locked --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
+          python3 scripts/ci_test_plan.py plan \
+            --changed-files-json "$CHANGED_FILES_JSON" \
+            --metadata-file "$RUNNER_TEMP/cargo-metadata.json" \
+            --event-name "$CI_EVENT_NAME" \
+            --github-output "$GITHUB_OUTPUT"
       - name: Test FastEmbed cache preparation
         run: python3 scripts/prepare-fastembed-cache.test.py
       - name: Restore portable FastEmbed model
@@ -498,13 +526,17 @@ jobs:
       # round-trip E2E further down.
       - name: Workspace lib tests (Linux)
         if: matrix.os == 'ubuntu-24.04'
-        run: cargo nextest run --workspace --lib
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite workspace-lib --plan-json "$CI_TEST_PLAN"
       - name: Workspace lib tests (macOS)
         if: matrix.os == 'macos-14'
         # nextest spawns one process per test by default — sidesteps the
         # ONNX atexit FFI race that required --test-threads=1 with cargo test.
         # FastEmbed initialization has its own cross-process file lock.
-        run: cargo nextest run --workspace --lib
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite workspace-lib --plan-json "$CI_TEST_PLAN"
       - name: Page lint scale gate (Windows functional)
         if: matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
         shell: pwsh
@@ -733,12 +765,16 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Integration tests wenlan-cli + wenlan-server (Linux)
-        run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-json "$CI_TEST_PLAN"
       - name: Run integration tests (core) (Linux)
         # --features eval-harness: selected eval_* targets compile to zero
         # tests without it. eval_harness.rs itself remains manual-only because
         # it requires external data or API credentials.
-        run: cargo nextest run -p wenlan-core --features eval-harness --test build_env --test chat_import_e2e --test distill_redesign_e2e --test distillation_quality --test doc_reconcile_e2e --test eval_cost_caps --test eval_report_paths --test eval_report_roundtrip --test eval_save_guards --test folder_ingest_e2e --test lint_maintenance_probe_e2e --test page_citations_e2e --test pdf_ordered_text --test provenance_p2 --test provenance_p3 --test read_scope --test space_scoping_e2e
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite core-integration --plan-json "$CI_TEST_PLAN"
       - name: E2E wenlan background on/off (Linux user-systemd)
         run: |
           set -euo pipefail

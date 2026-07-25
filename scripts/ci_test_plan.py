@@ -19,7 +19,7 @@ class PlanError(ValueError):
 ISOLATED_UNIT_MODULES = {
     "crates/wenlan-core/src/lint/pages/security_test.rs": (
         "wenlan-core",
-        "lint::pages::security_test",
+        "lint::pages::fs::tests::security_cases",
     ),
 }
 
@@ -194,7 +194,11 @@ def _workspace_lib_plan(
     if not expressions:
         return {"mode": "skip"}
     if isolated_filters:
-        return {"mode": "filterset", "filterset": " | ".join(expressions)}
+        return {
+            "mode": "filterset",
+            "packages": sorted(broad_packages | set(isolated_filters)),
+            "filterset": " | ".join(expressions),
+        }
     return {"mode": "packages", "packages": sorted(broad_packages)}
 
 
@@ -210,15 +214,14 @@ def build_plan(
     packages, directories = _workspace(cargo_metadata)
     reverse = _reverse_dependencies(packages)
     paths = [_normalize_path(path) for path in changed_paths]
+    if event_name != "pull_request":
+        return _full_plan(f"{event_name} keeps the full backstop")
     if not paths:
         raise PlanError("changed path inventory is empty")
     if existing_paths is None:
         existing = {path for path in paths if Path(path).exists()}
     else:
         existing = {_normalize_path(path) for path in existing_paths}
-
-    if event_name != "pull_request":
-        return _full_plan(f"{event_name} keeps the full backstop")
 
     broad_packages: set[str] = set()
     isolated_filters: dict[str, set[str]] = defaultdict(set)
@@ -394,7 +397,8 @@ def command_groups_for(
             filterset = suite.get("filterset")
             if not isinstance(filterset, str) or not filterset:
                 raise PlanError("workspace filterset is empty")
-            return [[*cargo, "--workspace", "--lib", "-E", filterset]]
+            names = _validated_package_names(suite.get("packages"), packages)
+            return [[*cargo, *_package_args(names), "--lib", "-E", filterset]]
         raise PlanError(f"unknown workspace-lib mode: {mode!r}")
 
     if suite_name == "cli-server-integration":

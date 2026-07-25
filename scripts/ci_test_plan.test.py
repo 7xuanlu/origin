@@ -177,9 +177,10 @@ class NarrowOwnerTests(unittest.TestCase):
             plan["workspace_lib"],
             {
                 "mode": "filterset",
+                "packages": ["wenlan-core"],
                 "filterset": (
                     "package(wenlan-core) "
-                    "& test(/^lint::pages::security_test::/)"
+                    "& test(/^lint::pages::fs::tests::security_cases::/)"
                 ),
             },
         )
@@ -233,6 +234,25 @@ class FailClosedTests(unittest.TestCase):
 
         self.assertEqual(plan["mode"], "full")
 
+    def test_non_pr_event_without_diff_inventory_runs_full_backstop(self) -> None:
+        plan = build_plan(
+            [],
+            cargo_metadata(),
+            event_name="workflow_dispatch",
+            existing_paths=set(),
+        )
+
+        self.assertEqual(plan["mode"], "full")
+
+    def test_pr_without_diff_inventory_fails_closed(self) -> None:
+        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
+            build_plan(
+                [],
+                cargo_metadata(),
+                event_name="pull_request",
+                existing_paths=set(),
+            )
+
     def test_malformed_metadata_fails_instead_of_emitting_empty_plan(self) -> None:
         with self.assertRaises(PlanError):
             build_plan(
@@ -275,12 +295,13 @@ class CommandGenerationTests(unittest.TestCase):
                     "cargo",
                     "nextest",
                     "run",
-                    "--workspace",
+                    "-p",
+                    "wenlan-core",
                     "--lib",
                     "-E",
                     (
                         "package(wenlan-core) "
-                        "& test(/^lint::pages::security_test::/)"
+                        "& test(/^lint::pages::fs::tests::security_cases::/)"
                     ),
                 ]
             ],
@@ -329,6 +350,34 @@ class CommandGenerationTests(unittest.TestCase):
                 ]
             ],
         )
+
+    def test_new_core_target_is_automatically_owned_by_full_plan(self) -> None:
+        metadata = cargo_metadata()
+        core = next(
+            package
+            for package in metadata["packages"]
+            if package["name"] == "wenlan-core"
+        )
+        core["targets"].append(
+            {
+                "name": "new_required_target",
+                "kind": ["test"],
+                "src_path": (
+                    f"{WORKSPACE_ROOT}/crates/wenlan-core/tests/"
+                    "new_required_target.rs"
+                ),
+            }
+        )
+        plan = build_plan(
+            ["Cargo.lock"],
+            metadata,
+            event_name="pull_request",
+            existing_paths={"Cargo.lock"},
+        )
+
+        commands = command_groups_for("core-integration", plan, metadata)
+
+        self.assertIn("new_required_target", commands[0])
 
     def test_skipped_suite_executes_no_command(self) -> None:
         plan = plan_for("crates/wenlan-core/tests/folder_ingest_e2e.rs")

@@ -1556,6 +1556,7 @@ fn ci_routing_contract_violations(
         "windows-lint",
         "windows-release",
         "mcp-platform",
+        "test-plan",
     ] {
         if ci["jobs"]["detect-changes"]["outputs"][output]
             .as_str()
@@ -1563,6 +1564,49 @@ fn ci_routing_contract_violations(
         {
             violations.push(format!("detect-changes does not expose {output} routing"));
         }
+    }
+
+    let filter_step = ci["jobs"]["detect-changes"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .find(|step| step["id"].as_str() == Some("filter"));
+    if filter_step.and_then(|step| step["with"]["list-files"].as_str()) != Some("json") {
+        violations.push("detect-changes does not expose the changed-file inventory as JSON".into());
+    }
+    let impact_paths = detect_change_filter_paths(&ci, "impact");
+    if !impact_paths.contains("**") {
+        violations.push("impact routing is not a fail-closed repository catch-all".into());
+    }
+    let planner_test = job_step(&ci, "detect-changes", "Test CI impact planner")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if planner_test != "python3 scripts/ci_test_plan.test.py" {
+        violations.push("detect-changes does not test the impact planner before use".into());
+    }
+    let planner = job_step(&ci, "detect-changes", "Plan affected Rust tests");
+    let planner_run = planner
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let changed_files = planner
+        .and_then(|step| step["env"]["CHANGED_FILES_JSON"].as_str())
+        .unwrap_or_default();
+    let event_name = planner
+        .and_then(|step| step["env"]["CI_EVENT_NAME"].as_str())
+        .unwrap_or_default();
+    if planner.and_then(|step| step["id"].as_str()) != Some("test-plan")
+        || !planner_run.contains("cargo metadata --format-version 1 --locked --no-deps")
+        || !planner_run.contains("python3 scripts/ci_test_plan.py plan")
+        || !planner_run.contains("--changed-files-json \"$CHANGED_FILES_JSON\"")
+        || !planner_run.contains("--event-name \"$CI_EVENT_NAME\"")
+        || !planner_run.contains("--github-output \"$GITHUB_OUTPUT\"")
+        || changed_files != "${{ steps.filter.outputs.impact_files }}"
+        || event_name != "${{ github.event_name }}"
+    {
+        violations.push(
+            "detect-changes does not derive its test plan from Cargo metadata and the complete changed-file inventory"
+                .into(),
+        );
     }
 
     let rust_paths = detect_change_filter_paths(&ci, "rust");
@@ -2083,14 +2127,36 @@ fn ci_routing_contract_violations(
         );
     }
 
-    let macos_lib = job_step(&ci, "test", "Workspace lib tests (macOS)");
-    let macos_lib_run = macos_lib
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if !macos_lib_run.contains("cargo nextest run --workspace --lib")
-        || macos_lib_run.contains("--test-threads=1")
-    {
-        violations.push("macOS nextest workspace proof is unnecessarily single-threaded".into());
+    for (job, step_name, suite) in [
+        ("test", "Workspace lib tests (Linux)", "workspace-lib"),
+        ("test", "Workspace lib tests (macOS)", "workspace-lib"),
+        (
+            "canonical-acceptance",
+            "Integration tests wenlan-cli + wenlan-server (Linux)",
+            "cli-server-integration",
+        ),
+        (
+            "canonical-acceptance",
+            "Run integration tests (core) (Linux)",
+            "core-integration",
+        ),
+    ] {
+        let step = job_step(&ci, job, step_name);
+        let run = step
+            .and_then(|candidate| candidate["run"].as_str())
+            .unwrap_or_default();
+        let plan = step
+            .and_then(|candidate| candidate["env"]["CI_TEST_PLAN"].as_str())
+            .unwrap_or_default();
+        if !run.contains("python3 scripts/ci_test_plan.py run")
+            || !run.contains(&format!("--suite {suite}"))
+            || !run.contains("--plan-json \"$CI_TEST_PLAN\"")
+            || plan != "${{ needs.detect-changes.outputs.test-plan }}"
+        {
+            violations.push(format!(
+                "{job} {step_name} does not execute the validated impacted-test plan"
+            ));
+        }
     }
     let linux_integration = job_step(
         &ci,
@@ -2102,9 +2168,7 @@ fn ci_routing_contract_violations(
         "test",
         "Integration tests wenlan-cli + wenlan-server (macOS)",
     );
-    if linux_integration
-        .and_then(|step| step["run"].as_str())
-        .is_none_or(|run| !run.contains("-E 'kind(test)'"))
+    if linux_integration.is_none()
         || macos_integration.and_then(|step| step["if"].as_str()) != Some("matrix.os == 'macos-14'")
         || macos_integration
             .and_then(|step| step["run"].as_str())
@@ -2266,12 +2330,16 @@ jobs:
         "debug runtime artifacts",
         "differentially compile every wenlan-mcp target",
         "mcp-platform routing",
-        "single-threaded",
         "duplicates wenlan CLI/server lib tests",
         "full CLI/server platform contract",
         "fail fast before integration",
         "fail fast from integration",
         "root installer",
+        "changed-file inventory as JSON",
+        "repository catch-all",
+        "test the impact planner",
+        "derive its test plan",
+        "validated impacted-test plan",
     ] {
         assert!(
             violations
@@ -2349,7 +2417,7 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         ),
         (
             "Integration tests wenlan-cli + wenlan-server (Linux)",
-            "cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'",
+            "python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-json \"$CI_TEST_PLAN\"",
             "Canonical acceptance CLI/server integration command is not executable",
         ),
         (
@@ -2370,6 +2438,19 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         "canonical-acceptance",
         "Run integration tests (core) (Linux)",
     );
+    for step_name in [
+        "Integration tests wenlan-cli + wenlan-server (Linux)",
+        "Run integration tests (core) (Linux)",
+    ] {
+        if job_step(&ci, "canonical-acceptance", step_name)
+            .and_then(|step| step["env"]["CI_TEST_PLAN"].as_str())
+            != Some("${{ needs.detect-changes.outputs.test-plan }}")
+        {
+            violations.push(format!(
+                "Canonical acceptance {step_name} does not consume the validated test plan"
+            ));
+        }
+    }
     if core_integration.is_some_and(|step| step.get("if").is_some()) {
         violations.push("Linux core integration coverage is conditionally disabled".into());
     }
@@ -2573,7 +2654,7 @@ fn canonical_acceptance_contract_rejects_semantic_noops_and_secondary_writers() 
             "      SCCACHE_GHA_RW_MODE: READ_ONLY",
         )
         .replace(
-            "        run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'",
+            "        run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-json \"$CI_TEST_PLAN\"",
             "        run: \"true\"",
         )
         .replace(
@@ -2612,128 +2693,46 @@ fn canonical_acceptance_contract_rejects_semantic_noops_and_secondary_writers() 
 
 // ── Teeth #10: every normal core integration target has a required owner ──
 
-fn core_integration_contract_violations(
-    ci_workflow: &str,
-    integration_targets: &[String],
-) -> Vec<String> {
-    const MANUAL_ONLY: &[(&str, &str)] = &[
-        (
-            "cached_scenario_db_check",
-            "requires the external cached eval scenario databases",
-        ),
-        (
-            "eval_harness",
-            "contains manual eval cases that require external data or API credentials",
-        ),
-    ];
-
+fn core_integration_contract_violations(ci_workflow: &str) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
-    let Some(run) = job_step(
+    let Some(step) = job_step(
         &ci,
         "canonical-acceptance",
         "Run integration tests (core) (Linux)",
-    )
-    .and_then(|step| step["run"].as_str()) else {
+    ) else {
         return vec!["required Linux core integration step is missing".into()];
     };
 
-    let nextest_commands = run
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("cargo nextest run "))
-        .collect::<Vec<_>>();
+    let expected =
+        "python3 scripts/ci_test_plan.py run --suite core-integration --plan-json \"$CI_TEST_PLAN\"";
     let mut violations = Vec::new();
-    if nextest_commands.len() != 1 {
-        violations.push(format!(
-            "required Linux core integration step has {} canonical cargo nextest invocations, expected exactly one",
-            nextest_commands.len()
-        ));
-    }
-    let words = nextest_commands
-        .first()
-        .map(|command| command.split_whitespace().collect::<Vec<_>>())
-        .unwrap_or_default();
-    let prefix = [
-        "cargo",
-        "nextest",
-        "run",
-        "-p",
-        "wenlan-core",
-        "--features",
-        "eval-harness",
-    ];
-    let test_arguments = words.get(prefix.len()..).unwrap_or_default();
-    let valid_test_arguments = words.starts_with(&prefix)
-        && test_arguments.len() % 2 == 0
-        && test_arguments.chunks_exact(2).all(|pair| {
-            pair[0] == "--test"
-                && !pair[1].is_empty()
-                && pair[1]
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
-        });
-    if !valid_test_arguments {
+    if step["run"].as_str() != Some(expected)
+        || step["env"]["CI_TEST_PLAN"].as_str()
+            != Some("${{ needs.detect-changes.outputs.test-plan }}")
+        || step.get("if").is_some()
+    {
         violations.push(
-            "required Linux core integration command is not the exact canonical argv contract"
+            "required Linux core integration step does not execute the validated fail-closed planner"
                 .into(),
         );
     }
-    let selected = if valid_test_arguments {
-        test_arguments
-            .chunks_exact(2)
-            .map(|pair| pair[1])
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
-    let manual_only = MANUAL_ONLY
-        .iter()
-        .map(|(target, _reason)| *target)
-        .collect::<BTreeSet<_>>();
-
-    violations.extend(
-        integration_targets
-            .iter()
-            .filter(|target| !manual_only.contains(target.as_str()))
-            .filter(|target| !selected.contains(target.as_str()))
-            .map(|target| {
-            format!(
-                "core integration target {target:?} has no required canonical Linux proof and is not manual-only"
-            )
-            }),
-    );
     violations
-}
-
-fn core_integration_targets(root: &Path) -> Vec<String> {
-    let mut targets = std::fs::read_dir(root.join("crates/wenlan-core/tests"))
-        .expect("read wenlan-core integration tests")
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            (path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
-                .then(|| path.file_stem()?.to_str().map(str::to_owned))
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    targets.sort();
-    targets
 }
 
 #[test]
 fn every_core_integration_target_has_a_required_or_manual_owner() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
-    let violations = core_integration_contract_violations(&ci, &core_integration_targets(&root));
+    let violations = core_integration_contract_violations(&ci);
     assert!(
         violations.is_empty(),
-        "core integration inventory drift:\n{}",
+        "core integration planner wiring drift:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn core_integration_inventory_fails_closed_for_an_unknown_target() {
+fn core_integration_inventory_rejects_direct_command_bypass() {
     let ci = r#"
 jobs:
   canonical-acceptance:
@@ -2741,16 +2740,12 @@ jobs:
       - name: Run integration tests (core) (Linux)
         run: cargo nextest run -p wenlan-core --features eval-harness --test known
 "#;
-    let targets = vec![
-        "known".to_string(),
-        "new_platform_sensitive_test".to_string(),
-    ];
-    let violations = core_integration_contract_violations(ci, &targets);
+    let violations = core_integration_contract_violations(ci);
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("new_platform_sensitive_test")),
-        "an unknown integration target must default into required Linux proof: {violations:?}"
+            .any(|violation| violation.contains("fail-closed planner")),
+        "a hand-maintained target list must not bypass the fail-closed planner: {violations:?}"
     );
 }
 
@@ -2766,42 +2761,35 @@ jobs:
           echo --test echoed_only
           cargo nextest run -p wenlan-core --features eval-harness --test actually_run # --test inline_commented
 "#;
-    let targets = vec![
-        "actually_run".to_string(),
-        "commented_out".to_string(),
-        "echoed_only".to_string(),
-        "inline_commented".to_string(),
-    ];
-    let violations = core_integration_contract_violations(ci, &targets);
-    for missing in ["commented_out", "echoed_only", "inline_commented"] {
-        assert!(
-            violations
-                .iter()
-                .any(|violation| violation.contains(missing)),
-            "dead text must not satisfy required integration ownership for {missing}: {violations:?}"
-        );
-    }
+    let violations = core_integration_contract_violations(ci);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("fail-closed planner")),
+        "dead command text must not satisfy required integration ownership: {violations:?}"
+    );
 }
 
 #[test]
 fn core_integration_inventory_rejects_shell_operator_dead_text() {
-    for (operator, dead_target) in [("|", "piped_only"), ("&", "background_only")] {
+    for operator in ["|", "&"] {
         let ci = format!(
             r#"
 jobs:
   canonical-acceptance:
     steps:
       - name: Run integration tests (core) (Linux)
-        run: cargo nextest run -p wenlan-core --features eval-harness --test actually_run {operator} echo --test {dead_target}
+        env:
+          CI_TEST_PLAN: ${{{{ needs.detect-changes.outputs.test-plan }}}}
+        run: python3 scripts/ci_test_plan.py run --suite core-integration --plan-json "$CI_TEST_PLAN" {operator} true
 "#
         );
-        let targets = vec!["actually_run".to_string(), dead_target.to_string()];
-        let violations = core_integration_contract_violations(&ci, &targets);
+        let violations = core_integration_contract_violations(&ci);
         assert!(
             violations
                 .iter()
-                .any(|violation| violation.contains(dead_target)),
-            "shell operator {operator:?} must not make {dead_target} look executed: {violations:?}"
+                .any(|violation| violation.contains("fail-closed planner")),
+            "shell operator {operator:?} must not weaken the exact planner invocation: {violations:?}"
         );
     }
 }
