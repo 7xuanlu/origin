@@ -49,6 +49,9 @@ set "VisualStudioVersion=17.0"
 
     $env:GITHUB_ENV = $githubEnv
     $env:GITHUB_PATH = $githubPath
+    # Keep the fixture independent of runner-image tools such as Chocolatey's
+    # preinstalled Ninja. This forces the Visual Studio fallback path.
+    $env:PATH = "$env:SystemRoot\System32"
     $env:LIB = "$testRoot\vcpkg-lib"
 
     & $setupScript -VisualStudioInstallPath $vsRoot
