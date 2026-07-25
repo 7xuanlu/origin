@@ -2170,12 +2170,14 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["run"].as_str())
         .is_none_or(|run| {
             !run.contains("cargo build -p wenlan -p wenlan-server")
+                || !run.contains("scripts/stage-onnxruntime-windows.ps1")
+                || !run.contains("scripts/stage-vulkan-loader-windows.ps1")
                 || !run.contains("target\\debug")
                 || run.contains("--release")
         })
     {
         violations.push(
-            "ordinary Windows contract does not build and stage debug runtime artifacts".into(),
+            "ordinary Windows contract does not build and stage adjacent ONNX/Vulkan debug runtime artifacts".into(),
         );
     }
     let schtasks = job_step(

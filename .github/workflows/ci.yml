@@ -689,14 +689,17 @@ jobs:
         if: (matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || needs.detect-changes.outputs.mcp-platform == 'true')
         run: cargo check -p wenlan-mcp --lib --bins
       # Ordinary Windows PR proof uses debug artifacts already warmed by the
-      # integration suite. Stage the pinned DLL next to the daemon because the
-      # scheduled task does not inherit ORT_DYLIB_PATH from this runner shell.
+      # integration suite. Stage both pinned runtime DLLs next to the daemon
+      # because the scheduled task must not depend on this runner shell's
+      # ORT_DYLIB_PATH or Vulkan SDK PATH.
       - name: Build Windows contract binaries
         if: matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           cargo build -p wenlan -p wenlan-server
           & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\debug"
+          & scripts/stage-vulkan-loader-windows.ps1 `
             -DestinationDirectory "target\debug"
 
       - name: Validate Windows LLM probe

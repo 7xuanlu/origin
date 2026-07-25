@@ -123,11 +123,13 @@ assumed to have the loader. CI downloads LunarG's pinned
 and x64 loader SHA-256
 `0419974f00e82a3d619077ba414da265a774f8db9d45ad93bc1843f44b2c2c1f`,
 checks the loader's LunarG Authenticode signer, and copies its accompanying
-license. Test jobs put only that extracted directory on the job-scoped `PATH`;
-release jobs stage the loader beside the executables and include both files in
-the zip. Nothing writes `System32` or the registry. This lets CPU-only tests and
-released binaries start on a vendorless machine; it is not GPU evidence. The
-physical smoke below remains the Vulkan execution proof.
+license. Test jobs put that extracted directory on the job-scoped `PATH` and
+also stage the verified loader beside `target\debug\wenlan-server.exe` for the
+Task Scheduler round-trip; a scheduled process must not depend on the workflow
+shell's SDK path. Release jobs stage the loader beside the executables and
+include both files in the zip. Nothing writes `System32` or the registry. This
+lets CPU-only tests and released binaries start on a vendorless machine; it is
+not GPU evidence. The physical smoke below remains the Vulkan execution proof.
 
 The implementation and CI contract were checked against these primary sources:
 
@@ -289,7 +291,10 @@ link alone is not the release gate.
   `dumpbin /DEPENDENTS <test.exe>`. The Vulkan-enabled test binary imports
   `vulkan-1.dll` before Rust starts; vendorless CI must run
   `scripts\stage-vulkan-loader-windows.ps1`. `ORT_DYLIB_PATH` separately pins
-  the verified ONNX Runtime, whose directory is also job-scoped in CI.
+  the verified ONNX Runtime, whose directory is also job-scoped in CI. If a
+  scheduled task reports decimal result `-1073741515`, stage both verified
+  runtime DLLs beside the scheduled `wenlan-server.exe`; the task's `Start In`
+  directory and inherited `PATH` are not runtime-distribution contracts.
 - `ort ... is not compatible ... expected version >= '1.23.x'`: the process
   found a stale `onnxruntime.dll` (for example 1.17.1). Run
   `scripts\stage-onnxruntime-windows.ps1`, set `ORT_DYLIB_PATH` to that exact
