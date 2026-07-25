@@ -172,7 +172,7 @@ impl KnowledgeWriter {
         self.write_page(&guard, page)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn write_page_after_open_for_test<F>(
         &self,
         page: &Page,

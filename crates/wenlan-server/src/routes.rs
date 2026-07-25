@@ -1590,11 +1590,13 @@ mod recent_endpoints_tests {
             .map(|offset| start + offset)
             .expect("handle_search marker should follow handle_status");
         let body = &source[start..end];
+        let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(
-            body.contains("let (\n        db,")
-                && body.contains("on_device_inference,")
-                && body.contains("let s = state.read().await;"),
+            normalized.contains(
+                "let (db, reranker_status, reranker_light_status, reranker_mode, \
+                 on_device_inference) = { let s = state.read().await;"
+            ),
             "handle_status must snapshot cloned state out of ServerState before awaiting DB work"
         );
     }

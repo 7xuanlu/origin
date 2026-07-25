@@ -64,6 +64,7 @@ cargo build --release --jobs 1 -p wenlan-core --bin model_probe
 cargo build --release --jobs 1 -p wenlan-server
 
 & scripts\setup-vulkan-sdk-windows.test.ps1
+& scripts\setup-msvc-ninja-windows.test.ps1
 & scripts\smoke-windows-llm.test.ps1
 ```
 
