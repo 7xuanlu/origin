@@ -17,8 +17,8 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # PRs: cancel superseded pushes to save runner time. main: never cancel, so
-  # every code-push's L6 eval canary runs to completion. A cancelled canary plus
-  # a release commit that skips the test job left 0.9.1 with no canary run.
+  # every full-platform backstop runs to completion. The L6 eval canary has its
+  # own non-cancelling workflow and never extends this required critical path.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -27,6 +27,8 @@ env:
 jobs:
   detect-changes:
     runs-on: ubuntu-24.04
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     outputs:
       rust:    ${{ steps.filter.outputs.rust }}
       docs:    ${{ steps.filter.outputs.docs }}
@@ -51,6 +53,9 @@ jobs:
               # `some` quantifier, a negative glob like `!crates/*/npm/**`
               # makes README-only PRs match this filter.
               - 'crates/**/*.rs'
+              # Required integration tests consume non-Rust fixtures here
+              # (PDF, Markdown, and text), so fixture-only PRs must not skip.
+              - 'crates/**/tests/**'
               # Native sources bootstrap the drift guard that verifies their
               # platform route; otherwise a new file could skip its own check.
               - 'crates/**/*.c'
@@ -71,6 +76,9 @@ jobs:
               - 'rust-toolchain.toml'
               - '.config/nextest.toml'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/main-canary.yml'
+              - '.github/workflows/ci-observer.yml'
+              - '.github/workflows/ci-benchmark.yml'
               - '.github/workflows/coverage.yml'
               - '.github/workflows/release.yml'
               - 'docker/**'
@@ -283,6 +291,32 @@ jobs:
           else
             echo 'json=["ubuntu-24.04"]' >> "$GITHUB_OUTPUT"
           fi
+      - name: Test FastEmbed cache preparation
+        run: python3 scripts/prepare-fastembed-cache.test.py
+      - name: Restore portable FastEmbed model
+        id: fastembed-portable-restore
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+      - name: Restore legacy Linux FastEmbed model
+        if: "(steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request') && steps.fastembed-portable-restore.outputs.cache-hit != 'true'"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-bge-base-en-v1.5-q-v2
+      - name: Prepare portable FastEmbed model
+        if: "steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request'"
+        run: python3 scripts/prepare-fastembed-cache.py
+      - name: Save portable FastEmbed model
+        if: "(steps.filter.outputs.rust == 'true' || steps.filter.outputs.macos == 'true' || steps.filter.outputs.windows == 'true' || github.event_name != 'pull_request') && steps.fastembed-portable-restore.outputs.cache-hit != 'true'"
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
 
   # On PRs, Rust fmt + lint only run when Rust-affecting paths changed.
   # Docs/image-only PRs should still get the required aggregate `conclusion`
@@ -342,9 +376,8 @@ jobs:
     needs: [detect-changes]
     if: "needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || github.event_name != 'pull_request'"
     runs-on: ${{ matrix.os }}
-    # Pull requests keep a hard wall-clock budget. Non-PR runs add the
-    # main-only canary/full-platform backstop, so they need a proof budget
-    # large enough to finish rather than being cancelled at the PR boundary.
+    # Pull requests keep a hard wall-clock budget. Non-PR runs add the full
+    # platform backstop, so they retain enough proof budget to finish.
     timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
     strategy:
       # Cancel the rest of the matrix when one OS fails. Saves ~20-30min
@@ -416,6 +449,8 @@ jobs:
       - name: Verify ort-sys source pin
         if: matrix.os == 'ubuntu-24.04'
         run: |
+          python3 scripts/ci-observer.test.py
+          python3 scripts/ci-timed-command.test.py
           python3 scripts/verify-ort-source-pin.test.py
           python3 scripts/verify-ort-source-pin.py
       # Windows needs sqlite3.lib for libsql linking (libsql does not bundle
@@ -446,16 +481,16 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
-      # Pin FastEmbed's cache independently of its upstream default and restore
-      # it before the first model-consuming test.
-      - name: Cache fastembed model (Linux)
-        if: matrix.os == 'ubuntu-24.04'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # detect-changes prepares one revision- and SHA-pinned archive before the
+      # matrix starts. Every OS restores that same portable snapshot, so a
+      # cold cache adds one bounded fetch instead of concurrent model races.
+      - name: Restore portable FastEmbed model
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ env.FASTEMBED_CACHE_DIR }}
-          key: fastembed-bge-base-en-v1.5-q-v2
-          restore-keys: |
-            fastembed-bge-base-en-v1.5-q-
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
       # Workspace lib tests skipped on Windows — Linux + macOS catch the
       # same cross-platform unit logic in ~5-15min vs 25min on Windows.
       # Windows-specific behavior (paths, mcp_add, schtasks) is covered
@@ -470,9 +505,6 @@ jobs:
         # ONNX atexit FFI race that required --test-threads=1 with cargo test.
         # FastEmbed initialization has its own cross-process file lock.
         run: cargo nextest run --workspace --lib
-      - name: Page lint scale gate (Linux time + RSS)
-        if: matrix.os == 'ubuntu-24.04'
-        run: bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
       - name: Page lint scale gate (Windows functional)
         if: matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
         shell: pwsh
@@ -503,9 +535,9 @@ jobs:
           $gateCode = $LASTEXITCODE
           "exit_code=$gateCode" | Add-Content -Path $receipt
           if ($gateCode -ne 0) { throw "Windows functional scale gate failed" }
-      - name: Upload Page lint scale receipt
-        if: always() && (matrix.os == 'ubuntu-24.04' || (matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')))
-        uses: actions/upload-artifact@v4
+      - name: Upload Page lint scale receipt (Windows)
+        if: always() && matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: task-19-lint-scale-${{ matrix.os }}-${{ github.sha }}
           path: ${{ runner.temp }}/task-19-memory-lint-debugger-*.txt
@@ -536,13 +568,11 @@ jobs:
       # NOT use `--workspace --tests` because that pulls in wenlan-core's
       # `eval_harness.rs` which requires `ANTHROPIC_API_KEY` (not in CI).
       # wenlan-core integration tests run via the Linux-only nextest step
-      # below (chat_import_e2e + distillation_quality + provenance_p2 +
-      # provenance_p3 + space_scoping_e2e + folder_ingest_e2e — the middle
-      # three carry the cross-workspace-leak security tests and the P3
-      # demotion regression; folder_ingest_e2e covers the full folder
-      # sync/enrich/delete lifecycle in-process).
-      - name: Integration tests wenlan-cli + wenlan-server (shared integration only)
-        if: matrix.os != 'windows-2022'
+      # below. The drift guard inventories crates/wenlan-core/tests/*.rs so a
+      # newly added integration target fails closed into this canonical lane
+      # unless it is explicitly classified as manual-only with a reason.
+      - name: Integration tests wenlan-cli + wenlan-server (macOS)
+        if: matrix.os == 'macos-14'
         run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'
       - name: Integration tests wenlan-cli + wenlan-server (Windows)
         if: matrix.os == 'windows-2022'
@@ -553,80 +583,6 @@ jobs:
       - name: Compile platform-owned MCP runtime
         if: (matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || needs.detect-changes.outputs.mcp-platform == 'true')
         run: cargo check -p wenlan-mcp --lib --bins
-      - name: Run integration tests (core) (Linux)
-        if: matrix.os == 'ubuntu-24.04'
-        # nextest process-per-test sidesteps the macOS SIGSEGV root cause
-        # (ONNX atexit FFI race). No --test-threads=1 needed on ubuntu.
-        # --features eval-harness: 4 of the 5 eval_* files below are gated
-        # behind #![cfg(feature = "eval-harness")] — without the flag they
-        # compile to 0 tests and pass silently. Explicit --test selection
-        # keeps eval_harness.rs (needs ANTHROPIC_API_KEY) out of the build.
-        run: cargo nextest run -p wenlan-core --features eval-harness --test chat_import_e2e --test distillation_quality --test provenance_p2 --test provenance_p3 --test space_scoping_e2e --test folder_ingest_e2e --test doc_reconcile_e2e --test page_citations_e2e --test build_env --test eval_cost_caps --test eval_report_paths --test eval_report_roundtrip --test eval_save_guards
-      - name: Run embedding-only eval (main only, Linux)
-        if: matrix.os == 'ubuntu-24.04' && github.ref == 'refs/heads/main'
-        env:
-          EVAL_BASELINES_DIR: ${{ runner.temp }}/origin-eval-canary
-        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
-      - name: Upload eval canary baseline (with env schema)
-        if: always() && matrix.os == 'ubuntu-24.04'
-        uses: actions/upload-artifact@v4
-        with:
-          name: eval-canary-baseline-${{ github.sha }}
-          path: ${{ runner.temp }}/origin-eval-canary/*.json
-          retention-days: 30
-          if-no-files-found: warn
-      - name: E2E wenlan background on/off (Linux user-systemd)
-        if: matrix.os == 'ubuntu-24.04'
-        run: |
-          set -euo pipefail
-          sudo loginctl enable-linger "$(whoami)"
-          uid="$(id -u)"
-          export XDG_RUNTIME_DIR="/run/user/$uid"
-          # Build native (cargo nextest run --workspace --lib already built tests,
-          # but the install path needs the actual release-or-debug binaries).
-          cargo build -p wenlan -p wenlan-server
-          STAGE=$(mktemp -d)
-          UNIT_PATH="$HOME/.config/systemd/user/wenlan-server.service"
-          cp target/debug/wenlan target/debug/wenlan-server "$STAGE/"
-          cleanup() {
-            "$STAGE/wenlan" background off 2>/dev/null || true
-            systemctl --user disable --now wenlan-server.service >/dev/null 2>&1 || true
-            rm -f "$UNIT_PATH"
-            systemctl --user daemon-reload >/dev/null 2>&1 || true
-            rm -rf "$STAGE"
-          }
-          trap cleanup EXIT
-          "$STAGE/wenlan" background on
-          test -f "$UNIT_PATH"
-          systemctl --user is-enabled wenlan-server
-          for i in $(seq 1 90); do
-            if curl -sf http://127.0.0.1:7878/api/health >/dev/null; then
-              echo "    daemon healthy after ${i}s"
-              break
-            fi
-            sleep 1
-            if [ "$i" = "90" ]; then
-              echo "FAIL: daemon did not start under systemd user service" >&2
-              journalctl --user -u wenlan-server --no-pager | tail -50 >&2 || true
-              exit 1
-            fi
-          done
-          "$STAGE/wenlan" background off
-          test -f "$UNIT_PATH"
-          systemctl --user is-enabled wenlan-server
-          active_state="$(systemctl --user show wenlan-server --property=ActiveState --value)"
-          test "$active_state" = "inactive"
-          echo "    Linux background on/off round-trip PASS"
-      # Full-stack acceptance test over real HTTP: ingest a folder via the
-      # shipped CLI, poll hybrid search for a sentinel string, delete a
-      # file, re-sync, and assert the chunks are reaped while the sibling
-      # survives. Complements the in-process folder_ingest_e2e above by
-      # exercising the daemon boundary (routes, scheduler drain, CLI).
-      # Reuses the binaries built by the background E2E and the cached
-      # fastembed model restored above.
-      - name: E2E folder ingest over HTTP (Linux)
-        if: matrix.os == 'ubuntu-24.04'
-        run: bash scripts/smoke-folder-ingest.sh
       # Ordinary Windows PR proof uses debug artifacts already warmed by the
       # integration suite. Stage the pinned DLL next to the daemon because the
       # scheduled task does not inherit ORT_DYLIB_PATH from this runner shell.
@@ -722,6 +678,109 @@ jobs:
             $global:LASTEXITCODE = 0
           }
 
+  # Linux acceptance runs beside the long workspace-lib lane. On PR #384,
+  # these steps occupied ~9 minutes after workspace lib tests had already
+  # finished; keeping them independent removes that serialization without
+  # transferring a target directory or making correctness depend on cache hits.
+  linux-acceptance:
+    name: linux-acceptance
+    needs: [detect-changes]
+    if: "needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || github.event_name != 'pull_request'"
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      # Main warms the eval-harness and integration variants owned only by this
+      # lane. Pull requests restore those outputs but never write ref-local keys.
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+      RUSTC_WRAPPER: sccache
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Restore compiler inputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: test
+          cache-all-crates: "true"
+          cache-targets: "false"
+          save-if: "false"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
+        with:
+          tool: cargo-nextest
+      - name: Restore portable FastEmbed model
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
+      - name: Page lint scale gate (Linux time + RSS)
+        run: bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
+      - name: Upload Page lint scale receipt (Linux)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: task-19-lint-scale-ubuntu-24.04-${{ github.sha }}
+          path: ${{ runner.temp }}/task-19-memory-lint-debugger-linux.txt
+          retention-days: 30
+          if-no-files-found: error
+      - name: Integration tests wenlan-cli + wenlan-server (Linux)
+        run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'
+      - name: Run integration tests (core) (Linux)
+        # --features eval-harness: selected eval_* targets compile to zero
+        # tests without it. eval_harness.rs itself remains manual-only because
+        # it requires external data or API credentials.
+        run: cargo nextest run -p wenlan-core --features eval-harness --test build_env --test chat_import_e2e --test distill_redesign_e2e --test distillation_quality --test doc_reconcile_e2e --test eval_cost_caps --test eval_report_paths --test eval_report_roundtrip --test eval_save_guards --test folder_ingest_e2e --test lint_maintenance_probe_e2e --test page_citations_e2e --test pdf_ordered_text --test provenance_p2 --test provenance_p3 --test read_scope --test space_scoping_e2e
+      - name: E2E wenlan background on/off (Linux user-systemd)
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$(whoami)"
+          uid="$(id -u)"
+          export XDG_RUNTIME_DIR="/run/user/$uid"
+          cargo build -p wenlan -p wenlan-server
+          STAGE=$(mktemp -d)
+          UNIT_PATH="$HOME/.config/systemd/user/wenlan-server.service"
+          cp target/debug/wenlan target/debug/wenlan-server "$STAGE/"
+          cleanup() {
+            "$STAGE/wenlan" background off 2>/dev/null || true
+            systemctl --user disable --now wenlan-server.service >/dev/null 2>&1 || true
+            rm -f "$UNIT_PATH"
+            systemctl --user daemon-reload >/dev/null 2>&1 || true
+            rm -rf "$STAGE"
+          }
+          trap cleanup EXIT
+          "$STAGE/wenlan" background on
+          test -f "$UNIT_PATH"
+          systemctl --user is-enabled wenlan-server
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:7878/api/health >/dev/null; then
+              echo "    daemon healthy after ${i}s"
+              break
+            fi
+            sleep 1
+            if [ "$i" = "90" ]; then
+              echo "FAIL: daemon did not start under systemd user service" >&2
+              journalctl --user -u wenlan-server --no-pager | tail -50 >&2 || true
+              exit 1
+            fi
+          done
+          "$STAGE/wenlan" background off
+          test -f "$UNIT_PATH"
+          systemctl --user is-enabled wenlan-server
+          active_state="$(systemctl --user show wenlan-server --property=ActiveState --value)"
+          test "$active_state" = "inactive"
+          echo "    Linux background on/off round-trip PASS"
+      - name: E2E folder ingest over HTTP (Linux)
+        run: bash scripts/smoke-folder-ingest.sh
+
   # Release-profile proof runs beside the ordinary Windows contract instead of
   # adding ~25-30 minutes to its critical path. It is required for native,
   # Cargo/build, packaging, and release workflow diffs, plus every non-PR
@@ -810,16 +869,15 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
-      # real_router.rs boots a real MemoryDB, which loads the FastEmbed ONNX
-      # model (network fetch if uncached). Reuse the cache from any previous
-      # successful Linux consumer so this job normally skips the cold fetch.
-      - name: Cache fastembed model (Linux)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # real_router.rs boots a real MemoryDB. detect-changes owns the only cold
+      # fetch; this lane must fail closed if the prepared snapshot is absent.
+      - name: Restore portable FastEmbed model
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ env.FASTEMBED_CACHE_DIR }}
-          key: fastembed-bge-base-en-v1.5-q-v2
-          restore-keys: |
-            fastembed-bge-base-en-v1.5-q-
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
       - name: Quarantined tests (wenlan-mcp + wenlan-types)
         run: cargo nextest run -p wenlan-mcp -p wenlan-types
 
@@ -848,7 +906,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, fmt, lint, test, windows-release-proof, docs, plugin, npm]
+    needs: [detect-changes, fmt, lint, test, linux-acceptance, windows-release-proof, docs, plugin, npm]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -879,6 +937,7 @@ jobs:
           expect_job fmt "$run_rust" '${{ needs.fmt.result }}'
           expect_job lint "$run_rust" '${{ needs.lint.result }}'
           expect_job test "$run_rust" '${{ needs.test.result }}'
+          expect_job linux-acceptance "$run_rust" '${{ needs.linux-acceptance.result }}'
           expect_job windows-release-proof '${{ github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-release == 'true' }}' '${{ needs.windows-release-proof.result }}'
           expect_job docs '${{ needs.detect-changes.outputs.docs == 'true' }}' '${{ needs.docs.result }}'
           expect_job plugin '${{ needs.detect-changes.outputs.plugin == 'true' }}' '${{ needs.plugin.result }}'

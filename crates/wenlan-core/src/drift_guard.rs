@@ -100,22 +100,33 @@ fn version_sync_detects_mismatch() {
 // ── Teeth #5: FastEmbed CI cache contract ──
 
 fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
-    const CACHE_STEP: &str = "Cache fastembed model (Linux)";
+    const CACHE_STEP: &str = "Restore portable FastEmbed model";
     const CACHE_DIR: &str = "${{ github.workspace }}/.fastembed_cache";
-    const CACHE_PATH: &str = "${{ env.FASTEMBED_CACHE_DIR }}";
-    const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v2";
-    const JOBS: &[(&str, &str)] = &[
-        ("test", "Workspace lib tests (Linux)"),
+    const CACHE_PATH: &str = ".fastembed_cache";
+    const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v3-portable";
+    const JOBS: &[(&str, &[&str])] = &[
+        (
+            "test",
+            &[
+                "Workspace lib tests (Linux)",
+                "Workspace lib tests (macOS)",
+                "Integration tests wenlan-cli + wenlan-server (Windows)",
+            ],
+        ),
+        (
+            "linux-acceptance",
+            &["Integration tests wenlan-cli + wenlan-server (Linux)"],
+        ),
         (
             "test-quarantine",
-            "Quarantined tests (wenlan-mcp + wenlan-types)",
+            &["Quarantined tests (wenlan-mcp + wenlan-types)"],
         ),
     ];
 
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse ci.yml");
     let mut violations = Vec::new();
 
-    for (job_name, consumer_name) in JOBS {
+    for (job_name, consumer_names) in JOBS {
         let actual_cache_dir = parsed["jobs"][*job_name]["env"]["FASTEMBED_CACHE_DIR"].as_str();
         if actual_cache_dir != Some(CACHE_DIR) {
             violations.push(format!(
@@ -164,18 +175,81 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 "job {job_name} uses FastEmbed cache key {actual_key:?}, expected {CACHE_KEY:?}"
             ));
         }
+        if steps[cache_index]["with"]["enableCrossOsArchive"].as_str() != Some("true")
+            || steps[cache_index]["with"]["fail-on-cache-miss"].as_str() != Some("true")
+        {
+            violations.push(format!(
+                "job {job_name} does not restore the portable cache cross-OS and fail closed"
+            ));
+        }
+        if *job_name == "test" && !steps[cache_index]["if"].is_null() {
+            violations.push("test restores the model only on a subset of matrix OSes".into());
+        }
 
-        let consumer_index = steps
+        for consumer_name in *consumer_names {
+            let consumer_index = steps
+                .iter()
+                .position(|step| step["name"].as_str() == Some(consumer_name));
+            match consumer_index {
+                Some(index) if cache_index < index => {}
+                Some(index) => violations.push(format!(
+                    "job {job_name} restores FastEmbed at step {cache_index} after consumer step {index}"
+                )),
+                None => violations.push(format!(
+                    "job {job_name} is missing consumer step {consumer_name:?}"
+                )),
+            }
+        }
+    }
+
+    let detect_steps = parsed["jobs"]["detect-changes"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let detect_index = |name: &str| {
+        detect_steps
             .iter()
-            .position(|step| step["name"].as_str() == Some(consumer_name));
-        match consumer_index {
-            Some(index) if cache_index < index => {}
-            Some(index) => violations.push(format!(
-                "job {job_name} restores FastEmbed at step {cache_index} after consumer step {index}"
-            )),
-            None => violations.push(format!(
-                "job {job_name} is missing consumer step {consumer_name:?}"
-            )),
+            .position(|step| step["name"].as_str() == Some(name))
+    };
+    let prep_order = [
+        detect_index("Test FastEmbed cache preparation"),
+        detect_index("Restore portable FastEmbed model"),
+        detect_index("Restore legacy Linux FastEmbed model"),
+        detect_index("Prepare portable FastEmbed model"),
+        detect_index("Save portable FastEmbed model"),
+    ];
+    if prep_order.iter().any(Option::is_none)
+        || !prep_order
+            .windows(2)
+            .all(|pair| pair[0].is_some_and(|left| pair[1].is_some_and(|right| left < right)))
+    {
+        violations.push(
+            "detect-changes does not test, restore, prepare, then save the portable model".into(),
+        );
+    }
+    let prepare = detect_index("Prepare portable FastEmbed model")
+        .and_then(|index| detect_steps.get(index).copied());
+    if prepare.and_then(|step| step["run"].as_str())
+        != Some("python3 scripts/prepare-fastembed-cache.py")
+    {
+        violations.push("detect-changes does not run the pinned FastEmbed preparer".into());
+    }
+    for name in [
+        "Restore portable FastEmbed model",
+        "Save portable FastEmbed model",
+    ] {
+        let Some(step) = detect_index(name).and_then(|index| detect_steps.get(index).copied())
+        else {
+            continue;
+        };
+        if step["with"]["path"].as_str() != Some(CACHE_PATH)
+            || step["with"]["key"].as_str() != Some(CACHE_KEY)
+            || step["with"]["enableCrossOsArchive"].as_str() != Some("true")
+        {
+            violations.push(format!(
+                "detect-changes {name:?} does not use the portable cache contract"
+            ));
         }
     }
 
@@ -583,16 +657,27 @@ jobs:
     steps:
       - name: Workspace lib tests (Linux)
         run: export WENLAN_TEST_FASTEMBED_CACHE=/tmp/stale-cache
-      - name: Cache fastembed model (Linux)
+      - name: Restore portable FastEmbed model
         with:
           path: ~/.local/share/wenlan/memorydb/fastembed_cache
+          key: stale
+  linux-acceptance:
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - name: Restore portable FastEmbed model
+        with:
+          path: .fastembed_cache
+          key: stale
+      - name: Integration tests wenlan-cli + wenlan-server (Linux)
   test-quarantine:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - name: Cache fastembed model (Linux)
+      - name: Restore portable FastEmbed model
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: stale
       - name: Quarantined tests (wenlan-mcp + wenlan-types)
 "#;
     let violations = fastembed_ci_cache_violations(workflow);
@@ -1053,6 +1138,32 @@ fn job_needs(workflow: &serde_yaml::Value, job_name: &str) -> Vec<String> {
         .collect()
 }
 
+fn required_job_closure(workflow: &serde_yaml::Value) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    let mut pending = vec!["conclusion".to_string()];
+    while let Some(job_name) = pending.pop() {
+        if required.insert(job_name.clone()) {
+            pending.extend(job_needs(workflow, &job_name));
+        }
+    }
+    required
+}
+
+fn required_jobs_contain(workflow: &serde_yaml::Value, needle: &str) -> bool {
+    required_job_closure(workflow).iter().any(|job_name| {
+        workflow["jobs"][job_name]["steps"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .any(|step| {
+                step["run"].as_str().is_some_and(|run| run.contains(needle))
+                    || step["uses"]
+                        .as_str()
+                        .is_some_and(|uses| uses.contains(needle))
+            })
+    })
+}
+
 fn job_step<'a>(
     workflow: &'a serde_yaml::Value,
     job_name: &str,
@@ -1459,6 +1570,11 @@ fn ci_routing_contract_violations(
         violations.push(
             "Linux canonical routing is not a fail-closed catch-all for tracked Rust sources"
                 .into(),
+        );
+    }
+    if !rust_paths.contains("crates/**/tests/**") {
+        violations.push(
+            "Linux canonical routing omits non-Rust test fixtures under crates/**/tests/**".into(),
         );
     }
     if !rust_paths.contains(".github/workflows/coverage.yml") {
@@ -1976,19 +2092,23 @@ fn ci_routing_contract_violations(
     {
         violations.push("macOS nextest workspace proof is unnecessarily single-threaded".into());
     }
-    let shared_integration = job_step(
+    let linux_integration = job_step(
+        &ci,
+        "linux-acceptance",
+        "Integration tests wenlan-cli + wenlan-server (Linux)",
+    );
+    let macos_integration = job_step(
         &ci,
         "test",
-        "Integration tests wenlan-cli + wenlan-server (shared integration only)",
+        "Integration tests wenlan-cli + wenlan-server (macOS)",
     );
-    let shared_integration_condition = shared_integration
-        .and_then(|step| step["if"].as_str())
-        .unwrap_or_default();
-    let shared_integration_run = shared_integration
+    if linux_integration
         .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if !shared_integration_condition.contains("matrix.os != 'windows-2022'")
-        || !shared_integration_run.contains("-E 'kind(test)'")
+        .is_none_or(|run| !run.contains("-E 'kind(test)'"))
+        || macos_integration.and_then(|step| step["if"].as_str()) != Some("matrix.os == 'macos-14'")
+        || macos_integration
+            .and_then(|step| step["run"].as_str())
+            .is_none_or(|run| !run.contains("-E 'kind(test)'"))
     {
         violations
             .push("Linux/macOS integration step duplicates wenlan CLI/server lib tests".into());
@@ -2131,6 +2251,7 @@ jobs:
         "condition omits CI scheduling trigger",
         "coverage workflow",
         "clippy configuration",
+        "non-Rust test fixtures",
         "nextest config",
         "release-profile-sensitive",
         "release-sensitive",
@@ -2157,6 +2278,1620 @@ jobs:
                 .iter()
                 .any(|violation| violation.contains(expected)),
             "fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+// ── Teeth #9: Linux acceptance runs beside the long workspace-lib lane ──
+
+fn linux_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let mut violations = Vec::new();
+    let job = &ci["jobs"]["linux-acceptance"];
+
+    if job_needs(&ci, "linux-acceptance") != ["detect-changes"] {
+        violations.push("Linux acceptance is serialized behind another required job".into());
+    }
+    if job["if"].as_str() != ci["jobs"]["test"]["if"].as_str() {
+        violations
+            .push("Linux acceptance does not share the fail-closed Rust routing condition".into());
+    }
+    if job["runs-on"].as_str() != Some("ubuntu-24.04")
+        || job["timeout-minutes"].as_str()
+            != Some("${{ github.event_name == 'pull_request' && 30 || 60 }}")
+    {
+        violations.push("Linux acceptance is not bounded on the canonical Linux runner".into());
+    }
+    for (name, expected) in [
+        ("CARGO_PROFILE_DEV_DEBUG", "0"),
+        ("CARGO_PROFILE_TEST_DEBUG", "0"),
+        (
+            "SCCACHE_GHA_RW_MODE",
+            "${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}",
+        ),
+        (
+            "FASTEMBED_CACHE_DIR",
+            "${{ github.workspace }}/.fastembed_cache",
+        ),
+    ] {
+        if job["env"][name].as_str() != Some(expected) {
+            violations.push(format!(
+                "Linux acceptance env {name} is not pinned to {expected}"
+            ));
+        }
+    }
+
+    for step_name in [
+        "Page lint scale gate (Linux time + RSS)",
+        "Upload Page lint scale receipt (Linux)",
+        "Integration tests wenlan-cli + wenlan-server (Linux)",
+        "Run integration tests (core) (Linux)",
+        "E2E wenlan background on/off (Linux user-systemd)",
+        "E2E folder ingest over HTTP (Linux)",
+    ] {
+        if job_step(&ci, "linux-acceptance", step_name).is_none() {
+            violations.push(format!(
+                "Linux acceptance does not own required step {step_name}"
+            ));
+        }
+        if job_step(&ci, "test", step_name).is_some() {
+            violations.push(format!(
+                "required step {step_name} remains serialized in the workspace-lib matrix"
+            ));
+        }
+    }
+    for (step_name, expected_run, violation) in [
+        (
+            "Page lint scale gate (Linux time + RSS)",
+            r#"bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt""#,
+            "Linux acceptance page lint command is not executable",
+        ),
+        (
+            "Integration tests wenlan-cli + wenlan-server (Linux)",
+            "cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'",
+            "Linux acceptance CLI/server integration command is not executable",
+        ),
+        (
+            "E2E folder ingest over HTTP (Linux)",
+            "bash scripts/smoke-folder-ingest.sh",
+            "Linux acceptance folder ingest smoke is not unconditional",
+        ),
+    ] {
+        let step = job_step(&ci, "linux-acceptance", step_name);
+        if step.and_then(|step| step["run"].as_str()) != Some(expected_run)
+            || step.is_some_and(|step| step.get("if").is_some())
+        {
+            violations.push(violation.into());
+        }
+    }
+    let core_integration = job_step(
+        &ci,
+        "linux-acceptance",
+        "Run integration tests (core) (Linux)",
+    );
+    if core_integration.is_some_and(|step| step.get("if").is_some()) {
+        violations.push("Linux core integration coverage is conditionally disabled".into());
+    }
+    let systemd = job_step(
+        &ci,
+        "linux-acceptance",
+        "E2E wenlan background on/off (Linux user-systemd)",
+    );
+    let systemd_run = systemd
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let systemd_active_lines = systemd_run
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<BTreeSet<_>>();
+    if systemd.is_some_and(|step| step.get("if").is_some())
+        || [
+            r#"sudo loginctl enable-linger "$(whoami)""#,
+            "cargo build -p wenlan -p wenlan-server",
+            "\"$STAGE/wenlan\" background on",
+            "systemctl --user is-enabled wenlan-server",
+            "\"$STAGE/wenlan\" background off",
+            r#"active_state="$(systemctl --user show wenlan-server --property=ActiveState --value)""#,
+            "test \"$active_state\" = \"inactive\"",
+        ]
+        .iter()
+        .any(|command| !systemd_active_lines.contains(command))
+    {
+        violations.push("Linux systemd acceptance command lost a lifecycle assertion".into());
+    }
+    let lint_upload = job_step(
+        &ci,
+        "linux-acceptance",
+        "Upload Page lint scale receipt (Linux)",
+    );
+    if lint_upload.and_then(|step| step["if"].as_str()) != Some("always()")
+        || lint_upload
+            .and_then(|step| step["uses"].as_str())
+            .is_none_or(|uses| !uses.starts_with("actions/upload-artifact@"))
+        || lint_upload.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ runner.temp }}/task-19-memory-lint-debugger-linux.txt")
+    {
+        violations.push("Linux page lint receipt is not always preserved".into());
+    }
+    let macos_integration = job_step(
+        &ci,
+        "test",
+        "Integration tests wenlan-cli + wenlan-server (macOS)",
+    );
+    if macos_integration.and_then(|step| step["if"].as_str()) != Some("matrix.os == 'macos-14'") {
+        violations.push("macOS lost its shared CLI/server integration owner".into());
+    }
+
+    let acceptance_steps = job["steps"]
+        .as_sequence()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let rust_caches = acceptance_steps
+        .iter()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
+        })
+        .collect::<Vec<_>>();
+    let rust_cache = rust_caches.first().copied();
+    if rust_caches.len() != 1
+        || rust_cache.and_then(|step| step["with"]["shared-key"].as_str()) != Some("test")
+        || rust_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some("false")
+        || rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
+    {
+        violations.push("Linux acceptance needs exactly one restore-only rust-cache action".into());
+    }
+    let sccache_actions = acceptance_steps
+        .iter()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.contains("sccache-action"))
+        })
+        .count();
+    if sccache_actions != 1 {
+        violations.push("Linux acceptance needs exactly one read-only sccache action".into());
+    }
+    let fastembed_restores = acceptance_steps
+        .iter()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.contains("actions/cache/restore@"))
+        })
+        .collect::<Vec<_>>();
+    let fastembed = fastembed_restores.first().copied();
+    if fastembed_restores.len() != 1
+        || fastembed.and_then(|step| step["with"]["path"].as_str()) != Some(".fastembed_cache")
+        || fastembed.and_then(|step| step["with"]["key"].as_str())
+            != Some("fastembed-bge-base-en-v1.5-q-v3-portable")
+        || fastembed.and_then(|step| step["with"]["enableCrossOsArchive"].as_str()) != Some("true")
+        || fastembed.and_then(|step| step["with"]["fail-on-cache-miss"].as_str()) != Some("true")
+    {
+        violations.push("Linux acceptance FastEmbed cache is not restore-only".into());
+    }
+    if acceptance_steps
+        .iter()
+        .filter_map(|step| step["uses"].as_str())
+        .any(|uses| uses.starts_with("actions/cache@") || uses.contains("actions/cache/save@"))
+    {
+        violations.push("Linux acceptance contains a FastEmbed cache writer".into());
+    }
+
+    if !job_needs(&ci, "conclusion")
+        .iter()
+        .any(|need| need == "linux-acceptance")
+    {
+        violations.push("conclusion.needs omits Linux acceptance".into());
+    }
+    let conclusion = workflow_step_run(&ci, "Aggregate expected CI results").unwrap_or_default();
+    if !conclusion.lines().map(str::trim).any(|line| {
+        line.starts_with("expect_job linux-acceptance ")
+            && line.contains("\"$run_rust\"")
+            && line.contains("needs.linux-acceptance.result")
+    }) {
+        violations.push("conclusion does not fail closed on Linux acceptance".into());
+    }
+
+    violations
+}
+
+#[test]
+fn linux_acceptance_is_parallel_required_and_restore_only() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let violations = linux_acceptance_contract_violations(&ci);
+    assert!(
+        violations.is_empty(),
+        "Linux acceptance critical-path contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn linux_acceptance_contract_rejects_serialized_or_optional_fixture() {
+    let ci = r#"
+jobs:
+  test:
+    if: run-rust
+    steps:
+      - name: E2E folder ingest over HTTP (Linux)
+        run: old
+  linux-acceptance:
+    needs: [test]
+    if: other
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "true"
+      - uses: actions/cache@v4
+  conclusion:
+    needs: [test]
+    steps:
+      - name: Aggregate expected CI results
+        run: echo success
+"#;
+    let violations = linux_acceptance_contract_violations(ci);
+    for expected in [
+        "serialized",
+        "fail-closed Rust routing",
+        "canonical Linux runner",
+        "env",
+        "does not own required step",
+        "remains serialized",
+        "macOS lost",
+        "exactly one restore-only rust-cache",
+        "FastEmbed cache is not restore-only",
+        "FastEmbed cache writer",
+        "conclusion.needs",
+        "conclusion does not fail closed",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn linux_acceptance_contract_rejects_semantic_noops_and_secondary_writers() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci = ci
+        .replace(
+            "      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}",
+            "      SCCACHE_GHA_RW_MODE: READ_ONLY",
+        )
+        .replace(
+            "        run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'",
+            "        run: \"true\"",
+        )
+        .replace(
+            "      - name: E2E folder ingest over HTTP (Linux)\n        run: bash scripts/smoke-folder-ingest.sh",
+            "      - name: E2E folder ingest over HTTP (Linux)\n        if: \"false\"\n        run: bash scripts/smoke-folder-ingest.sh",
+        )
+        .replace(
+            "          test \"$active_state\" = \"inactive\"",
+            "          # test \"$active_state\" = \"inactive\"",
+        )
+        .replace(
+            "      - name: Install cargo-nextest",
+            "      - uses: Swatinem/rust-cache@v2\n        with:\n          save-if: \"true\"\n      - name: Install cargo-nextest",
+        )
+        .replace(
+            "          expect_job linux-acceptance \"$run_rust\" '${{ needs.linux-acceptance.result }}'",
+            "          # expect_job linux-acceptance \"$run_rust\" '${{ needs.linux-acceptance.result }}'",
+        );
+    let violations = linux_acceptance_contract_violations(&ci);
+    for expected in [
+        "SCCACHE_GHA_RW_MODE",
+        "CLI/server integration command",
+        "folder ingest smoke",
+        "systemd acceptance command",
+        "exactly one restore-only rust-cache",
+        "conclusion does not fail closed",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "semantic mutation must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+// ── Teeth #10: every normal core integration target has a required owner ──
+
+fn core_integration_contract_violations(
+    ci_workflow: &str,
+    integration_targets: &[String],
+) -> Vec<String> {
+    const MANUAL_ONLY: &[(&str, &str)] = &[
+        (
+            "cached_scenario_db_check",
+            "requires the external cached eval scenario databases",
+        ),
+        (
+            "eval_harness",
+            "contains manual eval cases that require external data or API credentials",
+        ),
+    ];
+
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let Some(run) = job_step(
+        &ci,
+        "linux-acceptance",
+        "Run integration tests (core) (Linux)",
+    )
+    .and_then(|step| step["run"].as_str()) else {
+        return vec!["required Linux core integration step is missing".into()];
+    };
+
+    let nextest_commands = run
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("cargo nextest run "))
+        .collect::<Vec<_>>();
+    let mut violations = Vec::new();
+    if nextest_commands.len() != 1 {
+        violations.push(format!(
+            "required Linux core integration step has {} canonical cargo nextest invocations, expected exactly one",
+            nextest_commands.len()
+        ));
+    }
+    let words = nextest_commands
+        .first()
+        .map(|command| command.split_whitespace().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let prefix = [
+        "cargo",
+        "nextest",
+        "run",
+        "-p",
+        "wenlan-core",
+        "--features",
+        "eval-harness",
+    ];
+    let test_arguments = words.get(prefix.len()..).unwrap_or_default();
+    let valid_test_arguments = words.starts_with(&prefix)
+        && test_arguments.len() % 2 == 0
+        && test_arguments.chunks_exact(2).all(|pair| {
+            pair[0] == "--test"
+                && !pair[1].is_empty()
+                && pair[1]
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+        });
+    if !valid_test_arguments {
+        violations.push(
+            "required Linux core integration command is not the exact canonical argv contract"
+                .into(),
+        );
+    }
+    let selected = if valid_test_arguments {
+        test_arguments
+            .chunks_exact(2)
+            .map(|pair| pair[1])
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let manual_only = MANUAL_ONLY
+        .iter()
+        .map(|(target, _reason)| *target)
+        .collect::<BTreeSet<_>>();
+
+    violations.extend(
+        integration_targets
+            .iter()
+            .filter(|target| !manual_only.contains(target.as_str()))
+            .filter(|target| !selected.contains(target.as_str()))
+            .map(|target| {
+            format!(
+                "core integration target {target:?} has no required canonical Linux proof and is not manual-only"
+            )
+            }),
+    );
+    violations
+}
+
+fn core_integration_targets(root: &Path) -> Vec<String> {
+    let mut targets = std::fs::read_dir(root.join("crates/wenlan-core/tests"))
+        .expect("read wenlan-core integration tests")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
+                .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets
+}
+
+#[test]
+fn every_core_integration_target_has_a_required_or_manual_owner() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let violations = core_integration_contract_violations(&ci, &core_integration_targets(&root));
+    assert!(
+        violations.is_empty(),
+        "core integration inventory drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn core_integration_inventory_fails_closed_for_an_unknown_target() {
+    let ci = r#"
+jobs:
+  linux-acceptance:
+    steps:
+      - name: Run integration tests (core) (Linux)
+        run: cargo nextest run -p wenlan-core --features eval-harness --test known
+"#;
+    let targets = vec![
+        "known".to_string(),
+        "new_platform_sensitive_test".to_string(),
+    ];
+    let violations = core_integration_contract_violations(ci, &targets);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("new_platform_sensitive_test")),
+        "an unknown integration target must default into required Linux proof: {violations:?}"
+    );
+}
+
+#[test]
+fn core_integration_inventory_rejects_dead_text_coverage() {
+    let ci = r#"
+jobs:
+  linux-acceptance:
+    steps:
+      - name: Run integration tests (core) (Linux)
+        run: |
+          # cargo nextest run -p wenlan-core --features eval-harness --test commented_out
+          echo --test echoed_only
+          cargo nextest run -p wenlan-core --features eval-harness --test actually_run # --test inline_commented
+"#;
+    let targets = vec![
+        "actually_run".to_string(),
+        "commented_out".to_string(),
+        "echoed_only".to_string(),
+        "inline_commented".to_string(),
+    ];
+    let violations = core_integration_contract_violations(ci, &targets);
+    for missing in ["commented_out", "echoed_only", "inline_commented"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(missing)),
+            "dead text must not satisfy required integration ownership for {missing}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn core_integration_inventory_rejects_shell_operator_dead_text() {
+    for (operator, dead_target) in [("|", "piped_only"), ("&", "background_only")] {
+        let ci = format!(
+            r#"
+jobs:
+  linux-acceptance:
+    steps:
+      - name: Run integration tests (core) (Linux)
+        run: cargo nextest run -p wenlan-core --features eval-harness --test actually_run {operator} echo --test {dead_target}
+"#
+        );
+        let targets = vec!["actually_run".to_string(), dead_target.to_string()];
+        let violations = core_integration_contract_violations(&ci, &targets);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(dead_target)),
+            "shell operator {operator:?} must not make {dead_target} look executed: {violations:?}"
+        );
+    }
+}
+
+// ── Teeth #11: the main eval canary stays off the required CI path ──
+
+fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let canary: serde_yaml::Value =
+        serde_yaml::from_str(canary_workflow).unwrap_or(serde_yaml::Value::Null);
+    let mut violations = Vec::new();
+
+    let mut required_jobs = BTreeSet::new();
+    let mut pending_jobs = vec!["conclusion".to_string()];
+    while let Some(job_name) = pending_jobs.pop() {
+        if required_jobs.insert(job_name.clone()) {
+            pending_jobs.extend(job_needs(&ci, &job_name));
+        }
+    }
+    for job_name in &required_jobs {
+        for step in ci["jobs"][job_name]["steps"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+        {
+            let run = step["run"].as_str().unwrap_or_default();
+            if run.contains("eval::retrieval") && run.contains("--run-ignored=only") {
+                violations.push(format!(
+                    "required CI test critical path contains the embedding eval in job {job_name}"
+                ));
+            }
+        }
+    }
+    for step_name in [
+        "Run embedding-only eval (main only, Linux)",
+        "Upload eval canary baseline (with env schema)",
+    ] {
+        if job_step(&ci, "test", step_name).is_some() {
+            violations.push(format!(
+                "{step_name} still extends the required CI test critical path"
+            ));
+        }
+    }
+    if job_needs(&ci, "conclusion")
+        .iter()
+        .any(|job| job == "main-canary")
+    {
+        violations.push("conclusion.needs includes the non-blocking main canary".into());
+    }
+    if !detect_change_filter_paths(&ci, "rust").contains(".github/workflows/main-canary.yml") {
+        violations.push("Rust routing omits the main canary workflow contract".into());
+    }
+
+    let push_branches = canary["on"]["push"]["branches"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    if push_branches != ["main"] {
+        violations.push(format!(
+            "main canary push trigger is not limited to main: {push_branches:?}"
+        ));
+    }
+    if canary["on"]["push"].get("paths").is_some()
+        || canary["on"]["push"].get("paths-ignore").is_some()
+    {
+        violations.push(
+            "main canary filters main pushes by path instead of proving every accepted push".into(),
+        );
+    }
+    if !canary["on"]["workflow_dispatch"].is_null() {
+        // A null mapping value is how `workflow_dispatch:` is represented.
+    } else if canary["on"].get("workflow_dispatch").is_none() {
+        violations.push("main canary has no manual workflow_dispatch trigger".into());
+    }
+    if canary["on"].get("pull_request").is_some() {
+        violations.push("main canary runs on pull requests".into());
+    }
+    if !canary["concurrency"].is_null() {
+        violations.push(
+            "main canary uses concurrency that can discard an accepted main push proof".into(),
+        );
+    }
+
+    let job = &canary["jobs"]["main-canary"];
+    if job["runs-on"].as_str() != Some("ubuntu-24.04") {
+        violations.push("main canary does not run on the canonical Linux platform".into());
+    }
+    if job["timeout-minutes"].as_u64() != Some(60) {
+        violations.push("main canary does not retain a 60-minute cold-cache budget".into());
+    }
+    if !job_needs(&canary, "main-canary").is_empty() {
+        violations.push("main canary is not an independent job".into());
+    }
+    if job["env"]["SCCACHE_GHA_RW_MODE"].as_str() != Some("READ_ONLY") {
+        violations.push("main canary sccache is not read-only".into());
+    }
+    if job["env"]["FASTEMBED_CACHE_DIR"].as_str()
+        != Some("${{ github.workspace }}/.fastembed_cache")
+    {
+        violations.push("main canary does not pin the FastEmbed cache directory".into());
+    }
+
+    let canary_steps = job["steps"].as_sequence().into_iter().flatten();
+    let rust_cache_steps = canary_steps
+        .clone()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
+        })
+        .collect::<Vec<_>>();
+    if rust_cache_steps.len() != 1
+        || rust_cache_steps.iter().any(|step| {
+            step["with"]["shared-key"].as_str() != Some("test")
+                || step["with"]["cache-targets"].as_str() != Some("false")
+                || step["with"]["save-if"].as_str() != Some("false")
+        })
+    {
+        violations.push("main canary rust-cache is not restore-only".into());
+    }
+    if rust_cache_steps
+        .iter()
+        .any(|step| step["with"]["save-if"].as_str() != Some("false"))
+    {
+        violations.push("main canary contains a rust-cache writer".into());
+    }
+    if canary_steps.clone().any(|step| {
+        step["env"]["SCCACHE_GHA_RW_MODE"]
+            .as_str()
+            .is_some_and(|mode| mode != "READ_ONLY")
+            || step["run"].as_str().is_some_and(|run| {
+                run.contains("SCCACHE_GHA_RW_MODE") && run.contains("READ_WRITE")
+            })
+    }) {
+        violations.push("main canary step overrides sccache read-only mode".into());
+    }
+    let fastembed_restore = job_step_using(&canary, "main-canary", "actions/cache/restore");
+    if fastembed_restore
+        .and_then(|step| step["uses"].as_str())
+        .is_none_or(|uses| !uses.contains("actions/cache/restore@"))
+        || fastembed_restore.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ env.FASTEMBED_CACHE_DIR }}")
+        || fastembed_restore.and_then(|step| step["with"]["key"].as_str())
+            != Some("fastembed-bge-base-en-v1.5-q-v2")
+    {
+        violations.push("main canary FastEmbed cache is not restore-only".into());
+    }
+    if canary_steps
+        .clone()
+        .filter_map(|step| step["uses"].as_str())
+        .any(|uses| uses.starts_with("actions/cache@") || uses.contains("actions/cache/save@"))
+    {
+        violations.push("main canary contains a FastEmbed cache writer".into());
+    }
+
+    let eval = job_step(&canary, "main-canary", "Run embedding-only eval");
+    if eval.and_then(|step| step["run"].as_str())
+        != Some("cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval")
+        || eval.and_then(|step| step["env"]["EVAL_BASELINES_DIR"].as_str())
+            != Some("${{ runner.temp }}/origin-eval-canary")
+    {
+        violations.push("main canary does not run the exact embedding-only eval contract".into());
+    }
+    let upload = job_step(&canary, "main-canary", "Upload eval canary baseline");
+    if upload
+        .and_then(|step| step["uses"].as_str())
+        .is_none_or(|uses| !uses.contains("actions/upload-artifact@"))
+        || upload.and_then(|step| step["if"].as_str()) != Some("always()")
+        || upload.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ runner.temp }}/origin-eval-canary/*.json")
+        || upload.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("warn")
+    {
+        violations
+            .push("main canary does not preserve its always-uploaded baseline receipt".into());
+    }
+
+    violations
+}
+
+#[test]
+fn main_canary_is_independent_and_read_only() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let canary =
+        std::fs::read_to_string(root.join(".github/workflows/main-canary.yml")).unwrap_or_default();
+    let violations = main_canary_contract_violations(&ci, &canary);
+    assert!(
+        violations.is_empty(),
+        "main canary contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn main_canary_contract_rejects_embedded_or_writing_fixture() {
+    let ci = r#"
+jobs:
+  detect-changes:
+    steps:
+      - id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**/*.rs'
+  test:
+    steps:
+      - name: Run embedding-only eval (main only, Linux)
+        run: cargo nextest run
+      - name: Upload eval canary baseline (with env schema)
+        run: upload
+  conclusion:
+    needs: [test, main-canary]
+"#;
+    let canary = r#"
+on:
+  pull_request:
+  push:
+    branches: [feature]
+    paths-ignore: [docs/**]
+concurrency:
+  group: main-canary
+  cancel-in-progress: true
+jobs:
+  main-canary:
+    needs: test
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+      FASTEMBED_CACHE_DIR: /tmp/other
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: canary
+          cache-targets: "true"
+          save-if: "true"
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/other
+          key: mutable
+      - name: Run embedding-only eval
+        run: cargo test
+"#;
+    let violations = main_canary_contract_violations(ci, canary);
+    for expected in [
+        "required CI test critical path",
+        "conclusion.needs",
+        "Rust routing",
+        "limited to main",
+        "filters main pushes by path",
+        "manual workflow_dispatch",
+        "pull requests",
+        "concurrency",
+        "canonical Linux",
+        "60-minute cold-cache budget",
+        "independent job",
+        "sccache is not read-only",
+        "FastEmbed cache directory",
+        "rust-cache is not restore-only",
+        "FastEmbed cache is not restore-only",
+        "FastEmbed cache writer",
+        "exact embedding-only eval",
+        "always-uploaded baseline receipt",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn main_canary_contract_rejects_semantic_reinsertion_and_secondary_writers() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci = ci.replace(
+        "      - name: E2E wenlan background on/off (Linux user-systemd)",
+        r#"      - name: Renamed retrieval regression suite
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
+      - name: E2E wenlan background on/off (Linux user-systemd)"#,
+    );
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml");
+    let canary = canary
+        .replace(
+            "      - name: Install cargo-nextest",
+            r#"      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hidden-writer
+          cache-targets: "true"
+          save-if: "true"
+      - name: Install cargo-nextest"#,
+        )
+        .replace(
+            "      - name: Run embedding-only eval\n        env:\n",
+            "      - name: Run embedding-only eval\n        env:\n          SCCACHE_GHA_RW_MODE: READ_WRITE\n",
+        );
+    let violations = main_canary_contract_violations(&ci, &canary);
+    for expected in [
+        "required CI test critical path",
+        "rust-cache writer",
+        "step overrides sccache read-only mode",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn main_canary_contract_rejects_eval_inside_conclusion_itself() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci = ci.replace(
+        "      - name: Aggregate expected CI results",
+        r#"      - name: Renamed canary inside the required summary
+        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
+      - name: Aggregate expected CI results"#,
+    );
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml");
+    let violations = main_canary_contract_violations(&ci, &canary);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("required CI test critical path")),
+        "fixture must reject an eval step inside conclusion itself: {violations:?}"
+    );
+}
+
+// ── Teeth #12: CI measurements stay read-only and off the required path ──
+
+fn ci_observer_contract_violations(ci_workflow: &str, observer_workflow: &str) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let observer: serde_yaml::Value =
+        serde_yaml::from_str(observer_workflow).unwrap_or(serde_yaml::Value::Null);
+    let mut violations = Vec::new();
+
+    let workflows = observer["on"]["workflow_run"]["workflows"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    let types = observer["on"]["workflow_run"]["types"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    if workflows != ["CI"] || types != ["completed"] {
+        violations.push("CI observer is not triggered only after completed CI runs".into());
+    }
+    if observer["on"].as_mapping().is_none_or(|on| on.len() != 1) {
+        violations.push("CI observer has triggers beyond workflow_run".into());
+    }
+    if observer["permissions"]["actions"].as_str() != Some("read")
+        || observer["permissions"]["contents"].as_str() != Some("read")
+        || observer["permissions"]
+            .as_mapping()
+            .is_none_or(|permissions| permissions.len() != 2)
+    {
+        violations
+            .push("CI observer does not have exact read-only Actions/content permissions".into());
+    }
+    if observer_workflow.contains("${{ secrets.") {
+        violations.push("CI observer reads repository secrets".into());
+    }
+    if required_job_closure(&ci)
+        .iter()
+        .any(|job| job.contains("observer"))
+        || required_jobs_contain(&ci, ".github/workflows/ci-observer.yml")
+        || required_jobs_contain(&ci, "scripts/ci-observer.py")
+    {
+        violations.push("required CI closure depends on the out-of-band CI observer".into());
+    }
+    if !detect_change_filter_paths(&ci, "rust").contains(".github/workflows/ci-observer.yml") {
+        violations.push("Rust routing omits the CI observer contract".into());
+    }
+    let required_script_step = job_step(&ci, "test", "Verify ort-sys source pin");
+    let required_script_lines = required_script_step
+        .and_then(|step| step["run"].as_str())
+        .into_iter()
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let expected_script_lines = [
+        "python3 scripts/ci-observer.test.py",
+        "python3 scripts/ci-timed-command.test.py",
+        "python3 scripts/verify-ort-source-pin.test.py",
+        "python3 scripts/verify-ort-source-pin.py",
+    ];
+    if !required_job_closure(&ci).contains("test")
+        || ci["jobs"]["test"].get("continue-on-error").is_some()
+        || required_script_step.and_then(|step| step["if"].as_str())
+            != Some("matrix.os == 'ubuntu-24.04'")
+        || required_script_step.is_some_and(|step| step.get("continue-on-error").is_some())
+        || required_script_lines != expected_script_lines
+    {
+        violations.push(
+            "required Linux CI measurement contracts are not in the exact executable test step"
+                .into(),
+        );
+    }
+
+    let observer_jobs = observer["jobs"]
+        .as_mapping()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _job)| name.as_str())
+        .collect::<Vec<_>>();
+    if observer_jobs != ["collect"] {
+        violations.push("CI observer contains jobs beyond the single bounded collector".into());
+    }
+    let job = &observer["jobs"]["collect"];
+    if job["runs-on"].as_str() != Some("ubuntu-24.04") || job["timeout-minutes"].as_u64() != Some(5)
+    {
+        violations.push("CI observer is not bounded to the canonical hosted runner".into());
+    }
+    if job.get("environment").is_some() || job.get("permissions").is_some() {
+        violations.push("CI observer adds environment or job-level permissions".into());
+    }
+    let steps = job["steps"].as_sequence().into_iter().flatten();
+    let checkouts = steps
+        .clone()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.contains("actions/checkout@"))
+        })
+        .collect::<Vec<_>>();
+    let checkout = checkouts.first().copied();
+    if checkouts.len() != 1 {
+        violations.push("CI observer does not contain exactly one trusted checkout".into());
+    }
+    if checkout.and_then(|step| step["with"]["ref"].as_str()) != Some("${{ github.sha }}")
+        || checkout.and_then(|step| step["with"]["persist-credentials"].as_bool()) != Some(false)
+    {
+        violations.push(
+            "CI observer does not checkout trusted default-branch code without credentials".into(),
+        );
+    }
+    if checkout
+        .and_then(|step| step["with"]["ref"].as_str())
+        .is_some_and(|reference| reference.contains("head_sha"))
+    {
+        violations.push("CI observer executes code from the measured untrusted head SHA".into());
+    }
+    let uses = steps
+        .clone()
+        .filter_map(|step| step["uses"].as_str())
+        .collect::<Vec<_>>();
+    if uses.iter().any(|action| {
+        action.contains("actions/cache")
+            || action.contains("rust-cache")
+            || action.contains("sccache-action")
+            || action.contains("download-artifact")
+    }) {
+        violations.push("CI observer restores untrusted artifacts or build caches".into());
+    }
+    let action_pin = regex::Regex::new(r"^[^@]+@[0-9a-f]{40}$").unwrap();
+    if uses.iter().any(|action| !action_pin.is_match(action)) {
+        violations.push("CI observer uses an action without an immutable SHA pin".into());
+    }
+    let allowed_actions = [
+        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    ];
+    if uses.len() != allowed_actions.len()
+        || uses.iter().any(|action| !allowed_actions.contains(action))
+    {
+        violations.push("CI observer uses an action beyond checkout and receipt upload".into());
+    }
+    let run = steps
+        .clone()
+        .filter_map(|step| step["run"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "cargo ",
+        "npm ",
+        "git ",
+        "eval ",
+        "source ",
+        "/logs",
+        "/artifacts",
+        "cache delete",
+        "--method POST",
+        "--method PUT",
+        "--method PATCH",
+        "--method DELETE",
+        "${{ github.event.workflow_run.",
+    ] {
+        if run.contains(forbidden) {
+            violations.push(format!(
+                "CI observer can execute or mutate untrusted state through {forbidden:?}"
+            ));
+        }
+    }
+    for required in [
+        "/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100",
+        "/actions/cache/usage",
+        "/actions/cache/storage-limit",
+        "--method GET",
+        "--paginate --slurp",
+        "scripts/ci-observer.py",
+        "--event \"$GITHUB_EVENT_PATH\"",
+    ] {
+        if !run.contains(required) {
+            violations.push(format!("CI observer omits required evidence {required:?}"));
+        }
+    }
+    let receipt_builder = job_step(&observer, "collect", "Build timing and cache receipt");
+    if receipt_builder.and_then(|step| step["if"].as_str()) != Some("always()") {
+        violations.push("CI observer receipt builder does not run after metadata failures".into());
+    }
+    let upload = steps.clone().find(|step| {
+        step["uses"]
+            .as_str()
+            .is_some_and(|uses| uses.contains("actions/upload-artifact@"))
+    });
+    if upload.and_then(|step| step["if"].as_str()) != Some("always()")
+        || upload.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ runner.temp }}/ci-observer/receipt.json")
+        || upload.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("error")
+    {
+        violations.push(
+            "CI observer receipt is not always uploaded from runner.temp with missing files fatal"
+                .into(),
+        );
+    }
+
+    violations
+}
+
+#[test]
+fn ci_observer_is_out_of_band_read_only_and_never_executes_measured_code() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let observer =
+        std::fs::read_to_string(root.join(".github/workflows/ci-observer.yml")).unwrap_or_default();
+    let violations = ci_observer_contract_violations(&ci, &observer);
+    assert!(
+        violations.is_empty(),
+        "CI observer contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn ci_observer_contract_rejects_privilege_and_untrusted_inputs() {
+    let ci = "jobs:\n  conclusion:\n    needs: [ci-observer]\n";
+    let observer = r#"
+on:
+  pull_request:
+  workflow_run:
+    workflows: [Other]
+    types: [requested]
+permissions:
+  actions: write
+  contents: write
+jobs:
+  collect:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    environment: production
+    env:
+      TOKEN: ${{ secrets.RELEASE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: true
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+      - run: cargo test && gh api --method DELETE /actions/caches && gh api /logs
+      - uses: actions/upload-artifact@v4
+        with:
+          path: target/
+  extra:
+    permissions:
+      contents: write
+    steps:
+      - run: echo extra
+"#;
+    let violations = ci_observer_contract_violations(ci, observer);
+    for expected in [
+        "completed CI runs",
+        "triggers beyond",
+        "read-only Actions/content permissions",
+        "reads repository secrets",
+        "required CI closure",
+        "Rust routing",
+        "measurement contract",
+        "single bounded collector",
+        "canonical hosted runner",
+        "environment or job-level permissions",
+        "trusted default-branch code",
+        "untrusted head SHA",
+        "untrusted artifacts or build caches",
+        "immutable SHA pin",
+        "beyond checkout and receipt upload",
+        "execute or mutate untrusted state",
+        "required evidence",
+        "receipt builder",
+        "missing files fatal",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "observer fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ci_observer_contract_rejects_short_circuited_or_optional_measurement_tests() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let observer =
+        std::fs::read_to_string(root.join(".github/workflows/ci-observer.yml")).unwrap_or_default();
+    let ci = ci
+        .replace(
+            "        if: matrix.os == 'ubuntu-24.04'\n        run: |\n          python3 scripts/ci-observer.test.py",
+            "        if: \"false\"\n        run: |\n          exit 0\n          python3 scripts/ci-observer.test.py",
+        );
+    let violations = ci_observer_contract_violations(&ci, &observer);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| { violation.contains("exact executable test step") }),
+        "optional or short-circuited measurement tests must fail: {violations:?}"
+    );
+}
+
+#[test]
+fn ci_observer_contract_rejects_non_blocking_measurement_tests() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let observer =
+        std::fs::read_to_string(root.join(".github/workflows/ci-observer.yml")).unwrap_or_default();
+    let ci = ci.replace(
+        "        run: |\n          python3 scripts/ci-observer.test.py",
+        "        continue-on-error: true\n        run: |\n          python3 scripts/ci-observer.test.py",
+    );
+    let violations = ci_observer_contract_violations(&ci, &observer);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("exact executable test step")),
+        "non-blocking measurement tests must fail: {violations:?}"
+    );
+}
+
+// ── Teeth #13: hosted optimization experiments stay manual and restore-only ──
+
+fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let benchmark: serde_yaml::Value =
+        serde_yaml::from_str(benchmark_workflow).unwrap_or(serde_yaml::Value::Null);
+    let mut violations = Vec::new();
+
+    if benchmark["on"].get("workflow_dispatch").is_none()
+        || benchmark["on"].as_mapping().is_none_or(|on| on.len() != 1)
+    {
+        violations.push("CI benchmark is not workflow_dispatch-only".into());
+    }
+    if benchmark["permissions"]["contents"].as_str() != Some("read")
+        || benchmark["permissions"]
+            .as_mapping()
+            .is_none_or(|permissions| permissions.len() != 1)
+    {
+        violations.push("CI benchmark does not have exact read-only contents permission".into());
+    }
+    if benchmark_workflow.contains("${{ secrets.") {
+        violations.push("CI benchmark reads repository secrets".into());
+    }
+    if required_job_closure(&ci)
+        .iter()
+        .any(|job| job.contains("benchmark"))
+        || required_jobs_contain(&ci, "ci-benchmark")
+        || required_jobs_contain(&ci, "ci-timed-command.py")
+    {
+        violations.push("required CI closure depends on a benchmark job".into());
+    }
+    if !detect_change_filter_paths(&ci, "rust").contains(".github/workflows/ci-benchmark.yml") {
+        violations.push("Rust routing omits the CI benchmark contract".into());
+    }
+
+    for required in [
+        "p4-runners",
+        "p5-test-engine",
+        "p5-windows-drive",
+        "p6-release",
+        "ubuntu-24.04",
+        "ubuntu-latest",
+        "macos-14",
+        "macos-15",
+        "macos-26",
+        "macos-latest",
+        "windows-2022",
+        "windows-2025",
+        "windows-latest",
+        "cargo nextest run --workspace --lib",
+        "cargo test --workspace --lib --no-fail-fast",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+        "CARGO_PROFILE_RELEASE_LTO",
+        "scripts/ci-timed-command.py",
+    ] {
+        if !benchmark_workflow.contains(required) {
+            violations.push(format!(
+                "CI benchmark omits experiment control {required:?}"
+            ));
+        }
+    }
+    if benchmark["jobs"]["p5-test-engine"]["env"]["SCCACHE_GHA_RW_MODE"].as_str()
+        != Some("READ_ONLY")
+    {
+        violations.push("P5 benchmark does not enforce read-only sccache".into());
+    }
+    let p6_entries = benchmark["jobs"]["p6-release"]["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if p6_entries.is_empty()
+        || p6_entries.iter().any(|entry| {
+            entry.get("cache").is_some()
+                || !matches!(
+                    entry["cache_mode"].as_str(),
+                    Some("cold" | "production-restore")
+                )
+        })
+        || !p6_entries
+            .iter()
+            .any(|entry| entry["cache_mode"].as_str() == Some("cold"))
+        || !p6_entries
+            .iter()
+            .any(|entry| entry["cache_mode"].as_str() == Some("production-restore"))
+    {
+        violations.push(
+            "P6 cache_mode must use both exact cold and production-restore vocabulary".into(),
+        );
+    }
+    let p6_cache_receipt = job_step(&benchmark, "p6-release", "Record release cache evidence")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let active_receipt_lines = p6_cache_receipt
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let expected_cache_logic = [
+        r#"requested_mode = "${{ matrix.cache_mode }}""#,
+        r#"profile = "${{ matrix.profile }}""#,
+        "effective_cache = (",
+        r#""profile-invalidated-cold""#,
+        r#"if requested_mode == "production-restore" and profile != "current""#,
+        "else requested_mode",
+        ")",
+    ];
+    let has_exact_cache_logic = active_receipt_lines
+        .windows(expected_cache_logic.len())
+        .any(|window| window == expected_cache_logic);
+    let effective_cache_assignments = active_receipt_lines
+        .iter()
+        .filter(|line| line.starts_with("effective_cache ="))
+        .count();
+    if !has_exact_cache_logic
+        || effective_cache_assignments != 1
+        || !active_receipt_lines.contains(&r#""effective_cache": effective_cache,"#)
+    {
+        violations
+            .push("P6 cache receipt does not expose profile-invalidated restores as cold".into());
+    }
+    let drives = benchmark["jobs"]["p5-windows-drive"]["strategy"]["matrix"]["drive"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    if drives != ["C", "D"] || !benchmark_workflow.contains("/wenlan-benchmark/") {
+        violations.push("CI benchmark does not compare explicit Windows C and D roots".into());
+    }
+
+    let benchmark_jobs = benchmark["jobs"]
+        .as_mapping()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _job)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_jobs = BTreeSet::from([
+        "p4-runners",
+        "p5-test-engine",
+        "p5-windows-drive",
+        "p6-release",
+    ]);
+    if benchmark_jobs != expected_jobs {
+        violations.push("CI benchmark contains jobs beyond the four orthogonal suites".into());
+    }
+
+    let jobs = benchmark["jobs"].as_mapping().into_iter().flatten();
+    for (job_name, job) in jobs {
+        let job_name = job_name.as_str().unwrap_or("<non-string>");
+        if job.get("environment").is_some() || job.get("permissions").is_some() {
+            violations.push(format!(
+                "benchmark job {job_name} adds environment or job-level permissions"
+            ));
+        }
+        if serde_yaml::to_string(job)
+            .is_ok_and(|yaml| yaml.contains("SCCACHE_GHA_RW_MODE: READ_WRITE"))
+        {
+            violations.push(format!(
+                "benchmark job {job_name} enables sccache writes in env"
+            ));
+        }
+        if job["strategy"]["fail-fast"].as_bool() != Some(false) {
+            violations.push(format!("benchmark job {job_name} is not fail-fast false"));
+        }
+        if job["timeout-minutes"]
+            .as_u64()
+            .is_none_or(|timeout| timeout > 90)
+        {
+            violations.push(format!("benchmark job {job_name} lacks a bounded timeout"));
+        }
+        let steps = job["steps"].as_sequence().into_iter().flatten();
+        let upload = steps.clone().find(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.contains("actions/upload-artifact@"))
+        });
+        if upload.and_then(|step| step["if"].as_str()) != Some("always()")
+            || upload
+                .and_then(|step| step["with"]["path"].as_str())
+                .is_none_or(|path| path.contains("target"))
+        {
+            violations.push(format!(
+                "benchmark job {job_name} does not always upload receipt-only evidence"
+            ));
+        }
+    }
+
+    let steps = benchmark["jobs"]
+        .as_mapping()
+        .into_iter()
+        .flat_map(|jobs| jobs.values())
+        .flat_map(|job| job["steps"].as_sequence().into_iter().flatten());
+    let action_pin = regex::Regex::new(r"^[^@]+@[0-9a-f]{40}$").unwrap();
+    for step in steps {
+        let uses = step["uses"].as_str().unwrap_or_default();
+        if !uses.is_empty() && !action_pin.is_match(uses) {
+            violations.push("CI benchmark uses an action without an immutable SHA pin".into());
+        }
+        if uses.contains("Swatinem/rust-cache") && step["with"]["save-if"].as_str() != Some("false")
+        {
+            violations.push("CI benchmark contains a rust-cache writer".into());
+        }
+        if uses.contains("actions/cache@") || uses.contains("actions/cache/save@") {
+            violations.push("CI benchmark contains a generic cache writer".into());
+        }
+        if step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains("SCCACHE_GHA_RW_MODE") && run.contains("READ_WRITE"))
+        {
+            violations.push("CI benchmark contains an sccache writer".into());
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn ci_benchmark_is_manual_restore_only_and_outside_required_ci() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .unwrap_or_default();
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations.is_empty(),
+        "CI benchmark contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_automatic_or_writing_fixture() {
+    let ci = "jobs:\n  conclusion:\n    needs: [ci-benchmark]\n";
+    let benchmark = r#"
+on:
+  push:
+permissions:
+  contents: write
+env:
+  TOKEN: ${{ secrets.RELEASE_TOKEN }}
+jobs:
+  bad:
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+    strategy:
+      fail-fast: true
+    steps:
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+      - run: SCCACHE_GHA_RW_MODE=READ_WRITE cargo test
+      - uses: actions/upload-artifact@v4
+        with:
+          path: target/
+"#;
+    let violations = ci_benchmark_contract_violations(ci, benchmark);
+    for expected in [
+        "workflow_dispatch-only",
+        "read-only contents permission",
+        "reads repository secrets",
+        "required CI closure",
+        "Rust routing",
+        "omits experiment control",
+        "profile-invalidated restores",
+        "four orthogonal suites",
+        "environment or job-level permissions",
+        "sccache writes in env",
+        "fail-fast false",
+        "bounded timeout",
+        "receipt-only evidence",
+        "rust-cache writer",
+        "generic cache writer",
+        "sccache writer",
+        "immutable SHA pin",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "benchmark fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ci_benchmark_contract_requires_read_only_sccache_and_truthful_restore_modes() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark
+        .replace("      SCCACHE_GHA_RW_MODE: READ_ONLY\n", "")
+        .replace("cache_mode: production-restore", "cache_mode: warm")
+        .replace("profile-invalidated-cold", "production-restore");
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    for expected in [
+        "read-only sccache",
+        "production-restore",
+        "profile-invalidated restores",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "benchmark guard must reject missing {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_dead_profile_cache_logic() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        "if requested_mode == \"production-restore\" and profile != \"current\"",
+        "if False",
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("profile-invalidated restores")),
+        "dead truthfulness logic must fail the benchmark contract: {violations:?}"
+    );
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_unused_effective_cache_value() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        r#""effective_cache": effective_cache,"#,
+        r#""effective_cache": requested_mode,"#,
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("profile-invalidated restores")),
+        "unused effective cache logic must fail the benchmark contract: {violations:?}"
+    );
+}
+
+fn workflow_action_pin_violations(workflow_name: &str, workflow: &str) -> Vec<String> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse workflow");
+    let action_pin = regex::Regex::new(r"^[^@\s]+@[0-9a-f]{40}$").unwrap();
+    let mut violations = Vec::new();
+    for (job_name, job) in parsed["jobs"].as_mapping().into_iter().flatten() {
+        let job_name = job_name.as_str().unwrap_or("<non-string>");
+        let mut check = |location: &str, uses: Option<&str>| {
+            if let Some(uses) = uses {
+                if !uses.starts_with("./") && !action_pin.is_match(uses) {
+                    violations.push(format!(
+                        "{workflow_name} {location} uses action {uses:?} without an immutable SHA pin"
+                    ));
+                }
+            }
+        };
+        check(
+            &format!("job {job_name}"),
+            job.get("uses").and_then(serde_yaml::Value::as_str),
+        );
+        for (index, step) in job["steps"].as_sequence().into_iter().flatten().enumerate() {
+            let step_name = step["name"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{index}"));
+            check(
+                &format!("job {job_name} step {step_name}"),
+                step.get("uses").and_then(serde_yaml::Value::as_str),
+            );
+        }
+    }
+    violations
+}
+
+#[test]
+fn ci_evidence_workflows_pin_every_action_by_sha() {
+    let root = repo_root();
+    let mut violations = Vec::new();
+    for path in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/main-canary.yml",
+        ".github/workflows/ci-observer.yml",
+        ".github/workflows/ci-benchmark.yml",
+    ] {
+        let workflow = std::fs::read_to_string(root.join(path)).expect("read workflow");
+        violations.extend(workflow_action_pin_violations(path, &workflow));
+    }
+    assert!(
+        violations.is_empty(),
+        "CI evidence workflow action pin drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn ci_evidence_action_pin_contract_rejects_mutable_refs() {
+    let workflow = r#"
+on: push
+jobs:
+  reusable:
+    uses: owner/repo/.github/workflows/reusable.yml@main
+  test:
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/upload-artifact@v4
+      - uses: ./local-action
+"#;
+    let violations = workflow_action_pin_violations("fixture.yml", workflow);
+    assert_eq!(
+        violations.len(),
+        2,
+        "mutable job and step action refs must fail while SHA and local refs pass: {violations:?}"
+    );
+    for mutable_ref in ["@main", "@v4"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(mutable_ref)),
+            "missing violation for {mutable_ref}: {violations:?}"
         );
     }
 }
