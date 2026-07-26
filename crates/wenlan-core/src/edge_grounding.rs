@@ -583,14 +583,17 @@ async fn run_edge_grounding_with_budget(
             }
             Ok(_) => {
                 // Zero rows: between the scan and this flip the edge was
-                // superseded or its source content was edited (stale-evidence
-                // race). Do NOT poison and do NOT advance — hold so the edge is
-                // re-read and re-judged against fresh evidence next tick. A
-                // later candidate advancing the cursor would skip past this held
-                // head, so stop the tick here (mirrors the transient-hold path).
+                // superseded, its source content was edited, its relation's
+                // linkage moved to another source, or the relation was
+                // deleted/re-created (stale-evidence race; the full guard
+                // basis is on `promote_edges_grounded`). Do NOT poison and do
+                // NOT advance — hold so the edge is re-read and re-judged
+                // against fresh evidence next tick. A later candidate
+                // advancing the cursor would skip past this held head, so
+                // stop the tick here (mirrors the transient-hold path).
                 log::debug!(
-                    "[edge_grounding] flip affected 0 rows for edge {} (superseded or \
-                     source edited mid-entailment); holding for re-judge",
+                    "[edge_grounding] flip affected 0 rows for edge {} (evidence or \
+                     linkage changed mid-entailment); holding for re-judge",
                     cand.edge_id
                 );
                 break;
