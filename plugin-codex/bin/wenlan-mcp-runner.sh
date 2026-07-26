@@ -5,7 +5,7 @@
 #   1. Sibling file `bin/wenlan-mcp.local` next to this script.
 #   2. WENLAN_MCP_DEV_BIN env var, for local development.
 #   3. ~/.wenlan/bin/wenlan-mcp, installed by install.sh.
-#   4. npx -y wenlan-mcp@^0.14.1, package fallback.
+#   4. npx -y wenlan-mcp@^0.15.0, package fallback.
 #
 # The explicit agent name is a Codex plugin requirement: stdio MCP clients may
 # send a client name during initialize, but the fallback must not mislabel
@@ -29,4 +29,4 @@ if [ -x "${installed_bin}" ]; then
   exec "${installed_bin}" --agent-name "${agent_name}" "$@"
 fi
 
-exec npx -y wenlan-mcp@^0.14.1 --agent-name "${agent_name}" "$@"
+exec npx -y wenlan-mcp@^0.15.0 --agent-name "${agent_name}" "$@"

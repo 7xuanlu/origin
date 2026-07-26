@@ -33,7 +33,7 @@ codex plugin add wenlan@7xuanlu-wenlan
 ```
 
 The plugin runner uses `~/.wenlan/bin/wenlan-mcp` when available and falls back
-to `npx -y wenlan-mcp@^0.14.1`. It passes `--agent-name codex` so captures are
+to `npx -y wenlan-mcp@^0.15.0`. It passes `--agent-name codex` so captures are
 labeled as Codex writes.
 
 Before changing plugin skills, manifests, MCP runner wiring, or the local
