@@ -677,6 +677,7 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         .await
         .expect("open independent M4 observer");
     let observer = observer_db.connect().expect("connect M4 observer");
+    assert_m4_schema(&observer).await;
     seed_m4_graded_corpus(&observer).await;
 
     let root_id = db
@@ -734,6 +735,10 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
             .expect("promote second-space negative control"),
         1
     );
+    let second_space_state = read_m4_persisted_snapshot(&observer, SECOND_SPACE).await;
+    assert_eq!(second_space_state.graph_generation, 1);
+    assert!(second_space_state.dirty);
+    assert!(second_space_state.members.is_empty());
 
     db.set_reader_cutover("communities", true)
         .await
@@ -870,6 +875,13 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         ),
         "same-key exclusion must be typed LeaseHeld, got {held:?}"
     );
+    assert!(
+        db.run_next_community_grouping_cycle()
+            .await
+            .expect("phase-slot contention is a clean skip")
+            .is_none(),
+        "an already-held durable lease must not fail the whole refinery phase"
+    );
 
     let computed = compute_community_grouping(&attempt, &runtime)
         .expect("pure compute between DB phases, with no DB handle");
@@ -983,6 +995,283 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         "independent foreground-query max {foreground_max:?} reaches the hard fail"
     );
     assert_m4_job_phase_structure();
+}
+
+#[tokio::test]
+async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge() {
+    const SPACE: &str = "m4-correction-space";
+    const SOURCE_ID: &str = "m4-correction-source";
+    const SOURCE_CONTENT: &str =
+        "The correction fixture grounds relations before retracting or merging them.";
+
+    let dir = tempfile::tempdir().expect("M4 correction tempdir");
+    let db = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("open M4 correction database");
+    db.upsert_documents(vec![RawDocument {
+        source: "memory".to_owned(),
+        source_id: SOURCE_ID.to_owned(),
+        title: "M4 corrections".to_owned(),
+        content: SOURCE_CONTENT.to_owned(),
+        last_modified: 1_722_000_000,
+        memory_type: Some("fact".to_owned()),
+        space: Some(SPACE.to_owned()),
+        source_agent: Some("folder".to_owned()),
+        confirmed: Some(true),
+        ..Default::default()
+    }])
+    .await
+    .expect("seed M4 correction source");
+    let root_id = db
+        .acquire_provenance_root(
+            "document_ingest",
+            SOURCE_CONTENT,
+            &IndependenceSignals {
+                source_identity: Some("file:///m4-corrections.md"),
+                agent_turn: None,
+                import_batch: None,
+            },
+        )
+        .await
+        .expect("acquire correction provenance root");
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open correction observer");
+    let observer = observer_db.connect().expect("connect correction observer");
+
+    let left = db
+        .create_entity("Correction Left", "concept", Some(SPACE))
+        .await
+        .expect("create left entity");
+    let right = db
+        .create_entity("Correction Right", "concept", Some(SPACE))
+        .await
+        .expect("create right entity");
+    let relation_id = db
+        .create_relation(
+            &left,
+            &right,
+            "related_to",
+            Some("m4-gate"),
+            Some(1.0),
+            Some("ground before retract"),
+            Some(SOURCE_ID),
+        )
+        .await
+        .expect("create relation to retract");
+    let edge_id = compute_edge_id("relates", "entity", &left, "entity", &right, "related_to");
+    assert_eq!(
+        db.promote_edges_grounded(&[EdgePromotion {
+            edge_id: edge_id.clone(),
+            root_id: root_id.clone(),
+            payload: r#"{"grounded":true,"source":"m4-correction"}"#.to_owned(),
+            relation_id: relation_id.clone(),
+            source_memory_id: SOURCE_ID.to_owned(),
+            judged_content: SOURCE_CONTENT.to_owned(),
+        }])
+        .await
+        .expect("ground relation before retract"),
+        1
+    );
+    assert_eq!(read_m4_generation(&observer, SPACE).await, 1);
+
+    db.supersede_relation(&relation_id, "replacement-relation")
+        .await
+        .expect("retract grounded relation");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        2,
+        "grounded retraction must advance the space exactly once"
+    );
+
+    db.create_relation(
+        &left,
+        &right,
+        "related_to",
+        Some("m4-gate"),
+        Some(1.0),
+        Some("reactivate grounded relation"),
+        Some(SOURCE_ID),
+    )
+    .await
+    .expect("reactivate relation");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        3,
+        "reactivating an already-grounded edge must advance the space exactly once"
+    );
+
+    let canonical = db
+        .create_entity("Canonical Entity", "concept", Some(SPACE))
+        .await
+        .expect("create canonical entity");
+    let alias = db
+        .create_entity("Alias Entity", "concept", Some(SPACE))
+        .await
+        .expect("create alias entity");
+    let neighbor = db
+        .create_entity("Merge Neighbor", "concept", Some(SPACE))
+        .await
+        .expect("create merge neighbor");
+    let merge_relation = db
+        .create_relation(
+            &alias,
+            &neighbor,
+            "related_to",
+            Some("m4-gate"),
+            Some(1.0),
+            Some("ground before entity merge"),
+            Some(SOURCE_ID),
+        )
+        .await
+        .expect("create merge relation");
+    let old_merge_edge = compute_edge_id(
+        "relates",
+        "entity",
+        &alias,
+        "entity",
+        &neighbor,
+        "related_to",
+    );
+    assert_eq!(
+        db.promote_edges_grounded(&[EdgePromotion {
+            edge_id: old_merge_edge.clone(),
+            root_id,
+            payload: r#"{"grounded":true,"source":"m4-merge"}"#.to_owned(),
+            relation_id: merge_relation,
+            source_memory_id: SOURCE_ID.to_owned(),
+            judged_content: SOURCE_CONTENT.to_owned(),
+        }])
+        .await
+        .expect("ground relation before merge"),
+        1
+    );
+    assert_eq!(read_m4_generation(&observer, SPACE).await, 4);
+
+    db.merge_entities(&canonical, &alias)
+        .await
+        .expect("merge grounded relation endpoint");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        5,
+        "one entity-merge transaction must advance each affected space exactly once"
+    );
+    let new_merge_edge = compute_edge_id(
+        "relates",
+        "entity",
+        &canonical,
+        "entity",
+        &neighbor,
+        "related_to",
+    );
+    assert!(
+        read_edge_active_grounded(&observer, &old_merge_edge)
+            .await
+            .is_none(),
+        "the pre-merge grounded edge must leave the active graph"
+    );
+    assert_eq!(
+        read_edge_active_grounded(&observer, &new_merge_edge).await,
+        Some((canonical, neighbor)),
+        "the corrected endpoint edge must remain active and grounded"
+    );
+
+    let published = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run the phase-slot M4 wrapper")
+        .expect("the corrected space is dirty");
+    match published {
+        CommunityGroupingOutcome::Published(receipt) => {
+            assert_eq!(receipt.published_generation, 5);
+            assert_eq!(
+                receipt.member_count, 0,
+                "five participants stay below the authored viability floor"
+            );
+        }
+        other => panic!("phase-slot wrapper must publish the corrected generation: {other:?}"),
+    }
+    assert!(
+        db.run_next_community_grouping_cycle()
+            .await
+            .expect("query clean phase slot")
+            .is_none(),
+        "one phase firing drains at most one dirty space and leaves it clean"
+    );
+
+    let restart_left = db
+        .create_entity("Restart Left", "concept", Some(SPACE))
+        .await
+        .expect("create restart left");
+    let restart_right = db
+        .create_entity("Restart Right", "concept", Some(SPACE))
+        .await
+        .expect("create restart right");
+    let restart_relation = db
+        .create_relation(
+            &restart_left,
+            &restart_right,
+            "related_to",
+            Some("m4-gate"),
+            Some(1.0),
+            Some("ground before process restart"),
+            Some(SOURCE_ID),
+        )
+        .await
+        .expect("create restart relation");
+    let restart_edge = compute_edge_id(
+        "relates",
+        "entity",
+        &restart_left,
+        "entity",
+        &restart_right,
+        "related_to",
+    );
+    assert_eq!(
+        db.promote_edges_grounded(&[EdgePromotion {
+            edge_id: restart_edge,
+            root_id: db
+                .acquire_provenance_root(
+                    "document_ingest",
+                    SOURCE_CONTENT,
+                    &IndependenceSignals {
+                        source_identity: Some("file:///m4-corrections.md"),
+                        agent_turn: None,
+                        import_batch: None,
+                    },
+                )
+                .await
+                .expect("reacquire restart root"),
+            payload: r#"{"grounded":true,"source":"m4-restart"}"#.to_owned(),
+            relation_id: restart_relation,
+            source_memory_id: SOURCE_ID.to_owned(),
+            judged_content: SOURCE_CONTENT.to_owned(),
+        }])
+        .await
+        .expect("ground restart correction"),
+        1
+    );
+    assert_eq!(read_m4_generation(&observer, SPACE).await, 6);
+    drop(observer);
+    drop(observer_db);
+    drop(db);
+
+    let reopened = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("reopen after simulated process restart");
+    let restarted = reopened
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("restart routes missing volatile state to full partition")
+        .expect("durable dirty generation survives restart");
+    match restarted {
+        CommunityGroupingOutcome::Published(receipt) => {
+            assert_eq!(receipt.published_generation, 6);
+            assert_eq!(receipt.projected_edge_count, 3);
+        }
+        other => panic!("restart must publish via full fallback: {other:?}"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1241,6 +1530,21 @@ fn assert_m4_job_phase_structure() {
         prepare < compute && compute < finalize,
         "production composer must preserve prepare -> pure compute -> finalize ordering"
     );
+
+    let refinery_source = include_str!("../src/refinery/mod.rs");
+    let legacy = refinery_source
+        .find("let legacy_count = db_ref.detect_communities().await?")
+        .expect("legacy rollback producer stays live");
+    let flag = refinery_source
+        .find("crate::db::community_leiden_enabled()")
+        .expect("default-off M4 phase gate");
+    let shadow = refinery_source
+        .find(".run_next_community_grouping_cycle()")
+        .expect("M4 job uses the existing CommunityDetection phase");
+    assert!(
+        legacy < flag && flag < shadow,
+        "PR-1 phase wiring must keep legacy live, then gate the write-only M4 shadow"
+    );
 }
 
 fn rust_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -1314,6 +1618,80 @@ async fn read_m4_persisted_snapshot(
     }
 }
 
+async fn assert_m4_schema(observer: &libsql::Connection) {
+    let mut version_rows = observer
+        .query("PRAGMA user_version", ())
+        .await
+        .expect("query M4 schema version");
+    assert_eq!(
+        version_rows
+            .next()
+            .await
+            .expect("read M4 schema version")
+            .expect("M4 schema version row")
+            .get::<i64>(0)
+            .expect("decode M4 schema version"),
+        95
+    );
+
+    for (table, required_columns) in [
+        (
+            "communities",
+            &[
+                "community_id",
+                "space",
+                "algo_version",
+                "projection_version",
+                "retired_at",
+            ][..],
+        ),
+        (
+            "community_members",
+            &[
+                "space",
+                "node_id",
+                "community_id",
+                "published_generation",
+                "attachment",
+            ][..],
+        ),
+        (
+            "space_graph_state",
+            &["space", "graph_generation", "published_generation", "dirty"][..],
+        ),
+        (
+            "grouping_leases",
+            &[
+                "phase",
+                "space",
+                "input_generation",
+                "token",
+                "expires_at",
+                "attempt",
+            ][..],
+        ),
+    ] {
+        let mut rows = observer
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await
+            .unwrap_or_else(|error| panic!("query {table} schema: {error}"));
+        let mut actual = BTreeSet::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .unwrap_or_else(|error| panic!("read {table} schema: {error}"))
+        {
+            actual.insert(row.get::<String>(1).expect("decode M4 column"));
+        }
+        for column in required_columns {
+            assert!(
+                actual.contains(*column),
+                "migration 95 {table} is missing {column}: {actual:?}"
+            );
+        }
+    }
+}
+
 async fn read_legacy_community_shadow(
     observer: &libsql::Connection,
     space: &str,
@@ -1366,6 +1744,45 @@ async fn read_m4_lease_generations(observer: &libsql::Connection, space: &str) -
         generations.push(row.get(0).expect("lease generation"));
     }
     generations
+}
+
+async fn read_m4_generation(observer: &libsql::Connection, space: &str) -> i64 {
+    let mut rows = observer
+        .query(
+            "SELECT graph_generation FROM space_graph_state WHERE space = ?1",
+            libsql::params![space.to_owned()],
+        )
+        .await
+        .expect("query M4 generation");
+    rows.next()
+        .await
+        .expect("read M4 generation")
+        .expect("M4 generation row")
+        .get(0)
+        .expect("decode M4 generation")
+}
+
+async fn read_edge_active_grounded(
+    observer: &libsql::Connection,
+    edge_id: &str,
+) -> Option<(String, String)> {
+    let mut rows = observer
+        .query(
+            "SELECT src_id, dst_id FROM edges \
+             WHERE edge_id = ?1 AND grounded = 1 AND valid_until IS NULL",
+            libsql::params![edge_id.to_owned()],
+        )
+        .await
+        .expect("query active grounded edge");
+    rows.next()
+        .await
+        .expect("read active grounded edge")
+        .map(|row| {
+            (
+                row.get(0).expect("decode grounded source"),
+                row.get(1).expect("decode grounded destination"),
+            )
+        })
 }
 
 struct ChurnSeries {

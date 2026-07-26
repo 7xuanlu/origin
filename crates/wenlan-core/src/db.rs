@@ -12,7 +12,7 @@ use crate::sources::{stability_tier, RawDocument};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -576,7 +576,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 94;
+pub const SCHEMA_VERSION: u32 = 95;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -1603,6 +1603,25 @@ pub fn edge_grounding_promote_enabled() -> bool {
 }
 
 fn edge_grounding_promote_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+/// Gate for the M4 Leiden write-only community shadow. Opt-in: default OFF;
+/// enable with WENLAN_ENABLE_COMMUNITY_LEIDEN=1/true/yes. When enabled, the
+/// existing CommunityDetection phase runs one dirty space through the
+/// generation-guarded M4 job while keeping the legacy label-propagation shadow
+/// live for rollback. No new ambient scheduler lane is created.
+pub fn community_leiden_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_COMMUNITY_LEIDEN").ok();
+    community_leiden_enabled_value(value.as_deref())
+}
+
+fn community_leiden_enabled_value(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -2745,6 +2764,10 @@ pub struct MemoryDB {
     embedder: Option<Arc<std::sync::Mutex<TextEmbedding>>>,
     chunker: ChunkingEngine,
     embedding_cache: std::sync::Mutex<EmbeddingCache>,
+    pub(crate) community_dirty_nodes:
+        std::sync::Mutex<BTreeMap<String, BTreeMap<i64, BTreeSet<String>>>>,
+    pub(crate) community_grouping_runtime:
+        std::sync::Mutex<crate::community_grouping::CommunityGroupingRuntime>,
 }
 
 /// Returns true when a memory title looks like it would make a poor snippet —
@@ -2860,6 +2883,10 @@ impl MemoryDB {
             embedder: None,
             chunker: ChunkingEngine::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         })
     }
 
@@ -3055,6 +3082,10 @@ impl MemoryDB {
             embedder: Some(Arc::new(std::sync::Mutex::new(embedder))),
             chunker: build_chunker(db_path),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
 
         // Run schema migrations for existing databases
@@ -3134,6 +3165,10 @@ impl MemoryDB {
             embedder: Some(embedder),
             chunker: build_chunker(db_path),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
 
         instance.run_migrations(emitter.as_ref()).await?;
@@ -8142,6 +8177,14 @@ impl MemoryDB {
             if version < 94 {
                 self.migrate_94_entity_reader_cutover(version).await?;
             }
+
+            // Migration 95 (M4 PR-1): durable community publication
+            // substrate plus the per-space graph-generation and phase-lease
+            // control plane. The tables start empty; PR-1 remains a
+            // write-only shadow and does not touch entities.community_id.
+            if version < 95 {
+                self.migrate_95_community_substrate(version).await?;
+            }
         }
 
         Ok(())
@@ -10139,6 +10182,90 @@ impl MemoryDB {
         );
         Ok(())
     }
+
+    async fn ensure_community_substrate_tables(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS communities (
+                community_id TEXT PRIMARY KEY,
+                space TEXT NOT NULL,
+                display_name TEXT,
+                algo_version TEXT NOT NULL,
+                projection_version TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                retired_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_communities_space
+                ON communities(space) WHERE retired_at IS NULL;
+
+            CREATE TABLE IF NOT EXISTS community_members (
+                space TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                node_kind TEXT NOT NULL DEFAULT 'entity',
+                community_id TEXT NOT NULL REFERENCES communities(community_id),
+                published_generation INTEGER NOT NULL,
+                attachment TEXT NOT NULL,
+                PRIMARY KEY(space, node_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_community_members_community
+                ON community_members(community_id);
+
+            CREATE TABLE IF NOT EXISTS space_graph_state (
+                space TEXT PRIMARY KEY,
+                graph_generation INTEGER NOT NULL DEFAULT 0,
+                published_generation INTEGER,
+                dirty INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS grouping_leases (
+                phase TEXT NOT NULL,
+                space TEXT NOT NULL,
+                input_generation INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(phase, space, input_generation)
+            );",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("ensure community substrate tables: {error}"))
+        })?;
+        Ok(())
+    }
+
+    async fn migrate_95_community_substrate(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(95, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m95 begin: {error}")))?;
+        let result = Self::ensure_community_substrate_tables(&conn).await;
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("m95 commit: {error}")))?;
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        }
+        drop(conn);
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 95", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m95 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 95 applied: M4 community publication substrate and control plane"
+        );
+        Ok(())
+    }
 }
 
 /// Per-store backfill tally for the M2 PR-1 migration report (spec §2
@@ -10154,6 +10281,36 @@ struct EdgeBackfillCounts {
     unknown_inserted: u64,
     unknown_skipped: u64,
 }
+
+#[derive(Debug)]
+struct CommunityGraphChange {
+    space: String,
+    src_id: String,
+    dst_id: String,
+}
+
+#[derive(Debug)]
+struct EntityMergeEdgePlan {
+    old_edge_id: String,
+    src_id: String,
+    dst_id: String,
+    relation_type: String,
+    lineage: String,
+    space: String,
+    cross_space_downgrade: bool,
+    grounded: bool,
+    root_id: Option<String>,
+    payload: Option<String>,
+}
+
+type CommunityGenerationUpdate = (String, i64, BTreeSet<String>);
+type PreparedCommunityGrouping = (
+    i64,
+    Option<i64>,
+    String,
+    Vec<crate::community_partition::ProjectionInputEdge>,
+    BTreeMap<String, String>,
+);
 
 impl EdgeBackfillCounts {
     fn to_json(&self) -> serde_json::Value {
@@ -10351,7 +10508,7 @@ impl MemoryDB {
         cross_space_downgrade: bool,
         operation_id: Option<&str>,
     ) -> Result<String, libsql::Error> {
-        Self::dual_write_edge_with_payload(
+        let (edge_id, _) = Self::dual_write_edge_with_payload(
             conn,
             edge_type,
             src_kind,
@@ -10365,7 +10522,8 @@ impl MemoryDB {
             operation_id,
             None,
         )
-        .await
+        .await?;
+        Ok(edge_id)
     }
 
     /// Like [`dual_write_edge`], plus an optional JSON `payload` written
@@ -10404,7 +10562,7 @@ impl MemoryDB {
         cross_space_downgrade: bool,
         operation_id: Option<&str>,
         payload: Option<&str>,
-    ) -> Result<String, libsql::Error> {
+    ) -> Result<(String, Vec<CommunityGraphChange>), libsql::Error> {
         let edge_id = crate::provenance::compute_edge_id(
             edge_type,
             src_kind,
@@ -10414,6 +10572,29 @@ impl MemoryDB {
             discriminator,
         );
         let now = chrono::Utc::now().timestamp();
+        let prior = if edge_type == "relates" {
+            let mut prior_rows = conn
+                .query(
+                    "SELECT grounded, valid_until, lineage, space, src_id, dst_id \
+                     FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.clone()],
+                )
+                .await?;
+            let prior = prior_rows.next().await?.map(|row| {
+                (
+                    row.get::<i64>(0).unwrap_or(0),
+                    row.get::<Option<i64>>(1).unwrap_or(None),
+                    row.get::<String>(2).unwrap_or_default(),
+                    row.get::<String>(3).unwrap_or_default(),
+                    row.get::<String>(4).unwrap_or_default(),
+                    row.get::<String>(5).unwrap_or_default(),
+                )
+            });
+            drop(prior_rows);
+            prior
+        } else {
+            None
+        };
         // ON CONFLICT resolves the shadow edge independent of dual-write CALL
         // ORDER, reconciling three things a re-write can change:
         //   1. Reactivation -- a soft-invalidated edge (`valid_until` set) is
@@ -10464,7 +10645,8 @@ impl MemoryDB {
         // reconciles to a cross-space typed row is rejected here just as the
         // AFTER INSERT fence rejects it on first write (an earlier version only
         // fenced INSERTs, letting a stale-space reactivation slip through).
-        conn.execute(
+        let affected = conn
+            .execute(
             "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, ?12, NULL, ?9, ?10, NULL, NULL)
              ON CONFLICT(edge_id) DO UPDATE SET
@@ -10502,7 +10684,36 @@ impl MemoryDB {
             ],
         )
         .await?;
-        Ok(edge_id)
+
+        let mut graph_changes = Vec::new();
+        if affected > 0 && edge_type == "relates" {
+            let prior_grounded = prior.as_ref().is_some_and(|prior| prior.0 == 1);
+            let prior_participates = prior
+                .as_ref()
+                .is_some_and(|prior| prior.0 == 1 && prior.1.is_none() && prior.2 == "assertion");
+            let current_participates = prior_grounded && lineage == "assertion";
+            if prior_participates {
+                let prior = prior.as_ref().expect("participating edge has prior row");
+                if !current_participates || prior.3 != space {
+                    graph_changes.push(CommunityGraphChange {
+                        space: prior.3.clone(),
+                        src_id: prior.4.clone(),
+                        dst_id: prior.5.clone(),
+                    });
+                }
+            }
+            if current_participates {
+                let moved_space = prior.as_ref().is_some_and(|prior| prior.3 != space);
+                if !prior_participates || moved_space {
+                    graph_changes.push(CommunityGraphChange {
+                        space: space.to_owned(),
+                        src_id: src_id.to_owned(),
+                        dst_id: dst_id.to_owned(),
+                    });
+                }
+            }
+        }
+        Ok((edge_id, graph_changes))
     }
 
     /// Soft-invalidate a dual-written edge on legacy-store
@@ -10515,14 +10726,65 @@ impl MemoryDB {
         conn: &libsql::Connection,
         edge_id: &str,
         superseded_by: Option<&str>,
-    ) -> Result<(), libsql::Error> {
+    ) -> Result<Option<CommunityGraphChange>, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT space, src_id, dst_id FROM edges \
+                 WHERE edge_id = ?1 AND edge_type = 'relates' \
+                   AND grounded = 1 AND valid_until IS NULL \
+                   AND lineage = 'assertion'",
+                libsql::params![edge_id],
+            )
+            .await?;
+        let graph_change = rows.next().await?.map(|row| CommunityGraphChange {
+            space: row.get::<String>(0).unwrap_or_default(),
+            src_id: row.get::<String>(1).unwrap_or_default(),
+            dst_id: row.get::<String>(2).unwrap_or_default(),
+        });
+        drop(rows);
         let now = chrono::Utc::now().timestamp();
-        conn.execute(
+        let affected = conn
+            .execute(
             "UPDATE edges SET valid_until = ?1, superseded_by = ?2 WHERE edge_id = ?3 AND valid_until IS NULL",
             libsql::params![now, superseded_by.map(|s| s.to_string()), edge_id],
         )
         .await?;
-        Ok(())
+        Ok((affected > 0).then_some(graph_change).flatten())
+    }
+
+    async fn bump_community_graph_generations(
+        conn: &libsql::Connection,
+        changes: Vec<CommunityGraphChange>,
+    ) -> Result<Vec<CommunityGenerationUpdate>, libsql::Error> {
+        let mut by_space = BTreeMap::<String, BTreeSet<String>>::new();
+        for change in changes {
+            let dirty = by_space.entry(change.space).or_default();
+            dirty.insert(change.src_id);
+            dirty.insert(change.dst_id);
+        }
+
+        let mut updates = Vec::with_capacity(by_space.len());
+        for (space, dirty_nodes) in by_space {
+            conn.execute(
+                "INSERT INTO space_graph_state \
+                    (space, graph_generation, published_generation, dirty) \
+                 VALUES (?1, 1, NULL, 1) \
+                 ON CONFLICT(space) DO UPDATE SET \
+                    graph_generation = graph_generation + 1, dirty = 1",
+                libsql::params![space.clone()],
+            )
+            .await?;
+            let mut rows = conn
+                .query(
+                    "SELECT graph_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![space.clone()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                updates.push((space, row.get::<i64>(0).unwrap_or_default(), dirty_nodes));
+            }
+        }
+        Ok(updates)
     }
 
     /// Fetch a bounded batch of `relates` promotion candidates for the M3g
@@ -10748,8 +11010,9 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("promote_edges_grounded begin: {e}")))?;
-        let result: Result<usize, WenlanError> = async {
+        let result: Result<(usize, Vec<CommunityGenerationUpdate>), WenlanError> = async {
             let mut flipped = 0usize;
+            let mut dirty_by_space = BTreeMap::<String, BTreeSet<String>>::new();
             for promotion in survivors {
                 let affected = conn
                     .execute(
@@ -10778,21 +11041,513 @@ impl MemoryDB {
                         WenlanError::VectorDb(format!("promote_edges_grounded update: {e}"))
                     })?;
                 flipped += affected as usize;
+                if affected > 0 {
+                    let mut rows = conn
+                        .query(
+                            "SELECT space, src_id, dst_id FROM edges \
+                             WHERE edge_id = ?1 AND edge_type = 'relates'",
+                            libsql::params![promotion.edge_id.clone()],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded dirty endpoints: {error}"
+                            ))
+                        })?;
+                    if let Some(row) = rows.next().await.map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded dirty endpoint row: {error}"
+                        ))
+                    })? {
+                        let space: String = row.get(0).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded space decode: {error}"
+                            ))
+                        })?;
+                        let src_id: String = row.get(1).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded source decode: {error}"
+                            ))
+                        })?;
+                        let dst_id: String = row.get(2).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded destination decode: {error}"
+                            ))
+                        })?;
+                        let dirty = dirty_by_space.entry(space).or_default();
+                        dirty.insert(src_id);
+                        dirty.insert(dst_id);
+                    }
+                }
             }
-            Ok(flipped)
+
+            let mut generation_updates = Vec::with_capacity(dirty_by_space.len());
+            for (space, dirty_nodes) in dirty_by_space {
+                let mut rows = conn
+                    .query(
+                        "INSERT INTO space_graph_state \
+                            (space, graph_generation, published_generation, dirty) \
+                         VALUES (?1, 1, NULL, 1) \
+                         ON CONFLICT(space) DO UPDATE SET \
+                            graph_generation = graph_generation + 1, dirty = 1 \
+                         RETURNING graph_generation",
+                        libsql::params![space.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded graph generation: {error}"
+                        ))
+                    })?;
+                let generation = rows
+                    .next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded generation row: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        WenlanError::VectorDb(
+                            "promote_edges_grounded generation row missing".to_owned(),
+                        )
+                    })?
+                    .get::<i64>(0)
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded generation decode: {error}"
+                        ))
+                    })?;
+                generation_updates.push((space, generation, dirty_nodes));
+            }
+            Ok((flipped, generation_updates))
         }
         .await;
         match result {
-            Ok(flipped) => {
+            Ok((flipped, generation_updates)) => {
                 conn.execute("COMMIT", ()).await.map_err(|e| {
                     WenlanError::VectorDb(format!("promote_edges_grounded commit: {e}"))
                 })?;
+                self.record_community_dirty_nodes(generation_updates);
                 Ok(flipped)
             }
             Err(error) => {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 Err(error)
             }
+        }
+    }
+
+    fn record_community_dirty_nodes(&self, generation_updates: Vec<CommunityGenerationUpdate>) {
+        let mut all_spaces = self
+            .community_dirty_nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (space, generation, nodes) in generation_updates {
+            all_spaces
+                .entry(space)
+                .or_default()
+                .entry(generation)
+                .or_default()
+                .extend(nodes);
+        }
+    }
+
+    fn community_dirty_nodes_through(&self, space: &str, generation: i64) -> BTreeSet<String> {
+        self.community_dirty_nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(space)
+            .into_iter()
+            .flat_map(|generations| generations.range(..=generation))
+            .flat_map(|(_, nodes)| nodes.iter().cloned())
+            .collect()
+    }
+
+    fn clear_community_dirty_nodes_through(&self, space: &str, generation: i64) {
+        let mut all_spaces = self
+            .community_dirty_nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove_space = if let Some(generations) = all_spaces.get_mut(space) {
+            generations.retain(|&seen_generation, _| seen_generation > generation);
+            generations.is_empty()
+        } else {
+            false
+        };
+        if remove_space {
+            all_spaces.remove(space);
+        }
+    }
+
+    /// Acquire one durable community-phase lease and copy all database input
+    /// under one short mutex acquisition. Graph computation happens later,
+    /// after this method has returned and released the connection.
+    pub async fn prepare_community_grouping(
+        &self,
+        space: &str,
+    ) -> Result<
+        crate::community_grouping::CommunityGroupingAttempt,
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::{CommunityGroupingAttempt, CommunityGroupingError};
+
+        let started = std::time::Instant::now();
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|error| CommunityGroupingError::Database(format!("prepare begin: {error}")))?;
+
+        let result: Result<PreparedCommunityGrouping, CommunityGroupingError> = async {
+            let mut state_rows = conn
+                .query(
+                    "SELECT graph_generation, published_generation \
+                     FROM space_graph_state WHERE space = ?1 AND dirty = 1",
+                    libsql::params![space.to_owned()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare graph state query: {error}"))
+                })?;
+            let state = state_rows
+                .next()
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare graph state row: {error}"))
+                })?
+                .ok_or_else(|| {
+                    CommunityGroupingError::Database(format!(
+                        "space {space} has no dirty community graph generation"
+                    ))
+                })?;
+            let input_generation = state.get::<i64>(0).map_err(|error| {
+                CommunityGroupingError::Database(format!(
+                    "prepare graph generation decode: {error}"
+                ))
+            })?;
+            let published_generation = state.get::<Option<i64>>(1).map_err(|error| {
+                CommunityGroupingError::Database(format!(
+                    "prepare published generation decode: {error}"
+                ))
+            })?;
+            drop(state_rows);
+
+            conn.execute(
+                "DELETE FROM grouping_leases \
+                 WHERE phase = 'community' AND space = ?1 \
+                   AND (expires_at <= unixepoch() OR input_generation <> ?2)",
+                libsql::params![space.to_owned(), input_generation],
+            )
+            .await
+            .map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare reap leases: {error}"))
+            })?;
+
+            let token = uuid::Uuid::new_v4().to_string();
+            let acquired = conn
+                .execute(
+                    "INSERT INTO grouping_leases \
+                    (phase, space, input_generation, token, expires_at, attempt) \
+                 VALUES ('community', ?1, ?2, ?3, unixepoch() + 300, 1) \
+                 ON CONFLICT(phase, space, input_generation) DO NOTHING",
+                    libsql::params![space.to_owned(), input_generation, token.clone()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare insert lease: {error}"))
+                })?;
+            if acquired == 0 {
+                return Err(CommunityGroupingError::LeaseHeld {
+                    space: space.to_owned(),
+                    input_generation,
+                });
+            }
+
+            let mut edge_rows = conn
+                .query(
+                    "SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE edge_type = 'relates' AND grounded = 1 \
+                       AND valid_until IS NULL AND space = ?1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND lineage = 'assertion'",
+                    libsql::params![space.to_owned()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare grounded edges: {error}"))
+                })?;
+            let mut edges = Vec::new();
+            while let Some(row) = edge_rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare grounded edge row: {error}"))
+            })? {
+                edges.push(crate::community_partition::ProjectionInputEdge::new(
+                    row.get::<String>(0).map_err(|error| {
+                        CommunityGroupingError::Database(format!("prepare edge id decode: {error}"))
+                    })?,
+                    row.get::<String>(1).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare source id decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(2).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare destination id decode: {error}"
+                        ))
+                    })?,
+                ));
+            }
+            drop(edge_rows);
+
+            let mut member_rows = conn
+                .query(
+                    "SELECT node_id, community_id FROM community_members WHERE space = ?1",
+                    libsql::params![space.to_owned()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare prior members: {error}"))
+                })?;
+            let mut previous_ids = BTreeMap::new();
+            while let Some(row) = member_rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare prior member row: {error}"))
+            })? {
+                let node_id = row.get::<String>(0).map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare prior node decode: {error}"))
+                })?;
+                let community_id = row.get::<String>(1).map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "prepare prior community decode: {error}"
+                    ))
+                })?;
+                previous_ids.insert(node_id, community_id);
+            }
+            drop(member_rows);
+
+            Ok((
+                input_generation,
+                published_generation,
+                token,
+                edges,
+                previous_ids,
+            ))
+        }
+        .await;
+
+        let (input_generation, published_generation, token, edges, previous_ids) = match result {
+            Ok(prepared) => {
+                conn.execute("COMMIT", ()).await.map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare commit: {error}"))
+                })?;
+                prepared
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        };
+        let dirty_node_ids = self.community_dirty_nodes_through(space, input_generation);
+        drop(conn);
+
+        Ok(CommunityGroupingAttempt {
+            space: space.to_owned(),
+            input_generation,
+            published_generation,
+            token,
+            edges,
+            previous_ids,
+            dirty_node_ids,
+            db_mutex_hold: started.elapsed(),
+        })
+    }
+
+    /// Publish one computed community snapshot only when the graph generation
+    /// still matches the leased input. The consume-once attempt releases its
+    /// lease on both the success and stale paths.
+    pub async fn finalize_community_grouping(
+        &self,
+        attempt: crate::community_grouping::CommunityGroupingAttempt,
+        computed: crate::community_grouping::CommunityGroupingComputed,
+    ) -> Result<
+        crate::community_grouping::CommunityGroupingOutcome,
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::{
+            CommunityGroupingError, CommunityGroupingOutcome, CommunityGroupingReceipt,
+            COMMUNITY_ALGO_VERSION, COMMUNITY_PROJECTION_VERSION,
+        };
+
+        let finalize_started = std::time::Instant::now();
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ()).await.map_err(|error| {
+            CommunityGroupingError::Database(format!("finalize begin: {error}"))
+        })?;
+
+        let member_count = computed.members.len();
+        let projected_edge_count = computed.projected_edge_count;
+        let result: Result<bool, CommunityGroupingError> = async {
+            let mut lease_rows = conn
+                .query(
+                    "SELECT 1 FROM grouping_leases \
+                     WHERE phase = 'community' AND space = ?1 \
+                       AND input_generation = ?2 AND token = ?3 LIMIT 1",
+                    libsql::params![
+                        attempt.space.clone(),
+                        attempt.input_generation,
+                        attempt.token.clone()
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("finalize lease query: {error}"))
+                })?;
+            let owns_lease = lease_rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("finalize lease row: {error}"))
+            })?;
+            drop(lease_rows);
+            if owns_lease.is_none() {
+                return Err(CommunityGroupingError::Database(format!(
+                    "community grouping lease token is no longer current for {} generation {}",
+                    attempt.space, attempt.input_generation
+                )));
+            }
+
+            let matched =
+                conn.execute(
+                    "UPDATE space_graph_state \
+                     SET published_generation = ?2, dirty = 0 \
+                     WHERE space = ?1 AND graph_generation = ?2 AND dirty = 1",
+                    libsql::params![attempt.space.clone(), attempt.input_generation],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("finalize generation CAS: {error}"))
+                })? > 0;
+
+            if matched {
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "DELETE FROM community_members WHERE space = ?1",
+                    libsql::params![attempt.space.clone()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "finalize replace prior members: {error}"
+                    ))
+                })?;
+                conn.execute(
+                    "UPDATE communities SET retired_at = ?2, updated_at = ?2 \
+                     WHERE space = ?1 AND retired_at IS NULL",
+                    libsql::params![attempt.space.clone(), now],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "finalize retire prior communities: {error}"
+                    ))
+                })?;
+
+                let community_ids = computed
+                    .members
+                    .iter()
+                    .map(|member| member.community_id.clone())
+                    .collect::<BTreeSet<_>>();
+                for community_id in community_ids {
+                    conn.execute(
+                        "INSERT INTO communities \
+                            (community_id, space, display_name, algo_version, \
+                             projection_version, created_at, updated_at, retired_at) \
+                         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?5, NULL) \
+                         ON CONFLICT(community_id) DO UPDATE SET \
+                            space = excluded.space, \
+                            algo_version = excluded.algo_version, \
+                            projection_version = excluded.projection_version, \
+                            updated_at = excluded.updated_at, retired_at = NULL",
+                        libsql::params![
+                            community_id,
+                            attempt.space.clone(),
+                            COMMUNITY_ALGO_VERSION,
+                            COMMUNITY_PROJECTION_VERSION,
+                            now
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "finalize upsert community: {error}"
+                        ))
+                    })?;
+                }
+
+                for member in &computed.members {
+                    conn.execute(
+                        "INSERT INTO community_members \
+                            (space, node_id, node_kind, community_id, \
+                             published_generation, attachment) \
+                         VALUES (?1, ?2, 'entity', ?3, ?4, 'core')",
+                        libsql::params![
+                            attempt.space.clone(),
+                            member.node_id.clone(),
+                            member.community_id.clone(),
+                            attempt.input_generation
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "finalize insert community member: {error}"
+                        ))
+                    })?;
+                }
+            }
+
+            conn.execute(
+                "DELETE FROM grouping_leases \
+                 WHERE phase = 'community' AND space = ?1 \
+                   AND input_generation = ?2 AND token = ?3",
+                libsql::params![
+                    attempt.space.clone(),
+                    attempt.input_generation,
+                    attempt.token.clone()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                CommunityGroupingError::Database(format!("finalize consume lease: {error}"))
+            })?;
+            Ok(matched)
+        }
+        .await;
+
+        let matched = match result {
+            Ok(matched) => {
+                conn.execute("COMMIT", ()).await.map_err(|error| {
+                    CommunityGroupingError::Database(format!("finalize commit: {error}"))
+                })?;
+                matched
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        };
+        if matched {
+            self.clear_community_dirty_nodes_through(&attempt.space, attempt.input_generation);
+        }
+        drop(conn);
+
+        let receipt = CommunityGroupingReceipt {
+            input_generation: attempt.input_generation,
+            published_generation: attempt.input_generation,
+            projected_edge_count,
+            member_count,
+            db_mutex_hold: attempt.db_mutex_hold + finalize_started.elapsed(),
+            next_state: matched.then_some(computed.next_state),
+        };
+        if matched {
+            Ok(CommunityGroupingOutcome::Published(receipt))
+        } else {
+            Ok(CommunityGroupingOutcome::Stale(receipt))
         }
     }
 
@@ -24014,11 +24769,133 @@ impl MemoryDB {
         let should_promote = is_generic(&canonical_type) && !is_generic(&alias_type);
         let now_iso = chrono::Utc::now().to_rfc3339();
 
+        // Snapshot the alias's active relation-edge shadows before endpoint
+        // rewrite. The merge transaction below invalidates each old
+        // content-addressed edge and reasserts the corrected endpoint edge;
+        // grounded status and provenance survive the identity correction.
+        let merge_edge_plans = {
+            let mut relation_rows = conn
+                .query(
+                    "SELECT from_entity, to_entity, relation_type FROM relations \
+                     WHERE from_entity = ?1 OR to_entity = ?1",
+                    libsql::params![alias_id],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("merge_entities edge plan relations: {error}"))
+                })?;
+            let mut relations = Vec::new();
+            while let Some(row) = relation_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("merge_entities edge plan relation row: {error}"))
+            })? {
+                relations.push((
+                    row.get::<String>(0).unwrap_or_default(),
+                    row.get::<String>(1).unwrap_or_default(),
+                    row.get::<String>(2).unwrap_or_default(),
+                ));
+            }
+            drop(relation_rows);
+
+            let mut plans = Vec::new();
+            for (old_src, old_dst, relation_type) in relations {
+                let old_edge_id = crate::provenance::compute_edge_id(
+                    "relates",
+                    "entity",
+                    &old_src,
+                    "entity",
+                    &old_dst,
+                    &relation_type,
+                );
+                let mut edge_rows = conn
+                    .query(
+                        "SELECT grounded, valid_until, root_id, payload FROM edges \
+                         WHERE edge_id = ?1",
+                        libsql::params![old_edge_id.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("merge_entities edge plan shadow: {error}"))
+                    })?;
+                let edge_state = edge_rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("merge_entities edge plan shadow row: {error}"))
+                })?;
+                let Some(edge_state) = edge_state else {
+                    continue;
+                };
+                let grounded = edge_state.get::<i64>(0).unwrap_or(0) == 1;
+                let valid_until = edge_state.get::<Option<i64>>(1).unwrap_or(None);
+                let root_id = edge_state.get::<Option<String>>(2).unwrap_or(None);
+                let payload = edge_state.get::<Option<String>>(3).unwrap_or(None);
+                drop(edge_rows);
+                if valid_until.is_some() {
+                    continue;
+                }
+
+                let src_id = if old_src == alias_id {
+                    canonical_id.to_owned()
+                } else {
+                    old_src
+                };
+                let dst_id = if old_dst == alias_id {
+                    canonical_id.to_owned()
+                } else {
+                    old_dst
+                };
+                let mut space_rows = conn
+                    .query(
+                        "SELECT source.space, destination.space \
+                         FROM entities source, entities destination \
+                         WHERE source.id = ?1 AND destination.id = ?2",
+                        libsql::params![src_id.clone(), dst_id.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("merge_entities edge plan spaces: {error}"))
+                    })?;
+                let (src_space, dst_space) = match space_rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("merge_entities edge plan space row: {error}"))
+                })? {
+                    Some(row) => (
+                        row.get::<Option<String>>(0).unwrap_or(None),
+                        row.get::<Option<String>>(1).unwrap_or(None),
+                    ),
+                    None => (None, None),
+                };
+                drop(space_rows);
+                let (lineage, space, cross_space_downgrade) =
+                    match (src_space.as_ref(), dst_space.as_ref()) {
+                        (Some(src_space), Some(dst_space)) if src_space == dst_space => {
+                            ("assertion".to_owned(), src_space.clone(), false)
+                        }
+                        _ => (
+                            "legacy".to_owned(),
+                            src_space
+                                .or(dst_space)
+                                .unwrap_or_else(|| UNFILED_SPACE_ID.to_owned()),
+                            true,
+                        ),
+                    };
+                plans.push(EntityMergeEdgePlan {
+                    old_edge_id,
+                    src_id,
+                    dst_id,
+                    relation_type,
+                    lineage,
+                    space,
+                    cross_space_downgrade,
+                    grounded,
+                    root_id,
+                    payload,
+                });
+            }
+            plans
+        };
+
         conn.execute("BEGIN TRANSACTION", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities begin: {e}")))?;
 
-        let result: Result<(), WenlanError> = async {
+        let result: Result<Vec<CommunityGenerationUpdate>, WenlanError> = async {
             conn.execute(
                 "UPDATE relations SET from_entity = ?1 WHERE from_entity = ?2",
                 libsql::params![canonical_id, alias_id],
@@ -24032,6 +24909,68 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities rel.to: {e}")))?;
+
+            let mut graph_changes = Vec::new();
+            for plan in &merge_edge_plans {
+                if let Some(change) =
+                    Self::dual_write_invalidate_edge(&conn, &plan.old_edge_id, None)
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "merge_entities invalidate old edge: {error}"
+                            ))
+                        })?
+                {
+                    graph_changes.push(change);
+                }
+                let (new_edge_id, reactivation_changes) = Self::dual_write_edge_with_payload(
+                    &conn,
+                    "relates",
+                    "entity",
+                    &plan.src_id,
+                    "entity",
+                    &plan.dst_id,
+                    &plan.relation_type,
+                    &plan.lineage,
+                    &plan.space,
+                    plan.cross_space_downgrade,
+                    None,
+                    plan.payload.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "merge_entities reassert corrected edge: {error}"
+                    ))
+                })?;
+                graph_changes.extend(reactivation_changes);
+
+                if plan.grounded {
+                    conn.execute(
+                        "UPDATE edges SET grounded = 1, root_id = ?1, \
+                            payload = COALESCE(payload, ?2) \
+                         WHERE edge_id = ?3 AND valid_until IS NULL",
+                        libsql::params![
+                            plan.root_id.clone(),
+                            plan.payload.clone(),
+                            new_edge_id
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "merge_entities preserve edge grounding: {error}"
+                        ))
+                    })?;
+                    if plan.lineage == "assertion" {
+                        graph_changes.push(CommunityGraphChange {
+                            space: plan.space.clone(),
+                            src_id: plan.src_id.clone(),
+                            dst_id: plan.dst_id.clone(),
+                        });
+                    }
+                }
+            }
 
             conn.execute(
                 "UPDATE observations SET entity_id = ?1 WHERE entity_id = ?2",
@@ -24145,15 +25084,22 @@ impl MemoryDB {
             // to the final entity state (M3 PR-1 item C).
             Self::update_entity_shadow_page(&conn, canonical_id, &now_iso).await?;
 
-            Ok(())
+            Self::bump_community_graph_generations(&conn, graph_changes)
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "merge_entities community generation: {error}"
+                    ))
+                })
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(generation_updates) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("merge_entities commit: {e}")))?;
+                self.record_community_dirty_nodes(generation_updates);
                 Ok(())
             }
             Err(e) => {
@@ -24220,6 +25166,7 @@ impl MemoryDB {
             // rather than hard-delete it (append-only-with-soft-supersession,
             // spec v3 §2). Same-id computation as the live create_relation
             // dual-write and the migration-81 relations backfill.
+            let mut graph_changes = Vec::new();
             if let Some(snap) = &snapshot {
                 if let (Some(fe), Some(te), Some(rt)) = (
                     snap["from_entity"].as_str(),
@@ -24229,19 +25176,26 @@ impl MemoryDB {
                     let edge_id = crate::provenance::compute_edge_id(
                         "relates", "entity", fe, "entity", te, rt,
                     );
-                    Self::dual_write_invalidate_edge(&conn, &edge_id, None).await?;
+                    if let Some(change) =
+                        Self::dual_write_invalidate_edge(&conn, &edge_id, None).await?
+                    {
+                        graph_changes.push(change);
+                    }
                 }
             }
+            let generation_updates =
+                Self::bump_community_graph_generations(&conn, graph_changes).await?;
 
-            Ok::<_, libsql::Error>(snapshot)
+            Ok::<_, libsql::Error>((snapshot, generation_updates))
         }
         .await;
 
         match exec {
-            Ok(snapshot) => {
+            Ok((snapshot, generation_updates)) => {
                 conn.execute("COMMIT", ()).await.map_err(|e| {
                     WenlanError::VectorDb(format!("supersede_relation commit: {e}"))
                 })?;
+                self.record_community_dirty_nodes(generation_updates);
                 Ok(snapshot)
             }
             Err(e) => {
@@ -24389,7 +25343,10 @@ impl MemoryDB {
             .await?;
 
             if affected == 0 {
-                return Ok::<Option<String>, libsql::Error>(None);
+                return Ok::<
+                    Option<(String, Vec<CommunityGenerationUpdate>)>,
+                    libsql::Error,
+                >(None);
             }
 
             // Check if this was an insert (the id we generated exists) vs an update.
@@ -24465,7 +25422,7 @@ impl MemoryDB {
                 None
             };
 
-            Self::dual_write_edge_with_payload(
+            let (_, graph_changes) = Self::dual_write_edge_with_payload(
                 &conn,
                 "relates",
                 "entity",
@@ -24480,16 +25437,19 @@ impl MemoryDB {
                 payload.as_deref(),
             )
             .await?;
+            let generation_updates =
+                Self::bump_community_graph_generations(&conn, graph_changes).await?;
 
-            Ok(Some(existing_id))
+            Ok(Some((existing_id, generation_updates)))
         }
         .await;
 
         match exec {
-            Ok(Some(existing_id)) => {
+            Ok(Some((existing_id, generation_updates))) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("create_relation commit: {e}")))?;
+                self.record_community_dirty_nodes(generation_updates);
                 drop(conn);
                 // Only count new inserts (our generated id matches the stored id).
                 if existing_id == id {
@@ -26591,18 +27551,27 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-        for (i, entity_id) in entity_ids.iter().enumerate() {
-            let community_id = label_to_community[&labels[i]];
-            conn.execute(
-                "UPDATE entities SET community_id = ?1 WHERE id = ?2",
-                libsql::params![community_id, entity_id.clone()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+        let update_result: Result<(), WenlanError> = async {
+            for (i, entity_id) in entity_ids.iter().enumerate() {
+                let community_id = label_to_community[&labels[i]];
+                conn.execute(
+                    "UPDATE entities SET community_id = ?1 WHERE id = ?2",
+                    libsql::params![community_id, entity_id.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            }
+            Ok(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+        .await;
+        if let Err(error) = update_result {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(error);
+        }
+        if let Err(error) = conn.execute("COMMIT", ()).await {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(WenlanError::VectorDb(error.to_string()));
+        }
 
         log::info!(
             "[community] detected {} communities across {} entities",
@@ -43027,6 +43996,10 @@ pub(crate) mod tests {
             // when the BGE tokenizer isn't in the resolved cache.
             chunker: build_chunker(std::path::Path::new(".nonexistent")),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
         memory_db
             .run_migrations(&crate::events::NoopEmitter)
@@ -74221,6 +75194,29 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn community_leiden_enabled_is_explicit_opt_in() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !community_leiden_enabled_value(value),
+                "{value:?} must preserve the legacy-only community phase"
+            );
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), Some(" TRUE ")] {
+            assert!(
+                community_leiden_enabled_value(value),
+                "{value:?} must enable the M4 write-only shadow"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn migration_68_adds_citations_column_null_for_legacy() {
         let (db, _dir) = test_db().await;
@@ -74999,6 +75995,10 @@ pub(crate) mod tests {
             embedder: None,
             chunker: ChunkingEngine::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
 
         db.run_migrations(&crate::events::NoopEmitter)
