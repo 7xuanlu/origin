@@ -52,7 +52,7 @@ pub const EDGE_GROUNDING_ENTAILMENT_THRESHOLD: f64 = 0.5;
 /// Prompt version stamped on every grounding verdict (§6.6/§8). Bump on any
 /// change to [`crate::prompts::defaults::GROUNDING_ENTAILMENT`] so scores from
 /// different prompt versions are never compared under one threshold.
-pub const EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION: &str = "m3g-entailment-v2";
+pub const EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION: &str = "m3g-entailment-v3";
 /// The external-origin predicate (§5.2): only folder-ingested memories ground.
 const EXTERNAL_SOURCE_AGENT: &str = "folder";
 /// Durable cursor + poison state key in `app_metadata`.
@@ -1303,7 +1303,12 @@ mod tests {
         #[serde(default)]
         url: Option<String>,
         content: String,
-        span: String,
+        // `None` (JSON null or omitted) = a backlog positive with no captured
+        // span: gate 1 is skipped and the FULL `content` narration becomes the
+        // entailment evidence, so v3's declarative-self-reference rule is tested
+        // against the whole attesting sentence, not just an extracted span.
+        #[serde(default)]
+        span: Option<String>,
     }
 
     fn load_gate1_cases() -> Vec<Gate1Case> {
@@ -1485,7 +1490,7 @@ mod tests {
                 &c.relation_type,
                 space,
                 &c.source_id,
-                Some(&c.span),
+                c.span.as_deref(),
                 &c.content,
             )
             .await;
@@ -1554,12 +1559,14 @@ mod tests {
     #[ignore]
     async fn gate1_zero_false_grounding_real_model() {
         use crate::llm_provider::OnDeviceProvider;
+        // Fail CLOSED: a false-grounding gate must never report success without
+        // a model to judge. Run it only where the pinned model is present.
         let llm: Arc<dyn LlmProvider> = match OnDeviceProvider::new() {
             Ok(p) if p.is_available() => Arc::new(p),
-            _ => {
-                eprintln!("[gate1] SKIP: on-device model unavailable");
-                return;
-            }
+            _ => panic!(
+                "[gate1] on-device model unavailable — cannot run the real-model gate; \
+                 do NOT record a pass. Run on a machine with the pinned model."
+            ),
         };
         // Warm the model so the first sweep call is not cold under the 10s cap.
         let _ = llm
@@ -1618,6 +1625,19 @@ mod tests {
             promoted, 0,
             "Gate 1: exactly zero promoted on the real model"
         );
+        // Non-vacuity: the model MUST have been consulted for exactly the cases
+        // that clear the free gates — every external B/C/D case (A is rejected by
+        // the deterministic span gate, N by the origin gate, both without an LLM
+        // call). A zero here would mean the gate "passed" without judging anything.
+        let expect_calls = cases
+            .iter()
+            .filter(|c| matches!(c.class.as_str(), "B" | "C" | "D"))
+            .count();
+        assert_eq!(
+            calls, expect_calls,
+            "Gate 1: entailment must run for every external B/C/D case (span/origin \
+             gates short-circuit A/N); got {calls}, expected {expect_calls}"
+        );
     }
 
     /// Gate 2.1 (REAL MODEL, manual-only). PASS = >=80% (>=43/53) promoted, each
@@ -1629,12 +1649,15 @@ mod tests {
     #[ignore]
     async fn gate2_coverage_floor_real_model() {
         use crate::llm_provider::OnDeviceProvider;
+        // Fail CLOSED: a coverage FLOOR that "passes" by returning early on a
+        // missing model is a green light with no evidence. Run only where the
+        // pinned model is present.
         let llm: Arc<dyn LlmProvider> = match OnDeviceProvider::new() {
             Ok(p) if p.is_available() => Arc::new(p),
-            _ => {
-                eprintln!("[gate2] SKIP: on-device model unavailable");
-                return;
-            }
+            _ => panic!(
+                "[gate2] on-device model unavailable — cannot run the coverage floor; \
+                 do NOT record a pass. Run on a machine with the pinned model."
+            ),
         };
         let _ = llm
             .generate(LlmRequest {
@@ -1672,7 +1695,7 @@ mod tests {
                 &c.relation_type,
                 space,
                 &c.source_id,
-                Some(&c.span),
+                c.span.as_deref(),
                 &c.content,
             )
             .await;
@@ -1692,15 +1715,36 @@ mod tests {
                 missed.push(c.id.clone());
             }
         }
-        let recall = promoted as f64 / cases.len() as f64;
+        // Recall is measured from DB truth (grounded=1 rows), never the sweep's
+        // own promoted counter — the whole point of a floor is that it can't be
+        // satisfied by a miscount. `grounded` is what actually landed.
+        let grounded = cases.len() - missed.len();
+        let recall = grounded as f64 / cases.len() as f64;
         eprintln!(
-            "[gate2] real-model: promoted={promoted}/{} recall={:.1}% calls={calls} ticks={ticks} missed={missed:?}",
+            "[gate2] real-model: grounded={grounded}/{} recall={:.1}% promoted={promoted} calls={calls} ticks={ticks} missed={missed:?}",
             cases.len(),
             recall * 100.0
         );
+        // The counter and the DB must agree; a divergence means the promote path
+        // reported success without flipping the row (or vice versa).
+        assert_eq!(
+            promoted, grounded,
+            "Gate 2: promoted counter ({promoted}) must equal grounded rows ({grounded})"
+        );
+        // Non-vacuity: every case is an external folder relation that reaches the
+        // independent entailment — a span-bearing case clears the (locating) span
+        // gate, a backlog span-null case skips the span gate outright; neither is
+        // free-gated, so the model must be consulted once per case.
+        assert_eq!(
+            calls,
+            cases.len(),
+            "Gate 2: entailment must run for every external case (span-bearing or \
+             backlog); got {calls}, expected {}",
+            cases.len()
+        );
         assert!(
-            promoted * 5 >= cases.len() * 4,
-            "Gate 2 FLOOR: recall {:.1}% < 80% ({promoted}/{})",
+            grounded * 5 >= cases.len() * 4,
+            "Gate 2 FLOOR: recall {:.1}% < 80% ({grounded}/{})",
             recall * 100.0,
             cases.len()
         );

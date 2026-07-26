@@ -10538,22 +10538,17 @@ impl MemoryDB {
     /// current `grounded`/`valid_until`/`payload`, so the sweep can skip
     /// already-grounded, superseded, or missing edges before spending an entailment
     /// call. READ-ONLY. `limit` bounds the scan (§7 SCAN_PER_TICK).
-    pub async fn edge_grounding_candidates(
-        &self,
-        cursor_rowid: i64,
-        limit: usize,
-    ) -> Result<Vec<crate::edge_grounding::EdgeGroundingCandidate>, WenlanError> {
-        use crate::edge_grounding::EdgeGroundingCandidate;
-        let conn = self.conn.lock().await;
-        // The `+` on `m.source` is load-bearing, not a typo: without it SQLite
-        // drives the memories LEFT JOIN off `idx_memories_source (source=?)`,
-        // which matches every 'memory' row (the whole table) per relation — a
-        // full scan that put the 100k-corpus per-tick mutex hold at ~1.1s (Gate
-        // 3, §3.3). The unary `+` removes that term from index selection so the
-        // planner uses the selective `idx_memories_source_id` join instead.
-        let mut rows = conn
-            .query(
-                "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
+    ///
+    /// The `+` on `m.source` is load-bearing, not a typo. Without it SQLite plans
+    /// the memories LEFT JOIN off `idx_memories_source (source=?)`, which matches
+    /// every 'memory' row (the whole table) per relation — a full scan that put
+    /// the 100k-corpus per-tick mutex hold at ~1.1s (Gate 3, §3.3). The unary `+`
+    /// disqualifies that term from index selection, steering the planner onto the
+    /// selective `idx_memories_source_id` join. The scale bench (`db::tests`) pins
+    /// this via `EXPLAIN QUERY PLAN` over THIS exact string, so stripping the `+`
+    /// reddens by cause, not only by the p95 timing symptom.
+    const EDGE_GROUNDING_CANDIDATE_SCAN_SQL: &'static str =
+        "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
                         r.source_memory_id, fe.name, te.name,
                         m.content, m.source_agent, m.source_id, m.url
                  FROM relations r
@@ -10565,7 +10560,18 @@ impl MemoryDB {
                        AND m.chunk_index = 0
                  WHERE r.rowid > ?1
                  ORDER BY r.rowid
-                 LIMIT ?2",
+                 LIMIT ?2";
+
+    pub async fn edge_grounding_candidates(
+        &self,
+        cursor_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::edge_grounding::EdgeGroundingCandidate>, WenlanError> {
+        use crate::edge_grounding::EdgeGroundingCandidate;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                Self::EDGE_GROUNDING_CANDIDATE_SCAN_SQL,
                 libsql::params![cursor_rowid, limit as i64],
             )
             .await
@@ -80078,24 +80084,24 @@ pub(crate) mod tests {
         }
         let backlog_secs = t_backlog.elapsed().as_secs_f64();
 
-        // Guard the load-bearing `+m.source` access-path fix (Gate 3, §3.3):
-        // the candidate scan's memories LEFT JOIN must ride the selective
-        // `idx_memories_source_id`, never `idx_memories_source (source=?)` which
-        // matches the whole 'memory' table per relation (~1.1s/tick at 100k). If
-        // a refactor strips the `+`, this reddens by CAUSE before the p95 gate
-        // below reddens by symptom.
+        // Guard the load-bearing `+m.source` access-path fix (Gate 3, §3.3) by
+        // EXPLAIN-ing the PRODUCTION scan verbatim — the same
+        // `MemoryDB::EDGE_GROUNDING_CANDIDATE_SCAN_SQL` the sweep runs, not a
+        // hand-copy — so stripping the `+` from production reddens THIS assert by
+        // cause, before the p95 gate below reddens by symptom. The memories LEFT
+        // JOIN must ride the selective `idx_memories_source_id`, never
+        // `idx_memories_source (source=?)` (a whole-'memory'-table scan per
+        // relation, ~1.1s/tick at 100k).
         {
             let conn = db.conn.lock().await;
-            let plan_sql = "EXPLAIN QUERY PLAN \
-                SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type, r.source_memory_id, \
-                       fe.name, te.name, m.content, m.source_agent, m.source_id, m.url \
-                 FROM relations r \
-                 JOIN entities fe ON fe.id = r.from_entity \
-                 JOIN entities te ON te.id = r.to_entity \
-                 LEFT JOIN memories m ON m.source_id = r.source_memory_id \
-                        AND +m.source = 'memory' AND m.chunk_index = 0 \
-                 WHERE r.rowid > 0 ORDER BY r.rowid LIMIT 50";
-            let mut rows = conn.query(plan_sql, ()).await.unwrap();
+            let plan_sql = format!(
+                "EXPLAIN QUERY PLAN {}",
+                MemoryDB::EDGE_GROUNDING_CANDIDATE_SCAN_SQL
+            );
+            let mut rows = conn
+                .query(&plan_sql, libsql::params![0i64, 50i64])
+                .await
+                .unwrap();
             let mut plan = String::new();
             while let Some(row) = rows.next().await.unwrap() {
                 plan.push_str(&row.get::<String>(3).unwrap_or_default());
@@ -80125,7 +80131,6 @@ pub(crate) mod tests {
         let mut full_ticks = 0usize;
         let mut cum_promoted = 0usize;
         let mut cum_scanned = 0usize;
-        let mut prev_cum = 0usize;
         let mut ticks = 0usize;
         loop {
             let r = crate::edge_grounding::run_edge_grounding_tick(&db, &llm, &prompts)
@@ -80139,11 +80144,12 @@ pub(crate) mod tests {
                 "tick {ticks}: entailment_calls {} > 25",
                 r.entailment_calls
             );
-            // Gate 2.2 (c): cumulative promotion never decreases.
             cum_promoted += r.promoted;
             cum_scanned += r.scanned;
-            assert!(cum_promoted >= prev_cum, "cumulative promoted regressed");
-            prev_cum = cum_promoted;
+            // Gate 2.2 (c) — "promotion never regresses" — is the DB-truth
+            // grounded_before == grounded_after check after the drain (a
+            // cumulative-counter comparison here would be tautological for a
+            // monotone += counter and could not detect a grounded=1→0 revert).
             if r.promoted > 0 {
                 holds_ms.push(r.db_mutex_hold.as_secs_f64() * 1000.0);
                 if r.promoted == 25 {
