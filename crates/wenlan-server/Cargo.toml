@@ -51,6 +51,7 @@ cc = "1"
 [dev-dependencies]
 async-trait = { workspace = true }
 libsql = { workspace = true }
+temp-env = { version = "0.3" }
 tempfile = { workspace = true }
 tower = { workspace = true }
 zip = { workspace = true }

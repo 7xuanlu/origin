@@ -10695,17 +10695,27 @@ impl MemoryDB {
 
     /// Apply the M3g monotone `grounded 0→1` promotion flip (§1) for a tick's
     /// survivors in ONE rollback-protected transaction (the `fold_relation_type`
-    /// BEGIN idiom; issue #389). Each row's UPDATE is guarded `AND grounded = 0`,
-    /// making it idempotent + monotone: a re-run over an already-promoted edge
-    /// affects zero rows, and `grounded` can never go `1→0`. `root_id` and the
-    /// grounding-verdict `payload` (§2.4/§6.6) are written alongside `grounded`;
-    /// no structural column is touched, so the write is parity-invisible to the
-    /// M2 oracle (§1). No LLM/embedding call happens here (§6.3): entailment ran
-    /// outside, and each survivor's root was minted before this call. Returns the
-    /// number of edges actually flipped.
+    /// BEGIN idiom; issue #389). Each row's UPDATE is guarded on the full
+    /// stale-evidence recheck basis (§C2), all evaluated INSIDE this transaction:
+    /// - `grounded = 0` — idempotent + monotone (a re-run over an already-promoted
+    ///   edge affects zero rows, and `grounded` can never go `1→0`);
+    /// - `valid_until IS NULL` — the edge is still active (a concurrent supersede
+    ///   during the entailment call must not ground a now-inactive edge);
+    /// - the source memory's chunk-0 `content` still equals the exact text
+    ///   entailment judged (`judged_content`) — a concurrent source edit during
+    ///   the multi-second entailment invalidates the verdict, so the edge is not
+    ///   grounded against evidence that no longer exists.
+    ///
+    /// A row that fails any guard contributes zero to the returned count; the
+    /// caller skips it (no poison) and re-judges it against fresh evidence on a
+    /// later tick. `root_id` and the grounding-verdict `payload` (§2.4/§6.6) are
+    /// written alongside `grounded`; no structural column is touched, so the
+    /// write is parity-invisible to the M2 oracle (§1). No LLM/embedding call
+    /// happens here (§6.3): entailment ran outside, and each survivor's root was
+    /// minted before this call. Returns the number of edges ACTUALLY flipped.
     pub async fn promote_edges_grounded(
         &self,
-        survivors: &[(String, String, String)],
+        survivors: &[crate::edge_grounding::EdgePromotion],
     ) -> Result<usize, WenlanError> {
         if survivors.is_empty() {
             return Ok(0);
@@ -10716,12 +10726,23 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("promote_edges_grounded begin: {e}")))?;
         let result: Result<usize, WenlanError> = async {
             let mut flipped = 0usize;
-            for (edge_id, root_id, payload) in survivors {
+            for promotion in survivors {
                 let affected = conn
                     .execute(
                         "UPDATE edges SET grounded = 1, root_id = ?1, payload = ?2 \
-                         WHERE edge_id = ?3 AND grounded = 0",
-                        libsql::params![root_id.clone(), payload.clone(), edge_id.clone()],
+                         WHERE edge_id = ?3 AND grounded = 0 AND valid_until IS NULL \
+                           AND EXISTS ( \
+                               SELECT 1 FROM memories \
+                               WHERE source_id = ?4 AND source = 'memory' \
+                                 AND chunk_index = 0 AND content = ?5 \
+                           )",
+                        libsql::params![
+                            promotion.root_id.clone(),
+                            promotion.payload.clone(),
+                            promotion.edge_id.clone(),
+                            promotion.source_memory_id.clone(),
+                            promotion.judged_content.clone(),
+                        ],
                     )
                     .await
                     .map_err(|e| {
@@ -10776,6 +10797,32 @@ impl MemoryDB {
             "space": row.get::<String>(9).ok(),
             "payload": row.get::<Option<String>>(10).ok().flatten(),
         }))
+    }
+
+    /// Test-only: soft-supersede an edge (set `valid_until`), so the M3g
+    /// stale-evidence-race test (§C2) can simulate a concurrent supersede landing
+    /// DURING the entailment call and assert the flip then grounds nothing.
+    #[cfg(test)]
+    pub(crate) async fn supersede_edge_for_test(&self, edge_id: &str) {
+        let conn = self.conn.lock().await;
+        Self::dual_write_invalidate_edge(&conn, edge_id, None)
+            .await
+            .expect("test supersede edge");
+    }
+
+    /// Test-only: rewrite a source memory's chunk-0 `content`, so the §C2 test
+    /// can simulate a concurrent source edit DURING entailment and assert the
+    /// flip's content-equality guard then grounds nothing.
+    #[cfg(test)]
+    pub(crate) async fn edit_source_content_for_test(&self, source_id: &str, new_content: &str) {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET content = ?1 \
+             WHERE source_id = ?2 AND source = 'memory' AND chunk_index = 0",
+            libsql::params![new_content, source_id],
+        )
+        .await
+        .expect("test edit source content");
     }
 
     /// Test-only: read a `provenance_roots` row by `root_id`, returning
@@ -67050,6 +67097,100 @@ pub(crate) mod tests {
             .expect("entity-link receipt");
         assert_eq!(linked.status, "ok");
         assert_eq!(linked.input_version, Some(1));
+    }
+
+    // I3 CHARACTERIZATION (pre-existing M2 parity gap, NOT introduced by M3g).
+    //
+    // The ambient Entity-enrichment lane the scheduler drives —
+    // `run_entity_enrichment_slice_with_auto_link` ->
+    // `commit_entity_enrichment_at_version` — writes `relations` through a raw
+    // INSERT that neither consumes `relation.span` nor dual-writes to the unified
+    // `edges` table. Contrast `create_relation_with_span`, which DOES dual-write a
+    // payload-bearing `relates` edge. This lane is byte-identical on origin/main's
+    // merge-base (M2 shipped it); the M3g Stage-A diff touches none of it.
+    //
+    // Why this is SAFE for M3g and reported (not silently fixed) here: a relation
+    // with no `edges` row is invisible to the grounding sweep — the sweep looks up
+    // `edges` by edge_id and skips a missing row, so it can never false-ground a
+    // relation this lane produced. The gap is a COVERAGE limitation on the unified
+    // edges store, not an M3g correctness bug, and predates this branch.
+    //
+    // This test LOCKS IN the current (gap) behavior. When the M2 lane is routed
+    // through the payload-bearing writer upstream, this test turns RED — the signal
+    // to flip the assertion to expect a `relates` edge carrying the span payload.
+    #[tokio::test]
+    async fn ambient_entity_sweep_writes_relation_without_edges_dual_write_pre_existing_m2_gap() {
+        let (db, _dir) = test_db().await;
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_i3_entity_sweep",
+            "Alice works on ProjectX.",
+            "fact",
+            "work",
+            "folder",
+        )])
+        .await
+        .unwrap();
+
+        let kg = vec![crate::extract::KgExtractionResult {
+            index: 0,
+            entities: vec![
+                crate::extract::ExtractedEntity {
+                    name: "Alice".to_string(),
+                    entity_type: "person".to_string(),
+                },
+                crate::extract::ExtractedEntity {
+                    name: "ProjectX".to_string(),
+                    entity_type: "project".to_string(),
+                },
+            ],
+            observations: Vec::new(),
+            relations: vec![crate::extract::ExtractedRelation {
+                from: "Alice".to_string(),
+                to: "ProjectX".to_string(),
+                relation_type: "works_on".to_string(),
+                confidence: Some(0.9),
+                explanation: None,
+                span: Some("Alice works on ProjectX".to_string()),
+            }],
+        }];
+
+        // Drive the *scheduler's* Entity lane (auto-link enabled). No prior
+        // entities exist, so the auto-link vector search matches nothing and the
+        // extraction path runs, committing the relation.
+        let selected = db
+            .run_entity_enrichment_slice_with_auto_link(0.05, move |_content: String| async move {
+                Ok(kg)
+            })
+            .await
+            .unwrap();
+        assert_eq!(selected, 1, "the sweep processed the seeded memory");
+
+        let conn = db.conn.lock().await;
+        let relation_count: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM relations WHERE relation_type = 'works_on'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(relation_count, 1, "the ambient sweep wrote the relation");
+
+        let relates_edges: i64 = {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM edges WHERE edge_type = 'relates'", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            relates_edges, 0,
+            "PRE-EXISTING M2 GAP: the ambient Entity sweep writes a relation with no \
+             edges dual-write. When the lane is routed through the payload-bearing \
+             writer upstream, flip this to expect the relates edge + span payload."
+        );
     }
 
     #[tokio::test]

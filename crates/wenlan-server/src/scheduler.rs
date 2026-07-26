@@ -2618,6 +2618,31 @@ mod tests {
         }
     }
 
+    // Non-vacuity guard for the promotion lane's opt-in flag gate.
+    // `unconfigured_pin_allows_only_deterministic_document_preparation` above uses
+    // `for_provider(false)`, whose `provider_available && flag` term short-circuits
+    // on the provider alone — it never reaches the flag, so it cannot prove the
+    // flag gate does anything. This test pins `provider_available = true` and
+    // toggles ONLY `WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE`, proving the lane is
+    // default-OFF and turns on only when the flag is set (mirroring reconcile /
+    // citation gating).
+    #[test]
+    fn edge_grounding_promote_lane_gated_by_flag_even_with_provider() {
+        temp_env::with_var("WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE", None::<&str>, || {
+            assert!(
+                !AmbientAvailability::for_provider(true)
+                    .supports(AmbientJob::EdgeGroundingPromote),
+                "promotion lane must stay parked when the opt-in flag is unset, even with a provider"
+            );
+        });
+        temp_env::with_var("WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE", Some("1"), || {
+            assert!(
+                AmbientAvailability::for_provider(true).supports(AmbientJob::EdgeGroundingPromote),
+                "promotion lane must be available with an authorized provider AND the flag ON"
+            );
+        });
+    }
+
     #[test]
     fn automatic_batch_runs_one_eligible_phase_per_turn_and_completes_only_after_last_phase() {
         let mut batch = AutomaticSteepBatch::new(AutomaticTrigger::Idle, None);

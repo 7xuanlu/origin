@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::db::MemoryDB;
-use crate::llm_provider::{LlmProvider, LlmRequest};
+use crate::llm_provider::{LlmBackend, LlmProvider, LlmRequest};
 use crate::prompts::PromptRegistry;
 use crate::provenance::IndependenceSignals;
 
@@ -88,6 +88,28 @@ pub struct EdgeGroundingCandidate {
     pub edge_payload: Option<String>,
 }
 
+/// One survivor to flip in the promotion transaction, carrying the
+/// stale-evidence recheck basis (§C2). Candidate evidence — the edge's active
+/// state and the source memory content — is read at scan time, then a
+/// multi-second entailment call runs OUTSIDE any transaction. A concurrent
+/// supersede or source edit during that window can invalidate the basis, so the
+/// flip re-verifies IN its own transaction that the edge is still active
+/// (`valid_until IS NULL`) and the judged source content is byte-identical to
+/// what entailment saw. On mismatch the flip affects zero rows and the caller
+/// skips it (no poison), re-judging the edge against fresh evidence on a later
+/// tick. See [`MemoryDB::promote_edges_grounded`].
+#[derive(Debug, Clone)]
+pub struct EdgePromotion {
+    pub edge_id: String,
+    pub root_id: String,
+    pub payload: String,
+    /// The source memory whose chunk-0 content was judged (the recheck key).
+    pub source_memory_id: String,
+    /// The exact chunk-0 content entailment judged; the flip requires the live
+    /// `memories.content` to still equal this, else it grounds nothing.
+    pub judged_content: String,
+}
+
 /// Persisted cursor + poison-pill state (JSON in `app_metadata`). A
 /// missing/corrupt value degrades to a full-backlog sweep from zero (bounded by
 /// the per-tick caps), mirroring `reconcile::FrontierState`.
@@ -98,6 +120,24 @@ pub struct GroundingState {
     /// The rowid currently accruing consecutive-failure strikes.
     pub stuck_rowid: Option<i64>,
     pub failures: u32,
+    /// The `(prompt_version, model_id)` tag under which `cursor` was advanced
+    /// (see [`grounding_version_tag`]). When a later sweep runs under a different
+    /// entailment prompt or model, the cursor is reset to 0 so `grounded=0` edges
+    /// that a prior version rejected below-threshold are re-judged under the new
+    /// version (mechanics §8: *"a model upgrade re-derives before it re-judges"*).
+    /// `#[serde(default)]` keeps a pre-versioning persisted state readable — it
+    /// deserializes with an empty tag, which forces exactly one re-scan on the
+    /// first post-upgrade tick.
+    #[serde(default)]
+    pub entailment_version: String,
+}
+
+/// The `(prompt_version | model_id)` identity a grounding cursor is stamped
+/// with (mechanics §8). A change to either the entailment prompt version or the
+/// pinned model id invalidates the below-threshold rejections the cursor moved
+/// past, so the watermark carries this tag and resets when it changes.
+pub(crate) fn grounding_version_tag(model_id: &str) -> String {
+    format!("{EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION}|{model_id}")
 }
 
 /// Outcome of one sweep tick, for scheduler logging.
@@ -112,6 +152,12 @@ pub struct EdgeGroundingReport {
     /// True when the LLM provider was unavailable and the tick did no work
     /// (the lane is provider-gated, so this should be rare).
     pub skipped_no_provider: bool,
+    /// True when a provider was available but its backend is NOT the pinned
+    /// on-device model the gates validate (mechanics §11 / gate-criteria §1.3
+    /// fix the threshold + prompt version to the on-device entailment model).
+    /// The sweep no-ops rather than ground under an unvalidated judge (a
+    /// cloud/API backend could score the fixed 0.5 threshold differently).
+    pub skipped_non_on_device: bool,
     /// Cumulative wall time this tick spent inside the sweep's DB calls — the
     /// bounded `grounded=0` candidate SELECT, the durable cursor get/set, the
     /// ≤K per-survivor root mints, and the batch flip. Each of those is the only
@@ -141,6 +187,13 @@ pub(crate) fn span_quote_from_payload(payload: &str) -> Option<String> {
 /// (the caller treats `None` as below-threshold — never promote on garbage).
 /// Accepts either a numeric `score` or a boolean `supported`/`entailed` (mapped
 /// true→1.0, false→0.0) so a small model that emits a bare boolean still works.
+///
+/// **Fail-closed on out-of-contract scores.** A numeric score outside `[0.0,
+/// 1.0]` (e.g. `{"score":2}`) is a judge-contract violation, not a strong
+/// "yes": it is rejected (`None` → treated as below-threshold), never clamped
+/// into a pass. Clamping `2.0` to `1.0` would let a malformed/adversarial judge
+/// response force a promotion; refusing it keeps the mandatory-entailment gate
+/// honest (mechanics §3, invariant #11).
 pub(crate) fn parse_entailment(raw: &str) -> Option<f64> {
     let stripped = crate::llm_provider::strip_think_tags(raw);
     let (start, end) = match (stripped.find('{'), stripped.rfind('}')) {
@@ -162,7 +215,9 @@ pub(crate) fn parse_entailment(raw: &str) -> Option<f64> {
         .score
         .or_else(|| parsed.supported.map(bool_score))
         .or_else(|| parsed.entailed.map(bool_score))
-        .filter(|s| s.is_finite())
+        // Fail closed: non-finite OR outside the valid [0,1] contract → reject
+        // (do NOT clamp an out-of-range score into a promotion).
+        .filter(|s| s.is_finite() && (0.0..=1.0).contains(s))
 }
 
 /// Render the entailment user-prompt. The source text is fenced as UNTRUSTED
@@ -305,10 +360,34 @@ async fn run_edge_grounding_with_budget(
         report.skipped_no_provider = true;
         return Ok(report);
     }
+    // Provider-scope gate (§C-I5a): the gate criteria fix the entailment
+    // threshold + prompt version to the pinned ON-DEVICE model (gate-criteria
+    // §1.3, mechanics §11). The ambient provider router (`resolve_everyday`) can
+    // hand this lane a cloud/API backend when the user pins a non-on-device
+    // `everyday_source`; that judge would score the fixed 0.5 threshold on an
+    // unvalidated basis. Skip (no-op) rather than ground under it.
+    if llm.backend() != LlmBackend::OnDevice {
+        report.skipped_non_on_device = true;
+        return Ok(report);
+    }
 
     let load_start = Instant::now();
     let mut state = load_state(db).await;
     report.db_mutex_hold += load_start.elapsed();
+    // Version the watermark (§C-I5b, mechanics §8). If the entailment prompt
+    // version or the pinned model changed since the cursor last advanced, the
+    // below-threshold rejections it moved past are stale — reset the scan so
+    // they are re-judged under the new version. Already-grounded edges are free
+    // skips on the re-scan (monotone; grounded is immutable once true), so the
+    // reset only re-judges the `grounded=0` remainder. Runs once per version
+    // change: this tick re-stamps the current tag, matching future ticks.
+    let current_version = grounding_version_tag(&llm.model_id());
+    if state.entailment_version != current_version {
+        state = GroundingState {
+            entailment_version: current_version.clone(),
+            ..GroundingState::default()
+        };
+    }
     let start_cursor = state.cursor;
     let scan_start = Instant::now();
     let candidates = db
@@ -342,6 +421,13 @@ async fn run_edge_grounding_with_budget(
         }
         let Some(content) = cand.mem_content.as_deref() else {
             advance_cursor(&mut state, rowid); // source memory gone: cannot ground
+            continue;
+        };
+        // The source memory id keys the §C2 in-transaction recheck. Present
+        // whenever `content` is (both come from the same source-memory join),
+        // but guarded defensively so the recheck basis is never empty.
+        let Some(source_memory_id) = cand.source_memory_id.as_deref() else {
+            advance_cursor(&mut state, rowid);
             continue;
         };
 
@@ -460,15 +546,38 @@ async fn run_edge_grounding_with_budget(
             &llm.model_id(),
             chrono::Utc::now().timestamp(),
         );
+        let promotion = EdgePromotion {
+            edge_id: cand.edge_id.clone(),
+            root_id,
+            payload,
+            source_memory_id: source_memory_id.to_string(),
+            judged_content: content.to_string(),
+        };
         let flip_start = Instant::now();
         let flip_result = db
-            .promote_edges_grounded(&[(cand.edge_id.clone(), root_id, payload)])
+            .promote_edges_grounded(std::slice::from_ref(&promotion))
             .await;
         report.db_mutex_hold += flip_start.elapsed();
         match flip_result {
-            Ok(_) => {
+            // The flip is guarded on the full evidence basis (§C2): edge still
+            // active AND source content unchanged. Count what ACTUALLY flipped.
+            Ok(flipped) if flipped > 0 => {
                 report.promoted += 1;
                 advance_cursor(&mut state, rowid);
+            }
+            Ok(_) => {
+                // Zero rows: between the scan and this flip the edge was
+                // superseded or its source content was edited (stale-evidence
+                // race). Do NOT poison and do NOT advance — hold so the edge is
+                // re-read and re-judged against fresh evidence next tick. A
+                // later candidate advancing the cursor would skip past this held
+                // head, so stop the tick here (mirrors the transient-hold path).
+                log::debug!(
+                    "[edge_grounding] flip affected 0 rows for edge {} (superseded or \
+                     source edited mid-entailment); holding for re-judge",
+                    cand.edge_id
+                );
+                break;
             }
             Err(e) => {
                 log::warn!(
@@ -594,10 +703,18 @@ mod tests {
             cursor: 42,
             stuck_rowid: Some(9),
             failures: 2,
+            entailment_version: grounding_version_tag("qwen-test"),
         };
         let json = serde_json::to_string(&st).unwrap();
         assert_eq!(serde_json::from_str::<GroundingState>(&json).unwrap(), st);
         assert_eq!(serde_json::from_str::<GroundingState>("garbage").ok(), None);
+        // A pre-versioning persisted state (no `entailment_version` key) stays
+        // readable and degrades to an empty tag — which forces one re-scan on
+        // the first post-upgrade tick (§C-I5b).
+        let legacy: GroundingState =
+            serde_json::from_str(r#"{"cursor":7,"stuck_rowid":null,"failures":0}"#).unwrap();
+        assert_eq!(legacy.cursor, 7);
+        assert_eq!(legacy.entailment_version, "");
     }
 
     #[test]
@@ -733,6 +850,62 @@ mod tests {
         let concrete = Arc::new(ScriptedEntailment::new(rules, default));
         let dynamic: Arc<dyn LlmProvider> = concrete.clone();
         (concrete, dynamic)
+    }
+
+    /// Which stale-evidence mutation the §C2 test provider performs mid-entailment.
+    #[derive(Clone, Copy)]
+    enum StaleMutation {
+        /// Concurrent supersede: set the edge's `valid_until` (edge goes inactive).
+        SupersedeEdge,
+        /// Concurrent source edit: rewrite the source memory's chunk-0 content.
+        EditSource,
+    }
+
+    /// A provider that MUTATES the DB from inside `generate()` (re-entering the
+    /// same `MemoryDB`) and then returns a strongly-entailing score. It models a
+    /// concurrent supersede or source edit landing DURING the multi-second
+    /// entailment call — the exact stale-evidence race the §C2 in-transaction
+    /// recheck defends. Because the mutation takes the connection mutex from
+    /// inside `generate()`, this ALSO proves the sweep holds no DB mutex across
+    /// entailment even for a WRITE (the prior re-entrancy probe only read).
+    struct MutatingProvider {
+        db: Arc<MemoryDB>,
+        mutation: StaleMutation,
+        edge_id: String,
+        source_id: String,
+        new_content: String,
+        mutated: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MutatingProvider {
+        async fn generate(&self, _request: LlmRequest) -> Result<String, LlmError> {
+            match self.mutation {
+                StaleMutation::SupersedeEdge => {
+                    self.db.supersede_edge_for_test(&self.edge_id).await;
+                }
+                StaleMutation::EditSource => {
+                    self.db
+                        .edit_source_content_for_test(&self.source_id, &self.new_content)
+                        .await;
+                }
+            }
+            self.mutated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("{\"score\": 0.97}".to_string())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "mutating-provider"
+        }
+        fn backend(&self) -> LlmBackend {
+            LlmBackend::OnDevice
+        }
+        fn model_id(&self) -> String {
+            "mutating-provider-model".to_string()
+        }
     }
 
     #[tokio::test]
@@ -1257,6 +1430,337 @@ mod tests {
         assert_eq!(edge["grounded"], 0);
     }
 
+    // ---- §I4: fail-closed score parsing -----------------------------------
+
+    #[test]
+    fn parse_entailment_rejects_out_of_range_and_nonfinite_scores() {
+        // In-contract scores parse.
+        assert_eq!(parse_entailment(r#"{"score":0.0}"#), Some(0.0));
+        assert_eq!(parse_entailment(r#"{"score":1.0}"#), Some(1.0));
+        assert_eq!(parse_entailment(r#"{"score":0.5}"#), Some(0.5));
+        // Out-of-range (a judge-contract violation) is REJECTED, never clamped
+        // into a pass. `{"score":2}` must not become 1.0.
+        assert_eq!(parse_entailment(r#"{"score":2}"#), None);
+        assert_eq!(parse_entailment(r#"{"score":2.0}"#), None);
+        assert_eq!(parse_entailment(r#"{"score":-1}"#), None);
+        assert_eq!(parse_entailment(r#"{"score":1.0001}"#), None);
+        // Non-finite string forms → parse to None (no numeric score field).
+        assert_eq!(parse_entailment(r#"{"score":"NaN"}"#), None);
+        assert_eq!(parse_entailment(r#"{"score":"high"}"#), None);
+        // Booleans still map into the valid range.
+        assert_eq!(parse_entailment(r#"{"supported":true}"#), Some(1.0));
+        // Extra/contradictory fields: the first recognized numeric wins, still
+        // range-checked. An out-of-range score with a contradicting bool is
+        // rejected (does not silently fall back to the bool).
+        assert_eq!(parse_entailment(r#"{"score":2,"supported":false}"#), None);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_score_does_not_promote() {
+        // A model emitting {"score": 2} (out of contract) must NOT ground — the
+        // fail-closed parse treats it as below-threshold, not a strong yes.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "Alice works on ProjectX.";
+        seed_folder_memory(&db, "doc_1", content, "space_a").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        // Scripted provider returns score 2.0 (out of range).
+        let (_p, llm) = scripted(&[], 2.0);
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(report.entailment_calls, 1, "entailment ran");
+        assert_eq!(report.promoted, 0, "out-of-range score must not promote");
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 0);
+    }
+
+    // ---- §C2: stale-evidence race (recheck in the flip transaction) --------
+
+    async fn seed_single_span_edge(db: &Arc<MemoryDB>, content: &str) -> String {
+        seed_folder_memory(db, "doc_1", content, "space_a").await;
+        seed_edge(
+            db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn stale_evidence_supersede_during_entailment_grounds_nothing() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let db = Arc::new(db);
+        let content = "The charter records that Alice works on ProjectX.";
+        let edge_id = seed_single_span_edge(&db, content).await;
+
+        // The provider supersedes THIS edge from inside generate() (mid-
+        // entailment), then returns a strongly-entailing score. The flip's
+        // `valid_until IS NULL` guard must then match zero rows.
+        let provider = Arc::new(MutatingProvider {
+            db: db.clone(),
+            mutation: StaleMutation::SupersedeEdge,
+            edge_id: edge_id.clone(),
+            source_id: "doc_1".to_string(),
+            new_content: String::new(),
+            mutated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_edge_grounding_tick(&db, &llm, &PromptRegistry::default()),
+        )
+        .await
+        .expect("no DB mutex may span the entailment call even for a write")
+        .unwrap();
+
+        assert!(
+            provider.mutated.load(std::sync::atomic::Ordering::SeqCst),
+            "provider must have superseded the edge mid-entailment (test is real)"
+        );
+        assert_eq!(
+            report.promoted, 0,
+            "a concurrent supersede during entailment must ground nothing"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 0, "edge stays grounded=0 (invariant #11)");
+        assert!(
+            edge["valid_until"].as_i64().is_some(),
+            "the edge is now superseded"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_evidence_source_edit_during_entailment_grounds_nothing() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let db = Arc::new(db);
+        let content = "The charter records that Alice works on ProjectX.";
+        let edge_id = seed_single_span_edge(&db, content).await;
+
+        // The provider rewrites the source memory's content from inside
+        // generate(); the flip's content-equality guard must then match zero
+        // rows (the verdict was judged against text that no longer exists).
+        let provider = Arc::new(MutatingProvider {
+            db: db.clone(),
+            mutation: StaleMutation::EditSource,
+            edge_id: edge_id.clone(),
+            source_id: "doc_1".to_string(),
+            new_content: "The charter records that Bob works on ProjectY.".to_string(),
+            mutated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_edge_grounding_tick(&db, &llm, &PromptRegistry::default()),
+        )
+        .await
+        .expect("no DB mutex may span the entailment call even for a write")
+        .unwrap();
+
+        assert!(provider.mutated.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            report.promoted, 0,
+            "a concurrent source edit during entailment must ground nothing"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 0);
+        assert!(
+            edge["root_id"].is_null(),
+            "no root written on a skipped flip"
+        );
+
+        // The edge is NOT poison-advanced: a later tick (with a provider judging
+        // the NEW content) can still decide it. Re-running with a fresh cursor
+        // and a matching-content span promotes it, proving "skip, re-judge".
+        db.set_app_metadata(
+            EDGE_GROUNDING_CURSOR_KEY,
+            &serde_json::to_string(&GroundingState::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        // New content DOES contain a matching triple for a re-judge; the span
+        // "Bob works on ProjectY" locates in the edited content. But the edge's
+        // stored triple is still (Alice, works_on, ProjectX); entailment over the
+        // new content should score it low. Use an all-reject provider to confirm
+        // the edge remains decidable (rejected), not stuck.
+        let (_p, reject) = scripted(&[], 0.0);
+        let report2 = run_edge_grounding_tick(&db, &reject, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(report2.promoted, 0);
+        assert!(report2.progressed, "the edge is re-decided, not stuck");
+    }
+
+    // ---- §I5a: provider-scope gate (on-device only) ------------------------
+
+    #[tokio::test]
+    async fn non_on_device_backend_skips_without_writes() {
+        struct ApiBackendProvider;
+        #[async_trait]
+        impl LlmProvider for ApiBackendProvider {
+            async fn generate(&self, _request: LlmRequest) -> Result<String, LlmError> {
+                Ok("{\"score\": 0.99}".to_string())
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &str {
+                "api-backend"
+            }
+            fn backend(&self) -> LlmBackend {
+                LlmBackend::Api
+            }
+            fn model_id(&self) -> String {
+                "cloud-model".to_string()
+            }
+        }
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "Alice works on ProjectX.";
+        seed_folder_memory(&db, "doc_1", content, "space_a").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(ApiBackendProvider);
+
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert!(
+            report.skipped_non_on_device,
+            "an Api-backend provider must be refused by the on-device scope gate"
+        );
+        assert_eq!(
+            report.entailment_calls, 0,
+            "no entailment on a cloud backend"
+        );
+        assert_eq!(report.promoted, 0);
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(
+            edge["grounded"], 0,
+            "no grounding under an unvalidated judge"
+        );
+    }
+
+    // ---- §I5b: versioned watermark re-judges on model/prompt change --------
+
+    #[tokio::test]
+    async fn version_change_resets_cursor_and_rejudges() {
+        // A prior version advanced the cursor PAST this edge (rejected it). A new
+        // version tag must reset the scan so the edge is re-judged.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "Alice works on ProjectX per the charter.";
+        seed_folder_memory(&db, "doc_1", content, "space_a").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        // Persist a watermark whose cursor is far past the edge AND whose version
+        // tag is STALE (an older prompt/model).
+        db.set_app_metadata(
+            EDGE_GROUNDING_CURSOR_KEY,
+            &serde_json::to_string(&GroundingState {
+                cursor: 1_000_000,
+                stuck_rowid: None,
+                failures: 0,
+                entailment_version: "m3g-entailment-v0|old-model".to_string(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let (_p, llm) = scripted(&[], 0.9); // now entails
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.promoted, 1,
+            "a version change re-scans and re-judges the previously-rejected edge"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 1);
+    }
+
+    #[tokio::test]
+    async fn matching_version_does_not_rescan_past_cursor() {
+        // Control for the reset test: with a cursor past the edge AND the CURRENT
+        // version tag, no reset happens — the edge stays behind the watermark and
+        // is not re-judged. This proves the reset (not the re-scan alone) is what
+        // re-judged the edge in `version_change_resets_cursor_and_rejudges`.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "Alice works on ProjectX per the charter.";
+        seed_folder_memory(&db, "doc_1", content, "space_a").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        db.set_app_metadata(
+            EDGE_GROUNDING_CURSOR_KEY,
+            &serde_json::to_string(&GroundingState {
+                cursor: 1_000_000,
+                stuck_rowid: None,
+                failures: 0,
+                entailment_version: grounding_version_tag("scripted-entailment-model"),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let (_p, llm) = scripted(&[], 0.9);
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.promoted, 0,
+            "matching version → no reset → no re-judge"
+        );
+        assert_eq!(
+            report.entailment_calls, 0,
+            "the edge stays behind the cursor"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 0);
+    }
+
     // ===== Stage C committed-fixture gate runners (Gate 1 + Gate 2.1) =========
     //
     // These drive the ONE real sweep (`run_edge_grounding_tick`) over the
@@ -1498,8 +2002,19 @@ mod tests {
         }
 
         let (_p, llm) = scripted(&[], 0.9);
-        let (promoted, _calls, _ticks) =
+        let (promoted, calls, _ticks) =
             drain_all_ticks(&db, &llm, &PromptRegistry::default()).await;
+        // Non-vacuity: every case is an external folder relation reaching the
+        // independent entailment exactly once (span-bearing cases clear the
+        // locating span gate; backlog span-null cases skip it) — so the model is
+        // consulted once per case. A miscount here would let the gate "pass"
+        // without judging (mirrors the real-model gate2 assertion).
+        assert_eq!(
+            calls,
+            cases.len(),
+            "entailment must run once per external case; got {calls}, expected {}",
+            cases.len()
+        );
 
         // Every true relation promotes and is root-correct (name the misses).
         let mut missed = Vec::new();
