@@ -10550,7 +10550,7 @@ impl MemoryDB {
     const EDGE_GROUNDING_CANDIDATE_SCAN_SQL: &'static str =
         "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
                         r.source_memory_id, fe.name, te.name,
-                        m.content, m.source_agent, m.source_id, m.url
+                        m.content, m.source_agent, m.source_id, m.url, r.id
                  FROM relations r
                  JOIN entities fe ON fe.id = r.from_entity
                  JOIN entities te ON te.id = r.to_entity
@@ -10579,6 +10579,7 @@ impl MemoryDB {
 
         struct Staged {
             rowid: i64,
+            relation_id: String,
             edge_id: String,
             from_name: String,
             to_name: String,
@@ -10605,6 +10606,7 @@ impl MemoryDB {
             let mem_source_agent: Option<String> = row.get::<Option<String>>(8).ok().flatten();
             let mem_source_id: Option<String> = row.get::<Option<String>>(9).ok().flatten();
             let mem_url: Option<String> = row.get::<Option<String>>(10).ok().flatten();
+            let relation_id: String = row.get(11).unwrap_or_default();
             let edge_id = crate::provenance::compute_edge_id(
                 "relates",
                 "entity",
@@ -10623,6 +10625,7 @@ impl MemoryDB {
                 .filter(|s| !s.is_empty());
             staged.push(Staged {
                 rowid,
+                relation_id,
                 edge_id,
                 from_name,
                 to_name,
@@ -10677,6 +10680,7 @@ impl MemoryDB {
                     .unwrap_or((None, None, None));
                 EdgeGroundingCandidate {
                     rowid: s.rowid,
+                    relation_id: s.relation_id,
                     edge_id: s.edge_id,
                     from_name: s.from_name,
                     to_name: s.to_name,
@@ -10701,6 +10705,17 @@ impl MemoryDB {
     ///   edge affects zero rows, and `grounded` can never go `1→0`);
     /// - `valid_until IS NULL` — the edge is still active (a concurrent supersede
     ///   during the entailment call must not ground a now-inactive edge);
+    /// - the RELATION that produced this `edge_id` still derives from the judged
+    ///   source: a `relations` row with the scanned `id` (UUID generation) AND
+    ///   the judged `source_memory_id` still exists. The content-addressed
+    ///   `edge_id` is triple-only, so it survives two provenance-moving events the
+    ///   `edge_id`/content checks alone miss: (1) a same-triple ON CONFLICT
+    ///   upsert from a DIFFERENT source silently moves `source_memory_id` while
+    ///   the id stays fixed — the `source_memory_id` term rejects it; (2) a
+    ///   delete + re-add (supersede/reactivate) mints a NEW `relations.id` while
+    ///   the edge is reactivated active — the `id` term rejects it (a UUID, so no
+    ///   `rowid`-reuse hole). Together they refuse to ground a verdict whose
+    ///   provenance has moved off the judged source;
     /// - the source memory's chunk-0 `content` still equals the exact text
     ///   entailment judged (`judged_content`) — a concurrent source edit during
     ///   the multi-second entailment invalidates the verdict, so the edge is not
@@ -10732,14 +10747,19 @@ impl MemoryDB {
                         "UPDATE edges SET grounded = 1, root_id = ?1, payload = ?2 \
                          WHERE edge_id = ?3 AND grounded = 0 AND valid_until IS NULL \
                            AND EXISTS ( \
+                               SELECT 1 FROM relations \
+                               WHERE id = ?4 AND source_memory_id = ?5 \
+                           ) \
+                           AND EXISTS ( \
                                SELECT 1 FROM memories \
-                               WHERE source_id = ?4 AND source = 'memory' \
-                                 AND chunk_index = 0 AND content = ?5 \
+                               WHERE source_id = ?5 AND source = 'memory' \
+                                 AND chunk_index = 0 AND content = ?6 \
                            )",
                         libsql::params![
                             promotion.root_id.clone(),
                             promotion.payload.clone(),
                             promotion.edge_id.clone(),
+                            promotion.relation_id.clone(),
                             promotion.source_memory_id.clone(),
                             promotion.judged_content.clone(),
                         ],
@@ -10823,6 +10843,86 @@ impl MemoryDB {
         )
         .await
         .expect("test edit source content");
+    }
+
+    /// Test-only helper: read the single relation currently linked to
+    /// `source_id`, returning `(relation_id, from_entity, to_entity,
+    /// relation_type)`. Locks and drops the connection in one scope so callers
+    /// never hold it across the public methods below (which take their own lock).
+    #[cfg(test)]
+    async fn relation_triple_for_test(&self, source_id: &str) -> (String, String, String, String) {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, from_entity, to_entity, relation_type FROM relations \
+                 WHERE source_memory_id = ?1 LIMIT 1",
+                libsql::params![source_id],
+            )
+            .await
+            .expect("test relation lookup");
+        let row = rows
+            .next()
+            .await
+            .expect("test relation row")
+            .expect("relation exists for source");
+        (
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<String>(2).unwrap(),
+            row.get::<String>(3).unwrap(),
+        )
+    }
+
+    /// Test-only: re-assert the same (from,to,type) triple from a DIFFERENT
+    /// source memory via the REAL `create_relation` upsert, so the §C2
+    /// linkage-move race test can simulate a same-triple re-assert landing DURING
+    /// entailment. The ON CONFLICT COALESCE moves `source_memory_id` to
+    /// `new_source_id` while keeping the SAME `relations.id` — the flip's
+    /// `source_memory_id` term must then reject the stale verdict.
+    #[cfg(test)]
+    pub(crate) async fn reassert_relation_from_other_source_for_test(
+        &self,
+        old_source_id: &str,
+        new_source_id: &str,
+    ) {
+        let (_id, from, to, rt) = self.relation_triple_for_test(old_source_id).await;
+        self.create_relation(
+            &from,
+            &to,
+            &rt,
+            Some("post_ingest"),
+            Some(0.99),
+            None,
+            Some(new_source_id),
+        )
+        .await
+        .expect("test re-assert relation from other source");
+    }
+
+    /// Test-only: supersede-then-reactivate the relation for `source_id` via the
+    /// REAL public paths — `supersede_relation` (delete + soft-invalidate the
+    /// edge) followed by `create_relation` re-adding the SAME triple+source. The
+    /// re-add mints a FRESH `relations.id` (UUID) and reactivates the edge
+    /// (`valid_until` back to NULL). So at flip time the edge looks active and
+    /// its source content is unchanged — only the new `relations.id` differs from
+    /// the judged generation, isolating the §C2 relation-identity guard.
+    #[cfg(test)]
+    pub(crate) async fn supersede_and_readd_relation_for_test(&self, source_id: &str) {
+        let (rel_id, from, to, rt) = self.relation_triple_for_test(source_id).await;
+        self.supersede_relation(&rel_id, "test-reactivate-winner")
+            .await
+            .expect("test supersede relation");
+        self.create_relation(
+            &from,
+            &to,
+            &rt,
+            Some("post_ingest"),
+            None,
+            None,
+            Some(source_id),
+        )
+        .await
+        .expect("test re-add relation");
     }
 
     /// Test-only: read a `provenance_roots` row by `root_id`, returning

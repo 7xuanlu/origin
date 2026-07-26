@@ -66,6 +66,12 @@ pub(crate) const EDGE_GROUNDING_CURSOR_KEY: &str = "edge_grounding_cursor";
 pub struct EdgeGroundingCandidate {
     /// `relations.rowid` — the monotonic scan cursor key.
     pub rowid: i64,
+    /// `relations.id` (a UUID) — the relation-row identity/generation the flip
+    /// re-verifies (§C2 linkage guard). Stable across an ON CONFLICT upsert
+    /// (same triple re-asserted from a different source keeps this id but moves
+    /// `source_memory_id`), fresh on a delete + re-add (supersede/reactivate),
+    /// so it distinguishes the judged relation generation from a replacement.
+    pub relation_id: String,
     pub edge_id: String,
     pub from_name: String,
     pub to_name: String,
@@ -94,15 +100,24 @@ pub struct EdgeGroundingCandidate {
 /// multi-second entailment call runs OUTSIDE any transaction. A concurrent
 /// supersede or source edit during that window can invalidate the basis, so the
 /// flip re-verifies IN its own transaction that the edge is still active
-/// (`valid_until IS NULL`) and the judged source content is byte-identical to
-/// what entailment saw. On mismatch the flip affects zero rows and the caller
-/// skips it (no poison), re-judging the edge against fresh evidence on a later
-/// tick. See [`MemoryDB::promote_edges_grounded`].
+/// (`valid_until IS NULL`), that the RELATION still derives from the judged
+/// source (same `relations.id` generation AND same `source_memory_id`), and
+/// that the judged source content is byte-identical to what entailment saw. On
+/// any mismatch the flip affects zero rows and the caller skips it (no poison),
+/// re-judging the edge against fresh evidence on a later tick. See
+/// [`MemoryDB::promote_edges_grounded`].
 #[derive(Debug, Clone)]
 pub struct EdgePromotion {
     pub edge_id: String,
     pub root_id: String,
     pub payload: String,
+    /// The `relations.id` (UUID) whose triple produced this `edge_id` at scan
+    /// time — the linkage-recheck generation key. A same-triple upsert from
+    /// another source keeps this id but changes `source_memory_id`; a
+    /// delete + re-add mints a new id. The flip requires BOTH this id AND
+    /// `source_memory_id` to still match, so neither vector grounds a verdict
+    /// whose provenance has moved (§C2).
+    pub relation_id: String,
     /// The source memory whose chunk-0 content was judged (the recheck key).
     pub source_memory_id: String,
     /// The exact chunk-0 content entailment judged; the flip requires the live
@@ -550,6 +565,7 @@ async fn run_edge_grounding_with_budget(
             edge_id: cand.edge_id.clone(),
             root_id,
             payload,
+            relation_id: cand.relation_id.clone(),
             source_memory_id: source_memory_id.to_string(),
             judged_content: content.to_string(),
         };
@@ -853,12 +869,20 @@ mod tests {
     }
 
     /// Which stale-evidence mutation the §C2 test provider performs mid-entailment.
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum StaleMutation {
         /// Concurrent supersede: set the edge's `valid_until` (edge goes inactive).
         SupersedeEdge,
         /// Concurrent source edit: rewrite the source memory's chunk-0 content.
         EditSource,
+        /// Same-triple re-assert from a DIFFERENT source: the ON CONFLICT upsert
+        /// moves `source_memory_id` while the `relations.id` stays fixed. The
+        /// linkage guard's `source_memory_id` term must reject the stale verdict.
+        MoveLinkage { new_source_id: String },
+        /// Supersede-then-reactivate: delete + re-add the relation, minting a
+        /// FRESH `relations.id` while the edge is reactivated active. The linkage
+        /// guard's `id` term must reject the stale verdict.
+        SupersedeReactivate,
     }
 
     /// A provider that MUTATES the DB from inside `generate()` (re-entering the
@@ -880,13 +904,26 @@ mod tests {
     #[async_trait]
     impl LlmProvider for MutatingProvider {
         async fn generate(&self, _request: LlmRequest) -> Result<String, LlmError> {
-            match self.mutation {
+            match &self.mutation {
                 StaleMutation::SupersedeEdge => {
                     self.db.supersede_edge_for_test(&self.edge_id).await;
                 }
                 StaleMutation::EditSource => {
                     self.db
                         .edit_source_content_for_test(&self.source_id, &self.new_content)
+                        .await;
+                }
+                StaleMutation::MoveLinkage { new_source_id } => {
+                    self.db
+                        .reassert_relation_from_other_source_for_test(
+                            &self.source_id,
+                            new_source_id,
+                        )
+                        .await;
+                }
+                StaleMutation::SupersedeReactivate => {
+                    self.db
+                        .supersede_and_readd_relation_for_test(&self.source_id)
                         .await;
                 }
             }
@@ -1605,6 +1642,153 @@ mod tests {
             .unwrap();
         assert_eq!(report2.promoted, 0);
         assert!(report2.progressed, "the edge is re-decided, not stuck");
+    }
+
+    #[tokio::test]
+    async fn stale_evidence_linkage_move_during_entailment_grounds_nothing() {
+        // §C2 linkage-move race: a same-triple re-assert from a DIFFERENT source
+        // memory lands DURING entailment. The content-addressed edge_id is
+        // triple-only, so it is unchanged and source A's content is unchanged —
+        // only the relation's `source_memory_id` moved to B. The flip's linkage
+        // guard (`source_memory_id` term) must ground nothing: the verdict was
+        // judged against A, whose provenance the relation no longer carries.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let db = Arc::new(db);
+        let content_a = "Doc A: the charter records that Alice works on ProjectX.";
+        let edge_id = seed_single_span_edge(&db, content_a).await;
+        // A second folder source B whose content ALSO carries the span, so a
+        // later tick can re-judge the moved relation against its NEW evidence.
+        seed_folder_memory(
+            &db,
+            "doc_2",
+            "Doc B: minutes note Alice works on ProjectX.",
+            "space_a",
+        )
+        .await;
+
+        let provider = Arc::new(MutatingProvider {
+            db: db.clone(),
+            mutation: StaleMutation::MoveLinkage {
+                new_source_id: "doc_2".to_string(),
+            },
+            edge_id: edge_id.clone(),
+            source_id: "doc_1".to_string(),
+            new_content: String::new(),
+            mutated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_edge_grounding_tick(&db, &llm, &PromptRegistry::default()),
+        )
+        .await
+        .expect("no DB mutex may span the entailment call even for a write")
+        .unwrap();
+
+        assert!(provider.mutated.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            report.promoted, 0,
+            "a linkage move during entailment must ground nothing"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 0, "edge stays grounded=0 (invariant #11)");
+        assert!(
+            edge["root_id"].is_null(),
+            "no root written on a skipped flip"
+        );
+        assert!(
+            edge["valid_until"].is_null(),
+            "the edge is still active — only its source linkage moved, so the \
+             source_memory_id term (not valid_until) is what refused"
+        );
+
+        // Re-decidable, not poisoned: a fresh tick re-scans the relation (now
+        // linked to B) and grounds it against B's OWN content — the skip
+        // re-judges against the moved evidence, not the stale A verdict.
+        db.set_app_metadata(
+            EDGE_GROUNDING_CURSOR_KEY,
+            &serde_json::to_string(&GroundingState::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (_p, entail) = scripted(&[], 0.9);
+        let report2 = run_edge_grounding_tick(&db, &entail, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            report2.promoted, 1,
+            "the moved relation is re-grounded against source B"
+        );
+        let edge2 = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge2["grounded"], 1);
+    }
+
+    #[tokio::test]
+    async fn stale_evidence_supersede_reactivate_during_entailment_grounds_nothing() {
+        // §C2 supersede-and-reactivate race: the relation is deleted and re-added
+        // (a FRESH `relations.id`) DURING entailment, and the edge is reactivated
+        // ACTIVE. So at flip time the edge passes `valid_until IS NULL` and the
+        // source content is unchanged — ONLY the relation identity differs from
+        // the judged generation. The flip's linkage `id` term must ground
+        // nothing; the pre-existing valid_until guard cannot catch this.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let db = Arc::new(db);
+        let content = "The charter records that Alice works on ProjectX.";
+        let edge_id = seed_single_span_edge(&db, content).await;
+
+        let provider = Arc::new(MutatingProvider {
+            db: db.clone(),
+            mutation: StaleMutation::SupersedeReactivate,
+            edge_id: edge_id.clone(),
+            source_id: "doc_1".to_string(),
+            new_content: String::new(),
+            mutated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_edge_grounding_tick(&db, &llm, &PromptRegistry::default()),
+        )
+        .await
+        .expect("no DB mutex may span the entailment call even for a write")
+        .unwrap();
+
+        assert!(provider.mutated.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            report.promoted, 0,
+            "a supersede + reactivate during entailment must ground nothing"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 0, "edge stays grounded=0 (invariant #11)");
+        assert!(edge["root_id"].is_null());
+        // KEY isolation: the reactivated edge is ACTIVE, so the pre-existing
+        // valid_until guard would have let it through — only the fresh
+        // relation.id refused it.
+        assert!(
+            edge["valid_until"].is_null(),
+            "edge was reactivated active; the relation.id term, not valid_until, is what refused"
+        );
+
+        // Re-decidable: a fresh tick scans the re-added relation (new identity)
+        // and grounds it — the skip held, it did not poison.
+        db.set_app_metadata(
+            EDGE_GROUNDING_CURSOR_KEY,
+            &serde_json::to_string(&GroundingState::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (_p, entail) = scripted(&[], 0.9);
+        let report2 = run_edge_grounding_tick(&db, &entail, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            report2.promoted, 1,
+            "the re-added relation grounds cleanly on a later tick"
+        );
+        let edge2 = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge2["grounded"], 1);
     }
 
     // ---- §I5a: provider-scope gate (on-device only) ------------------------
