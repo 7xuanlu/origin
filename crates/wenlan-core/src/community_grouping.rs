@@ -10,9 +10,9 @@ use thiserror::Error;
 
 use crate::{
     community_partition::{
-        full_partition, incremental_partition, project_grounded_relates, rebind_durable_ids,
-        IncrementalConfig, IncrementalPartitionState, PartitionConfig, ProjectionConfig,
-        ProjectionInputEdge,
+        full_partition, incremental_partition, project_grounded_relates,
+        rebind_durable_ids_weighted, IncrementalConfig, IncrementalPartitionState, PartitionConfig,
+        ProjectionConfig, ProjectionInputEdge,
     },
     db::MemoryDB,
 };
@@ -43,6 +43,8 @@ pub struct CommunityGroupingAttempt {
     pub(crate) published_generation: Option<i64>,
     pub(crate) token: String,
     pub(crate) edges: Vec<ProjectionInputEdge>,
+    pub(crate) ungrounded_edges: Vec<ProjectionInputEdge>,
+    pub(crate) entity_embeddings: BTreeMap<String, Vec<f32>>,
     pub(crate) previous_ids: BTreeMap<String, String>,
     pub(crate) dirty_node_ids: BTreeSet<String>,
     pub(crate) db_mutex_hold: Duration,
@@ -71,6 +73,7 @@ impl CommunityGroupingComputed {
 pub(crate) struct ComputedCommunityMember {
     pub(crate) node_id: String,
     pub(crate) community_id: String,
+    pub(crate) attachment: &'static str,
 }
 
 #[derive(Debug)]
@@ -185,9 +188,9 @@ pub fn compute_community_grouping(
                     .unwrap_or_else(|| format!("__m4-new-node-{node_id}"))
             })
             .collect::<Vec<_>>();
-        let rebound = rebind_durable_ids(&previous_ids, &membership);
+        let rebound = rebind_durable_ids_weighted(&previous_ids, &membership, &graph);
         let mut minted = BTreeMap::<String, String>::new();
-        graph
+        let mut core_members = graph
             .node_ids()
             .iter()
             .zip(rebound)
@@ -205,9 +208,17 @@ pub fn compute_community_grouping(
                 ComputedCommunityMember {
                     node_id: node_id.clone(),
                     community_id,
+                    attachment: "core",
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let isolated = posthoc_isolated_attachments(
+            &core_members,
+            &attempt.ungrounded_edges,
+            &attempt.entity_embeddings,
+        );
+        core_members.extend(isolated);
+        core_members
     };
 
     Ok(CommunityGroupingComputed {
@@ -215,6 +226,154 @@ pub fn compute_community_grouping(
         projected_edge_count: attempt.edges.len(),
         next_state,
     })
+}
+
+fn posthoc_isolated_attachments(
+    core_members: &[ComputedCommunityMember],
+    ungrounded_edges: &[ProjectionInputEdge],
+    entity_embeddings: &BTreeMap<String, Vec<f32>>,
+) -> Vec<ComputedCommunityMember> {
+    let core_community = core_members
+        .iter()
+        .map(|member| (member.node_id.clone(), member.community_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let ungrounded = project_grounded_relates(ungrounded_edges, ProjectionConfig::default());
+    let mut strongest_neighbor = BTreeMap::<String, (f64, String)>::new();
+    for edge in ungrounded.edges() {
+        let src = &ungrounded.node_ids()[edge.src];
+        let dst = &ungrounded.node_ids()[edge.dst];
+        update_strongest_neighbor(&mut strongest_neighbor, src, dst, edge.weight);
+        update_strongest_neighbor(&mut strongest_neighbor, dst, src, edge.weight);
+    }
+
+    let centroids = community_centroids(&core_community, entity_embeddings);
+    let mut attached = Vec::new();
+    for (node_id, embedding) in entity_embeddings {
+        if core_community.contains_key(node_id) {
+            continue;
+        }
+        let ungrounded_community =
+            resolve_ungrounded_community(node_id, &strongest_neighbor, &core_community);
+        if let Some(community_id) = ungrounded_community {
+            attached.push(ComputedCommunityMember {
+                node_id: node_id.clone(),
+                community_id,
+                attachment: "isolated_ungrounded",
+            });
+            continue;
+        }
+        if let Some(community_id) = nearest_centroid(embedding, &centroids) {
+            attached.push(ComputedCommunityMember {
+                node_id: node_id.clone(),
+                community_id,
+                attachment: "isolated_embedding",
+            });
+        }
+    }
+    attached
+}
+
+fn update_strongest_neighbor(
+    strongest: &mut BTreeMap<String, (f64, String)>,
+    node_id: &str,
+    neighbor_id: &str,
+    weight: f64,
+) {
+    let candidate = (weight, neighbor_id.to_owned());
+    let replace = strongest.get(node_id).is_none_or(|current| {
+        candidate.0.total_cmp(&current.0).is_gt()
+            || (candidate.0.total_cmp(&current.0).is_eq() && candidate.1 < current.1)
+    });
+    if replace {
+        strongest.insert(node_id.to_owned(), candidate);
+    }
+}
+
+fn resolve_ungrounded_community(
+    node_id: &str,
+    strongest_neighbor: &BTreeMap<String, (f64, String)>,
+    core_community: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut cursor = node_id;
+    let mut visited = BTreeSet::new();
+    while visited.insert(cursor.to_owned()) {
+        let (_, neighbor) = strongest_neighbor.get(cursor)?;
+        if let Some(community_id) = core_community.get(neighbor) {
+            return Some(community_id.clone());
+        }
+        cursor = neighbor;
+    }
+    None
+}
+
+fn community_centroids(
+    core_community: &BTreeMap<String, String>,
+    entity_embeddings: &BTreeMap<String, Vec<f32>>,
+) -> BTreeMap<String, Vec<f64>> {
+    let mut sums = BTreeMap::<String, (Vec<f64>, usize)>::new();
+    for (node_id, community_id) in core_community {
+        let Some(embedding) = entity_embeddings
+            .get(node_id)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let entry = sums
+            .entry(community_id.clone())
+            .or_insert_with(|| (vec![0.0; embedding.len()], 0));
+        if entry.0.len() != embedding.len() {
+            continue;
+        }
+        for (sum, value) in entry.0.iter_mut().zip(embedding) {
+            *sum += f64::from(*value);
+        }
+        entry.1 += 1;
+    }
+    sums.into_iter()
+        .filter_map(|(community_id, (mut sum, count))| {
+            if count == 0 {
+                return None;
+            }
+            for value in &mut sum {
+                *value /= count as f64;
+            }
+            Some((community_id, sum))
+        })
+        .collect()
+}
+
+fn nearest_centroid(embedding: &[f32], centroids: &BTreeMap<String, Vec<f64>>) -> Option<String> {
+    if embedding.is_empty() {
+        return None;
+    }
+    let mut best: Option<(f64, String)> = None;
+    for (community_id, centroid) in centroids {
+        if centroid.len() != embedding.len() {
+            continue;
+        }
+        let dot = centroid
+            .iter()
+            .zip(embedding)
+            .map(|(left, right)| left * f64::from(*right))
+            .sum::<f64>();
+        let left_norm = centroid.iter().map(|value| value * value).sum::<f64>();
+        let right_norm = embedding
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>();
+        if left_norm <= 0.0 || right_norm <= 0.0 {
+            continue;
+        }
+        let cosine = dot / (left_norm.sqrt() * right_norm.sqrt());
+        let replace = best.as_ref().is_none_or(|current| {
+            cosine.total_cmp(&current.0).is_gt()
+                || (cosine.total_cmp(&current.0).is_eq() && community_id < &current.1)
+        });
+        if replace {
+            best = Some((cosine, community_id.clone()));
+        }
+    }
+    best.map(|(_, community_id)| community_id)
 }
 
 fn full_partition_state(

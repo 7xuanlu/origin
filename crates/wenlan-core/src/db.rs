@@ -10304,13 +10304,7 @@ struct EntityMergeEdgePlan {
 }
 
 type CommunityGenerationUpdate = (String, i64, BTreeSet<String>);
-type PreparedCommunityGrouping = (
-    i64,
-    Option<i64>,
-    String,
-    Vec<crate::community_partition::ProjectionInputEdge>,
-    BTreeMap<String, String>,
-);
+const COMMUNITY_READ_PAGE_SIZE: i64 = 512;
 
 impl EdgeBackfillCounts {
     fn to_json(&self) -> serde_json::Value {
@@ -11180,25 +11174,21 @@ impl MemoryDB {
         }
     }
 
-    /// Acquire one durable community-phase lease and copy all database input
-    /// under one short mutex acquisition. Graph computation happens later,
-    /// after this method has returned and released the connection.
-    pub async fn prepare_community_grouping(
+    async fn acquire_community_grouping_lease(
         &self,
         space: &str,
     ) -> Result<
-        crate::community_grouping::CommunityGroupingAttempt,
+        (i64, Option<i64>, String, std::time::Duration),
         crate::community_grouping::CommunityGroupingError,
     > {
-        use crate::community_grouping::{CommunityGroupingAttempt, CommunityGroupingError};
+        use crate::community_grouping::CommunityGroupingError;
 
-        let started = std::time::Instant::now();
         let conn = self.conn.lock().await;
+        let held_at = std::time::Instant::now();
         conn.execute("BEGIN", ())
             .await
             .map_err(|error| CommunityGroupingError::Database(format!("prepare begin: {error}")))?;
-
-        let result: Result<PreparedCommunityGrouping, CommunityGroupingError> = async {
+        let result: Result<(i64, Option<i64>, String), CommunityGroupingError> = async {
             let mut state_rows = conn
                 .query(
                     "SELECT graph_generation, published_generation \
@@ -11247,9 +11237,9 @@ impl MemoryDB {
             let acquired = conn
                 .execute(
                     "INSERT INTO grouping_leases \
-                    (phase, space, input_generation, token, expires_at, attempt) \
-                 VALUES ('community', ?1, ?2, ?3, unixepoch() + 300, 1) \
-                 ON CONFLICT(phase, space, input_generation) DO NOTHING",
+                        (phase, space, input_generation, token, expires_at, attempt) \
+                     VALUES ('community', ?1, ?2, ?3, unixepoch() + 300, 1) \
+                     ON CONFLICT(phase, space, input_generation) DO NOTHING",
                     libsql::params![space.to_owned(), input_generation, token.clone()],
                 )
                 .await
@@ -11262,25 +11252,66 @@ impl MemoryDB {
                     input_generation,
                 });
             }
+            Ok((input_generation, published_generation, token))
+        }
+        .await;
 
-            let mut edge_rows = conn
+        match result {
+            Ok((input_generation, published_generation, token)) => {
+                conn.execute("COMMIT", ()).await.map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare commit: {error}"))
+                })?;
+                Ok((
+                    input_generation,
+                    published_generation,
+                    token,
+                    held_at.elapsed(),
+                ))
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn load_community_grounded_edges_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (
+            Vec<crate::community_partition::ProjectionInputEdge>,
+            std::time::Duration,
+        ),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = Vec::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
                 .query(
                     "SELECT edge_id, src_id, dst_id FROM edges \
                      WHERE edge_type = 'relates' AND grounded = 1 \
                        AND valid_until IS NULL AND space = ?1 \
                        AND src_kind = 'entity' AND dst_kind = 'entity' \
-                       AND lineage = 'assertion'",
-                    libsql::params![space.to_owned()],
+                       AND lineage = 'assertion' AND edge_id > ?2 \
+                     ORDER BY edge_id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
                 )
                 .await
                 .map_err(|error| {
                     CommunityGroupingError::Database(format!("prepare grounded edges: {error}"))
                 })?;
-            let mut edges = Vec::new();
-            while let Some(row) = edge_rows.next().await.map_err(|error| {
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
                 CommunityGroupingError::Database(format!("prepare grounded edge row: {error}"))
             })? {
-                edges.push(crate::community_partition::ProjectionInputEdge::new(
+                page.push(crate::community_partition::ProjectionInputEdge::new(
                     row.get::<String>(0).map_err(|error| {
                         CommunityGroupingError::Database(format!("prepare edge id decode: {error}"))
                     })?,
@@ -11296,56 +11327,278 @@ impl MemoryDB {
                     })?,
                 ));
             }
-            drop(edge_rows);
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some(last) = page.last() {
+                cursor.clone_from(&last.edge_id);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
 
-            let mut member_rows = conn
+    async fn load_community_ungrounded_edges_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (
+            Vec<crate::community_partition::ProjectionInputEdge>,
+            std::time::Duration,
+        ),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = Vec::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
                 .query(
-                    "SELECT node_id, community_id FROM community_members WHERE space = ?1",
-                    libsql::params![space.to_owned()],
+                    "SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE edge_type = 'relates' AND grounded = 0 \
+                       AND valid_until IS NULL AND space = ?1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND lineage = 'assertion' AND edge_id > ?2 \
+                     ORDER BY edge_id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare ungrounded edges: {error}"))
+                })?;
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare ungrounded edge row: {error}"))
+            })? {
+                page.push(crate::community_partition::ProjectionInputEdge::new(
+                    row.get::<String>(0).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare ungrounded edge id decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(1).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare ungrounded source decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(2).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare ungrounded destination decode: {error}"
+                        ))
+                    })?,
+                ));
+            }
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some(last) = page.last() {
+                cursor.clone_from(&last.edge_id);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
+
+    async fn load_community_entities_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (BTreeMap<String, Vec<f32>>, std::time::Duration),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = BTreeMap::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
+                .query(
+                    "SELECT id, embedding FROM entities \
+                     WHERE space = ?1 AND id > ?2 \
+                     ORDER BY id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare entities: {error}"))
+                })?;
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare entity row: {error}"))
+            })? {
+                let node_id = row.get::<String>(0).map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare entity id decode: {error}"))
+                })?;
+                let embedding = row
+                    .get::<Option<Vec<u8>>>(1)
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare entity embedding decode: {error}"
+                        ))
+                    })?
+                    .unwrap_or_default()
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    .collect();
+                page.push((node_id, embedding));
+            }
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some((last, _)) = page.last() {
+                cursor.clone_from(last);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
+
+    async fn load_previous_community_members_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (BTreeMap<String, String>, std::time::Duration),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = BTreeMap::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
+                .query(
+                    "SELECT node_id, community_id FROM community_members \
+                     WHERE space = ?1 AND node_id > ?2 \
+                     ORDER BY node_id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
                 )
                 .await
                 .map_err(|error| {
                     CommunityGroupingError::Database(format!("prepare prior members: {error}"))
                 })?;
-            let mut previous_ids = BTreeMap::new();
-            while let Some(row) = member_rows.next().await.map_err(|error| {
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
                 CommunityGroupingError::Database(format!("prepare prior member row: {error}"))
             })? {
-                let node_id = row.get::<String>(0).map_err(|error| {
-                    CommunityGroupingError::Database(format!("prepare prior node decode: {error}"))
-                })?;
-                let community_id = row.get::<String>(1).map_err(|error| {
-                    CommunityGroupingError::Database(format!(
-                        "prepare prior community decode: {error}"
-                    ))
-                })?;
-                previous_ids.insert(node_id, community_id);
+                page.push((
+                    row.get::<String>(0).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare prior node decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(1).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare prior community decode: {error}"
+                        ))
+                    })?,
+                ));
             }
-            drop(member_rows);
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some((last, _)) = page.last() {
+                cursor.clone_from(last);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
 
-            Ok((
-                input_generation,
-                published_generation,
-                token,
+    async fn release_community_grouping_lease(
+        &self,
+        space: &str,
+        input_generation: i64,
+        token: &str,
+    ) {
+        let conn = self.conn.lock().await;
+        let _ = conn
+            .execute(
+                "DELETE FROM grouping_leases \
+                 WHERE phase='community' AND space=?1 \
+                   AND input_generation=?2 AND token=?3",
+                libsql::params![space.to_owned(), input_generation, token.to_owned()],
+            )
+            .await;
+    }
+
+    /// Acquire one durable community-phase lease, then copy every potentially
+    /// large input through deterministic keyset pages. Each page releases the
+    /// single DB connection mutex before the next page and before all graph
+    /// computation.
+    pub async fn prepare_community_grouping(
+        &self,
+        space: &str,
+    ) -> Result<
+        crate::community_grouping::CommunityGroupingAttempt,
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::{CommunityGroupingAttempt, CommunityGroupingError};
+
+        let (input_generation, published_generation, token, mut db_mutex_hold) =
+            self.acquire_community_grouping_lease(space).await?;
+        let loaded = async {
+            let (edges, edge_hold) = self.load_community_grounded_edges_paged(space).await?;
+            let (ungrounded_edges, ungrounded_hold) =
+                self.load_community_ungrounded_edges_paged(space).await?;
+            let (entity_embeddings, entity_hold) =
+                self.load_community_entities_paged(space).await?;
+            let (previous_ids, member_hold) =
+                self.load_previous_community_members_paged(space).await?;
+            Ok::<_, CommunityGroupingError>((
                 edges,
+                ungrounded_edges,
+                entity_embeddings,
                 previous_ids,
+                edge_hold + ungrounded_hold + entity_hold + member_hold,
             ))
         }
         .await;
-
-        let (input_generation, published_generation, token, edges, previous_ids) = match result {
-            Ok(prepared) => {
-                conn.execute("COMMIT", ()).await.map_err(|error| {
-                    CommunityGroupingError::Database(format!("prepare commit: {error}"))
-                })?;
-                prepared
-            }
+        let (edges, ungrounded_edges, entity_embeddings, previous_ids, load_hold) = match loaded {
+            Ok(loaded) => loaded,
             Err(error) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
+                self.release_community_grouping_lease(space, input_generation, &token)
+                    .await;
                 return Err(error);
             }
         };
+        db_mutex_hold += load_hold;
+
+        // Serialize the volatile frontier snapshot behind the same connection
+        // mutex every graph writer retains through its dirty-node record.
+        let conn = self.conn.lock().await;
+        let held_at = std::time::Instant::now();
         let dirty_node_ids = self.community_dirty_nodes_through(space, input_generation);
+        db_mutex_hold += held_at.elapsed();
         drop(conn);
 
         Ok(CommunityGroupingAttempt {
@@ -11354,9 +11607,11 @@ impl MemoryDB {
             published_generation,
             token,
             edges,
+            ungrounded_edges,
+            entity_embeddings,
             previous_ids,
             dirty_node_ids,
-            db_mutex_hold: started.elapsed(),
+            db_mutex_hold,
         })
     }
 
@@ -11484,12 +11739,13 @@ impl MemoryDB {
                         "INSERT INTO community_members \
                             (space, node_id, node_kind, community_id, \
                              published_generation, attachment) \
-                         VALUES (?1, ?2, 'entity', ?3, ?4, 'core')",
+                         VALUES (?1, ?2, 'entity', ?3, ?4, ?5)",
                         libsql::params![
                             attempt.space.clone(),
                             member.node_id.clone(),
                             member.community_id.clone(),
-                            attempt.input_generation
+                            attempt.input_generation,
+                            member.attachment
                         ],
                     )
                     .await
@@ -11538,7 +11794,11 @@ impl MemoryDB {
 
         let receipt = CommunityGroupingReceipt {
             input_generation: attempt.input_generation,
-            published_generation: attempt.input_generation,
+            published_generation: if matched {
+                attempt.input_generation
+            } else {
+                attempt.published_generation.unwrap_or_default()
+            },
             projected_edge_count,
             member_count,
             db_mutex_hold: attempt.db_mutex_hold + finalize_started.elapsed(),
@@ -14632,7 +14892,8 @@ impl MemoryDB {
                 drop(rows);
                 Self::mark_pages_depending_on_memory_sources(&tx, &deleted_sources).await?;
                 for (source, source_id) in &deleted_sources {
-                    Self::delete_by_source_id_in_transaction(&tx, source, source_id, true).await?;
+                    self.delete_by_source_id_in_transaction(&tx, source, source_id, true)
+                        .await?;
                 }
                 // Tear the space's entities down the SAME way the single-entity
                 // `delete_entity` does (M3 PR-1), scoped to the space, BEFORE the
@@ -16201,7 +16462,7 @@ impl MemoryDB {
             // Delete existing rows for these source_ids
             for (source, source_id) in &source_ids_to_delete {
                 if source == "memory" && changed_page_sources.contains(source_id) {
-                    Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                    self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                         .await
                         .map_err(|e| {
                             WenlanError::VectorDb(format!(
@@ -20707,8 +20968,9 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_by_source_id BEGIN: {e}")))?;
-        let result =
-            Self::delete_by_source_id_in_transaction(&conn, source, source_id, false).await;
+        let result = self
+            .delete_by_source_id_in_transaction(&conn, source, source_id, false)
+            .await;
         if let Err(error) = result {
             let _ = conn.execute("ROLLBACK", ()).await;
             return Err(error);
@@ -20726,6 +20988,7 @@ impl MemoryDB {
     /// this separate lets space deletion reuse the exact forget semantics
     /// without committing between members of the space.
     async fn delete_by_source_id_in_transaction(
+        &self,
         conn: &libsql::Connection,
         source: &str,
         source_id: &str,
@@ -20904,6 +21167,9 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("delete summary nodes: {e}")))?;
+        self.invalidate_relation_edges_for_source_in_transaction(conn, source_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete source relation edges: {e}")))?;
         conn.execute(
             "DELETE FROM relations WHERE source_memory_id = ?1",
             libsql::params![source_id],
@@ -22130,7 +22396,8 @@ impl MemoryDB {
             drop(rows);
             Self::mark_pages_depending_on_memory_sources(&conn, &deleted_sources).await?;
             for (source, source_id) in &deleted_sources {
-                Self::delete_by_source_id_in_transaction(&conn, source, source_id, true).await?;
+                self.delete_by_source_id_in_transaction(&conn, source, source_id, true)
+                    .await?;
             }
             Ok(deleted_rows)
         }
@@ -22170,7 +22437,8 @@ impl MemoryDB {
         let result: Result<(), WenlanError> = async {
             Self::mark_pages_depending_on_memory_sources(&conn, &unique_items).await?;
             for (source, source_id) in &unique_items {
-                Self::delete_by_source_id_in_transaction(&conn, source, source_id, true).await?;
+                self.delete_by_source_id_in_transaction(&conn, source, source_id, true)
+                    .await?;
             }
             Ok(())
         }
@@ -22348,10 +22616,60 @@ impl MemoryDB {
     /// Entity rows themselves are shared/global and deliberately survive; the
     /// next versioned entity-enrichment slice rebuilds only this memory's links,
     /// observations, and relations.
-    async fn invalidate_memory_entity_projection_in_transaction(
+    async fn invalidate_relation_edges_for_source_in_transaction(
+        &self,
         conn: &libsql::Connection,
         source_id: &str,
     ) -> Result<(), libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT from_entity, to_entity, relation_type \
+                 FROM relations WHERE source_memory_id = ?1 \
+                 ORDER BY from_entity, to_entity, relation_type",
+                libsql::params![source_id],
+            )
+            .await?;
+        let mut relation_keys = Vec::new();
+        while let Some(row) = rows.next().await? {
+            relation_keys.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+            ));
+        }
+        drop(rows);
+
+        let mut graph_changes = Vec::new();
+        for (from_entity, to_entity, relation_type) in relation_keys {
+            let edge_id = crate::provenance::compute_edge_id(
+                "relates",
+                "entity",
+                &from_entity,
+                "entity",
+                &to_entity,
+                &relation_type,
+            );
+            if let Some(change) = Self::dual_write_invalidate_edge(conn, &edge_id, None).await? {
+                graph_changes.push(change);
+            }
+        }
+        let generation_updates =
+            Self::bump_community_graph_generations(conn, graph_changes).await?;
+        // The caller still owns `self.conn` here. Recording before the outer
+        // COMMIT is conservative on rollback (at worst a later generation gets
+        // a wider dirty frontier) and preserves the no COMMIT-to-volatile-map
+        // race required by the grouping prepare snapshot.
+        self.record_community_dirty_nodes(generation_updates);
+        Ok(())
+    }
+
+    async fn invalidate_memory_entity_projection_in_transaction(
+        &self,
+        conn: &libsql::Connection,
+        source_id: &str,
+    ) -> Result<(), libsql::Error> {
+        self.invalidate_relation_edges_for_source_in_transaction(conn, source_id)
+            .await?;
         conn.execute(
             "DELETE FROM relations WHERE source_memory_id = ?1",
             libsql::params![source_id],
@@ -22604,7 +22922,7 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("update_memory service-class promotion: {e}"))
             })?;
             if head.source == "memory" && new_content.is_some() {
-                Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                     .await
                     .map_err(|e| {
                         WenlanError::VectorDb(format!(
@@ -29847,7 +30165,7 @@ impl MemoryDB {
             )
             .await?;
             for source_id in [&target_source_id, &revision_source_id] {
-                Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                     .await
                     .map_err(|error| {
                         WenlanError::VectorDb(format!(
@@ -37887,8 +38205,9 @@ impl MemoryDB {
                     "pending page revision was already consumed: {revision_id}"
                 )));
             }
-            if let Err(error) =
-                Self::delete_by_source_id_in_transaction(&conn, "memory", revision_id, false).await
+            if let Err(error) = self
+                .delete_by_source_id_in_transaction(&conn, "memory", revision_id, false)
+                .await
             {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 return Err(WenlanError::VectorDb(format!(
@@ -41595,7 +41914,7 @@ impl MemoryDB {
             let source_keys = [(saved.source.clone(), source_id.to_string())];
             let transaction_result: Result<(), WenlanError> = async {
                 Self::mark_pages_depending_on_memory_sources(&conn, &source_keys).await?;
-                Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                     .await
                     .map_err(|e| {
                         WenlanError::VectorDb(format!(

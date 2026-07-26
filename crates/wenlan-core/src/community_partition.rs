@@ -629,25 +629,75 @@ pub fn rebind_durable_ids(previous_ids: &[String], new_membership: &[usize]) -> 
         new_membership.len(),
         "prior IDs and new membership must cover the same nodes"
     );
-    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
+    let mut overlaps = BTreeMap::<(usize, String), f64>::new();
     for (node, &group) in new_membership.iter().enumerate() {
-        groups.entry(group).or_default().push(node);
+        *overlaps
+            .entry((group, previous_ids[node].clone()))
+            .or_default() += 1.0;
     }
+    assign_rebound_ids(previous_ids, new_membership, overlaps)
+}
 
-    let mut candidates = Vec::<(usize, String, usize)>::new();
-    for (&group, nodes) in &groups {
-        let mut overlaps = BTreeMap::<String, usize>::new();
-        for &node in nodes {
-            *overlaps.entry(previous_ids[node].clone()).or_default() += 1;
+/// Rebind partitioner groups by weighted-fractional overlap with prior
+/// communities. Each node contributes one unit split across the prior
+/// communities reached by its incident grounded weight. A node with no
+/// grounded adjacency falls back to its own prior identity.
+pub fn rebind_durable_ids_weighted(
+    previous_ids: &[String],
+    new_membership: &[usize],
+    graph: &ProjectedGraph,
+) -> Vec<String> {
+    assert_eq!(
+        previous_ids.len(),
+        new_membership.len(),
+        "prior IDs and new membership must cover the same nodes"
+    );
+    assert_eq!(
+        previous_ids.len(),
+        graph.node_ids.len(),
+        "weighted rebinding inputs must cover the projected graph"
+    );
+
+    let mut overlaps = BTreeMap::<(usize, String), f64>::new();
+    for (node, &group) in new_membership.iter().enumerate() {
+        let mut incident_by_old = BTreeMap::<String, f64>::new();
+        let mut total = 0.0;
+        for &(neighbor, weight) in &graph.adjacency[node] {
+            if weight <= 0.0 {
+                continue;
+            }
+            *incident_by_old
+                .entry(previous_ids[neighbor].clone())
+                .or_default() += weight;
+            total += weight;
         }
-        for (old_id, overlap) in overlaps {
-            candidates.push((overlap, old_id, group));
+        if total > 0.0 {
+            for (old_id, weight) in incident_by_old {
+                *overlaps.entry((group, old_id)).or_default() += weight / total;
+            }
+        } else {
+            *overlaps
+                .entry((group, previous_ids[node].clone()))
+                .or_default() += 1.0;
         }
     }
+    assign_rebound_ids(previous_ids, new_membership, overlaps)
+}
+
+fn assign_rebound_ids(
+    previous_ids: &[String],
+    new_membership: &[usize],
+    overlaps: BTreeMap<(usize, String), f64>,
+) -> Vec<String> {
+    let groups = new_membership.iter().copied().collect::<BTreeSet<_>>();
+    let mut candidates = overlaps
+        .into_iter()
+        .map(|((group, old_id), overlap)| (overlap, old_id, group))
+        .collect::<Vec<_>>();
     candidates.sort_by(
         |(left_overlap, left_old, left_group), (right_overlap, right_old, right_group)| {
             right_overlap
-                .cmp(left_overlap)
+                .total_cmp(left_overlap)
                 .then(left_old.cmp(right_old))
                 .then(left_group.cmp(right_group))
         },
@@ -663,7 +713,7 @@ pub fn rebind_durable_ids(previous_ids: &[String], new_membership: &[usize]) -> 
 
     let mut used_ids = previous_ids.iter().cloned().collect::<BTreeSet<_>>();
     let mut fresh_ordinal = 0usize;
-    for &group in groups.keys() {
+    for &group in &groups {
         if rebound.contains_key(&group) {
             continue;
         }

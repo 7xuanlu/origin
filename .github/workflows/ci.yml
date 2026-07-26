@@ -170,7 +170,6 @@ jobs:
               - 'crates/wenlan-core/src/repair/**'
               - 'crates/wenlan-core/src/repair_plan/**'
               - 'crates/wenlan-core/src/sources/directory.rs'
-              - 'crates/wenlan-core/tests/m4_community_gates.rs'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
