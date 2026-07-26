@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict, deque
@@ -388,6 +389,8 @@ def command_groups_for(
     suite_name: str,
     plan: object,
     cargo_metadata: object,
+    *,
+    partition: str | None = None,
 ) -> list[list[str]]:
     """Translate a plan suite into validated argv vectors."""
 
@@ -403,18 +406,34 @@ def command_groups_for(
         return []
 
     cargo = ["cargo", "nextest", "run"]
+    if partition is not None:
+        match = re.fullmatch(r"slice:([1-9][0-9]*)/([1-9][0-9]*)", partition)
+        if match is None or int(match.group(1)) > int(match.group(2)):
+            raise PlanError(f"invalid nextest partition: {partition!r}")
+        if suite_name != "workspace-lib":
+            raise PlanError("nextest partition is only supported for workspace-lib")
+
+    def workspace_command(arguments: list[str]) -> list[str]:
+        if partition is None:
+            return arguments
+        return [*arguments, "--partition", partition]
+
     if suite_name == "workspace-lib":
         if mode == "full":
-            return [[*cargo, "--workspace", "--lib"]]
+            return [workspace_command([*cargo, "--workspace", "--lib"])]
         if mode == "packages":
             names = _validated_package_names(suite.get("packages"), packages)
-            return [[*cargo, *_package_args(names), "--lib"]]
+            return [workspace_command([*cargo, *_package_args(names), "--lib"])]
         if mode == "filterset":
             filterset = suite.get("filterset")
             if not isinstance(filterset, str) or not filterset:
                 raise PlanError("workspace filterset is empty")
             names = _validated_package_names(suite.get("packages"), packages)
-            return [[*cargo, *_package_args(names), "--lib", "-E", filterset]]
+            return [
+                workspace_command(
+                    [*cargo, *_package_args(names), "--lib", "-E", filterset]
+                )
+            ]
         raise PlanError(f"unknown workspace-lib mode: {mode!r}")
 
     if suite_name == "cli-server-integration":
@@ -546,11 +565,17 @@ def _cargo_metadata() -> object:
 def _require_filterset_match(command: list[str]) -> None:
     if command[:3] != ["cargo", "nextest", "run"]:
         raise PlanError(f"cannot validate non-nextest command: {command!r}")
+    unpartitioned = command
+    if "--partition" in command:
+        index = command.index("--partition")
+        if index + 1 >= len(command):
+            raise PlanError("nextest partition has no value")
+        unpartitioned = [*command[:index], *command[index + 2 :]]
     list_command = [
         _cargo_executable(),
         "nextest",
         "list",
-        *command[3:],
+        *unpartitioned[3:],
         "--message-format",
         "json",
     ]
@@ -615,6 +640,7 @@ def _main(argv: list[str]) -> int:
         ),
     )
     run_parser.add_argument("--plan-json", required=True)
+    run_parser.add_argument("--partition")
 
     arguments = parser.parse_args(argv)
     if arguments.command == "plan":
@@ -639,7 +665,12 @@ def _main(argv: list[str]) -> int:
         plan = json.loads(arguments.plan_json)
     except json.JSONDecodeError as error:
         raise PlanError("plan-json is invalid") from error
-    commands = command_groups_for(arguments.suite, plan, _cargo_metadata())
+    commands = command_groups_for(
+        arguments.suite,
+        plan,
+        _cargo_metadata(),
+        partition=arguments.partition,
+    )
     if not commands:
         print(f"{arguments.suite}: no affected tests")
         return 0

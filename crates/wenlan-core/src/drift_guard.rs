@@ -1816,6 +1816,7 @@ fn ci_routing_contract_violations(
         "windows-lint",
         "release-preflight",
         "mcp-platform",
+        "workspace-platform",
         "test-plan",
     ] {
         if ci["jobs"]["detect-changes"]["outputs"][output]
@@ -2571,6 +2572,231 @@ fn ordinary_pr_required_path_excludes_release_and_unowned_platform_backstops() {
         Some(20),
         "the focused MCP platform compile must keep a 20-minute ceiling"
     );
+}
+
+#[test]
+fn ci_release_reuse_and_linux_shards_are_fail_closed() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse ci.yml");
+    let proof_output = "verified-release-merge";
+    let proof_ref = "needs.detect-changes.outputs.verified-release-merge != 'true'";
+
+    let permissions = &ci["jobs"]["detect-changes"]["permissions"];
+    assert_eq!(
+        permissions["contents"].as_str(),
+        Some("read"),
+        "release proof needs read-only repository contents"
+    );
+    assert_eq!(
+        permissions["checks"].as_str(),
+        Some("read"),
+        "release proof must read the required conclusion check"
+    );
+    assert_eq!(
+        permissions["pull-requests"].as_str(),
+        Some("read"),
+        "release proof must read the associated PR and its file inventory"
+    );
+    assert!(
+        ci["permissions"]["checks"].is_null() && ci["permissions"]["pull-requests"].is_null(),
+        "proof-only permissions must not be granted workflow-wide"
+    );
+    assert!(
+        ci["jobs"]["detect-changes"]["outputs"][proof_output]
+            .as_str()
+            .is_some(),
+        "detect-changes must expose the verified release proof"
+    );
+    let proof = job_step(&ci, "detect-changes", "Verify reusable release merge")
+        .expect("release proof step");
+    let proof_test = job_step(&ci, "detect-changes", "Test release merge proof")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        proof_test, "python3 scripts/verify-release-merge.test.py",
+        "release proof tests must run before routing"
+    );
+    assert_eq!(
+        proof["id"].as_str(),
+        Some("release-proof"),
+        "release proof output owner"
+    );
+    let proof_run = proof["run"].as_str().unwrap_or_default();
+    for required in [
+        "python3 scripts/verify-release-merge.py",
+        "--github-output \"$GITHUB_OUTPUT\"",
+    ] {
+        assert!(
+            proof_run.contains(required),
+            "release proof step omits {required:?}: {proof_run}"
+        );
+    }
+
+    for job in [
+        "fmt",
+        "lint",
+        "test",
+        "mcp-platform",
+        "canonical-acceptance",
+        "test-quarantine",
+        "release-preflight",
+        "docs",
+        "plugin",
+        "npm",
+    ] {
+        let condition = ci["jobs"][job]["if"].as_str().unwrap_or_default();
+        assert!(
+            condition.contains(proof_ref),
+            "{job} can repeat a verified release merge: {condition}"
+        );
+    }
+
+    let matrix = ci["jobs"]["detect-changes"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .find(|step| step["id"].as_str() == Some("matrix"))
+        .and_then(|step| step["run"].as_str())
+        .expect("dynamic test matrix");
+    for shard in ["slice:1/2", "slice:2/2"] {
+        assert_eq!(
+            matrix.matches(shard).count(),
+            1,
+            "dynamic Linux matrix must contain {shard} exactly once"
+        );
+    }
+    assert_eq!(
+        ci["jobs"]["test"]["name"].as_str(),
+        Some("test (${{ matrix.label }})"),
+        "matrix shards need unique check names"
+    );
+    let linux =
+        job_step(&ci, "test", "Workspace lib tests (Linux)").expect("Linux workspace tests");
+    assert_eq!(
+        linux["env"]["CI_TEST_PARTITION"].as_str(),
+        Some("${{ matrix.partition }}"),
+        "Linux must receive the matrix partition"
+    );
+    let linux_run = linux["run"].as_str().unwrap_or_default();
+    assert!(
+        linux_run.contains("--partition \"$CI_TEST_PARTITION\""),
+        "Linux workspace tests do not execute their nextest partition"
+    );
+    let macos_run = job_step(&ci, "test", "Workspace lib tests (macOS)")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    assert!(
+        !macos_run.contains("--partition"),
+        "macOS must retain its single complete test run"
+    );
+
+    let conclusion =
+        workflow_step_run(&ci, "Aggregate expected CI results").expect("conclusion script");
+    assert!(
+        conclusion.contains(proof_ref),
+        "conclusion can accept skipped main jobs without the verified release proof"
+    );
+}
+
+#[test]
+fn ci_manifest_and_lockfile_changes_get_focused_platform_compile_proof() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse ci.yml");
+
+    assert!(
+        ci["jobs"]["detect-changes"]["outputs"]["workspace-platform"]
+            .as_str()
+            .is_some(),
+        "detect-changes must expose workspace platform dependency routing"
+    );
+    let paths = detect_change_filter_paths(&ci, "workspace-platform");
+    for path in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/**/Cargo.toml",
+        "rust-toolchain.toml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+    ] {
+        assert!(
+            paths.contains(path),
+            "workspace platform compile omits dependency-sensitive path {path}"
+        );
+    }
+    let condition = ci["jobs"]["mcp-platform"]["if"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        condition.contains("needs.detect-changes.outputs.workspace-platform == 'true'"),
+        "focused platform job does not schedule workspace dependency changes"
+    );
+    let workspace = job_step(&ci, "mcp-platform", "Build workspace contract binaries")
+        .expect("workspace platform build step");
+    assert_eq!(
+        workspace["if"].as_str(),
+        Some("needs.detect-changes.outputs.workspace-platform == 'true'"),
+        "workspace build must be limited to dependency-sensitive changes"
+    );
+    let run = workspace["run"].as_str().unwrap_or_default();
+    assert!(
+        run.contains("cargo build -p wenlan -p wenlan-server -p wenlan-mcp --bins"),
+        "workspace platform proof does not link every shipped binary"
+    );
+    assert!(
+        !run.contains("--release"),
+        "ordinary dependency PRs must not pay release-preflight cost"
+    );
+
+    let platform_steps = ci["jobs"]["mcp-platform"]["steps"]
+        .as_sequence()
+        .expect("mcp-platform steps");
+    let build_index = platform_steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Build workspace contract binaries"))
+        .expect("workspace platform build step index");
+    let windows_condition =
+        "matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'";
+    for (step_name, required_command) in [
+        (
+            "Install sqlite3 (Windows platform build)",
+            "vcpkg install sqlite3",
+        ),
+        (
+            "Set up Vulkan SDK (Windows platform build)",
+            "scripts/setup-vulkan-sdk-windows.ps1",
+        ),
+        (
+            "Configure MSVC Ninja (Windows platform build)",
+            "scripts/setup-msvc-ninja-windows.ps1",
+        ),
+    ] {
+        let step = job_step(&ci, "mcp-platform", step_name)
+            .unwrap_or_else(|| panic!("missing workspace platform prerequisite {step_name}"));
+        assert_eq!(
+            step["if"].as_str(),
+            Some(windows_condition),
+            "{step_name} must run only for Windows dependency-sensitive changes"
+        );
+        assert!(
+            step["run"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(required_command),
+            "{step_name} does not run {required_command}"
+        );
+        let prerequisite_index = platform_steps
+            .iter()
+            .position(|candidate| candidate["name"].as_str() == Some(step_name))
+            .expect("workspace platform prerequisite index");
+        assert!(
+            prerequisite_index < build_index,
+            "{step_name} must run before the workspace platform build"
+        );
+    }
 }
 
 #[test]
