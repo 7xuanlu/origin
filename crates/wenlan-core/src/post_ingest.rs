@@ -479,12 +479,40 @@ pub async fn run_post_ingest_enrichment(
                     batch.len()
                 );
 
-                // Extract from combined content, link entities to all batch memories
-                match crate::refinery::extract_single_memory_entities(
-                    db, llm_ref, prompts, source_id, &combined,
-                )
-                .await
-                {
+                // Extract from combined content, then commit against the anchor's
+                // own content so span offsets stay char offsets into
+                // `memories.content` of the stamped `source_memory_id` (§2.2) --
+                // never against the combined batch blob.
+                let extraction = crate::refinery::extract_kg(llm_ref, prompts, &combined).await;
+                let commit_result = match extraction {
+                    Ok(mut kg) => {
+                        // A batch-extracted quote may belong to a non-anchor
+                        // window member. Re-locate it against the anchor's real
+                        // content and drop it on a miss -- never guess, never
+                        // fuzzy-match, never keep blob-based offsets.
+                        for kg_item in &mut kg {
+                            for rel in &mut kg_item.relations {
+                                if let Some(quote) = &rel.span {
+                                    if crate::extract::locate_span_chars(content, quote).is_none() {
+                                        rel.span = None;
+                                    }
+                                }
+                            }
+                        }
+                        crate::refinery::commit_kg(
+                            db,
+                            source_id,
+                            &kg,
+                            content,
+                            Some(&llm_ref.model_id()),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+
+                // Link entities to all batch memories
+                match commit_result {
                     Ok(Some(eid)) => {
                         // Link all batch memories to the extracted entity
                         for (batch_sid, _) in &batch {
@@ -1261,6 +1289,150 @@ mod tests {
 
         assert_eq!(claude_ids, vec!["mem_iso_claude"]);
         assert_eq!(cursor_ids, vec!["mem_iso_cursor"]);
+    }
+
+    // ---- M3g Important-1: batch span base must be the anchor's own content ----
+
+    /// A CannedLlmProvider that always returns one Alice-works_on-Acme
+    /// relation carrying `quote` as its span, keyed on the
+    /// extract_knowledge_graph prompt (same pattern as `canned_alice` in
+    /// `kg/entity_extraction.rs`).
+    fn canned_relation_with_span(
+        quote: &str,
+    ) -> (
+        crate::prompts::PromptRegistry,
+        std::sync::Arc<dyn crate::llm_provider::LlmProvider>,
+    ) {
+        use crate::llm_provider::CannedLlmProvider;
+        let prompts = crate::prompts::PromptRegistry::default();
+        let key_fragment: String = prompts.extract_knowledge_graph.chars().take(30).collect();
+        let kg_json = serde_json::json!([{
+            "entities": [{"name": "Alice", "type": "person"}, {"name": "Acme", "type": "org"}],
+            "observations": [],
+            "relations": [{"from": "Alice", "to": "Acme", "type": "works_on", "span": quote}]
+        }])
+        .to_string();
+        let canned: std::sync::Arc<dyn crate::llm_provider::LlmProvider> =
+            std::sync::Arc::new(CannedLlmProvider::new("DEFAULT").with(key_fragment, kg_json));
+        (prompts, canned)
+    }
+
+    /// Fetch the `relates` edge payload between two entities by name.
+    async fn relates_payload_between(
+        db: &MemoryDB,
+        from_name: &str,
+        to_name: &str,
+    ) -> Option<String> {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT e.payload FROM edges e \
+                 JOIN entities fe ON e.src_id = fe.id \
+                 JOIN entities te ON e.dst_id = te.id \
+                 WHERE e.edge_type = 'relates' AND fe.name = ?1 AND te.name = ?2",
+                libsql::params![from_name, to_name],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .and_then(|row| row.get::<Option<String>>(0).unwrap_or(None))
+    }
+
+    /// A quote that is real text from the combined batch blob but belongs to
+    /// the non-anchor window member must be dropped entirely, never located
+    /// against the blob and never left as a null-offset placeholder.
+    #[tokio::test]
+    async fn batch_extraction_span_not_in_anchor_is_dropped() {
+        let (db, _dir) = test_db().await;
+        let anchor_content = "Alice joined Acme in 2020.";
+        let other_content = "Bob left Beta Corp last year.";
+        db.upsert_documents(vec![
+            make_doc("mem_batch_anchor", anchor_content),
+            make_doc("mem_batch_other", other_content),
+        ])
+        .await
+        .unwrap();
+
+        let (prompts, canned) = canned_relation_with_span("Bob left Beta Corp");
+
+        run_post_ingest_enrichment(
+            &db,
+            "mem_batch_anchor",
+            anchor_content,
+            None,
+            Some("fact"),
+            None,
+            None,
+            Some(&canned),
+            &prompts,
+            &crate::tuning::RefineryConfig::default(),
+            &crate::tuning::DistillationConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let payload = relates_payload_between(&db, "Alice", "Acme").await.expect(
+            "payload must be written -- model_version/prompt_version are always Some on this path",
+        );
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            payload["span"].is_null(),
+            "a quote that only locates in a non-anchor batch member must be dropped entirely, got {payload}"
+        );
+    }
+
+    /// A quote that is genuinely the anchor's own text must locate with
+    /// correct anchor-based char offsets, exactly as the single-memory path
+    /// already does.
+    #[tokio::test]
+    async fn batch_extraction_span_in_anchor_locates_with_anchor_offsets() {
+        let (db, _dir) = test_db().await;
+        let anchor_content = "Alice joined Acme in 2020.";
+        let other_content = "Bob left Beta Corp last year.";
+        db.upsert_documents(vec![
+            make_doc("mem_batch_anchor", anchor_content),
+            make_doc("mem_batch_other", other_content),
+        ])
+        .await
+        .unwrap();
+
+        let quote = "Alice joined Acme";
+        let (prompts, canned) = canned_relation_with_span(quote);
+
+        run_post_ingest_enrichment(
+            &db,
+            "mem_batch_anchor",
+            anchor_content,
+            None,
+            Some("fact"),
+            None,
+            None,
+            Some(&canned),
+            &prompts,
+            &crate::tuning::RefineryConfig::default(),
+            &crate::tuning::DistillationConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let payload = relates_payload_between(&db, "Alice", "Acme")
+            .await
+            .expect("payload must be written");
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["span"]["quote"], serde_json::json!(quote));
+        assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+        assert_eq!(
+            payload["span"]["char_end"],
+            serde_json::json!(quote.chars().count())
+        );
     }
 
     // ---- T22: cooperative-cancellation (debounced reflection) ----

@@ -1196,7 +1196,7 @@ pub async fn handle_create_entity(
 pub async fn handle_create_relation(
     State(state): State<Arc<RwLock<ServerState>>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<CreateRelationRequest>,
+    Json(mut req): Json<CreateRelationRequest>,
 ) -> Result<Json<CreateRelationResponse>, ServerError> {
     let agent = extract_agent_name(&headers, req.source_agent.as_deref());
     let db = {
@@ -1205,6 +1205,12 @@ pub async fn handle_create_relation(
             .cloned()
             .ok_or(ServerError::DbNotInitialized)?
     };
+    // M3g span capture (span/model_version/prompt_version) is daemon-internal
+    // (KG extraction) only -- strip them so an agent-triggered request can
+    // never set them, matching the CreateRelationRequest doc comment.
+    req.span = None;
+    req.model_version = None;
+    req.prompt_version = None;
     let result = wenlan_core::post_write::create_relation(&db, req, &agent).await?;
     Ok(Json(CreateRelationResponse {
         id: result.id,

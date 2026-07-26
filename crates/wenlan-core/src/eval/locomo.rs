@@ -1833,7 +1833,11 @@ pub async fn populate_memory_entities_sweep(
         }
         for (sid, content) in fresh {
             let ents = crate::kg::entity_extraction::extract_entities_for_content(
-                db, llm, prompts, &content,
+                db,
+                llm,
+                prompts,
+                &content,
+                Some(sid.as_str()),
             )
             .await
             .unwrap_or_default();

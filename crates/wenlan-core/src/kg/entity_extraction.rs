@@ -12,12 +12,16 @@ use std::sync::Arc;
 /// the caller is responsible for linking them to a specific memory.
 ///
 /// This is the extraction-only primitive used by `run_enrichment_sweep` (and any
-/// other caller that controls when/how linkage happens).
+/// other caller that controls when/how linkage happens). `source_id`, when the
+/// caller has it in hand, is threaded into each relation's `source_memory_id`
+/// so its span payload can resolve back to a source memory; `None` keeps the
+/// relation's payload `source_memory_id`-less, matching pre-M3g behavior.
 pub async fn extract_entities_for_content(
     db: &MemoryDB,
     llm: &Arc<dyn LlmProvider>,
     prompts: &PromptRegistry,
     content: &str,
+    source_id: Option<&str>,
 ) -> Result<Vec<String>, WenlanError> {
     let truncated: String = content.chars().take(500).collect();
     let numbered = format!("1. {}", truncated);
@@ -84,7 +88,7 @@ pub async fn extract_entities_for_content(
                     source_agent: Some("post_ingest".to_string()),
                     confidence: rel.confidence,
                     explanation: rel.explanation.clone(),
-                    source_memory_id: None,
+                    source_memory_id: source_id.map(|s| s.to_string()),
                     span: rel.span.clone(),
                     model_version: Some(llm.model_id()),
                     prompt_version: Some(
@@ -347,5 +351,66 @@ mod tests {
             stored_eid, eid,
             "stored entity_id should match the one returned by commit_kg"
         );
+    }
+
+    /// Minor-1 (M3g stage-a review): the entity-sweep path used to write
+    /// `source_memory_id: null` even when the caller had the real source
+    /// memory id trivially in hand, leaving the span dead weight (no
+    /// promotion path can resolve it). When `source_id` is threaded through,
+    /// the payload must carry it.
+    #[tokio::test]
+    async fn extract_entities_for_content_threads_source_id_into_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+            .await
+            .expect("MemoryDB::new failed");
+        let content = "Alice works at Acme Corp.";
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: "mem_sweep".to_string(),
+            title: "Test memory".to_string(),
+            content: content.to_string(),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc])
+            .await
+            .expect("upsert_documents failed");
+
+        let prompts = test_prompts();
+        let key_fragment = prompts
+            .extract_knowledge_graph
+            .chars()
+            .take(30)
+            .collect::<String>();
+        let kg_json = r#"[{"entities":[{"name":"Alice","type":"person"},{"name":"Acme","type":"org"}],"observations":[],"relations":[{"from":"Alice","to":"Acme","type":"works_on","span":"Alice works at Acme Corp"}]}]"#;
+        let canned: Arc<dyn LlmProvider> =
+            Arc::new(CannedLlmProvider::new("DEFAULT").with(key_fragment, kg_json));
+
+        extract_entities_for_content(&db, &canned, &prompts, content, Some("mem_sweep"))
+            .await
+            .expect("extract_entities_for_content failed");
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT e.payload FROM edges e \
+                 JOIN entities fe ON e.src_id = fe.id \
+                 JOIN entities te ON e.dst_id = te.id \
+                 WHERE e.edge_type = 'relates' AND fe.name = 'Alice' AND te.name = 'Acme'",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect(
+                "payload must be non-NULL: source_memory_id + model_version + prompt_version are Some",
+            );
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        assert_eq!(payload["source_memory_id"], serde_json::json!("mem_sweep"));
     }
 }
