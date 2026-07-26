@@ -10539,6 +10539,13 @@ impl MemoryDB {
     /// already-grounded, superseded, or missing edges before spending an entailment
     /// call. READ-ONLY. `limit` bounds the scan (§7 SCAN_PER_TICK).
     ///
+    /// Cursor-stability assumption: the durable cursor is keyed on the IMPLICIT
+    /// `relations.rowid` (the declared PK is `id TEXT`). Implicit rowids are
+    /// stable only while the database is never VACUUMed — this repo's backup
+    /// path deliberately byte-copies and never VACUUMs (DiskANN shadow tables),
+    /// so the assumption holds in-tree; an external `VACUUM` would renumber
+    /// rowids and could strand rows behind the persisted cursor.
+    ///
     /// The `+` on `m.source` is load-bearing, not a typo. Without it SQLite plans
     /// the memories LEFT JOIN off `idx_memories_source (source=?)`, which matches
     /// every 'memory' row (the whole table) per relation — a full scan that put
@@ -10595,7 +10602,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("edge_grounding_candidates row: {e}")))?
         {
-            let rowid: i64 = row.get(0).unwrap_or_default();
+            let rowid: i64 = row.get(0).map_err(|e| {
+                WenlanError::VectorDb(format!("edge_grounding_candidates rowid decode: {e}"))
+            })?;
             let from_id: String = row.get(1).unwrap_or_default();
             let to_id: String = row.get(2).unwrap_or_default();
             let relation_type: String = row.get(3).unwrap_or_default();
@@ -80473,7 +80482,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(test)]
     async fn count_grounded_relates(db: &MemoryDB) -> i64 {
         let conn = db.conn.lock().await;
         let mut rows = conn

@@ -319,9 +319,12 @@ async fn save_state(db: &MemoryDB, state: &GroundingState) {
 }
 
 /// Advance the cursor past a durably-decided edge, clearing any poison strike
-/// that was tracking a rowid we have now moved past.
+/// that was tracking a rowid we have now moved past. Monotone: the cursor can
+/// never move backward here (a scan of ascending rowids must not let a bad
+/// value rewind the durable frontier and re-spend entailment budget); resets
+/// happen only by replacing the whole `GroundingState` (version-tag change).
 fn advance_cursor(state: &mut GroundingState, rowid: i64) {
-    state.cursor = rowid;
+    state.cursor = state.cursor.max(rowid);
     if let Some(stuck) = state.stuck_rowid {
         if stuck <= rowid {
             state.stuck_rowid = None;
@@ -2107,14 +2110,16 @@ mod tests {
             .await;
             edge_ids.push((c.id.clone(), c.class.clone(), edge_id));
             rules.push((c.from.clone(), c.hermetic_score));
-            // A case reaches entailment iff it is folder-sourced AND either has
-            // no span (backlog) or a span that actually locates in content.
+            // A case reaches entailment iff it is folder-sourced AND either
+            // carries no located span — a backlog edge (payload NULL) or a
+            // span-null propose both skip gate 1 outright — or a span that
+            // actually locates in content.
             let reaches = c.source_agent == "folder"
                 && (c.as_backlog
-                    || c.span
-                        .as_deref()
-                        .map(|q| c.content.contains(q))
-                        .unwrap_or(false));
+                    || match c.span.as_deref() {
+                        None => true,
+                        Some(q) => c.content.contains(q),
+                    });
             if reaches {
                 expected_calls += 1;
             }
@@ -2352,7 +2357,7 @@ mod tests {
         );
     }
 
-    /// Gate 2.1 (REAL MODEL, manual-only). PASS = >=80% (>=43/53) promoted, each
+    /// Gate 2.1 (REAL MODEL, manual-only). PASS = >=80% (>=46/57) promoted, each
     /// promoted edge root-correct.
     ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
     ///     edge_grounding::tests::gate2_coverage_floor_real_model \

@@ -2161,7 +2161,8 @@ impl WenlanMcpServer {
 
         let path = format!("/api/pages/{}", page_id);
         let resp: GetPageResponse = try_call!(self.client.get(&path), "get_page");
-        let pretty = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| String::new());
+        let pretty = serde_json::to_string_pretty(&resp)
+            .unwrap_or_else(|e| format!("serialization error: {e}"));
         Ok(CallToolResult::success(vec![Content::text(pretty)]))
     }
 
@@ -2170,7 +2171,8 @@ impl WenlanMcpServer {
         // Typed end-to-end via PageLinksResponse — keeps wire shape pinned.
         let resp: wenlan_types::responses::PageLinksResponse =
             try_call!(self.client.get(&path), "get_page_links");
-        let pretty = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| String::new());
+        let pretty = serde_json::to_string_pretty(&resp)
+            .unwrap_or_else(|e| format!("serialization error: {e}"));
         Ok(CallToolResult::success(vec![Content::text(pretty)]))
     }
 
