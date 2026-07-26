@@ -5778,6 +5778,7 @@ dependencies = [
  "service-manager",
  "sha2",
  "sysinfo",
+ "temp-env",
  "tempfile",
  "tokio",
  "tower 0.5.3",

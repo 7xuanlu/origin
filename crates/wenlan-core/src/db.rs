@@ -1586,6 +1586,31 @@ fn entity_page_reconcile_enabled_value(value: Option<&str>) -> bool {
     })
 }
 
+/// Gate for the background edge-grounding promotion sweep (M3g, spec v3 §7).
+/// Opt-in: default OFF; enable with WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE=1/true/yes.
+/// The sweep promotes stored `grounded=0` `relates` edges to `grounded=1` (writing
+/// `root_id`) after a deterministic span pre-filter (when the edge carries one) and
+/// a MANDATORY independent entailment check; it is the ONLY writer of `grounded=1`.
+/// Promotion is monotone derived state (§1) — disabling the flag leaves already-promoted
+/// bits in place. Bounded per tick (scan + entailment caps); the entailment LLM runs
+/// strictly OUTSIDE any transaction (§6.3). Parsed here, checked in `scheduler.rs`
+/// before the fire-condition, mirroring [`edges_reconcile_enabled`]. It stays
+/// opt-in until the sweep's foreground-latency and false-grounding gates
+/// (`docs/plans/2026-07-25-m3g-gate-criteria.md`) are measured on a real corpus.
+pub fn edge_grounding_promote_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE").ok();
+    edge_grounding_promote_enabled_value(value.as_deref())
+}
+
+fn edge_grounding_promote_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 /// True iff `WENLAN_RERANK_SKIP_PREFERENCE` is truthy. OPT-IN, default OFF.
 ///
 /// When ON, preference/recommendation-seeking queries (per
@@ -10306,11 +10331,50 @@ impl MemoryDB {
     /// rather than leaving it stuck invalid. M2 PR-1 has no
     /// span-validation pipeline, so every dual-written edge is honestly
     /// `grounded=false`, `root_id=NULL` -- same legacy-honesty ceiling as
-    /// the backfill (spec v3 §2). Returns `libsql::Error` so callers whose
-    /// existing transaction block is already typed that way (the common
-    /// case in this file) can `.await?` it directly.
+    /// the backfill (spec v3 §2); this stays true whether or not the edge
+    /// carries a `payload` (M3g Stage A span capture is grounding-adjacent
+    /// evidence, not a promotion -- see `dual_write_edge_with_payload`).
+    /// Returns `libsql::Error` so callers whose existing transaction block
+    /// is already typed that way (the common case in this file) can
+    /// `.await?` it directly.
     #[allow(clippy::too_many_arguments)]
     async fn dual_write_edge(
+        conn: &libsql::Connection,
+        edge_type: &str,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+        discriminator: &str,
+        lineage: &str,
+        space: &str,
+        cross_space_downgrade: bool,
+        operation_id: Option<&str>,
+    ) -> Result<String, libsql::Error> {
+        Self::dual_write_edge_with_payload(
+            conn,
+            edge_type,
+            src_kind,
+            src_id,
+            dst_kind,
+            dst_id,
+            discriminator,
+            lineage,
+            space,
+            cross_space_downgrade,
+            operation_id,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`dual_write_edge`], plus an optional JSON `payload` written
+    /// once at INSERT time (M3g Stage A span capture, §2.3/§6.6). The
+    /// `ON CONFLICT` clause below never assigns `payload`, so a later
+    /// reactivation/re-write of the same content-addressed `edge_id`
+    /// cannot clobber it -- payload is write-once-at-birth by construction.
+    #[allow(clippy::too_many_arguments)]
+    async fn dual_write_edge_with_payload(
         conn: &libsql::Connection,
         edge_type: &str,
         src_kind: &str,
@@ -10339,6 +10403,7 @@ impl MemoryDB {
         // non-external `legacy`.
         cross_space_downgrade: bool,
         operation_id: Option<&str>,
+        payload: Option<&str>,
     ) -> Result<String, libsql::Error> {
         let edge_id = crate::provenance::compute_edge_id(
             edge_type,
@@ -10401,7 +10466,7 @@ impl MemoryDB {
         // fenced INSERTs, letting a stale-space reactivation slip through).
         conn.execute(
             "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, NULL, NULL, ?9, ?10, NULL, NULL)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, ?12, NULL, ?9, ?10, NULL, NULL)
              ON CONFLICT(edge_id) DO UPDATE SET
                  valid_until = NULL,
                  superseded_by = NULL,
@@ -10432,7 +10497,8 @@ impl MemoryDB {
                 space.to_string(),
                 operation_id.map(|s| s.to_string()),
                 now,
-                cross_space_downgrade as i64
+                cross_space_downgrade as i64,
+                payload.map(|s| s.to_string())
             ],
         )
         .await?;
@@ -10457,6 +10523,440 @@ impl MemoryDB {
         )
         .await?;
         Ok(())
+    }
+
+    /// Fetch a bounded batch of `relates` promotion candidates for the M3g
+    /// edge-grounding sweep, driven off the `relations` table (the sole producer
+    /// of every `relates` edge, so this scan is complete). Cursored by
+    /// `relations.rowid` — the implicit clustered key, monotonic in insert order,
+    /// so no extra index is needed and the scan stays off a full-table sort (gate
+    /// 3, `docs/plans/2026-07-25-m3g-gate-criteria.md` §3.3). For each relation it
+    /// recomputes the content-addressed `edge_id`, resolves the endpoint entity
+    /// NAMES (the triple the entailment check scores), and LEFT-joins the chunk-0
+    /// source memory (present only for a still-live source) for the external-origin
+    /// gate + span validation. A second PK-indexed batch fetch attaches each edge's
+    /// current `grounded`/`valid_until`/`payload`, so the sweep can skip
+    /// already-grounded, superseded, or missing edges before spending an entailment
+    /// call. READ-ONLY. `limit` bounds the scan (§7 SCAN_PER_TICK).
+    ///
+    /// Cursor-stability assumption: the durable cursor is keyed on the IMPLICIT
+    /// `relations.rowid` (the declared PK is `id TEXT`). Implicit rowids are
+    /// stable only while the database is never VACUUMed — this repo's backup
+    /// path deliberately byte-copies and never VACUUMs (DiskANN shadow tables),
+    /// so the assumption holds in-tree; an external `VACUUM` would renumber
+    /// rowids and could strand rows behind the persisted cursor.
+    ///
+    /// The `+` on `m.source` is load-bearing, not a typo. Without it SQLite plans
+    /// the memories LEFT JOIN off `idx_memories_source (source=?)`, which matches
+    /// every 'memory' row (the whole table) per relation — a full scan that put
+    /// the 100k-corpus per-tick mutex hold at ~1.1s (Gate 3, §3.3). The unary `+`
+    /// disqualifies that term from index selection, steering the planner onto the
+    /// selective `idx_memories_source_id` join. The scale bench (`db::tests`) pins
+    /// this via `EXPLAIN QUERY PLAN` over THIS exact string, so stripping the `+`
+    /// reddens by cause, not only by the p95 timing symptom.
+    const EDGE_GROUNDING_CANDIDATE_SCAN_SQL: &'static str =
+        "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
+                        r.source_memory_id, fe.name, te.name,
+                        m.content, m.source_agent, m.source_id, m.url, r.id
+                 FROM relations r
+                 JOIN entities fe ON fe.id = r.from_entity
+                 JOIN entities te ON te.id = r.to_entity
+                 LEFT JOIN memories m
+                        ON m.source_id = r.source_memory_id
+                       AND +m.source = 'memory'
+                       AND m.chunk_index = 0
+                 WHERE r.rowid > ?1
+                 ORDER BY r.rowid
+                 LIMIT ?2";
+
+    pub async fn edge_grounding_candidates(
+        &self,
+        cursor_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::edge_grounding::EdgeGroundingCandidate>, WenlanError> {
+        use crate::edge_grounding::EdgeGroundingCandidate;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                Self::EDGE_GROUNDING_CANDIDATE_SCAN_SQL,
+                libsql::params![cursor_rowid, limit as i64],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("edge_grounding_candidates scan: {e}")))?;
+
+        struct Staged {
+            rowid: i64,
+            relation_id: String,
+            edge_id: String,
+            from_name: String,
+            to_name: String,
+            relation_type: String,
+            source_memory_id: Option<String>,
+            mem_content: Option<String>,
+            mem_source_agent: Option<String>,
+            mem_source_identity: Option<String>,
+        }
+        let mut staged: Vec<Staged> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("edge_grounding_candidates row: {e}")))?
+        {
+            let rowid: i64 = row.get(0).map_err(|e| {
+                WenlanError::VectorDb(format!("edge_grounding_candidates rowid decode: {e}"))
+            })?;
+            let from_id: String = row.get(1).unwrap_or_default();
+            let to_id: String = row.get(2).unwrap_or_default();
+            let relation_type: String = row.get(3).unwrap_or_default();
+            let source_memory_id: Option<String> = row.get::<Option<String>>(4).ok().flatten();
+            let from_name: String = row.get(5).unwrap_or_default();
+            let to_name: String = row.get(6).unwrap_or_default();
+            let mem_content: Option<String> = row.get::<Option<String>>(7).ok().flatten();
+            let mem_source_agent: Option<String> = row.get::<Option<String>>(8).ok().flatten();
+            let mem_source_id: Option<String> = row.get::<Option<String>>(9).ok().flatten();
+            let mem_url: Option<String> = row.get::<Option<String>>(10).ok().flatten();
+            let relation_id: String = row.get(11).unwrap_or_default();
+            let edge_id = crate::provenance::compute_edge_id(
+                "relates",
+                "entity",
+                &from_id,
+                "entity",
+                &to_id,
+                &relation_type,
+            );
+            // Independence signal for the root mint (§5.3): the document source
+            // identity — `url` when present (file path / URL), else the
+            // always-present `source_id`. Both are stable per source memory, so
+            // two edges from one memory (and any re-mint) converge on one root.
+            let mem_source_identity = mem_url
+                .filter(|s| !s.is_empty())
+                .or(mem_source_id)
+                .filter(|s| !s.is_empty());
+            staged.push(Staged {
+                rowid,
+                relation_id,
+                edge_id,
+                from_name,
+                to_name,
+                relation_type,
+                source_memory_id,
+                mem_content,
+                mem_source_agent,
+                mem_source_identity,
+            });
+        }
+        drop(rows);
+
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (1..=staged.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT edge_id, grounded, valid_until, payload FROM edges \
+             WHERE edge_type = 'relates' AND edge_id IN ({placeholders})"
+        );
+        let params: Vec<libsql::Value> = staged
+            .iter()
+            .map(|s| libsql::Value::Text(s.edge_id.clone()))
+            .collect();
+        let mut edge_rows = conn
+            .query(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("edge_grounding_candidates edges: {e}")))?;
+        let mut edge_state: std::collections::HashMap<String, (i64, Option<i64>, Option<String>)> =
+            std::collections::HashMap::new();
+        while let Some(row) = edge_rows.next().await.map_err(|e| {
+            WenlanError::VectorDb(format!("edge_grounding_candidates edge row: {e}"))
+        })? {
+            let edge_id: String = row.get(0).unwrap_or_default();
+            let grounded: i64 = row.get(1).unwrap_or(0);
+            let valid_until: Option<i64> = row.get::<Option<i64>>(2).ok().flatten();
+            let payload: Option<String> = row.get::<Option<String>>(3).ok().flatten();
+            edge_state.insert(edge_id, (grounded, valid_until, payload));
+        }
+        drop(edge_rows);
+
+        Ok(staged
+            .into_iter()
+            .map(|s| {
+                let (edge_grounded, edge_valid_until, edge_payload) = edge_state
+                    .get(&s.edge_id)
+                    .map(|(g, v, p)| (Some(*g), *v, p.clone()))
+                    .unwrap_or((None, None, None));
+                EdgeGroundingCandidate {
+                    rowid: s.rowid,
+                    relation_id: s.relation_id,
+                    edge_id: s.edge_id,
+                    from_name: s.from_name,
+                    to_name: s.to_name,
+                    relation_type: s.relation_type,
+                    source_memory_id: s.source_memory_id,
+                    mem_content: s.mem_content,
+                    mem_source_agent: s.mem_source_agent,
+                    mem_source_identity: s.mem_source_identity,
+                    edge_grounded,
+                    edge_valid_until,
+                    edge_payload,
+                }
+            })
+            .collect())
+    }
+
+    /// Apply the M3g monotone `grounded 0→1` promotion flip (§1) for a tick's
+    /// survivors in ONE rollback-protected transaction (the `fold_relation_type`
+    /// BEGIN idiom; issue #389). Each row's UPDATE is guarded on the full
+    /// stale-evidence recheck basis (§C2), all evaluated INSIDE this transaction:
+    /// - `grounded = 0` — idempotent + monotone (a re-run over an already-promoted
+    ///   edge affects zero rows, and `grounded` can never go `1→0`);
+    /// - `valid_until IS NULL` — the edge is still active (a concurrent supersede
+    ///   during the entailment call must not ground a now-inactive edge);
+    /// - the RELATION that produced this `edge_id` still derives from the judged
+    ///   source: a `relations` row with the scanned `id` (UUID generation) AND
+    ///   the judged `source_memory_id` still exists. The content-addressed
+    ///   `edge_id` is triple-only, so it survives two provenance-moving events the
+    ///   `edge_id`/content checks alone miss: (1) a same-triple ON CONFLICT
+    ///   upsert from a DIFFERENT source silently moves `source_memory_id` while
+    ///   the id stays fixed — the `source_memory_id` term rejects it; (2) a
+    ///   delete + re-add (supersede/reactivate) mints a NEW `relations.id` while
+    ///   the edge is reactivated active — the `id` term rejects it (a UUID, so no
+    ///   `rowid`-reuse hole). Together they refuse to ground a verdict whose
+    ///   provenance has moved off the judged source;
+    /// - the source memory's chunk-0 `content` still equals the exact text
+    ///   entailment judged (`judged_content`) — a concurrent source edit during
+    ///   the multi-second entailment invalidates the verdict, so the edge is not
+    ///   grounded against evidence that no longer exists.
+    ///
+    /// A row that fails any guard contributes zero to the returned count; the
+    /// caller skips it (no poison) and re-judges it against fresh evidence on a
+    /// later tick. `root_id` and the grounding-verdict `payload` (§2.4/§6.6) are
+    /// written alongside `grounded`; no structural column is touched, so the
+    /// write is parity-invisible to the M2 oracle (§1). No LLM/embedding call
+    /// happens here (§6.3): entailment ran outside, and each survivor's root was
+    /// minted before this call. Returns the number of edges ACTUALLY flipped.
+    pub async fn promote_edges_grounded(
+        &self,
+        survivors: &[crate::edge_grounding::EdgePromotion],
+    ) -> Result<usize, WenlanError> {
+        if survivors.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("promote_edges_grounded begin: {e}")))?;
+        let result: Result<usize, WenlanError> = async {
+            let mut flipped = 0usize;
+            for promotion in survivors {
+                let affected = conn
+                    .execute(
+                        "UPDATE edges SET grounded = 1, root_id = ?1, payload = ?2 \
+                         WHERE edge_id = ?3 AND grounded = 0 AND valid_until IS NULL \
+                           AND EXISTS ( \
+                               SELECT 1 FROM relations \
+                               WHERE id = ?4 AND source_memory_id = ?5 \
+                           ) \
+                           AND EXISTS ( \
+                               SELECT 1 FROM memories \
+                               WHERE source_id = ?5 AND source = 'memory' \
+                                 AND chunk_index = 0 AND content = ?6 \
+                           )",
+                        libsql::params![
+                            promotion.root_id.clone(),
+                            promotion.payload.clone(),
+                            promotion.edge_id.clone(),
+                            promotion.relation_id.clone(),
+                            promotion.source_memory_id.clone(),
+                            promotion.judged_content.clone(),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("promote_edges_grounded update: {e}"))
+                    })?;
+                flipped += affected as usize;
+            }
+            Ok(flipped)
+        }
+        .await;
+        match result {
+            Ok(flipped) => {
+                conn.execute("COMMIT", ()).await.map_err(|e| {
+                    WenlanError::VectorDb(format!("promote_edges_grounded commit: {e}"))
+                })?;
+                Ok(flipped)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Test-only: snapshot an edge's full column set, so the M3g
+    /// `edge_grounding` tests (a separate module that cannot reach the private
+    /// `conn`) can assert the grounded/root_id/payload flip AND parity of the
+    /// structural columns (§1, §10 of the promotion-mechanics spec).
+    #[cfg(test)]
+    pub(crate) async fn edge_snapshot_for_test(&self, edge_id: &str) -> Option<serde_json::Value> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT edge_type, src_kind, src_id, dst_kind, dst_id, grounded, root_id, \
+                        valid_until, lineage, space, payload \
+                 FROM edges WHERE edge_id = ?1",
+                libsql::params![edge_id],
+            )
+            .await
+            .ok()?;
+        let row = rows.next().await.ok()??;
+        Some(serde_json::json!({
+            "edge_type": row.get::<String>(0).ok(),
+            "src_kind": row.get::<String>(1).ok(),
+            "src_id": row.get::<String>(2).ok(),
+            "dst_kind": row.get::<String>(3).ok(),
+            "dst_id": row.get::<String>(4).ok(),
+            "grounded": row.get::<i64>(5).ok(),
+            "root_id": row.get::<Option<String>>(6).ok().flatten(),
+            "valid_until": row.get::<Option<i64>>(7).ok().flatten(),
+            "lineage": row.get::<String>(8).ok(),
+            "space": row.get::<String>(9).ok(),
+            "payload": row.get::<Option<String>>(10).ok().flatten(),
+        }))
+    }
+
+    /// Test-only: soft-supersede an edge (set `valid_until`), so the M3g
+    /// stale-evidence-race test (§C2) can simulate a concurrent supersede landing
+    /// DURING the entailment call and assert the flip then grounds nothing.
+    #[cfg(test)]
+    pub(crate) async fn supersede_edge_for_test(&self, edge_id: &str) {
+        let conn = self.conn.lock().await;
+        Self::dual_write_invalidate_edge(&conn, edge_id, None)
+            .await
+            .expect("test supersede edge");
+    }
+
+    /// Test-only: rewrite a source memory's chunk-0 `content`, so the §C2 test
+    /// can simulate a concurrent source edit DURING entailment and assert the
+    /// flip's content-equality guard then grounds nothing.
+    #[cfg(test)]
+    pub(crate) async fn edit_source_content_for_test(&self, source_id: &str, new_content: &str) {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET content = ?1 \
+             WHERE source_id = ?2 AND source = 'memory' AND chunk_index = 0",
+            libsql::params![new_content, source_id],
+        )
+        .await
+        .expect("test edit source content");
+    }
+
+    /// Test-only helper: read the single relation currently linked to
+    /// `source_id`, returning `(relation_id, from_entity, to_entity,
+    /// relation_type)`. Locks and drops the connection in one scope so callers
+    /// never hold it across the public methods below (which take their own lock).
+    #[cfg(test)]
+    async fn relation_triple_for_test(&self, source_id: &str) -> (String, String, String, String) {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, from_entity, to_entity, relation_type FROM relations \
+                 WHERE source_memory_id = ?1 LIMIT 1",
+                libsql::params![source_id],
+            )
+            .await
+            .expect("test relation lookup");
+        let row = rows
+            .next()
+            .await
+            .expect("test relation row")
+            .expect("relation exists for source");
+        (
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<String>(2).unwrap(),
+            row.get::<String>(3).unwrap(),
+        )
+    }
+
+    /// Test-only: re-assert the same (from,to,type) triple from a DIFFERENT
+    /// source memory via the REAL `create_relation` upsert, so the §C2
+    /// linkage-move race test can simulate a same-triple re-assert landing DURING
+    /// entailment. The ON CONFLICT COALESCE moves `source_memory_id` to
+    /// `new_source_id` while keeping the SAME `relations.id` — the flip's
+    /// `source_memory_id` term must then reject the stale verdict.
+    #[cfg(test)]
+    pub(crate) async fn reassert_relation_from_other_source_for_test(
+        &self,
+        old_source_id: &str,
+        new_source_id: &str,
+    ) {
+        let (_id, from, to, rt) = self.relation_triple_for_test(old_source_id).await;
+        self.create_relation(
+            &from,
+            &to,
+            &rt,
+            Some("post_ingest"),
+            Some(0.99),
+            None,
+            Some(new_source_id),
+        )
+        .await
+        .expect("test re-assert relation from other source");
+    }
+
+    /// Test-only: supersede-then-reactivate the relation for `source_id` via the
+    /// REAL public paths — `supersede_relation` (delete + soft-invalidate the
+    /// edge) followed by `create_relation` re-adding the SAME triple+source. The
+    /// re-add mints a FRESH `relations.id` (UUID) and reactivates the edge
+    /// (`valid_until` back to NULL). So at flip time the edge looks active and
+    /// its source content is unchanged — only the new `relations.id` differs from
+    /// the judged generation, isolating the §C2 relation-identity guard.
+    #[cfg(test)]
+    pub(crate) async fn supersede_and_readd_relation_for_test(&self, source_id: &str) {
+        let (rel_id, from, to, rt) = self.relation_triple_for_test(source_id).await;
+        self.supersede_relation(&rel_id, "test-reactivate-winner")
+            .await
+            .expect("test supersede relation");
+        self.create_relation(
+            &from,
+            &to,
+            &rt,
+            Some("post_ingest"),
+            None,
+            None,
+            Some(source_id),
+        )
+        .await
+        .expect("test re-add relation");
+    }
+
+    /// Test-only: read a `provenance_roots` row by `root_id`, returning
+    /// `(root_kind, independence_group_id)`. Lets the M3g Gate-2 root-correctness
+    /// checks (a separate module without `conn` access) assert that every
+    /// promoted edge's `root_id` resolves to a real root of
+    /// `root_kind='document_ingest'`, that edges sharing one source memory
+    /// converge on one `root_id`, and that distinct source memories sharing one
+    /// file identity land in one `independence_group_id` (§2.1 /
+    /// `docs/plans/2026-07-25-m3g-gate-criteria.md`, §5.3-§5.4 of the mechanics).
+    #[cfg(test)]
+    pub(crate) async fn provenance_root_row_for_test(
+        &self,
+        root_id: &str,
+    ) -> Option<(String, String)> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT root_kind, independence_group_id FROM provenance_roots WHERE root_id = ?1",
+                libsql::params![root_id],
+            )
+            .await
+            .ok()?;
+        let row = rows.next().await.ok()??;
+        Some((row.get::<String>(0).ok()?, row.get::<String>(1).ok()?))
     }
 
     // ===== M2 PR-2 reader-cutover control plane (stages c+d) =====
@@ -23787,6 +24287,47 @@ impl MemoryDB {
         explanation: Option<&str>,
         source_memory_id: Option<&str>,
     ) -> Result<String, WenlanError> {
+        self.create_relation_with_span(
+            from_entity,
+            to_entity,
+            relation_type,
+            source_agent,
+            confidence,
+            explanation,
+            source_memory_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`create_relation`], plus a verbatim source-memory `span_quote`
+    /// (M3g Stage A capture, §2.3-§2.4 of `docs/plans/2026-07-25-m3g-promotion-mechanics.md`).
+    /// `source_content` is the exact memory text the extractor saw, used
+    /// ONLY to locate `span_quote`'s char offsets -- never re-fetched from
+    /// the DB, since batch extraction can combine multiple memories'
+    /// content and the caller must supply the exact string the model read.
+    /// `model_version`/`prompt_version` record the extraction call's
+    /// provenance (§6.6). When all four are `None` (the plain
+    /// `create_relation` wrapper), no payload is written and the edge
+    /// stays `payload=NULL`, identical to before M3g.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_relation_with_span(
+        &self,
+        from_entity: &str,
+        to_entity: &str,
+        relation_type: &str,
+        source_agent: Option<&str>,
+        confidence: Option<f64>,
+        explanation: Option<&str>,
+        source_memory_id: Option<&str>,
+        span_quote: Option<&str>,
+        source_content: Option<&str>,
+        model_version: Option<&str>,
+        prompt_version: Option<&str>,
+    ) -> Result<String, WenlanError> {
         // Normalize relation type against vocabulary.
         // NOTE: resolve_relation_type acquires the conn lock, so we must not hold it here.
         let canonical = match self.resolve_relation_type(relation_type).await? {
@@ -23895,7 +24436,36 @@ impl MemoryDB {
                     true,
                 ),
             };
-            Self::dual_write_edge(
+            // M3g Stage A span capture (§2.3/§2.4): CODE locates the
+            // model-supplied quote as an exact char-offset substring of the
+            // source memory's content -- never guessed. A payload is only
+            // written when this call actually carries extraction-time data
+            // (the plain `create_relation` wrapper passes all four as
+            // `None`, so existing edges keep `payload=NULL`).
+            let payload = if span_quote.is_some() || model_version.is_some() || prompt_version.is_some() {
+                let span_json = span_quote.map(|quote| {
+                    let offsets = source_content
+                        .and_then(|content| crate::extract::locate_span_chars(content, quote));
+                    serde_json::json!({
+                        "quote": quote,
+                        "char_start": offsets.map(|(start, _)| start),
+                        "char_end": offsets.map(|(_, end)| end),
+                    })
+                });
+                Some(
+                    serde_json::json!({
+                        "source_memory_id": source_memory_id,
+                        "span": span_json,
+                        "model_version": model_version,
+                        "prompt_version": prompt_version,
+                    })
+                    .to_string(),
+                )
+            } else {
+                None
+            };
+
+            Self::dual_write_edge_with_payload(
                 &conn,
                 "relates",
                 "entity",
@@ -23907,6 +24477,7 @@ impl MemoryDB {
                 &space,
                 cross_space_downgrade,
                 None,
+                payload.as_deref(),
             )
             .await?;
 
@@ -66575,6 +67146,7 @@ pub(crate) mod tests {
                 relation_type: "related_to".to_string(),
                 confidence: Some(0.9),
                 explanation: Some("test graph relation".to_string()),
+                span: None,
             }],
         }]
     }
@@ -66634,6 +67206,100 @@ pub(crate) mod tests {
             .expect("entity-link receipt");
         assert_eq!(linked.status, "ok");
         assert_eq!(linked.input_version, Some(1));
+    }
+
+    // I3 CHARACTERIZATION (pre-existing M2 parity gap, NOT introduced by M3g).
+    //
+    // The ambient Entity-enrichment lane the scheduler drives —
+    // `run_entity_enrichment_slice_with_auto_link` ->
+    // `commit_entity_enrichment_at_version` — writes `relations` through a raw
+    // INSERT that neither consumes `relation.span` nor dual-writes to the unified
+    // `edges` table. Contrast `create_relation_with_span`, which DOES dual-write a
+    // payload-bearing `relates` edge. This lane is byte-identical on origin/main's
+    // merge-base (M2 shipped it); the M3g Stage-A diff touches none of it.
+    //
+    // Why this is SAFE for M3g and reported (not silently fixed) here: a relation
+    // with no `edges` row is invisible to the grounding sweep — the sweep looks up
+    // `edges` by edge_id and skips a missing row, so it can never false-ground a
+    // relation this lane produced. The gap is a COVERAGE limitation on the unified
+    // edges store, not an M3g correctness bug, and predates this branch.
+    //
+    // This test LOCKS IN the current (gap) behavior. When the M2 lane is routed
+    // through the payload-bearing writer upstream, this test turns RED — the signal
+    // to flip the assertion to expect a `relates` edge carrying the span payload.
+    #[tokio::test]
+    async fn ambient_entity_sweep_writes_relation_without_edges_dual_write_pre_existing_m2_gap() {
+        let (db, _dir) = test_db().await;
+        db.upsert_documents(vec![make_memory_doc(
+            "mem_i3_entity_sweep",
+            "Alice works on ProjectX.",
+            "fact",
+            "work",
+            "folder",
+        )])
+        .await
+        .unwrap();
+
+        let kg = vec![crate::extract::KgExtractionResult {
+            index: 0,
+            entities: vec![
+                crate::extract::ExtractedEntity {
+                    name: "Alice".to_string(),
+                    entity_type: "person".to_string(),
+                },
+                crate::extract::ExtractedEntity {
+                    name: "ProjectX".to_string(),
+                    entity_type: "project".to_string(),
+                },
+            ],
+            observations: Vec::new(),
+            relations: vec![crate::extract::ExtractedRelation {
+                from: "Alice".to_string(),
+                to: "ProjectX".to_string(),
+                relation_type: "works_on".to_string(),
+                confidence: Some(0.9),
+                explanation: None,
+                span: Some("Alice works on ProjectX".to_string()),
+            }],
+        }];
+
+        // Drive the *scheduler's* Entity lane (auto-link enabled). No prior
+        // entities exist, so the auto-link vector search matches nothing and the
+        // extraction path runs, committing the relation.
+        let selected = db
+            .run_entity_enrichment_slice_with_auto_link(0.05, move |_content: String| async move {
+                Ok(kg)
+            })
+            .await
+            .unwrap();
+        assert_eq!(selected, 1, "the sweep processed the seeded memory");
+
+        let conn = db.conn.lock().await;
+        let relation_count: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM relations WHERE relation_type = 'works_on'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(relation_count, 1, "the ambient sweep wrote the relation");
+
+        let relates_edges: i64 = {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM edges WHERE edge_type = 'relates'", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            relates_edges, 0,
+            "PRE-EXISTING M2 GAP: the ambient Entity sweep writes a relation with no \
+             edges dual-write. When the lane is routed through the payload-bearing \
+             writer upstream, flip this to expect the relates edge + span payload."
+        );
     }
 
     #[tokio::test]
@@ -66986,6 +67652,7 @@ pub(crate) mod tests {
                         relation_type: "works_on".to_string(),
                         confidence: Some(0.9),
                         explanation: Some("shared project".to_string()),
+                        span: None,
                     }],
                 }])
             })
@@ -79567,6 +80234,266 @@ pub(crate) mod tests {
         assert!(flip, "gate opens on a clean, current watermark (communities has no edges but the predicate still holds)");
     }
 
+    /// M3g Gate 2.2 (scale demo) + Gate 3 (foreground-latency ceiling) at §6.5
+    /// scale. Manual-only (needs minutes + hundreds of MB, but NO GPU — the
+    /// entailment provider is a stub). Run with:
+    ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
+    ///     db::tests::edge_grounding_scale_and_latency_bench -- --ignored --nocapture
+    ///
+    /// Seeds the M2 §6.5 corpus (100k folder memories / 5k pages / 100k page
+    /// cites) via raw batched SQL, then a `relates` backlog of BACKLOG
+    /// folder-sourced grounded=0 edges (payload=NULL, entailment-only) through the
+    /// REAL relation path, and drives `run_edge_grounding_tick` with an always-
+    /// entail stub. Asserts, per `docs/plans/2026-07-25-m3g-gate-criteria.md`:
+    ///   Gate 2.2 — every tick within bounds (≤50 scanned, ≤25 entailment calls),
+    ///     promotion monotone (no `grounded=1 → 0`), a drained re-run promotes 0
+    ///     (idempotent);
+    ///   Gate 3  — per-tick cumulative DB-mutex hold p95 ≤ 500ms over ≥20 full
+    ///     ticks, no single tick > 2s.
+    /// The structural "no LLM inside a transaction" guard is the companion
+    /// hermetic test `edge_grounding::tests::sweep_holds_no_db_mutex_across_entailment`.
+    #[tokio::test]
+    #[ignore]
+    async fn edge_grounding_scale_and_latency_bench() {
+        use std::time::Instant;
+        const MEMORIES: usize = 100_000;
+        const PAGES: usize = 5_000;
+        const CITES_PER_PAGE: usize = MEMORIES / PAGES; // 20
+        const BACKLOG: usize = 750; // 30 full ticks of 25 — well past the 20-tick floor
+
+        let (db, _dir) = test_db().await;
+
+        // --- seed the §6.5 corpus (raw batched SQL, one BEGIN/COMMIT) ----------
+        let t_seed = Instant::now();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            for i in 0..MEMORIES {
+                conn.execute(
+                    "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                        last_modified, chunk_type, source_agent, space, confidence, confirmed, \
+                        memory_type, pending_revision) \
+                     VALUES (?1, ?2, 'memory', ?1, 't', 0, 1712707200, 'text', 'folder', 'space_a', 1.0, 1, 'fact', 0)",
+                    libsql::params![format!("mem_{i}"), format!("Folder document {i}.")],
+                )
+                .await
+                .unwrap();
+            }
+            for p in 0..PAGES {
+                conn.execute(
+                    "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, space, workspace) \
+                     VALUES (?1, 't', 'c', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'space_a', 'space_a')",
+                    libsql::params![format!("page_{p}")],
+                )
+                .await
+                .unwrap();
+                for k in 0..CITES_PER_PAGE {
+                    let mem = p * CITES_PER_PAGE + k;
+                    conn.execute(
+                        "INSERT INTO page_sources (page_id, memory_source_id, linked_at, link_reason) \
+                         VALUES (?1, ?2, 1712707200, 'bench')",
+                        libsql::params![format!("page_{p}"), format!("mem_{mem}")],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+        let seed_secs = t_seed.elapsed().as_secs_f64();
+
+        // --- seed the relates backlog through the REAL relation path -----------
+        // Each: a folder-sourced grounded=0 `relates` edge, payload=NULL
+        // (entailment-only), whose source memory (mem_i) carries live content.
+        let t_backlog = Instant::now();
+        for i in 0..BACKLOG {
+            let from = db
+                .create_entity(&format!("bench_from_{i}"), "concept", Some("space_a"))
+                .await
+                .unwrap();
+            let to = db
+                .create_entity(&format!("bench_to_{i}"), "concept", Some("space_a"))
+                .await
+                .unwrap();
+            let mem_id = format!("mem_{i}");
+            db.create_relation_with_span(
+                &from,
+                &to,
+                "works_on",
+                Some("post_ingest"),
+                None,
+                None,
+                Some(&mem_id),
+                None, // span_quote → payload NULL → entailment-only backlog
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let backlog_secs = t_backlog.elapsed().as_secs_f64();
+
+        // Guard the load-bearing `+m.source` access-path fix (Gate 3, §3.3) by
+        // EXPLAIN-ing the PRODUCTION scan verbatim — the same
+        // `MemoryDB::EDGE_GROUNDING_CANDIDATE_SCAN_SQL` the sweep runs, not a
+        // hand-copy — so stripping the `+` from production reddens THIS assert by
+        // cause, before the p95 gate below reddens by symptom. The memories LEFT
+        // JOIN must ride the selective `idx_memories_source_id`, never
+        // `idx_memories_source (source=?)` (a whole-'memory'-table scan per
+        // relation, ~1.1s/tick at 100k).
+        {
+            let conn = db.conn.lock().await;
+            let plan_sql = format!(
+                "EXPLAIN QUERY PLAN {}",
+                MemoryDB::EDGE_GROUNDING_CANDIDATE_SCAN_SQL
+            );
+            let mut rows = conn
+                .query(&plan_sql, libsql::params![0i64, 50i64])
+                .await
+                .unwrap();
+            let mut plan = String::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                plan.push_str(&row.get::<String>(3).unwrap_or_default());
+                plan.push('\n');
+            }
+            drop(rows);
+            drop(conn);
+            assert!(
+                plan.contains("idx_memories_source_id"),
+                "Gate 3 access-path regression: memories join is not using \
+                 idx_memories_source_id (the `+m.source` fix). Plan:\n{plan}"
+            );
+            assert!(
+                !plan.contains("idx_memories_source (source"),
+                "Gate 3 access-path regression: memories join fell back to the \
+                 full-table idx_memories_source (source=?) scan. Plan:\n{plan}"
+            );
+        }
+
+        // --- drive ticks: always-entail stub, measure per-tick mutex hold ------
+        let llm: std::sync::Arc<dyn crate::llm_provider::LlmProvider> = std::sync::Arc::new(
+            crate::llm_provider::CannedLlmProvider::new(r#"{"score": 1.0}"#),
+        );
+        let prompts = crate::prompts::PromptRegistry::default();
+
+        let mut holds_ms: Vec<f64> = Vec::new();
+        let mut full_ticks = 0usize;
+        let mut cum_promoted = 0usize;
+        let mut cum_scanned = 0usize;
+        let mut ticks = 0usize;
+        loop {
+            let r = crate::edge_grounding::run_edge_grounding_tick(&db, &llm, &prompts)
+                .await
+                .unwrap();
+            ticks += 1;
+            // Gate 2.2 (b): per-tick bounds.
+            assert!(r.scanned <= 50, "tick {ticks}: scanned {} > 50", r.scanned);
+            assert!(
+                r.entailment_calls <= 25,
+                "tick {ticks}: entailment_calls {} > 25",
+                r.entailment_calls
+            );
+            cum_promoted += r.promoted;
+            cum_scanned += r.scanned;
+            // Gate 2.2 (c) — "promotion never regresses" — is the DB-truth
+            // grounded_before == grounded_after check after the drain (a
+            // cumulative-counter comparison here would be tautological for a
+            // monotone += counter and could not detect a grounded=1→0 revert).
+            if r.promoted > 0 {
+                holds_ms.push(r.db_mutex_hold.as_secs_f64() * 1000.0);
+                if r.promoted == 25 {
+                    full_ticks += 1;
+                }
+            }
+            if !r.progressed {
+                break;
+            }
+            assert!(ticks < 200, "drain did not terminate");
+        }
+
+        // Gate 2.2 (d): a further tick past the drained backlog promotes 0.
+        let drained = crate::edge_grounding::run_edge_grounding_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+        assert_eq!(
+            drained.promoted, 0,
+            "drained backlog promotes 0 (idempotent)"
+        );
+        assert_eq!(drained.scanned, 0, "cursor past end: nothing left to scan");
+
+        // Gate 2.2 (c) reinforced — no `grounded=1 → 0`: reset the cursor to 0 and
+        // re-run. Every backlog edge is grounded=1 now, so the free grounded!=0
+        // skip fires for all of them: 0 promoted, 0 entailment calls, grounded=1
+        // count unchanged (the `AND grounded=0` flip guard holds).
+        let grounded_before = count_grounded_relates(&db).await;
+        db.set_app_metadata(
+            crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
+            &serde_json::to_string(&crate::edge_grounding::GroundingState::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let rerun = crate::edge_grounding::run_edge_grounding_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+        assert_eq!(rerun.promoted, 0, "re-run over grounded=1 promotes 0");
+        assert_eq!(
+            rerun.entailment_calls, 0,
+            "re-run spends no entailment on already-grounded edges"
+        );
+        let grounded_after = count_grounded_relates(&db).await;
+        assert_eq!(
+            grounded_before, grounded_after,
+            "no grounded=1 → 0 revert across a re-run"
+        );
+
+        // --- Gate 3: p95 + max over the full ticks -----------------------------
+        assert!(
+            full_ticks >= 20,
+            "need >=20 full ticks for a p95; got {full_ticks} (raise BACKLOG)"
+        );
+        let mut sorted = holds_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p95_idx = ((sorted.len() as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
+        let p95 = sorted[p95_idx];
+        let max = *sorted.last().unwrap();
+
+        eprintln!("[m3g bench] corpus: memories={MEMORIES} pages={PAGES} backlog={BACKLOG}");
+        eprintln!("[m3g bench] seed={seed_secs:.1}s backlog_seed={backlog_secs:.1}s");
+        eprintln!(
+            "[m3g bench] ticks={ticks} full_ticks={full_ticks} promoted={cum_promoted} scanned={cum_scanned} promoted/scanned={:.3}",
+            cum_promoted as f64 / cum_scanned.max(1) as f64
+        );
+        eprintln!(
+            "[m3g bench] db_mutex_hold over {} promoting ticks: p95={p95:.1}ms max={max:.1}ms",
+            holds_ms.len()
+        );
+
+        // Gate 3 ceilings.
+        assert!(
+            max <= 2000.0,
+            "Gate 3 hard-fail: a tick held the mutex {max:.1}ms > 2s"
+        );
+        assert!(
+            p95 <= 500.0,
+            "Gate 3: p95 mutex hold {p95:.1}ms > 500ms ceiling"
+        );
+    }
+
+    async fn count_grounded_relates(db: &MemoryDB) -> i64 {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE edge_type='relates' AND grounded=1",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
     /// §6.5-scale acceptance for the M3 PR-2 entity<->page reader cutover
     /// (100k memories / 5k pages / 10k entities). Manual-only (needs
     /// minutes + hundreds of MB); run with:
@@ -81539,6 +82466,144 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(lineage, "legacy", "links row must reconcile to legacy");
+    }
+
+    // ===== M3g Stage A: span capture payload tests =====
+
+    #[tokio::test]
+    async fn create_relation_with_span_writes_payload_and_keeps_parity_clean() {
+        // A relation extracted with a locatable verbatim quote must carry
+        // {source_memory_id, span, model_version, prompt_version} in
+        // edges.payload. payload is a non-structural column, so
+        // reconcile_edges_parity (which matches structural columns only)
+        // must stay clean.
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .create_entity("Alice", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let e2 = db
+            .create_entity("Acme", "org", Some("space_a"))
+            .await
+            .unwrap();
+        let content = "Alice works at Acme Corp.";
+        seed_memory_with_source_id_and_space(&db, "mem_1", content, "space_a").await;
+
+        db.create_relation_with_span(
+            &e1,
+            &e2,
+            "works_at",
+            Some("test"),
+            None,
+            None,
+            Some("mem_1"),
+            Some(content),
+            Some(content),
+            Some("qwen3-4b-instruct-2507"),
+            Some(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION),
+        )
+        .await
+        .unwrap();
+
+        let report = db.reconcile_edges_parity().await.unwrap();
+        assert_eq!(
+            report.drift_count, 0,
+            "a payload write must not disturb structural-column parity"
+        );
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![e1.clone(), e2.clone()],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect("payload must be non-NULL for a span-carrying write");
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        assert_eq!(payload["source_memory_id"], serde_json::json!("mem_1"));
+        assert_eq!(payload["span"]["quote"], serde_json::json!(content));
+        assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+        assert_eq!(
+            payload["span"]["char_end"],
+            serde_json::json!(content.chars().count())
+        );
+        assert_eq!(
+            payload["model_version"],
+            serde_json::json!("qwen3-4b-instruct-2507")
+        );
+        assert_eq!(
+            payload["prompt_version"],
+            serde_json::json!(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_relation_with_span_stores_unlocated_quote_as_null_offsets() {
+        // §2.3: if the model's quote is not an exact substring of the
+        // source memory's content, char_start/char_end are stored null --
+        // the quote itself is still recorded, never guessed at or dropped.
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .create_entity("Alice", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let e2 = db
+            .create_entity("Acme", "org", Some("space_a"))
+            .await
+            .unwrap();
+        let content = "Alice works at Acme Corp.";
+        seed_memory_with_source_id_and_space(&db, "mem_2", content, "space_a").await;
+        let fabricated_quote = "Alice is the CEO of Acme"; // not a substring of `content`
+
+        db.create_relation_with_span(
+            &e1,
+            &e2,
+            "works_at",
+            Some("test"),
+            None,
+            None,
+            Some("mem_2"),
+            Some(fabricated_quote),
+            Some(content),
+            Some("qwen3-4b-instruct-2507"),
+            Some(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION),
+        )
+        .await
+        .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![e1.clone(), e2.clone()],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect("payload must be non-NULL for a span-carrying write");
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        assert_eq!(
+            payload["span"]["quote"],
+            serde_json::json!(fabricated_quote),
+            "the quote is stored even when it cannot be located"
+        );
+        assert!(
+            payload["span"]["char_start"].is_null(),
+            "an unlocated quote must not fabricate an offset"
+        );
+        assert!(payload["span"]["char_end"].is_null());
     }
 
     #[tokio::test]

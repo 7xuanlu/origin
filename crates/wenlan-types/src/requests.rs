@@ -158,6 +158,20 @@ pub struct CreateRelationRequest {
     pub explanation: Option<String>,
     #[serde(default)]
     pub source_memory_id: Option<String>,
+    /// Verbatim source-memory quote the relation was extracted from (M3g
+    /// span capture). Daemon-internal (KG extraction) only -- the
+    /// `/api/memory/relations` wire route strips this to `None` before the
+    /// core call, so an agent-triggered request can never set it.
+    #[serde(default)]
+    pub span: Option<String>,
+    /// Extraction model id/version that produced `span` (§6.6 versioning).
+    /// Daemon-internal only -- stripped on the wire route, same as `span`.
+    #[serde(default)]
+    pub model_version: Option<String>,
+    /// `extract_knowledge_graph` prompt version that produced `span`.
+    /// Daemon-internal only -- stripped on the wire route, same as `span`.
+    #[serde(default)]
+    pub prompt_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

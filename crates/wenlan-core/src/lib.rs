@@ -25,6 +25,7 @@ mod derived_artifact_state;
 pub mod document_enrichment;
 #[cfg(test)]
 mod drift_guard;
+pub mod edge_grounding;
 pub mod engine;
 pub mod env_compat;
 pub mod error;
