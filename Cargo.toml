@@ -9,15 +9,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.14.1"   # x-release-please-version
+version = "0.15.0"   # x-release-please-version
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/7xuanlu/wenlan"
 
 [workspace.dependencies]
 # Internal crates — both path AND version required for cargo publish
-wenlan-types = { path = "crates/wenlan-types", version = "0.14.1" }
-wenlan-core  = { path = "crates/wenlan-core",  version = "0.14.1" }
+wenlan-types = { path = "crates/wenlan-types", version = "0.15.0" }
+wenlan-core  = { path = "crates/wenlan-core",  version = "0.15.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
