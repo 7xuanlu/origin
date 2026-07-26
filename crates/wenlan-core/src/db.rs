@@ -1586,6 +1586,31 @@ fn entity_page_reconcile_enabled_value(value: Option<&str>) -> bool {
     })
 }
 
+/// Gate for the background edge-grounding promotion sweep (M3g, spec v3 §7).
+/// Opt-in: default OFF; enable with WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE=1/true/yes.
+/// The sweep promotes stored `grounded=0` `relates` edges to `grounded=1` (writing
+/// `root_id`) after a deterministic span pre-filter (when the edge carries one) and
+/// a MANDATORY independent entailment check; it is the ONLY writer of `grounded=1`.
+/// Promotion is monotone derived state (§1) — disabling the flag leaves already-promoted
+/// bits in place. Bounded per tick (scan + entailment caps); the entailment LLM runs
+/// strictly OUTSIDE any transaction (§6.3). Parsed here, checked in `scheduler.rs`
+/// before the fire-condition, mirroring [`edges_reconcile_enabled`]. It stays
+/// opt-in until the sweep's foreground-latency and false-grounding gates
+/// (`docs/plans/2026-07-25-m3g-gate-criteria.md`) are measured on a real corpus.
+pub fn edge_grounding_promote_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE").ok();
+    edge_grounding_promote_enabled_value(value.as_deref())
+}
+
+fn edge_grounding_promote_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 /// True iff `WENLAN_RERANK_SKIP_PREFERENCE` is truthy. OPT-IN, default OFF.
 ///
 /// When ON, preference/recommendation-seeking queries (per
@@ -10498,6 +10523,247 @@ impl MemoryDB {
         )
         .await?;
         Ok(())
+    }
+
+    /// Fetch a bounded batch of `relates` promotion candidates for the M3g
+    /// edge-grounding sweep, driven off the `relations` table (the sole producer
+    /// of every `relates` edge, so this scan is complete). Cursored by
+    /// `relations.rowid` — the implicit clustered key, monotonic in insert order,
+    /// so no extra index is needed and the scan stays off a full-table sort (gate
+    /// 3, `docs/plans/2026-07-25-m3g-gate-criteria.md` §3.3). For each relation it
+    /// recomputes the content-addressed `edge_id`, resolves the endpoint entity
+    /// NAMES (the triple the entailment check scores), and LEFT-joins the chunk-0
+    /// source memory (present only for a still-live source) for the external-origin
+    /// gate + span validation. A second PK-indexed batch fetch attaches each edge's
+    /// current `grounded`/`valid_until`/`payload`, so the sweep can skip
+    /// already-grounded, superseded, or missing edges before spending an entailment
+    /// call. READ-ONLY. `limit` bounds the scan (§7 SCAN_PER_TICK).
+    pub async fn edge_grounding_candidates(
+        &self,
+        cursor_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::edge_grounding::EdgeGroundingCandidate>, WenlanError> {
+        use crate::edge_grounding::EdgeGroundingCandidate;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
+                        r.source_memory_id, fe.name, te.name,
+                        m.content, m.source_agent, m.source_id, m.url
+                 FROM relations r
+                 JOIN entities fe ON fe.id = r.from_entity
+                 JOIN entities te ON te.id = r.to_entity
+                 LEFT JOIN memories m
+                        ON m.source_id = r.source_memory_id
+                       AND m.source = 'memory'
+                       AND m.chunk_index = 0
+                 WHERE r.rowid > ?1
+                 ORDER BY r.rowid
+                 LIMIT ?2",
+                libsql::params![cursor_rowid, limit as i64],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("edge_grounding_candidates scan: {e}")))?;
+
+        struct Staged {
+            rowid: i64,
+            edge_id: String,
+            from_name: String,
+            to_name: String,
+            relation_type: String,
+            source_memory_id: Option<String>,
+            mem_content: Option<String>,
+            mem_source_agent: Option<String>,
+            mem_source_identity: Option<String>,
+        }
+        let mut staged: Vec<Staged> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("edge_grounding_candidates row: {e}")))?
+        {
+            let rowid: i64 = row.get(0).unwrap_or_default();
+            let from_id: String = row.get(1).unwrap_or_default();
+            let to_id: String = row.get(2).unwrap_or_default();
+            let relation_type: String = row.get(3).unwrap_or_default();
+            let source_memory_id: Option<String> = row.get::<Option<String>>(4).ok().flatten();
+            let from_name: String = row.get(5).unwrap_or_default();
+            let to_name: String = row.get(6).unwrap_or_default();
+            let mem_content: Option<String> = row.get::<Option<String>>(7).ok().flatten();
+            let mem_source_agent: Option<String> = row.get::<Option<String>>(8).ok().flatten();
+            let mem_source_id: Option<String> = row.get::<Option<String>>(9).ok().flatten();
+            let mem_url: Option<String> = row.get::<Option<String>>(10).ok().flatten();
+            let edge_id = crate::provenance::compute_edge_id(
+                "relates",
+                "entity",
+                &from_id,
+                "entity",
+                &to_id,
+                &relation_type,
+            );
+            // Independence signal for the root mint (§5.3): the document source
+            // identity — `url` when present (file path / URL), else the
+            // always-present `source_id`. Both are stable per source memory, so
+            // two edges from one memory (and any re-mint) converge on one root.
+            let mem_source_identity = mem_url
+                .filter(|s| !s.is_empty())
+                .or(mem_source_id)
+                .filter(|s| !s.is_empty());
+            staged.push(Staged {
+                rowid,
+                edge_id,
+                from_name,
+                to_name,
+                relation_type,
+                source_memory_id,
+                mem_content,
+                mem_source_agent,
+                mem_source_identity,
+            });
+        }
+        drop(rows);
+
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (1..=staged.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT edge_id, grounded, valid_until, payload FROM edges \
+             WHERE edge_type = 'relates' AND edge_id IN ({placeholders})"
+        );
+        let params: Vec<libsql::Value> = staged
+            .iter()
+            .map(|s| libsql::Value::Text(s.edge_id.clone()))
+            .collect();
+        let mut edge_rows = conn
+            .query(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("edge_grounding_candidates edges: {e}")))?;
+        let mut edge_state: std::collections::HashMap<String, (i64, Option<i64>, Option<String>)> =
+            std::collections::HashMap::new();
+        while let Some(row) = edge_rows.next().await.map_err(|e| {
+            WenlanError::VectorDb(format!("edge_grounding_candidates edge row: {e}"))
+        })? {
+            let edge_id: String = row.get(0).unwrap_or_default();
+            let grounded: i64 = row.get(1).unwrap_or(0);
+            let valid_until: Option<i64> = row.get::<Option<i64>>(2).ok().flatten();
+            let payload: Option<String> = row.get::<Option<String>>(3).ok().flatten();
+            edge_state.insert(edge_id, (grounded, valid_until, payload));
+        }
+        drop(edge_rows);
+
+        Ok(staged
+            .into_iter()
+            .map(|s| {
+                let (edge_grounded, edge_valid_until, edge_payload) = edge_state
+                    .get(&s.edge_id)
+                    .map(|(g, v, p)| (Some(*g), *v, p.clone()))
+                    .unwrap_or((None, None, None));
+                EdgeGroundingCandidate {
+                    rowid: s.rowid,
+                    edge_id: s.edge_id,
+                    from_name: s.from_name,
+                    to_name: s.to_name,
+                    relation_type: s.relation_type,
+                    source_memory_id: s.source_memory_id,
+                    mem_content: s.mem_content,
+                    mem_source_agent: s.mem_source_agent,
+                    mem_source_identity: s.mem_source_identity,
+                    edge_grounded,
+                    edge_valid_until,
+                    edge_payload,
+                }
+            })
+            .collect())
+    }
+
+    /// Apply the M3g monotone `grounded 0→1` promotion flip (§1) for a tick's
+    /// survivors in ONE rollback-protected transaction (the `fold_relation_type`
+    /// BEGIN idiom; issue #389). Each row's UPDATE is guarded `AND grounded = 0`,
+    /// making it idempotent + monotone: a re-run over an already-promoted edge
+    /// affects zero rows, and `grounded` can never go `1→0`. `root_id` and the
+    /// grounding-verdict `payload` (§2.4/§6.6) are written alongside `grounded`;
+    /// no structural column is touched, so the write is parity-invisible to the
+    /// M2 oracle (§1). No LLM/embedding call happens here (§6.3): entailment ran
+    /// outside, and each survivor's root was minted before this call. Returns the
+    /// number of edges actually flipped.
+    pub async fn promote_edges_grounded(
+        &self,
+        survivors: &[(String, String, String)],
+    ) -> Result<usize, WenlanError> {
+        if survivors.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("promote_edges_grounded begin: {e}")))?;
+        let result: Result<usize, WenlanError> = async {
+            let mut flipped = 0usize;
+            for (edge_id, root_id, payload) in survivors {
+                let affected = conn
+                    .execute(
+                        "UPDATE edges SET grounded = 1, root_id = ?1, payload = ?2 \
+                         WHERE edge_id = ?3 AND grounded = 0",
+                        libsql::params![root_id.clone(), payload.clone(), edge_id.clone()],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("promote_edges_grounded update: {e}"))
+                    })?;
+                flipped += affected as usize;
+            }
+            Ok(flipped)
+        }
+        .await;
+        match result {
+            Ok(flipped) => {
+                conn.execute("COMMIT", ()).await.map_err(|e| {
+                    WenlanError::VectorDb(format!("promote_edges_grounded commit: {e}"))
+                })?;
+                Ok(flipped)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Test-only: snapshot an edge's full column set, so the M3g
+    /// `edge_grounding` tests (a separate module that cannot reach the private
+    /// `conn`) can assert the grounded/root_id/payload flip AND parity of the
+    /// structural columns (§1, §10 of the promotion-mechanics spec).
+    #[cfg(test)]
+    pub(crate) async fn edge_snapshot_for_test(&self, edge_id: &str) -> Option<serde_json::Value> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT edge_type, src_kind, src_id, dst_kind, dst_id, grounded, root_id, \
+                        valid_until, lineage, space, payload \
+                 FROM edges WHERE edge_id = ?1",
+                libsql::params![edge_id],
+            )
+            .await
+            .ok()?;
+        let row = rows.next().await.ok()??;
+        Some(serde_json::json!({
+            "edge_type": row.get::<String>(0).ok(),
+            "src_kind": row.get::<String>(1).ok(),
+            "src_id": row.get::<String>(2).ok(),
+            "dst_kind": row.get::<String>(3).ok(),
+            "dst_id": row.get::<String>(4).ok(),
+            "grounded": row.get::<i64>(5).ok(),
+            "root_id": row.get::<Option<String>>(6).ok().flatten(),
+            "valid_until": row.get::<Option<i64>>(7).ok().flatten(),
+            "lineage": row.get::<String>(8).ok(),
+            "space": row.get::<String>(9).ok(),
+            "payload": row.get::<Option<String>>(10).ok().flatten(),
+        }))
     }
 
     // ===== M2 PR-2 reader-cutover control plane (stages c+d) =====

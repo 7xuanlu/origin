@@ -39,6 +39,7 @@ const RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const CITATION_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const EDGES_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const ENTITY_PAGE_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const EDGE_GROUNDING_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Target-Mac evidence keeps short ambient turns below a 5% duty cycle while
 /// avoiding the fivefold convergence penalty of the provisional ten-minute
 /// hotfix. Automatic recap batching still uses its separate ten-minute window.
@@ -433,10 +434,11 @@ enum AmbientJob {
     Citation,
     EdgesReconcile,
     EntityPageReconcile,
+    EdgeGroundingPromote,
 }
 
 impl AmbientJob {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Document,
         Self::Classification,
         Self::StructuredExtract,
@@ -447,6 +449,7 @@ impl AmbientJob {
         Self::Citation,
         Self::EdgesReconcile,
         Self::EntityPageReconcile,
+        Self::EdgeGroundingPromote,
     ];
 }
 
@@ -462,6 +465,7 @@ struct AmbientAvailability {
     citation: bool,
     edges_reconcile: bool,
     entity_page_reconcile: bool,
+    edge_grounding_promote: bool,
 }
 
 impl AmbientAvailability {
@@ -483,6 +487,11 @@ impl AmbientAvailability {
             // through the shared foreground/resource/cooldown controller.
             edges_reconcile: wenlan_core::db::edges_reconcile_enabled(),
             entity_page_reconcile: wenlan_core::db::entity_page_reconcile_enabled(),
+            // Provider-gated: the mandatory entailment check spends an LLM call,
+            // so the lane parks unless the pinned provider is authorized+healthy
+            // AND the opt-in flag is set (mirroring reconcile / citation).
+            edge_grounding_promote: provider_available
+                && wenlan_core::db::edge_grounding_promote_enabled(),
         }
     }
 
@@ -498,6 +507,7 @@ impl AmbientAvailability {
             AmbientJob::Citation => self.citation,
             AmbientJob::EdgesReconcile => self.edges_reconcile,
             AmbientJob::EntityPageReconcile => self.entity_page_reconcile,
+            AmbientJob::EdgeGroundingPromote => self.edge_grounding_promote,
         }
     }
 }
@@ -514,6 +524,7 @@ struct AmbientSchedule {
     last_citation: Option<Instant>,
     last_edges_reconcile: Option<Instant>,
     last_entity_page_reconcile: Option<Instant>,
+    last_edge_grounding_promote: Option<Instant>,
 }
 
 impl AmbientSchedule {
@@ -530,6 +541,7 @@ impl AmbientSchedule {
             last_citation: None,
             last_edges_reconcile: None,
             last_entity_page_reconcile: None,
+            last_edge_grounding_promote: None,
         }
     }
 
@@ -575,6 +587,9 @@ impl AmbientSchedule {
                         now.duration_since(last) >= ENTITY_PAGE_RECONCILE_SWEEP_INTERVAL
                     })
                 }
+                AmbientJob::EdgeGroundingPromote => self
+                    .last_edge_grounding_promote
+                    .is_none_or(|last| now.duration_since(last) >= EDGE_GROUNDING_SWEEP_INTERVAL),
             };
             if !due {
                 continue;
@@ -605,6 +620,10 @@ impl AmbientSchedule {
             AmbientJob::EdgesReconcile => self.last_edges_reconcile = Some(now),
             // Same full-pass reasoning as EdgesReconcile.
             AmbientJob::EntityPageReconcile => self.last_entity_page_reconcile = Some(now),
+            // Backlog drainer, not a full pass: this arm only runs when the
+            // slice made no progress (empty backlog), so stamp the interval to
+            // back off. A progressing slice returned early above, staying due.
+            AmbientJob::EdgeGroundingPromote => self.last_edge_grounding_promote = Some(now),
         }
     }
 
@@ -2232,6 +2251,26 @@ async fn run_ambient_job(
                 false
             }
         },
+        AmbientJob::EdgeGroundingPromote => {
+            let Some(provider) = provider.as_ref() else {
+                return AmbientTurnReport {
+                    job,
+                    selected: false,
+                    page_growth_terminal_no_match_committed: false,
+                    llm_calls: 0,
+                    panicked: false,
+                    elapsed: started.elapsed(),
+                };
+            };
+            match wenlan_core::edge_grounding::run_edge_grounding_slice(db, provider, prompts).await
+            {
+                Ok(report) => report.progressed,
+                Err(error) => {
+                    tracing::warn!("[scheduler] edge grounding slice error: {error}");
+                    false
+                }
+            }
+        }
     };
 
     AmbientTurnReport {
@@ -2533,9 +2572,10 @@ mod tests {
             citation: true,
             edges_reconcile: true,
             entity_page_reconcile: true,
+            edge_grounding_promote: true,
         };
         assert_eq!(
-            (0..10)
+            (0..11)
                 .filter_map(|_| schedule.select_due(now, available))
                 .collect::<Vec<_>>(),
             vec![
@@ -2549,6 +2589,7 @@ mod tests {
                 AmbientJob::Citation,
                 AmbientJob::EdgesReconcile,
                 AmbientJob::EntityPageReconcile,
+                AmbientJob::EdgeGroundingPromote,
             ]
         );
     }
@@ -2568,6 +2609,7 @@ mod tests {
             AmbientJob::PageGrowth,
             AmbientJob::Reconcile,
             AmbientJob::Citation,
+            AmbientJob::EdgeGroundingPromote,
         ] {
             assert!(
                 !availability.supports(job),
@@ -2846,6 +2888,7 @@ mod tests {
             citation: true,
             edges_reconcile: true,
             entity_page_reconcile: true,
+            edge_grounding_promote: true,
         };
 
         assert_eq!(
@@ -2898,6 +2941,7 @@ mod tests {
             citation: true,
             edges_reconcile: true,
             entity_page_reconcile: true,
+            edge_grounding_promote: true,
         };
 
         assert_eq!(
@@ -2940,6 +2984,10 @@ mod tests {
         );
         assert_eq!(
             schedule.select_due(now, available),
+            Some(AmbientJob::EdgeGroundingPromote)
+        );
+        assert_eq!(
+            schedule.select_due(now, available),
             Some(AmbientJob::Document)
         );
         assert_eq!(
@@ -2971,6 +3019,7 @@ mod tests {
             citation: false,
             edges_reconcile: true,
             entity_page_reconcile: false,
+            edge_grounding_promote: false,
         };
 
         assert_eq!(
@@ -3011,6 +3060,7 @@ mod tests {
             citation: false,
             edges_reconcile: false,
             entity_page_reconcile: true,
+            edge_grounding_promote: false,
         };
 
         assert_eq!(
@@ -5794,6 +5844,7 @@ mod tests {
             citation: false,
             edges_reconcile: false,
             entity_page_reconcile: false,
+            edge_grounding_promote: false,
         };
         assert_eq!(
             schedule.select_due(
