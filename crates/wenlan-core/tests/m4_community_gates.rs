@@ -17,8 +17,9 @@ use std::{
 };
 
 use wenlan_core::community_grouping::{
-    compute_community_grouping, run_community_grouping_cycle, CommunityGroupingError,
-    CommunityGroupingOutcome, CommunityGroupingRuntime,
+    compute_community_grouping, run_community_grouping_cycle, CommunityGroupingComputeMode,
+    CommunityGroupingError, CommunityGroupingFullReason, CommunityGroupingOutcome,
+    CommunityGroupingRuntime,
 };
 use wenlan_core::community_partition::{
     disconnected_community_count, full_partition, incremental_partition,
@@ -427,6 +428,54 @@ fn m4_rebinding_never_lets_new_node_sentinels_steal_a_durable_identity() {
 }
 
 #[test]
+fn m4_rebinding_new_only_split_cannot_claim_an_old_groups_durable_id() {
+    let mut edges = Vec::new();
+    for leaf in 0..8 {
+        edges.push(ProjectionInputEdge::new(
+            format!("old-leaf-{leaf}"),
+            "old",
+            format!("new-{leaf}"),
+        ));
+    }
+    let graph = project_grounded_relates(&edges, ProjectionConfig::default());
+    let previous = graph
+        .node_ids()
+        .iter()
+        .map(|node_id| {
+            if node_id == "old" {
+                "durable-old".to_owned()
+            } else {
+                format!("__m4-new-node-{node_id}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let membership = graph
+        .node_ids()
+        .iter()
+        .map(|node_id| usize::from(node_id != "old"))
+        .collect::<Vec<_>>();
+    let rebound = rebind_durable_ids_weighted(&previous, &membership, &graph);
+    let old_index = graph
+        .node_ids()
+        .iter()
+        .position(|node_id| node_id == "old")
+        .expect("old member index");
+
+    assert_eq!(
+        rebound[old_index], "durable-old",
+        "only the group containing an old member may inherit that member's durable identity"
+    );
+    assert!(
+        rebound
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != old_index)
+            .all(|(_, community_id)| community_id != "durable-old"),
+        "a new-only split must mint instead of stealing the old group's identity: {rebound:?}"
+    );
+}
+
+#[test]
 #[ignore = "manual M4 Gate 1.2 multi-size locality receipt"]
 fn m4_incremental_cost_tracks_frontier_size_not_total_graph_size() {
     const RUNS: usize = 21;
@@ -708,6 +757,7 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
     const SOURCE_CONTENT: &str =
         "The M4 acceptance graph records grounded relationships for the community job.";
     const BASE_EDGES_PER_SPACE: usize = 6_151;
+    const BASE_GRAPH_GENERATION: i64 = BASE_EDGES_PER_SPACE as i64;
     const PARTICIPANTS_PER_SPACE: usize = 2_048;
 
     let dir = tempfile::tempdir().expect("M4 real-job tempdir");
@@ -752,7 +802,7 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         .await
         .expect("acquire M4 provenance root");
 
-    let chords = m4_scale_chord_pairs(22);
+    let chords = m4_scale_chord_pairs(23);
     let initial_promotion = stage_m4_promotion(
         &db,
         &chords[0].0,
@@ -795,7 +845,10 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         1
     );
     let second_space_state = read_m4_persisted_snapshot(&observer, SECOND_SPACE).await;
-    assert_eq!(second_space_state.graph_generation, 1);
+    assert_eq!(
+        second_space_state.graph_generation,
+        BASE_GRAPH_GENERATION + 1
+    );
     assert!(second_space_state.dirty);
     assert!(second_space_state.members.is_empty());
 
@@ -814,14 +867,16 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
     );
 
     let initial_state = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(initial_state.graph_generation, 1);
+    assert_eq!(initial_state.graph_generation, BASE_GRAPH_GENERATION + 1);
     assert_eq!(initial_state.published_generation, None);
     assert!(initial_state.dirty);
     assert!(initial_state.members.is_empty());
+    let first_generation = read_m4_grouping_generation(&observer, SPACE).await;
 
     let mut runtime = CommunityGroupingRuntime::default();
     let mut mutex_holds = Vec::new();
     let mut foreground_latencies = Vec::new();
+    let mut composer_latencies = Vec::new();
     let (first_result, first_foreground_latency) =
         run_m4_cycle_with_foreground_probe(&db, &mut runtime, SPACE).await;
     foreground_latencies.push(first_foreground_latency);
@@ -829,8 +884,15 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         CommunityGroupingOutcome::Published(receipt) => receipt,
         other => panic!("first dirty cycle must publish, got {other:?}"),
     };
-    assert_eq!(first.input_generation, 1);
-    assert_eq!(first.published_generation, 1);
+    assert_eq!(first.input_generation, first_generation);
+    assert_eq!(first.published_generation, first_generation);
+    assert_eq!(
+        first.compute_mode,
+        CommunityGroupingComputeMode::Full {
+            reason: CommunityGroupingFullReason::FirstPublication,
+        },
+        "the first production publication is the positive full-mode control"
+    );
     assert_eq!(
         first.projected_edge_count,
         BASE_EDGES_PER_SPACE + 1,
@@ -838,16 +900,34 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
     );
     assert_eq!(first.member_count, PARTICIPANTS_PER_SPACE);
     mutex_holds.push(first.db_mutex_hold);
+    composer_latencies.push(first.composer_elapsed);
+    let graded_input_rows = first.input_rows_loaded;
+    let graded_member_rows = first.member_rows_written;
 
     let first_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(first_snapshot.graph_generation, 1);
-    assert_eq!(first_snapshot.published_generation, Some(1));
+    assert_eq!(first_snapshot.graph_generation, BASE_GRAPH_GENERATION + 1);
+    assert_eq!(first_snapshot.published_generation, Some(first_generation));
     assert!(!first_snapshot.dirty);
     assert_eq!(first_snapshot.members.len(), PARTICIPANTS_PER_SPACE);
     assert!(first_snapshot
         .members
         .iter()
-        .all(|member| member.published_generation == 1));
+        .all(|member| member.published_generation == first_generation));
+
+    let second = match run_community_grouping_cycle(&db, &mut runtime, SECOND_SPACE)
+        .await
+        .expect("publish second-space runtime control")
+    {
+        CommunityGroupingOutcome::Published(receipt) => receipt,
+        other => panic!("second-space control must publish, got {other:?}"),
+    };
+    assert_eq!(
+        second.compute_mode,
+        CommunityGroupingComputeMode::Full {
+            reason: CommunityGroupingFullReason::FirstPublication,
+        }
+    );
+    let second_runtime_generation = second.published_generation;
 
     for (cycle, (from, to)) in chords.iter().skip(2).take(18).enumerate() {
         let promotion =
@@ -865,15 +945,25 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
             CommunityGroupingOutcome::Published(receipt) => receipt,
             other => panic!("common correction cycle {cycle} must publish, got {other:?}"),
         };
-        let expected_generation = cycle as i64 + 2;
+        let expected_generation = read_m4_grouping_generation(&observer, SPACE).await;
         assert_eq!(published.input_generation, expected_generation);
         assert_eq!(published.published_generation, expected_generation);
+        assert!(
+            matches!(
+                published.compute_mode,
+                CommunityGroupingComputeMode::Incremental { optimized_nodes }
+                    if optimized_nodes > 0 && optimized_nodes < PARTICIPANTS_PER_SPACE
+            ),
+            "one grounded correction must optimize only its bounded frontier: {:?}",
+            published.compute_mode
+        );
         assert_eq!(
             published.projected_edge_count,
             BASE_EDGES_PER_SPACE + cycle + 2,
             "the published receipt must include that cycle's corrected edge"
         );
         mutex_holds.push(published.db_mutex_hold);
+        composer_latencies.push(published.composer_elapsed);
 
         let persisted = read_m4_persisted_snapshot(&observer, SPACE).await;
         assert_eq!(
@@ -905,19 +995,22 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         1
     );
     let before_stale = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(before_stale.graph_generation, 20);
-    assert_eq!(before_stale.published_generation, Some(19));
+    assert_eq!(before_stale.graph_generation, BASE_GRAPH_GENERATION + 20);
+    let stale_input_generation = read_m4_grouping_generation(&observer, SPACE).await;
+    let live_generation = before_stale
+        .published_generation
+        .expect("the preceding correction cycle is published");
     assert!(before_stale.dirty);
 
-    seed_obsolete_m4_leases(&observer, SPACE, before_stale.graph_generation).await;
+    seed_obsolete_m4_leases(&observer, SPACE, stale_input_generation).await;
     let attempt = db
         .prepare_community_grouping(SPACE)
         .await
         .expect("prepare real lease + grounded SELECT");
-    assert_eq!(attempt.input_generation(), 20);
+    assert_eq!(attempt.input_generation(), stale_input_generation);
     assert_eq!(
         read_m4_lease_generations(&observer, SPACE).await,
-        vec![20],
+        vec![stale_input_generation],
         "prepare must reap expired and old-generation lease garbage"
     );
     let held = db
@@ -929,8 +1022,8 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
             held,
             CommunityGroupingError::LeaseHeld {
                 ref space,
-                input_generation: 20,
-            } if space == SPACE
+                input_generation,
+            } if space == SPACE && input_generation == stale_input_generation
         ),
         "same-key exclusion must be typed LeaseHeld, got {held:?}"
     );
@@ -942,9 +1035,9 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         "an already-held durable lease must not fail the whole refinery phase"
     );
 
-    let computed = compute_community_grouping(&attempt, &runtime)
+    let work = compute_community_grouping(&attempt, &mut runtime)
         .expect("pure compute between DB phases, with no DB handle");
-    assert_eq!(computed.projected_edge_count(), BASE_EDGES_PER_SPACE + 20);
+    assert_eq!(work.projected_edge_count(), BASE_EDGES_PER_SPACE + 20);
 
     let (midrun_from, midrun_to) = &chords[21];
     let midrun_promotion = stage_m4_promotion(
@@ -963,29 +1056,30 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         1
     );
 
-    let stale = match db
-        .finalize_community_grouping(attempt, computed)
+    let stale = match work
+        .finalize(&db, attempt, &mut runtime)
         .await
         .expect("generation-CAS stale finalize")
     {
         CommunityGroupingOutcome::Stale(receipt) => receipt,
         other => panic!("mid-run promotion must reject stale publication, got {other:?}"),
     };
-    assert_eq!(stale.input_generation, 20);
+    assert_eq!(stale.input_generation, stale_input_generation);
     assert_eq!(
-        stale.published_generation, 19,
+        stale.published_generation, live_generation,
         "stale telemetry must report the still-live generation, not the rejected input"
     );
     mutex_holds.push(stale.db_mutex_hold);
+    composer_latencies.push(stale.composer_elapsed);
     assert_eq!(
         runtime.published_generation(SPACE),
-        Some(19),
+        Some(live_generation),
         "a stale finalize must not install its computed in-memory state"
     );
 
     let after_stale = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(after_stale.graph_generation, 21);
-    assert_eq!(after_stale.published_generation, Some(19));
+    assert_eq!(after_stale.graph_generation, BASE_GRAPH_GENERATION + 21);
+    assert_eq!(after_stale.published_generation, Some(live_generation));
     assert!(after_stale.dirty, "stale CAS must leave the space queued");
     assert_eq!(
         after_stale.members, before_stale.members,
@@ -1004,20 +1098,101 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
             CommunityGroupingOutcome::Published(receipt) => receipt,
             other => panic!("second cycle must publish corrected input, got {other:?}"),
         };
-    assert_eq!(recovered.input_generation, 21);
-    assert_eq!(recovered.published_generation, 21);
+    let recovered_generation = read_m4_grouping_generation(&observer, SPACE).await;
+    assert_eq!(recovered.input_generation, recovered_generation);
+    assert_eq!(recovered.published_generation, recovered_generation);
+    assert!(
+        matches!(
+            recovered.compute_mode,
+            CommunityGroupingComputeMode::Incremental { optimized_nodes }
+                if optimized_nodes > 0 && optimized_nodes < PARTICIPANTS_PER_SPACE
+        ),
+        "stale recovery must retain the prior runtime and stay incremental: {:?}",
+        recovered.compute_mode
+    );
     assert_eq!(recovered.projected_edge_count, BASE_EDGES_PER_SPACE + 21);
     mutex_holds.push(recovered.db_mutex_hold);
-    assert_eq!(runtime.published_generation(SPACE), Some(21));
+    composer_latencies.push(recovered.composer_elapsed);
+    assert_eq!(
+        runtime.published_generation(SPACE),
+        Some(recovered_generation)
+    );
 
     let recovered_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(recovered_snapshot.graph_generation, 21);
-    assert_eq!(recovered_snapshot.published_generation, Some(21));
+    assert_eq!(
+        recovered_snapshot.graph_generation,
+        BASE_GRAPH_GENERATION + 21
+    );
+    assert_eq!(
+        recovered_snapshot.published_generation,
+        Some(recovered_generation)
+    );
     assert!(!recovered_snapshot.dirty);
     assert!(recovered_snapshot
         .members
         .iter()
-        .all(|member| member.published_generation == 21));
+        .all(|member| member.published_generation == recovered_generation));
+
+    let (error_from, error_to) = &chords[22];
+    let error_promotion = stage_m4_promotion(
+        &db,
+        error_from,
+        error_to,
+        SOURCE_ID,
+        SOURCE_CONTENT,
+        &root_id,
+    )
+    .await;
+    assert_eq!(
+        db.promote_edges_grounded(&[error_promotion])
+            .await
+            .expect("promote correction before finalize-error control"),
+        1
+    );
+    let error_attempt = db
+        .prepare_community_grouping(SPACE)
+        .await
+        .expect("prepare finalize-error control");
+    let error_work = compute_community_grouping(&error_attempt, &mut runtime)
+        .expect("compute finalize-error control");
+    observer
+        .execute(
+            "DELETE FROM grouping_leases WHERE phase='community' AND space=?1",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("remove lease before finalize-error control");
+    error_work
+        .finalize(&db, error_attempt, &mut runtime)
+        .await
+        .expect_err("missing lease must fail finalization");
+    assert_eq!(
+        runtime.published_generation(SPACE),
+        Some(recovered_generation),
+        "finalize errors must roll the frontier state back to the live publication"
+    );
+    let error_retry = match run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("retry finalize-error generation")
+    {
+        CommunityGroupingOutcome::Published(receipt) => receipt,
+        other => panic!("finalize-error retry must publish, got {other:?}"),
+    };
+    assert!(
+        matches!(
+            error_retry.compute_mode,
+            CommunityGroupingComputeMode::Incremental { optimized_nodes }
+                if optimized_nodes > 0 && optimized_nodes < PARTICIPANTS_PER_SPACE
+        ),
+        "error recovery must retain the prior runtime and stay incremental"
+    );
+    mutex_holds.push(error_retry.db_mutex_hold);
+    composer_latencies.push(error_retry.composer_elapsed);
+    assert_eq!(
+        runtime.published_generation(SECOND_SPACE),
+        Some(second_runtime_generation),
+        "updating one space must neither copy nor alter another runtime partition"
+    );
     assert_eq!(
         read_legacy_community_shadow(&observer, SPACE).await,
         legacy_before,
@@ -1057,6 +1232,23 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         foreground_max < Duration::from_secs(2),
         "independent foreground-query max {foreground_max:?} reaches the hard fail"
     );
+    println!(
+        "[m4_production_composer] composer_p95_ms={:.3} composer_max_ms={:.3} \
+         input_rows_loaded={} member_rows_written={} mutex_p95_ms={:.3} \
+         foreground_p95_ms={:.3}",
+        duration_p95(&composer_latencies).as_secs_f64() * 1_000.0,
+        composer_latencies
+            .iter()
+            .copied()
+            .max()
+            .expect("composer latency receipts")
+            .as_secs_f64()
+            * 1_000.0,
+        graded_input_rows,
+        graded_member_rows,
+        mutex_p95.as_secs_f64() * 1_000.0,
+        foreground_p95.as_secs_f64() * 1_000.0,
+    );
     assert_m4_job_phase_structure();
 }
 
@@ -1064,6 +1256,8 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
 async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
     const SPACE: &str = "m4-isolated-space";
     const ROOT: &str = "m4-isolated-root";
+    const SOURCE_ID: &str = "m4-isolated-source";
+    const SOURCE_CONTENT: &str = "The isolated M4 fixture supports bounded core corrections.";
 
     let dir = tempfile::tempdir().expect("M4 isolated tempdir");
     let db = Arc::new(
@@ -1071,6 +1265,20 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
             .await
             .expect("open M4 isolated database"),
     );
+    db.upsert_documents(vec![RawDocument {
+        source: "memory".to_owned(),
+        source_id: SOURCE_ID.to_owned(),
+        title: "M4 isolated source".to_owned(),
+        content: SOURCE_CONTENT.to_owned(),
+        last_modified: 1_722_000_000,
+        memory_type: Some("fact".to_owned()),
+        space: Some(SPACE.to_owned()),
+        source_agent: Some("folder".to_owned()),
+        confirmed: Some(true),
+        ..Default::default()
+    }])
+    .await
+    .expect("seed isolated promotion source");
     let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
         .build()
         .await
@@ -1177,15 +1385,6 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         .await
         .expect("seed multi-hop and cyclic ungrounded attachments");
     observer
-        .execute(
-            "INSERT INTO space_graph_state \
-                (space, graph_generation, grouping_generation, published_generation, dirty) \
-             VALUES (?1, 1, 1, NULL, 1)",
-            libsql::params![SPACE],
-        )
-        .await
-        .expect("seed dirty M4 isolated generation");
-    observer
         .execute("COMMIT", ())
         .await
         .expect("commit M4 isolated seed");
@@ -1199,10 +1398,11 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         | (Err(CommunityGroupingError::LeaseHeld { .. }), Ok(attempt)) => attempt,
         outcome => panic!("exactly one concurrent same-generation lease must win: {outcome:?}"),
     };
+    let leased_generation = attempt.input_generation();
 
-    let runtime = CommunityGroupingRuntime::default();
-    let computed =
-        compute_community_grouping(&attempt, &runtime).expect("compute isolated grouping");
+    let mut runtime = CommunityGroupingRuntime::default();
+    let work =
+        compute_community_grouping(&attempt, &mut runtime).expect("compute isolated grouping");
     let late_relation = db
         .create_relation(
             "isolated-none",
@@ -1215,36 +1415,46 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         )
         .await
         .expect("write an ungrounded attachment after prepare");
-    let stale = match db
-        .finalize_community_grouping(attempt, computed)
+    let stale = match work
+        .finalize(&db, attempt, &mut runtime)
         .await
         .expect("finalize isolated grouping")
     {
         CommunityGroupingOutcome::Stale(receipt) => receipt,
         other => panic!("an attachment-input write must stale the leased snapshot: {other:?}"),
     };
-    assert_eq!(stale.input_generation, 1);
+    assert_eq!(stale.input_generation, leased_generation);
 
     let stale_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(stale_snapshot.graph_generation, 1);
-    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 2);
+    assert_eq!(stale_snapshot.graph_generation, 10);
+    assert_eq!(
+        read_m4_grouping_generation(&observer, SPACE).await,
+        leased_generation + 1
+    );
     assert_eq!(stale_snapshot.published_generation, None);
     assert!(stale_snapshot.dirty);
     assert!(stale_snapshot.members.is_empty());
 
-    let mut runtime = CommunityGroupingRuntime::default();
-    let receipt = match run_community_grouping_cycle(&db, &mut runtime, SPACE)
+    let receipt = match db
+        .run_next_community_grouping_cycle()
         .await
-        .expect("rerun after attachment-input stale")
+        .expect("rerun phase slot after attachment-input stale")
+        .expect("dirty attachment generation must be selected")
     {
         CommunityGroupingOutcome::Published(receipt) => receipt,
         other => panic!("the current attachment generation must publish: {other:?}"),
     };
-    assert_eq!(receipt.published_generation, 2);
+    assert_eq!(receipt.published_generation, leased_generation + 1);
     assert_eq!(receipt.member_count, 15);
+    assert_eq!(
+        receipt.compute_mode,
+        CommunityGroupingComputeMode::Full {
+            reason: CommunityGroupingFullReason::FirstPublication,
+        }
+    );
 
     let snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(snapshot.published_generation, Some(2));
+    assert_eq!(snapshot.published_generation, Some(leased_generation + 1));
     assert!(!snapshot.dirty);
     let core = snapshot
         .members
@@ -1296,6 +1506,12 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
             .all(|member| !member.node_id.starts_with("z-cycle-")),
         "an ungrounded cycle with no core or embedding path must stay unassigned"
     );
+    let core_before = snapshot
+        .members
+        .iter()
+        .filter(|member| member.attachment == "core")
+        .map(|member| (member.node_id.clone(), member.community_id.clone()))
+        .collect::<Vec<_>>();
 
     let mut version_rows = observer
         .query(
@@ -1320,8 +1536,11 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
     db.supersede_relation(&late_relation, "unused-review-winner")
         .await
         .expect("soft-invalidate the ungrounded attachment");
-    assert_eq!(read_m4_generation(&observer, SPACE).await, 1);
-    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 3);
+    assert_eq!(read_m4_generation(&observer, SPACE).await, 10);
+    assert_eq!(
+        read_m4_grouping_generation(&observer, SPACE).await,
+        leased_generation + 2
+    );
     let deleted = db
         .run_next_community_grouping_cycle()
         .await
@@ -1329,7 +1548,12 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         .expect("ungrounded deletion must queue a grouping cycle");
     match deleted {
         CommunityGroupingOutcome::Published(receipt) => {
-            assert_eq!(receipt.published_generation, 3);
+            assert_eq!(receipt.published_generation, leased_generation + 2);
+            assert_eq!(
+                receipt.compute_mode,
+                CommunityGroupingComputeMode::CoreReused,
+                "ungrounded-only deletion must preserve the published core partition"
+            );
         }
         other => panic!("ungrounded deletion must publish current input: {other:?}"),
     }
@@ -1349,38 +1573,356 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         )
         .await
         .expect("mutate an attachment embedding after clean publication");
-    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 4);
-    let embedding_attempt = db
-        .prepare_community_grouping(SPACE)
+    assert_eq!(
+        read_m4_grouping_generation(&observer, SPACE).await,
+        leased_generation + 3
+    );
+    match db
+        .run_next_community_grouping_cycle()
         .await
-        .expect("embedding mutation must queue grouping");
-    let embedding_computed = compute_community_grouping(&embedding_attempt, &runtime)
-        .expect("compute embedding-mutated grouping");
+        .expect("run embedding-only generation")
+        .expect("embedding mutation must queue grouping")
+    {
+        CommunityGroupingOutcome::Published(receipt) => {
+            assert_eq!(receipt.published_generation, leased_generation + 3);
+            assert_eq!(
+                receipt.compute_mode,
+                CommunityGroupingComputeMode::CoreReused,
+                "embedding-only publication must preserve the core partition"
+            );
+        }
+        other => panic!("embedding-only generation must publish: {other:?}"),
+    }
+    let embedding_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    let core_after = embedding_snapshot
+        .members
+        .iter()
+        .filter(|member| member.attachment == "core")
+        .map(|member| (member.node_id.clone(), member.community_id.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        core_after, core_before,
+        "attachment-only cycles must preserve core durable membership byte-for-byte"
+    );
+
+    let mut promotions = Vec::new();
+    for (left, right) in [
+        ("core-00", "core-05"),
+        ("core-01", "core-06"),
+        ("core-02", "core-07"),
+    ] {
+        promotions
+            .push(stage_m4_promotion(&db, left, right, SOURCE_ID, SOURCE_CONTENT, ROOT).await);
+    }
+    assert_eq!(
+        db.promote_edges_grounded(&promotions)
+            .await
+            .expect("promote wide dirty frontier"),
+        promotions.len(),
+    );
+    let threshold = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run threshold full-mode control")
+        .expect("wide frontier must queue grouping");
+    assert!(matches!(
+        threshold,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode == CommunityGroupingComputeMode::Full {
+                reason: CommunityGroupingFullReason::ThresholdExceeded,
+            }
+    ));
+
+    observer
+        .execute(
+            "UPDATE space_graph_state \
+             SET graph_generation = graph_generation + 1, \
+                 grouping_generation = grouping_generation + 1, dirty = 1 \
+             WHERE space = ?1",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("advance graph generation without a volatile frontier");
+    let missing_frontier = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run missing-frontier full-mode control")
+        .expect("manual generation advance must queue grouping");
+    assert!(matches!(
+        missing_frontier,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode == CommunityGroupingComputeMode::Full {
+                reason: CommunityGroupingFullReason::DirtyFrontierMissing,
+            }
+    ));
+
+    observer
+        .execute(
+            "UPDATE communities SET algo_version = 'old-m4-version' \
+             WHERE space = ?1 AND retired_at IS NULL",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("inject published algorithm-version mismatch");
     observer
         .execute(
             "UPDATE entities SET embedding = vector32(?1) WHERE id = 'isolated-embedding'",
             libsql::params![m4_unit_embedding(2)],
         )
         .await
-        .expect("mutate embedding while grouping is in flight");
-    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 5);
-    assert!(matches!(
-        db.finalize_community_grouping(embedding_attempt, embedding_computed)
-            .await
-            .expect("finalize stale embedding snapshot"),
-        CommunityGroupingOutcome::Stale(_)
-    ));
-    match db
+        .expect("queue grouping after version mismatch");
+    let version_changed = db
         .run_next_community_grouping_cycle()
         .await
-        .expect("run current embedding generation")
-        .expect("stale embedding generation must remain queued")
-    {
-        CommunityGroupingOutcome::Published(receipt) => {
-            assert_eq!(receipt.published_generation, 5);
-        }
-        other => panic!("current embedding generation must publish: {other:?}"),
+        .expect("run version full-mode control")
+        .expect("version mismatch must queue grouping");
+    assert!(matches!(
+        version_changed,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode == CommunityGroupingComputeMode::Full {
+                reason: CommunityGroupingFullReason::VersionChanged,
+            }
+    ));
+
+    observer
+        .execute(
+            "UPDATE entities SET embedding = vector32(?1) WHERE id = 'isolated-embedding'",
+            libsql::params![m4_unit_embedding(3)],
+        )
+        .await
+        .expect("queue grouping before runtime restart");
+    drop(observer);
+    drop(observer_db);
+    drop(db);
+    let reopened = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("reopen M4 database without volatile runtime state");
+    let restarted = reopened
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run restart full-mode control")
+        .expect("queued restart generation must be selected");
+    assert!(matches!(
+        restarted,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode == CommunityGroupingComputeMode::Full {
+                reason: CommunityGroupingFullReason::RuntimeStateMissing,
+            }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_raw_grounded_writes_force_full_recovery_instead_of_reusing_stale_core() {
+    const SPACE: &str = "m4-raw-trigger-space";
+    const ROOT: &str = "m4-raw-trigger-root";
+
+    let dir = tempfile::tempdir().expect("M4 raw-trigger tempdir");
+    let db = Arc::new(
+        MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+            .await
+            .expect("open M4 raw-trigger database"),
+    );
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open M4 raw-trigger observer");
+    let observer = observer_db
+        .connect()
+        .expect("connect M4 raw-trigger observer");
+
+    observer
+        .execute(
+            "INSERT INTO provenance_roots
+                (root_id, identity_version, identity_digest, root_kind,
+                 independence_group_id, status, created_at)
+             VALUES (?1, 1, 'm4-raw-trigger-digest', 'generated',
+                     'm4-raw-trigger-group', 'active', 1712707200)",
+            libsql::params![ROOT],
+        )
+        .await
+        .expect("seed raw-trigger provenance root");
+    for node in 0..10 {
+        observer
+            .execute(
+                "INSERT INTO entities
+                    (id, name, entity_type, space, created_at, updated_at)
+                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                libsql::params![format!("raw-node-{node:02}"), SPACE],
+            )
+            .await
+            .expect("seed raw-trigger entity");
     }
+    for node in 0..10 {
+        observer
+            .execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                         1, ?4, ?5, 1712707200)",
+                libsql::params![
+                    format!("raw-base-edge-{node:02}"),
+                    format!("raw-node-{node:02}"),
+                    format!("raw-node-{:02}", (node + 1) % 10),
+                    ROOT,
+                    SPACE
+                ],
+            )
+            .await
+            .expect("seed raw-trigger base edge");
+    }
+    let mut runtime = CommunityGroupingRuntime::default();
+    let first = run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("publish raw-trigger baseline");
+    assert!(matches!(
+        first,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode
+                == (CommunityGroupingComputeMode::Full {
+                    reason: CommunityGroupingFullReason::FirstPublication,
+                })
+    ));
+
+    let baseline_graph_generation = read_m4_generation(&observer, SPACE).await;
+    observer
+        .execute(
+            "INSERT INTO edges
+                (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                 grounded, root_id, space, created_at)
+             VALUES ('raw-direct-edge', 'raw-node-00', 'entity', 'raw-node-03', 'entity',
+                     'relates', 'assertion', 1, ?1, ?2, 1712707200)",
+            libsql::params![ROOT, SPACE],
+        )
+        .await
+        .expect("raw direct grounded insert");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        baseline_graph_generation + 1,
+        "raw grounded insert must advance the core graph generation"
+    );
+    let inserted = run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("recover raw grounded insert");
+    assert!(matches!(
+        inserted,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode
+                == (CommunityGroupingComputeMode::Full {
+                    reason: CommunityGroupingFullReason::DirtyFrontierMissing,
+                })
+    ));
+
+    observer
+        .execute("DELETE FROM edges WHERE edge_id = 'raw-direct-edge'", ())
+        .await
+        .expect("raw direct grounded delete");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        baseline_graph_generation + 2,
+        "raw grounded delete must advance the core graph generation"
+    );
+    let deleted = run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("recover raw grounded delete");
+    assert!(matches!(
+        deleted,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode
+                == (CommunityGroupingComputeMode::Full {
+                    reason: CommunityGroupingFullReason::DirtyFrontierMissing,
+                })
+    ));
+
+    observer
+        .execute(
+            "UPDATE edges SET dst_id = 'raw-node-04'
+             WHERE edge_id = 'raw-base-edge-00'",
+            (),
+        )
+        .await
+        .expect("raw direct grounded topology update");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        baseline_graph_generation + 3,
+        "raw grounded topology update must advance the core graph generation"
+    );
+    let updated = run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("recover raw grounded topology update");
+    assert!(matches!(
+        updated,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode
+                == (CommunityGroupingComputeMode::Full {
+                    reason: CommunityGroupingFullReason::DirtyFrontierMissing,
+                })
+    ));
+
+    observer
+        .execute(
+            "UPDATE edges SET dst_id = 'raw-node-05'
+             WHERE edge_id = 'raw-base-edge-00'",
+            (),
+        )
+        .await
+        .expect("queue shared-runtime baseline");
+    let shared_baseline = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("publish shared-runtime baseline")
+        .expect("shared-runtime baseline work");
+    assert!(matches!(
+        shared_baseline,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.compute_mode
+                == (CommunityGroupingComputeMode::Full {
+                    reason: CommunityGroupingFullReason::RuntimeStateMissing,
+                })
+    ));
+
+    observer
+        .execute(
+            "UPDATE edges SET dst_id = 'raw-node-06'
+             WHERE edge_id = 'raw-base-edge-00'",
+            (),
+        )
+        .await
+        .expect("queue concurrent shared-runtime correction");
+    let (left, right) = tokio::join!(
+        db.run_next_community_grouping_cycle(),
+        db.run_next_community_grouping_cycle()
+    );
+    let outcomes = [
+        left.expect("left same-space phase contender"),
+        right.expect("right same-space phase contender"),
+    ];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+        1,
+        "exactly one same-space phase contender must publish"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+        1,
+        "the losing same-space phase contender must skip cleanly"
+    );
+    let winner = outcomes
+        .into_iter()
+        .flatten()
+        .next()
+        .expect("same-space winner");
+    assert!(
+        matches!(
+            winner,
+            CommunityGroupingOutcome::Published(ref receipt)
+                if receipt.compute_mode
+                    == (CommunityGroupingComputeMode::Full {
+                        reason: CommunityGroupingFullReason::DirtyFrontierMissing,
+                    })
+        ),
+        "the lease winner must receive the prior shared runtime, got {winner:?}"
+    );
 }
 
 #[tokio::test]
@@ -1562,6 +2104,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         Some((canonical, neighbor)),
         "the corrected endpoint edge must remain active and grounded"
     );
+    let merged_grouping_generation = read_m4_grouping_generation(&observer, SPACE).await;
 
     let published = db
         .run_next_community_grouping_cycle()
@@ -1570,7 +2113,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .expect("the corrected space is dirty");
     match published {
         CommunityGroupingOutcome::Published(receipt) => {
-            assert_eq!(receipt.published_generation, 5);
+            assert_eq!(receipt.published_generation, merged_grouping_generation);
             assert_eq!(
                 receipt.member_count, 0,
                 "five participants stay below the authored viability floor"
@@ -1639,6 +2182,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         1
     );
     assert_eq!(read_m4_generation(&observer, SPACE).await, 6);
+    let restart_grouping_generation = read_m4_grouping_generation(&observer, SPACE).await;
     drop(observer);
     drop(observer_db);
     drop(db);
@@ -1651,13 +2195,17 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .await
         .expect("restart routes missing volatile state to full partition")
         .expect("durable dirty generation survives restart");
-    match restarted {
+    let restarted_generation = match restarted {
         CommunityGroupingOutcome::Published(receipt) => {
-            assert_eq!(receipt.published_generation, 6);
+            assert!(
+                receipt.published_generation >= restart_grouping_generation,
+                "startup embedding recovery may advance the broader grouping input generation"
+            );
             assert_eq!(receipt.projected_edge_count, 3);
+            receipt.published_generation
         }
         other => panic!("restart must publish via full fallback: {other:?}"),
-    }
+    };
 
     let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
         .build()
@@ -1666,6 +2214,11 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
     let observer = observer_db
         .connect()
         .expect("reconnect correction observer");
+    assert_eq!(
+        read_m4_grouping_generation(&observer, SPACE).await,
+        restarted_generation,
+        "restart must publish the exact durable grouping input it observed"
+    );
 
     const DELETE_SOURCE: &str = "m4-delete-cascade-source";
     const DELETE_CONTENT: &str =
@@ -1848,6 +2401,176 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
             Some(Some(_))
         ),
         "source refresh must soft-invalidate the grounded edge"
+    );
+}
+
+#[tokio::test]
+async fn m4_merge_collision_advances_graph_and_rebuilds_changed_node_order() {
+    const SPACE: &str = "m4-merge-collision-space";
+    const SOURCE_ID: &str = "m4-merge-collision-source";
+    const SOURCE_CONTENT: &str =
+        "A grounded alias edge collapses onto an already-grounded canonical edge.";
+    const CORE_NODES: usize = 10;
+
+    let dir = tempfile::tempdir().expect("M4 merge-collision tempdir");
+    let db = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("open M4 merge-collision database");
+    db.upsert_documents(vec![RawDocument {
+        source: "memory".to_owned(),
+        source_id: SOURCE_ID.to_owned(),
+        title: "M4 merge collision".to_owned(),
+        content: SOURCE_CONTENT.to_owned(),
+        last_modified: 1_722_000_000,
+        memory_type: Some("fact".to_owned()),
+        space: Some(SPACE.to_owned()),
+        source_agent: Some("folder".to_owned()),
+        confirmed: Some(true),
+        ..Default::default()
+    }])
+    .await
+    .expect("seed M4 merge-collision source");
+    let root_id = db
+        .acquire_provenance_root(
+            "document_ingest",
+            SOURCE_CONTENT,
+            &IndependenceSignals {
+                source_identity: Some("file:///m4-merge-collision.md"),
+                agent_turn: None,
+                import_batch: None,
+            },
+        )
+        .await
+        .expect("acquire M4 merge-collision root");
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open M4 merge-collision observer");
+    let observer = observer_db
+        .connect()
+        .expect("connect M4 merge-collision observer");
+
+    for node in 0..CORE_NODES {
+        observer
+            .execute(
+                "INSERT INTO entities
+                    (id, name, entity_type, space, created_at, updated_at)
+                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                libsql::params![format!("merge-core-{node:02}"), SPACE],
+            )
+            .await
+            .expect("seed merge-collision core entity");
+    }
+    observer
+        .execute(
+            "INSERT INTO entities
+                (id, name, entity_type, space, created_at, updated_at)
+             VALUES ('merge-alias', 'merge-alias', 'concept', ?1, 1712707200, 1712707200)",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("seed merge-collision alias");
+    for node in 0..CORE_NODES {
+        observer
+            .execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                         1, ?4, ?5, 1712707200)",
+                libsql::params![
+                    format!("merge-ring-{node:02}"),
+                    format!("merge-core-{node:02}"),
+                    format!("merge-core-{:02}", (node + 1) % CORE_NODES),
+                    root_id.as_str(),
+                    SPACE
+                ],
+            )
+            .await
+            .expect("seed merge-collision core ring");
+    }
+
+    let canonical_promotion = stage_m4_promotion(
+        &db,
+        "merge-core-00",
+        "merge-core-01",
+        SOURCE_ID,
+        SOURCE_CONTENT,
+        &root_id,
+    )
+    .await;
+    let canonical_relation_id = canonical_promotion.relation_id.clone();
+    assert_eq!(
+        db.promote_edges_grounded(&[canonical_promotion])
+            .await
+            .expect("ground canonical collision edge before superseding"),
+        1
+    );
+    db.supersede_relation(&canonical_relation_id, "merge-canonical-superseder")
+        .await
+        .expect("supersede canonical collision relation");
+
+    let alias_promotion = stage_m4_promotion(
+        &db,
+        "merge-alias",
+        "merge-core-01",
+        SOURCE_ID,
+        SOURCE_CONTENT,
+        &root_id,
+    )
+    .await;
+    assert_eq!(
+        db.promote_edges_grounded(&[alias_promotion])
+            .await
+            .expect("ground alias collision edge"),
+        1
+    );
+
+    let first = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("publish merge-collision baseline")
+        .expect("merge-collision baseline work");
+    assert!(matches!(
+        first,
+        CommunityGroupingOutcome::Published(ref receipt)
+            if receipt.member_count == CORE_NODES + 1
+    ));
+    let graph_before = read_m4_generation(&observer, SPACE).await;
+
+    db.merge_entities("merge-core-00", "merge-alias")
+        .await
+        .expect("merge alias onto existing grounded canonical edge");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        graph_before + 1,
+        "colliding merge must retain the real old-edge retraction bump"
+    );
+
+    let merged = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("publish merge-collision correction")
+        .expect("merge-collision correction work");
+    assert!(
+        matches!(
+            merged,
+            CommunityGroupingOutcome::Published(ref receipt)
+                if receipt.member_count == CORE_NODES
+                    && receipt.compute_mode
+                        == (CommunityGroupingComputeMode::Full {
+                            reason: CommunityGroupingFullReason::NodeOrderChanged,
+                        })
+        ),
+        "node removal must rebuild instead of reusing stale membership: {merged:?}"
+    );
+    let snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert!(
+        snapshot
+            .members
+            .iter()
+            .all(|member| member.node_id != "merge-alias"),
+        "published members must not retain the merged-away alias"
     );
 }
 
@@ -2091,8 +2814,28 @@ fn assert_m4_job_phase_structure() {
             );
         }
     }
+    for signature in [
+        "async fn acquire_community_grouping_lease",
+        "pub async fn finalize_community_grouping",
+    ] {
+        let body = rust_function_body(db_source, signature);
+        assert!(
+            body.contains("transaction_with_behavior(libsql::TransactionBehavior::Immediate)"),
+            "{signature} must use the pinned libSQL RAII transaction API"
+        );
+        assert!(
+            !body.contains("execute(\"BEGIN\"")
+                && !body.contains("execute(\"COMMIT\"")
+                && !body.contains("execute(\"ROLLBACK\""),
+            "{signature} must not leave a manual transaction open when its future is dropped"
+        );
+    }
 
     let job_source = include_str!("../src/community_grouping.rs");
+    assert!(
+        job_source.contains("tokio::runtime::Handle::try_current()"),
+        "attempt-drop lease cleanup must fall back to expiry instead of panicking without a runtime"
+    );
     let composer = rust_function_body(job_source, "pub async fn run_community_grouping_cycle");
     let prepare = composer
         .find("prepare_community_grouping(")
@@ -2101,11 +2844,56 @@ fn assert_m4_job_phase_structure() {
         .find("compute_community_grouping(")
         .expect("composer pure compute phase");
     let finalize = composer
-        .find("finalize_community_grouping(")
-        .expect("composer finalize phase");
+        .find("work.finalize(")
+        .expect("composer work finalization phase");
     assert!(
         prepare < compute && compute < finalize,
         "production composer must preserve prepare -> pure compute -> finalize ordering"
+    );
+    let phase_slot =
+        rust_function_body(job_source, "pub async fn run_next_community_grouping_cycle");
+    assert!(
+        !phase_slot.contains(".clone()"),
+        "the production phase slot must move only the selected space, not clone graph-wide runtime"
+    );
+    assert_eq!(
+        phase_slot.matches("prepare_community_grouping(").count(),
+        1,
+        "the phase slot must win the durable lease before touching volatile runtime state"
+    );
+    let prepare = phase_slot
+        .find("prepare_community_grouping(")
+        .expect("phase-slot lease acquisition");
+    let runtime_claim = phase_slot
+        .find("SharedRuntimeSpaceGuard::take(")
+        .expect("phase-slot runtime claim");
+    assert!(
+        prepare < runtime_claim,
+        "same-space contenders must acquire the lease before one removes runtime state"
+    );
+    assert!(
+        !job_source.contains("community_degrees: self.community_degrees.clone()"),
+        "the rollback journal must not clone graph-wide community statistics"
+    );
+    let partition_source = include_str!("../src/community_partition.rs");
+    let recoverable = rust_function_body(
+        partition_source,
+        "pub(crate) fn incremental_partition_recoverable",
+    );
+    let threshold = recoverable
+        .find("incremental_frontier(")
+        .expect("incremental threshold/frontier validation");
+    let journal = recoverable
+        .find("rollback_snapshot(")
+        .expect("bounded rollback journal allocation");
+    assert!(
+        threshold < journal,
+        "dirty/frontier threshold rejection must happen before rollback-journal allocation"
+    );
+    let snapshot = rust_function_body(partition_source, "fn rollback_snapshot");
+    assert!(
+        snapshot.contains("self.adjacency[node]") && snapshot.contains("graph.adjacency[node]"),
+        "the bounded journal must cover every old/new adjacency community candidate"
     );
 
     let refinery_source = include_str!("../src/refinery/mod.rs");

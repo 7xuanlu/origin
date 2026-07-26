@@ -270,13 +270,26 @@ pub enum IncrementalPartitionError {
 /// restart, an algorithm/projection version change, or an explicit full
 /// repartition. Steady-state edge changes update it only through the supplied
 /// dirty endpoints and their old/new incident edges.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct IncrementalPartitionState {
     partition: PartitionOutput,
     node_order_fingerprint: u64,
     adjacency: Vec<BTreeMap<usize, f64>>,
     weighted_degrees: Vec<f64>,
     community_degrees: BTreeMap<usize, f64>,
+    total_internal_weight: f64,
+    sum_community_degree_squares: f64,
+    total_edge_weight: f64,
+    next_community: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct IncrementalPartitionRollback {
+    membership: Vec<(usize, usize)>,
+    adjacency: Vec<(usize, BTreeMap<usize, f64>)>,
+    weighted_degrees: Vec<(usize, f64)>,
+    community_degrees: Vec<(usize, f64)>,
+    partition_modularity: f64,
     total_internal_weight: f64,
     sum_community_degree_squares: f64,
     total_edge_weight: f64,
@@ -340,6 +353,133 @@ impl IncrementalPartitionState {
         &self.partition
     }
 
+    fn incremental_frontier(
+        &self,
+        graph: &ProjectedGraph,
+        dirty_nodes: &[usize],
+        config: IncrementalConfig,
+    ) -> Result<(BTreeSet<usize>, BTreeSet<usize>), IncrementalPartitionError> {
+        let node_count = graph.node_ids.len();
+        if self.partition.membership.len() != node_count {
+            return Err(IncrementalPartitionError::MembershipSize {
+                expected: node_count,
+                actual: self.partition.membership.len(),
+            });
+        }
+        if self.node_order_fingerprint != graph.node_order_fingerprint {
+            return Err(IncrementalPartitionError::NodeOrder);
+        }
+        let dirty = dirty_nodes.iter().copied().collect::<BTreeSet<_>>();
+        if let Some(&node) = dirty.iter().find(|&&node| node >= node_count) {
+            return Err(IncrementalPartitionError::DirtyNode { node, node_count });
+        }
+        let dirty_fraction = if node_count == 0 {
+            0.0
+        } else {
+            dirty.len() as f64 / node_count as f64
+        };
+        if dirty_fraction > config.max_dirty_fraction {
+            return Err(IncrementalPartitionError::DirtyFraction {
+                actual: dirty_fraction,
+                maximum: config.max_dirty_fraction,
+            });
+        }
+
+        let mut frontier = dirty.clone();
+        for &node in &dirty {
+            frontier.extend(self.adjacency[node].keys().copied());
+            frontier.extend(graph.adjacency[node].iter().map(|(neighbor, _)| *neighbor));
+        }
+        let frontier_fraction = if node_count == 0 {
+            0.0
+        } else {
+            frontier.len() as f64 / node_count as f64
+        };
+        if frontier_fraction > config.max_frontier_fraction {
+            return Err(IncrementalPartitionError::FrontierFraction {
+                actual: frontier_fraction,
+                maximum: config.max_frontier_fraction,
+            });
+        }
+        Ok((dirty, frontier))
+    }
+
+    fn rollback_snapshot(
+        &self,
+        graph: &ProjectedGraph,
+        dirty: &BTreeSet<usize>,
+        frontier: &BTreeSet<usize>,
+    ) -> IncrementalPartitionRollback {
+        let mut touched_communities = BTreeSet::new();
+        for &node in frontier {
+            touched_communities.insert(self.partition.membership[node]);
+            touched_communities.extend(
+                self.adjacency[node]
+                    .keys()
+                    .map(|&neighbor| self.partition.membership[neighbor]),
+            );
+            touched_communities.extend(
+                graph.adjacency[node]
+                    .iter()
+                    .map(|(neighbor, _)| self.partition.membership[*neighbor]),
+            );
+        }
+        for &node in dirty {
+            touched_communities.insert(self.partition.membership[node]);
+        }
+
+        IncrementalPartitionRollback {
+            membership: frontier
+                .iter()
+                .map(|&node| (node, self.partition.membership[node]))
+                .collect(),
+            adjacency: frontier
+                .iter()
+                .map(|&node| (node, self.adjacency[node].clone()))
+                .collect(),
+            weighted_degrees: frontier
+                .iter()
+                .map(|&node| (node, self.weighted_degrees[node]))
+                .collect(),
+            community_degrees: touched_communities
+                .into_iter()
+                .filter_map(|community| {
+                    self.community_degrees
+                        .get(&community)
+                        .copied()
+                        .map(|degree| (community, degree))
+                })
+                .collect(),
+            partition_modularity: self.partition.modularity,
+            total_internal_weight: self.total_internal_weight,
+            sum_community_degree_squares: self.sum_community_degree_squares,
+            total_edge_weight: self.total_edge_weight,
+            next_community: self.next_community,
+        }
+    }
+
+    pub(crate) fn restore(&mut self, rollback: IncrementalPartitionRollback) {
+        for (node, membership) in rollback.membership {
+            self.partition.membership[node] = membership;
+        }
+        for (node, adjacency) in rollback.adjacency {
+            self.adjacency[node] = adjacency;
+        }
+        for (node, weighted_degree) in rollback.weighted_degrees {
+            self.weighted_degrees[node] = weighted_degree;
+        }
+        self.community_degrees
+            .retain(|community, _| *community < rollback.next_community);
+        for (community, degree) in rollback.community_degrees {
+            self.community_degrees.insert(community, degree);
+        }
+        self.partition.modularity = rollback.partition_modularity;
+        self.total_internal_weight = rollback.total_internal_weight;
+        self.sum_community_degree_squares = rollback.sum_community_degree_squares;
+        self.total_edge_weight = rollback.total_edge_weight;
+        self.next_community = rollback.next_community;
+    }
+
     fn adjust_community_degree(&mut self, community: usize, delta: f64) {
         let degree = self.community_degrees.entry(community).or_default();
         self.sum_community_degree_squares -= degree.powi(2);
@@ -358,7 +498,7 @@ impl IncrementalPartitionState {
 
 /// Result of a frontier-restricted update. Nodes outside `optimized_nodes` are
 /// carried forward byte-for-byte from the prior partition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct IncrementalOutput {
     state: IncrementalPartitionState,
     optimized_nodes: Vec<usize>,
@@ -386,52 +526,32 @@ impl IncrementalOutput {
 /// connectedness, so the postcondition checks exactly that bounded set.
 pub fn incremental_partition(
     graph: &ProjectedGraph,
-    mut state: IncrementalPartitionState,
+    state: IncrementalPartitionState,
     dirty_nodes: &[usize],
     config: IncrementalConfig,
 ) -> Result<IncrementalOutput, IncrementalPartitionError> {
-    let node_count = graph.node_ids.len();
-    if state.partition.membership.len() != node_count {
-        return Err(IncrementalPartitionError::MembershipSize {
-            expected: node_count,
-            actual: state.partition.membership.len(),
-        });
-    }
-    if state.node_order_fingerprint != graph.node_order_fingerprint {
-        return Err(IncrementalPartitionError::NodeOrder);
-    }
-    let dirty = dirty_nodes.iter().copied().collect::<BTreeSet<_>>();
-    if let Some(&node) = dirty.iter().find(|&&node| node >= node_count) {
-        return Err(IncrementalPartitionError::DirtyNode { node, node_count });
-    }
-    let dirty_fraction = if node_count == 0 {
-        0.0
-    } else {
-        dirty.len() as f64 / node_count as f64
-    };
-    if dirty_fraction > config.max_dirty_fraction {
-        return Err(IncrementalPartitionError::DirtyFraction {
-            actual: dirty_fraction,
-            maximum: config.max_dirty_fraction,
-        });
-    }
+    incremental_partition_recoverable(graph, state, dirty_nodes, config)
+        .map(|(output, _rollback)| output)
+        .map_err(|failure| {
+            let (error, _state) = *failure;
+            error
+        })
+}
 
-    let mut frontier = dirty.clone();
-    for &node in &dirty {
-        frontier.extend(state.adjacency[node].keys().copied());
-        frontier.extend(graph.adjacency[node].iter().map(|(neighbor, _)| *neighbor));
-    }
-    let frontier_fraction = if node_count == 0 {
-        0.0
-    } else {
-        frontier.len() as f64 / node_count as f64
+pub(crate) fn incremental_partition_recoverable(
+    graph: &ProjectedGraph,
+    mut state: IncrementalPartitionState,
+    dirty_nodes: &[usize],
+    config: IncrementalConfig,
+) -> Result<
+    (IncrementalOutput, IncrementalPartitionRollback),
+    Box<(IncrementalPartitionError, IncrementalPartitionState)>,
+> {
+    let (dirty, frontier) = match state.incremental_frontier(graph, dirty_nodes, config) {
+        Ok(frontier) => frontier,
+        Err(error) => return Err(Box::new((error, state))),
     };
-    if frontier_fraction > config.max_frontier_fraction {
-        return Err(IncrementalPartitionError::FrontierFraction {
-            actual: frontier_fraction,
-            maximum: config.max_frontier_fraction,
-        });
-    }
+    let rollback = state.rollback_snapshot(graph, &dirty, &frontier);
 
     let mut touched_communities = apply_projection_deltas(graph, &mut state, &dirty);
     let optimized_nodes = frontier.iter().copied().collect::<Vec<_>>();
@@ -518,13 +638,20 @@ pub fn incremental_partition(
         .into_iter()
         .any(|community| !community_is_connected(graph, &state.partition.membership, community))
     {
-        return Err(IncrementalPartitionError::DisconnectedCommunity);
+        state.restore(rollback);
+        return Err(Box::new((
+            IncrementalPartitionError::DisconnectedCommunity,
+            state,
+        )));
     }
 
-    Ok(IncrementalOutput {
-        state,
-        optimized_nodes,
-    })
+    Ok((
+        IncrementalOutput {
+            state,
+            optimized_nodes,
+        },
+        rollback,
+    ))
 }
 
 fn apply_projection_deltas(
@@ -660,28 +787,34 @@ pub fn rebind_durable_ids_weighted(
 
     let mut overlaps = BTreeMap::<(usize, String), f64>::new();
     for (node, &group) in new_membership.iter().enumerate() {
+        if is_new_community_marker(&previous_ids[node]) {
+            continue;
+        }
         let mut incident_by_old = BTreeMap::<String, f64>::new();
         let mut total = 0.0;
         for &(neighbor, weight) in &graph.adjacency[node] {
-            if weight <= 0.0 {
+            let prior_id = &previous_ids[neighbor];
+            if weight <= 0.0 || is_new_community_marker(prior_id) {
                 continue;
             }
-            *incident_by_old
-                .entry(previous_ids[neighbor].clone())
-                .or_default() += weight;
+            *incident_by_old.entry(prior_id.clone()).or_default() += weight;
             total += weight;
         }
         if total > 0.0 {
             for (old_id, weight) in incident_by_old {
                 *overlaps.entry((group, old_id)).or_default() += weight / total;
             }
-        } else {
+        } else if !is_new_community_marker(&previous_ids[node]) {
             *overlaps
                 .entry((group, previous_ids[node].clone()))
                 .or_default() += 1.0;
         }
     }
     assign_rebound_ids(previous_ids, new_membership, overlaps)
+}
+
+fn is_new_community_marker(community_id: &str) -> bool {
+    community_id.starts_with("__m4-new-node-") || community_id.starts_with("community-m4-new-")
 }
 
 fn assign_rebound_ids(

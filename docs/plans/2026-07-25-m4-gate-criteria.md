@@ -137,6 +137,17 @@ Invariant §3: *"incrementality is required, not aspirational."*
   not actually local — effectively a full re-partition per cycle). This is the §3
   "full re-partition per cycle is a fail" made numeric → Q-B.
 
+This gate bounds the **partition optimizer** reached by the production composer. It does
+not claim that PR-1's exact snapshot I/O or post-hoc attachment recomputation is independent
+of space size: both deliberately read/write the frozen whole-space snapshot, and centroid
+changes can affect every isolated attachment. Those costs remain governed by Gate 1.3
+(partition RSS only), Gate 1.4 (mutex/foreground), and Gate 2.4 (correction-cycle
+latency). The composer reports elapsed time and loaded/written row counts, but its
+whole-snapshot peak RSS is **not measured by PR-1**; Gate 1.3 must not be cited as
+composer-I/O memory evidence. The composer must nevertheless report its executed branch
+(`CoreReused`, `Incremental`, or a reasoned `Full`) so a whole-space partition cannot hide
+inside those permitted snapshot costs.
+
 ### 1.3 Peak memory (CEILING)
 
 - **Bar: peak additional RSS for the first full partition in a fresh child process at the
@@ -145,6 +156,9 @@ Invariant §3: *"incrementality is required, not aspirational."*
   (A few
   thousand nodes / edges is a small graph; this leaves generous headroom and catches an
   accidental all-pairs / dense-matrix representation.)
+- **Scope:** partition implementation only. This child-process oracle excludes database
+  snapshot loading, attachment recomputation, and publication writes in the production
+  composer.
 - **Hard fail: > 1 GB** — a representation blow-up; fix or Q-B.
 
 ### 1.4 Mutex-hold / foreground-latency (CEILING — the 18.88s guard)

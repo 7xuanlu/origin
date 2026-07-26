@@ -305,7 +305,25 @@ A full re-partition per cycle is a **Gate-1 fail** (§3). The job is incremental
   doc) where incremental would cost more than a full pass.
 
 Gate-1 measures the incremental warm-start cost around a changed subgraph and fails a
-per-cycle full re-partition.
+per-cycle full re-partition. The production receipt records the branch it actually ran:
+
+- `CoreReused` when `graph_generation` plus the algorithm/projection versions still match
+  the live runtime state (an ungrounded-edge or embedding-only publication);
+- `Incremental { optimized_nodes }` when a grounded change has a recoverable dirty frontier;
+- `Full { reason }` for first publication, process restart/lost state, version change,
+  missing frontier, node-order change, or an explicit dirty/frontier threshold breach.
+
+The runtime moves only the selected space's partition into the job. Incremental mutation
+keeps a frontier rollback journal; stale-CAS and finalize-error paths restore the prior
+published state before it is returned to the runtime. No graph-wide runtime clone is part
+of a warm cycle.
+
+Gate-1.2 bounds the partition optimizer, not PR-1's exact whole-space snapshot I/O.
+Deterministic attachment recomputation may inspect all frozen ungrounded edges and entity
+embeddings because a changed centroid can affect any isolated attachment. That work remains
+under the DB-mutex/foreground and correction-cycle gates, with elapsed-time plus row-count
+telemetry in the production receipt. Gate 1.3 measures partition RSS only; PR-1 does not
+measure the composer's whole-snapshot peak RSS and does not claim that evidence.
 
 ### 4.4 Stability vs truthfulness are separate dials (invariant #12)
 
@@ -360,8 +378,9 @@ CREATE INDEX IF NOT EXISTS idx_community_members_community ON community_members(
 CREATE TABLE IF NOT EXISTS space_graph_state (
     space          TEXT PRIMARY KEY,
     graph_generation      INTEGER NOT NULL DEFAULT 0,  -- bumped by active-grounded edge writes (§5.2)
-    published_generation  INTEGER,                     -- last generation whose assignment is live
-    dirty                 INTEGER NOT NULL DEFAULT 0    -- CAS-cleared only via WHERE graph_generation = input_generation
+    grouping_generation   INTEGER NOT NULL DEFAULT 0,  -- bumped by every publication input (§5.2)
+    published_generation  INTEGER,                     -- last grouping_generation whose assignment is live
+    dirty                 INTEGER NOT NULL DEFAULT 0    -- CAS-cleared only via WHERE grouping_generation = input_generation
 );
 
 -- Durable §6.2 phase lease keyed (phase, space, input_generation) — a process mutex is not a lease.
@@ -402,6 +421,20 @@ subgraph. Rationale: the spec says "bumped by grounded-edge writes"; a retractio
 grounded edge is such a write, and omitting it would leave a space silently stale after a
 correction. The bump is monotonic and never decreases.
 
+`grouping_generation` is the broader publication-input version. It advances on every
+change visible to either grouping read: the active grounded/ungrounded assertion-edge
+union, or the per-space entity rows and embeddings used for post-hoc attachment. A
+grounded-edge change therefore advances both counters; a pure attachment-input change
+advances only `grouping_generation`. This separation preserves the authored meaning of
+`graph_generation` while making the §3.5 attachment snapshot generation-guarded too.
+Migration-95 triggers maintain this fail-closed across all edge/entity mutation paths.
+An experimental database already stamped `user_version=95` is shape-checked once at
+startup. If `grouping_generation` is newly repaired, every pre-existing state row advances
+past its old graph-only publication and is marked dirty; an old clean bit is not accepted
+as proof for the broader input set. The repair also bootstraps pre-M4 grounded spaces.
+Complete M95 shapes skip the repair transaction and grounded-edge bootstrap scan on later
+startups.
+
 ### 5.3 The publication CAS (generation-guard, not check-then-act)
 
 A grouping job for a space:
@@ -410,16 +443,21 @@ A grouping job for a space:
    `grouping_leases` (§6.2) — token + expiry; a second concurrent job for the same
    `(space, input_generation)` is excluded at the DB, not by a process mutex. Expired
    leases recover at startup.
-2. **Captures `input_generation`** = the space's current `graph_generation` at job start.
+2. **Captures both versions**: `input_generation` = the space's current
+   `grouping_generation`, plus `graph_generation` and the published
+   algorithm/projection versions. `CoreReused` is legal only when the graph and versions
+   still match. If the graph advanced but the volatile frontier is absent, the job routes
+   to reasoned full recovery rather than misclassifying the change as attachment-only.
 3. Reads the subgraph, projects (§3), partitions (§4), rebinds (§6) — **all outside any
    SQLite transaction** (no txn spans a compute-heavy or embedding call, §6.3).
 4. **Finalizes in one CAS-guarded transaction**: writes the new `community_members`
    snapshot + `communities` upserts + sets `published_generation = input_generation`, and
    **clears dirty ONLY via `UPDATE space_graph_state SET dirty=0, published_generation=?
-   WHERE space=? AND graph_generation = input_generation`**. If a grounded edge arrived
-   mid-run, `graph_generation != input_generation`, the CAS matches zero rows, the snapshot
-   is **discarded** (nothing visible published on a stale input), and the space stays
-   `dirty` and re-queues. A mid-run edge is never silently lost (§3, runtime finding 19).
+   WHERE space=? AND grouping_generation = input_generation`**. If a grounded or ungrounded
+   edge, entity, or attachment embedding changed mid-run, the CAS matches zero rows, the
+   snapshot is **discarded** (nothing visible published on a stale input), and the space
+   stays `dirty` and re-queues. A mid-run input is never silently lost (§3, runtime
+   finding 19).
 
 The finalize transaction uses the **rollback-protected `BEGIN` idiom** (`fold_relation_type`,
 `db.rs:304`; D9) — no bare `BEGIN`/`COMMIT` (unlike today's `detect_communities` at
@@ -536,9 +574,9 @@ outlive the community structure it was computed against.
 The grouping job lives in the existing **`Phase::CommunityDetection` steep-phase slot**
 (`refinery/mod.rs:928`/`:942-943`), replacing the `detect_communities` call — NOT a new
 ambient sweep (per the goal prompt; the incrementality design does not argue for a separate
-sweep). It fires for a space when `space_graph_state.dirty=1` (its `graph_generation`
-advanced past `published_generation`). Each firing does the §5.3 CAS publication with the
-§4.3 warm-start. Bounded per firing (§10).
+sweep). It fires for a space when `space_graph_state.dirty=1` (its
+`grouping_generation` advanced past `published_generation`). Each firing does the §5.3 CAS
+publication with the §4.3 warm-start. Bounded per firing (§10).
 
 ### 9.2 Rollback (§6.9, §7 M4 row)
 

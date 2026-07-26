@@ -170,6 +170,7 @@ jobs:
               - 'crates/wenlan-core/src/repair/**'
               - 'crates/wenlan-core/src/repair_plan/**'
               - 'crates/wenlan-core/src/sources/directory.rs'
+              - 'crates/wenlan-core/tests/m4_community_gates.rs'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
@@ -649,6 +650,12 @@ jobs:
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
         run: python3 scripts/ci_test_plan.py run --suite workspace-lib --plan-json "$CI_TEST_PLAN"
+      - name: M4 community gates (macOS-owned)
+        if: matrix.os == 'macos-14'
+        # This target contains cfg(macos) RSS probes. Linux owns the complete
+        # core-integration plan; this focused leg compiles and runs the actual
+        # macOS branches whenever its fail-closed owner filter schedules macOS.
+        run: cargo nextest run -p wenlan-core --test m4_community_gates
       - name: Page lint scale gate (Windows functional)
         if: matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
         shell: pwsh

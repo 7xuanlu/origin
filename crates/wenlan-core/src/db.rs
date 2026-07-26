@@ -2757,7 +2757,7 @@ END;
 
 pub struct MemoryDB {
     pub(crate) _db: libsql::Database,
-    pub(crate) conn: tokio::sync::Mutex<libsql::Connection>,
+    pub(crate) conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
     pub(crate) lint_freshness: Arc<crate::lint::snapshot::LintFreshnessClock>,
     page_projection_tracker: Arc<crate::page_projection_tracker::PageProjectionTracker>,
     pub(crate) derived_artifact_state: Arc<crate::derived_artifact_state::DerivedArtifactState>,
@@ -2876,7 +2876,7 @@ impl MemoryDB {
         );
         Ok(Self {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3075,7 +3075,7 @@ impl MemoryDB {
         );
         let instance = Self {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3158,7 +3158,7 @@ impl MemoryDB {
         );
         let instance = Self {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -8187,6 +8187,15 @@ impl MemoryDB {
             }
         }
 
+        // Private M4 builds could already have stamped user_version=95 before
+        // the broader publication generation and bootstrap were added. Inspect
+        // the schema shape outside `version < 95` so those experimental files
+        // are repaired once without making every later startup repeat the
+        // grounded-edge bootstrap scan.
+        if self.community_substrate_needs_repair().await? {
+            self.repair_community_substrate().await?;
+        }
+
         Ok(())
     }
 
@@ -10215,6 +10224,7 @@ impl MemoryDB {
             CREATE TABLE IF NOT EXISTS space_graph_state (
                 space TEXT PRIMARY KEY,
                 graph_generation INTEGER NOT NULL DEFAULT 0,
+                grouping_generation INTEGER NOT NULL DEFAULT 0,
                 published_generation INTEGER,
                 dirty INTEGER NOT NULL DEFAULT 0
             );
@@ -10232,6 +10242,314 @@ impl MemoryDB {
         .await
         .map_err(|error| {
             WenlanError::VectorDb(format!("ensure community substrate tables: {error}"))
+        })?;
+
+        // Replay an interrupted development build of migration 95 that may
+        // have created the first table shape before grouping_generation was
+        // added. Migration 95 has not shipped, so this preserves idempotence
+        // without consuming another schema number.
+        let mut columns = conn
+            .query("PRAGMA table_info(space_graph_state)", ())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("inspect community graph state columns: {error}"))
+            })?;
+        let mut has_grouping_generation = false;
+        while let Some(row) = columns.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("read community graph state column: {error}"))
+        })? {
+            has_grouping_generation |=
+                row.get::<String>(1).ok().as_deref() == Some("grouping_generation");
+        }
+        drop(columns);
+        if !has_grouping_generation {
+            conn.execute(
+                "ALTER TABLE space_graph_state \
+                 ADD COLUMN grouping_generation INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("add community grouping generation: {error}"))
+            })?;
+            conn.execute(
+                "UPDATE space_graph_state \
+                 SET grouping_generation = \
+                         MAX(graph_generation, COALESCE(published_generation, 0)) + 1, \
+                     dirty = 1",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "invalidate repaired community grouping generation: {error}"
+                ))
+            })?;
+        }
+
+        // `grouping_generation` is the publication input version. It covers
+        // the union of both edge scans plus the entity rows/embeddings used by
+        // post-hoc attachment. A grounded edge change atomically advances both
+        // graph and grouping generations, including the first raw SQL write.
+        // Ungrounded-only changes advance grouping on an existing graph state.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m4_grouping_edge_insert;
+             DROP TRIGGER IF EXISTS m4_grouping_edge_delete;
+             DROP TRIGGER IF EXISTS m4_grouping_edge_update;
+
+             CREATE TRIGGER m4_grouping_edge_insert
+             AFTER INSERT ON edges
+             WHEN NEW.edge_type = 'relates'
+               AND NEW.valid_until IS NULL
+               AND NEW.src_kind = 'entity'
+               AND NEW.dst_kind = 'entity'
+               AND NEW.lineage = 'assertion'
+             BEGIN
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT NEW.space, 1, 1, NULL, 1
+                WHERE NEW.grounded = 1
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space AND NEW.grounded = 0;
+             END;
+
+             CREATE TRIGGER m4_grouping_edge_delete
+             AFTER DELETE ON edges
+             WHEN OLD.edge_type = 'relates'
+               AND OLD.valid_until IS NULL
+               AND OLD.src_kind = 'entity'
+               AND OLD.dst_kind = 'entity'
+               AND OLD.lineage = 'assertion'
+             BEGIN
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT OLD.space, 1, 1, NULL, 1
+                WHERE OLD.grounded = 1
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space AND OLD.grounded = 0;
+             END;
+
+             CREATE TRIGGER m4_grouping_edge_update
+             AFTER UPDATE ON edges
+             WHEN (
+                    OLD.edge_type = 'relates'
+                AND OLD.valid_until IS NULL
+                AND OLD.src_kind = 'entity'
+                AND OLD.dst_kind = 'entity'
+                AND OLD.lineage = 'assertion'
+             ) OR (
+                    NEW.edge_type = 'relates'
+                AND NEW.valid_until IS NULL
+                AND NEW.src_kind = 'entity'
+                AND NEW.dst_kind = 'entity'
+                AND NEW.lineage = 'assertion'
+             )
+             BEGIN
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT OLD.space, 1, 1, NULL, 1
+                WHERE OLD.grounded = 1
+                  AND (
+                         NOT (
+                                NEW.edge_type = 'relates'
+                            AND NEW.valid_until IS NULL
+                            AND NEW.src_kind = 'entity'
+                            AND NEW.dst_kind = 'entity'
+                            AND NEW.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT NEW.space, 1, 1, NULL, 1
+                WHERE NEW.grounded = 1
+                  AND (
+                         NOT (
+                                OLD.edge_type = 'relates'
+                            AND OLD.valid_until IS NULL
+                            AND OLD.src_kind = 'entity'
+                            AND OLD.dst_kind = 'entity'
+                            AND OLD.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT OLD.space, 1, 1, NULL, 1
+                WHERE OLD.space IS NEW.space
+                  AND (OLD.grounded = 1 OR NEW.grounded = 1)
+                  AND OLD.edge_type = 'relates'
+                  AND OLD.valid_until IS NULL
+                  AND OLD.src_kind = 'entity'
+                  AND OLD.dst_kind = 'entity'
+                  AND OLD.lineage = 'assertion'
+                  AND NEW.edge_type = 'relates'
+                  AND NEW.valid_until IS NULL
+                  AND NEW.src_kind = 'entity'
+                  AND NEW.dst_kind = 'entity'
+                  AND NEW.lineage = 'assertion'
+                  AND (
+                         OLD.edge_id IS NOT NEW.edge_id
+                      OR OLD.src_id IS NOT NEW.src_id
+                      OR OLD.dst_id IS NOT NEW.dst_id
+                      OR OLD.grounded IS NOT NEW.grounded
+                  )
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space
+                  AND (
+                         OLD.edge_type = 'relates'
+                     AND OLD.valid_until IS NULL
+                     AND OLD.src_kind = 'entity'
+                     AND OLD.dst_kind = 'entity'
+                     AND OLD.lineage = 'assertion'
+                  )
+                  AND (
+                         NOT (
+                                NEW.edge_type = 'relates'
+                            AND NEW.valid_until IS NULL
+                            AND NEW.src_kind = 'entity'
+                            AND NEW.dst_kind = 'entity'
+                            AND NEW.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+                  AND OLD.grounded = 0;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space
+                  AND (
+                         NEW.edge_type = 'relates'
+                     AND NEW.valid_until IS NULL
+                     AND NEW.src_kind = 'entity'
+                     AND NEW.dst_kind = 'entity'
+                     AND NEW.lineage = 'assertion'
+                  )
+                  AND (
+                         NOT (
+                                OLD.edge_type = 'relates'
+                            AND OLD.valid_until IS NULL
+                            AND OLD.src_kind = 'entity'
+                            AND OLD.dst_kind = 'entity'
+                            AND OLD.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+                  AND NEW.grounded = 0;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space
+                  AND OLD.space IS NEW.space
+                  AND OLD.edge_type = 'relates'
+                  AND OLD.valid_until IS NULL
+                  AND OLD.src_kind = 'entity'
+                  AND OLD.dst_kind = 'entity'
+                  AND OLD.lineage = 'assertion'
+                  AND NEW.edge_type = 'relates'
+                  AND NEW.valid_until IS NULL
+                  AND NEW.src_kind = 'entity'
+                  AND NEW.dst_kind = 'entity'
+                  AND NEW.lineage = 'assertion'
+                  AND OLD.grounded = 0
+                  AND NEW.grounded = 0
+                  AND (
+                         OLD.edge_id IS NOT NEW.edge_id
+                      OR OLD.src_id IS NOT NEW.src_id
+                      OR OLD.dst_id IS NOT NEW.dst_id
+                      OR OLD.grounded IS NOT NEW.grounded
+                  );
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_insert
+             AFTER INSERT ON entities
+             WHEN NEW.space IS NOT NULL
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space;
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_delete
+             AFTER DELETE ON entities
+             WHEN OLD.space IS NOT NULL
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space;
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_update
+             AFTER UPDATE ON entities
+             WHEN OLD.space IS NOT NEW.space OR OLD.embedding IS NOT NEW.embedding
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space
+                  AND OLD.space IS NOT NULL
+                  AND OLD.space IS NOT NEW.space;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space
+                  AND NEW.space IS NOT NULL
+                  AND OLD.space IS NOT NEW.space;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space
+                  AND NEW.space IS NOT NULL
+                  AND OLD.space IS NEW.space
+                  AND OLD.embedding IS NOT NEW.embedding;
+             END;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("ensure community input triggers: {error}"))
+        })?;
+
+        // M3g may already have grounded a corpus before M4 is installed.
+        // Seed one dirty baseline for every such space; without this, triggers
+        // that deliberately update only existing state would wait forever for
+        // a future mutation and the existing corpus would never publish.
+        conn.execute(
+            "INSERT INTO space_graph_state (
+                 space, graph_generation, grouping_generation, published_generation, dirty
+             )
+             SELECT space, 1, 1, NULL, 1
+               FROM edges
+              WHERE edge_type = 'relates'
+                AND grounded = 1
+                AND valid_until IS NULL
+                AND src_kind = 'entity'
+                AND dst_kind = 'entity'
+                AND lineage = 'assertion'
+              GROUP BY space
+             ON CONFLICT(space) DO NOTHING",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("bootstrap community graph states: {error}"))
         })?;
         Ok(())
     }
@@ -10265,6 +10583,117 @@ impl MemoryDB {
             "[migration] Migration 95 applied: M4 community publication substrate and control plane"
         );
         Ok(())
+    }
+
+    async fn repair_community_substrate(&self) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("M4 startup repair begin: {error}")))?;
+        let result = Self::ensure_community_substrate_tables(&conn).await;
+        match result {
+            Ok(()) => conn
+                .execute("COMMIT", ())
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M4 startup repair commit: {error}"))
+                })
+                .map(|_| ()),
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn community_substrate_needs_repair(&self) -> Result<bool, WenlanError> {
+        const REQUIRED_TABLES: [&str; 4] = [
+            "communities",
+            "community_members",
+            "space_graph_state",
+            "grouping_leases",
+        ];
+        const REQUIRED_TRIGGERS: [&str; 6] = [
+            "m4_grouping_edge_insert",
+            "m4_grouping_edge_delete",
+            "m4_grouping_edge_update",
+            "m4_grouping_entity_insert",
+            "m4_grouping_entity_delete",
+            "m4_grouping_entity_update",
+        ];
+
+        let conn = self.conn.lock().await;
+        for table in REQUIRED_TABLES {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = ?1 LIMIT 1",
+                    libsql::params![table],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community substrate table {table}: {error}"
+                    ))
+                })?;
+            if rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "read community substrate table {table}: {error}"
+                    ))
+                })?
+                .is_none()
+            {
+                return Ok(true);
+            }
+        }
+
+        let mut columns = conn
+            .query("PRAGMA table_info(space_graph_state)", ())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("inspect community graph state shape: {error}"))
+            })?;
+        let mut has_grouping_generation = false;
+        while let Some(row) = columns.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("read community graph state shape: {error}"))
+        })? {
+            has_grouping_generation |=
+                row.get::<String>(1).ok().as_deref() == Some("grouping_generation");
+        }
+        if !has_grouping_generation {
+            return Ok(true);
+        }
+
+        for trigger in REQUIRED_TRIGGERS {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master \
+                     WHERE type = 'trigger' AND name = ?1 LIMIT 1",
+                    libsql::params![trigger],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community substrate trigger {trigger}: {error}"
+                    ))
+                })?;
+            if rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "read community substrate trigger {trigger}: {error}"
+                    ))
+                })?
+                .is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -10750,27 +11179,28 @@ impl MemoryDB {
         conn: &libsql::Connection,
         changes: Vec<CommunityGraphChange>,
     ) -> Result<Vec<CommunityGenerationUpdate>, libsql::Error> {
-        let mut by_space = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut by_space = BTreeMap::<String, (i64, BTreeSet<String>)>::new();
         for change in changes {
-            let dirty = by_space.entry(change.space).or_default();
+            let (trigger_count, dirty) = by_space.entry(change.space).or_default();
+            *trigger_count += 1;
             dirty.insert(change.src_id);
             dirty.insert(change.dst_id);
         }
 
         let mut updates = Vec::with_capacity(by_space.len());
-        for (space, dirty_nodes) in by_space {
+        for (space, (trigger_count, dirty_nodes)) in by_space {
             conn.execute(
                 "INSERT INTO space_graph_state \
-                    (space, graph_generation, published_generation, dirty) \
-                 VALUES (?1, 1, NULL, 1) \
+                    (space, graph_generation, grouping_generation, published_generation, dirty) \
+                 VALUES (?1, 1, 1, NULL, 1) \
                  ON CONFLICT(space) DO UPDATE SET \
-                    graph_generation = graph_generation + 1, dirty = 1",
-                libsql::params![space.clone()],
+                    graph_generation = MAX(graph_generation - ?2 + 1, 1), dirty = 1",
+                libsql::params![space.clone(), trigger_count],
             )
             .await?;
             let mut rows = conn
                 .query(
-                    "SELECT graph_generation FROM space_graph_state WHERE space = ?1",
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
                     libsql::params![space.clone()],
                 )
                 .await?;
@@ -11006,7 +11436,7 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("promote_edges_grounded begin: {e}")))?;
         let result: Result<(usize, Vec<CommunityGenerationUpdate>), WenlanError> = async {
             let mut flipped = 0usize;
-            let mut dirty_by_space = BTreeMap::<String, BTreeSet<String>>::new();
+            let mut dirty_by_space = BTreeMap::<String, (i64, BTreeSet<String>)>::new();
             for promotion in survivors {
                 let affected = conn
                     .execute(
@@ -11068,7 +11498,8 @@ impl MemoryDB {
                                 "promote_edges_grounded destination decode: {error}"
                             ))
                         })?;
-                        let dirty = dirty_by_space.entry(space).or_default();
+                        let (trigger_count, dirty) = dirty_by_space.entry(space).or_default();
+                        *trigger_count += 1;
                         dirty.insert(src_id);
                         dirty.insert(dst_id);
                     }
@@ -11076,16 +11507,16 @@ impl MemoryDB {
             }
 
             let mut generation_updates = Vec::with_capacity(dirty_by_space.len());
-            for (space, dirty_nodes) in dirty_by_space {
+            for (space, (trigger_count, dirty_nodes)) in dirty_by_space {
                 let mut rows = conn
                     .query(
                         "INSERT INTO space_graph_state \
-                            (space, graph_generation, published_generation, dirty) \
-                         VALUES (?1, 1, NULL, 1) \
+                            (space, graph_generation, grouping_generation, published_generation, dirty) \
+                         VALUES (?1, 1, 1, NULL, 1) \
                          ON CONFLICT(space) DO UPDATE SET \
-                            graph_generation = graph_generation + 1, dirty = 1 \
-                         RETURNING graph_generation",
-                        libsql::params![space.clone()],
+                            graph_generation = MAX(graph_generation - ?2 + 1, 1), dirty = 1 \
+                         RETURNING grouping_generation",
+                        libsql::params![space.clone(), trigger_count],
                     )
                     .await
                     .map_err(|error| {
@@ -11178,20 +11609,21 @@ impl MemoryDB {
         &self,
         space: &str,
     ) -> Result<
-        (i64, Option<i64>, String, std::time::Duration),
+        (i64, i64, Option<i64>, String, std::time::Duration),
         crate::community_grouping::CommunityGroupingError,
     > {
         use crate::community_grouping::CommunityGroupingError;
 
         let conn = self.conn.lock().await;
         let held_at = std::time::Instant::now();
-        conn.execute("BEGIN", ())
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .map_err(|error| CommunityGroupingError::Database(format!("prepare begin: {error}")))?;
-        let result: Result<(i64, Option<i64>, String), CommunityGroupingError> = async {
-            let mut state_rows = conn
+        let result: Result<(i64, i64, Option<i64>, String), CommunityGroupingError> = async {
+            let mut state_rows = tx
                 .query(
-                    "SELECT graph_generation, published_generation \
+                    "SELECT graph_generation, grouping_generation, published_generation \
                      FROM space_graph_state WHERE space = ?1 AND dirty = 1",
                     libsql::params![space.to_owned()],
                 )
@@ -11205,24 +11637,27 @@ impl MemoryDB {
                 .map_err(|error| {
                     CommunityGroupingError::Database(format!("prepare graph state row: {error}"))
                 })?
-                .ok_or_else(|| {
-                    CommunityGroupingError::Database(format!(
-                        "space {space} has no dirty community graph generation"
-                    ))
+                .ok_or_else(|| CommunityGroupingError::NotDirty {
+                    space: space.to_owned(),
                 })?;
-            let input_generation = state.get::<i64>(0).map_err(|error| {
+            let graph_generation = state.get::<i64>(0).map_err(|error| {
                 CommunityGroupingError::Database(format!(
                     "prepare graph generation decode: {error}"
                 ))
             })?;
-            let published_generation = state.get::<Option<i64>>(1).map_err(|error| {
+            let input_generation = state.get::<i64>(1).map_err(|error| {
+                CommunityGroupingError::Database(format!(
+                    "prepare grouping generation decode: {error}"
+                ))
+            })?;
+            let published_generation = state.get::<Option<i64>>(2).map_err(|error| {
                 CommunityGroupingError::Database(format!(
                     "prepare published generation decode: {error}"
                 ))
             })?;
             drop(state_rows);
 
-            conn.execute(
+            tx.execute(
                 "DELETE FROM grouping_leases \
                  WHERE phase = 'community' AND space = ?1 \
                    AND (expires_at <= unixepoch() OR input_generation <> ?2)",
@@ -11234,7 +11669,7 @@ impl MemoryDB {
             })?;
 
             let token = uuid::Uuid::new_v4().to_string();
-            let acquired = conn
+            let acquired = tx
                 .execute(
                     "INSERT INTO grouping_leases \
                         (phase, space, input_generation, token, expires_at, attempt) \
@@ -11252,26 +11687,29 @@ impl MemoryDB {
                     input_generation,
                 });
             }
-            Ok((input_generation, published_generation, token))
+            Ok((
+                graph_generation,
+                input_generation,
+                published_generation,
+                token,
+            ))
         }
         .await;
 
         match result {
-            Ok((input_generation, published_generation, token)) => {
-                conn.execute("COMMIT", ()).await.map_err(|error| {
+            Ok((graph_generation, input_generation, published_generation, token)) => {
+                tx.commit().await.map_err(|error| {
                     CommunityGroupingError::Database(format!("prepare commit: {error}"))
                 })?;
                 Ok((
+                    graph_generation,
                     input_generation,
                     published_generation,
                     token,
                     held_at.elapsed(),
                 ))
             }
-            Err(error) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -11564,8 +12002,15 @@ impl MemoryDB {
     > {
         use crate::community_grouping::{CommunityGroupingAttempt, CommunityGroupingError};
 
-        let (input_generation, published_generation, token, mut db_mutex_hold) =
+        let composer_started = std::time::Instant::now();
+        let (graph_generation, input_generation, published_generation, token, mut db_mutex_hold) =
             self.acquire_community_grouping_lease(space).await?;
+        let mut lease_cleanup = crate::community_grouping::CommunityGroupingLeaseCleanup::new(
+            Arc::clone(&self.conn),
+            space.to_owned(),
+            input_generation,
+            token.clone(),
+        );
         let loaded = async {
             let (edges, edge_hold) = self.load_community_grounded_edges_paged(space).await?;
             let (ungrounded_edges, ungrounded_hold) =
@@ -11588,6 +12033,7 @@ impl MemoryDB {
             Err(error) => {
                 self.release_community_grouping_lease(space, input_generation, &token)
                     .await;
+                lease_cleanup.disarm();
                 return Err(error);
             }
         };
@@ -11598,14 +12044,57 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let held_at = std::time::Instant::now();
         let dirty_node_ids = self.community_dirty_nodes_through(space, input_generation);
+        let published_versions = if published_generation.is_some() {
+            let mut rows = conn
+                .query(
+                    "SELECT algo_version, projection_version FROM communities \
+                     WHERE space = ?1 AND retired_at IS NULL \
+                     ORDER BY community_id LIMIT 1",
+                    libsql::params![space.to_owned()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "prepare published community versions: {error}"
+                    ))
+                })?;
+            rows.next()
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "read published community versions: {error}"
+                    ))
+                })?
+                .map(|row| {
+                    Ok::<_, CommunityGroupingError>((
+                        row.get::<String>(0).map_err(|error| {
+                            CommunityGroupingError::Database(format!(
+                                "decode published algorithm version: {error}"
+                            ))
+                        })?,
+                        row.get::<String>(1).map_err(|error| {
+                            CommunityGroupingError::Database(format!(
+                                "decode published projection version: {error}"
+                            ))
+                        })?,
+                    ))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         db_mutex_hold += held_at.elapsed();
         drop(conn);
 
         Ok(CommunityGroupingAttempt {
             space: space.to_owned(),
+            composer_started,
+            graph_generation,
             input_generation,
             published_generation,
+            published_versions,
             token,
+            lease_cleanup,
             edges,
             ungrounded_edges,
             entity_embeddings,
@@ -11620,7 +12109,7 @@ impl MemoryDB {
     /// lease on both the success and stale paths.
     pub async fn finalize_community_grouping(
         &self,
-        attempt: crate::community_grouping::CommunityGroupingAttempt,
+        mut attempt: crate::community_grouping::CommunityGroupingAttempt,
         computed: crate::community_grouping::CommunityGroupingComputed,
     ) -> Result<
         crate::community_grouping::CommunityGroupingOutcome,
@@ -11633,14 +12122,22 @@ impl MemoryDB {
 
         let finalize_started = std::time::Instant::now();
         let conn = self.conn.lock().await;
-        conn.execute("BEGIN", ()).await.map_err(|error| {
-            CommunityGroupingError::Database(format!("finalize begin: {error}"))
-        })?;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                CommunityGroupingError::Database(format!("finalize begin: {error}"))
+            })?;
 
         let member_count = computed.members.len();
         let projected_edge_count = computed.projected_edge_count;
+        let compute_mode = computed.compute_mode;
+        let input_rows_loaded = attempt.edges.len()
+            + attempt.ungrounded_edges.len()
+            + attempt.entity_embeddings.len()
+            + attempt.previous_ids.len();
         let result: Result<bool, CommunityGroupingError> = async {
-            let mut lease_rows = conn
+            let mut lease_rows = tx
                 .query(
                     "SELECT 1 FROM grouping_leases \
                      WHERE phase = 'community' AND space = ?1 \
@@ -11667,10 +12164,10 @@ impl MemoryDB {
             }
 
             let matched =
-                conn.execute(
+                tx.execute(
                     "UPDATE space_graph_state \
                      SET published_generation = ?2, dirty = 0 \
-                     WHERE space = ?1 AND graph_generation = ?2 AND dirty = 1",
+                     WHERE space = ?1 AND grouping_generation = ?2 AND dirty = 1",
                     libsql::params![attempt.space.clone(), attempt.input_generation],
                 )
                 .await
@@ -11680,7 +12177,7 @@ impl MemoryDB {
 
             if matched {
                 let now = chrono::Utc::now().timestamp();
-                conn.execute(
+                tx.execute(
                     "DELETE FROM community_members WHERE space = ?1",
                     libsql::params![attempt.space.clone()],
                 )
@@ -11690,7 +12187,9 @@ impl MemoryDB {
                         "finalize replace prior members: {error}"
                     ))
                 })?;
-                conn.execute(
+                #[cfg(test)]
+                tests::community_grouping_test_hooks::after_member_delete(&attempt.space).await;
+                tx.execute(
                     "UPDATE communities SET retired_at = ?2, updated_at = ?2 \
                      WHERE space = ?1 AND retired_at IS NULL",
                     libsql::params![attempt.space.clone(), now],
@@ -11708,7 +12207,7 @@ impl MemoryDB {
                     .map(|member| member.community_id.clone())
                     .collect::<BTreeSet<_>>();
                 for community_id in community_ids {
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO communities \
                             (community_id, space, display_name, algo_version, \
                              projection_version, created_at, updated_at, retired_at) \
@@ -11735,7 +12234,7 @@ impl MemoryDB {
                 }
 
                 for member in &computed.members {
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO community_members \
                             (space, node_id, node_kind, community_id, \
                              published_generation, attachment) \
@@ -11757,7 +12256,7 @@ impl MemoryDB {
                 }
             }
 
-            conn.execute(
+            tx.execute(
                 "DELETE FROM grouping_leases \
                  WHERE phase = 'community' AND space = ?1 \
                    AND input_generation = ?2 AND token = ?3",
@@ -11777,16 +12276,14 @@ impl MemoryDB {
 
         let matched = match result {
             Ok(matched) => {
-                conn.execute("COMMIT", ()).await.map_err(|error| {
+                tx.commit().await.map_err(|error| {
                     CommunityGroupingError::Database(format!("finalize commit: {error}"))
                 })?;
                 matched
             }
-            Err(error) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
+        attempt.disarm_lease_cleanup();
         if matched {
             self.clear_community_dirty_nodes_through(&attempt.space, attempt.input_generation);
         }
@@ -11802,7 +12299,10 @@ impl MemoryDB {
             projected_edge_count,
             member_count,
             db_mutex_hold: attempt.db_mutex_hold + finalize_started.elapsed(),
-            next_state: matched.then_some(computed.next_state),
+            composer_elapsed: attempt.composer_started.elapsed(),
+            input_rows_loaded,
+            member_rows_written: if matched { member_count } else { 0 },
+            compute_mode,
         };
         if matched {
             Ok(CommunityGroupingOutcome::Published(receipt))
@@ -25264,14 +25764,15 @@ impl MemoryDB {
                 graph_changes.extend(reactivation_changes);
 
                 if plan.grounded {
-                    conn.execute(
+                    let grounded_transition = conn
+                        .execute(
                         "UPDATE edges SET grounded = 1, root_id = ?1, \
                             payload = COALESCE(payload, ?2) \
-                         WHERE edge_id = ?3 AND valid_until IS NULL",
+                         WHERE edge_id = ?3 AND valid_until IS NULL AND grounded = 0",
                         libsql::params![
                             plan.root_id.clone(),
                             plan.payload.clone(),
-                            new_edge_id
+                            new_edge_id.clone()
                         ],
                     )
                     .await
@@ -25280,7 +25781,23 @@ impl MemoryDB {
                             "merge_entities preserve edge grounding: {error}"
                         ))
                     })?;
-                    if plan.lineage == "assertion" {
+                    if grounded_transition == 0 {
+                        conn.execute(
+                            "UPDATE edges SET root_id = ?1, payload = COALESCE(payload, ?2) \
+                             WHERE edge_id = ?3 AND valid_until IS NULL",
+                            libsql::params![
+                                plan.root_id.clone(),
+                                plan.payload.clone(),
+                                new_edge_id
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "merge_entities preserve grounded edge metadata: {error}"
+                            ))
+                        })?;
+                    } else if plan.lineage == "assertion" {
                         graph_changes.push(CommunityGraphChange {
                             space: plan.space.clone(),
                             src_id: plan.src_id.clone(),
@@ -44025,6 +44542,71 @@ pub(crate) mod tests {
     use std::sync::OnceLock;
     use tempfile::tempdir;
 
+    pub(crate) mod community_grouping_test_hooks {
+        use super::*;
+
+        struct Pause {
+            reached: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+        }
+
+        static AFTER_MEMBER_DELETE: OnceLock<std::sync::Mutex<HashMap<String, Pause>>> =
+            OnceLock::new();
+        static AFTER_RUNTIME_TAKE: OnceLock<std::sync::Mutex<HashMap<String, Pause>>> =
+            OnceLock::new();
+
+        fn install_pause(
+            pauses: &'static OnceLock<std::sync::Mutex<HashMap<String, Pause>>>,
+            space: &str,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            pauses.get_or_init(Default::default).lock().unwrap().insert(
+                space.to_owned(),
+                Pause {
+                    reached: Arc::clone(&reached),
+                    resume: Arc::clone(&resume),
+                },
+            );
+            (reached, resume)
+        }
+
+        pub(crate) fn pause_after_member_delete(
+            space: &str,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            install_pause(&AFTER_MEMBER_DELETE, space)
+        }
+
+        pub(crate) fn pause_after_runtime_take(
+            space: &str,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            install_pause(&AFTER_RUNTIME_TAKE, space)
+        }
+
+        async fn await_pause(
+            pauses: &'static OnceLock<std::sync::Mutex<HashMap<String, Pause>>>,
+            space: &str,
+        ) {
+            let pause = pauses
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(space);
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+
+        pub(crate) async fn after_member_delete(space: &str) {
+            await_pause(&AFTER_MEMBER_DELETE, space).await;
+        }
+
+        pub(crate) async fn after_runtime_take(space: &str) {
+            await_pause(&AFTER_RUNTIME_TAKE, space).await;
+        }
+    }
+
     // ── compute_page_delta_summary tests ─────────────────────────────────────
 
     #[test]
@@ -44306,7 +44888,7 @@ pub(crate) mod tests {
         );
         let memory_db = MemoryDB {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -44325,6 +44907,440 @@ pub(crate) mod tests {
             .await
             .unwrap();
         (memory_db, dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_m4_finalize_rolls_back_and_restores_lease_connection_and_runtime() {
+        const SPACE: &str = "m4-cancel-space";
+        const ROOT: &str = "m4-cancel-root";
+        const NODE_COUNT: usize = 32;
+
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO provenance_roots
+                    (root_id, identity_version, identity_digest, root_kind,
+                     independence_group_id, status, created_at)
+                 VALUES (?1, 1, 'm4-cancel-digest', 'generated',
+                         'm4-cancel-group', 'active', 1712707200)",
+                libsql::params![ROOT],
+            )
+            .await
+            .unwrap();
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                    libsql::params![format!("m4-cancel-node-{node:02}"), SPACE],
+                )
+                .await
+                .unwrap();
+            }
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO edges
+                        (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                         grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                             1, ?4, ?5, 1712707200)",
+                    libsql::params![
+                        format!("m4-cancel-edge-{node:02}"),
+                        format!("m4-cancel-node-{node:02}"),
+                        format!("m4-cancel-node-{:02}", (node + 1) % NODE_COUNT),
+                        ROOT,
+                        SPACE
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let first = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("first M4 cancellation fixture publication");
+        assert!(matches!(
+            first,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if receipt.compute_mode
+                    == (crate::community_grouping::CommunityGroupingComputeMode::Full {
+                        reason: crate::community_grouping::CommunityGroupingFullReason::FirstPublication,
+                    })
+        ));
+
+        let (published_before, members_before, input_generation) = {
+            let conn = db.conn.lock().await;
+            let mut state = conn
+                .query(
+                    "SELECT published_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let published = state
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<Option<i64>>(0)
+                .unwrap()
+                .unwrap();
+            drop(state);
+            let mut member_rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM community_members WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let members = member_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap();
+            drop(member_rows);
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-cancel-chord', 'm4-cancel-node-00', 'entity',
+                         'm4-cancel-node-03', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut generation_rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let generation = generation_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap();
+            (published, members, generation)
+        };
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            input_generation,
+            BTreeSet::from([
+                "m4-cancel-node-00".to_owned(),
+                "m4-cancel-node-03".to_owned(),
+            ]),
+        )]);
+
+        let (reached, _resume) = community_grouping_test_hooks::pause_after_member_delete(SPACE);
+        let operation = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move { db.run_next_community_grouping_cycle().await })
+        };
+        reached.notified().await;
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let conn = db.conn.lock().await;
+                let mut lease_rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM grouping_leases
+                         WHERE phase = 'community' AND space = ?1",
+                        libsql::params![SPACE],
+                    )
+                    .await
+                    .unwrap();
+                let leases = lease_rows
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<i64>(0)
+                    .unwrap();
+                drop(lease_rows);
+                drop(conn);
+                if leases == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attempt drop must release its durable lease");
+
+        let (published_after, dirty_after, members_after) = {
+            let conn = db.conn.lock().await;
+            let mut state = conn
+                .query(
+                    "SELECT published_generation, dirty FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let state = state.next().await.unwrap().unwrap();
+            let published = state.get::<Option<i64>>(0).unwrap().unwrap();
+            let dirty = state.get::<i64>(1).unwrap();
+            let mut member_rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM community_members WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let members = member_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap();
+            (published, dirty, members)
+        };
+        assert_eq!(published_after, published_before);
+        assert_eq!(dirty_after, 1);
+        assert_eq!(members_after, members_before);
+        assert_eq!(db.get_memory_count().await.unwrap(), 0);
+
+        let retry = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("retry cancelled M4 publication");
+        assert!(matches!(
+            retry,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if matches!(
+                    receipt.compute_mode,
+                    crate::community_grouping::CommunityGroupingComputeMode::Incremental {
+                        optimized_nodes
+                    } if optimized_nodes > 0 && optimized_nodes < NODE_COUNT
+                )
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn older_m4_cycle_cannot_overwrite_newer_published_runtime() {
+        const SPACE: &str = "m4-overlap-space";
+        const ROOT: &str = "m4-overlap-root";
+        const NODE_COUNT: usize = 32;
+
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO provenance_roots
+                    (root_id, identity_version, identity_digest, root_kind,
+                     independence_group_id, status, created_at)
+                 VALUES (?1, 1, 'm4-overlap-digest', 'generated',
+                         'm4-overlap-group', 'active', 1712707200)",
+                libsql::params![ROOT],
+            )
+            .await
+            .unwrap();
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                    libsql::params![format!("m4-overlap-node-{node:02}"), SPACE],
+                )
+                .await
+                .unwrap();
+            }
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO edges
+                        (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                         grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                             1, ?4, ?5, 1712707200)",
+                    libsql::params![
+                        format!("m4-overlap-ring-{node:02}"),
+                        format!("m4-overlap-node-{node:02}"),
+                        format!("m4-overlap-node-{:02}", (node + 1) % NODE_COUNT),
+                        ROOT,
+                        SPACE
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let first = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("publish initial M4 overlap runtime");
+        let initial_generation = match first {
+            crate::community_grouping::CommunityGroupingOutcome::Published(receipt) => {
+                receipt.published_generation
+            }
+            crate::community_grouping::CommunityGroupingOutcome::Stale(receipt) => {
+                panic!("initial M4 overlap publication went stale: {receipt:?}")
+            }
+        };
+
+        let generation_g = {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-overlap-g', 'm4-overlap-node-00', 'entity',
+                         'm4-overlap-node-03', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        };
+        assert!(generation_g > initial_generation);
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            generation_g,
+            BTreeSet::from([
+                "m4-overlap-node-00".to_owned(),
+                "m4-overlap-node-03".to_owned(),
+            ]),
+        )]);
+
+        let (reached, resume) = community_grouping_test_hooks::pause_after_runtime_take(SPACE);
+        let older_cycle = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move { db.run_next_community_grouping_cycle().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("generation G must pause after taking the shared runtime");
+
+        let generation_g1 = {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-overlap-g1', 'm4-overlap-node-01', 'entity',
+                         'm4-overlap-node-05', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        };
+        assert!(generation_g1 > generation_g);
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            generation_g1,
+            BTreeSet::from([
+                "m4-overlap-node-01".to_owned(),
+                "m4-overlap-node-05".to_owned(),
+            ]),
+        )]);
+
+        let newer = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("generation G+1 must publish while G is paused");
+        assert!(matches!(
+            newer,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if receipt.published_generation == generation_g1
+                    && receipt.compute_mode
+                        == (crate::community_grouping::CommunityGroupingComputeMode::Full {
+                            reason: crate::community_grouping::CommunityGroupingFullReason::RuntimeStateMissing,
+                        })
+        ));
+
+        resume.notify_one();
+        assert!(
+            older_cycle.await.unwrap().is_err(),
+            "generation G must lose its superseded lease"
+        );
+        assert_eq!(
+            db.community_grouping_runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .published_generation(SPACE),
+            Some(generation_g1),
+            "the unwinding generation G guard must not replace the published G+1 runtime"
+        );
+
+        let generation_g2 = {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-overlap-g2', 'm4-overlap-node-02', 'entity',
+                         'm4-overlap-node-07', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        };
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            generation_g2,
+            BTreeSet::from([
+                "m4-overlap-node-02".to_owned(),
+                "m4-overlap-node-07".to_owned(),
+            ]),
+        )]);
+        let next = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("generation G+2 must retain the warm G+1 runtime");
+        assert!(matches!(
+            next,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if matches!(
+                    receipt.compute_mode,
+                    crate::community_grouping::CommunityGroupingComputeMode::Incremental {
+                        optimized_nodes
+                    } if optimized_nodes > 0 && optimized_nodes < NODE_COUNT
+                )
+        ));
     }
 
     /// Helper: build a minimal RawDocument for testing.
@@ -44568,6 +45584,15 @@ pub(crate) mod tests {
                  'partial-community', 'partial-space', NULL, 'leiden-m4-v1',
                  'grounded-relates-v1', 1712707200, 1712707200, NULL
              );
+             CREATE TABLE space_graph_state (
+                 space TEXT PRIMARY KEY,
+                 graph_generation INTEGER NOT NULL DEFAULT 0,
+                 published_generation INTEGER,
+                 dirty INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO space_graph_state (
+                 space, graph_generation, published_generation, dirty
+             ) VALUES ('partial-space', 7, 6, 1);
              PRAGMA user_version=94;",
         )
         .await
@@ -44624,6 +45649,204 @@ pub(crate) mod tests {
         let identity = identity_rows.next().await.unwrap().unwrap();
         assert_eq!(identity.get::<String>(0).unwrap(), "leiden-m4-v1");
         assert_eq!(identity.get::<String>(1).unwrap(), "grounded-relates-v1");
+        drop(identity_rows);
+        let mut state_rows = conn
+            .query(
+                "SELECT graph_generation, grouping_generation, published_generation, dirty \
+                 FROM space_graph_state WHERE space='partial-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let state = state_rows.next().await.unwrap().unwrap();
+        assert_eq!(state.get::<i64>(0).unwrap(), 7);
+        assert_eq!(
+            state.get::<i64>(1).unwrap(),
+            8,
+            "partial migration replay must advance the broader generation past graph-only state"
+        );
+        assert_eq!(state.get::<i64>(2).unwrap(), 6);
+        assert_eq!(state.get::<i64>(3).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_95_repairs_stamped_schema_and_bootstraps_existing_grounded_spaces() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDB::new_with_shared_embedder(
+            dir.path(),
+            Arc::new(crate::events::NoopEmitter),
+            shared_embedder(),
+        )
+        .await
+        .unwrap();
+        let conn = db.conn.lock().await;
+        let embedding = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        conn.execute(
+            "INSERT INTO entities (
+                 id, name, entity_type, space, created_at, updated_at, embedding
+             ) VALUES
+                 ('m95-bootstrap-left', 'Left', 'concept', ?1, 1, 1, vector32(?2)),
+                 ('m95-bootstrap-right', 'Right', 'concept', ?1, 1, 1, vector32(?2))",
+            libsql::params!["m95-bootstrap-space", embedding],
+        )
+        .await
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO provenance_roots (
+                 root_id, identity_version, identity_digest, root_kind,
+                 independence_group_id, status, created_at
+             ) VALUES (
+                 'm95-bootstrap-root', 1, 'm95-bootstrap-digest', 'generated',
+                 'm95-bootstrap-group', 'active', 1
+             );
+             INSERT INTO edges (
+                 edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                 lineage, grounded, root_id, space, created_at
+             ) VALUES (
+                 'm95-bootstrap-edge', 'm95-bootstrap-left', 'entity',
+                 'm95-bootstrap-right', 'entity', 'relates', 'assertion', 1,
+                 'm95-bootstrap-root', 'm95-bootstrap-space', 1
+             );
+             DROP TABLE community_members;
+             DROP TABLE grouping_leases;
+             DROP TABLE space_graph_state;
+             DROP TABLE communities;
+             CREATE TABLE space_graph_state (
+                 space TEXT PRIMARY KEY,
+                 graph_generation INTEGER NOT NULL DEFAULT 0,
+                 published_generation INTEGER,
+                 dirty INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO space_graph_state (
+                 space, graph_generation, published_generation, dirty
+             ) VALUES ('m95-clean-space', 9, 9, 0);
+             PRAGMA user_version=95;",
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("startup repair must run even when user_version is already 95");
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT graph_generation, grouping_generation, published_generation, dirty \
+                 FROM space_graph_state WHERE space='m95-bootstrap-space'",
+                (),
+            )
+            .await
+            .expect("query bootstrapped M4 state");
+        let state = rows
+            .next()
+            .await
+            .expect("read bootstrapped M4 state")
+            .expect("pre-existing grounded space must be queued");
+        assert_eq!(state.get::<i64>(0).unwrap(), 1);
+        assert_eq!(state.get::<i64>(1).unwrap(), 1);
+        assert_eq!(state.get::<Option<i64>>(2).unwrap(), None);
+        assert_eq!(state.get::<i64>(3).unwrap(), 1);
+        drop(rows);
+
+        let mut rows = conn
+            .query(
+                "SELECT graph_generation, grouping_generation, published_generation, dirty \
+                 FROM space_graph_state WHERE space='m95-clean-space'",
+                (),
+            )
+            .await
+            .expect("query conservatively invalidated clean M4 state");
+        let state = rows
+            .next()
+            .await
+            .expect("read conservatively invalidated clean M4 state")
+            .expect("existing state row must survive repair");
+        assert_eq!(state.get::<i64>(0).unwrap(), 9);
+        assert_eq!(
+            state.get::<i64>(1).unwrap(),
+            10,
+            "a newly repaired grouping generation must outrun the old clean publication"
+        );
+        assert_eq!(state.get::<Option<i64>>(2).unwrap(), Some(9));
+        assert_eq!(
+            state.get::<i64>(3).unwrap(),
+            1,
+            "old graph-only cleanliness cannot prove the broader grouping snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_95_complete_shape_does_not_repeat_grounded_bootstrap_scan() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let embedding = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        conn.execute(
+            "INSERT INTO entities (
+                 id, name, entity_type, space, created_at, updated_at, embedding
+             ) VALUES
+                 ('m95-late-left', 'Left', 'concept', ?1, 1, 1, vector32(?2)),
+                 ('m95-late-right', 'Right', 'concept', ?1, 1, 1, vector32(?2))",
+            libsql::params!["m95-late-direct-space", embedding],
+        )
+        .await
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO provenance_roots (
+                 root_id, identity_version, identity_digest, root_kind,
+                 independence_group_id, status, created_at
+             ) VALUES (
+                 'm95-late-root', 1, 'm95-late-digest', 'generated',
+                 'm95-late-group', 'active', 1
+             );
+             INSERT INTO edges (
+                 edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                 lineage, grounded, root_id, space, created_at
+             ) VALUES (
+                 'm95-late-edge', 'm95-late-left', 'entity',
+                 'm95-late-right', 'entity', 'relates', 'assertion', 1,
+                 'm95-late-root', 'm95-late-direct-space', 1
+             );",
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "DELETE FROM space_graph_state WHERE space='m95-late-direct-space'",
+            (),
+        )
+        .await
+        .unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM space_graph_state WHERE space='m95-late-direct-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "fixture removes trigger-created state to isolate complete-shape startup scanning"
+        );
+        drop(rows);
+        drop(conn);
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("a complete M95 shape needs no repair");
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM space_graph_state WHERE space='m95-late-direct-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "complete M95 startup must not rescan all grounded edges"
+        );
     }
 
     // ==================== upsert_documents ====================
@@ -76411,7 +77634,7 @@ pub(crate) mod tests {
         );
         let db = MemoryDB {
             _db: raw_db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),

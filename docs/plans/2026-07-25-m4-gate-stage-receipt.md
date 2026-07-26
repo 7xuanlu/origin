@@ -136,3 +136,33 @@ an accepted node move, skipping the postcondition. A RED bridge-retraction test 
 it; the state now checks communities whose internal edge was removed and routes a
 disconnected result to full repartition. Gate 1.4 remains honestly provisional until the
 real PR-1 job test turns GREEN.
+
+## 2026-07-26 PR-1 closure addendum
+
+The production composer is now implemented. The post-review closure run produced:
+
+- complete M4 target: `18 passed; 0 failed; 4 ignored`;
+- real composer p95 `244.089 ms`, max `285.747 ms`, `8,201` input rows loaded,
+  `2,048` member rows written, DB-mutex p95 `57.589 ms`, foreground p95 `139.260 ms`;
+- Gate 1.2 with the production rollback-journal path included: fixed frontier
+  `18.750 µs` at 2,048 nodes and `9.833 µs` at 32,768 nodes; dirty set 8→64 at
+  32,768 nodes measured `50.458 µs`→`322.000 µs`;
+- deterministic abort after the finalize member-delete proved transaction rollback,
+  connection reuse, token-guarded lease cleanup, runtime restoration, and an incremental
+  retry;
+- raw grounded INSERT/DELETE/topology UPDATE each advanced `graph_generation` and routed
+  through `Full(DirtyFrontierMissing)` rather than reusing stale core state; concurrent
+  same-space phase calls produced exactly one publisher and one clean skip;
+- the supported supersede/reactivate/entity-merge collision first reproduced the erased
+  generation bump (`13`, expected `14`), then passed with exact transition accounting and
+  `Full(NodeOrderChanged)`;
+- a controlled overlapping G/G+1 publication first reproduced the stale runtime overwrite
+  (`32`, expected `34`), then passed with generation-aware shared-runtime installation;
+- strict Clippy, formatting, diff whitespace, the 26-test CI planner suite, and the 6-test
+  release-verifier suite all passed. The first full-core run had one transient libSQL
+  `PRAGMA page_count` API-misuse during a test fixture's migration setup; the focused test
+  immediately passed, and a second normally parallel full run exited 0 with core lib
+  `3,074 passed; 0 failed; 33 ignored` plus every integration target green.
+
+Gate 1.3 remains a partition-only RSS receipt. The production composer reports elapsed time
+and row counts, but PR-1 does not measure or claim whole-snapshot composer peak RSS.

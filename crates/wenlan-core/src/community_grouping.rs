@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -10,9 +11,10 @@ use thiserror::Error;
 
 use crate::{
     community_partition::{
-        full_partition, incremental_partition, project_grounded_relates,
-        rebind_durable_ids_weighted, IncrementalConfig, IncrementalPartitionState, PartitionConfig,
-        ProjectionConfig, ProjectionInputEdge,
+        full_partition, incremental_partition_recoverable, project_grounded_relates,
+        rebind_durable_ids_weighted, IncrementalConfig, IncrementalPartitionError,
+        IncrementalPartitionRollback, IncrementalPartitionState, PartitionConfig, ProjectionConfig,
+        ProjectionInputEdge,
     },
     db::MemoryDB,
 };
@@ -30,6 +32,8 @@ pub enum CommunityGroupingError {
         space: String,
         input_generation: i64,
     },
+    #[error("space {space} has no dirty community graph generation")]
+    NotDirty { space: String },
     #[error("community grouping database error: {0}")]
     Database(String),
     #[error("community grouping computation failed: {0}")]
@@ -39,9 +43,13 @@ pub enum CommunityGroupingError {
 #[derive(Debug)]
 pub struct CommunityGroupingAttempt {
     pub(crate) space: String,
+    pub(crate) composer_started: std::time::Instant,
+    pub(crate) graph_generation: i64,
     pub(crate) input_generation: i64,
     pub(crate) published_generation: Option<i64>,
+    pub(crate) published_versions: Option<(String, String)>,
     pub(crate) token: String,
+    pub(crate) lease_cleanup: CommunityGroupingLeaseCleanup,
     pub(crate) edges: Vec<ProjectionInputEdge>,
     pub(crate) ungrounded_edges: Vec<ProjectionInputEdge>,
     pub(crate) entity_embeddings: BTreeMap<String, Vec<f32>>,
@@ -54,13 +62,83 @@ impl CommunityGroupingAttempt {
     pub fn input_generation(&self) -> i64 {
         self.input_generation
     }
+
+    pub(crate) fn disarm_lease_cleanup(&mut self) {
+        self.lease_cleanup.disarm();
+    }
+}
+
+pub(crate) struct CommunityGroupingLeaseCleanup {
+    conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
+    space: String,
+    input_generation: i64,
+    token: String,
+    armed: bool,
+}
+
+impl std::fmt::Debug for CommunityGroupingLeaseCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommunityGroupingLeaseCleanup")
+            .field("space", &self.space)
+            .field("input_generation", &self.input_generation)
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommunityGroupingLeaseCleanup {
+    pub(crate) fn new(
+        conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
+        space: String,
+        input_generation: i64,
+        token: String,
+    ) -> Self {
+        Self {
+            conn,
+            space,
+            input_generation,
+            token,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CommunityGroupingLeaseCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let conn = Arc::clone(&self.conn);
+        let space = self.space.clone();
+        let input_generation = self.input_generation;
+        let token = self.token.clone();
+        runtime.spawn(async move {
+            let conn = conn.lock().await;
+            let _ = conn
+                .execute(
+                    "DELETE FROM grouping_leases
+                     WHERE phase = 'community' AND space = ?1
+                       AND input_generation = ?2 AND token = ?3",
+                    libsql::params![space, input_generation, token],
+                )
+                .await;
+        });
+    }
 }
 
 #[derive(Debug)]
 pub struct CommunityGroupingComputed {
     pub(crate) members: Vec<ComputedCommunityMember>,
     pub(crate) projected_edge_count: usize,
-    pub(crate) next_state: IncrementalPartitionState,
+    pub(crate) compute_mode: CommunityGroupingComputeMode,
 }
 
 impl CommunityGroupingComputed {
@@ -83,7 +161,10 @@ pub struct CommunityGroupingReceipt {
     pub projected_edge_count: usize,
     pub member_count: usize,
     pub db_mutex_hold: Duration,
-    pub(crate) next_state: Option<IncrementalPartitionState>,
+    pub composer_elapsed: Duration,
+    pub input_rows_loaded: usize,
+    pub member_rows_written: usize,
+    pub compute_mode: CommunityGroupingComputeMode,
 }
 
 #[derive(Debug)]
@@ -92,13 +173,16 @@ pub enum CommunityGroupingOutcome {
     Stale(CommunityGroupingReceipt),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RuntimeCommunityState {
     published_generation: i64,
+    graph_generation: i64,
+    algo_version: String,
+    projection_version: String,
     partition: IncrementalPartitionState,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct CommunityGroupingRuntime {
     spaces: BTreeMap<String, RuntimeCommunityState>,
 }
@@ -110,36 +194,211 @@ impl CommunityGroupingRuntime {
             .map(|state| state.published_generation)
     }
 
-    fn matching_partition(
-        &self,
-        space: &str,
-        published_generation: Option<i64>,
-    ) -> Option<IncrementalPartitionState> {
-        let published_generation = published_generation?;
-        self.spaces
+    fn take(&mut self, space: &str) -> Option<RuntimeCommunityState> {
+        self.spaces.remove(space)
+    }
+
+    fn install(&mut self, space: String, state: RuntimeCommunityState) {
+        self.spaces.insert(space, state);
+    }
+
+    pub(crate) fn take_space_from(&mut self, other: &mut Self, space: &str) {
+        if let Some(state) = other.take(space) {
+            self.install(space.to_owned(), state);
+        }
+    }
+
+    fn take_space_from_if_not_older(&mut self, other: &mut Self, space: &str) {
+        let Some(candidate) = other.take(space) else {
+            return;
+        };
+        let should_install = self
+            .spaces
             .get(space)
-            .filter(|state| state.published_generation == published_generation)
-            .map(|state| state.partition.clone())
+            .is_none_or(|current| candidate.published_generation >= current.published_generation);
+        if should_install {
+            self.install(space.to_owned(), candidate);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunityGroupingComputeMode {
+    CoreReused,
+    Incremental { optimized_nodes: usize },
+    Full { reason: CommunityGroupingFullReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunityGroupingFullReason {
+    FirstPublication,
+    RuntimeStateMissing,
+    VersionChanged,
+    PublishedGenerationMismatch,
+    GraphGenerationRegressed,
+    DirtyFrontierMissing,
+    ThresholdExceeded,
+    NodeOrderChanged,
+    IncrementalRejected,
+}
+
+#[derive(Debug)]
+enum RuntimeTransition {
+    Reused {
+        state: RuntimeCommunityState,
+    },
+    Incremental {
+        state: RuntimeCommunityState,
+        rollback: IncrementalPartitionRollback,
+    },
+    Full {
+        prior: Option<RuntimeCommunityState>,
+        next: RuntimeCommunityState,
+    },
+}
+
+impl RuntimeTransition {
+    fn publish(self, published_generation: i64, graph_generation: i64) -> RuntimeCommunityState {
+        let mut state = match self {
+            Self::Reused { state } | Self::Incremental { state, .. } => state,
+            Self::Full { next, .. } => next,
+        };
+        state.published_generation = published_generation;
+        state.graph_generation = graph_generation;
+        state.algo_version = COMMUNITY_ALGO_VERSION.to_owned();
+        state.projection_version = COMMUNITY_PROJECTION_VERSION.to_owned();
+        state
     }
 
-    fn install(
-        &mut self,
+    fn restore(self) -> Option<RuntimeCommunityState> {
+        match self {
+            Self::Reused { state } => Some(state),
+            Self::Incremental {
+                mut state,
+                rollback,
+            } => {
+                state.partition.restore(rollback);
+                Some(state)
+            }
+            Self::Full { prior, .. } => prior,
+        }
+    }
+}
+
+struct RuntimeTransitionGuard<'a> {
+    runtime: &'a mut CommunityGroupingRuntime,
+    space: String,
+    transition: Option<RuntimeTransition>,
+}
+
+impl<'a> RuntimeTransitionGuard<'a> {
+    fn new(
+        runtime: &'a mut CommunityGroupingRuntime,
         space: String,
-        published_generation: i64,
-        partition: IncrementalPartitionState,
-    ) {
-        self.spaces.insert(
+        transition: RuntimeTransition,
+    ) -> Self {
+        Self {
+            runtime,
             space,
-            RuntimeCommunityState {
-                published_generation,
-                partition,
-            },
-        );
+            transition: Some(transition),
+        }
     }
 
-    pub(crate) fn adopt_space_from(&mut self, other: &Self, space: &str) {
-        if let Some(state) = other.spaces.get(space) {
-            self.spaces.insert(space.to_owned(), state.clone());
+    fn publish(&mut self, published_generation: i64, graph_generation: i64) {
+        if let Some(transition) = self.transition.take() {
+            self.runtime.install(
+                self.space.clone(),
+                transition.publish(published_generation, graph_generation),
+            );
+        }
+    }
+
+    fn restore(&mut self) {
+        if let Some(transition) = self.transition.take() {
+            if let Some(state) = transition.restore() {
+                self.runtime.install(self.space.clone(), state);
+            }
+        }
+    }
+}
+
+impl Drop for RuntimeTransitionGuard<'_> {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+struct SharedRuntimeSpaceGuard<'a> {
+    shared: &'a std::sync::Mutex<CommunityGroupingRuntime>,
+    space: String,
+    local: CommunityGroupingRuntime,
+}
+
+impl<'a> SharedRuntimeSpaceGuard<'a> {
+    fn take(shared: &'a std::sync::Mutex<CommunityGroupingRuntime>, space: &str) -> Self {
+        let mut local = CommunityGroupingRuntime::default();
+        {
+            let mut shared_runtime = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            local.take_space_from(&mut shared_runtime, space);
+        }
+        Self {
+            shared,
+            space: space.to_owned(),
+            local,
+        }
+    }
+
+    fn runtime_mut(&mut self) -> &mut CommunityGroupingRuntime {
+        &mut self.local
+    }
+}
+
+impl Drop for SharedRuntimeSpaceGuard<'_> {
+    fn drop(&mut self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shared.take_space_from_if_not_older(&mut self.local, &self.space);
+    }
+}
+
+#[derive(Debug)]
+pub struct CommunityGroupingWork {
+    computed: CommunityGroupingComputed,
+    transition: RuntimeTransition,
+}
+
+type GroupingSelection = (Vec<usize>, RuntimeTransition, CommunityGroupingComputeMode);
+type GroupingSelectionFailure = Box<(CommunityGroupingError, Option<RuntimeCommunityState>)>;
+
+impl CommunityGroupingWork {
+    pub fn projected_edge_count(&self) -> usize {
+        self.computed.projected_edge_count()
+    }
+
+    pub async fn finalize(
+        self,
+        db: &MemoryDB,
+        attempt: CommunityGroupingAttempt,
+        runtime: &mut CommunityGroupingRuntime,
+    ) -> Result<CommunityGroupingOutcome, CommunityGroupingError> {
+        let space = attempt.space.clone();
+        let graph_generation = attempt.graph_generation;
+        let input_generation = attempt.input_generation;
+        let mut transition = RuntimeTransitionGuard::new(runtime, space, self.transition);
+        match db.finalize_community_grouping(attempt, self.computed).await {
+            Ok(outcome) => {
+                if matches!(outcome, CommunityGroupingOutcome::Published(_)) {
+                    transition.publish(input_generation, graph_generation);
+                } else {
+                    transition.restore();
+                }
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -147,8 +406,8 @@ impl CommunityGroupingRuntime {
 /// Pure graph computation. This function deliberately has no database handle.
 pub fn compute_community_grouping(
     attempt: &CommunityGroupingAttempt,
-    runtime: &CommunityGroupingRuntime,
-) -> Result<CommunityGroupingComputed, CommunityGroupingError> {
+    runtime: &mut CommunityGroupingRuntime,
+) -> Result<CommunityGroupingWork, CommunityGroupingError> {
     let graph = project_grounded_relates(&attempt.edges, ProjectionConfig::default());
     let dirty_nodes = attempt
         .dirty_node_ids
@@ -156,22 +415,132 @@ pub fn compute_community_grouping(
         .filter_map(|node_id| graph.node_ids().binary_search(node_id).ok())
         .collect::<Vec<_>>();
 
-    let (membership, next_state) = if let Some(prior) =
-        runtime.matching_partition(&attempt.space, attempt.published_generation)
-    {
-        if dirty_nodes.is_empty() {
-            full_partition_state(&graph)?
-        } else {
-            match incremental_partition(&graph, prior, &dirty_nodes, IncrementalConfig::default()) {
-                Ok(output) => {
-                    let membership = output.partition().membership().to_vec();
-                    (membership, output.into_state())
+    let prior = runtime.take(&attempt.space);
+    let full = |prior: Option<RuntimeCommunityState>,
+                reason: CommunityGroupingFullReason|
+     -> Result<GroupingSelection, GroupingSelectionFailure> {
+        let (membership, partition) = match full_partition_state(&graph) {
+            Ok(full) => full,
+            Err(error) => return Err(Box::new((error, prior))),
+        };
+        let next = RuntimeCommunityState {
+            published_generation: attempt.published_generation.unwrap_or_default(),
+            graph_generation: attempt.graph_generation,
+            algo_version: COMMUNITY_ALGO_VERSION.to_owned(),
+            projection_version: COMMUNITY_PROJECTION_VERSION.to_owned(),
+            partition,
+        };
+        Ok((
+            membership,
+            RuntimeTransition::Full { prior, next },
+            CommunityGroupingComputeMode::Full { reason },
+        ))
+    };
+
+    let selection = match prior {
+        None => full(
+            None,
+            if attempt.published_generation.is_none() {
+                CommunityGroupingFullReason::FirstPublication
+            } else {
+                CommunityGroupingFullReason::RuntimeStateMissing
+            },
+        ),
+        Some(prior) => {
+            let published_versions_match =
+                attempt
+                    .published_versions
+                    .as_ref()
+                    .is_none_or(|(algo, projection)| {
+                        algo == COMMUNITY_ALGO_VERSION && projection == COMMUNITY_PROJECTION_VERSION
+                    });
+            if prior.algo_version != COMMUNITY_ALGO_VERSION
+                || prior.projection_version != COMMUNITY_PROJECTION_VERSION
+                || !published_versions_match
+            {
+                full(Some(prior), CommunityGroupingFullReason::VersionChanged)
+            } else if Some(prior.published_generation) != attempt.published_generation {
+                full(
+                    Some(prior),
+                    CommunityGroupingFullReason::PublishedGenerationMismatch,
+                )
+            } else if attempt.graph_generation < prior.graph_generation {
+                full(
+                    Some(prior),
+                    CommunityGroupingFullReason::GraphGenerationRegressed,
+                )
+            } else if attempt.graph_generation == prior.graph_generation {
+                let membership = prior.partition.partition().membership().to_vec();
+                Ok((
+                    membership,
+                    RuntimeTransition::Reused { state: prior },
+                    CommunityGroupingComputeMode::CoreReused,
+                ))
+            } else if dirty_nodes.is_empty() {
+                full(
+                    Some(prior),
+                    if attempt.dirty_node_ids.is_empty() {
+                        CommunityGroupingFullReason::DirtyFrontierMissing
+                    } else {
+                        CommunityGroupingFullReason::NodeOrderChanged
+                    },
+                )
+            } else {
+                let RuntimeCommunityState {
+                    published_generation,
+                    graph_generation,
+                    algo_version,
+                    projection_version,
+                    partition,
+                } = prior;
+                match incremental_partition_recoverable(
+                    &graph,
+                    partition,
+                    &dirty_nodes,
+                    IncrementalConfig::default(),
+                ) {
+                    Ok((output, rollback)) => {
+                        let optimized_nodes = output.optimized_nodes().len();
+                        let membership = output.partition().membership().to_vec();
+                        let state = RuntimeCommunityState {
+                            published_generation,
+                            graph_generation,
+                            algo_version,
+                            projection_version,
+                            partition: output.into_state(),
+                        };
+                        Ok((
+                            membership,
+                            RuntimeTransition::Incremental { state, rollback },
+                            CommunityGroupingComputeMode::Incremental { optimized_nodes },
+                        ))
+                    }
+                    Err(failure) => {
+                        let (error, partition) = *failure;
+                        full(
+                            Some(RuntimeCommunityState {
+                                published_generation,
+                                graph_generation,
+                                algo_version,
+                                projection_version,
+                                partition,
+                            }),
+                            full_reason_for_incremental_error(&error),
+                        )
+                    }
                 }
-                Err(_) => full_partition_state(&graph)?,
             }
         }
-    } else {
-        full_partition_state(&graph)?
+    };
+    let (membership, transition, compute_mode) = match selection {
+        Ok(selection) => selection,
+        Err(failure) => {
+            let (error, prior) = *failure;
+            if let Some(prior) = prior {
+                runtime.install(attempt.space.clone(), prior);
+            }
+            return Err(error);
+        }
     };
 
     let members = if graph.node_ids().len() < MIN_COMMUNITY_PARTICIPANTS {
@@ -221,11 +590,31 @@ pub fn compute_community_grouping(
         core_members
     };
 
-    Ok(CommunityGroupingComputed {
-        members,
-        projected_edge_count: attempt.edges.len(),
-        next_state,
+    Ok(CommunityGroupingWork {
+        computed: CommunityGroupingComputed {
+            members,
+            projected_edge_count: attempt.edges.len(),
+            compute_mode,
+        },
+        transition,
     })
+}
+
+fn full_reason_for_incremental_error(
+    error: &IncrementalPartitionError,
+) -> CommunityGroupingFullReason {
+    match error {
+        IncrementalPartitionError::DirtyFraction { .. }
+        | IncrementalPartitionError::FrontierFraction { .. } => {
+            CommunityGroupingFullReason::ThresholdExceeded
+        }
+        IncrementalPartitionError::MembershipSize { .. }
+        | IncrementalPartitionError::DirtyNode { .. }
+        | IncrementalPartitionError::NodeOrder => CommunityGroupingFullReason::NodeOrderChanged,
+        IncrementalPartitionError::DisconnectedCommunity => {
+            CommunityGroupingFullReason::IncrementalRejected
+        }
+    }
 }
 
 fn posthoc_isolated_attachments(
@@ -247,17 +636,20 @@ fn posthoc_isolated_attachments(
     }
 
     let centroids = community_centroids(&core_community, entity_embeddings);
+    let ungrounded_communities = resolve_ungrounded_communities(
+        entity_embeddings.keys().map(String::as_str),
+        &strongest_neighbor,
+        &core_community,
+    );
     let mut attached = Vec::new();
     for (node_id, embedding) in entity_embeddings {
         if core_community.contains_key(node_id) {
             continue;
         }
-        let ungrounded_community =
-            resolve_ungrounded_community(node_id, &strongest_neighbor, &core_community);
-        if let Some(community_id) = ungrounded_community {
+        if let Some(community_id) = ungrounded_communities.get(node_id) {
             attached.push(ComputedCommunityMember {
                 node_id: node_id.clone(),
-                community_id,
+                community_id: community_id.clone(),
                 attachment: "isolated_ungrounded",
             });
             continue;
@@ -289,21 +681,46 @@ fn update_strongest_neighbor(
     }
 }
 
-fn resolve_ungrounded_community(
-    node_id: &str,
+fn resolve_ungrounded_communities<'a>(
+    node_ids: impl IntoIterator<Item = &'a str>,
     strongest_neighbor: &BTreeMap<String, (f64, String)>,
     core_community: &BTreeMap<String, String>,
-) -> Option<String> {
-    let mut cursor = node_id;
-    let mut visited = BTreeSet::new();
-    while visited.insert(cursor.to_owned()) {
-        let (_, neighbor) = strongest_neighbor.get(cursor)?;
-        if let Some(community_id) = core_community.get(neighbor) {
-            return Some(community_id.clone());
+) -> BTreeMap<String, String> {
+    let mut resolved = BTreeMap::<String, Option<String>>::new();
+    for node_id in node_ids {
+        if core_community.contains_key(node_id) || resolved.contains_key(node_id) {
+            continue;
         }
-        cursor = neighbor;
+
+        let mut path = Vec::new();
+        let mut path_index = BTreeMap::<String, usize>::new();
+        let mut cursor = node_id.to_owned();
+        let result = loop {
+            if let Some(community_id) = core_community.get(&cursor) {
+                break Some(community_id.clone());
+            }
+            if let Some(cached) = resolved.get(&cursor) {
+                break cached.clone();
+            }
+            if path_index.insert(cursor.clone(), path.len()).is_some() {
+                break None;
+            }
+            path.push(cursor.clone());
+            let Some((_, neighbor)) = strongest_neighbor.get(&cursor) else {
+                break None;
+            };
+            cursor.clone_from(neighbor);
+        };
+
+        for visited in path {
+            resolved.insert(visited, result.clone());
+        }
     }
-    None
+
+    resolved
+        .into_iter()
+        .filter_map(|(node_id, community_id)| community_id.map(|value| (node_id, value)))
+        .collect()
 }
 
 fn community_centroids(
@@ -395,17 +812,8 @@ pub async fn run_community_grouping_cycle(
     space: &str,
 ) -> Result<CommunityGroupingOutcome, CommunityGroupingError> {
     let attempt = db.prepare_community_grouping(space).await?;
-    let computed = compute_community_grouping(&attempt, runtime)?;
-    let outcome = db.finalize_community_grouping(attempt, computed).await?;
-    if let CommunityGroupingOutcome::Published(receipt) = outcome {
-        let mut receipt = receipt;
-        if let Some(next_state) = receipt.next_state.take() {
-            runtime.install(space.to_owned(), receipt.published_generation, next_state);
-        }
-        Ok(CommunityGroupingOutcome::Published(receipt))
-    } else {
-        Ok(outcome)
-    }
+    let work = compute_community_grouping(&attempt, runtime)?;
+    work.finalize(db, attempt, runtime).await
 }
 
 impl MemoryDB {
@@ -449,22 +857,52 @@ impl MemoryDB {
             return Ok(None);
         };
 
-        let mut runtime = self
-            .community_grouping_runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let outcome = match run_community_grouping_cycle(self, &mut runtime, &space).await {
-            Ok(outcome) => outcome,
-            Err(CommunityGroupingError::LeaseHeld { .. }) => return Ok(None),
+        let attempt = match self.prepare_community_grouping(&space).await {
+            Ok(attempt) => attempt,
+            Err(
+                CommunityGroupingError::LeaseHeld { .. } | CommunityGroupingError::NotDirty { .. },
+            ) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if matches!(outcome, CommunityGroupingOutcome::Published(_)) {
-            self.community_grouping_runtime
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .adopt_space_from(&runtime, &space);
+        let mut runtime = SharedRuntimeSpaceGuard::take(&self.community_grouping_runtime, &space);
+        #[cfg(test)]
+        crate::db::tests::community_grouping_test_hooks::after_runtime_take(&space).await;
+        let work = compute_community_grouping(&attempt, runtime.runtime_mut())?;
+        let result = work.finalize(self, attempt, runtime.runtime_mut()).await;
+        match result {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(error) => Err(error),
         }
-        Ok(Some(outcome))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_cleanup_drop_without_tokio_runtime_falls_back_without_panicking() {
+        let directory = tempfile::tempdir().expect("lease cleanup tempdir");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("lease cleanup setup runtime");
+        let (_db, connection) = runtime.block_on(async {
+            let db = libsql::Builder::new_local(directory.path().join("lease-cleanup.db"))
+                .build()
+                .await
+                .expect("lease cleanup database");
+            let connection = db.connect().expect("lease cleanup connection");
+            (db, connection)
+        });
+        drop(runtime);
+
+        let cleanup = CommunityGroupingLeaseCleanup::new(
+            Arc::new(tokio::sync::Mutex::new(connection)),
+            "no-runtime-space".to_owned(),
+            1,
+            "no-runtime-token".to_owned(),
+        );
+        drop(cleanup);
     }
 }
