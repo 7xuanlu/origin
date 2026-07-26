@@ -12,6 +12,7 @@ from pathlib import Path
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_GITHUB_CLOCK_SKEW_MS = 5_000
 CACHE_ALERT_RATIO_PPM = 1_150_000
+REQUIRED_GATE_TARGET_MS = 20 * 60 * 1000
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -164,6 +165,9 @@ def build_receipt(event_payload, pages, usage, limit):
     over_by = max(0, usage_bytes - budget_bytes)
     ratio_ppm = usage_bytes * 1_000_000 // budget_bytes
     alert = usage_bytes * 1_000_000 > budget_bytes * CACHE_ALERT_RATIO_PPM
+    required_gate_elapsed_ms = duration_ms(
+        run.get("run_started_at"), gates[0]["completed_at"]
+    )
 
     return {
         "schema_version": 1,
@@ -177,9 +181,10 @@ def build_receipt(event_payload, pages, usage, limit):
             "run_started_at": run.get("run_started_at"),
             "updated_at": run.get("updated_at"),
         },
-        "required_gate_elapsed_ms": duration_ms(
-            run.get("run_started_at"), gates[0]["completed_at"]
-        ),
+        "required_gate_elapsed_ms": required_gate_elapsed_ms,
+        "required_gate_target_ms": REQUIRED_GATE_TARGET_MS,
+        "required_gate_target_met": required_gate_elapsed_ms is not None
+        and required_gate_elapsed_ms < REQUIRED_GATE_TARGET_MS,
         "jobs": jobs,
         "cache": {
             "usage_bytes": usage_bytes,

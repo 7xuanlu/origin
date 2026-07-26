@@ -121,6 +121,30 @@ class CiObserverTests(unittest.TestCase):
         self.assertEqual(receipt["required_gate_elapsed_ms"], 1_230_000)
         self.assertEqual(receipt["cache"]["status"], "under_budget")
 
+    def test_required_gate_target_is_strictly_under_twenty_minutes(self):
+        conclusion = job(102, "conclusion")
+        conclusion["completed_at"] = "2026-07-24T01:19:59Z"
+        result, receipt = self.run_observer(
+            event(),
+            [{"total_count": 1, "jobs": [conclusion]}],
+            {"active_caches_size_in_bytes": 1, "active_caches_count": 1},
+            {"max_cache_size_gb": 10},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt["required_gate_target_ms"], 1_200_000)
+        self.assertTrue(receipt["required_gate_target_met"])
+
+        conclusion["completed_at"] = "2026-07-24T01:20:00Z"
+        result, receipt = self.run_observer(
+            event(),
+            [{"total_count": 1, "jobs": [conclusion]}],
+            {"active_caches_size_in_bytes": 1, "active_caches_count": 1},
+            {"max_cache_size_gb": 10},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt["required_gate_target_ms"], 1_200_000)
+        self.assertFalse(receipt["required_gate_target_met"])
+
     def test_normal_eviction_pressure_is_recorded_without_failing(self):
         result, receipt = self.run_observer(
             event(),
