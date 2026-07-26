@@ -23,8 +23,9 @@ use wenlan_core::community_grouping::{
 use wenlan_core::community_partition::{
     disconnected_community_count, full_partition, incremental_partition,
     label_propagation_partition, modularity, project_grounded_relates, rebind_durable_ids,
-    IncrementalConfig, IncrementalPartitionError, IncrementalPartitionState, PartitionConfig,
-    ProjectedEdge, ProjectedGraph, ProjectionConfig, ProjectionInputEdge,
+    rebind_durable_ids_weighted, IncrementalConfig, IncrementalPartitionError,
+    IncrementalPartitionState, PartitionConfig, ProjectedEdge, ProjectedGraph, ProjectionConfig,
+    ProjectionInputEdge,
 };
 use wenlan_core::db::MemoryDB;
 use wenlan_core::edge_grounding::EdgePromotion;
@@ -364,6 +365,34 @@ fn m4_rebinding_uses_member_overlap_not_partitioner_labels() {
             "community-b",
             "community-b",
         ]
+    );
+}
+
+#[test]
+fn m4_rebinding_fractionally_weights_boundary_nodes_by_grounded_adjacency() {
+    let graph = project_grounded_relates(
+        &[
+            ProjectionInputEdge::new("a-c-1", "a", "c"),
+            ProjectionInputEdge::new("a-c-2", "a", "c"),
+            ProjectionInputEdge::new("a-c-3", "a", "c"),
+            ProjectionInputEdge::new("b-c-1", "b", "c"),
+            ProjectionInputEdge::new("b-c-2", "b", "c"),
+            ProjectionInputEdge::new("b-c-3", "b", "c"),
+        ],
+        ProjectionConfig::default(),
+    );
+    assert_eq!(graph.node_ids(), &["a", "b", "c"]);
+
+    // A raw member count would choose old-a (two nodes versus one). Weighted
+    // multi-membership instead lets a and b each contribute through their
+    // grounded boundary to old-b, while c contributes through its two
+    // old-a neighbors. That makes old-b the stable max-overlap identity.
+    let previous = vec!["old-a".to_owned(), "old-a".to_owned(), "old-b".to_owned()];
+    let rebound = rebind_durable_ids_weighted(&previous, &[7, 7, 7], &graph);
+
+    assert_eq!(
+        rebound,
+        vec!["old-b".to_owned(), "old-b".to_owned(), "old-b".to_owned()]
     );
 }
 
@@ -913,6 +942,10 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         other => panic!("mid-run promotion must reject stale publication, got {other:?}"),
     };
     assert_eq!(stale.input_generation, 20);
+    assert_eq!(
+        stale.published_generation, 19,
+        "stale telemetry must report the still-live generation, not the rejected input"
+    );
     mutex_holds.push(stale.db_mutex_hold);
     assert_eq!(
         runtime.published_generation(SPACE),
@@ -995,6 +1028,196 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         "independent foreground-query max {foreground_max:?} reaches the hard fail"
     );
     assert_m4_job_phase_structure();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
+    const SPACE: &str = "m4-isolated-space";
+    const ROOT: &str = "m4-isolated-root";
+
+    let dir = tempfile::tempdir().expect("M4 isolated tempdir");
+    let db = Arc::new(
+        MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+            .await
+            .expect("open M4 isolated database"),
+    );
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open M4 isolated observer");
+    let observer = observer_db.connect().expect("connect M4 isolated observer");
+    let unit_embedding = m4_unit_embedding(0);
+
+    observer
+        .execute("BEGIN", ())
+        .await
+        .expect("begin M4 isolated seed");
+    observer
+        .execute(
+            "INSERT INTO provenance_roots \
+                (root_id, identity_version, identity_digest, root_kind, \
+                 independence_group_id, status, created_at) \
+             VALUES (?1, 1, 'm4-isolated-digest', 'generated', \
+                     'm4-isolated-group', 'active', 1712707200)",
+            libsql::params![ROOT],
+        )
+        .await
+        .expect("seed M4 isolated provenance root");
+    for node in 0..10 {
+        let entity_id = format!("core-{node:02}");
+        observer
+            .execute(
+                "INSERT INTO entities \
+                    (id, name, entity_type, space, created_at, updated_at, embedding) \
+                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200, vector32(?3))",
+                libsql::params![entity_id, SPACE, unit_embedding.as_str()],
+            )
+            .await
+            .expect("seed core entity");
+    }
+    observer
+        .execute(
+            "INSERT INTO entities \
+                (id, name, entity_type, space, created_at, updated_at) VALUES \
+                ('isolated-ungrounded', 'isolated-ungrounded', 'concept', ?1, 1712707200, 1712707200), \
+                ('isolated-none', 'isolated-none', 'concept', ?1, 1712707200, 1712707200)",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("seed non-embedded isolated entities");
+    observer
+        .execute(
+            "INSERT INTO entities \
+                (id, name, entity_type, space, created_at, updated_at, embedding) \
+             VALUES ('isolated-embedding', 'isolated-embedding', 'concept', ?1, \
+                     1712707200, 1712707200, vector32(?2))",
+            libsql::params![SPACE, unit_embedding],
+        )
+        .await
+        .expect("seed embedded isolated entity");
+    for node in 0..10 {
+        observer
+            .execute(
+                "INSERT INTO edges \
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, \
+                     grounded, root_id, space, created_at) \
+                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', \
+                         1, ?4, ?5, 1712707200)",
+                libsql::params![
+                    format!("core-edge-{node:02}"),
+                    format!("core-{node:02}"),
+                    format!("core-{:02}", (node + 1) % 10),
+                    ROOT,
+                    SPACE
+                ],
+            )
+            .await
+            .expect("seed grounded core ring");
+    }
+    observer
+        .execute(
+            "INSERT INTO edges \
+                (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, \
+                 grounded, root_id, space, created_at) \
+             VALUES ('isolated-ungrounded-edge', 'isolated-ungrounded', 'entity', \
+                     'core-00', 'entity', 'relates', 'assertion', 0, NULL, ?1, 1712707200)",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("seed ungrounded isolated attachment");
+    observer
+        .execute(
+            "INSERT INTO space_graph_state \
+                (space, graph_generation, published_generation, dirty) \
+             VALUES (?1, 1, NULL, 1)",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("seed dirty M4 isolated generation");
+    observer
+        .execute("COMMIT", ())
+        .await
+        .expect("commit M4 isolated seed");
+
+    let (left, right) = tokio::join!(
+        db.prepare_community_grouping(SPACE),
+        db.prepare_community_grouping(SPACE)
+    );
+    let attempt = match (left, right) {
+        (Ok(attempt), Err(CommunityGroupingError::LeaseHeld { .. }))
+        | (Err(CommunityGroupingError::LeaseHeld { .. }), Ok(attempt)) => attempt,
+        outcome => panic!("exactly one concurrent same-generation lease must win: {outcome:?}"),
+    };
+
+    let runtime = CommunityGroupingRuntime::default();
+    let computed =
+        compute_community_grouping(&attempt, &runtime).expect("compute isolated grouping");
+    let receipt = match db
+        .finalize_community_grouping(attempt, computed)
+        .await
+        .expect("finalize isolated grouping")
+    {
+        CommunityGroupingOutcome::Published(receipt) => receipt,
+        other => panic!("the sole lease winner must publish exactly once: {other:?}"),
+    };
+    assert_eq!(receipt.published_generation, 1);
+    assert_eq!(receipt.member_count, 12);
+
+    let snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert_eq!(snapshot.published_generation, Some(1));
+    assert!(!snapshot.dirty);
+    let core = snapshot
+        .members
+        .iter()
+        .find(|member| member.node_id == "core-00")
+        .expect("core member");
+    assert_eq!(core.attachment, "core");
+    let ungrounded = snapshot
+        .members
+        .iter()
+        .find(|member| member.node_id == "isolated-ungrounded")
+        .expect("ungrounded isolated node must attach");
+    assert_eq!(ungrounded.attachment, "isolated_ungrounded");
+    assert_eq!(
+        ungrounded.community_id, core.community_id,
+        "strongest ungrounded neighbor must supply the attachment community"
+    );
+    assert_eq!(
+        snapshot
+            .members
+            .iter()
+            .find(|member| member.node_id == "isolated-embedding")
+            .expect("embedded isolated node must attach")
+            .attachment,
+        "isolated_embedding"
+    );
+    assert!(
+        snapshot
+            .members
+            .iter()
+            .all(|member| member.node_id != "isolated-none"),
+        "a fully isolated node without an embedding must remain unassigned"
+    );
+
+    let mut version_rows = observer
+        .query(
+            "SELECT DISTINCT algo_version, projection_version \
+             FROM communities WHERE space = ?1 AND retired_at IS NULL",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("query persisted community versions");
+    while let Some(row) = version_rows
+        .next()
+        .await
+        .expect("read persisted community versions")
+    {
+        assert_eq!(row.get::<String>(0).expect("algo version"), "leiden-m4-v1");
+        assert_eq!(
+            row.get::<String>(1).expect("projection version"),
+            "grounded-relates-v1"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1272,6 +1495,197 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         }
         other => panic!("restart must publish via full fallback: {other:?}"),
     }
+
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("reopen correction observer");
+    let observer = observer_db
+        .connect()
+        .expect("reconnect correction observer");
+
+    const DELETE_SOURCE: &str = "m4-delete-cascade-source";
+    const DELETE_CONTENT: &str =
+        "Deleting this source must retract its grounded relation edge atomically.";
+    reopened
+        .upsert_documents(vec![RawDocument {
+            source: "memory".to_owned(),
+            source_id: DELETE_SOURCE.to_owned(),
+            title: "M4 delete cascade".to_owned(),
+            content: DELETE_CONTENT.to_owned(),
+            last_modified: 1_722_000_001,
+            memory_type: Some("fact".to_owned()),
+            space: Some(SPACE.to_owned()),
+            source_agent: Some("folder".to_owned()),
+            confirmed: Some(true),
+            ..Default::default()
+        }])
+        .await
+        .expect("seed deletion-cascade source");
+    let delete_left = reopened
+        .create_entity("Delete Cascade Left", "concept", Some(SPACE))
+        .await
+        .expect("create delete-cascade left");
+    let delete_right = reopened
+        .create_entity("Delete Cascade Right", "concept", Some(SPACE))
+        .await
+        .expect("create delete-cascade right");
+    let delete_relation = reopened
+        .create_relation(
+            &delete_left,
+            &delete_right,
+            "related_to",
+            Some("m4-gate"),
+            Some(1.0),
+            Some("ground before deleting source evidence"),
+            Some(DELETE_SOURCE),
+        )
+        .await
+        .expect("create delete-cascade relation");
+    let delete_edge = compute_edge_id(
+        "relates",
+        "entity",
+        &delete_left,
+        "entity",
+        &delete_right,
+        "related_to",
+    );
+    let delete_root = reopened
+        .acquire_provenance_root(
+            "document_ingest",
+            DELETE_CONTENT,
+            &IndependenceSignals {
+                source_identity: Some("file:///m4-delete-cascade.md"),
+                agent_turn: None,
+                import_batch: None,
+            },
+        )
+        .await
+        .expect("acquire delete-cascade root");
+    assert_eq!(
+        reopened
+            .promote_edges_grounded(&[EdgePromotion {
+                edge_id: delete_edge.clone(),
+                root_id: delete_root,
+                payload: r#"{"grounded":true,"source":"m4-delete"}"#.to_owned(),
+                relation_id: delete_relation,
+                source_memory_id: DELETE_SOURCE.to_owned(),
+                judged_content: DELETE_CONTENT.to_owned(),
+            }])
+            .await
+            .expect("ground delete-cascade relation"),
+        1
+    );
+    assert_eq!(read_m4_generation(&observer, SPACE).await, 7);
+    reopened
+        .delete_by_source_id("memory", DELETE_SOURCE)
+        .await
+        .expect("delete grounded relation source");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        8,
+        "source deletion must advance the grounded graph generation exactly once"
+    );
+    assert!(
+        matches!(
+            read_edge_valid_until(&observer, &delete_edge).await,
+            Some(Some(_))
+        ),
+        "source deletion must soft-invalidate the grounded edge, never leave or hard-delete it"
+    );
+
+    const REFRESH_SOURCE: &str = "m4-refresh-cascade-source";
+    const REFRESH_CONTENT: &str =
+        "Refreshing this source must retract the grounded projection built from old evidence.";
+    reopened
+        .upsert_documents(vec![RawDocument {
+            source: "memory".to_owned(),
+            source_id: REFRESH_SOURCE.to_owned(),
+            title: "M4 refresh cascade".to_owned(),
+            content: REFRESH_CONTENT.to_owned(),
+            last_modified: 1_722_000_002,
+            memory_type: Some("fact".to_owned()),
+            space: Some(SPACE.to_owned()),
+            source_agent: Some("folder".to_owned()),
+            confirmed: Some(true),
+            ..Default::default()
+        }])
+        .await
+        .expect("seed refresh-cascade source");
+    let refresh_left = reopened
+        .create_entity("Refresh Cascade Left", "concept", Some(SPACE))
+        .await
+        .expect("create refresh-cascade left");
+    let refresh_right = reopened
+        .create_entity("Refresh Cascade Right", "concept", Some(SPACE))
+        .await
+        .expect("create refresh-cascade right");
+    let refresh_relation = reopened
+        .create_relation(
+            &refresh_left,
+            &refresh_right,
+            "related_to",
+            Some("m4-gate"),
+            Some(1.0),
+            Some("ground before refreshing source evidence"),
+            Some(REFRESH_SOURCE),
+        )
+        .await
+        .expect("create refresh-cascade relation");
+    let refresh_edge = compute_edge_id(
+        "relates",
+        "entity",
+        &refresh_left,
+        "entity",
+        &refresh_right,
+        "related_to",
+    );
+    let refresh_root = reopened
+        .acquire_provenance_root(
+            "document_ingest",
+            REFRESH_CONTENT,
+            &IndependenceSignals {
+                source_identity: Some("file:///m4-refresh-cascade.md"),
+                agent_turn: None,
+                import_batch: None,
+            },
+        )
+        .await
+        .expect("acquire refresh-cascade root");
+    assert_eq!(
+        reopened
+            .promote_edges_grounded(&[EdgePromotion {
+                edge_id: refresh_edge.clone(),
+                root_id: refresh_root,
+                payload: r#"{"grounded":true,"source":"m4-refresh"}"#.to_owned(),
+                relation_id: refresh_relation,
+                source_memory_id: REFRESH_SOURCE.to_owned(),
+                judged_content: REFRESH_CONTENT.to_owned(),
+            }])
+            .await
+            .expect("ground refresh-cascade relation"),
+        1
+    );
+    assert_eq!(read_m4_generation(&observer, SPACE).await, 9);
+    reopened
+        .update_memory(
+            REFRESH_SOURCE,
+            "The evidence changed, so the old grounded projection is no longer valid.",
+        )
+        .await
+        .expect("refresh grounded relation source");
+    assert_eq!(
+        read_m4_generation(&observer, SPACE).await,
+        10,
+        "source refresh must advance the grounded graph generation exactly once"
+    );
+    assert!(
+        matches!(
+            read_edge_valid_until(&observer, &refresh_edge).await,
+            Some(Some(_))
+        ),
+        "source refresh must soft-invalidate the grounded edge"
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1547,6 +1961,48 @@ fn assert_m4_job_phase_structure() {
     );
 }
 
+#[test]
+fn m4_prepare_reads_are_keyset_paged_and_lock_scoped_per_page() {
+    let source = include_str!("../src/db.rs");
+    let prepare = rust_function_body(source, "pub async fn prepare_community_grouping");
+    for helper in [
+        "load_community_grounded_edges_paged(",
+        "load_community_ungrounded_edges_paged(",
+        "load_community_entities_paged(",
+        "load_previous_community_members_paged(",
+    ] {
+        assert!(
+            prepare.contains(helper),
+            "prepare must route its potentially large {helper} input through a paged loader"
+        );
+    }
+    assert!(
+        !prepare.contains("while let Some(row)"),
+        "prepare must not hold one connection guard while draining an unbounded row stream"
+    );
+
+    for signature in [
+        "async fn load_community_grounded_edges_paged",
+        "async fn load_community_ungrounded_edges_paged",
+        "async fn load_community_entities_paged",
+        "async fn load_previous_community_members_paged",
+    ] {
+        let body = rust_function_body(source, signature);
+        assert!(
+            body.contains("COMMUNITY_READ_PAGE_SIZE"),
+            "{signature} must use the authored fixed page bound"
+        );
+        assert!(
+            body.contains("ORDER BY") && body.contains("LIMIT"),
+            "{signature} must use deterministic keyset pages"
+        );
+        assert!(
+            body.contains("self.conn.lock().await"),
+            "{signature} must acquire and release the DB mutex one page at a time"
+        );
+    }
+}
+
 fn rust_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
     let signature_start = source
         .find(signature)
@@ -1783,6 +2239,29 @@ async fn read_edge_active_grounded(
                 row.get(1).expect("decode grounded destination"),
             )
         })
+}
+
+async fn read_edge_valid_until(
+    observer: &libsql::Connection,
+    edge_id: &str,
+) -> Option<Option<i64>> {
+    let mut rows = observer
+        .query(
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id.to_owned()],
+        )
+        .await
+        .expect("query edge validity");
+    rows.next()
+        .await
+        .expect("read edge validity")
+        .map(|row| row.get(0).expect("decode edge validity"))
+}
+
+fn m4_unit_embedding(axis: usize) -> String {
+    let mut values = vec!["0"; 768];
+    values[axis] = "1";
+    format!("[{}]", values.join(","))
 }
 
 struct ChurnSeries {

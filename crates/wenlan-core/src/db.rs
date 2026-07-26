@@ -44203,6 +44203,110 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn migration_95_replays_after_partial_ddl_without_losing_existing_identity_rows() {
+        let dir = tempdir().unwrap();
+        let embedder = shared_embedder();
+        let db = MemoryDB::new_with_shared_embedder(
+            dir.path(),
+            Arc::new(crate::events::NoopEmitter),
+            Arc::clone(&embedder),
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let raw_db = libsql::Builder::new_local(
+            dir.path()
+                .join("origin_memory.db")
+                .to_str()
+                .expect("migration replay path"),
+        )
+        .build()
+        .await
+        .unwrap();
+        let raw = raw_db.connect().unwrap();
+        raw.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE IF EXISTS community_members;
+             DROP TABLE IF EXISTS grouping_leases;
+             DROP TABLE IF EXISTS space_graph_state;
+             DROP TABLE IF EXISTS communities;
+             CREATE TABLE communities (
+                 community_id TEXT PRIMARY KEY,
+                 space TEXT NOT NULL,
+                 display_name TEXT,
+                 algo_version TEXT NOT NULL,
+                 projection_version TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 retired_at INTEGER
+             );
+             INSERT INTO communities (
+                 community_id, space, display_name, algo_version,
+                 projection_version, created_at, updated_at, retired_at
+             ) VALUES (
+                 'partial-community', 'partial-space', NULL, 'leiden-m4-v1',
+                 'grounded-relates-v1', 1712707200, 1712707200, NULL
+             );
+             PRAGMA user_version=94;",
+        )
+        .await
+        .unwrap();
+        drop(raw);
+        drop(raw_db);
+
+        let reopened = MemoryDB::new_with_shared_embedder(
+            dir.path(),
+            Arc::new(crate::events::NoopEmitter),
+            embedder,
+        )
+        .await
+        .expect("migration 95 must replay after interrupted partial DDL");
+        let conn = reopened.conn.lock().await;
+        let mut version_rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        assert_eq!(
+            version_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            95
+        );
+        drop(version_rows);
+        for table in [
+            "communities",
+            "community_members",
+            "space_graph_state",
+            "grouping_leases",
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "migration replay must restore {table}"
+            );
+        }
+        let mut identity_rows = conn
+            .query(
+                "SELECT algo_version, projection_version FROM communities \
+                 WHERE community_id='partial-community'",
+                (),
+            )
+            .await
+            .unwrap();
+        let identity = identity_rows.next().await.unwrap().unwrap();
+        assert_eq!(identity.get::<String>(0).unwrap(), "leiden-m4-v1");
+        assert_eq!(identity.get::<String>(1).unwrap(), "grounded-relates-v1");
+    }
+
     // ==================== upsert_documents ====================
 
     #[tokio::test]
