@@ -10545,6 +10545,12 @@ impl MemoryDB {
     ) -> Result<Vec<crate::edge_grounding::EdgeGroundingCandidate>, WenlanError> {
         use crate::edge_grounding::EdgeGroundingCandidate;
         let conn = self.conn.lock().await;
+        // The `+` on `m.source` is load-bearing, not a typo: without it SQLite
+        // drives the memories LEFT JOIN off `idx_memories_source (source=?)`,
+        // which matches every 'memory' row (the whole table) per relation — a
+        // full scan that put the 100k-corpus per-tick mutex hold at ~1.1s (Gate
+        // 3, §3.3). The unary `+` removes that term from index selection so the
+        // planner uses the selective `idx_memories_source_id` join instead.
         let mut rows = conn
             .query(
                 "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
@@ -10555,7 +10561,7 @@ impl MemoryDB {
                  JOIN entities te ON te.id = r.to_entity
                  LEFT JOIN memories m
                         ON m.source_id = r.source_memory_id
-                       AND m.source = 'memory'
+                       AND +m.source = 'memory'
                        AND m.chunk_index = 0
                  WHERE r.rowid > ?1
                  ORDER BY r.rowid
@@ -10764,6 +10770,31 @@ impl MemoryDB {
             "space": row.get::<String>(9).ok(),
             "payload": row.get::<Option<String>>(10).ok().flatten(),
         }))
+    }
+
+    /// Test-only: read a `provenance_roots` row by `root_id`, returning
+    /// `(root_kind, independence_group_id)`. Lets the M3g Gate-2 root-correctness
+    /// checks (a separate module without `conn` access) assert that every
+    /// promoted edge's `root_id` resolves to a real root of
+    /// `root_kind='document_ingest'`, that edges sharing one source memory
+    /// converge on one `root_id`, and that distinct source memories sharing one
+    /// file identity land in one `independence_group_id` (§2.1 /
+    /// `docs/plans/2026-07-25-m3g-gate-criteria.md`, §5.3-§5.4 of the mechanics).
+    #[cfg(test)]
+    pub(crate) async fn provenance_root_row_for_test(
+        &self,
+        root_id: &str,
+    ) -> Option<(String, String)> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT root_kind, independence_group_id FROM provenance_roots WHERE root_id = ?1",
+                libsql::params![root_id],
+            )
+            .await
+            .ok()?;
+        let row = rows.next().await.ok()??;
+        Some((row.get::<String>(0).ok()?, row.get::<String>(1).ok()?))
     }
 
     // ===== M2 PR-2 reader-cutover control plane (stages c+d) =====
@@ -79945,6 +79976,267 @@ pub(crate) mod tests {
             "one cites edge per memory"
         );
         assert!(flip, "gate opens on a clean, current watermark (communities has no edges but the predicate still holds)");
+    }
+
+    /// M3g Gate 2.2 (scale demo) + Gate 3 (foreground-latency ceiling) at §6.5
+    /// scale. Manual-only (needs minutes + hundreds of MB, but NO GPU — the
+    /// entailment provider is a stub). Run with:
+    ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
+    ///     db::tests::edge_grounding_scale_and_latency_bench -- --ignored --nocapture
+    ///
+    /// Seeds the M2 §6.5 corpus (100k folder memories / 5k pages / 100k page
+    /// cites) via raw batched SQL, then a `relates` backlog of BACKLOG
+    /// folder-sourced grounded=0 edges (payload=NULL, entailment-only) through the
+    /// REAL relation path, and drives `run_edge_grounding_tick` with an always-
+    /// entail stub. Asserts, per `docs/plans/2026-07-25-m3g-gate-criteria.md`:
+    ///   Gate 2.2 — every tick within bounds (≤50 scanned, ≤25 entailment calls),
+    ///     promotion monotone (no `grounded=1 → 0`), a drained re-run promotes 0
+    ///     (idempotent);
+    ///   Gate 3  — per-tick cumulative DB-mutex hold p95 ≤ 500ms over ≥20 full
+    ///     ticks, no single tick > 2s.
+    /// The structural "no LLM inside a transaction" guard is the companion
+    /// hermetic test `edge_grounding::tests::sweep_holds_no_db_mutex_across_entailment`.
+    #[tokio::test]
+    #[ignore]
+    async fn edge_grounding_scale_and_latency_bench() {
+        use std::time::Instant;
+        const MEMORIES: usize = 100_000;
+        const PAGES: usize = 5_000;
+        const CITES_PER_PAGE: usize = MEMORIES / PAGES; // 20
+        const BACKLOG: usize = 750; // 30 full ticks of 25 — well past the 20-tick floor
+
+        let (db, _dir) = test_db().await;
+
+        // --- seed the §6.5 corpus (raw batched SQL, one BEGIN/COMMIT) ----------
+        let t_seed = Instant::now();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            for i in 0..MEMORIES {
+                conn.execute(
+                    "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                        last_modified, chunk_type, source_agent, space, confidence, confirmed, \
+                        memory_type, pending_revision) \
+                     VALUES (?1, ?2, 'memory', ?1, 't', 0, 1712707200, 'text', 'folder', 'space_a', 1.0, 1, 'fact', 0)",
+                    libsql::params![format!("mem_{i}"), format!("Folder document {i}.")],
+                )
+                .await
+                .unwrap();
+            }
+            for p in 0..PAGES {
+                conn.execute(
+                    "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, space, workspace) \
+                     VALUES (?1, 't', 'c', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'space_a', 'space_a')",
+                    libsql::params![format!("page_{p}")],
+                )
+                .await
+                .unwrap();
+                for k in 0..CITES_PER_PAGE {
+                    let mem = p * CITES_PER_PAGE + k;
+                    conn.execute(
+                        "INSERT INTO page_sources (page_id, memory_source_id, linked_at, link_reason) \
+                         VALUES (?1, ?2, 1712707200, 'bench')",
+                        libsql::params![format!("page_{p}"), format!("mem_{mem}")],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+        let seed_secs = t_seed.elapsed().as_secs_f64();
+
+        // --- seed the relates backlog through the REAL relation path -----------
+        // Each: a folder-sourced grounded=0 `relates` edge, payload=NULL
+        // (entailment-only), whose source memory (mem_i) carries live content.
+        let t_backlog = Instant::now();
+        for i in 0..BACKLOG {
+            let from = db
+                .create_entity(&format!("bench_from_{i}"), "concept", Some("space_a"))
+                .await
+                .unwrap();
+            let to = db
+                .create_entity(&format!("bench_to_{i}"), "concept", Some("space_a"))
+                .await
+                .unwrap();
+            let mem_id = format!("mem_{i}");
+            db.create_relation_with_span(
+                &from,
+                &to,
+                "works_on",
+                Some("post_ingest"),
+                None,
+                None,
+                Some(&mem_id),
+                None, // span_quote → payload NULL → entailment-only backlog
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let backlog_secs = t_backlog.elapsed().as_secs_f64();
+
+        // Guard the load-bearing `+m.source` access-path fix (Gate 3, §3.3):
+        // the candidate scan's memories LEFT JOIN must ride the selective
+        // `idx_memories_source_id`, never `idx_memories_source (source=?)` which
+        // matches the whole 'memory' table per relation (~1.1s/tick at 100k). If
+        // a refactor strips the `+`, this reddens by CAUSE before the p95 gate
+        // below reddens by symptom.
+        {
+            let conn = db.conn.lock().await;
+            let plan_sql = "EXPLAIN QUERY PLAN \
+                SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type, r.source_memory_id, \
+                       fe.name, te.name, m.content, m.source_agent, m.source_id, m.url \
+                 FROM relations r \
+                 JOIN entities fe ON fe.id = r.from_entity \
+                 JOIN entities te ON te.id = r.to_entity \
+                 LEFT JOIN memories m ON m.source_id = r.source_memory_id \
+                        AND +m.source = 'memory' AND m.chunk_index = 0 \
+                 WHERE r.rowid > 0 ORDER BY r.rowid LIMIT 50";
+            let mut rows = conn.query(plan_sql, ()).await.unwrap();
+            let mut plan = String::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                plan.push_str(&row.get::<String>(3).unwrap_or_default());
+                plan.push('\n');
+            }
+            drop(rows);
+            drop(conn);
+            assert!(
+                plan.contains("idx_memories_source_id"),
+                "Gate 3 access-path regression: memories join is not using \
+                 idx_memories_source_id (the `+m.source` fix). Plan:\n{plan}"
+            );
+            assert!(
+                !plan.contains("idx_memories_source (source"),
+                "Gate 3 access-path regression: memories join fell back to the \
+                 full-table idx_memories_source (source=?) scan. Plan:\n{plan}"
+            );
+        }
+
+        // --- drive ticks: always-entail stub, measure per-tick mutex hold ------
+        let llm: std::sync::Arc<dyn crate::llm_provider::LlmProvider> = std::sync::Arc::new(
+            crate::llm_provider::CannedLlmProvider::new(r#"{"score": 1.0}"#),
+        );
+        let prompts = crate::prompts::PromptRegistry::default();
+
+        let mut holds_ms: Vec<f64> = Vec::new();
+        let mut full_ticks = 0usize;
+        let mut cum_promoted = 0usize;
+        let mut cum_scanned = 0usize;
+        let mut prev_cum = 0usize;
+        let mut ticks = 0usize;
+        loop {
+            let r = crate::edge_grounding::run_edge_grounding_tick(&db, &llm, &prompts)
+                .await
+                .unwrap();
+            ticks += 1;
+            // Gate 2.2 (b): per-tick bounds.
+            assert!(r.scanned <= 50, "tick {ticks}: scanned {} > 50", r.scanned);
+            assert!(
+                r.entailment_calls <= 25,
+                "tick {ticks}: entailment_calls {} > 25",
+                r.entailment_calls
+            );
+            // Gate 2.2 (c): cumulative promotion never decreases.
+            cum_promoted += r.promoted;
+            cum_scanned += r.scanned;
+            assert!(cum_promoted >= prev_cum, "cumulative promoted regressed");
+            prev_cum = cum_promoted;
+            if r.promoted > 0 {
+                holds_ms.push(r.db_mutex_hold.as_secs_f64() * 1000.0);
+                if r.promoted == 25 {
+                    full_ticks += 1;
+                }
+            }
+            if !r.progressed {
+                break;
+            }
+            assert!(ticks < 200, "drain did not terminate");
+        }
+
+        // Gate 2.2 (d): a further tick past the drained backlog promotes 0.
+        let drained = crate::edge_grounding::run_edge_grounding_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+        assert_eq!(
+            drained.promoted, 0,
+            "drained backlog promotes 0 (idempotent)"
+        );
+        assert_eq!(drained.scanned, 0, "cursor past end: nothing left to scan");
+
+        // Gate 2.2 (c) reinforced — no `grounded=1 → 0`: reset the cursor to 0 and
+        // re-run. Every backlog edge is grounded=1 now, so the free grounded!=0
+        // skip fires for all of them: 0 promoted, 0 entailment calls, grounded=1
+        // count unchanged (the `AND grounded=0` flip guard holds).
+        let grounded_before = count_grounded_relates(&db).await;
+        db.set_app_metadata(
+            crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
+            &serde_json::to_string(&crate::edge_grounding::GroundingState::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let rerun = crate::edge_grounding::run_edge_grounding_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+        assert_eq!(rerun.promoted, 0, "re-run over grounded=1 promotes 0");
+        assert_eq!(
+            rerun.entailment_calls, 0,
+            "re-run spends no entailment on already-grounded edges"
+        );
+        let grounded_after = count_grounded_relates(&db).await;
+        assert_eq!(
+            grounded_before, grounded_after,
+            "no grounded=1 → 0 revert across a re-run"
+        );
+
+        // --- Gate 3: p95 + max over the full ticks -----------------------------
+        assert!(
+            full_ticks >= 20,
+            "need >=20 full ticks for a p95; got {full_ticks} (raise BACKLOG)"
+        );
+        let mut sorted = holds_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p95_idx = ((sorted.len() as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
+        let p95 = sorted[p95_idx];
+        let max = *sorted.last().unwrap();
+
+        eprintln!("[m3g bench] corpus: memories={MEMORIES} pages={PAGES} backlog={BACKLOG}");
+        eprintln!("[m3g bench] seed={seed_secs:.1}s backlog_seed={backlog_secs:.1}s");
+        eprintln!(
+            "[m3g bench] ticks={ticks} full_ticks={full_ticks} promoted={cum_promoted} scanned={cum_scanned} promoted/scanned={:.3}",
+            cum_promoted as f64 / cum_scanned.max(1) as f64
+        );
+        eprintln!(
+            "[m3g bench] db_mutex_hold over {} promoting ticks: p95={p95:.1}ms max={max:.1}ms",
+            holds_ms.len()
+        );
+
+        // Gate 3 ceilings.
+        assert!(
+            max <= 2000.0,
+            "Gate 3 hard-fail: a tick held the mutex {max:.1}ms > 2s"
+        );
+        assert!(
+            p95 <= 500.0,
+            "Gate 3: p95 mutex hold {p95:.1}ms > 500ms ceiling"
+        );
+    }
+
+    #[cfg(test)]
+    async fn count_grounded_relates(db: &MemoryDB) -> i64 {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE edge_type='relates' AND grounded=1",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
     }
 
     /// §6.5-scale acceptance for the M3 PR-2 entity<->page reader cutover

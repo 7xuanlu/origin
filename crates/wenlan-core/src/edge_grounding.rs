@@ -29,7 +29,7 @@
 //! ([`crate::db::edge_grounding_promote_enabled`]).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::db::MemoryDB;
 use crate::llm_provider::{LlmProvider, LlmRequest};
@@ -52,7 +52,7 @@ pub const EDGE_GROUNDING_ENTAILMENT_THRESHOLD: f64 = 0.5;
 /// Prompt version stamped on every grounding verdict (§6.6/§8). Bump on any
 /// change to [`crate::prompts::defaults::GROUNDING_ENTAILMENT`] so scores from
 /// different prompt versions are never compared under one threshold.
-pub const EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION: &str = "m3g-entailment-v1";
+pub const EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION: &str = "m3g-entailment-v2";
 /// The external-origin predicate (§5.2): only folder-ingested memories ground.
 const EXTERNAL_SOURCE_AGENT: &str = "folder";
 /// Durable cursor + poison state key in `app_metadata`.
@@ -112,6 +112,16 @@ pub struct EdgeGroundingReport {
     /// True when the LLM provider was unavailable and the tick did no work
     /// (the lane is provider-gated, so this should be rare).
     pub skipped_no_provider: bool,
+    /// Cumulative wall time this tick spent inside the sweep's DB calls — the
+    /// bounded `grounded=0` candidate SELECT, the durable cursor get/set, the
+    /// ≤K per-survivor root mints, and the batch flip. Each of those is the only
+    /// work that takes the single connection mutex (§6.3, §3.1 of
+    /// `docs/plans/2026-07-25-m3g-gate-criteria.md`), and the sweep holds the
+    /// mutex for nothing else — span validation is in-memory and entailment runs
+    /// fully outside any DB call. Under the uncontended lock of the Gate-3 bench
+    /// this equals the per-tick mutex-hold the latency ceiling measures. It is a
+    /// measurement field only; nothing branches on it.
+    pub db_mutex_hold: Duration,
 }
 
 /// Extract `payload.span.quote` (§2.4). `None` when there is no payload, no
@@ -296,11 +306,15 @@ async fn run_edge_grounding_with_budget(
         return Ok(report);
     }
 
+    let load_start = Instant::now();
     let mut state = load_state(db).await;
+    report.db_mutex_hold += load_start.elapsed();
     let start_cursor = state.cursor;
+    let scan_start = Instant::now();
     let candidates = db
         .edge_grounding_candidates(state.cursor, EDGE_GROUNDING_SCAN_PER_TICK)
         .await?;
+    report.db_mutex_hold += scan_start.elapsed();
     let mut entailment_budget = entailment_budget_max;
 
     for cand in candidates {
@@ -414,10 +428,12 @@ async fn run_edge_grounding_with_budget(
             agent_turn: None,
             import_batch: None,
         };
-        let root_id = match db
+        let mint_start = Instant::now();
+        let mint_result = db
             .acquire_provenance_root("document_ingest", content, &signals)
-            .await
-        {
+            .await;
+        report.db_mutex_hold += mint_start.elapsed();
+        let root_id = match mint_result {
             Ok(id) => id,
             Err(e) => {
                 log::warn!(
@@ -444,10 +460,12 @@ async fn run_edge_grounding_with_budget(
             &llm.model_id(),
             chrono::Utc::now().timestamp(),
         );
-        match db
+        let flip_start = Instant::now();
+        let flip_result = db
             .promote_edges_grounded(&[(cand.edge_id.clone(), root_id, payload)])
-            .await
-        {
+            .await;
+        report.db_mutex_hold += flip_start.elapsed();
+        match flip_result {
             Ok(_) => {
                 report.promoted += 1;
                 advance_cursor(&mut state, rowid);
@@ -468,7 +486,9 @@ async fn run_edge_grounding_with_budget(
     }
 
     report.progressed = state.cursor != start_cursor || report.promoted > 0;
+    let save_start = Instant::now();
     save_state(db, &state).await;
+    report.db_mutex_hold += save_start.elapsed();
     Ok(report)
 }
 
@@ -1124,6 +1144,92 @@ mod tests {
         assert!(t3.progressed, "cursor advances past the ejected edge");
     }
 
+    /// Gate 3 structural assertion (§3.2 of the gate-criteria doc), made
+    /// executable rather than left as a code comment: **no DB mutex (hence no
+    /// open transaction) is held across the entailment LLM call.** The provider
+    /// re-enters the SAME `MemoryDB` from inside `generate()` and takes the
+    /// connection mutex (`get_app_metadata`). `tokio::sync::Mutex` is NOT
+    /// re-entrant, so had the sweep still held the mutex when it called the LLM,
+    /// this re-entrant acquire would deadlock and the whole tick would hang; the
+    /// outer `timeout` converts that into a hard failure. The tick completing
+    /// (and the edge promoting) proves the mutex is free during entailment — the
+    /// worst-case guard the ms ceiling backs up. If a future change ever wraps
+    /// the entailment call in a transaction or holds the lock across it, this
+    /// test deadlocks and fails.
+    #[tokio::test]
+    async fn sweep_holds_no_db_mutex_across_entailment() {
+        struct ReentrantDbProvider {
+            db: Arc<MemoryDB>,
+            reentered: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl LlmProvider for ReentrantDbProvider {
+            async fn generate(&self, _request: LlmRequest) -> Result<String, LlmError> {
+                // Take the connection mutex mid-entailment. Deadlocks iff the
+                // sweep is (incorrectly) still holding it across this call.
+                let _ = self.db.get_app_metadata("gate3_reentrancy_probe").await;
+                self.reentered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("{\"score\": 0.95}".to_string())
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &str {
+                "reentrant-db-probe"
+            }
+            fn backend(&self) -> LlmBackend {
+                LlmBackend::OnDevice
+            }
+            fn model_id(&self) -> String {
+                "reentrant-db-probe".to_string()
+            }
+        }
+
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let db = Arc::new(db);
+        let content = "The charter records that Alice works on ProjectX.";
+        seed_folder_memory(&db, "doc_1", content, "space_a").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+
+        let provider = Arc::new(ReentrantDbProvider {
+            db: db.clone(),
+            reentered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        // If any mutex/txn spanned the entailment call, the re-entrant acquire
+        // inside generate() deadlocks and this times out.
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_edge_grounding_tick(&db, &llm, &PromptRegistry::default()),
+        )
+        .await
+        .expect("tick must not deadlock — no DB mutex may span the entailment call")
+        .unwrap();
+
+        assert!(
+            provider.reentered.load(std::sync::atomic::Ordering::SeqCst),
+            "the provider must have re-entered the DB mid-entailment (test is real)"
+        );
+        assert_eq!(
+            report.promoted, 1,
+            "the edge promotes after the free-lock LLM"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 1);
+    }
+
     #[tokio::test]
     async fn threshold_rejects_low_score() {
         let (db, _dir) = crate::db::tests::test_db().await;
@@ -1149,5 +1255,454 @@ mod tests {
         assert_eq!(report.promoted, 0, "score below threshold does not ground");
         let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
         assert_eq!(edge["grounded"], 0);
+    }
+
+    // ===== Stage C committed-fixture gate runners (Gate 1 + Gate 2.1) =========
+    //
+    // These drive the ONE real sweep (`run_edge_grounding_tick`) over the
+    // committed, hand-authored, deterministic fixtures under
+    // `tests/fixtures/m3g/`. Each gate has a fast HERMETIC test (scripted
+    // provider, runs in `cargo test -p wenlan-core --lib`) and an `#[ignore]`
+    // REAL-MODEL runner (pinned Qwen3-4B on Metal, manual-only) that measures
+    // the gate on the actual on-device entailment model. Gate criteria:
+    // `docs/plans/2026-07-25-m3g-gate-criteria.md`. Gate 2.2 (scale demo) and
+    // Gate 3 (latency) live in `db.rs` tests next to the M2 scale benches
+    // (`edge_grounding_scale_and_latency_bench`), because they need raw-SQL
+    // 100k/5k bulk seeding through the private connection.
+
+    #[derive(serde::Deserialize)]
+    struct Gate1Fixture {
+        cases: Vec<Gate1Case>,
+    }
+    #[derive(serde::Deserialize, Clone)]
+    struct Gate1Case {
+        id: String,
+        class: String,
+        from: String,
+        to: String,
+        relation_type: String,
+        source_id: String,
+        source_agent: String,
+        content: String,
+        span: Option<String>,
+        as_backlog: bool,
+        hermetic_score: f64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Gate2Fixture {
+        cases: Vec<Gate2Case>,
+    }
+    #[derive(serde::Deserialize, Clone)]
+    struct Gate2Case {
+        id: String,
+        from: String,
+        to: String,
+        relation_type: String,
+        source_id: String,
+        #[serde(default)]
+        url: Option<String>,
+        content: String,
+        span: String,
+    }
+
+    fn load_gate1_cases() -> Vec<Gate1Case> {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/m3g/gate1_negative.json"
+        ))
+        .expect("read gate1 fixture");
+        serde_json::from_str::<Gate1Fixture>(&raw)
+            .expect("parse gate1 fixture")
+            .cases
+    }
+
+    fn load_gate2_cases() -> Vec<Gate2Case> {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/m3g/gate2_positive.json"
+        ))
+        .expect("read gate2 fixture");
+        serde_json::from_str::<Gate2Fixture>(&raw)
+            .expect("parse gate2 fixture")
+            .cases
+    }
+
+    async fn seed_doc_memory(
+        db: &MemoryDB,
+        source_id: &str,
+        content: &str,
+        space: &str,
+        source_agent: &str,
+        url: Option<&str>,
+    ) {
+        db.upsert_documents(vec![RawDocument {
+            source: "memory".to_string(),
+            source_id: source_id.to_string(),
+            title: source_id.to_string(),
+            content: content.to_string(),
+            last_modified: 1_712_707_200,
+            space: Some(space.to_string()),
+            source_agent: Some(source_agent.to_string()),
+            confirmed: Some(true),
+            url: url.map(str::to_string),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+    }
+
+    /// Run full ticks (budget 25) until the sweep stops making progress.
+    /// Returns (promoted, entailment_calls, ticks). Bounded to 200 ticks so a
+    /// wiring bug surfaces as a failed assert, not a hang.
+    async fn drain_all_ticks(
+        db: &MemoryDB,
+        llm: &Arc<dyn LlmProvider>,
+        prompts: &PromptRegistry,
+    ) -> (usize, usize, usize) {
+        let (mut promoted, mut calls, mut ticks) = (0usize, 0usize, 0usize);
+        loop {
+            let r = run_edge_grounding_tick(db, llm, prompts).await.unwrap();
+            promoted += r.promoted;
+            calls += r.entailment_calls;
+            ticks += 1;
+            if !r.progressed || ticks >= 200 {
+                break;
+            }
+        }
+        (promoted, calls, ticks)
+    }
+
+    /// Gate 1 (hermetic): the scripted provider returns each case's
+    /// `hermetic_score` (keyed on the globally-unique `from` name). The gate is
+    /// exactly-zero promoted, and the entailment-call count proves the free
+    /// gates short-circuit: class A (fabricated span) and N (non-external) never
+    /// reach the LLM, while B/C/D do and are rejected.
+    #[tokio::test]
+    async fn gate1_hermetic_zero_promoted_and_wiring() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let space = "gate1";
+        let cases = load_gate1_cases();
+        assert!(
+            cases.len() >= 24,
+            "fixture must carry the full negative set"
+        );
+
+        let mut edge_ids = Vec::new();
+        let mut rules: Vec<(String, f64)> = Vec::new();
+        let mut expected_calls = 0usize;
+        for c in &cases {
+            seed_doc_memory(&db, &c.source_id, &c.content, space, &c.source_agent, None).await;
+            let span = if c.as_backlog {
+                None
+            } else {
+                c.span.as_deref()
+            };
+            let edge_id = seed_edge(
+                &db,
+                &c.from,
+                &c.to,
+                &c.relation_type,
+                space,
+                &c.source_id,
+                span,
+                &c.content,
+            )
+            .await;
+            edge_ids.push((c.id.clone(), c.class.clone(), edge_id));
+            rules.push((c.from.clone(), c.hermetic_score));
+            // A case reaches entailment iff it is folder-sourced AND either has
+            // no span (backlog) or a span that actually locates in content.
+            let reaches = c.source_agent == "folder"
+                && (c.as_backlog
+                    || c.span
+                        .as_deref()
+                        .map(|q| c.content.contains(q))
+                        .unwrap_or(false));
+            if reaches {
+                expected_calls += 1;
+            }
+        }
+
+        let provider = Arc::new(ScriptedEntailment {
+            rules,
+            default: 0.0,
+            available: true,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let (promoted, calls, _ticks) =
+            drain_all_ticks(&db, &llm, &PromptRegistry::default()).await;
+
+        assert_eq!(promoted, 0, "Gate 1 HARD: exactly zero false-grounding");
+        assert_eq!(
+            calls, expected_calls,
+            "class A (span) + N (origin) must short-circuit before the LLM; \
+             only B/C/D reach entailment"
+        );
+        for (id, class, edge_id) in &edge_ids {
+            let edge = db.edge_snapshot_for_test(edge_id).await.unwrap();
+            assert_eq!(
+                edge["grounded"], 0,
+                "case {id} (class {class}) must stay grounded=0"
+            );
+        }
+    }
+
+    /// Gate 2.1 (hermetic): with an all-entailing scripted provider every true
+    /// relation promotes, each with a real `document_ingest` root; the
+    /// root-correctness structure holds (same source memory -> one root; shared
+    /// file -> distinct roots, one independence group).
+    #[tokio::test]
+    async fn gate2_hermetic_promotes_all_and_root_correct() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let space = "gate2";
+        let cases = load_gate2_cases();
+        assert!(cases.len() >= 50, "recall floor needs >=50 positives");
+
+        let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Seed each DISTINCT source memory exactly once: re-upserting an existing
+        // source_id invalidates that memory's derived relations/edges (db.rs
+        // upsert replace semantics), which would destroy an already-seeded edge.
+        // The shared-source case (P50a/P50b) is "two relations from ONE memory".
+        let mut seeded: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &cases {
+            if seeded.insert(c.source_id.clone()) {
+                seed_doc_memory(
+                    &db,
+                    &c.source_id,
+                    &c.content,
+                    space,
+                    "folder",
+                    c.url.as_deref(),
+                )
+                .await;
+            }
+            let edge_id = seed_edge(
+                &db,
+                &c.from,
+                &c.to,
+                &c.relation_type,
+                space,
+                &c.source_id,
+                Some(&c.span),
+                &c.content,
+            )
+            .await;
+            by_id.insert(c.id.clone(), edge_id);
+        }
+
+        let (_p, llm) = scripted(&[], 0.9);
+        let (promoted, _calls, _ticks) =
+            drain_all_ticks(&db, &llm, &PromptRegistry::default()).await;
+
+        // Every true relation promotes and is root-correct (name the misses).
+        let mut missed = Vec::new();
+        for c in &cases {
+            let edge = db.edge_snapshot_for_test(&by_id[&c.id]).await.unwrap();
+            if edge["grounded"] != serde_json::json!(1) {
+                missed.push(c.id.clone());
+                continue;
+            }
+            let root_id = edge["root_id"].as_str().expect("non-NULL root_id");
+            let (kind, _grp) = db.provenance_root_row_for_test(root_id).await.unwrap();
+            assert_eq!(kind, "document_ingest", "{} root_kind", c.id);
+        }
+        assert!(
+            missed.is_empty(),
+            "all true relations promote under all-entail; missed {missed:?}"
+        );
+        assert_eq!(promoted, cases.len(), "promoted count matches case count");
+
+        // Same source memory (P50a/P50b) -> one root_id.
+        let r50a = db.edge_snapshot_for_test(&by_id["P50a"]).await.unwrap();
+        let r50b = db.edge_snapshot_for_test(&by_id["P50b"]).await.unwrap();
+        assert_eq!(
+            r50a["root_id"], r50b["root_id"],
+            "two relations from one source memory share one root_id"
+        );
+
+        // Shared file, distinct content (P51/P52) -> distinct roots, one group.
+        let r51 = db.edge_snapshot_for_test(&by_id["P51"]).await.unwrap();
+        let r52 = db.edge_snapshot_for_test(&by_id["P52"]).await.unwrap();
+        assert_ne!(
+            r51["root_id"], r52["root_id"],
+            "distinct chunks/docs get distinct roots"
+        );
+        let (_k51, g51) = db
+            .provenance_root_row_for_test(r51["root_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        let (_k52, g52) = db
+            .provenance_root_row_for_test(r52["root_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            g51, g52,
+            "distinct chunks of one file share one independence_group_id"
+        );
+    }
+
+    /// Gate 1 (REAL MODEL, manual-only). PASS = exactly 0 promoted on the pinned
+    /// Qwen3-4B. A promotion here is a false-grounding; if it is a B/D-backlog
+    /// case the pinned model cannot reject, that is the gate doc's STOP
+    /// condition (report BLOCKED, do not lower the bar).
+    ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
+    ///     edge_grounding::tests::gate1_zero_false_grounding_real_model \
+    ///     -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn gate1_zero_false_grounding_real_model() {
+        use crate::llm_provider::OnDeviceProvider;
+        let llm: Arc<dyn LlmProvider> = match OnDeviceProvider::new() {
+            Ok(p) if p.is_available() => Arc::new(p),
+            _ => {
+                eprintln!("[gate1] SKIP: on-device model unavailable");
+                return;
+            }
+        };
+        // Warm the model so the first sweep call is not cold under the 10s cap.
+        let _ = llm
+            .generate(LlmRequest {
+                system_prompt: None,
+                user_prompt: "reply with {\"score\": 0.0}".to_string(),
+                max_tokens: 16,
+                temperature: 0.0,
+                label: Some("gate1_warmup".to_string()),
+                timeout_secs: None,
+            })
+            .await;
+
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let space = "gate1";
+        let cases = load_gate1_cases();
+        let mut edge_ids = Vec::new();
+        for c in &cases {
+            seed_doc_memory(&db, &c.source_id, &c.content, space, &c.source_agent, None).await;
+            let span = if c.as_backlog {
+                None
+            } else {
+                c.span.as_deref()
+            };
+            let edge_id = seed_edge(
+                &db,
+                &c.from,
+                &c.to,
+                &c.relation_type,
+                space,
+                &c.source_id,
+                span,
+                &c.content,
+            )
+            .await;
+            edge_ids.push((c.id.clone(), c.class.clone(), edge_id));
+        }
+
+        let (promoted, calls, ticks) = drain_all_ticks(&db, &llm, &PromptRegistry::default()).await;
+        eprintln!(
+            "[gate1] real-model: cases={} entailment_calls={calls} ticks={ticks} promoted={promoted}",
+            cases.len()
+        );
+        let mut leaked = Vec::new();
+        for (id, class, edge_id) in &edge_ids {
+            let edge = db.edge_snapshot_for_test(edge_id).await.unwrap();
+            if edge["grounded"] != serde_json::json!(0) {
+                leaked.push(format!("{id}({class})"));
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "Gate 1 HARD FAIL — false-grounded on real model: {leaked:?}"
+        );
+        assert_eq!(
+            promoted, 0,
+            "Gate 1: exactly zero promoted on the real model"
+        );
+    }
+
+    /// Gate 2.1 (REAL MODEL, manual-only). PASS = >=80% (>=43/53) promoted, each
+    /// promoted edge root-correct.
+    ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
+    ///     edge_grounding::tests::gate2_coverage_floor_real_model \
+    ///     -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn gate2_coverage_floor_real_model() {
+        use crate::llm_provider::OnDeviceProvider;
+        let llm: Arc<dyn LlmProvider> = match OnDeviceProvider::new() {
+            Ok(p) if p.is_available() => Arc::new(p),
+            _ => {
+                eprintln!("[gate2] SKIP: on-device model unavailable");
+                return;
+            }
+        };
+        let _ = llm
+            .generate(LlmRequest {
+                system_prompt: None,
+                user_prompt: "reply with {\"score\": 1.0}".to_string(),
+                max_tokens: 16,
+                temperature: 0.0,
+                label: Some("gate2_warmup".to_string()),
+                timeout_secs: None,
+            })
+            .await;
+
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let space = "gate2";
+        let cases = load_gate2_cases();
+        let mut by_id = std::collections::HashMap::new();
+        // Seed each distinct source memory once (see the hermetic gate2 note).
+        let mut seeded: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &cases {
+            if seeded.insert(c.source_id.clone()) {
+                seed_doc_memory(
+                    &db,
+                    &c.source_id,
+                    &c.content,
+                    space,
+                    "folder",
+                    c.url.as_deref(),
+                )
+                .await;
+            }
+            let edge_id = seed_edge(
+                &db,
+                &c.from,
+                &c.to,
+                &c.relation_type,
+                space,
+                &c.source_id,
+                Some(&c.span),
+                &c.content,
+            )
+            .await;
+            by_id.insert(c.id.clone(), edge_id);
+        }
+
+        let (promoted, calls, ticks) = drain_all_ticks(&db, &llm, &PromptRegistry::default()).await;
+        let mut missed = Vec::new();
+        for c in &cases {
+            let edge = db.edge_snapshot_for_test(&by_id[&c.id]).await.unwrap();
+            if edge["grounded"] == serde_json::json!(1) {
+                // Root-correctness on every promoted edge.
+                let root_id = edge["root_id"].as_str().expect("promoted edge has root_id");
+                let (kind, _grp) = db.provenance_root_row_for_test(root_id).await.unwrap();
+                assert_eq!(kind, "document_ingest", "{} root_kind", c.id);
+            } else {
+                missed.push(c.id.clone());
+            }
+        }
+        let recall = promoted as f64 / cases.len() as f64;
+        eprintln!(
+            "[gate2] real-model: promoted={promoted}/{} recall={:.1}% calls={calls} ticks={ticks} missed={missed:?}",
+            cases.len(),
+            recall * 100.0
+        );
+        assert!(
+            promoted * 5 >= cases.len() * 4,
+            "Gate 2 FLOOR: recall {:.1}% < 80% ({promoted}/{})",
+            recall * 100.0,
+            cases.len()
+        );
     }
 }
