@@ -95,7 +95,7 @@ Supported builds and prebuilt releases cover macOS arm64, Linux x86_64/aarch64 w
 
 ### llama-cpp-2 backend
 
-By default, Linux and Windows builds are CPU-only. macOS keeps Metal. CUDA and Vulkan backends are not enabled in v1; they will land behind opt-in cargo features in a follow-up.
+macOS builds use Metal, Windows x86_64 builds use Vulkan with observable CPU/OpenMP fallback, and Linux builds remain CPU/OpenMP. Windows setup, device selection, CI/release prerequisites, and physical Qwen live-smoke commands are in [`docs/windows-vulkan.md`](docs/windows-vulkan.md).
 
 ### ORT (ONNX Runtime) on Windows
 
@@ -105,9 +105,9 @@ If you see `Failed to load onnxruntime.dll` or version-mismatch errors on Window
 
 The daemon binds to `127.0.0.1:7878` by default. To expose it on a non-loopback address (e.g., inside Docker), set `WENLAN_BIND_ADDR=0.0.0.0:7878` in the daemon's environment. The Docker image already sets this.
 
-### Manual Windows verification from macOS
+### Manual Windows verification
 
-The CI matrix runs `windows-2022` on every PR and is the primary signal. For hands-on testing, run a Windows 11 VM via UTM or Parallels; install MSVC 2022 Build Tools and Rust; then `cargo build --release -p wenlan-server` and `scripts/smoke-windows.ps1`.
+The CI matrix includes `windows-2022` for Windows-affecting PRs, but hosted runners do not prove physical GPU inference. Follow [`docs/windows-vulkan.md`](docs/windows-vulkan.md) on a real Windows 11 GPU machine and run all three Qwen live-smoke legs: Vulkan/device assertion, forced CPU, and injected CPU fallback.
 
 ### Linux smoke from macOS
 

@@ -91,7 +91,10 @@ fastembed = { workspace = true, features = ["ort-download-binaries-native-tls"] 
 [target.'cfg(target_os = "macos")'.dependencies]
 llama-cpp-2 = { version = "0.1", features = ["metal", "sampler"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
+llama-cpp-2 = { version = "0.1", features = ["vulkan", "sampler"] }
+
+[target.'cfg(all(not(target_os = "macos"), not(target_os = "windows")))'.dependencies]
 llama-cpp-2 = { version = "0.1", features = ["sampler"] }
 
 [build-dependencies]

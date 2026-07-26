@@ -32,6 +32,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_path = PathBuf::from(&args[1]);
     let prompts = PromptRegistry::default();
     let engine = LlmEngine::new(&model_path, prompts.clone())?;
+    let runtime = engine.inference_runtime_info();
+
+    println!("--- Inference backend: {} ---", runtime.backend);
+    println!(
+        "--- Inference device index: {} ---",
+        runtime
+            .device_index
+            .map_or_else(|| "none".to_string(), |index| index.to_string())
+    );
+    println!(
+        "--- Inference device: {} ---",
+        runtime.device.as_deref().unwrap_or("none")
+    );
+    if let Some(reason) = runtime.fallback_reason.as_deref() {
+        println!("--- Inference fallback: {reason} ---");
+    }
 
     let system = prompts.classify_memory.clone();
     let user = "I prefer tabs over spaces for indentation.";

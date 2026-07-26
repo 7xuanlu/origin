@@ -228,15 +228,13 @@ async fn check_daemon_not_running() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn check_service_unloaded_returns_ok_when_no_service_installed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let unit = tmp.path().join("com.wenlan.server.plist");
 
-        check_service_unit_absent(&unit).expect("expected Ok for absent test unit");
+        super::check_service_unit_absent(&unit).expect("expected Ok for absent test unit");
     }
 
     /// Pin both copies (CLI + server) to the on-disk paths `service-manager`

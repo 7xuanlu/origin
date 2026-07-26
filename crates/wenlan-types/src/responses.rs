@@ -144,6 +144,41 @@ pub enum QueueStatus {
     },
 }
 
+/// Observable runtime selected for the local llama.cpp model.
+///
+/// This is additive to `/api/status`: older daemons omit it and deserialize as
+/// `backend = "disabled"`. A GPU failure is visible through
+/// `fallback_reason` even when the provider recovered and is serving on CPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDeviceInferenceStatus {
+    #[serde(default = "default_disabled_backend")]
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_index: Option<usize>,
+    #[serde(default)]
+    pub gpu_layers: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+fn default_disabled_backend() -> String {
+    "disabled".to_string()
+}
+
+impl Default for OnDeviceInferenceStatus {
+    fn default() -> Self {
+        Self {
+            backend: default_disabled_backend(),
+            device: None,
+            device_index: None,
+            gpu_layers: 0,
+            fallback_reason: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub is_running: bool,
@@ -174,6 +209,11 @@ pub struct StatusResponse {
     /// daemons that predate `WENLAN_RERANKER_MODE`.
     #[serde(default)]
     pub reranker_mode: String,
+    /// llama.cpp runtime used by the selected on-device provider. Additive:
+    /// defaults to `disabled` for older daemons and for installations without
+    /// a local model.
+    #[serde(default)]
+    pub on_device_inference: OnDeviceInferenceStatus,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1419,6 +1459,37 @@ mod queue_status_tests {
             r#"{"is_running":true,"files_indexed":0,"files_total":0,"sources_connected":[]}"#;
         let parsed: StatusResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.queue, QueueStatus::Idle);
+        assert_eq!(
+            parsed.on_device_inference,
+            OnDeviceInferenceStatus::default()
+        );
+    }
+
+    #[test]
+    fn on_device_inference_status_round_trips_vulkan_device_and_fallback() {
+        let status = OnDeviceInferenceStatus {
+            backend: "vulkan".into(),
+            device: Some("NVIDIA GeForce RTX 3060 Laptop GPU".into()),
+            device_index: Some(2),
+            gpu_layers: 99,
+            fallback_reason: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: OnDeviceInferenceStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, status);
+        assert!(json.contains("\"backend\":\"vulkan\""));
+        assert!(json.contains("RTX 3060"));
+
+        let fallback: OnDeviceInferenceStatus = serde_json::from_str(
+            r#"{"backend":"cpu","gpu_layers":0,"fallback_reason":"Vulkan context creation failed"}"#,
+        )
+        .unwrap();
+        assert_eq!(fallback.backend, "cpu");
+        assert_eq!(
+            fallback.fallback_reason.as_deref(),
+            Some("Vulkan context creation failed")
+        );
     }
 
     #[test]
@@ -1486,6 +1557,7 @@ mod reranker_status_tests {
                 model_id: "JINARerankerV1TurboEn".into(),
             },
             reranker_mode: "full".into(),
+            on_device_inference: OnDeviceInferenceStatus::default(),
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();

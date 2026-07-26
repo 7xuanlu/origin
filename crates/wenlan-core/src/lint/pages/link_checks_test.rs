@@ -4,14 +4,16 @@ use crate::lint::context::{
     AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
 };
 use crate::lint::pages::fs::scan_page_root;
+#[cfg(unix)]
 use crate::lint::runner::LintRunner;
 use crate::lint::snapshot::LintReadSnapshot;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
+#[cfg(unix)]
+use wenlan_types::lint::LintQuery;
 use wenlan_types::lint::{
-    LintApplicability, LintMetricCode, LintMetricValue, LintOpaqueId, LintOutcome, LintQuery,
-    LintSeverity,
+    LintApplicability, LintMetricCode, LintMetricValue, LintOpaqueId, LintOutcome, LintSeverity,
 };
 
 #[path = "link_checks_test/artifacts.rs"]

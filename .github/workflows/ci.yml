@@ -233,6 +233,12 @@ jobs:
               - 'scripts/smoke-windows-llm.test.ps1'
               - 'scripts/stabilize-rust-cache-toolchains.sh'
               - 'scripts/stabilize-rust-cache-toolchains.test.sh'
+              - 'scripts/setup-vulkan-sdk-windows.ps1'
+              - 'scripts/setup-vulkan-sdk-windows.test.ps1'
+              - 'scripts/stage-vulkan-loader-windows.ps1'
+              - 'scripts/stage-vulkan-loader-windows.test.ps1'
+              - 'scripts/setup-msvc-ninja-windows.ps1'
+              - 'scripts/setup-msvc-ninja-windows.test.ps1'
               - 'scripts/release_targets.py'
               - 'scripts/release_targets.test.py'
               - 'scripts/build-release-binaries.sh'
@@ -263,6 +269,8 @@ jobs:
               # its implementation or harness changes.
               - 'crates/wenlan-core/src/lint/**'
               - 'scripts/lint-scale-gate.sh'
+              - 'scripts/stage-vulkan-loader-windows.ps1'
+              - 'scripts/stage-vulkan-loader-windows.test.ps1'
             release-preflight:
               # The four shipped release targets build only when a PR can
               # change native linkage, Cargo/build inputs, or packaged output.
@@ -291,6 +299,12 @@ jobs:
               - 'scripts/smoke-windows.ps1'
               - 'scripts/smoke-windows-llm.ps1'
               - 'scripts/smoke-windows-llm.test.ps1'
+              - 'scripts/setup-vulkan-sdk-windows.ps1'
+              - 'scripts/setup-vulkan-sdk-windows.test.ps1'
+              - 'scripts/stage-vulkan-loader-windows.ps1'
+              - 'scripts/stage-vulkan-loader-windows.test.ps1'
+              - 'scripts/setup-msvc-ninja-windows.ps1'
+              - 'scripts/setup-msvc-ninja-windows.test.ps1'
               - 'scripts/release_targets.py'
               - 'scripts/release_targets.test.py'
               - 'scripts/build-release-binaries.sh'
@@ -442,9 +456,10 @@ jobs:
     needs: [detect-changes]
     if: "needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || github.event_name != 'pull_request'"
     runs-on: ${{ matrix.os }}
-    # Pull requests keep a hard wall-clock budget. Non-PR runs add the full
-    # platform backstop, so they retain enough proof budget to finish.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
+    # Pull requests keep a hard wall-clock budget. Windows needs the full
+    # backstop because its Vulkan/native bootstrap plus integration suite can
+    # exceed 30 minutes on a cold hosted runner; other PR platforms stay at 30.
+    timeout-minutes: ${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 30 }}
     strategy:
       # Cancel the rest of the matrix when one OS fails. Saves ~20-30min
       # per PR when a real bug breaks all platforms — Linux/macOS catch
@@ -492,6 +507,8 @@ jobs:
           if (-not (Test-Path $lld)) {
             throw "rust-lld.exe missing at $lld"
           }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Set up sccache
@@ -528,10 +545,27 @@ jobs:
           vcpkg install sqlite3:x64-windows-static-md
           "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
         shell: pwsh
+      - name: Set up Vulkan SDK (Windows only)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          & scripts/setup-vulkan-sdk-windows.test.ps1
+          & scripts/setup-vulkan-sdk-windows.ps1
+          & scripts/stage-vulkan-loader-windows.test.ps1
+          $loaderDir = Join-Path $env:RUNNER_TEMP "wenlan-test-vulkan-loader"
+          & scripts/stage-vulkan-loader-windows.ps1 `
+            -DestinationDirectory $loaderDir
+      - name: Configure MSVC Ninja (Windows tests)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.test.ps1
+          & scripts/setup-msvc-ninja-windows.ps1
       # The hosted runner currently exposes an unrelated onnxruntime.dll on
       # its default DLL search path. Dynamic-ORT tests must never pick that up:
       # stage the SHA-verified runtime before any inference-capable test and
-      # pin the exact absolute path for all later Windows test steps.
+      # pin both the dynamic loader's absolute path and a job-scoped fallback
+      # search directory for all later Windows test steps.
       - name: Stage ONNX Runtime for Windows tests
         if: matrix.os == 'windows-2022'
         shell: pwsh
@@ -541,6 +575,7 @@ jobs:
           & scripts/stage-onnxruntime-windows.ps1 -DestinationDirectory $ortDir
           $ortDll = (Resolve-Path (Join-Path $ortDir "onnxruntime.dll")).Path
           "ORT_DYLIB_PATH=$ortDll" | Out-File -FilePath $env:GITHUB_ENV -Append
+          (Split-Path -Parent $ortDll) | Out-File -FilePath $env:GITHUB_PATH -Append
       # nextest runs tests as separate processes in parallel; ~2x faster
       # than `cargo test` on multi-core runners. Install on all 3 OSes.
       - name: Install cargo-nextest
@@ -654,14 +689,17 @@ jobs:
         if: (matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || needs.detect-changes.outputs.mcp-platform == 'true')
         run: cargo check -p wenlan-mcp --lib --bins
       # Ordinary Windows PR proof uses debug artifacts already warmed by the
-      # integration suite. Stage the pinned DLL next to the daemon because the
-      # scheduled task does not inherit ORT_DYLIB_PATH from this runner shell.
+      # integration suite. Stage both pinned runtime DLLs next to the daemon
+      # because the scheduled task must not depend on this runner shell's
+      # ORT_DYLIB_PATH or Vulkan SDK PATH.
       - name: Build Windows contract binaries
         if: matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           cargo build -p wenlan -p wenlan-server
           & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\debug"
+          & scripts/stage-vulkan-loader-windows.ps1 `
             -DestinationDirectory "target\debug"
 
       - name: Validate Windows LLM probe
@@ -864,10 +902,11 @@ jobs:
     needs: [detect-changes]
     if: "github.event_name != 'pull_request' || needs.detect-changes.outputs.release-preflight == 'true'"
     runs-on: ${{ matrix.os }}
-    # 30 minutes is the performance target, not a correctness timeout. The
-    # larger PR ceiling keeps a cold Windows cache miss from becoming an
-    # infrastructure failure while live hosted-run data is collected.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 45 || 60 }}
+    # 30 minutes is the performance target, not a correctness timeout. Keep
+    # non-Windows PR targets at 45 minutes and non-PR backstops at 60. Hosted
+    # Windows serial native release builds have measured over 55 minutes before
+    # their executable smoke, so retain a bounded 90-minute cold-cache ceiling.
+    timeout-minutes: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}
     strategy:
       fail-fast: true
       matrix: ${{ fromJSON(needs.detect-changes.outputs.release-targets) }}
@@ -890,6 +929,10 @@ jobs:
           if (-not (Test-Path $lld)) {
             throw "rust-lld.exe missing at $lld"
           }
+          # `--target` keeps RUSTFLAGS away from host build scripts. Pin the
+          # host triple's linker too so Git Bash cannot resolve usr/bin/link.exe.
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Select native Perl for vendored OpenSSL
@@ -930,6 +973,36 @@ jobs:
           vcpkg install sqlite3:x64-windows-static-md
           "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" |
             Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Set up Vulkan SDK (Windows only)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & scripts/setup-vulkan-sdk-windows.test.ps1
+          & scripts/setup-vulkan-sdk-windows.ps1
+      - name: Configure MSVC Ninja (Windows release proof)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.test.ps1
+          & scripts/setup-msvc-ninja-windows.ps1
+      # Cargo remains serialized to cap peak native memory while Ninja owns
+      # dependency-correct ordering for llama.cpp's nested Vulkan build.
+      - name: Serialize native build (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: '"CARGO_BUILD_JOBS=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
+      # The shared build script launches each shipped executable immediately
+      # after linking it. Stage load-time DLLs first; a later PATH update cannot
+      # rescue process startup under Git Bash or Task Scheduler.
+      - name: Stage Windows release runtimes before smoke
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & scripts/stage-vulkan-loader-windows.test.ps1
+          & scripts/stage-vulkan-loader-windows.ps1 `
+            -DestinationDirectory "target\${{ matrix.target }}\release"
+          & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\${{ matrix.target }}\release"
       - name: Build and smoke shipped release binaries
         shell: bash
         run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
@@ -937,8 +1010,6 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          & scripts/stage-onnxruntime-windows.ps1 `
-            -DestinationDirectory "target\${{ matrix.target }}\release"
           & scripts/smoke-windows.ps1 `
             -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
 

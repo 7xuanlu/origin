@@ -47,7 +47,15 @@ try {
     @'
 @echo off
 if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="exit" exit /b 17
-if /I not "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="missing-backend" echo [llm_engine] inference backend=CPU ^(OpenMP^)
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="vulkan" echo --- Inference backend: vulkan ---
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="vulkan" echo --- Inference device: NVIDIA GeForce RTX 3060 Laptop GPU ---
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="missing-device" echo --- Inference backend: vulkan ---
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="fallback" echo --- Inference backend: cpu ---
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="fallback" echo --- Inference fallback: requested GPU device index 99 is unavailable ---
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="pass" echo --- Inference backend: cpu ---
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="cpu-gpu-leak" echo --- Inference backend: cpu ---
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="cpu-gpu-leak" echo sched_reserve: Vulkan1 compute buffer size = 630.52 MiB
+if /I "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="missing-classification" echo --- Inference backend: cpu ---
 if /I not "%WENLAN_LLM_SMOKE_STUB_SCENARIO%"=="missing-classification" echo --- Verified classification: preference ---
 exit /b 0
 '@ | Set-Content -Path $probePath -Encoding ascii
@@ -56,6 +64,23 @@ exit /b 0
     & $smokeScript `
         -ModelPath $modelPath `
         -ProbePath $probePath `
+        -SkipHardwareInventory
+
+    $env:WENLAN_LLM_SMOKE_STUB_SCENARIO = "vulkan"
+    & $smokeScript `
+        -ModelPath $modelPath `
+        -ProbePath $probePath `
+        -ExpectedBackend vulkan `
+        -ExpectedDevicePattern "NVIDIA.*RTX 3060" `
+        -SkipHardwareInventory
+
+    $env:WENLAN_LLM_SMOKE_STUB_SCENARIO = "fallback"
+    & $smokeScript `
+        -ModelPath $modelPath `
+        -ProbePath $probePath `
+        -Device 99 `
+        -ExpectedBackend cpu `
+        -ExpectedFallbackPattern "requested GPU device index 99 is unavailable" `
         -SkipHardwareInventory
 
     Assert-SmokeFails `
@@ -67,6 +92,28 @@ exit /b 0
     Assert-SmokeFails `
         -Scenario "missing-classification" `
         -ExpectedMessage "expected classification"
+    Assert-SmokeFails `
+        -Scenario "cpu-gpu-leak" `
+        -ExpectedMessage "CPU smoke observed GPU runtime allocation"
+    $env:WENLAN_LLM_SMOKE_STUB_SCENARIO = "missing-device"
+    $failed = $false
+    try {
+        & $smokeScript `
+            -ModelPath $modelPath `
+            -ProbePath $probePath `
+            -ExpectedBackend vulkan `
+            -ExpectedDevicePattern "NVIDIA.*RTX 3060" `
+            -SkipHardwareInventory
+    }
+    catch {
+        $failed = $true
+        if (-not $_.Exception.Message.Contains("expected device matching")) {
+            throw "missing-device failed for the wrong reason: $($_.Exception.Message)"
+        }
+    }
+    if (-not $failed) {
+        throw "missing-device unexpectedly passed"
+    }
 
     Write-Host "PASS: Windows LLM smoke harness behavior"
 }
