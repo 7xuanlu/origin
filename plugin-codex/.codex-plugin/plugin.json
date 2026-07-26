@@ -1,6 +1,6 @@
 {
   "name": "wenlan",
-  "version": "0.14.1+codex",
+  "version": "0.15.0+codex",
   "description": "A living knowledge base your agents build as they work. What they learn becomes source-cited wiki pages that refresh between sessions, so each new thread starts from your latest work.",
   "author": {
     "name": "Qi-Xuan Lu",
