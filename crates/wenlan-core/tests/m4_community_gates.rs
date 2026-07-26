@@ -397,6 +397,36 @@ fn m4_rebinding_fractionally_weights_boundary_nodes_by_grounded_adjacency() {
 }
 
 #[test]
+fn m4_rebinding_never_lets_new_node_sentinels_steal_a_durable_identity() {
+    let mut edges = vec![ProjectionInputEdge::new("old-hub", "old", "hub")];
+    for leaf in 0..8 {
+        edges.push(ProjectionInputEdge::new(
+            format!("hub-leaf-{leaf}"),
+            "hub",
+            format!("leaf-{leaf}"),
+        ));
+    }
+    let graph = project_grounded_relates(&edges, ProjectionConfig::default());
+    let previous = graph
+        .node_ids()
+        .iter()
+        .map(|node_id| {
+            if node_id == "old" {
+                "durable-old".to_owned()
+            } else {
+                format!("__m4-new-node-{node_id}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let rebound = rebind_durable_ids_weighted(&previous, &vec![7; previous.len()], &graph);
+
+    assert!(
+        rebound.iter().all(|community_id| community_id == "durable-old"),
+        "synthetic new-node markers are not prior communities and must never outvote a real durable id: {rebound:?}"
+    );
+}
+
+#[test]
 #[ignore = "manual M4 Gate 1.2 multi-size locality receipt"]
 fn m4_incremental_cost_tracks_frontier_size_not_total_graph_size() {
     const RUNS: usize = 21;
@@ -1080,7 +1110,11 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
             "INSERT INTO entities \
                 (id, name, entity_type, space, created_at, updated_at) VALUES \
                 ('isolated-ungrounded', 'isolated-ungrounded', 'concept', ?1, 1712707200, 1712707200), \
-                ('isolated-none', 'isolated-none', 'concept', ?1, 1712707200, 1712707200)",
+                ('isolated-none', 'isolated-none', 'concept', ?1, 1712707200, 1712707200), \
+                ('z-chain-a', 'z-chain-a', 'concept', ?1, 1712707200, 1712707200), \
+                ('z-chain-b', 'z-chain-b', 'concept', ?1, 1712707200, 1712707200), \
+                ('z-cycle-a', 'z-cycle-a', 'concept', ?1, 1712707200, 1712707200), \
+                ('z-cycle-b', 'z-cycle-b', 'concept', ?1, 1712707200, 1712707200)",
             libsql::params![SPACE],
         )
         .await
@@ -1127,9 +1161,26 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         .expect("seed ungrounded isolated attachment");
     observer
         .execute(
+            "INSERT INTO edges \
+                (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, \
+                 grounded, root_id, space, created_at) VALUES \
+                ('chain-a-b', 'z-chain-a', 'entity', 'z-chain-b', 'entity', \
+                 'relates', 'assertion', 0, NULL, ?1, 1712707200), \
+                ('chain-b-core-1', 'z-chain-b', 'entity', 'core-00', 'entity', \
+                 'relates', 'assertion', 0, NULL, ?1, 1712707200), \
+                ('chain-b-core-2', 'z-chain-b', 'entity', 'core-00', 'entity', \
+                 'relates', 'assertion', 0, NULL, ?1, 1712707200), \
+                ('cycle-a-b', 'z-cycle-a', 'entity', 'z-cycle-b', 'entity', \
+                 'relates', 'assertion', 0, NULL, ?1, 1712707200)",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("seed multi-hop and cyclic ungrounded attachments");
+    observer
+        .execute(
             "INSERT INTO space_graph_state \
-                (space, graph_generation, published_generation, dirty) \
-             VALUES (?1, 1, NULL, 1)",
+                (space, graph_generation, grouping_generation, published_generation, dirty) \
+             VALUES (?1, 1, 1, NULL, 1)",
             libsql::params![SPACE],
         )
         .await
@@ -1152,19 +1203,48 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
     let runtime = CommunityGroupingRuntime::default();
     let computed =
         compute_community_grouping(&attempt, &runtime).expect("compute isolated grouping");
-    let receipt = match db
+    let late_relation = db
+        .create_relation(
+            "isolated-none",
+            "core-00",
+            "related_to",
+            Some("m4-review"),
+            Some(1.0),
+            Some("attachment input changes after prepare"),
+            None,
+        )
+        .await
+        .expect("write an ungrounded attachment after prepare");
+    let stale = match db
         .finalize_community_grouping(attempt, computed)
         .await
         .expect("finalize isolated grouping")
     {
-        CommunityGroupingOutcome::Published(receipt) => receipt,
-        other => panic!("the sole lease winner must publish exactly once: {other:?}"),
+        CommunityGroupingOutcome::Stale(receipt) => receipt,
+        other => panic!("an attachment-input write must stale the leased snapshot: {other:?}"),
     };
-    assert_eq!(receipt.published_generation, 1);
-    assert_eq!(receipt.member_count, 12);
+    assert_eq!(stale.input_generation, 1);
+
+    let stale_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert_eq!(stale_snapshot.graph_generation, 1);
+    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 2);
+    assert_eq!(stale_snapshot.published_generation, None);
+    assert!(stale_snapshot.dirty);
+    assert!(stale_snapshot.members.is_empty());
+
+    let mut runtime = CommunityGroupingRuntime::default();
+    let receipt = match run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("rerun after attachment-input stale")
+    {
+        CommunityGroupingOutcome::Published(receipt) => receipt,
+        other => panic!("the current attachment generation must publish: {other:?}"),
+    };
+    assert_eq!(receipt.published_generation, 2);
+    assert_eq!(receipt.member_count, 15);
 
     let snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
-    assert_eq!(snapshot.published_generation, Some(1));
+    assert_eq!(snapshot.published_generation, Some(2));
     assert!(!snapshot.dirty);
     let core = snapshot
         .members
@@ -1195,8 +1275,26 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         snapshot
             .members
             .iter()
-            .all(|member| member.node_id != "isolated-none"),
-        "a fully isolated node without an embedding must remain unassigned"
+            .find(|member| member.node_id == "isolated-none")
+            .is_some_and(|member| member.attachment == "isolated_ungrounded"),
+        "the late ungrounded write must queue and publish the isolated attachment"
+    );
+    assert_eq!(
+        snapshot
+            .members
+            .iter()
+            .find(|member| member.node_id == "z-chain-a")
+            .expect("multi-hop isolated node must attach")
+            .community_id,
+        core.community_id,
+        "multi-hop strongest-neighbor chains must resolve to the core community"
+    );
+    assert!(
+        snapshot
+            .members
+            .iter()
+            .all(|member| !member.node_id.starts_with("z-cycle-")),
+        "an ungrounded cycle with no core or embedding path must stay unassigned"
     );
 
     let mut version_rows = observer
@@ -1217,6 +1315,71 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
             row.get::<String>(1).expect("projection version"),
             "grounded-relates-v1"
         );
+    }
+
+    db.supersede_relation(&late_relation, "unused-review-winner")
+        .await
+        .expect("soft-invalidate the ungrounded attachment");
+    assert_eq!(read_m4_generation(&observer, SPACE).await, 1);
+    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 3);
+    let deleted = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run attachment deletion regroup")
+        .expect("ungrounded deletion must queue a grouping cycle");
+    match deleted {
+        CommunityGroupingOutcome::Published(receipt) => {
+            assert_eq!(receipt.published_generation, 3);
+        }
+        other => panic!("ungrounded deletion must publish current input: {other:?}"),
+    }
+    let deleted_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert!(
+        deleted_snapshot
+            .members
+            .iter()
+            .all(|member| member.node_id != "isolated-none"),
+        "soft-invalidating the only ungrounded attachment must remove the stale assignment"
+    );
+
+    observer
+        .execute(
+            "UPDATE entities SET embedding = vector32(?1) WHERE id = 'isolated-embedding'",
+            libsql::params![m4_unit_embedding(1)],
+        )
+        .await
+        .expect("mutate an attachment embedding after clean publication");
+    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 4);
+    let embedding_attempt = db
+        .prepare_community_grouping(SPACE)
+        .await
+        .expect("embedding mutation must queue grouping");
+    let embedding_computed = compute_community_grouping(&embedding_attempt, &runtime)
+        .expect("compute embedding-mutated grouping");
+    observer
+        .execute(
+            "UPDATE entities SET embedding = vector32(?1) WHERE id = 'isolated-embedding'",
+            libsql::params![m4_unit_embedding(2)],
+        )
+        .await
+        .expect("mutate embedding while grouping is in flight");
+    assert_eq!(read_m4_grouping_generation(&observer, SPACE).await, 5);
+    assert!(matches!(
+        db.finalize_community_grouping(embedding_attempt, embedding_computed)
+            .await
+            .expect("finalize stale embedding snapshot"),
+        CommunityGroupingOutcome::Stale(_)
+    ));
+    match db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run current embedding generation")
+        .expect("stale embedding generation must remain queued")
+    {
+        CommunityGroupingOutcome::Published(receipt) => {
+            assert_eq!(receipt.published_generation, 5);
+        }
+        other => panic!("current embedding generation must publish: {other:?}"),
     }
 }
 
@@ -2113,7 +2276,13 @@ async fn assert_m4_schema(observer: &libsql::Connection) {
         ),
         (
             "space_graph_state",
-            &["space", "graph_generation", "published_generation", "dirty"][..],
+            &[
+                "space",
+                "graph_generation",
+                "grouping_generation",
+                "published_generation",
+                "dirty",
+            ][..],
         ),
         (
             "grouping_leases",
@@ -2216,6 +2385,22 @@ async fn read_m4_generation(observer: &libsql::Connection, space: &str) -> i64 {
         .expect("M4 generation row")
         .get(0)
         .expect("decode M4 generation")
+}
+
+async fn read_m4_grouping_generation(observer: &libsql::Connection, space: &str) -> i64 {
+    let mut rows = observer
+        .query(
+            "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+            libsql::params![space.to_owned()],
+        )
+        .await
+        .expect("query M4 grouping generation");
+    rows.next()
+        .await
+        .expect("read M4 grouping generation")
+        .expect("M4 grouping generation row")
+        .get(0)
+        .expect("decode M4 grouping generation")
 }
 
 async fn read_edge_active_grounded(
