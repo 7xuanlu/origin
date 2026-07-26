@@ -1,14 +1,45 @@
 # M4 Stage 0 — Gate PASS/FAIL criteria (authored before code)
 
 **Rung:** M4 (persisted communities). Companion to
-`2026-07-25-m4-communities-mechanics.md`. The **two executable gates** (Gate 1 partition
-spike, Gate 2 churn + correction latency) run and BOTH PASS in the gate stage **before any
-persistence/implementation code** (D1). This doc also fixes the numeric bars the PR-1/PR-2
-acceptance tests are judged against (§4), so no measurement grades itself after the fact
-(§3: *"the projection must be written down before any benchmark"*; the M4 §7 row: the two
-executable gates "written before code"). A gate may be **MET** or **re-argued to the user
-with evidence**; it may never be silently loosened to get green (floor: *"never weaken an
-existing check to get green"*).
+`2026-07-25-m4-communities-mechanics.md`. Gate 1.1–1.3, Gate 1.5, and Gate 2.1–2.3 run
+and PASS in the gate stage **before any persistence/implementation code** (D1). The
+whole-job portion of Gate 1.4 and Gate 2.4 are unmeasurable until the real publication path
+exists, so their unchanged acceptance test is committed RED before all PR-1 persistence
+implementation and must turn GREEN on that real path before PR-1 may merge or either gate
+may be declared fully PASS (sequencing rulings below). This doc also fixes
+the numeric bars the PR-1/PR-2 acceptance tests are judged against (§4), so no measurement
+grades itself after the fact (§3: *"the projection must be written down before any
+benchmark"*; the M4 §7 row: the two executable gates "written before code"). A gate may be
+**MET** or **re-argued to the user with evidence**; it may never be silently loosened to get
+green (floor: *"never weaken an existing check to get green"*).
+
+### Sequencing rulings (2026-07-25 and 2026-07-26; Fable sign-off; no bar changes)
+
+1. Gate 1.1–1.3, Gate 1.5, and Gate 2.1–2.3 run and must PASS in the gate stage before any
+   persistence/implementation code. At gate stage, 2.1–2.3 are measured on the
+   grouping assignment output — the exact artifact PR-1 will persist as
+   `community_members`. References to `community_members` / durable ids in 2.1–2.3 read
+   accordingly. This measures the algorithm under test; it is not a fake publication path.
+2. The pre-persistence part of Gate 1.4 proves the indexed bounded SELECT and that projection
+   and partition begin after its connection guard is released. Lease acquisition, finalize
+   generation-CAS, cumulative mutex time, and transaction structure can only be measured on
+   the real PR-1 job, so 1.4 remains PROVISIONAL until that path exists.
+3. Gate 2.4 is likewise unmeasurable before the publication path exists. Its measurement
+   moves to PR-1: the **first commit after the gate-stage commits on the PR-1 branch** is a
+   RED integration acceptance test asserting both the whole-job 1.4 bar and the 2.4 bar
+   verbatim against the real lease, generation-CAS grouping job, and real published
+   snapshot. No in-memory or disposable SQLite substitute counts as evidence.
+4. That RED test commit precedes all persistence-implementation commits. Persistence
+   commits may then land while the test is RED. PR-1 may not merge, Gate 2 may not be
+   declared PASS, Gate 1.4 may not be declared MET, and no completion claim may be made
+   until the real-path 1.4 and 2.4 assertions are GREEN at the unchanged bars in a
+   full-suite run.
+5. Gate 2.5 is recorded at gate stage as
+   `PROVISIONAL PASS — 2.1–2.3 MET, 2.4 pending PR-1`; it becomes final only when 2.4 turns
+   GREEN.
+6. Gate 1 is recorded at gate stage as
+   `PROVISIONAL PASS — 1.1–1.3 and 1.5 MET; 1.4 SELECT preflight MET, real job pending PR-1`.
+7. Nothing in these rulings changes Gate 1.4 or Gate 2.4's bar or FAIL semantics.
 
 **Gates + implementation WAIT on M3g** (Q-A ruling): Gate 1 and Gate 2 measure over a
 **real grounded subgraph** produced by M3g. Stage-0 authoring is data-independent and runs
@@ -37,6 +68,7 @@ any value re-runs the affected gate.
 | `HUB_DEGREE_CAP` | `50` | grounded degree above which incident weights soft-down-weight (§3.4) |
 | `M4_MIN_PARTICIPANTS` | `10` | viability floor — a space below this publishes nothing (§2.3) |
 | `FULL_REPARTITION_FRACTION` | `0.25` | dirty-node fraction above which a full re-partition replaces warm-start (§4.3) |
+| `MAX_INCREMENTAL_FRONTIER_FRACTION` | `0.25` | expanded dirty + old/new one-hop frontier above which a full re-partition replaces warm-start (§4.3) |
 | `LEIDEN_RESOLUTION` (γ) | `1.0` | standard modularity resolution |
 | `LEIDEN_SEED` | fixed constant (e.g. `0x4D34`) | RNG determinism (§4.2) |
 | `T_hi` | `0.50` | page→community assign threshold, normalized score (§8.2) |
@@ -92,13 +124,25 @@ Invariant §3: *"incrementality is required, not aspirational."*
 - **Bar: an incremental warm-start around a dirty frontier of ≤ 1% of a space's nodes costs
   ≤ 10% of that space's full-partition time (p95 over ≥ 20 single-edge-addition cycles),**
   and scales with the frontier size, not the graph size.
+- **Observable scaling oracle:** at a fixed one-node frontier, growing a sparse graph from
+  2,048 to 32,768 nodes increases incremental p95 by no more than `3×`; on the 32,768-node
+  graph, growing the dirty set `8×` (8→64 nodes) increases p95 by no more than `12×`.
+  Graph-wide state initialization is allowed only on first publication, process restart,
+  algorithm/projection-version change, or an explicit full-repartition threshold.
+- **Expanded-frontier cap:** if dirty nodes plus their old/new one-hop neighbors exceed
+  `MAX_INCREMENTAL_FRONTIER_FRACTION`, the call routes to full repartition. The cap does not
+  silently truncate optimization and the resulting full/incremental output remains subject
+  to Gate 1.5.
 - **FAIL: incremental cost ≥ 50% of full-partition cost** for a ≤ 1% frontier (warm-start is
   not actually local — effectively a full re-partition per cycle). This is the §3
   "full re-partition per cycle is a fail" made numeric → Q-B.
 
 ### 1.3 Peak memory (CEILING)
 
-- **Bar: peak additional RSS for a full partition at the graded scale ≤ 256 MB.** (A few
+- **Bar: peak additional RSS for the first full partition in a fresh child process at the
+  graded scale ≤ 256 MB.** The no-partition child baseline constructs the identical graph;
+  the partition child runs the first Leiden operation, and OS peak RSS is differenced.
+  (A few
   thousand nodes / edges is a small graph; this leaves generous headroom and catches an
   accidental all-pairs / dense-matrix representation.)
 - **Hard fail: > 1 GB** — a representation blow-up; fix or Q-B.
@@ -116,6 +160,9 @@ acquire, and the finalize CAS (mechanics §5.3, §10.1) — never during project
   **no partition, projection, rebinding, or embedding call occurs inside any `BEGIN…COMMIT`**
   in the job path (§6.3) — the same worst-case guard M3g's Gate 3 uses. The ms ceiling is the
   quantitative backup.
+- **Gate-stage status:** the real-path lease/finalize pieces do not exist before persistence.
+  The indexed SELECT timing and outside-lock compute are a PROVISIONAL preflight only; §1.4
+  becomes MET only when the first PR-1 RED integration test turns GREEN on the actual job.
 
 ### 1.5 Grouping quality vs label-prop (FLOOR)
 
@@ -129,7 +176,10 @@ acquire, and the finalize CAS (mechanics §5.3, §10.1) — never during project
 
 ### 1.6 PASS / FAIL (Gate 1)
 
-- **PASS:** 1.1 ≤ 10 s full / 1.2 warm-start ≤ 10% / 1.3 ≤ 256 MB / 1.4 ≤ 500 ms p95 mutex +
+- **Gate-stage provisional PASS:** 1.1–1.3 and 1.5 MET, plus the 1.4 indexed-SELECT
+  preflight MET; record exactly
+  `PROVISIONAL PASS — 1.1–1.3 and 1.5 MET; 1.4 SELECT preflight MET, real job pending PR-1`.
+- **Final PASS:** 1.1 ≤ 10 s full / 1.2 warm-start ≤ 10% / 1.3 ≤ 256 MB / 1.4 ≤ 500 ms p95 mutex +
   no-compute-in-txn / 1.5 modularity ≥ label-prop with zero disconnected communities — all
   MET, receipts attached.
 - **FAIL:** any sub-gate hard-fail, or a floor missed → **surface as Q-B** (label-prop
@@ -218,8 +268,11 @@ quickly.
 
 ### 2.5 PASS / FAIL (Gate 2)
 
-- **PASS:** 2.1 determinism-zero / 2.2 churn ≤ 2% mean, ≤ 10% p95 / 2.3 poison churn ≤ 4% and
-  count ≥ 70% / 2.4 latency ≤ 1 cycle (≤ 2 worst) — all MET, receipts attached.
+- **Gate-stage provisional PASS:** 2.1 determinism-zero / 2.2 churn ≤ 2% mean, ≤ 10% p95 /
+  2.3 poison churn ≤ 4% and count ≥ 70% are MET, with receipts attached; record exactly
+  `PROVISIONAL PASS — 2.1–2.3 MET, 2.4 pending PR-1`.
+- **Final PASS:** the gate-stage provisional PASS plus 2.4 latency ≤ 1 cycle (≤ 2 worst)
+  proven GREEN against the real PR-1 publication path.
 - **FAIL:** any bar missed. Determinism (2.1) and correction-latency (2.4) failures are bugs
   to fix; churn (2.2/2.3) failures point at the projection/rebinding design (three-fix rule
   → question the design).
@@ -265,6 +318,9 @@ gate.
   stability test fails and 2.2 churn explodes. Restore.
 - **Hub normalization / parallel cap (2.3):** disable the soft down-weight → poison
   robustness collapses the community count → 2.3 fails. Restore.
+- **Frontier locality (1.2):** replace the reusable incremental statistics with per-call
+  all-node/all-edge rebuilds → the fixed-frontier multi-size oracle fails. Remove the
+  expanded-frontier check → the high-degree-hub cap test fails. Restore.
 
 ---
 
@@ -380,9 +436,9 @@ attached. A full-table scan on the hot path = FAIL.
 | Gate | Bar | Kind | Corpus | Fail |
 |---|---|---|---|---|
 | **1.1 full-partition runtime** | ≤ 10 s/space p95 | ceiling | graded grounded subgraph @ 100k/5k | > 30 s → Q-B |
-| **1.2 warm-start incremental** | ≤ 10% of full for ≤1% frontier | floor | single-edge cycles | ≥ 50% → Q-B |
-| **1.3 peak memory** | ≤ 256 MB | ceiling | full partition @ scale | > 1 GB → Q-B |
-| **1.4 mutex hold** | ≤ 500 ms p95; no compute in txn | ceiling | ≥ 20 firings @ scale | > 2 s single |
+| **1.2 warm-start incremental** | ≤ 10% of full for ≤1% frontier; multi-size locality oracle | floor | single-edge cycles + 2k→32k fixed-frontier | ≥ 50% → Q-B |
+| **1.3 peak memory** | ≤ 256 MB | ceiling | first full partition in fresh child @ scale | > 1 GB → Q-B |
+| **1.4 mutex hold** | ≤ 500 ms p95; no compute in txn | ceiling | ≥ 20 real job firings @ scale; SELECT-only preflight is provisional | > 2 s single |
 | **1.5 quality vs label-prop** | modularity ≥ label-prop, 0 disconnected | floor | graded subgraph | < baseline → question projection |
 | **2.1 determinism churn** | exactly 0 on frozen subgraph | hard | frozen (M3g OFF) | any change |
 | **2.2 incremental churn** | ≤ 2% mean, ≤ 10% p95 | ceiling | ≥ 50 single-edge additions | > bar |

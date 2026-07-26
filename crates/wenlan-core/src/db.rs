@@ -80144,6 +80144,218 @@ pub(crate) mod tests {
         assert_eq!(n, 1, "the live db row must survive a rejected self-backup");
     }
 
+    /// M4 Gate 1.4 mutex-hold receipt at the authored §6.5 corpus scale.
+    /// Seeds 100k memories, 5k pages, and the three-space grounded projection,
+    /// then times 20 indexed subgraph reads while keeping projection and
+    /// partitioning structurally outside the connection guard.
+    #[tokio::test]
+    #[ignore]
+    async fn m4_grounded_projection_select_mutex_receipt() {
+        use crate::community_partition::{
+            full_partition, project_grounded_relates, PartitionConfig, ProjectionConfig,
+            ProjectionInputEdge,
+        };
+        use std::time::{Duration, Instant};
+
+        const MEMORIES: usize = 100_000;
+        const PAGES: usize = 5_000;
+        const SPACES: usize = 3;
+        const CLUSTERS_PER_SPACE: usize = 8;
+        const NODES_PER_CLUSTER: usize = 256;
+        const FIRINGS: usize = 20;
+
+        let (db, _dir) = test_db().await;
+        let seed_started = Instant::now();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            for i in 0..MEMORIES {
+                conn.execute(
+                    "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                        last_modified, chunk_type, source_agent, space, confidence, confirmed, \
+                        memory_type, pending_revision) \
+                     VALUES (?1, 'c', 'memory', ?1, 't', 0, 1712707200, 'text', NULL, ?2, \
+                        1.0, 0, 'fact', 0)",
+                    libsql::params![format!("m4_mem_{i}"), format!("space-{}", i % SPACES)],
+                )
+                .await
+                .unwrap();
+            }
+            for page in 0..PAGES {
+                let space = format!("space-{}", page % SPACES);
+                conn.execute(
+                    "INSERT INTO pages (id, title, content, created_at, last_compiled, \
+                        last_modified, space, workspace) \
+                     VALUES (?1, 't', 'c', '2024-01-01T00:00:00Z', \
+                        '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', ?2, ?2)",
+                    libsql::params![format!("m4_page_{page}"), space],
+                )
+                .await
+                .unwrap();
+            }
+            for space in 0..SPACES {
+                conn.execute(
+                    "INSERT INTO provenance_roots (root_id, identity_version, identity_digest, \
+                        root_kind, independence_group_id, status, created_at) \
+                     VALUES (?1, 1, ?2, 'generated', ?3, 'active', 1712707200)",
+                    libsql::params![
+                        format!("m4-root-{space}"),
+                        format!("m4-root-digest-{space}"),
+                        format!("m4-space-{space}")
+                    ],
+                )
+                .await
+                .unwrap();
+                for cluster in 0..CLUSTERS_PER_SPACE {
+                    for node in 0..NODES_PER_CLUSTER {
+                        let entity_id =
+                            format!("space-{space}-cluster-{cluster:02}-node-{node:03}");
+                        conn.execute(
+                            "INSERT INTO entities (id, name, entity_type, space, created_at, updated_at) \
+                             VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                            libsql::params![entity_id, format!("space-{space}")],
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+
+                let mut edge_index = 0usize;
+                for cluster in 0..CLUSTERS_PER_SPACE {
+                    for node in 0..NODES_PER_CLUSTER {
+                        for offset in 1..=3 {
+                            conn.execute(
+                                "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, \
+                                    edge_type, lineage, grounded, root_id, space, created_at) \
+                                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', \
+                                    1, ?4, ?5, 1712707200)",
+                                libsql::params![
+                                    format!("m4-space-{space}-edge-{edge_index:06}"),
+                                    format!("space-{space}-cluster-{cluster:02}-node-{node:03}"),
+                                    format!(
+                                        "space-{space}-cluster-{cluster:02}-node-{:03}",
+                                        (node + offset) % NODES_PER_CLUSTER
+                                    ),
+                                    format!("m4-root-{space}"),
+                                    format!("space-{space}")
+                                ],
+                            )
+                            .await
+                            .unwrap();
+                            edge_index += 1;
+                        }
+                    }
+                    if cluster + 1 < CLUSTERS_PER_SPACE {
+                        conn.execute(
+                            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, \
+                                edge_type, lineage, grounded, root_id, space, created_at) \
+                             VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', \
+                                1, ?4, ?5, 1712707200)",
+                            libsql::params![
+                                format!("m4-space-{space}-edge-{edge_index:06}"),
+                                format!("space-{space}-cluster-{cluster:02}-node-000"),
+                                format!("space-{space}-cluster-{:02}-node-000", cluster + 1),
+                                format!("m4-root-{space}"),
+                                format!("space-{space}")
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                        edge_index += 1;
+                    }
+                }
+                assert_eq!(edge_index, 6_151);
+            }
+            conn.execute("COMMIT", ()).await.unwrap();
+            conn.execute("ANALYZE edges", ()).await.unwrap();
+        }
+        let seed_secs = seed_started.elapsed().as_secs_f64();
+
+        {
+            let conn = db.conn.lock().await;
+            let mut plan = conn
+                .query(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE space = ?1 AND edge_type = 'relates' \
+                       AND valid_until IS NULL AND grounded = 1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity'",
+                    libsql::params!["space-0"],
+                )
+                .await
+                .unwrap();
+            let mut details = Vec::new();
+            while let Some(row) = plan.next().await.unwrap() {
+                details.push(row.get::<String>(3).unwrap());
+            }
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_edges_active_grounded_space_type")),
+                "Gate 1.4 SELECT must use the partial active-grounded index: {details:?}"
+            );
+        }
+
+        let mut holds = Vec::with_capacity(FIRINGS);
+        let mut last_projection = Vec::new();
+        for firing in 0..FIRINGS {
+            let space = format!("space-{}", firing % SPACES);
+            let hold_started = Instant::now();
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE space = ?1 AND edge_type = 'relates' \
+                       AND valid_until IS NULL AND grounded = 1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity'",
+                    libsql::params![space],
+                )
+                .await
+                .unwrap();
+            let mut projection = Vec::with_capacity(6_151);
+            while let Some(row) = rows.next().await.unwrap() {
+                projection.push(ProjectionInputEdge::new(
+                    row.get::<String>(0).unwrap(),
+                    row.get::<String>(1).unwrap(),
+                    row.get::<String>(2).unwrap(),
+                ));
+            }
+            drop(rows);
+            drop(conn);
+            holds.push(hold_started.elapsed());
+            assert_eq!(projection.len(), 6_151);
+            last_projection = projection;
+        }
+
+        // Structural bite for the gate-stage path: projection and partition
+        // begin only after the connection guard above has been dropped.
+        let graph = project_grounded_relates(&last_projection, ProjectionConfig::default());
+        let partition =
+            full_partition(&graph, PartitionConfig::default()).expect("outside-lock partition");
+        assert_eq!(partition.membership().len(), 2_048);
+
+        holds.sort_unstable();
+        let p95 = holds[(holds.len() * 95).div_ceil(100) - 1];
+        let max = *holds.last().unwrap();
+        assert!(
+            p95 <= Duration::from_millis(500),
+            "Gate 1.4 mutex p95 {p95:?} exceeds 500ms"
+        );
+        assert!(
+            max <= Duration::from_secs(2),
+            "Gate 1.4 hard fail: mutex max {max:?} exceeds 2s"
+        );
+        eprintln!(
+            "[m4_db_gate_receipt] memories={MEMORIES} pages={PAGES} spaces={SPACES} \
+             edges={} participants={} firings={FIRINGS} seed_secs={seed_secs:.3} \
+             mutex_p95_ms={:.3} mutex_max_ms={:.3}",
+            SPACES * 6_151,
+            SPACES * CLUSTERS_PER_SPACE * NODES_PER_CLUSTER,
+            p95.as_secs_f64() * 1_000.0,
+            max.as_secs_f64() * 1_000.0,
+        );
+    }
+
     /// §6.5-scale acceptance (100k memories / 5k pages). Manual-only (needs
     /// minutes + hundreds of MB); run with:
     ///   RUSTC_WRAPPER= cargo test -p wenlan-core --lib \
