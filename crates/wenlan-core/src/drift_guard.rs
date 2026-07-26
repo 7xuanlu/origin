@@ -928,9 +928,165 @@ fn windows_ort_distribution_violations(
         violations.push("release workflow does not use the pinned Windows ORT stager".into());
     }
 
+    for (workflow, job, step_name, required_condition, owner) in [
+        (
+            &ci,
+            "test",
+            "Configure MSVC Ninja (Windows tests)",
+            "matrix.os == 'windows-2022'",
+            "Windows test CI",
+        ),
+        (
+            &ci,
+            "release-preflight",
+            "Configure MSVC Ninja (Windows release proof)",
+            "",
+            "Windows release proof",
+        ),
+        (
+            &release,
+            "release",
+            "Configure MSVC Ninja (Windows release)",
+            "matrix.target == 'x86_64-pc-windows-msvc'",
+            "Windows release workflow",
+        ),
+    ] {
+        let step = job_step(workflow, job, step_name);
+        let condition = step
+            .and_then(|candidate| candidate["if"].as_str())
+            .unwrap_or_default();
+        let run = step
+            .and_then(|candidate| candidate["run"].as_str())
+            .unwrap_or_default();
+        if (!required_condition.is_empty() && !condition.contains(required_condition))
+            || !run.contains("scripts/setup-msvc-ninja-windows.ps1")
+        {
+            violations.push(format!(
+                "{owner} does not configure the shared x64 MSVC Ninja environment"
+            ));
+        }
+    }
+
+    for (workflow, job, required_condition, owner) in [
+        (
+            &ci,
+            "test",
+            "matrix.os == 'windows-2022'",
+            "Windows test CI",
+        ),
+        (&ci, "release-preflight", "", "Windows release proof"),
+        (
+            &release,
+            "release",
+            "matrix.os == 'windows-2022'",
+            "Windows release workflow",
+        ),
+    ] {
+        let step = job_step(workflow, job, "Set up Vulkan SDK (Windows only)");
+        let condition = step
+            .and_then(|candidate| candidate["if"].as_str())
+            .unwrap_or_default();
+        let run = step
+            .and_then(|candidate| candidate["run"].as_str())
+            .unwrap_or_default();
+        if (!required_condition.is_empty() && !condition.contains(required_condition))
+            || !run.contains("scripts/setup-vulkan-sdk-windows.ps1")
+        {
+            violations.push(format!(
+                "{owner} does not configure the pinned Vulkan SDK in its required scope"
+            ));
+        }
+    }
+    for (workflow, job, step_name, required_condition, required_destination, owner) in [
+        (
+            &ci,
+            "test",
+            "Set up Vulkan SDK (Windows only)",
+            "matrix.os == 'windows-2022'",
+            "$env:RUNNER_TEMP",
+            "Windows test CI",
+        ),
+        (
+            &ci,
+            "release-preflight",
+            "Stage Windows release runtimes before smoke",
+            "matrix.target == 'x86_64-pc-windows-msvc'",
+            r#"target\${{ matrix.target }}\release"#,
+            "Windows release proof",
+        ),
+        (
+            &release,
+            "release",
+            "Set up Vulkan SDK (Windows only)",
+            "matrix.os == 'windows-2022'",
+            r#"target\${{ matrix.target }}\release"#,
+            "Windows release workflow",
+        ),
+    ] {
+        let step = job_step(workflow, job, step_name);
+        let condition = step
+            .and_then(|candidate| candidate["if"].as_str())
+            .unwrap_or_default();
+        let run = step
+            .and_then(|candidate| candidate["run"].as_str())
+            .unwrap_or_default();
+        if !condition.contains(required_condition)
+            || !run.contains("scripts/stage-vulkan-loader-windows.ps1")
+            || !run.contains(required_destination)
+            || run.contains("SkipAuthenticodeValidationForFixture")
+        {
+            violations.push(format!(
+                "{owner} does not stage the pinned Vulkan loader in its required scope"
+            ));
+        }
+    }
+
     let package = workflow_step_run(&release, "Package").unwrap_or_default();
-    if !package.contains("wenlan-server.exe") || !package.contains("onnxruntime.dll") {
-        violations.push("release archive does not include the server and ORT DLL together".into());
+    if !package.contains("wenlan-server.exe")
+        || !package.contains("onnxruntime.dll")
+        || !package.contains("vulkan-1.dll")
+        || !package.contains("VulkanRT-License.txt")
+    {
+        violations.push(
+            "release archive does not include the server, runtimes, and Vulkan license together"
+                .into(),
+        );
+    }
+
+    let universal_archive_verify = workflow_step_run(
+        &release,
+        "Verify release archive contains wenlan, wenlan-server, wenlan-mcp",
+    )
+    .unwrap_or_default();
+    if !universal_archive_verify.contains("for bin in wenlan wenlan-server wenlan-mcp")
+        || universal_archive_verify.contains("onnxruntime.dll")
+        || universal_archive_verify.contains("vulkan-1.dll")
+        || universal_archive_verify.contains("VulkanRT-License.txt")
+    {
+        violations.push(
+            "cross-platform archive verification mixes Windows-only runtime payloads into every target"
+                .into(),
+        );
+    }
+    let windows_archive_verify = job_step(
+        &release,
+        "release",
+        "Verify Windows release archive runtimes",
+    );
+    let windows_archive_verify_run = windows_archive_verify
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if windows_archive_verify.and_then(|step| step["if"].as_str())
+        != Some("matrix.target == 'x86_64-pc-windows-msvc'")
+        || !windows_archive_verify_run.contains("unzip -l")
+        || !windows_archive_verify_run.contains("onnxruntime.dll")
+        || !windows_archive_verify_run.contains("vulkan-1.dll")
+        || !windows_archive_verify_run.contains("VulkanRT-License.txt")
+    {
+        violations.push(
+            "Windows archive runtime verification is not restricted to the shipped Windows zip"
+                .into(),
+        );
     }
 
     let packaged_smoke =
@@ -938,12 +1094,16 @@ fn windows_ort_distribution_violations(
     if !packaged_smoke.contains("Expand-Archive")
         || !packaged_smoke.contains("Test-Path")
         || !packaged_smoke.contains("scripts/smoke-windows.ps1")
+        || !packaged_smoke.contains("vulkan-1.dll")
+        || !packaged_smoke.contains("VulkanRT-License.txt")
     {
         violations.push("release workflow does not smoke the extracted Windows archive".into());
     }
 
     let pr_build =
         workflow_step_run(&ci, "Build and smoke shipped release binaries").unwrap_or_default();
+    let pr_runtime_stage =
+        workflow_step_run(&ci, "Stage Windows release runtimes before smoke").unwrap_or_default();
     let pr_smoke =
         workflow_step_run(&ci, "Native ORT smoke (Windows release preflight)").unwrap_or_default();
     let windows_test_bootstrap =
@@ -951,9 +1111,10 @@ fn windows_ort_distribution_violations(
     if !windows_test_bootstrap.contains("scripts/stage-onnxruntime-windows.ps1")
         || !windows_test_bootstrap.contains("ORT_DYLIB_PATH=")
         || !windows_test_bootstrap.contains("$env:GITHUB_ENV")
+        || !windows_test_bootstrap.contains("$env:GITHUB_PATH")
     {
         violations.push(
-            "Windows tests do not pin ORT_DYLIB_PATH to the verified runtime before inference"
+            "Windows tests do not pin the verified ORT build path and DLL search path before inference"
                 .into(),
         );
     }
@@ -995,7 +1156,8 @@ fn windows_ort_distribution_violations(
             .push("Windows ORT test bootstrap must run before inference-capable tests".into());
     }
     if !pr_build.contains("scripts/build-release-binaries.sh")
-        || !pr_smoke.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !pr_runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !pr_runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
         || !pr_smoke.contains("scripts/smoke-windows.ps1")
     {
         violations.push("PR CI does not build, stage, and exercise dynamic ORT on Windows".into());
@@ -1011,6 +1173,7 @@ fn windows_ort_distribution_violations(
 
     if !smoke_script.contains("Get-Process -Id $proc.Id -Module")
         || !smoke_script.contains("onnxruntime.dll")
+        || !smoke_script.contains("vulkan-1.dll")
         || !smoke_script.contains("Resolve-Path")
         || !smoke_script.contains("/api/memory/store")
         || !smoke_script.contains("chunks_created")
@@ -1061,8 +1224,14 @@ jobs:
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("ORT_DYLIB_PATH")),
+            .any(|violation| violation.contains("DLL search path")),
         "fixture must reject Windows tests that can load a runner DLL: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("Vulkan loader")),
+        "fixture must reject a release without a scoped Vulkan loader: {violations:?}"
     );
     assert!(
         violations
@@ -1075,6 +1244,29 @@ jobs:
             .iter()
             .any(|violation| violation.contains("vector inference")),
         "fixture must reject a smoke with no module proof: {violations:?}"
+    );
+}
+
+#[test]
+fn windows_ort_distribution_contract_rejects_unscoped_archive_payloads() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("read release.yml")
+        .replace(
+            "      - name: Verify Windows release archive runtimes\n        if: matrix.target == 'x86_64-pc-windows-msvc'",
+            "      - name: Verify Windows release archive runtimes\n        if: always()",
+        );
+    let smoke = std::fs::read_to_string(root.join("scripts/smoke-windows.ps1"))
+        .expect("read smoke-windows.ps1");
+    let violations = windows_ort_distribution_violations(&ci, &release, &smoke);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains(
+                "Windows archive runtime verification is not restricted to the shipped Windows zip",
+            )
+        }),
+        "fixture must reject Windows-only payload checks on non-Windows archives: {violations:?}"
     );
 }
 
@@ -1662,6 +1854,20 @@ fn ci_routing_contract_violations(
             ));
         }
     }
+    for path in [
+        "scripts/setup-vulkan-sdk-windows.ps1",
+        "scripts/setup-vulkan-sdk-windows.test.ps1",
+        "scripts/stage-vulkan-loader-windows.ps1",
+        "scripts/stage-vulkan-loader-windows.test.ps1",
+        "scripts/setup-msvc-ninja-windows.ps1",
+        "scripts/setup-msvc-ninja-windows.test.ps1",
+    ] {
+        if !release_sensitive.contains(path) {
+            violations.push(format!(
+                "Windows native-build bootstrap is not routed through windows-release: {path}"
+            ));
+        }
+    }
     let windows_paths = detect_change_filter_paths(&ci, "windows");
     let macos_paths = detect_change_filter_paths(&ci, "macos");
     for (filter, paths) in [
@@ -1752,6 +1958,8 @@ fn ci_routing_contract_violations(
     for path in [
         "crates/wenlan-core/src/lint/**",
         "scripts/lint-scale-gate.sh",
+        "scripts/stage-vulkan-loader-windows.ps1",
+        "scripts/stage-vulkan-loader-windows.test.ps1",
     ] {
         if !windows_lint.contains(path) {
             violations.push(format!(
@@ -1809,11 +2017,11 @@ fn ci_routing_contract_violations(
             ));
         }
     }
-    let differential_timeout = "${{ github.event_name == 'pull_request' && 30 || 60 }}";
+    let differential_timeout =
+        "${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 30 }}";
     if ci["jobs"]["test"]["timeout-minutes"].as_str() != Some(differential_timeout) {
         violations.push(
-            "test does not enforce the 30-minute PR budget while allowing a 60-minute non-PR backstop"
-                .into(),
+            "test does not enforce the 30-minute non-Windows PR budget while allowing a 60-minute Windows/non-PR backstop".into(),
         );
     }
     let release_preflight_condition = ci["jobs"]["release-preflight"]["if"]
@@ -2000,6 +2208,7 @@ fn ci_routing_contract_violations(
         .unwrap_or_default();
     if !windows_linker_condition.contains("matrix.os == 'windows-2022'")
         || !windows_linker_run.contains("rust-lld.exe")
+        || !windows_linker_run.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=")
         || !windows_linker_run.contains("RUSTFLAGS=")
         || !windows_linker_run.contains("$env:GITHUB_ENV")
     {
@@ -2023,12 +2232,14 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["run"].as_str())
         .is_none_or(|run| {
             !run.contains("cargo build -p wenlan -p wenlan-server")
+                || !run.contains("scripts/stage-onnxruntime-windows.ps1")
+                || !run.contains("scripts/stage-vulkan-loader-windows.ps1")
                 || !run.contains("target\\debug")
                 || run.contains("--release")
         })
     {
         violations.push(
-            "ordinary Windows contract does not build and stage debug runtime artifacts".into(),
+            "ordinary Windows contract does not build and stage adjacent ONNX/Vulkan debug runtime artifacts".into(),
         );
     }
     let schtasks = job_step(
@@ -2254,7 +2465,7 @@ jobs:
         "nextest config",
         "release-profile-sensitive",
         "release-sensitive",
-        "30-minute PR budget",
+        "30-minute non-Windows PR budget",
         "independent differential job",
         "rust-lld",
         "does not also schedule",
@@ -2407,7 +2618,9 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     }
     if job["runs-on"].as_str() != Some("${{ matrix.os }}")
         || job["timeout-minutes"].as_str()
-            != Some("${{ github.event_name == 'pull_request' && 45 || 60 }}")
+            != Some(
+                "${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}",
+            )
         || job["strategy"]["fail-fast"].as_bool() != Some(true)
         || job["strategy"]["matrix"].as_str()
             != Some("${{ fromJSON(needs.detect-changes.outputs.release-targets) }}")
@@ -2473,6 +2686,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
         "Stabilize Windows Rust cache toolchain inputs",
         "Configure rust-lld linker (Windows release preflight)",
         "Install sqlite3 (Windows only)",
+        "Stage Windows release runtimes before smoke",
         "Native ORT smoke (Windows release preflight)",
     ] {
         if job_step(&ci, "release-preflight", step_name).and_then(|step| step["if"].as_str())
@@ -2483,18 +2697,32 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             ));
         }
     }
-    let linker = job_step(
-        &ci,
-        "release-preflight",
-        "Configure rust-lld linker (Windows release preflight)",
-    )
-    .and_then(|step| step["run"].as_str())
-    .unwrap_or_default();
-    if !linker.contains("rust-lld.exe")
-        || !linker.contains("RUSTFLAGS=")
-        || !linker.contains("$env:GITHUB_ENV")
-    {
-        violations.push("release-preflight does not configure rust-lld on Windows".into());
+    for (workflow, job_name, step_name, owner) in [
+        (
+            &ci,
+            "release-preflight",
+            "Configure rust-lld linker (Windows release preflight)",
+            "release-preflight",
+        ),
+        (
+            &release,
+            "release",
+            "Configure rust-lld linker (Windows)",
+            "tag release",
+        ),
+    ] {
+        let linker = job_step(workflow, job_name, step_name)
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if !linker.contains("rust-lld.exe")
+            || !linker.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=")
+            || !linker.contains("RUSTFLAGS=")
+            || !linker.contains("$env:GITHUB_ENV")
+        {
+            violations.push(format!(
+                "{owner} does not configure rust-lld for target and host build artifacts on Windows"
+            ));
+        }
     }
     let sqlite = job_step(&ci, "release-preflight", "Install sqlite3 (Windows only)")
         .and_then(|step| step["run"].as_str())
@@ -2560,6 +2788,22 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             "release-preflight cache is not target-scoped, capacity-bounded, and main-owned".into(),
         );
     }
+    let windows_runtime_stage = job_step(
+        &ci,
+        "release-preflight",
+        "Stage Windows release runtimes before smoke",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !windows_runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !windows_runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
+        || !windows_runtime_stage.contains(r"target\${{ matrix.target }}\release")
+    {
+        violations.push(
+            "Windows release preflight omits adjacent runtime DLL staging before executable smoke"
+                .into(),
+        );
+    }
     let windows_smoke = job_step(
         &ci,
         "release-preflight",
@@ -2567,11 +2811,58 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     )
     .and_then(|step| step["run"].as_str())
     .unwrap_or_default();
-    if !windows_smoke.contains("scripts/stage-onnxruntime-windows.ps1")
-        || !windows_smoke.contains("scripts/smoke-windows.ps1")
+    if !windows_smoke.contains("scripts/smoke-windows.ps1")
         || !windows_smoke.contains(r"target\${{ matrix.target }}\release")
     {
         violations.push("Windows release preflight omits the native ORT smoke".into());
+    }
+    let ci_steps = job["steps"].as_sequence();
+    let runtime_stage_index = ci_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Stage Windows release runtimes before smoke")
+        })
+    });
+    let build_index = ci_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Build and smoke shipped release binaries")
+        })
+    });
+    let smoke_index = ci_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Native ORT smoke (Windows release preflight)")
+        })
+    });
+    if !matches!(
+        (runtime_stage_index, build_index, smoke_index),
+        (Some(runtime_stage_index), Some(build_index), Some(smoke_index))
+            if runtime_stage_index < build_index && build_index < smoke_index
+    ) {
+        violations.push(
+            "Windows release preflight does not stage runtime DLLs before executable smoke".into(),
+        );
+    }
+    let release_steps = release["jobs"]["release"]["steps"].as_sequence();
+    let release_ort_index = release_steps.and_then(|steps| {
+        steps
+            .iter()
+            .position(|step| step["name"].as_str() == Some("Bundle onnxruntime.dll (Windows)"))
+    });
+    let release_vulkan_index = release_steps.and_then(|steps| {
+        steps
+            .iter()
+            .position(|step| step["name"].as_str() == Some("Set up Vulkan SDK (Windows only)"))
+    });
+    let release_build_index = release_steps.and_then(|steps| {
+        steps.iter().position(|step| {
+            step["name"].as_str() == Some("Build and smoke shipped release binaries")
+        })
+    });
+    if !matches!(
+        (release_ort_index, release_vulkan_index, release_build_index),
+        (Some(ort_index), Some(vulkan_index), Some(build_index))
+            if ort_index < build_index && vulkan_index < build_index
+    ) {
+        violations.push("tag release does not stage runtime DLLs before executable smoke".into());
     }
 
     for step in job["steps"].as_sequence().into_iter().flatten() {
@@ -2663,8 +2954,16 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "      - name: Native ORT smoke removed",
         )
         .replace(
+            "      - name: Stage Windows release runtimes before smoke",
+            "      - name: Stage Windows release runtimes removed",
+        )
+        .replace(
             "      - name: Select native Perl for vendored OpenSSL",
             "      - name: Native Perl removed",
+        )
+        .replace(
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=",
+            "REMOVED_WINDOWS_LINKER=",
         );
     let release = release
         .replace(
@@ -2674,6 +2973,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace(
             "      - name: Require main workflow for manual release",
             "      - name: Manual release ref guard removed",
+        )
+        .replace(
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=",
+            "REMOVED_WINDOWS_LINKER=",
         );
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
@@ -2685,6 +2988,8 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "target-scoped, capacity-bounded, and main-owned",
         "truncated PR file inventory",
         "native Windows Perl",
+        "target and host build artifacts",
+        "runtime DLLs before executable smoke",
         "native ORT smoke",
         "publishing or packaging side effect",
         "conclusion does not fail closed",
@@ -3863,6 +4168,24 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
             ));
         }
     }
+    for (job_name, step_name) in [
+        ("p4-runners", "Configure rust-lld (Windows)"),
+        ("p5-windows-drive", "Configure rust-lld"),
+        ("p6-release", "Configure rust-lld (Windows)"),
+    ] {
+        let linker = job_step(&benchmark, job_name, step_name)
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if !linker.contains("rust-lld.exe")
+            || !linker.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=")
+            || !linker.contains("RUSTFLAGS=")
+            || !linker.contains("$env:GITHUB_ENV")
+        {
+            violations.push(format!(
+                "benchmark job {job_name} does not configure rust-lld for target and host build artifacts"
+            ));
+        }
+    }
     if benchmark["jobs"]["p5-test-engine"]["env"]["SCCACHE_GHA_RW_MODE"].as_str()
         != Some("READ_ONLY")
     {
@@ -4112,6 +4435,25 @@ fn ci_benchmark_contract_requires_read_only_sccache_and_truthful_restore_modes()
             "benchmark guard must reject missing {expected}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn ci_benchmark_contract_requires_target_and_host_linkers_on_windows() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=",
+        "REMOVED_WINDOWS_LINKER=",
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("target and host build artifacts")),
+        "missing Cargo target linker must fail the benchmark contract: {violations:?}"
+    );
 }
 
 #[test]

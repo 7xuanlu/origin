@@ -226,6 +226,25 @@ jobs:
           vcpkg install sqlite3:x64-windows-static-md
           "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Set up Vulkan SDK (Windows only)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          & scripts/setup-vulkan-sdk-windows.ps1
+          # The release keeps the official loader beside wenlan-server.exe.
+          # Windows searches the application directory before system PATH, so
+          # a driverless machine can start and select the CPU backend while a
+          # GPU machine still discovers vendor ICDs through this loader.
+          $loaderDir = "target\${{ matrix.target }}\release"
+          & scripts/stage-vulkan-loader-windows.ps1 `
+            -DestinationDirectory $loaderDir
+
+      - name: Configure MSVC Ninja (Windows release)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.ps1
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -238,8 +257,9 @@ jobs:
       # rust-lld shipped with the Rust toolchain (~3-5min faster link
       # than MSVC link.exe on our binary sizes). rustup does NOT proxy
       # rust-lld, so its path must be discovered via `rustc --print
-      # sysroot`. Export RUSTFLAGS via $GITHUB_ENV so the Build step
-      # picks it up.
+      # sysroot`. Export the Cargo target linker for host build scripts plus
+      # RUSTFLAGS for target artifacts via $GITHUB_ENV so the Bash build step
+      # cannot resolve Git for Windows' unrelated usr/bin/link.exe.
       - name: Configure rust-lld linker (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -252,8 +272,15 @@ jobs:
             throw "rust-lld.exe missing"
           }
           $rustflags = "-C linker=$lld -C linker-flavor=lld-link"
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=$rustflags" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "RUSTFLAGS=$rustflags"
+
+      - name: Serialize native build (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: '"CARGO_BUILD_JOBS=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
 
       - name: Select native Perl for vendored OpenSSL
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -280,6 +307,16 @@ jobs:
       # CI release-preflight and the authoritative tag build share this exact
       # shipped-binary build/smoke contract. Packaging and publishing remain
       # release-only below.
+      # The shared script launches each executable immediately after linking,
+      # so the dynamically loaded ORT runtime must already be adjacent. Vulkan
+      # was staged by the Windows SDK step above.
+      - name: Bundle onnxruntime.dll (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\${{ matrix.target }}\release"
+
       - name: Build and smoke shipped release binaries
         shell: bash
         env:
@@ -291,15 +328,6 @@ jobs:
         shell: bash
         run: |
           find "target/${{ matrix.target }}/release" -maxdepth 1 -mindepth 1 -print | sort | head -30
-
-      # Windows builds FastEmbed with ort-load-dynamic. The shared stager pins
-      # the ort 2.0.0-rc.11-compatible DLL and verifies the archive SHA-256.
-      - name: Bundle onnxruntime.dll (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          & scripts/stage-onnxruntime-windows.ps1 `
-            -DestinationDirectory "target\${{ matrix.target }}\release"
 
       - name: Package
         shell: bash
@@ -314,7 +342,9 @@ jobs:
               "./target/${{ matrix.target }}/release/wenlan.exe" \
               "./target/${{ matrix.target }}/release/wenlan-server.exe" \
               "./target/${{ matrix.target }}/release/wenlan-mcp.exe" \
-              "./target/${{ matrix.target }}/release/onnxruntime.dll"
+              "./target/${{ matrix.target }}/release/onnxruntime.dll" \
+              "./target/${{ matrix.target }}/release/vulkan-1.dll" \
+              "./target/${{ matrix.target }}/release/VulkanRT-License.txt"
           else
             tar -C "target/${{ matrix.target }}/release" -czf "dist/${{ matrix.artifact_name }}.tar.gz" \
               wenlan wenlan-server wenlan-mcp
@@ -330,11 +360,19 @@ jobs:
             -DestinationPath $ExtractDir
           $ServerPath = Join-Path $ExtractDir "wenlan-server.exe"
           $OrtPath = Join-Path $ExtractDir "onnxruntime.dll"
+          $VulkanLoaderPath = Join-Path $ExtractDir "vulkan-1.dll"
+          $VulkanLicensePath = Join-Path $ExtractDir "VulkanRT-License.txt"
           if (-not (Test-Path $ServerPath)) {
             throw "packaged wenlan-server.exe is missing"
           }
           if (-not (Test-Path $OrtPath)) {
             throw "packaged onnxruntime.dll is missing"
+          }
+          if (-not (Test-Path $VulkanLoaderPath)) {
+            throw "packaged vulkan-1.dll is missing"
+          }
+          if (-not (Test-Path $VulkanLicensePath)) {
+            throw "packaged VulkanRT-License.txt is missing"
           }
           & scripts/smoke-windows.ps1 `
             -ExePath $ServerPath
@@ -383,7 +421,23 @@ jobs:
               exit 1
             fi
           done
-          echo "OK: archive contains wenlan, wenlan-server, wenlan-mcp"
+          echo "OK: archive contains all shipped binaries"
+
+      - name: Verify Windows release archive runtimes
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -e
+          contents=$(unzip -l "dist/${{ matrix.artifact_name }}.zip" | awk '{print $NF}')
+          for payload in onnxruntime.dll vulkan-1.dll VulkanRT-License.txt; do
+            if ! printf '%s\n' "$contents" | grep -qE "(^|/)${payload}$"; then
+              echo "ERROR: dist/${{ matrix.artifact_name }}.zip missing ${payload}"
+              echo "--- archive contents ---"
+              printf '%s\n' "$contents"
+              exit 1
+            fi
+          done
+          echo "OK: Windows archive contains required runtimes"
 
       - name: Upload archives to release
         uses: softprops/action-gh-release@v2

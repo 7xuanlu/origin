@@ -63,6 +63,8 @@ jobs:
           $lld = Join-Path ((rustc --print sysroot).Trim()) `
             "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
           if (-not (Test-Path $lld)) { throw "rust-lld.exe missing at $lld" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Fetch locked dependencies outside timed region
@@ -267,6 +269,8 @@ jobs:
           $lld = Join-Path ((rustc --print sysroot).Trim()) `
             "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
           if (-not (Test-Path $lld)) { throw "rust-lld.exe missing at $lld" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Fetch locked dependencies outside timed region
@@ -340,6 +344,8 @@ jobs:
           $lld = Join-Path ((rustc --print sysroot).Trim()) `
             "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
           if (-not (Test-Path $lld)) { throw "rust-lld.exe missing at $lld" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Restore production release cache

@@ -125,6 +125,12 @@ pub trait LlmProvider: Send + Sync {
     fn model_id(&self) -> String {
         "unknown".to_string()
     }
+    /// Runtime backend selected for an on-device provider. Non-local
+    /// providers return `None`; callers can expose this as optional status
+    /// without downcasting the trait object.
+    fn inference_runtime_info(&self) -> Option<wenlan_types::responses::OnDeviceInferenceStatus> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +364,7 @@ pub struct OnDeviceProvider {
     model_context_size: u32,
     model_max_output: u32,
     resolved_model_id: String,
+    runtime_info: wenlan_types::responses::OnDeviceInferenceStatus,
 }
 
 impl OnDeviceProvider {
@@ -415,7 +422,7 @@ impl OnDeviceProvider {
         std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
 
         let engine = LlmEngine::new(&model_path, prompts.clone())?;
-        let backend_plan = engine.inference_backend_plan();
+        let backend_plan = engine.inference_backend_plan().clone();
         log::info!(
             "[on_device_provider] selected inference backend: {}",
             backend_plan.label()
@@ -465,15 +472,32 @@ impl OnDeviceProvider {
         } else {
             if let Err(cause) = engine.probe_context() {
                 let message = backend_plan.context_failure_message(&cause);
-                log::error!("[on_device_provider] {message}. On-device inference unavailable.");
-                return Err(crate::error::WenlanError::Llm(message));
+                if backend_plan.supports_cpu_fallback() {
+                    log::warn!("[on_device_provider] {message}; reloading the model on CPU");
+                    drop(engine);
+                    let fallback = LlmEngine::reload_on_cpu(&model_path, prompts, message.clone())?;
+                    fallback.probe_context().map_err(|cpu_cause| {
+                        crate::error::WenlanError::Llm(format!(
+                            "{message}; CPU fallback context creation failed: {cpu_cause}"
+                        ))
+                    })?;
+                    log::warn!(
+                        "[on_device_provider] GPU context failed; CPU fallback context probe passed"
+                    );
+                    fallback
+                } else {
+                    log::error!("[on_device_provider] {message}. On-device inference unavailable.");
+                    return Err(crate::error::WenlanError::Llm(message));
+                }
+            } else {
+                log::info!(
+                    "[on_device_provider] {} context probe passed",
+                    backend_plan.label()
+                );
+                engine
             }
-            log::info!(
-                "[on_device_provider] {} context probe passed",
-                backend_plan.label()
-            );
-            engine
         };
+        let runtime_info = engine.inference_runtime_info();
 
         // Channel capacity sized for concurrent MCP bursts: a 10-store
         // `remember` burst fires ~4 LLM requests per store (classify +
@@ -865,6 +889,7 @@ impl OnDeviceProvider {
             model_context_size: model_spec.context_size,
             model_max_output: model_spec.max_output_tokens,
             resolved_model_id: model_spec.id.to_string(),
+            runtime_info,
         })
     }
 
@@ -928,6 +953,10 @@ impl LlmProvider for OnDeviceProvider {
 
     fn kind(&self) -> &'static str {
         "on-device"
+    }
+
+    fn inference_runtime_info(&self) -> Option<wenlan_types::responses::OnDeviceInferenceStatus> {
+        Some(self.runtime_info.clone())
     }
 
     fn model_id(&self) -> String {

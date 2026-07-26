@@ -92,13 +92,17 @@ fn queue_status_wire(
 pub async fn handle_status(
     State(state): State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<wenlan_types::responses::StatusResponse>, ServerError> {
-    let (db, reranker_status, reranker_light_status, reranker_mode) = {
+    let (db, reranker_status, reranker_light_status, reranker_mode, on_device_inference) = {
         let s = state.read().await;
         (
             s.db.clone(),
             s.reranker_status.clone(),
             s.reranker_light_status.clone(),
             s.reranker_mode.clone(),
+            s.llm
+                .as_ref()
+                .and_then(|provider| provider.inference_runtime_info())
+                .unwrap_or_default(),
         )
     };
 
@@ -134,6 +138,7 @@ pub async fn handle_status(
         reranker: reranker_status,
         reranker_light: reranker_light_status,
         reranker_mode,
+        on_device_inference,
     }))
 }
 
@@ -1303,6 +1308,39 @@ mod recent_endpoints_tests {
         }
     }
 
+    struct VulkanStatusProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for VulkanStatusProvider {
+        async fn generate(&self, _request: LlmRequest) -> Result<String, LlmError> {
+            Ok("unused".into())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "vulkan-status-test"
+        }
+
+        fn backend(&self) -> LlmBackend {
+            LlmBackend::OnDevice
+        }
+
+        fn inference_runtime_info(
+            &self,
+        ) -> Option<wenlan_types::responses::OnDeviceInferenceStatus> {
+            Some(wenlan_types::responses::OnDeviceInferenceStatus {
+                backend: "vulkan".into(),
+                device: Some("NVIDIA GeForce RTX 3060 Laptop GPU".into()),
+                device_index: Some(2),
+                gpu_layers: 99,
+                fallback_reason: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn get_recent_retrievals_without_db_returns_503() {
         let state = Arc::new(RwLock::new(ServerState::default()));
@@ -1484,6 +1522,35 @@ mod recent_endpoints_tests {
             parsed.reranker,
             wenlan_types::responses::RerankerStatus::Disabled
         );
+        assert_eq!(parsed.on_device_inference.backend, "disabled");
+    }
+
+    #[tokio::test]
+    async fn status_reports_selected_vulkan_device() {
+        let state = Arc::new(RwLock::new(ServerState {
+            llm: Some(Arc::new(VulkanStatusProvider)),
+            ..ServerState::default()
+        }));
+        let app = crate::router::build_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/status")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: wenlan_types::responses::StatusResponse =
+            serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(parsed.on_device_inference.backend, "vulkan");
+        assert_eq!(
+            parsed.on_device_inference.device.as_deref(),
+            Some("NVIDIA GeForce RTX 3060 Laptop GPU")
+        );
+        assert_eq!(parsed.on_device_inference.device_index, Some(2));
     }
 
     #[tokio::test]
@@ -1523,9 +1590,13 @@ mod recent_endpoints_tests {
             .map(|offset| start + offset)
             .expect("handle_search marker should follow handle_status");
         let body = &source[start..end];
+        let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(
-            body.contains("let (db, reranker_status, reranker_light_status, reranker_mode) = {"),
+            normalized.contains(
+                "let (db, reranker_status, reranker_light_status, reranker_mode, \
+                 on_device_inference) = { let s = state.read().await;"
+            ),
             "handle_status must snapshot cloned state out of ServerState before awaiting DB work"
         );
     }

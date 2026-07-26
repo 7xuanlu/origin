@@ -14,6 +14,7 @@ use crate::llm_provider::format_chatml_prompt;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::LlamaBackendDeviceType;
 use std::sync::{Arc, OnceLock};
 
 /// Process-wide llama.cpp backend. Initialized lazily on first use and shared
@@ -73,21 +74,71 @@ pub(crate) enum InferenceBackendKind {
     Cpu,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferenceDeviceClass {
+    DiscreteGpu,
+    IntegratedGpu,
+    Accelerator,
+    Cpu,
+    Unknown,
+}
+
+impl InferenceDeviceClass {
+    fn gpu_preference(self) -> Option<u8> {
+        match self {
+            Self::DiscreteGpu => Some(3),
+            Self::IntegratedGpu => Some(2),
+            Self::Accelerator => Some(1),
+            Self::Cpu | Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InferenceDeviceCandidate {
+    index: usize,
+    backend: String,
+    description: String,
+    memory_free: usize,
+    class: InferenceDeviceClass,
+}
+
+impl From<&llama_cpp_2::LlamaBackendDevice> for InferenceDeviceCandidate {
+    fn from(device: &llama_cpp_2::LlamaBackendDevice) -> Self {
+        let class = match device.device_type {
+            LlamaBackendDeviceType::Gpu => InferenceDeviceClass::DiscreteGpu,
+            LlamaBackendDeviceType::IntegratedGpu => InferenceDeviceClass::IntegratedGpu,
+            LlamaBackendDeviceType::Accelerator => InferenceDeviceClass::Accelerator,
+            LlamaBackendDeviceType::Cpu => InferenceDeviceClass::Cpu,
+            LlamaBackendDeviceType::Unknown => InferenceDeviceClass::Unknown,
+        };
+        Self {
+            index: device.index,
+            backend: device.backend.clone(),
+            description: device.description.clone(),
+            memory_free: device.memory_free,
+            class,
+        }
+    }
+}
+
 /// Runtime plan derived from the backends that this exact llama.cpp binary
 /// compiled and can currently use. Hardware discovery outside llama.cpp (for
 /// example `nvidia-smi`) is deliberately not an input: seeing a GPU does not
 /// prove that the corresponding ggml backend was linked into the binary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InferenceBackendPlan {
     kind: InferenceBackendKind,
+    device_index: Option<usize>,
+    device_description: Option<String>,
+    fallback_reason: Option<String>,
 }
 
 impl InferenceBackendPlan {
+    #[cfg(test)]
     pub(crate) fn from_runtime(supports_gpu_offload: bool, backend_names: &[&str]) -> Self {
         if !supports_gpu_offload {
-            return Self {
-                kind: InferenceBackendKind::Cpu,
-            };
+            return Self::cpu(None);
         }
 
         let kind = backend_names
@@ -102,15 +153,92 @@ impl InferenceBackendPlan {
             })
             .unwrap_or(InferenceBackendKind::OtherGpu);
 
-        Self { kind }
+        Self {
+            kind,
+            device_index: None,
+            device_description: None,
+            fallback_reason: None,
+        }
+    }
+
+    pub(crate) fn from_devices(
+        supports_gpu_offload: bool,
+        devices: &[InferenceDeviceCandidate],
+        selector: &str,
+    ) -> Self {
+        let selector = selector.trim().to_ascii_lowercase();
+        if !supports_gpu_offload || selector == "cpu" {
+            return Self::cpu(None);
+        }
+
+        if !selector.is_empty() && selector != "auto" {
+            return match selector.parse::<usize>() {
+                Ok(index) => devices
+                    .iter()
+                    .find(|device| device.index == index && device.class.gpu_preference().is_some())
+                    .map(Self::for_device)
+                    .unwrap_or_else(|| {
+                        Self::cpu(Some(format!(
+                            "requested GPU device index {index} is unavailable"
+                        )))
+                    }),
+                Err(_) => Self::cpu(Some(format!(
+                    "invalid WENLAN_LLM_DEVICE value '{selector}' (expected auto, cpu, or an index)"
+                ))),
+            };
+        }
+
+        let selected = devices
+            .iter()
+            .filter(|device| device.class.gpu_preference().is_some())
+            .max_by(|left, right| {
+                left.class
+                    .gpu_preference()
+                    .cmp(&right.class.gpu_preference())
+                    .then_with(|| left.memory_free.cmp(&right.memory_free))
+                    // For otherwise-identical devices, the lower llama.cpp
+                    // index wins so selection remains stable across starts.
+                    .then_with(|| right.index.cmp(&left.index))
+            });
+
+        selected
+            .map(Self::for_device)
+            .unwrap_or_else(|| Self::cpu(None))
+    }
+
+    fn for_device(device: &InferenceDeviceCandidate) -> Self {
+        Self {
+            kind: Self::kind_from_backend(&device.backend),
+            device_index: Some(device.index),
+            device_description: Some(device.description.clone()),
+            fallback_reason: None,
+        }
+    }
+
+    fn kind_from_backend(backend: &str) -> InferenceBackendKind {
+        match backend.trim().to_ascii_lowercase().as_str() {
+            "mtl" | "metal" => InferenceBackendKind::Metal,
+            "cuda" => InferenceBackendKind::Cuda,
+            "vulkan" => InferenceBackendKind::Vulkan,
+            _ => InferenceBackendKind::OtherGpu,
+        }
+    }
+
+    fn cpu(fallback_reason: Option<String>) -> Self {
+        Self {
+            kind: InferenceBackendKind::Cpu,
+            device_index: None,
+            device_description: None,
+            fallback_reason,
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn kind(self) -> InferenceBackendKind {
+    pub(crate) fn kind(&self) -> InferenceBackendKind {
         self.kind
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self.kind {
             InferenceBackendKind::Metal => "Metal",
             InferenceBackendKind::Cuda => "CUDA",
@@ -120,23 +248,102 @@ impl InferenceBackendPlan {
         }
     }
 
-    pub(crate) fn gpu_layers(self) -> u32 {
+    pub(crate) fn backend_id(&self) -> &'static str {
+        match self.kind {
+            InferenceBackendKind::Metal => "metal",
+            InferenceBackendKind::Cuda => "cuda",
+            InferenceBackendKind::Vulkan => "vulkan",
+            InferenceBackendKind::OtherGpu => "gpu",
+            InferenceBackendKind::Cpu => "cpu",
+        }
+    }
+
+    pub(crate) fn gpu_layers(&self) -> u32 {
         match self.kind {
             InferenceBackendKind::Cpu => 0,
             _ => 99,
         }
     }
 
-    pub(crate) fn uses_metal_compatibility_fallback(self) -> bool {
+    pub(crate) fn uses_metal_compatibility_fallback(&self) -> bool {
         self.kind == InferenceBackendKind::Metal
     }
 
-    pub(crate) fn context_failure_message(self, cause: &str) -> String {
+    pub(crate) fn supports_cpu_fallback(&self) -> bool {
+        matches!(
+            self.kind,
+            InferenceBackendKind::Cuda
+                | InferenceBackendKind::Vulkan
+                | InferenceBackendKind::OtherGpu
+        )
+    }
+
+    pub(crate) fn device_index(&self) -> Option<usize> {
+        self.device_index
+    }
+
+    pub(crate) fn device_description(&self) -> Option<&str> {
+        self.device_description.as_deref()
+    }
+
+    pub(crate) fn fallback_reason(&self) -> Option<&str> {
+        self.fallback_reason.as_deref()
+    }
+
+    pub(crate) fn context_failure_message(&self, cause: &str) -> String {
         format!("{} context creation failed: {cause}", self.label())
     }
 
-    pub(crate) fn model_load_failure_message(self, cause: &str) -> String {
+    pub(crate) fn model_load_failure_message(&self, cause: &str) -> String {
         format!("model load with {} backend failed: {cause}", self.label())
+    }
+
+    fn model_params(&self) -> Result<LlamaModelParams, WenlanError> {
+        let params = LlamaModelParams::default().with_n_gpu_layers(self.gpu_layers());
+        match self.device_index {
+            Some(index) => params.with_devices(&[index]).map_err(|error| {
+                WenlanError::Llm(format!("selecting GPU device index {index}: {error}"))
+            }),
+            None => Ok(params),
+        }
+    }
+
+    fn configure_context_params(&self, params: LlamaContextParams) -> LlamaContextParams {
+        if self.kind == InferenceBackendKind::Cpu {
+            params.with_offload_kqv(false).with_op_offload(false)
+        } else {
+            params
+        }
+    }
+}
+
+fn llm_error_detail(error: &WenlanError) -> String {
+    match error {
+        WenlanError::Llm(detail) => detail.clone(),
+        _ => error.to_string(),
+    }
+}
+
+fn load_with_cpu_fallback<T>(
+    initial_plan: InferenceBackendPlan,
+    mut load: impl FnMut(&InferenceBackendPlan) -> Result<T, WenlanError>,
+) -> Result<(T, InferenceBackendPlan), WenlanError> {
+    match load(&initial_plan) {
+        Ok(value) => Ok((value, initial_plan)),
+        Err(error) if initial_plan.supports_cpu_fallback() => {
+            let reason = initial_plan.model_load_failure_message(&llm_error_detail(&error));
+            log::warn!("[llm_engine] {reason}; reloading the model on CPU");
+            let cpu_plan = InferenceBackendPlan::cpu(Some(reason.clone()));
+            load(&cpu_plan)
+                .map(|value| (value, cpu_plan))
+                .map_err(|cpu_error| {
+                    WenlanError::Llm(format!(
+                        "{reason}; CPU fallback model load failed: {}",
+                        llm_error_detail(&cpu_error)
+                    ))
+                })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -226,12 +433,17 @@ impl LlmEngine {
         let backend = shared_backend()?;
 
         let devices = llama_cpp_2::list_llama_ggml_backend_devices();
-        let backend_names: Vec<&str> = devices
+        let candidates = devices
             .iter()
-            .map(|device| device.backend.as_str())
-            .collect();
-        let backend_plan =
-            InferenceBackendPlan::from_runtime(backend.supports_gpu_offload(), &backend_names);
+            .map(InferenceDeviceCandidate::from)
+            .collect::<Vec<_>>();
+        let device_selector =
+            std::env::var("WENLAN_LLM_DEVICE").unwrap_or_else(|_| "auto".to_string());
+        let backend_plan = InferenceBackendPlan::from_devices(
+            backend.supports_gpu_offload(),
+            &candidates,
+            &device_selector,
+        );
         let device_summary = devices
             .iter()
             .map(|device| {
@@ -243,21 +455,30 @@ impl LlmEngine {
             .collect::<Vec<_>>()
             .join(", ");
         log::info!(
-            "[llm_engine] inference backend={} gpu_layers={} devices=[{}]",
+            "[llm_engine] inference backend={} device_index={} device={} gpu_layers={} devices=[{}]",
             backend_plan.label(),
+            backend_plan
+                .device_index()
+                .map_or_else(|| "none".to_string(), |index| index.to_string()),
+            backend_plan.device_description().unwrap_or("none"),
             backend_plan.gpu_layers(),
             device_summary
         );
-
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(backend_plan.gpu_layers());
+        if let Some(reason) = backend_plan.fallback_reason() {
+            log::warn!("[llm_engine] using CPU fallback: {reason}");
+        }
 
         log::info!("[llm_engine] loading model...");
-        let model =
-            LlamaCppModel::load_from_file(&backend, model_path, &model_params).map_err(|e| {
-                WenlanError::Llm(backend_plan.model_load_failure_message(&e.to_string()))
-            })?;
+        let (model, backend_plan) = load_with_cpu_fallback(backend_plan, |attempt| {
+            let model_params = attempt.model_params()?;
+            LlamaCppModel::load_from_file(&backend, model_path, &model_params)
+                .map_err(|error| WenlanError::Llm(error.to_string()))
+        })?;
 
-        log::info!("[llm_engine] model loaded successfully");
+        log::info!(
+            "[llm_engine] model loaded successfully with {}",
+            backend_plan.label()
+        );
         Ok(Self {
             backend,
             model,
@@ -270,9 +491,11 @@ impl LlmEngine {
     /// backend. Metal callers may use failure to trigger their BF16 compatibility
     /// fallback; other platforms surface the selected backend in the error.
     pub fn probe_context(&self) -> Result<(), String> {
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(Some(NonZeroU32::new(512).unwrap()))
-            .with_n_batch(512);
+        let ctx_params = self.context_params(
+            LlamaContextParams::default()
+                .with_n_ctx(Some(NonZeroU32::new(512).unwrap()))
+                .with_n_batch(512),
+        );
         self.model
             .new_context(&self.backend, ctx_params)
             .map(|_| ())
@@ -284,8 +507,40 @@ impl LlmEngine {
         self.probe_context().is_ok()
     }
 
-    pub(crate) fn inference_backend_plan(&self) -> InferenceBackendPlan {
-        self.backend_plan
+    pub(crate) fn inference_backend_plan(&self) -> &InferenceBackendPlan {
+        &self.backend_plan
+    }
+
+    pub(crate) fn context_params(&self, params: LlamaContextParams) -> LlamaContextParams {
+        self.backend_plan.configure_context_params(params)
+    }
+
+    pub(crate) fn reload_on_cpu(
+        model_path: &Path,
+        prompts: crate::prompts::PromptRegistry,
+        reason: String,
+    ) -> Result<Self, WenlanError> {
+        let backend = shared_backend()?;
+        let plan = InferenceBackendPlan::cpu(Some(reason));
+        let params = plan.model_params()?;
+        let model = LlamaCppModel::load_from_file(&backend, model_path, &params)
+            .map_err(|error| WenlanError::Llm(format!("CPU fallback model load: {error}")))?;
+        Ok(Self {
+            backend,
+            model,
+            prompts,
+            backend_plan: plan,
+        })
+    }
+
+    pub fn inference_runtime_info(&self) -> wenlan_types::responses::OnDeviceInferenceStatus {
+        wenlan_types::responses::OnDeviceInferenceStatus {
+            backend: self.backend_plan.backend_id().to_string(),
+            device: self.backend_plan.device_description.clone(),
+            device_index: self.backend_plan.device_index,
+            gpu_layers: self.backend_plan.gpu_layers(),
+            fallback_reason: self.backend_plan.fallback_reason.clone(),
+        }
     }
 
     /// Access the loaded llama-cpp model. Used by domain modules that need to
@@ -345,9 +600,11 @@ impl LlmEngine {
         };
 
         let n_batch = tokens.len().max(512) as u32;
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(Some(NonZeroU32::new(ctx_size).unwrap()))
-            .with_n_batch(n_batch);
+        let ctx_params = self.context_params(
+            LlamaContextParams::default()
+                .with_n_ctx(Some(NonZeroU32::new(ctx_size).unwrap()))
+                .with_n_batch(n_batch),
+        );
 
         let mut ctx = match self.model.new_context(&self.backend, ctx_params) {
             Ok(c) => c,
@@ -442,10 +699,12 @@ impl LlmEngine {
         ctx_size: u32,
         n_seq_max: u32,
     ) -> Option<LlamaContext<'_>> {
-        let params = LlamaContextParams::default()
-            .with_n_ctx(Some(NonZeroU32::new(ctx_size)?))
-            .with_n_batch(ctx_size)
-            .with_n_seq_max(n_seq_max.max(1));
+        let params = self.context_params(
+            LlamaContextParams::default()
+                .with_n_ctx(Some(NonZeroU32::new(ctx_size)?))
+                .with_n_batch(ctx_size)
+                .with_n_seq_max(n_seq_max.max(1)),
+        );
         match self.model.new_context(&self.backend, params) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -1226,9 +1485,11 @@ impl LlmEngine {
         };
 
         let n_batch = tokens.len().max(512) as u32;
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(Some(NonZeroU32::new(ctx_size).unwrap()))
-            .with_n_batch(n_batch);
+        let ctx_params = self.context_params(
+            LlamaContextParams::default()
+                .with_n_ctx(Some(NonZeroU32::new(ctx_size).unwrap()))
+                .with_n_batch(n_batch),
+        );
 
         let mut ctx = match self.model.new_context(&self.backend, ctx_params) {
             Ok(c) => c,
@@ -1350,9 +1611,11 @@ impl LlmEngine {
 
         // Create context
         let n_batch = tokens.len().max(512) as u32;
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(Some(NonZeroU32::new(CTX_SIZE).unwrap()))
-            .with_n_batch(n_batch);
+        let ctx_params = self.context_params(
+            LlamaContextParams::default()
+                .with_n_ctx(Some(NonZeroU32::new(CTX_SIZE).unwrap()))
+                .with_n_batch(n_batch),
+        );
 
         let mut ctx = match self.model.new_context(&self.backend, ctx_params) {
             Ok(c) => c,
@@ -1748,6 +2011,7 @@ mod tests {
         assert_eq!(plan.gpu_layers(), 99);
         assert_eq!(plan.label(), "Metal");
         assert!(plan.uses_metal_compatibility_fallback());
+        assert!(!plan.supports_cpu_fallback());
     }
 
     #[test]
@@ -1784,9 +2048,197 @@ mod tests {
         assert_eq!(plan.gpu_layers(), 99);
         assert_eq!(plan.label(), "Vulkan");
         assert!(!plan.uses_metal_compatibility_fallback());
+        assert!(plan.supports_cpu_fallback());
         assert_eq!(
             plan.context_failure_message("device lost"),
             "Vulkan context creation failed: device lost"
+        );
+    }
+
+    fn candidate(
+        index: usize,
+        backend: &str,
+        description: &str,
+        memory_free: usize,
+        class: InferenceDeviceClass,
+    ) -> InferenceDeviceCandidate {
+        InferenceDeviceCandidate {
+            index,
+            backend: backend.to_string(),
+            description: description.to_string(),
+            memory_free,
+            class,
+        }
+    }
+
+    #[test]
+    fn auto_device_selection_prefers_discrete_gpu_over_integrated_gpu() {
+        let devices = vec![
+            candidate(
+                1,
+                "Vulkan",
+                "Intel Iris Xe Graphics",
+                8_000,
+                InferenceDeviceClass::IntegratedGpu,
+            ),
+            candidate(
+                2,
+                "Vulkan",
+                "NVIDIA GeForce RTX 3060 Laptop GPU",
+                4_000,
+                InferenceDeviceClass::DiscreteGpu,
+            ),
+        ];
+
+        let plan = InferenceBackendPlan::from_devices(true, &devices, "auto");
+
+        assert_eq!(plan.kind(), InferenceBackendKind::Vulkan);
+        assert_eq!(plan.device_index(), Some(2));
+        assert_eq!(
+            plan.device_description(),
+            Some("NVIDIA GeForce RTX 3060 Laptop GPU")
+        );
+    }
+
+    #[test]
+    fn auto_device_selection_preserves_metal_accelerators() {
+        let devices = vec![candidate(
+            0,
+            "MTL",
+            "Apple M2 Pro",
+            16_000,
+            InferenceDeviceClass::Accelerator,
+        )];
+
+        let plan = InferenceBackendPlan::from_devices(true, &devices, "auto");
+
+        assert_eq!(plan.kind(), InferenceBackendKind::Metal);
+        assert_eq!(plan.device_index(), Some(0));
+        assert_eq!(plan.device_description(), Some("Apple M2 Pro"));
+    }
+
+    #[test]
+    fn auto_device_selection_uses_free_memory_then_stable_index() {
+        let devices = vec![
+            candidate(
+                7,
+                "Vulkan",
+                "GPU seven",
+                12_000,
+                InferenceDeviceClass::DiscreteGpu,
+            ),
+            candidate(
+                3,
+                "Vulkan",
+                "GPU three",
+                12_000,
+                InferenceDeviceClass::DiscreteGpu,
+            ),
+            candidate(
+                1,
+                "Vulkan",
+                "GPU one",
+                4_000,
+                InferenceDeviceClass::DiscreteGpu,
+            ),
+        ];
+
+        let plan = InferenceBackendPlan::from_devices(true, &devices, "auto");
+
+        assert_eq!(plan.device_index(), Some(3));
+        assert_eq!(plan.device_description(), Some("GPU three"));
+    }
+
+    #[test]
+    fn explicit_device_and_cpu_overrides_are_deterministic() {
+        let devices = vec![
+            candidate(
+                1,
+                "Vulkan",
+                "Intel Iris Xe Graphics",
+                8_000,
+                InferenceDeviceClass::IntegratedGpu,
+            ),
+            candidate(
+                2,
+                "Vulkan",
+                "NVIDIA GeForce RTX 3060 Laptop GPU",
+                4_000,
+                InferenceDeviceClass::DiscreteGpu,
+            ),
+        ];
+
+        let explicit = InferenceBackendPlan::from_devices(true, &devices, "1");
+        assert_eq!(explicit.device_index(), Some(1));
+        assert_eq!(
+            explicit.device_description(),
+            Some("Intel Iris Xe Graphics")
+        );
+
+        let cpu = InferenceBackendPlan::from_devices(true, &devices, "cpu");
+        assert_eq!(cpu.kind(), InferenceBackendKind::Cpu);
+        assert_eq!(cpu.device_index(), None);
+        assert_eq!(cpu.gpu_layers(), 0);
+        let cpu_context = cpu.configure_context_params(LlamaContextParams::default());
+        assert!(!cpu_context.offload_kqv());
+        assert!(!cpu_context.op_offload());
+    }
+
+    #[test]
+    fn unavailable_explicit_device_falls_back_to_cpu_with_visible_reason() {
+        let devices = vec![candidate(
+            2,
+            "Vulkan",
+            "NVIDIA GeForce RTX 3060 Laptop GPU",
+            4_000,
+            InferenceDeviceClass::DiscreteGpu,
+        )];
+
+        let plan = InferenceBackendPlan::from_devices(true, &devices, "99");
+
+        assert_eq!(plan.kind(), InferenceBackendKind::Cpu);
+        assert_eq!(
+            plan.fallback_reason(),
+            Some("requested GPU device index 99 is unavailable")
+        );
+    }
+
+    #[test]
+    fn gpu_model_load_failure_reloads_the_model_on_cpu() {
+        let devices = vec![candidate(
+            2,
+            "Vulkan",
+            "NVIDIA GeForce RTX 3060 Laptop GPU",
+            4_000,
+            InferenceDeviceClass::DiscreteGpu,
+        )];
+        let plan = InferenceBackendPlan::from_devices(true, &devices, "auto");
+        let mut attempted = Vec::new();
+
+        let (loaded, final_plan) = load_with_cpu_fallback(plan, |attempt| {
+            attempted.push((attempt.kind(), attempt.device_index()));
+            if attempt.kind() == InferenceBackendKind::Vulkan {
+                Err(WenlanError::Llm(
+                    "simulated Vulkan allocation failure".into(),
+                ))
+            } else {
+                Ok("CPU model")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(loaded, "CPU model");
+        assert_eq!(
+            attempted,
+            vec![
+                (InferenceBackendKind::Vulkan, Some(2)),
+                (InferenceBackendKind::Cpu, None),
+            ]
+        );
+        assert_eq!(final_plan.kind(), InferenceBackendKind::Cpu);
+        assert_eq!(
+            final_plan.fallback_reason(),
+            Some("model load with Vulkan backend failed: simulated Vulkan allocation failure")
         );
     }
 

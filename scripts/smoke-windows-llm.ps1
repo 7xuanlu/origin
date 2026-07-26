@@ -4,6 +4,16 @@ param(
 
     [string]$ProbePath = "target\release\model_probe.exe",
 
+    [ValidatePattern("^(auto|cpu|\d+)$")]
+    [string]$Device = "auto",
+
+    [ValidateSet("cpu", "vulkan")]
+    [string]$ExpectedBackend = "cpu",
+
+    [string]$ExpectedDevicePattern,
+
+    [string]$ExpectedFallbackPattern,
+
     [switch]$SkipHardwareInventory
 )
 
@@ -22,7 +32,9 @@ if (-not (Test-Path $ModelPath -PathType Leaf)) {
 $ProbePath = (Resolve-Path $ProbePath).Path
 $ModelPath = (Resolve-Path $ModelPath).Path
 $previousRustLog = $env:RUST_LOG
+$previousLlmDevice = $env:WENLAN_LLM_DEVICE
 $env:RUST_LOG = "wenlan_core=info"
+$env:WENLAN_LLM_DEVICE = $Device
 
 try {
     if (-not $SkipHardwareInventory) {
@@ -33,8 +45,20 @@ try {
     }
 
     Write-Host "==> Running Qwen model probe"
-    $output = & $ProbePath $ModelPath 2>&1
-    $exitCode = $LASTEXITCODE
+    # Windows PowerShell 5 turns native stderr records into terminating errors
+    # when ErrorActionPreference is Stop. llama.cpp logs normally on stderr, so
+    # capture under Continue and check LASTEXITCODE ourselves. PowerShell 7
+    # follows the same explicit path because PSNativeCommandUseErrorActionPreference
+    # is disabled above.
+    $savedErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $ProbePath $ModelPath 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
     $text = ($output | Out-String)
     Write-Host $text
 
@@ -42,21 +66,38 @@ try {
         throw "model probe exited with code $exitCode"
     }
 
-    $backendMarker = "[llm_engine] inference backend=CPU (OpenMP)"
+    $backendMarker = "--- Inference backend: $ExpectedBackend ---"
     if (-not $text.Contains($backendMarker)) {
         throw "expected backend marker '$backendMarker'"
+    }
+    if (
+        $ExpectedBackend -eq "cpu" -and
+        $text -match "(?im)\bVulkan\d+\s+(?:KV|compute|output)\s+buffer\s+size\s*="
+    ) {
+        throw "CPU smoke observed GPU runtime allocation: $($Matches[0])"
+    }
+    if ($ExpectedDevicePattern -and $text -notmatch $ExpectedDevicePattern) {
+        throw "expected device matching '$ExpectedDevicePattern'"
+    }
+    if ($ExpectedFallbackPattern -and $text -notmatch $ExpectedFallbackPattern) {
+        throw "expected fallback reason matching '$ExpectedFallbackPattern'"
     }
     $classificationMarker = "--- Verified classification: preference ---"
     if (-not $text.Contains($classificationMarker)) {
         throw "model probe did not produce the expected classification"
     }
 
-    Write-Host "==> PASS: Qwen produced a valid classification on CPU (OpenMP)"
+    Write-Host "==> PASS: Qwen produced a valid classification on $ExpectedBackend"
 }
 finally {
     if ($null -eq $previousRustLog) {
         Remove-Item Env:RUST_LOG -ErrorAction SilentlyContinue
     } else {
         $env:RUST_LOG = $previousRustLog
+    }
+    if ($null -eq $previousLlmDevice) {
+        Remove-Item Env:WENLAN_LLM_DEVICE -ErrorAction SilentlyContinue
+    } else {
+        $env:WENLAN_LLM_DEVICE = $previousLlmDevice
     }
 }
