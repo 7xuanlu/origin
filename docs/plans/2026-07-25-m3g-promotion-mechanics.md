@@ -318,7 +318,7 @@ the **document-source identity** — the identifier of the ingested file
 (`memories.source_id`, `db.rs:2495`, and/or `url`, `db.rs:2498`); doc-reconcile already
 uses a file-level id `"{source_id}::{path}"` shared by all chunks
 (`reconcile.rs:39`). Keying the signal on the file id (not the chunk) means **all chunks
-of one document land in one `independence_group_id`** — matching §1's *"a document is one
+of one document land in one `independence_group_id`** — matching §4's *"a document is one
 group regardless of chunk count"* — even though each chunk mints a distinct `root_id`
 (distinct content ⇒ distinct `identity_digest`). Genesis floors count independence
 groups (§4), so the document correctly counts once.

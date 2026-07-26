@@ -2243,6 +2243,21 @@ pub async fn create_relation(
     req: CreateRelationRequest,
     agent: &str,
 ) -> Result<WriteResult, WenlanError> {
+    create_relation_with_span(db, req, agent, None).await
+}
+
+/// Like [`create_relation`], plus the verbatim source-memory text the
+/// relation's `span` quote (if any) was extracted from. Used by
+/// daemon-internal KG extraction to ground `req.span` into char offsets
+/// (M3g span capture, §2.3). `source_content` should be the exact string
+/// the extraction model saw -- never re-fetched from the DB, since a
+/// batch-extraction `source_memory_id` may not map 1:1 to that content.
+pub async fn create_relation_with_span(
+    db: &MemoryDB,
+    req: CreateRelationRequest,
+    agent: &str,
+    source_content: Option<&str>,
+) -> Result<WriteResult, WenlanError> {
     // Pre-write validation
     if !db.entity_exists(&req.from_entity).await? {
         return Err(WenlanError::Validation(format!(
@@ -2284,7 +2299,7 @@ pub async fn create_relation(
     }
 
     let id = db
-        .create_relation(
+        .create_relation_with_span(
             &req.from_entity,
             &req.to_entity,
             rt,
@@ -2292,6 +2307,10 @@ pub async fn create_relation(
             req.confidence,
             req.explanation.as_deref(),
             req.source_memory_id.as_deref(),
+            req.span.as_deref(),
+            source_content,
+            req.model_version.as_deref(),
+            req.prompt_version.as_deref(),
         )
         .await?;
 
@@ -4211,6 +4230,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         assert!(matches!(
             create_relation(&db, req, "test").await,
@@ -4237,6 +4259,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         assert!(matches!(
             create_relation(&db, req, "test").await,
@@ -4263,6 +4288,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let result = create_relation(&db, req, "test").await.unwrap();
         assert!(!result.id.is_empty());
@@ -4287,6 +4315,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let first = create_relation(&db, req1, "agent-x").await.unwrap();
         let req2 = CreateRelationRequest {
@@ -4297,6 +4328,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let second = create_relation(&db, req2, "agent-x").await.unwrap();
         // Idempotent re-post must resolve to the same relation id.
@@ -4332,6 +4366,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let knows_result = create_relation(&db, req_knows, "test-agent").await.unwrap();
         let knows_id = knows_result.id.clone();
@@ -4345,6 +4382,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let likes_result = create_relation(&db, req_likes, "test-agent").await.unwrap();
 
@@ -4408,6 +4448,9 @@ mod tests {
             confidence: Some(0.72),
             explanation: Some("met at offsite".to_string()),
             source_memory_id: Some("mem_seed".to_string()),
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let knows_id = create_relation(&db, req_knows, "test-agent")
             .await
@@ -4423,6 +4466,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         create_relation(&db, req_likes, "test-agent").await.unwrap();
 
@@ -4468,6 +4514,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let first = create_relation(&db, req1, "test-agent").await.unwrap();
 
@@ -4480,6 +4529,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let second = create_relation(&db, req2, "test-agent").await.unwrap();
 
@@ -4524,6 +4576,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let result = create_relation(&db, req, "test-agent").await.unwrap();
 

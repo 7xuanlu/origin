@@ -10306,11 +10306,50 @@ impl MemoryDB {
     /// rather than leaving it stuck invalid. M2 PR-1 has no
     /// span-validation pipeline, so every dual-written edge is honestly
     /// `grounded=false`, `root_id=NULL` -- same legacy-honesty ceiling as
-    /// the backfill (spec v3 §2). Returns `libsql::Error` so callers whose
-    /// existing transaction block is already typed that way (the common
-    /// case in this file) can `.await?` it directly.
+    /// the backfill (spec v3 §2); this stays true whether or not the edge
+    /// carries a `payload` (M3g Stage A span capture is grounding-adjacent
+    /// evidence, not a promotion -- see `dual_write_edge_with_payload`).
+    /// Returns `libsql::Error` so callers whose existing transaction block
+    /// is already typed that way (the common case in this file) can
+    /// `.await?` it directly.
     #[allow(clippy::too_many_arguments)]
     async fn dual_write_edge(
+        conn: &libsql::Connection,
+        edge_type: &str,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+        discriminator: &str,
+        lineage: &str,
+        space: &str,
+        cross_space_downgrade: bool,
+        operation_id: Option<&str>,
+    ) -> Result<String, libsql::Error> {
+        Self::dual_write_edge_with_payload(
+            conn,
+            edge_type,
+            src_kind,
+            src_id,
+            dst_kind,
+            dst_id,
+            discriminator,
+            lineage,
+            space,
+            cross_space_downgrade,
+            operation_id,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`dual_write_edge`], plus an optional JSON `payload` written
+    /// once at INSERT time (M3g Stage A span capture, §2.3/§6.6). The
+    /// `ON CONFLICT` clause below never assigns `payload`, so a later
+    /// reactivation/re-write of the same content-addressed `edge_id`
+    /// cannot clobber it -- payload is write-once-at-birth by construction.
+    #[allow(clippy::too_many_arguments)]
+    async fn dual_write_edge_with_payload(
         conn: &libsql::Connection,
         edge_type: &str,
         src_kind: &str,
@@ -10339,6 +10378,7 @@ impl MemoryDB {
         // non-external `legacy`.
         cross_space_downgrade: bool,
         operation_id: Option<&str>,
+        payload: Option<&str>,
     ) -> Result<String, libsql::Error> {
         let edge_id = crate::provenance::compute_edge_id(
             edge_type,
@@ -10401,7 +10441,7 @@ impl MemoryDB {
         // fenced INSERTs, letting a stale-space reactivation slip through).
         conn.execute(
             "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, NULL, NULL, ?9, ?10, NULL, NULL)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, ?12, NULL, ?9, ?10, NULL, NULL)
              ON CONFLICT(edge_id) DO UPDATE SET
                  valid_until = NULL,
                  superseded_by = NULL,
@@ -10432,7 +10472,8 @@ impl MemoryDB {
                 space.to_string(),
                 operation_id.map(|s| s.to_string()),
                 now,
-                cross_space_downgrade as i64
+                cross_space_downgrade as i64,
+                payload.map(|s| s.to_string())
             ],
         )
         .await?;
@@ -23787,6 +23828,47 @@ impl MemoryDB {
         explanation: Option<&str>,
         source_memory_id: Option<&str>,
     ) -> Result<String, WenlanError> {
+        self.create_relation_with_span(
+            from_entity,
+            to_entity,
+            relation_type,
+            source_agent,
+            confidence,
+            explanation,
+            source_memory_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`create_relation`], plus a verbatim source-memory `span_quote`
+    /// (M3g Stage A capture, §2.3-§2.4 of `docs/plans/2026-07-25-m3g-promotion-mechanics.md`).
+    /// `source_content` is the exact memory text the extractor saw, used
+    /// ONLY to locate `span_quote`'s char offsets -- never re-fetched from
+    /// the DB, since batch extraction can combine multiple memories'
+    /// content and the caller must supply the exact string the model read.
+    /// `model_version`/`prompt_version` record the extraction call's
+    /// provenance (§6.6). When all four are `None` (the plain
+    /// `create_relation` wrapper), no payload is written and the edge
+    /// stays `payload=NULL`, identical to before M3g.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_relation_with_span(
+        &self,
+        from_entity: &str,
+        to_entity: &str,
+        relation_type: &str,
+        source_agent: Option<&str>,
+        confidence: Option<f64>,
+        explanation: Option<&str>,
+        source_memory_id: Option<&str>,
+        span_quote: Option<&str>,
+        source_content: Option<&str>,
+        model_version: Option<&str>,
+        prompt_version: Option<&str>,
+    ) -> Result<String, WenlanError> {
         // Normalize relation type against vocabulary.
         // NOTE: resolve_relation_type acquires the conn lock, so we must not hold it here.
         let canonical = match self.resolve_relation_type(relation_type).await? {
@@ -23895,7 +23977,36 @@ impl MemoryDB {
                     true,
                 ),
             };
-            Self::dual_write_edge(
+            // M3g Stage A span capture (§2.3/§2.4): CODE locates the
+            // model-supplied quote as an exact char-offset substring of the
+            // source memory's content -- never guessed. A payload is only
+            // written when this call actually carries extraction-time data
+            // (the plain `create_relation` wrapper passes all four as
+            // `None`, so existing edges keep `payload=NULL`).
+            let payload = if span_quote.is_some() || model_version.is_some() || prompt_version.is_some() {
+                let span_json = span_quote.map(|quote| {
+                    let offsets = source_content
+                        .and_then(|content| crate::extract::locate_span_chars(content, quote));
+                    serde_json::json!({
+                        "quote": quote,
+                        "char_start": offsets.map(|(start, _)| start),
+                        "char_end": offsets.map(|(_, end)| end),
+                    })
+                });
+                Some(
+                    serde_json::json!({
+                        "source_memory_id": source_memory_id,
+                        "span": span_json,
+                        "model_version": model_version,
+                        "prompt_version": prompt_version,
+                    })
+                    .to_string(),
+                )
+            } else {
+                None
+            };
+
+            Self::dual_write_edge_with_payload(
                 &conn,
                 "relates",
                 "entity",
@@ -23907,6 +24018,7 @@ impl MemoryDB {
                 &space,
                 cross_space_downgrade,
                 None,
+                payload.as_deref(),
             )
             .await?;
 
@@ -66575,6 +66687,7 @@ pub(crate) mod tests {
                 relation_type: "related_to".to_string(),
                 confidence: Some(0.9),
                 explanation: Some("test graph relation".to_string()),
+                span: None,
             }],
         }]
     }
@@ -66986,6 +67099,7 @@ pub(crate) mod tests {
                         relation_type: "works_on".to_string(),
                         confidence: Some(0.9),
                         explanation: Some("shared project".to_string()),
+                        span: None,
                     }],
                 }])
             })
@@ -81539,6 +81653,144 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(lineage, "legacy", "links row must reconcile to legacy");
+    }
+
+    // ===== M3g Stage A: span capture payload tests =====
+
+    #[tokio::test]
+    async fn create_relation_with_span_writes_payload_and_keeps_parity_clean() {
+        // A relation extracted with a locatable verbatim quote must carry
+        // {source_memory_id, span, model_version, prompt_version} in
+        // edges.payload. payload is a non-structural column, so
+        // reconcile_edges_parity (which matches structural columns only)
+        // must stay clean.
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .create_entity("Alice", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let e2 = db
+            .create_entity("Acme", "org", Some("space_a"))
+            .await
+            .unwrap();
+        let content = "Alice works at Acme Corp.";
+        seed_memory_with_source_id_and_space(&db, "mem_1", content, "space_a").await;
+
+        db.create_relation_with_span(
+            &e1,
+            &e2,
+            "works_at",
+            Some("test"),
+            None,
+            None,
+            Some("mem_1"),
+            Some(content),
+            Some(content),
+            Some("qwen3-4b-instruct-2507"),
+            Some(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION),
+        )
+        .await
+        .unwrap();
+
+        let report = db.reconcile_edges_parity().await.unwrap();
+        assert_eq!(
+            report.drift_count, 0,
+            "a payload write must not disturb structural-column parity"
+        );
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![e1.clone(), e2.clone()],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect("payload must be non-NULL for a span-carrying write");
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        assert_eq!(payload["source_memory_id"], serde_json::json!("mem_1"));
+        assert_eq!(payload["span"]["quote"], serde_json::json!(content));
+        assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+        assert_eq!(
+            payload["span"]["char_end"],
+            serde_json::json!(content.chars().count())
+        );
+        assert_eq!(
+            payload["model_version"],
+            serde_json::json!("qwen3-4b-instruct-2507")
+        );
+        assert_eq!(
+            payload["prompt_version"],
+            serde_json::json!(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_relation_with_span_stores_unlocated_quote_as_null_offsets() {
+        // §2.3: if the model's quote is not an exact substring of the
+        // source memory's content, char_start/char_end are stored null --
+        // the quote itself is still recorded, never guessed at or dropped.
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .create_entity("Alice", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let e2 = db
+            .create_entity("Acme", "org", Some("space_a"))
+            .await
+            .unwrap();
+        let content = "Alice works at Acme Corp.";
+        seed_memory_with_source_id_and_space(&db, "mem_2", content, "space_a").await;
+        let fabricated_quote = "Alice is the CEO of Acme"; // not a substring of `content`
+
+        db.create_relation_with_span(
+            &e1,
+            &e2,
+            "works_at",
+            Some("test"),
+            None,
+            None,
+            Some("mem_2"),
+            Some(fabricated_quote),
+            Some(content),
+            Some("qwen3-4b-instruct-2507"),
+            Some(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION),
+        )
+        .await
+        .unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![e1.clone(), e2.clone()],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect("payload must be non-NULL for a span-carrying write");
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        assert_eq!(
+            payload["span"]["quote"],
+            serde_json::json!(fabricated_quote),
+            "the quote is stored even when it cannot be located"
+        );
+        assert!(
+            payload["span"]["char_start"].is_null(),
+            "an unlocated quote must not fabricate an offset"
+        );
+        assert!(payload["span"]["char_end"].is_null());
     }
 
     #[tokio::test]

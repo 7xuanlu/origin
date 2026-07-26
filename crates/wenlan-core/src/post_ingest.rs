@@ -523,7 +523,16 @@ pub async fn run_post_ingest_enrichment(
                 // (skipping the inline LLM extract). Otherwise, run the LLM extract
                 // as today. Both paths return Result<Option<String>, WenlanError>.
                 match match precomputed_kg {
-                    Some(kg) => crate::refinery::commit_kg(db, source_id, &kg).await,
+                    Some(kg) => {
+                        crate::refinery::commit_kg(
+                            db,
+                            source_id,
+                            &kg,
+                            content,
+                            Some(&llm_ref.model_id()),
+                        )
+                        .await
+                    }
                     None => {
                         crate::refinery::extract_single_memory_entities(
                             db, llm_ref, prompts, source_id, content,

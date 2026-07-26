@@ -1926,6 +1926,9 @@ impl WenlanMcpServer {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let resp: CreateRelationResponse = try_call!(
             self.client.post("/api/memory/relations", &req),
@@ -6175,6 +6178,9 @@ mod tests {
             confidence: None,
             explanation: None,
             source_memory_id: None,
+            span: None,
+            model_version: None,
+            prompt_version: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["from_entity"], "Alice");

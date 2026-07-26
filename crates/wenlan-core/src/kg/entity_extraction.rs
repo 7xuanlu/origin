@@ -85,8 +85,20 @@ pub async fn extract_entities_for_content(
                     confidence: rel.confidence,
                     explanation: rel.explanation.clone(),
                     source_memory_id: None,
+                    span: rel.span.clone(),
+                    model_version: Some(llm.model_id()),
+                    prompt_version: Some(
+                        crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION.to_string(),
+                    ),
                 };
-                if let Err(e) = crate::post_write::create_relation(db, req, "post_ingest").await {
+                if let Err(e) = crate::post_write::create_relation_with_span(
+                    db,
+                    req,
+                    "post_ingest",
+                    Some(content),
+                )
+                .await
+                {
                     log::warn!("[extract_entities_for_content] create_relation failed: {e}");
                 }
             }
@@ -124,10 +136,16 @@ pub async fn extract_kg(
 
 /// Serial DB-write half: commit a parsed KG result set to the DB and link
 /// the memory row identified by `source_id`. Returns the primary entity id.
+/// `content` is the exact text `kg` was extracted from -- threaded through
+/// (never re-fetched) so M3g span capture (§2.3) locates each relation's
+/// quote against the string the model actually saw. `model_version` is the
+/// extraction LLM's provenance for the same capture (§6.6).
 pub async fn commit_kg(
     db: &MemoryDB,
     source_id: &str,
     kg: &[crate::extract::KgExtractionResult],
+    content: &str,
+    model_version: Option<&str>,
 ) -> Result<Option<String>, WenlanError> {
     let mut entity_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -185,8 +203,20 @@ pub async fn commit_kg(
                     confidence: rel.confidence,
                     explanation: rel.explanation.clone(),
                     source_memory_id: Some(source_id.to_string()),
+                    span: rel.span.clone(),
+                    model_version: model_version.map(|s| s.to_string()),
+                    prompt_version: Some(
+                        crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION.to_string(),
+                    ),
                 };
-                if let Err(e) = crate::post_write::create_relation(db, req, "post_ingest").await {
+                if let Err(e) = crate::post_write::create_relation_with_span(
+                    db,
+                    req,
+                    "post_ingest",
+                    Some(content),
+                )
+                .await
+                {
                     log::warn!("[post_ingest] create_relation failed: {e}");
                 }
             }
@@ -218,7 +248,7 @@ pub async fn extract_single_memory_entities(
     content: &str,
 ) -> Result<Option<String>, WenlanError> {
     let kg = extract_kg(llm, prompts, content).await?;
-    commit_kg(db, source_id, &kg).await
+    commit_kg(db, source_id, &kg, content, Some(&llm.model_id())).await
 }
 
 #[cfg(test)]
@@ -300,7 +330,9 @@ mod tests {
         .await
         .expect("extract_kg failed");
 
-        let eid = commit_kg(&db, "m1", &kg).await.expect("commit_kg failed");
+        let eid = commit_kg(&db, "m1", &kg, "Alice joined Acme", None)
+            .await
+            .expect("commit_kg failed");
         assert!(
             eid.is_some(),
             "expected a primary entity id after commit_kg"

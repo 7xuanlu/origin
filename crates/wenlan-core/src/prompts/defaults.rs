@@ -144,14 +144,15 @@ Relation types (pick from this list ONLY): works_on, uses, prefers, decided, lea
 If none fit, use `related_to`. Do not invent new types — they are coerced to `related_to` at write.\n\
 \n\
 Return JSON array. For each memory:\n\
-{\"i\": <number>, \"entities\": [{\"name\": \"...\", \"type\": \"...\"}], \"observations\": [{\"entity\": \"...\", \"content\": \"...\"}], \"relations\": [{\"from\": \"...\", \"to\": \"...\", \"type\": \"...\", \"confidence\": 0.0-1.0, \"explanation\": \"one sentence why\"}]}\n\
+{\"i\": <number>, \"entities\": [{\"name\": \"...\", \"type\": \"...\"}], \"observations\": [{\"entity\": \"...\", \"content\": \"...\"}], \"relations\": [{\"from\": \"...\", \"to\": \"...\", \"type\": \"...\", \"confidence\": 0.0-1.0, \"explanation\": \"one sentence why\", \"span\": \"verbatim quote\"}]}\n\
 \n\
 Rules:\n\
 - Normalize entity names: title case for people/orgs (\"Alice Chen\"), lowercase for tech/concepts (\"rust\", \"tdd\")\n\
 - Include \"user\" (person) when memory is about the user\n\
 - One observation per distinct fact (not summaries)\n\
 - Skip relations you're unsure about rather than guessing\n\
-- confidence: 0.9+ for explicitly stated, 0.5-0.8 for inferred";
+- confidence: 0.9+ for explicitly stated, 0.5-0.8 for inferred\n\
+- span: the exact clause from the memory text that states the relation, copied VERBATIM (same characters, no paraphrasing). Omit if no single clause states it.";
 
 pub(crate) const EXTRACT_STRUCTURED_FIELDS: &str = "\
 Extract structured fields from this {memory_type} memory. Respond with ONLY valid JSON:\n\
