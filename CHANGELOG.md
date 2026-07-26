@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.15.0](https://github.com/7xuanlu/wenlan/compare/v0.14.1...v0.15.0) (2026-07-26)
+
+
+### Features
+
+* make background enrichment bounded and foreground-safe ([#379](https://github.com/7xuanlu/wenlan/issues/379)) ([9817e38](https://github.com/7xuanlu/wenlan/commit/9817e38661894fa3627580e8a09319ff44805c67))
+
+
+### Bug Fixes
+
+* accelerate Windows inference with Vulkan ([#382](https://github.com/7xuanlu/wenlan/issues/382)) ([6501345](https://github.com/7xuanlu/wenlan/commit/65013459b0909cbb1899e9fd1667f80bad981194))
+* bound daemon logs and preserve bootstrap errors ([#385](https://github.com/7xuanlu/wenlan/issues/385)) ([93451bf](https://github.com/7xuanlu/wenlan/commit/93451bf0ef58399e08400e3b4ac613942adcfec8))
+* defer observation provenance index to migrations ([#381](https://github.com/7xuanlu/wenlan/issues/381)) ([c8533a7](https://github.com/7xuanlu/wenlan/commit/c8533a7a825bab5830c73b0fe4998d2e7e6e0ec4))
+* load bundled ONNX Runtime on Windows ([#365](https://github.com/7xuanlu/wenlan/issues/365)) ([c66f9d8](https://github.com/7xuanlu/wenlan/commit/c66f9d8e3e2edc991a540a89d3c5f60e2c109a99))
+* M1 honest columns — migrate Page scope into unified `space` column ([#375](https://github.com/7xuanlu/wenlan/issues/375)) ([1b56c3a](https://github.com/7xuanlu/wenlan/commit/1b56c3a883c8f916fe3e604287a784898ec2167b))
+* M2 PR-2 — edges reader cutover, parity reconciliation + §6.9 online backup ([#378](https://github.com/7xuanlu/wenlan/issues/378)) ([3246e18](https://github.com/7xuanlu/wenlan/commit/3246e180b3d5f196d8bf6be4079d53cf98aac850))
+* M2 unified edges — schema expand + dual-write shadow (PR-1) ([#377](https://github.com/7xuanlu/wenlan/issues/377)) ([b256814](https://github.com/7xuanlu/wenlan/commit/b256814832be585e63888e997c6c7c6bf22fe119))
+* M3 PR-1 — entity→page dual-write foundation (schema 89–93) ([#380](https://github.com/7xuanlu/wenlan/issues/380)) ([24c45d8](https://github.com/7xuanlu/wenlan/commit/24c45d8ab74713191fea501c35c3cd98b38e9737))
+* M3 PR-2 — entity reader cutover, parity watermark + D6 + §6.5 soak ([#387](https://github.com/7xuanlu/wenlan/issues/387)) ([7f3bd7e](https://github.com/7xuanlu/wenlan/commit/7f3bd7ec3238acdaf2c5902bc424f033be264811))
+* M3 wire freeze — adapter seam, freeze teeth, Q1 stub-page fence lifts ([#390](https://github.com/7xuanlu/wenlan/issues/390)) ([084e39d](https://github.com/7xuanlu/wenlan/commit/084e39dfcfd0091e5143a9acdf458a4f92775e2a))
+* M3g edge-grounding promotion — span capture, default-OFF grounding sweep, gates made real ([#392](https://github.com/7xuanlu/wenlan/issues/392)) ([31e0fa6](https://github.com/7xuanlu/wenlan/commit/31e0fa6377a4537b0df7cb073b5fa403c5b118ac))
+* start Page-Map Canvas blank — proactive suggestions now opt-in ([#371](https://github.com/7xuanlu/wenlan/issues/371)) ([34beb24](https://github.com/7xuanlu/wenlan/commit/34beb24663590c3e62e9391e3f138960ef229021))
+
 ## [0.14.1](https://github.com/7xuanlu/wenlan/compare/v0.14.0...v0.14.1) (2026-07-20)
 
 
