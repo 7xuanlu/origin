@@ -97,13 +97,14 @@ fn version_sync_detects_mismatch() {
     assert_eq!(mismatched.len(), 1, "mismatch must be detected");
 }
 
-// ── Teeth #5: FastEmbed CI cache contract ──
+// ── Teeth #5: FastEmbed CI distribution contract ──
 
 fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
-    const CACHE_STEP: &str = "Restore portable FastEmbed model";
+    const DOWNLOAD_STEP: &str = "Download portable FastEmbed model";
     const CACHE_DIR: &str = "${{ github.workspace }}/.fastembed_cache";
     const CACHE_PATH: &str = ".fastembed_cache";
     const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v3-portable";
+    const ARTIFACT_NAME: &str = "fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}";
     const JOBS: &[(&str, &[&str])] = &[
         (
             "test",
@@ -147,43 +148,54 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 "job {job_name} overrides FASTEMBED_CACHE_DIR with WENLAN_TEST_FASTEMBED_CACHE"
             ));
         }
-        let cache_indexes: Vec<usize> = steps
+        let download_indexes: Vec<usize> = steps
             .iter()
             .enumerate()
             .filter_map(|(index, step)| {
-                (step["name"].as_str() == Some(CACHE_STEP)).then_some(index)
+                (step["name"].as_str() == Some(DOWNLOAD_STEP)).then_some(index)
             })
             .collect();
-        if cache_indexes.len() != 1 {
+        if download_indexes.len() != 1 {
             violations.push(format!(
-                "job {job_name} has {} {CACHE_STEP:?} steps, expected 1",
-                cache_indexes.len()
+                "job {job_name} has {} {DOWNLOAD_STEP:?} steps, expected 1",
+                download_indexes.len()
             ));
             continue;
         }
 
-        let cache_index = cache_indexes[0];
-        let actual_path = steps[cache_index]["with"]["path"].as_str();
-        if actual_path != Some(CACHE_PATH) {
-            violations.push(format!(
-                "job {job_name} caches {actual_path:?}, expected {CACHE_PATH:?}"
-            ));
-        }
-        let actual_key = steps[cache_index]["with"]["key"].as_str();
-        if actual_key != Some(CACHE_KEY) {
-            violations.push(format!(
-                "job {job_name} uses FastEmbed cache key {actual_key:?}, expected {CACHE_KEY:?}"
-            ));
-        }
-        if steps[cache_index]["with"]["enableCrossOsArchive"].as_str() != Some("true")
-            || steps[cache_index]["with"]["fail-on-cache-miss"].as_str() != Some("true")
+        let download_index = download_indexes[0];
+        let download = &steps[download_index];
+        if download["uses"]
+            .as_str()
+            .is_none_or(|uses| !uses.starts_with("actions/download-artifact@"))
         {
             violations.push(format!(
-                "job {job_name} does not restore the portable cache cross-OS and fail closed"
+                "job {job_name} does not download the prepared FastEmbed artifact"
             ));
         }
-        if *job_name == "test" && !steps[cache_index]["if"].is_null() {
-            violations.push("test restores the model only on a subset of matrix OSes".into());
+        let actual_path = download["with"]["path"].as_str();
+        if actual_path != Some(CACHE_PATH) {
+            violations.push(format!(
+                "job {job_name} downloads FastEmbed to {actual_path:?}, expected {CACHE_PATH:?}"
+            ));
+        }
+        let actual_name = download["with"]["name"].as_str();
+        if actual_name != Some(ARTIFACT_NAME) {
+            violations.push(format!(
+                "job {job_name} uses FastEmbed artifact name {actual_name:?}, expected {ARTIFACT_NAME:?}"
+            ));
+        }
+        if steps.iter().any(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/cache/restore@"))
+        }) {
+            violations.push(format!(
+                "job {job_name} still performs a concurrent FastEmbed cache restore"
+            ));
+        }
+        if *job_name == "test" && !download["if"].is_null() {
+            violations.push("test downloads the model only on a subset of matrix OSes".into());
         }
 
         for consumer_name in *consumer_names {
@@ -191,9 +203,9 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 .iter()
                 .position(|step| step["name"].as_str() == Some(consumer_name));
             match consumer_index {
-                Some(index) if cache_index < index => {}
+                Some(index) if download_index < index => {}
                 Some(index) => violations.push(format!(
-                    "job {job_name} restores FastEmbed at step {cache_index} after consumer step {index}"
+                    "job {job_name} downloads FastEmbed at step {download_index} after consumer step {index}"
                 )),
                 None => violations.push(format!(
                     "job {job_name} is missing consumer step {consumer_name:?}"
@@ -217,6 +229,7 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
         detect_index("Restore portable FastEmbed model"),
         detect_index("Restore legacy Linux FastEmbed model"),
         detect_index("Prepare portable FastEmbed model"),
+        detect_index("Publish portable FastEmbed model for this run"),
         detect_index("Save portable FastEmbed model"),
     ];
     if prep_order.iter().any(Option::is_none)
@@ -225,7 +238,8 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
             .all(|pair| pair[0].is_some_and(|left| pair[1].is_some_and(|right| left < right)))
     {
         violations.push(
-            "detect-changes does not test, restore, prepare, then save the portable model".into(),
+            "detect-changes does not test, restore, prepare, publish, then save the portable model"
+                .into(),
         );
     }
     let prepare = detect_index("Prepare portable FastEmbed model")
@@ -234,6 +248,22 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
         != Some("python3 scripts/prepare-fastembed-cache.py")
     {
         violations.push("detect-changes does not run the pinned FastEmbed preparer".into());
+    }
+    for name in [
+        "Restore portable FastEmbed model",
+        "Prepare portable FastEmbed model",
+        "Publish portable FastEmbed model for this run",
+        "Save portable FastEmbed model",
+    ] {
+        let condition = detect_index(name)
+            .and_then(|index| detect_steps.get(index).copied())
+            .and_then(|step| step["if"].as_str())
+            .unwrap_or_default();
+        if !condition.contains("startsWith(github.head_ref, 'release-please--branches--')") {
+            violations.push(format!(
+                "detect-changes {name:?} can skip the release-please full-proof path"
+            ));
+        }
     }
     for name in [
         "Restore portable FastEmbed model",
@@ -251,6 +281,34 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 "detect-changes {name:?} does not use the portable cache contract"
             ));
         }
+    }
+    let restore = detect_index("Restore portable FastEmbed model")
+        .and_then(|index| detect_steps.get(index).copied());
+    if restore.and_then(|step| step["with"]["fail-on-cache-miss"].as_str()) == Some("true") {
+        violations
+            .push("detect-changes treats a FastEmbed cache miss as a correctness failure".into());
+    }
+    let save = detect_index("Save portable FastEmbed model")
+        .and_then(|index| detect_steps.get(index).copied());
+    if save.and_then(|step| step["continue-on-error"].as_bool()) != Some(true) {
+        violations.push("detect-changes treats a FastEmbed cache save failure as fatal".into());
+    }
+    let publish = detect_index("Publish portable FastEmbed model for this run")
+        .and_then(|index| detect_steps.get(index).copied());
+    if publish
+        .and_then(|step| step["uses"].as_str())
+        .is_none_or(|uses| !uses.starts_with("actions/upload-artifact@"))
+        || publish.and_then(|step| step["with"]["name"].as_str()) != Some(ARTIFACT_NAME)
+        || publish.and_then(|step| step["with"]["path"].as_str()) != Some(CACHE_PATH)
+        || publish.and_then(|step| step["with"]["include-hidden-files"].as_bool()) != Some(true)
+        || publish.and_then(|step| step["with"]["compression-level"].as_u64()) != Some(0)
+        || publish.and_then(|step| step["with"]["retention-days"].as_u64()) != Some(1)
+        || publish.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("error")
+        || publish.and_then(|step| step["with"]["overwrite"].as_bool()) != Some(true)
+    {
+        violations.push(
+            "detect-changes does not publish one run-scoped verified FastEmbed artifact".into(),
+        );
     }
 
     violations
@@ -455,13 +513,13 @@ fn text_embedding_initializer_sites(path: &str, source: &str) -> Vec<String> {
 }
 
 #[test]
-fn fastembed_ci_cache_is_restored_before_model_consumers() {
+fn fastembed_ci_artifact_is_prepared_once_before_model_consumers() {
     let workflow =
         std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read ci.yml");
     let violations = fastembed_ci_cache_violations(&workflow);
     assert!(
         violations.is_empty(),
-        "FastEmbed CI cache contract drift:\n{}",
+        "FastEmbed CI distribution contract drift:\n{}",
         violations.join("\n")
     );
 }
@@ -664,27 +722,30 @@ jobs:
     steps:
       - name: Workspace lib tests (Linux)
         run: export WENLAN_TEST_FASTEMBED_CACHE=/tmp/stale-cache
-      - name: Restore portable FastEmbed model
+      - name: Download portable FastEmbed model
+        uses: actions/download-artifact@bad
         with:
           path: ~/.local/share/wenlan/memorydb/fastembed_cache
-          key: stale
+          name: stale
   canonical-acceptance:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - name: Restore portable FastEmbed model
+      - name: Download portable FastEmbed model
+        uses: actions/download-artifact@bad
         with:
           path: .fastembed_cache
-          key: stale
+          name: stale
       - name: Integration tests wenlan-cli + wenlan-server (Linux)
   test-quarantine:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - name: Restore portable FastEmbed model
+      - name: Download portable FastEmbed model
+        uses: actions/download-artifact@bad
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
-          key: stale
+          name: stale
       - name: Quarantined tests (wenlan-mcp + wenlan-types)
 "#;
     let violations = fastembed_ci_cache_violations(workflow);
@@ -709,8 +770,8 @@ jobs:
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("cache key")),
-        "fixture must reject a missing or stale cache key: {violations:?}"
+            .any(|violation| violation.contains("artifact name")),
+        "fixture must reject a missing or stale artifact name: {violations:?}"
     );
 }
 
@@ -1659,7 +1720,6 @@ fn release_profile_sensitive_paths(root: &Path) -> Vec<String> {
         .filter(|path| {
             path.starts_with("crates/")
                 && path.contains("/src/")
-                // The whole module is imported behind #[cfg(test)] in lib.rs.
                 && path != "crates/wenlan-core/src/drift_guard.rs"
         })
         .filter(|path| {
@@ -1794,6 +1854,9 @@ fn ci_routing_contract_violations(
     let event_name = planner
         .and_then(|step| step["env"]["CI_EVENT_NAME"].as_str())
         .unwrap_or_default();
+    let planner_condition = planner
+        .and_then(|step| step["if"].as_str())
+        .unwrap_or_default();
     if planner.and_then(|step| step["id"].as_str()) != Some("test-plan")
         || !planner_run.contains("cargo metadata --format-version 1 --locked --no-deps")
         || !planner_run.contains("python3 scripts/ci_test_plan.py plan")
@@ -1802,6 +1865,7 @@ fn ci_routing_contract_violations(
         || !planner_run.contains("--github-output \"$GITHUB_OUTPUT\"")
         || changed_files != "${{ steps.filter.outputs.impact_files }}"
         || event_name != "${{ github.event_name }}"
+        || !planner_condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
     {
         violations.push(
             "detect-changes does not derive its test plan from Cargo metadata and the complete changed-file inventory"
@@ -1832,11 +1896,23 @@ fn ci_routing_contract_violations(
                 .into(),
         );
     }
+    let windows_paths = detect_change_filter_paths(&ci, "windows");
+    let macos_paths = detect_change_filter_paths(&ci, "macos");
+    let mcp_platform = detect_change_filter_paths(&ci, "mcp-platform");
     for (path, platform, filter) in platform_sensitive_paths {
-        let routed = detect_change_filter_paths(&ci, filter);
-        if !filter_routes_path(&routed, path) {
+        let routed =
+            if path.starts_with("crates/wenlan-mcp/") || path.starts_with("crates/wenlan-types/") {
+                &mcp_platform
+            } else {
+                match *filter {
+                    "macos" => &macos_paths,
+                    "windows" => &windows_paths,
+                    _ => &rust_paths,
+                }
+            };
+        if !filter_routes_path(routed, path) {
             violations.push(format!(
-                "platform-sensitive {platform} path is not fail-closed through {filter}: {path}"
+                "platform-sensitive {platform} path is not fail-closed through its owner: {path}"
             ));
         }
         if !filter_routes_path(&rust_paths, path) {
@@ -1855,21 +1931,25 @@ fn ci_routing_contract_violations(
         }
     }
     for path in [
+        "Cargo.toml",
+        "rust-toolchain.toml",
+        "crates/wenlan-core/Cargo.toml",
+        "crates/**/build.rs",
+        "crates/*/npm/**",
+        "install.sh",
+        "scripts/stage-onnxruntime-windows.ps1",
         "scripts/setup-vulkan-sdk-windows.ps1",
-        "scripts/setup-vulkan-sdk-windows.test.ps1",
-        "scripts/stage-vulkan-loader-windows.ps1",
-        "scripts/stage-vulkan-loader-windows.test.ps1",
-        "scripts/setup-msvc-ninja-windows.ps1",
-        "scripts/setup-msvc-ninja-windows.test.ps1",
+        "scripts/build-release-binaries.sh",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
     ] {
         if !release_sensitive.contains(path) {
             violations.push(format!(
-                "Windows native-build bootstrap is not routed through windows-release: {path}"
+                "release-preflight routing omits native/build-sensitive path {path}"
             ));
         }
     }
-    let windows_paths = detect_change_filter_paths(&ci, "windows");
-    let macos_paths = detect_change_filter_paths(&ci, "macos");
+
     for (filter, paths) in [
         ("rust", &rust_paths),
         ("macos", &macos_paths),
@@ -1887,7 +1967,6 @@ fn ci_routing_contract_violations(
             ("rust", &rust_paths),
             ("macos", &macos_paths),
             ("windows", &windows_paths),
-            ("release-preflight", &release_sensitive),
         ] {
             if !paths.contains(&path) {
                 violations.push(format!(
@@ -1895,34 +1974,17 @@ fn ci_routing_contract_violations(
                 ));
             }
         }
-    }
-    for path in [
-        "Cargo.toml",
-        "Cargo.lock",
-        "rust-toolchain.toml",
-        "crates/**/Cargo.toml",
-        "crates/**/build.rs",
-        "crates/**/*.c",
-        "crates/**/*.cc",
-        "crates/**/*.cpp",
-        "crates/**/*.cxx",
-        "crates/**/*.h",
-        "crates/**/*.hh",
-        "crates/**/*.hpp",
-        "crates/**/*.hxx",
-        "crates/*/npm/**",
-        "install.sh",
-        ".github/workflows/ci.yml",
-        ".github/workflows/release.yml",
-        "scripts/stage-onnxruntime-windows.ps1",
-        "scripts/smoke-windows.ps1",
-        "version.txt",
-        ".release-please-manifest.json",
-        "CHANGELOG.md",
-    ] {
-        if !release_sensitive.contains(path) {
+        if !release_sensitive.contains(&path) {
             violations.push(format!(
-                "release-preflight routing omits release-sensitive path {path}"
+                "release-preflight routing omits shared native source glob {path}"
+            ));
+        }
+    }
+    for extension in ["m", "mm"] {
+        let path = format!("crates/**/*.{extension}");
+        if !release_sensitive.contains(&path) {
+            violations.push(format!(
+                "release-preflight routing omits Apple native source glob {path}"
             ));
         }
     }
@@ -1931,27 +1993,6 @@ fn ci_routing_contract_violations(
             violations.push(format!(
                 "{platform} routing omits the root installer install.sh"
             ));
-        }
-        for path in [
-            "crates/wenlan-server/src/**",
-            "crates/wenlan-server/tests/**",
-        ] {
-            if !paths.contains(path) {
-                violations.push(format!(
-                    "{platform} routing omits shared server runtime boundary {path}"
-                ));
-            }
-        }
-        for path in [
-            "version.txt",
-            ".release-please-manifest.json",
-            "CHANGELOG.md",
-        ] {
-            if !paths.contains(path) {
-                violations.push(format!(
-                    "{platform} routing omits pre-release full-platform trigger {path}"
-                ));
-            }
         }
     }
     let windows_lint = detect_change_filter_paths(&ci, "windows-lint");
@@ -1967,19 +2008,13 @@ fn ci_routing_contract_violations(
             ));
         }
     }
-    for (child_name, child_paths) in [
-        ("release-sensitive", &release_sensitive),
-        ("lint-sensitive", &windows_lint),
-    ] {
-        for path in child_paths {
-            if !filter_routes_path(&windows_paths, path) {
-                violations.push(format!(
-                    "{child_name} Windows path does not also schedule the Windows job: {path}"
-                ));
-            }
+    for path in &windows_lint {
+        if !filter_routes_path(&windows_paths, path) {
+            violations.push(format!(
+                "lint-sensitive Windows path does not also schedule the Windows job: {path}"
+            ));
         }
     }
-    let mcp_platform = detect_change_filter_paths(&ci, "mcp-platform");
     for path in [
         "crates/wenlan-mcp/src/**",
         "crates/wenlan-mcp/Cargo.toml",
@@ -1997,15 +2032,6 @@ fn ci_routing_contract_violations(
             violations.push(format!(
                 "mcp-platform routing omits platform-compile-sensitive path {path}"
             ));
-        }
-    }
-    for path in &mcp_platform {
-        for (platform, platform_paths) in [("macos", &macos_paths), ("windows", &windows_paths)] {
-            if !filter_routes_path(platform_paths, path) {
-                violations.push(format!(
-                    "mcp-platform path does not also schedule {platform}: {path}"
-                ));
-            }
         }
     }
 
@@ -2028,12 +2054,15 @@ fn ci_routing_contract_violations(
         .as_str()
         .unwrap_or_default();
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
+        || !release_preflight_condition.contains("github.event_name != 'pull_request'")
+        || !release_preflight_condition
+            .contains("startsWith(github.head_ref, 'release-please--branches--')")
         || !release_preflight_condition
             .contains("needs.detect-changes.outputs.release-preflight == 'true'")
-        || !release_preflight_condition.contains("github.event_name != 'pull_request'")
     {
         violations.push(
-            "release-preflight is not an independent differential job after detect-changes".into(),
+            "release-preflight is not isolated to release-sensitive PRs and release backstops"
+                .into(),
         );
     }
     for profile in ["DEV", "TEST"] {
@@ -2067,7 +2096,13 @@ fn ci_routing_contract_violations(
         );
     }
     let main_owned_cache = "${{ github.ref == 'refs/heads/main' }}";
-    for job in ["lint", "test", "test-quarantine", "release-preflight"] {
+    for job in [
+        "lint",
+        "test",
+        "mcp-platform",
+        "test-quarantine",
+        "release-preflight",
+    ] {
         let rust_cache = job_step_using(&ci, job, "Swatinem/rust-cache");
         if rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some(main_owned_cache) {
             violations.push(format!("{job} cache writes are not restricted to main"));
@@ -2097,6 +2132,7 @@ fn ci_routing_contract_violations(
             "needs.detect-changes.outputs.rust",
             "needs.detect-changes.outputs.macos",
             "needs.detect-changes.outputs.windows",
+            "startsWith(github.head_ref, 'release-please--branches--')",
             "github.event_name != 'pull_request'",
         ] {
             if !condition.contains(required) {
@@ -2122,6 +2158,7 @@ fn ci_routing_contract_violations(
     for required in [
         "github.event_name",
         "pull_request",
+        "startsWith(github.head_ref, 'release-please--branches--')",
         "ubuntu-24.04",
         "steps.filter.outputs.macos",
         "steps.filter.outputs.windows",
@@ -2145,6 +2182,7 @@ fn ci_routing_contract_violations(
         "needs.detect-changes.outputs.rust",
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
+        "startsWith(github.head_ref, 'release-please--branches--')",
         "github.event_name != 'pull_request'",
     ] {
         if !conclusion_run.contains(required) {
@@ -2159,20 +2197,18 @@ fn ci_routing_contract_violations(
                 .into(),
         );
     }
-    if !job_needs(&ci, "conclusion")
-        .iter()
-        .any(|job| job == "release-preflight")
-    {
-        violations.push("conclusion.needs omits release-preflight".into());
+    let conclusion_needs = job_needs(&ci, "conclusion");
+    for job in ["mcp-platform", "release-preflight"] {
+        if !conclusion_needs.iter().any(|candidate| candidate == job) {
+            violations.push(format!("conclusion.needs omits {job}"));
+        }
     }
     for (job, expected) in [
         ("fmt", "\"$run_rust\""),
         ("lint", "\"$run_rust\""),
         ("test", "\"$run_rust\""),
-        (
-            "release-preflight",
-            "needs.detect-changes.outputs.release-preflight",
-        ),
+        ("mcp-platform", "needs.detect-changes.outputs.mcp-platform"),
+        ("release-preflight", "startsWith(github.head_ref"),
         ("docs", "needs.detect-changes.outputs.docs"),
         ("plugin", "needs.detect-changes.outputs.plugin"),
         ("npm", "needs.detect-changes.outputs.npm"),
@@ -2253,22 +2289,43 @@ fn ci_routing_contract_violations(
         violations.push("ordinary Windows schtasks contract does not use debug binaries".into());
     }
 
-    let mcp_compile = job_step(&ci, "test", "Compile platform-owned MCP runtime");
-    let mcp_condition = mcp_compile
-        .and_then(|step| step["if"].as_str())
+    let mcp_compile = job_step(&ci, "mcp-platform", "Compile platform-owned MCP runtime");
+    let mcp_condition = ci["jobs"]["mcp-platform"]["if"]
+        .as_str()
         .unwrap_or_default();
     let mcp_run = mcp_compile
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
-    if !mcp_condition.contains("matrix.os == 'macos-14'")
-        || !mcp_condition.contains("matrix.os == 'windows-2022'")
+    let mcp_rust_cache = job_step_using(&ci, "mcp-platform", "Swatinem/rust-cache");
+    let mcp_windows_linker = job_step(
+        &ci,
+        "mcp-platform",
+        "Configure rust-lld linker (Windows MCP compile)",
+    );
+    let mcp_oses = ci["jobs"]["mcp-platform"]["strategy"]["matrix"]["os"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    if mcp_oses != BTreeSet::from(["macos-14", "windows-2022"])
         || !mcp_condition.contains("needs.detect-changes.outputs.mcp-platform == 'true'")
+        || !mcp_condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
         || !mcp_condition.contains("github.event_name != 'pull_request'")
         || !mcp_run.contains("cargo check -p wenlan-mcp --lib --bins")
         || mcp_run.contains("--all-targets")
+        || ci["jobs"]["mcp-platform"]["env"]["CARGO_PROFILE_DEV_DEBUG"].as_str() != Some("0")
+        || ci["jobs"]["mcp-platform"]["env"]["CARGO_PROFILE_TEST_DEBUG"].as_str() != Some("0")
+        || mcp_rust_cache.and_then(|step| step["with"]["shared-key"].as_str())
+            != Some("mcp-platform")
+        || mcp_windows_linker.and_then(|step| step["if"].as_str())
+            != Some("matrix.os == 'windows-2022'")
+        || mcp_windows_linker
+            .and_then(|step| step["run"].as_str())
+            .is_none_or(|run| !run.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"))
     {
         violations.push(
-            "macOS/Windows ownership does not differentially compile every wenlan-mcp target"
+            "independent macOS/Windows ownership does not differentially compile every wenlan-mcp target"
                 .into(),
         );
     }
@@ -2361,12 +2418,11 @@ fn ci_routing_contract_violations(
     }
     match (
         integration_index,
-        step_index("Compile platform-owned MCP runtime"),
         step_index("Build Windows contract binaries"),
     ) {
-        (Some(integration), Some(mcp), Some(debug)) if integration < mcp && mcp < debug => {}
+        (Some(integration), Some(debug)) if integration < debug => {}
         _ => violations
-            .push("Windows steps do not fail fast from integration into later compilation".into()),
+            .push("Windows steps do not fail fast from integration into the debug build".into()),
     }
 
     violations
@@ -2389,6 +2445,183 @@ fn ci_routing_is_fail_closed_and_differential() {
         "CI routing contract drift:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn ordinary_pr_required_path_excludes_release_and_unowned_platform_backstops() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse ci.yml");
+
+    let release_condition = ci["jobs"]["release-preflight"]["if"]
+        .as_str()
+        .expect("release-preflight condition");
+    assert!(
+        release_condition.contains("github.event_name != 'pull_request'")
+            && release_condition
+                .contains("startsWith(github.head_ref, 'release-please--branches--')")
+            && release_condition
+                .contains("needs.detect-changes.outputs.release-preflight == 'true'"),
+        "release preflight must run for release-sensitive PRs, release-please PRs, and non-PR \
+         backstops: \
+         {release_condition}"
+    );
+
+    let matrix = ci["jobs"]["detect-changes"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .find(|step| step["id"].as_str() == Some("matrix"))
+        .and_then(|step| step["run"].as_str())
+        .expect("dynamic OS matrix");
+    assert!(
+        matrix.contains("startsWith(github.head_ref, 'release-please--branches--')"),
+        "release-please PRs must retain the full OS matrix"
+    );
+
+    for filter in ["macos", "windows"] {
+        let paths = detect_change_filter_paths(&ci, filter);
+        for shared_path in [
+            "crates/wenlan-cli/src/**",
+            "crates/wenlan-cli/tests/**",
+            "crates/wenlan-server/src/**",
+            "crates/wenlan-server/tests/**",
+            "crates/wenlan-mcp/src/**",
+            "crates/wenlan-types/src/**",
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/**/Cargo.toml",
+            "version.txt",
+            ".release-please-manifest.json",
+            "CHANGELOG.md",
+        ] {
+            assert!(
+                !paths.contains(shared_path),
+                "{filter} full-platform routing must not claim shared path {shared_path}"
+            );
+        }
+    }
+
+    let mcp_platform_paths = detect_change_filter_paths(&ci, "mcp-platform");
+    let platform_paths = platform_sensitive_paths(&root);
+    for (path, platform, filter) in platform_paths {
+        if path.starts_with("crates/wenlan-mcp/") || path.starts_with("crates/wenlan-types/") {
+            assert!(
+                filter_routes_path(&mcp_platform_paths, &path),
+                "MCP platform compile does not own {platform}-sensitive path {path}"
+            );
+        } else {
+            let routed = detect_change_filter_paths(&ci, filter);
+            assert!(
+                filter_routes_path(&routed, &path),
+                "{platform}-sensitive path is not routed through {filter}: {path}"
+            );
+        }
+    }
+
+    // PR #392 was a representative shared-code change: it touched the global
+    // lockfile, MCP/wire code, ordinary server code, and one macOS-owned
+    // scheduler. It must keep the macOS proof and focused MCP compile without
+    // paying for the unrelated full Windows CLI/server contract.
+    let pr_392_paths = [
+        "Cargo.lock",
+        "crates/wenlan-core/src/db.rs",
+        "crates/wenlan-mcp/src/tools.rs",
+        "crates/wenlan-server/Cargo.toml",
+        "crates/wenlan-server/src/memory_routes.rs",
+        "crates/wenlan-server/src/scheduler.rs",
+        "crates/wenlan-server/tests/route_convergence.rs",
+        "crates/wenlan-types/src/requests.rs",
+    ];
+    let macos_paths = detect_change_filter_paths(&ci, "macos");
+    let windows_paths = detect_change_filter_paths(&ci, "windows");
+    let release_paths = detect_change_filter_paths(&ci, "release-preflight");
+    assert!(
+        pr_392_paths
+            .iter()
+            .any(|path| filter_routes_path(&macos_paths, path)),
+        "PR #392 must retain its macOS-owned scheduler proof"
+    );
+    assert!(
+        !pr_392_paths
+            .iter()
+            .any(|path| filter_routes_path(&windows_paths, path)),
+        "PR #392 must not schedule the unrelated full Windows contract"
+    );
+    assert!(
+        !pr_392_paths
+            .iter()
+            .any(|path| filter_routes_path(&release_paths, path)),
+        "PR #392 must not schedule the unrelated release-profile matrix"
+    );
+    assert!(
+        pr_392_paths
+            .iter()
+            .any(|path| filter_routes_path(&mcp_platform_paths, path)),
+        "PR #392 must retain the focused MCP platform compile"
+    );
+
+    assert!(
+        required_job_closure(&ci).contains("mcp-platform"),
+        "the independent MCP platform compile must gate conclusion"
+    );
+    assert_eq!(
+        ci["jobs"]["mcp-platform"]["timeout-minutes"].as_u64(),
+        Some(20),
+        "the focused MCP platform compile must keep a 20-minute ceiling"
+    );
+}
+
+#[test]
+fn ci_fans_out_one_prepared_fastembed_artifact_per_run() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse ci.yml");
+    let artifact_name = "fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}";
+
+    let producer = job_step_using(&ci, "detect-changes", "actions/upload-artifact")
+        .expect("detect-changes must publish the prepared FastEmbed snapshot");
+    assert_eq!(
+        producer["with"]["name"].as_str(),
+        Some(artifact_name),
+        "FastEmbed artifact producer name"
+    );
+    assert_eq!(
+        producer["with"]["path"].as_str(),
+        Some(".fastembed_cache"),
+        "FastEmbed artifact producer path"
+    );
+    assert_eq!(
+        producer["with"]["include-hidden-files"].as_bool(),
+        Some(true),
+        "the hidden FastEmbed cache directory must be included"
+    );
+    assert_eq!(
+        producer["with"]["overwrite"].as_bool(),
+        Some(true),
+        "re-running the full workflow must replace the run-scoped artifact"
+    );
+
+    for job in ["test", "canonical-acceptance", "test-quarantine"] {
+        assert!(
+            job_step_using(&ci, job, "actions/cache/restore").is_none(),
+            "{job} must not make a concurrent cache-service restore"
+        );
+        let consumer = job_step_using(&ci, job, "actions/download-artifact")
+            .unwrap_or_else(|| panic!("{job} must download the prepared FastEmbed artifact"));
+        assert_eq!(
+            consumer["with"]["name"].as_str(),
+            Some(artifact_name),
+            "{job} FastEmbed artifact name"
+        );
+        assert_eq!(
+            consumer["with"]["path"].as_str(),
+            Some(".fastembed_cache"),
+            "{job} FastEmbed artifact path"
+        );
+    }
 }
 
 #[test]
@@ -2464,11 +2697,10 @@ jobs:
         "non-Rust test fixtures",
         "nextest config",
         "release-profile-sensitive",
-        "release-sensitive",
+        "native/build-sensitive",
         "30-minute non-Windows PR budget",
-        "independent differential job",
+        "release-sensitive PRs and release backstops",
         "rust-lld",
-        "does not also schedule",
         "debug runtime artifacts",
         "differentially compile every wenlan-mcp target",
         "mcp-platform routing",
@@ -2609,12 +2841,15 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     let job = &ci["jobs"]["release-preflight"];
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
         || job["if"].as_str().is_none_or(|condition| {
-            !condition.contains("needs.detect-changes.outputs.release-preflight == 'true'")
-                || !condition.contains("github.event_name != 'pull_request'")
+            !condition.contains("github.event_name != 'pull_request'")
+                || !condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
+                || !condition.contains("needs.detect-changes.outputs.release-preflight == 'true'")
         })
     {
-        violations
-            .push("release-preflight is not an independent fail-closed differential job".into());
+        violations.push(
+            "release-preflight is not isolated to release-sensitive PRs and release backstops"
+                .into(),
+        );
     }
     if job["runs-on"].as_str() != Some("${{ matrix.os }}")
         || job["timeout-minutes"].as_str()
@@ -2898,6 +3133,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     let conclusion = workflow_step_run(&ci, "Aggregate expected CI results").unwrap_or_default();
     if !conclusion.lines().map(str::trim).any(|line| {
         line.starts_with("expect_job release-preflight ")
+            && line.contains("startsWith(github.head_ref, 'release-please--branches--')")
             && line.contains("needs.detect-changes.outputs.release-preflight")
             && line.contains("needs.release-preflight.result")
     }) {
@@ -2908,7 +3144,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
 }
 
 #[test]
-fn release_preflight_is_shared_differential_and_read_only() {
+fn release_preflight_is_release_gated_and_read_only() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let release =
@@ -2933,7 +3169,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "      - name: Accept truncated PR file inventory",
         )
         .replace(
-            "needs.detect-changes.outputs.release-preflight == 'true'",
+            "startsWith(github.head_ref, 'release-please--branches--')",
             "false",
         )
         .replace("      fail-fast: true", "      fail-fast: false")
@@ -2946,7 +3182,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "        run: gh release create unsafe",
         )
         .replace(
-            "          expect_job release-preflight '${{ github.event_name != 'pull_request' || needs.detect-changes.outputs.release-preflight == 'true' }}' '${{ needs.release-preflight.result }}'",
+            "          expect_job release-preflight '${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true' }}' '${{ needs.release-preflight.result }}'",
             "          echo release-preflight skipped",
         )
         .replace(
@@ -2980,7 +3216,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         );
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
-        "independent fail-closed",
+        "release-sensitive PRs and release backstops",
         "fail-fast four-target",
         "canonical release matrix",
         "shared shipped-binary",
@@ -3190,30 +3426,28 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     if sccache_actions != 1 {
         violations.push("Canonical acceptance needs exactly one read-only sccache action".into());
     }
-    let fastembed_restores = acceptance_steps
+    let fastembed_downloads = acceptance_steps
         .iter()
         .filter(|step| {
             step["uses"]
                 .as_str()
-                .is_some_and(|uses| uses.contains("actions/cache/restore@"))
+                .is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
         })
         .collect::<Vec<_>>();
-    let fastembed = fastembed_restores.first().copied();
-    if fastembed_restores.len() != 1
+    let fastembed = fastembed_downloads.first().copied();
+    if fastembed_downloads.len() != 1
         || fastembed.and_then(|step| step["with"]["path"].as_str()) != Some(".fastembed_cache")
-        || fastembed.and_then(|step| step["with"]["key"].as_str())
-            != Some("fastembed-bge-base-en-v1.5-q-v3-portable")
-        || fastembed.and_then(|step| step["with"]["enableCrossOsArchive"].as_str()) != Some("true")
-        || fastembed.and_then(|step| step["with"]["fail-on-cache-miss"].as_str()) != Some("true")
+        || fastembed.and_then(|step| step["with"]["name"].as_str())
+            != Some("fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}")
     {
-        violations.push("Canonical acceptance FastEmbed cache is not restore-only".into());
+        violations.push("Canonical acceptance FastEmbed artifact is not run-scoped".into());
     }
     if acceptance_steps
         .iter()
         .filter_map(|step| step["uses"].as_str())
-        .any(|uses| uses.starts_with("actions/cache@") || uses.contains("actions/cache/save@"))
+        .any(|uses| uses.starts_with("actions/cache"))
     {
-        violations.push("Canonical acceptance contains a FastEmbed cache writer".into());
+        violations.push("Canonical acceptance contains a FastEmbed cache action".into());
     }
 
     if !job_needs(&ci, "conclusion")
@@ -3235,7 +3469,7 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
 }
 
 #[test]
-fn canonical_acceptance_is_parallel_required_and_restore_only() {
+fn canonical_acceptance_is_parallel_required_and_artifact_only() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let violations = canonical_acceptance_contract_violations(&ci);
@@ -3283,8 +3517,8 @@ jobs:
         "remains serialized",
         "macOS lost",
         "exactly one restore-only rust-cache",
-        "FastEmbed cache is not restore-only",
-        "FastEmbed cache writer",
+        "FastEmbed artifact is not run-scoped",
+        "FastEmbed cache action",
         "conclusion.needs",
         "conclusion does not fail closed",
     ] {
