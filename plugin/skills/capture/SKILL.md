@@ -5,7 +5,7 @@ description: >
   when the user states a preference, makes a decision, corrects you, or
   shares a durable fact. Invoked as `/capture <content>`.
 argument-hint: "<content>"
-allowed-tools: ["mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__create_entity", "mcp__plugin_wenlan_wenlan__create_relation", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision", "Bash"]
+allowed-tools: ["mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision", "Bash"]
 ---
 
 # /capture
@@ -93,23 +93,9 @@ omit `entity`.
 
 ### Multiple entities or relations
 
-The MCP `capture` tool takes a single primary `entity`. For additional
-entities or relations, use the dedicated MCP tools. If the content
-names more than one entity, capture the memory first, then for each
-additional entity:
-
-```
-create_entity(name="<entity>", entity_type="<person|project|tool|place>")
-```
-
-For a relation between two entities:
-
-```
-create_relation(from_entity="<a>", to_entity="<b>", relation_type="<verb>")
-```
-
-Skip these calls when the daemon has an LLM — its post-ingest enrichment
-covers extraction.
+Pass the single most important named anchor through `capture.entity`.
+The daemon's post-ingest enrichment extracts additional entities and
+relations when a model is configured.
 
 ## What to capture
 

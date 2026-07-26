@@ -775,43 +775,6 @@ pub struct ConfirmMemoryParams {
     pub memory_id: String,
 }
 
-// --- Knowledge graph CRUD params ---
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CreateEntityParams {
-    #[schemars(
-        description = "Canonical entity name (e.g. 'Alice', 'Wenlan', 'PostgreSQL'). Use the exact, full name — aliases resolve to this canonical form."
-    )]
-    pub name: String,
-    #[schemars(
-        description = "Entity category: 'person', 'project', 'tool', 'place', 'organization', etc. Free-form string; choose the noun that best describes what it is."
-    )]
-    pub entity_type: String,
-    #[schemars(description = "Topic scope (e.g. 'work', 'origin'). Optional.")]
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
-    #[schemars(
-        description = "0.0-1.0 confidence in the entity assertion. Leave unset for caller-default."
-    )]
-    pub confidence: Option<f32>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CreateRelationParams {
-    #[schemars(
-        description = "Canonical name of the source entity (e.g. 'Alice'). Must exist or will be created on the daemon side."
-    )]
-    pub from_entity: String,
-    #[schemars(
-        description = "Canonical name of the target entity (e.g. 'Wenlan'). Must exist or will be created on the daemon side."
-    )]
-    pub to_entity: String,
-    #[schemars(
-        description = "Verb describing the directed relation (e.g. 'works_on', 'prefers', 'uses', 'depends_on'). Snake_case, present-tense."
-    )]
-    pub relation_type: String,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreatePageParams {
     #[schemars(
@@ -1675,58 +1638,6 @@ impl WenlanMcpServer {
         }
     }
 
-    pub async fn create_entity_impl(
-        &self,
-        params: CreateEntityParams,
-    ) -> Result<CallToolResult, McpError> {
-        let source_agent = self.resolve_source_agent(None);
-        let space_arg = effective_space(&params.space);
-        let req = CreateEntityRequest {
-            name: params.name,
-            entity_type: params.entity_type,
-            space: space_arg,
-            source_agent,
-            confidence: params.confidence,
-        };
-        let resp: CreateEntityResponse = try_call!(
-            self.client.post("/api/memory/entities", &req),
-            "create_entity"
-        );
-        let mut text = format!("Created entity {}", resp.id);
-        for w in &resp.warnings {
-            text.push_str(&format!("\nwarning: {w}"));
-        }
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
-    pub async fn create_relation_impl(
-        &self,
-        params: CreateRelationParams,
-    ) -> Result<CallToolResult, McpError> {
-        let source_agent = self.resolve_source_agent(None);
-        let req = CreateRelationRequest {
-            from_entity: params.from_entity,
-            to_entity: params.to_entity,
-            relation_type: params.relation_type,
-            source_agent,
-            confidence: None,
-            explanation: None,
-            source_memory_id: None,
-            span: None,
-            model_version: None,
-            prompt_version: None,
-        };
-        let resp: CreateRelationResponse = try_call!(
-            self.client.post("/api/memory/relations", &req),
-            "create_relation"
-        );
-        let mut text = format!("Created relation {}", resp.id);
-        for w in &resp.warnings {
-            text.push_str(&format!("\nwarning: {w}"));
-        }
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
     pub async fn create_page_impl(
         &self,
         params: CreatePageParams,
@@ -2163,42 +2074,6 @@ impl WenlanMcpServer {
         Parameters(params): Parameters<ConfirmMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
         self.confirm_memory_impl(&params.memory_id).await
-    }
-
-    // --- Knowledge graph CRUD ---
-
-    #[tool(
-        description = "Create an entity in the knowledge graph. Use when the user names a person, project, tool, or place that isn't yet linked, or when you need a stable id to anchor memories or pages to. The daemon's post-ingest enrichment usually creates entities automatically when a model or Anthropic key is configured — call this explicitly when distill cycles are off or you need the id back synchronously.",
-        annotations(
-            title = "Create entity",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn create_entity(
-        &self,
-        Parameters(params): Parameters<CreateEntityParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.create_entity_impl(params).await
-    }
-
-    #[tool(
-        description = "Create a directed relation between two entities in the knowledge graph. Use sparingly — most relations come out of the daemon's enrichment when a model or Anthropic key is configured. Call this explicitly to record a relation the user articulated that the daemon couldn't infer, or when distill cycles are off.",
-        annotations(
-            title = "Create relation",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn create_relation(
-        &self,
-        Parameters(params): Parameters<CreateRelationParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.create_relation_impl(params).await
     }
 
     #[tool(
@@ -4753,125 +4628,7 @@ mod tests {
         );
     }
 
-    // ===== Knowledge graph / page CRUD =====
-
-    // --- CreateEntityParams ---
-
-    #[test]
-    fn test_create_entity_params_minimal() {
-        let json = r#"{"name": "Alice", "entity_type": "person"}"#;
-        let params: CreateEntityParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "Alice");
-        assert_eq!(params.entity_type, "person");
-        assert!(params.space.is_none());
-        assert!(params.confidence.is_none());
-    }
-
-    #[test]
-    fn test_create_entity_params_full() {
-        let json = r#"{
-            "name": "PostgreSQL",
-            "entity_type": "tool",
-            "space": "origin",
-            "confidence": 0.9
-        }"#;
-        let params: CreateEntityParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "PostgreSQL");
-        assert_eq!(params.entity_type, "tool");
-        assert_eq!(params.space.as_deref(), Some("origin"));
-        assert_eq!(params.confidence, Some(0.9));
-    }
-
-    #[test]
-    fn test_create_entity_params_missing_name_fails() {
-        let json = r#"{"entity_type": "person"}"#;
-        let result = serde_json::from_str::<CreateEntityParams>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_entity_params_missing_type_fails() {
-        let json = r#"{"name": "Alice"}"#;
-        let result = serde_json::from_str::<CreateEntityParams>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_entity_request_body_shape() {
-        let server = make_server(TransportMode::Stdio, "claude", None);
-        let params = CreateEntityParams {
-            name: "Wenlan".into(),
-            entity_type: "project".into(),
-            space: Some("origin".into()),
-            confidence: Some(0.95),
-        };
-        let source_agent = server.resolve_source_agent(None);
-        let req = CreateEntityRequest {
-            name: params.name,
-            entity_type: params.entity_type,
-            space: params.space,
-            source_agent,
-            confidence: params.confidence,
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["name"], "Wenlan");
-        assert_eq!(json["entity_type"], "project");
-        assert_eq!(json["space"], "origin");
-        assert_eq!(json["source_agent"], "claude");
-        assert!(json["confidence"].as_f64().unwrap() > 0.94);
-    }
-
-    // --- CreateRelationParams ---
-
-    #[test]
-    fn test_create_relation_params() {
-        let json = r#"{
-            "from_entity": "Alice",
-            "to_entity": "Wenlan",
-            "relation_type": "works_on"
-        }"#;
-        let params: CreateRelationParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.from_entity, "Alice");
-        assert_eq!(params.to_entity, "Wenlan");
-        assert_eq!(params.relation_type, "works_on");
-    }
-
-    #[test]
-    fn test_create_relation_params_missing_field_fails() {
-        let json = r#"{"from_entity": "Alice", "to_entity": "Wenlan"}"#;
-        let result = serde_json::from_str::<CreateRelationParams>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_relation_request_body_shape() {
-        let server = make_server(TransportMode::Stdio, "claude", None);
-        let params = CreateRelationParams {
-            from_entity: "Alice".into(),
-            to_entity: "Wenlan".into(),
-            relation_type: "prefers".into(),
-        };
-        let source_agent = server.resolve_source_agent(None);
-        let req = CreateRelationRequest {
-            from_entity: params.from_entity,
-            to_entity: params.to_entity,
-            relation_type: params.relation_type,
-            source_agent,
-            confidence: None,
-            explanation: None,
-            source_memory_id: None,
-            span: None,
-            model_version: None,
-            prompt_version: None,
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["from_entity"], "Alice");
-        assert_eq!(json["to_entity"], "Wenlan");
-        assert_eq!(json["relation_type"], "prefers");
-        assert_eq!(json["source_agent"], "claude");
-    }
-
-    // --- CreatePageParams ---
+    // ===== Page CRUD =====
 
     #[test]
     fn test_create_page_params_minimal() {
@@ -5043,14 +4800,7 @@ mod tests {
     #[test]
     fn new_crud_tools_are_registered() {
         let descriptions = tool_descriptions();
-        for name in [
-            "create_entity",
-            "create_relation",
-            "create_page",
-            "update_page",
-            "delete_page",
-            "list_spaces",
-        ] {
+        for name in ["create_page", "update_page", "delete_page", "list_spaces"] {
             assert!(
                 descriptions.contains_key(name),
                 "tool `{name}` must be registered, got: {:?}",
@@ -5081,20 +4831,6 @@ mod tests {
                 "RecallParams.memory_type schema must list canonical type \"{ty}\", got: {params_schema}"
             );
         }
-    }
-
-    #[test]
-    fn create_entity_schema_documents_name_and_type() {
-        let schema = serde_json::to_string(&schemars::schema_for!(CreateEntityParams))
-            .expect("CreateEntityParams schema serializes");
-        assert!(
-            schema.contains("Canonical entity name"),
-            "schema must describe `name` field"
-        );
-        assert!(
-            schema.contains("Entity category"),
-            "schema must describe `entity_type` field"
-        );
     }
 
     #[test]
@@ -5393,9 +5129,7 @@ mod tests {
             "capture",
             "confirm_memory",
             "context",
-            "create_entity",
             "create_page",
-            "create_relation",
             "delete_page",
             "dismiss_revision",
             "distill",

@@ -5,7 +5,7 @@ description: >
   states a preference, makes a decision, corrects you, or shares a durable
   fact. Invoked as /capture <content>.
 argument-hint: "<content>"
-allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__create_entity", "mcp__wenlan__create_relation", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
+allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
 user-invocable: true
 ---
 
@@ -82,14 +82,9 @@ If two types fit, pick the one closest to why the memory matters.
 Pick the single most important named anchor: person, project, tool, or place.
 Use the exact name. If there is no named anchor, omit `entity`.
 
-For additional entities or explicit relations, capture first, then call:
-
-```text
-create_entity(name="<entity>", entity_type="<person|project|tool|place>")
-create_relation(from_entity="<a>", to_entity="<b>", relation_type="<verb>")
-```
-
-Skip those calls when daemon enrichment is configured.
+Pass the single most important named anchor through `capture.entity`. The
+daemon's post-ingest enrichment extracts additional entities and relations
+when a model is configured.
 
 ## What to capture
 
