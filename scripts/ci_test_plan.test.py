@@ -105,6 +105,8 @@ class FiltersetExecutionTests(unittest.TestCase):
     def run_filterset_with_listing(
         self,
         listing: dict,
+        *,
+        partition: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], bool]:
         plan = plan_for(
             "crates/wenlan-core/src/lint/pages/security_test.rs"
@@ -121,6 +123,8 @@ import sys
 if sys.argv[1] == "metadata":
     print(os.environ["FAKE_CARGO_METADATA"])
 elif sys.argv[1:3] == ["nextest", "list"]:
+    if "--partition" in sys.argv:
+        raise SystemExit("partitioned filterset validation can reject a valid empty shard")
     print(os.environ["FAKE_NEXTEST_LISTING"])
 elif sys.argv[1:3] == ["nextest", "run"]:
     Path(os.environ["NEXTEST_RUN_MARKER"]).write_text("ran")
@@ -144,16 +148,19 @@ else:
             environment["FAKE_NEXTEST_LISTING"] = json.dumps(listing)
             environment["NEXTEST_RUN_MARKER"] = str(run_marker)
 
+            arguments = [
+                sys.executable,
+                str(Path(__file__).with_name("ci_test_plan.py")),
+                "run",
+                "--suite",
+                "workspace-lib",
+                "--plan-json",
+                json.dumps(plan),
+            ]
+            if partition is not None:
+                arguments.extend(["--partition", partition])
             result = subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(__file__).with_name("ci_test_plan.py")),
-                    "run",
-                    "--suite",
-                    "workspace-lib",
-                    "--plan-json",
-                    json.dumps(plan),
-                ],
+                arguments,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -216,6 +223,26 @@ else:
                     }
                 }
             }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(did_run)
+
+    def test_partition_does_not_narrow_filterset_validation(self) -> None:
+        result, did_run = self.run_filterset_with_listing(
+            {
+                "rust-suites": {
+                    "wenlan-core": {
+                        "testcases": {
+                            "owned::active": {
+                                "ignored": False,
+                                "filter-match": {"status": "matches"},
+                            }
+                        }
+                    }
+                }
+            },
+            partition="slice:2/2",
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -391,6 +418,48 @@ class FailClosedTests(unittest.TestCase):
 
 
 class CommandGenerationTests(unittest.TestCase):
+    def test_partition_rejects_shell_text_and_non_workspace_suites(self) -> None:
+        plan = plan_for("Cargo.lock")
+        for partition in ["slice:0/2", "slice:3/2", "slice:1/2;echo unsafe"]:
+            with self.subTest(partition=partition):
+                with self.assertRaisesRegex(PlanError, "invalid nextest partition"):
+                    command_groups_for(
+                        "workspace-lib",
+                        plan,
+                        cargo_metadata(),
+                        partition=partition,
+                    )
+        with self.assertRaisesRegex(PlanError, "only supported for workspace-lib"):
+            command_groups_for(
+                "core-integration",
+                plan,
+                cargo_metadata(),
+                partition="slice:1/2",
+            )
+
+    def test_workspace_partition_is_appended_without_changing_the_plan(self) -> None:
+        plan = plan_for("Cargo.lock")
+
+        self.assertEqual(
+            command_groups_for(
+                "workspace-lib",
+                plan,
+                cargo_metadata(),
+                partition="slice:1/2",
+            ),
+            [
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--workspace",
+                    "--lib",
+                    "--partition",
+                    "slice:1/2",
+                ]
+            ],
+        )
+
     def test_workspace_package_plan_is_an_argv_vector_without_shell_text(self) -> None:
         plan = plan_for("crates/wenlan-server/src/routes.rs")
 
