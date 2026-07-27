@@ -2597,6 +2597,8 @@ const LOCAL_ONLY_TOOL_NAMES: &[&str] = &[
     "delete_page",
     "accept_refinement",
     "reject_refinement",
+    "accept_revision",
+    "dismiss_revision",
 ];
 
 impl WenlanMcpServer {
@@ -2945,6 +2947,8 @@ mod tests {
             "delete_page",
             "accept_refinement",
             "reject_refinement",
+            "accept_revision",
+            "dismiss_revision",
         ] {
             assert!(stdio.iter().any(|candidate| candidate == name));
             assert!(!http.iter().any(|candidate| candidate == name));

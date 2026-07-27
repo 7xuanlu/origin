@@ -85,7 +85,15 @@ to run `/pages <query>` to open one.
 ## Explicit changelog lookup
 
 Only when the user explicitly asks for a page's changelog or version history,
-call:
+resolve its stable id without reading the page body. Resolve the page ID first
+with `wenlan pages "<query-or-filename>" --resolve-id`.
+
+```bash
+"$W" pages "<query-or-filename>" --resolve-id
+```
+
+If several pages match, ask the user to narrow by filename and rerun the
+resolver. Then call:
 
 ```text
 mcp__wenlan__get_page_revisions(page_id="<page-id>")

@@ -61,7 +61,7 @@ LINT_SHARED_GUARDRAILS = [
     "Do not compare General and Deep Page digests across profiles because their Page scan coverage intentionally differs.",
     "Lead repair output with exactly one compact typed-count funnel",
     "Never substitute check, family, or candidate counts for occurrence counts",
-    "CLI fallback: `wenlan lint --profile deep --agent_assist`",
+    "CLI fallback: `wenlan lint --profile deep --agent-assist`",
     "global",
     "uncategorized",
     "Plain `/lint`, `/lint deep`, the lint MCP tool, and `/api/lint` are fully read-only",
@@ -98,6 +98,9 @@ LINT_SHARED_GUARDRAILS = [
     "applied_unverified",
     "Match every line byte-for-byte",
     "the MCP repair-manifest tools have no CLI equivalent yet",
+]
+PAGES_SHARED_GUARDRAILS = [
+    'Resolve the page ID first with `wenlan pages "<query-or-filename>" --resolve-id`.',
 ]
 ENRICHMENT_CONSENT_GUARDRAILS = [
     "wenlan enrichment status",
@@ -589,6 +592,11 @@ def validate_skill_surface(
             )
             if resolver not in text:
                 fail(f"{rel(root, skill_path)} must use {resolver}")
+        if name == "pages":
+            normalized_text = " ".join(text.split())
+            for needle in PAGES_SHARED_GUARDRAILS:
+                if needle not in normalized_text:
+                    fail(f"{rel(root, skill_path)} must contain guardrail {needle!r}")
         if name == "help" and "/lint [deep|repair] [scope]" not in text:
             fail(f"{rel(root, skill_path)} must advertise the unified lint grammar")
         if name in {"help", "setup"}:

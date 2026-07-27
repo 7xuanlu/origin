@@ -71,8 +71,16 @@ If `wenlan` isn't found, the CLI isn't installed — tell the user to run `/setu
 ## Explicit changelog lookup
 
 Only when the user explicitly asks for a page's changelog or version history,
-call `get_page_revisions(page_id="<page-id>")`. Do not fetch changelogs during
-ordinary `/pages` list/open flows.
+resolve its stable id without reading the page body. Resolve the page ID first
+with `wenlan pages "<query-or-filename>" --resolve-id`.
+
+```bash
+"$W" pages "<query-or-filename>" --resolve-id
+```
+
+If several pages match, use the same picker/narrowing flow above and rerun with
+the selected filename. Then call `get_page_revisions(page_id="<resolved-id>")`.
+Do not fetch changelogs during ordinary `/pages` list/open flows.
 
 ## When NOT to use
 

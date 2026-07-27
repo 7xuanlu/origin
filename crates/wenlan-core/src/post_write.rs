@@ -3172,11 +3172,13 @@ pub(crate) async fn update_page_growth_at_versions(
     .await
 }
 
-/// Test-only seam. A test installs a `(parked, go)` handshake here and
-/// `update_page_impl` uses it once, *after* deciding ownership and *before*
-/// writing — i.e. in the exact window a competing edit has to land in. It
-/// announces that it is parked, then blocks until released, so the test can
-/// land a full competing write in between with no ordering guesswork.
+/// Test-only seam. A test installs a `(page_id, parked, go)` handshake here and
+/// `update_page_impl` uses it once for that page only, *after* deciding
+/// ownership and *before* writing — i.e. in the exact window a competing edit
+/// has to land in. It announces that it is parked, then blocks until released,
+/// so the test can land a full competing write in between with no ordering
+/// guesswork. Binding the seam to a page keeps unrelated parallel tests from
+/// consuming it.
 ///
 /// This is the only way to deterministically exercise the version CAS: with no
 /// interleaving edit, a guarded write and an unguarded one behave identically.
@@ -3185,6 +3187,7 @@ pub(crate) async fn update_page_growth_at_versions(
 /// Compiled out entirely in non-test builds.
 #[cfg(test)]
 type PreWriteGate = (
+    String,
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 );
@@ -3194,9 +3197,19 @@ pub(crate) static PRE_WRITE_GATE: std::sync::Mutex<Option<PreWriteGate>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-async fn pre_write_pause() {
-    let gate = PRE_WRITE_GATE.lock().unwrap().take();
-    if let Some((parked, go)) = gate {
+async fn pre_write_pause(page_id: &str) {
+    let gate = {
+        let mut slot = PRE_WRITE_GATE.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|(target, _, _)| target == page_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, parked, go)) = gate {
         let _ = parked.send(());
         let _ = go.await;
     }
@@ -3204,7 +3217,7 @@ async fn pre_write_pause() {
 
 #[cfg(not(test))]
 #[inline(always)]
-async fn pre_write_pause() {}
+async fn pre_write_pause(_page_id: &str) {}
 
 #[allow(clippy::too_many_arguments)]
 /// The advisory line a successful page update returns. Shared between the
@@ -3693,7 +3706,7 @@ async fn update_page_impl(
                 _ => None,
             };
 
-            pre_write_pause().await;
+            pre_write_pause(page_id).await;
             // citations: None -> resets `citations` to SQL NULL (no fresh
             // citation source for this write; a stale claim-map must not
             // survive a content change, and the new body re-enters bounded
@@ -7649,7 +7662,7 @@ mod tests {
         // (page is still machine-owned) and before writing.
         let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
         let (go_tx, go_rx) = tokio::sync::oneshot::channel();
-        *PRE_WRITE_GATE.lock().unwrap() = Some((parked_tx, go_rx));
+        *PRE_WRITE_GATE.lock().unwrap() = Some((page_id.to_string(), parked_tx, go_rx));
 
         // Close to the seeded source: `fs_edit` is not exempt from the
         // hallucination guard, so an unrelated body would be rejected before

@@ -18,7 +18,7 @@ For `global`, omit `space`. For `uncategorized`, pass
 `space="uncategorized"`. For `space:<name>`, pass that name. With no explicit
 scope, call `$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh --cwd "$PWD"`; use a
 non-empty result, otherwise omit `space`. Bash is allowed only for that exact
-resolver. CLI fallback: `wenlan lint --profile deep --agent_assist`
+resolver. CLI fallback: `wenlan lint --profile deep --agent-assist`
 (submissions via `--agent-submission <file>`); the MCP repair-manifest tools
 have no CLI equivalent yet.
 

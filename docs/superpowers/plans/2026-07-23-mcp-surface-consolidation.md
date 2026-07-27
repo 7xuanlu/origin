@@ -91,9 +91,10 @@ require an explicit item-level user decision.
    `prepare_lint_repair`, `get_lint_agent_work_page`,
    `prepare_lint_repair_plan`, `get_lint_repair_plan_entries`,
    `apply_lint_repair`, `verify_lint_repair`, `forget`, `confirm_memory`, and
-   `delete_page`, `accept_refinement`, and `reject_refinement`.
+   `delete_page`, `accept_refinement`, `reject_refinement`, `accept_revision`,
+   and `dismiss_revision`.
 7. Make lint routing and fallback copy truthful. The CLI can submit agent
-   results with `wenlan lint --profile deep --agent_assist
+   results with `wenlan lint --profile deep --agent-assist
    --agent-submission <file>`; MCP repair-manifest tools have no CLI equivalent.
 8. Correct plugin guidance for `~/.wenlan`: commits land at session boundaries
    (handoff or daemon events), not per capture, and uncommitted page edits
