@@ -5,7 +5,7 @@ description: >
   when the user states a preference, makes a decision, corrects you, or
   shares a durable fact. Invoked as `/capture <content>`.
 argument-hint: "<content>"
-allowed-tools: ["mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision", "Bash"]
+allowed-tools: ["mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__create_entity", "mcp__plugin_wenlan_wenlan__create_relation", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision", "Bash"]
 ---
 
 # /capture
@@ -103,9 +103,23 @@ W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
 
 ### Multiple entities or relations
 
-Pass the single most important named anchor through `capture.entity`.
-The daemon's post-ingest enrichment extracts additional entities and
-relations when a model is configured.
+Ordinary captures stop after `capture`: pass the single most important named
+anchor through `capture.entity` and let daemon enrichment handle routine
+extraction. Do not call `create_entity` for every capture, and never infer a
+relation the user did not state.
+
+Use the explicit KG tools only when the user directly states a durable relation:
+
+1. Call `capture` first with the complete relation statement.
+2. Call `create_entity` for both named endpoints to resolve stable entity ids.
+   This is idempotent and may return an existing id.
+3. Call `create_relation(from_entity_id=..., to_entity_id=...,
+   relation_type=..., source_memory_id=...)`, using the capture result's
+   `source_memory_id`.
+
+For a durable named entity explicitly established by the user, `create_entity`
+may also be used alone when its stable id is needed. Its `Entity <id> ready`
+result does not imply that a new row was created.
 
 ## What to capture
 

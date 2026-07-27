@@ -5,7 +5,7 @@ description: >
   states a preference, makes a decision, corrects you, or shares a durable
   fact. Invoked as /capture <content>.
 argument-hint: "<content>"
-allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
+allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__create_entity", "mcp__wenlan__create_relation", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
 user-invocable: true
 ---
 
@@ -82,9 +82,22 @@ If two types fit, pick the one closest to why the memory matters.
 Pick the single most important named anchor: person, project, tool, or place.
 Use the exact name. If there is no named anchor, omit `entity`.
 
-Pass the single most important named anchor through `capture.entity`. The
-daemon's post-ingest enrichment extracts additional entities and relations
-when a model is configured.
+Pass the single most important named anchor through `capture.entity`. Ordinary
+captures stop there; daemon enrichment handles routine extraction. Do not call
+`mcp__wenlan__create_entity` for every capture, and never infer a relation the
+user did not state.
+
+Only when the user explicitly states a durable relation:
+
+1. Call `mcp__wenlan__capture` first with the complete relation statement.
+2. Call `mcp__wenlan__create_entity` for both named endpoints to resolve their
+   stable ids. The call is idempotent and may return an existing id.
+3. Call `mcp__wenlan__create_relation` with `from_entity_id`, `to_entity_id`,
+   `relation_type`, and the capture result's required `source_memory_id`.
+
+For a durable named entity explicitly established by the user,
+`mcp__wenlan__create_entity` may also be used alone when its stable id is
+needed. `Entity <id> ready` does not imply that a new row was created.
 
 ## What to capture
 

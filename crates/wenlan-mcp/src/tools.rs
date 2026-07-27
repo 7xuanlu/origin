@@ -776,6 +776,45 @@ pub struct ConfirmMemoryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateEntityParams {
+    #[schemars(
+        description = "Canonical entity name (e.g. 'Alice', 'Wenlan', 'PostgreSQL'). Use the exact, full name; the daemon resolves an existing canonical entity idempotently when present."
+    )]
+    pub name: String,
+    #[schemars(
+        description = "Entity category: 'person', 'project', 'tool', 'place', 'organization', etc. Free-form string; choose the noun that best describes what it is."
+    )]
+    pub entity_type: String,
+    #[schemars(description = "Topic scope (e.g. 'work', 'wenlan'). Optional.")]
+    #[serde(default, alias = "domain")]
+    pub space: Option<String>,
+    #[schemars(
+        description = "0.0-1.0 confidence in the entity assertion. Leave unset for caller-default."
+    )]
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateRelationParams {
+    #[schemars(
+        description = "Resolved source entity id (e.g. 'ent_alice'). Obtain it from create_entity; names are not accepted or auto-created."
+    )]
+    pub from_entity_id: String,
+    #[schemars(
+        description = "Resolved target entity id (e.g. 'ent_wenlan'). Obtain it from create_entity; names are not accepted or auto-created."
+    )]
+    pub to_entity_id: String,
+    #[schemars(
+        description = "Verb describing the directed relation (e.g. 'works_on', 'prefers', 'uses', 'depends_on'). Snake_case, present-tense."
+    )]
+    pub relation_type: String,
+    #[schemars(
+        description = "Required source memory id returned by capture for the user's explicit relation statement."
+    )]
+    pub source_memory_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WritePageParams {
     #[schemars(
         description = "Omit to create a new page. Pass an existing page id (e.g. 'page_abc', from the `stale_pages` block in distill output) to refresh that page in place."
@@ -1519,6 +1558,51 @@ impl WenlanMcpServer {
         }
     }
 
+    pub async fn create_entity_impl(
+        &self,
+        params: CreateEntityParams,
+    ) -> Result<CallToolResult, McpError> {
+        let req = CreateEntityRequest {
+            name: params.name,
+            entity_type: params.entity_type,
+            space: effective_space(&params.space),
+            source_agent: self.resolve_source_agent(None),
+            confidence: params.confidence,
+        };
+        let resp: CreateEntityResponse = try_call!(
+            self.client.post("/api/memory/entities", &req),
+            "create_entity"
+        );
+        Ok(CallToolResult::success(vec![Content::text(
+            format_entity_ready_response(resp),
+        )]))
+    }
+
+    pub async fn create_relation_impl(
+        &self,
+        params: CreateRelationParams,
+    ) -> Result<CallToolResult, McpError> {
+        let req = CreateRelationRequest {
+            from_entity: params.from_entity_id,
+            to_entity: params.to_entity_id,
+            relation_type: params.relation_type,
+            source_agent: self.resolve_source_agent(None),
+            confidence: None,
+            explanation: None,
+            source_memory_id: Some(params.source_memory_id),
+            span: None,
+            model_version: None,
+            prompt_version: None,
+        };
+        let resp: CreateRelationResponse = try_call!(
+            self.client.post("/api/memory/relations", &req),
+            "create_relation"
+        );
+        Ok(CallToolResult::success(vec![Content::text(
+            format_relation_ready_response(resp),
+        )]))
+    }
+
     pub async fn write_page_impl(
         &self,
         params: WritePageParams,
@@ -1708,6 +1792,22 @@ fn format_create_page_response(resp: CreatePageResponse) -> String {
         Some(page_id) => format!("Attached to existing page {page_id}"),
         None => format!("Created page {}", resp.id),
     };
+    for warning in resp.warnings {
+        text.push_str(&format!("\nwarning: {warning}"));
+    }
+    text
+}
+
+fn format_entity_ready_response(resp: CreateEntityResponse) -> String {
+    let mut text = format!("Entity {} ready", resp.id);
+    for warning in resp.warnings {
+        text.push_str(&format!("\nwarning: {warning}"));
+    }
+    text
+}
+
+fn format_relation_ready_response(resp: CreateRelationResponse) -> String {
+    let mut text = format!("Relation {} ready", resp.id);
     for warning in resp.warnings {
         text.push_str(&format!("\nwarning: {warning}"));
     }
@@ -1952,6 +2052,40 @@ impl WenlanMcpServer {
         Parameters(params): Parameters<ConfirmMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
         self.confirm_memory_impl(&params.memory_id).await
+    }
+
+    #[tool(
+        description = "Resolve a durable named entity idempotently. Use only as a support step when the user explicitly establishes a durable named entity, or when resolved ids are needed for a relation the user explicitly stated. Do not call create_entity for every ordinary capture; capture already handles its primary entity and daemon enrichment handles routine extraction.",
+        annotations(
+            title = "Resolve entity",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn create_entity(
+        &self,
+        Parameters(params): Parameters<CreateEntityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.create_entity_impl(params).await
+    }
+
+    #[tool(
+        description = "Create a source-backed directed relation only when the user explicitly states a durable relation. Resolve both endpoint ids with create_entity, capture the user's relation statement, then pass those ids plus the capture result's source_memory_id. Entity names are not accepted or auto-created. Never infer an unstated relation.",
+        annotations(
+            title = "Create relation",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn create_relation(
+        &self,
+        Parameters(params): Parameters<CreateRelationParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.create_relation_impl(params).await
     }
 
     #[tool(
@@ -4457,6 +4591,108 @@ mod tests {
         );
     }
 
+    // ===== Explicit KG writes =====
+
+    #[test]
+    fn create_entity_params_require_name_and_type() {
+        let params: CreateEntityParams =
+            serde_json::from_value(serde_json::json!({"name": "Alice", "entity_type": "person"}))
+                .unwrap();
+        assert_eq!(params.name, "Alice");
+        assert_eq!(params.entity_type, "person");
+        assert!(params.space.is_none());
+        assert!(params.confidence.is_none());
+        assert!(serde_json::from_value::<CreateEntityParams>(
+            serde_json::json!({"entity_type": "person"})
+        )
+        .is_err());
+        assert!(
+            serde_json::from_value::<CreateEntityParams>(serde_json::json!({"name": "Alice"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn create_relation_params_require_resolved_ids_and_source_memory() {
+        let params: CreateRelationParams = serde_json::from_value(serde_json::json!({
+            "from_entity_id": "ent_alice",
+            "to_entity_id": "ent_wenlan",
+            "relation_type": "works_on",
+            "source_memory_id": "mem_user_statement"
+        }))
+        .unwrap();
+        assert_eq!(params.from_entity_id, "ent_alice");
+        assert_eq!(params.to_entity_id, "ent_wenlan");
+        assert_eq!(params.relation_type, "works_on");
+        assert_eq!(params.source_memory_id, "mem_user_statement");
+
+        assert!(
+            serde_json::from_value::<CreateRelationParams>(serde_json::json!({
+                "from_entity_id": "ent_alice",
+                "to_entity_id": "ent_wenlan",
+                "relation_type": "works_on"
+            }))
+            .is_err(),
+            "source_memory_id must be required"
+        );
+        assert!(
+            serde_json::from_value::<CreateRelationParams>(serde_json::json!({
+                "from_entity": "Alice",
+                "to_entity": "Wenlan",
+                "relation_type": "works_on",
+                "source_memory_id": "mem_user_statement"
+            }))
+            .is_err(),
+            "entity names must not satisfy the id-based contract"
+        );
+    }
+
+    #[test]
+    fn create_relation_request_maps_ids_and_source_memory() {
+        let params = CreateRelationParams {
+            from_entity_id: "ent_alice".into(),
+            to_entity_id: "ent_wenlan".into(),
+            relation_type: "works_on".into(),
+            source_memory_id: "mem_user_statement".into(),
+        };
+        let req = CreateRelationRequest {
+            from_entity: params.from_entity_id,
+            to_entity: params.to_entity_id,
+            relation_type: params.relation_type,
+            source_agent: Some("claude".into()),
+            confidence: None,
+            explanation: None,
+            source_memory_id: Some(params.source_memory_id),
+            span: None,
+            model_version: None,
+            prompt_version: None,
+        };
+        let json = serde_json::to_value(req).unwrap();
+        assert_eq!(json["from_entity"], "ent_alice");
+        assert_eq!(json["to_entity"], "ent_wenlan");
+        assert_eq!(json["relation_type"], "works_on");
+        assert_eq!(json["source_memory_id"], "mem_user_statement");
+        assert_eq!(json["source_agent"], "claude");
+    }
+
+    #[test]
+    fn kg_write_outputs_do_not_claim_new_creation() {
+        let entity = format_entity_ready_response(CreateEntityResponse {
+            id: "ent_alice".into(),
+            warnings: vec!["resolved existing canonical entity".into()],
+        });
+        assert!(entity.starts_with("Entity ent_alice ready"));
+        assert!(!entity.contains("Created"));
+        assert!(entity.contains("warning: resolved existing canonical entity"));
+
+        let relation = format_relation_ready_response(CreateRelationResponse {
+            id: "rel_alice_wenlan".into(),
+            warnings: Vec::new(),
+        });
+        assert_eq!(relation, "Relation rel_alice_wenlan ready");
+        assert!(!relation.contains("Created"));
+    }
+
     // ===== Page CRUD =====
 
     #[test]
@@ -4533,6 +4769,52 @@ mod tests {
                 descriptions.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn explicit_kg_write_tools_advertise_source_backed_narrow_contract() {
+        let tools = WenlanMcpServer::tool_router().list_all();
+        let entity = tools
+            .iter()
+            .find(|tool| tool.name == "create_entity")
+            .expect("create_entity must be registered");
+        assert!(
+            entity
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("explicitly establishes")),
+            "create_entity must advertise its narrow explicit-user trigger"
+        );
+
+        let relation = tools
+            .iter()
+            .find(|tool| tool.name == "create_relation")
+            .expect("create_relation must be registered");
+        let description = relation.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("Never infer an unstated relation"),
+            "create_relation must prohibit inferred writes: {description}"
+        );
+        let schema = serde_json::Value::Object((*relation.input_schema).clone());
+        let required = schema["required"]
+            .as_array()
+            .expect("create_relation schema must declare required fields");
+        for field in [
+            "from_entity_id",
+            "to_entity_id",
+            "relation_type",
+            "source_memory_id",
+        ] {
+            assert!(
+                required.iter().any(|value| value == field),
+                "create_relation must require {field}: {schema}"
+            );
+        }
+        assert!(
+            schema["properties"].get("from_entity").is_none()
+                && schema["properties"].get("to_entity").is_none(),
+            "create_relation must take resolved ids, not entity names: {schema}"
+        );
     }
 
     #[test]
@@ -4855,6 +5137,8 @@ mod tests {
             "capture",
             "confirm_memory",
             "context",
+            "create_entity",
+            "create_relation",
             "delete_page",
             "dismiss_revision",
             "distill",
