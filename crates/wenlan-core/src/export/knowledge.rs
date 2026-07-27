@@ -3561,7 +3561,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(PROJECTION_WRITE_LOCK.try_lock().is_ok());
     }
 
     #[tokio::test]

@@ -944,7 +944,7 @@ async fn run_periodic_steep_with_api_scope(
             // default-OFF flag and rollback path remain byte-compatible.
             let legacy_count = db_ref.detect_communities().await?;
             let shadow_count = if crate::db::community_leiden_enabled() {
-                match db_ref
+                let published_members = match db_ref
                     .run_next_community_grouping_cycle()
                     .await
                     .map_err(|error| {
@@ -954,7 +954,9 @@ async fn run_periodic_steep_with_api_scope(
                         receipt,
                     )) => receipt.member_count,
                     Some(crate::community_grouping::CommunityGroupingOutcome::Stale(_)) | None => 0,
-                }
+                };
+                db_ref.reconcile_pending_community_readers().await?;
+                published_members
             } else {
                 0
             };

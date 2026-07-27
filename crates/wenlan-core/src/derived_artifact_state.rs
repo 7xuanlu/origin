@@ -6,13 +6,51 @@ mod sweep;
 
 pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     let minimum = crate::refinery::summary::min_bucket_members();
-    format!(
-        "{alias}.is_recap=0
-         AND {alias}.supersede_mode<>'archive'
-         AND {alias}.source_id NOT LIKE 'merged_%'
-         AND {alias}.source_id NOT LIKE 'recap_%'
-         AND {alias}.embedding IS NOT NULL
-         AND {alias}.entity_id IN (
+    let durable_gate = format!(
+        "EXISTS (
+             SELECT 1 FROM community_reader_cutover cutover
+              WHERE cutover.consumer='{consumer}' AND cutover.enabled=1
+         )
+         AND NOT EXISTS (
+             WITH candidates AS (
+                 SELECT candidate.source_id, candidate.space, candidate.entity_id
+                  FROM memories candidate
+                  WHERE candidate.source='memory' AND candidate.chunk_index=0
+                    AND candidate.is_recap=0
+                    AND candidate.supersede_mode<>'archive'
+                    AND candidate.source_id NOT LIKE 'merged_%'
+                    AND candidate.source_id NOT LIKE 'recap_%'
+                    AND candidate.embedding IS NOT NULL
+             ),
+             relevant(space) AS (
+                 SELECT DISTINCT candidate.space
+                   FROM candidates candidate
+                   JOIN entities legacy_entity
+                     ON legacy_entity.id=candidate.entity_id
+                  WHERE legacy_entity.community_id IS NOT NULL
+                 UNION
+                 SELECT DISTINCT durable_member.space
+                   FROM community_members durable_member
+                   JOIN candidates candidate
+                     ON candidate.entity_id=durable_member.node_id
+                    AND candidate.space=durable_member.space
+             )
+             SELECT 1
+               FROM relevant
+               LEFT JOIN space_graph_state state ON state.space=relevant.space
+               LEFT JOIN community_reader_parity parity
+                 ON parity.consumer='{consumer}' AND parity.space=relevant.space
+              WHERE state.space IS NULL
+                 OR state.dirty<>0
+                 OR state.published_generation IS NULL
+                 OR parity.space IS NULL
+                 OR parity.unexplained_drift_count<>0
+                 OR parity.proven_published_generation<>state.published_generation
+         )",
+        consumer = crate::db::COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+    );
+    let legacy = format!(
+        "{alias}.entity_id IN (
              SELECT owner.id FROM entities owner
              JOIN (
                  SELECT peer_entity.community_id
@@ -28,6 +66,45 @@ pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
                  HAVING COUNT(*) >= {minimum}
              ) eligible ON eligible.community_id=owner.community_id
          )"
+    );
+    let durable = format!(
+        "{alias}.entity_id IN (
+             SELECT owner.node_id FROM community_members owner
+             JOIN space_graph_state owner_state
+               ON owner_state.space=owner.space
+              AND owner.published_generation=owner_state.published_generation
+             JOIN (
+                 SELECT peer_member.space, peer_member.community_id
+                   FROM memories peer
+                   JOIN community_members peer_member
+                     ON peer.entity_id=peer_member.node_id
+                    AND peer.space=peer_member.space
+                   JOIN space_graph_state peer_state
+                     ON peer_state.space=peer_member.space
+                    AND peer_member.published_generation=peer_state.published_generation
+                   JOIN communities peer_community
+                     ON peer_community.community_id=peer_member.community_id
+                    AND peer_community.space=peer_member.space
+                    AND peer_community.retired_at IS NULL
+                  WHERE peer.source='memory' AND peer.chunk_index=0
+                    AND peer.is_recap=0 AND peer.supersede_mode<>'archive'
+                    AND peer.source_id NOT LIKE 'merged_%'
+                    AND peer.source_id NOT LIKE 'recap_%'
+                    AND peer.embedding IS NOT NULL
+                  GROUP BY peer_member.space, peer_member.community_id
+                 HAVING COUNT(*) >= {minimum}
+             ) eligible
+               ON eligible.space=owner.space
+              AND eligible.community_id=owner.community_id
+         )"
+    );
+    format!(
+        "{alias}.is_recap=0
+         AND {alias}.supersede_mode<>'archive'
+         AND {alias}.source_id NOT LIKE 'merged_%'
+         AND {alias}.source_id NOT LIKE 'recap_%'
+         AND {alias}.embedding IS NOT NULL
+         AND CASE WHEN ({durable_gate}) THEN ({durable}) ELSE ({legacy}) END"
     )
 }
 

@@ -370,7 +370,7 @@ pub fn assert_wave_4_knowledge_catalog_contract() {
     }
 
     let rows = wenlan_server::sensitive_read_routes::sensitive_read_routes().collect::<Vec<_>>();
-    assert_eq!(rows.len(), 58);
+    assert_eq!(rows.len(), 62);
     assert_eq!(
         rows.iter()
             .filter(|row| row.scope_binding == ScopeBinding::Global)
@@ -381,7 +381,7 @@ pub fn assert_wave_4_knowledge_catalog_contract() {
         rows.iter()
             .filter(|row| row.scope_binding != ScopeBinding::Global)
             .count(),
-        43
+        47
     );
     assert_eq!(
         rows.iter()

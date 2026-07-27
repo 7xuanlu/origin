@@ -958,6 +958,45 @@ where
         if &before_target_receipt != manifest.expected_state().canonical_receipt() {
             return Err(WenlanError::Conflict("repair_target_stale".to_string()));
         }
+        let route_invalidation_before =
+            if let (RepairTarget::Page { page_id, .. }, RepairWriter::ArchiveEmptySourcePage) =
+                (manifest.target(), manifest.writer())
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT i.space, i.generation, s.generation
+                           FROM page_community_route_inputs i
+                           JOIN community_route_space_inputs s ON s.space=i.space
+                          WHERE i.page_id=?1",
+                        libsql::params![page_id.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "repair read page route invalidation: {error}"
+                        ))
+                    })?;
+                let row = rows
+                    .next()
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(error.to_string()))?
+                    .ok_or_else(|| {
+                        WenlanError::VectorDb(
+                            "repair target page route invalidation state missing".to_string(),
+                        )
+                    })?;
+                Some((
+                    page_id.clone(),
+                    row.get::<String>(0)
+                        .map_err(|error| WenlanError::VectorDb(error.to_string()))?,
+                    row.get::<i64>(1)
+                        .map_err(|error| WenlanError::VectorDb(error.to_string()))?,
+                    row.get::<i64>(2)
+                        .map_err(|error| WenlanError::VectorDb(error.to_string()))?,
+                ))
+            } else {
+                None
+            };
         let non_target_before = crate::repair::effect_guard_receipt(conn.total_changes());
         let affected = match (manifest.target(), manifest.writer(), manifest.mutation()) {
             (
@@ -1183,9 +1222,60 @@ where
                 "repair_target_write_unproven".to_string(),
             ));
         }
+        let allowed_derived_changes =
+            if let Some((page_id, expected_space, page_generation, space_generation)) =
+                route_invalidation_before
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT i.space, i.generation, s.generation
+                           FROM page_community_route_inputs i
+                           JOIN community_route_space_inputs s ON s.space=i.space
+                          WHERE i.page_id=?1",
+                        libsql::params![page_id],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "repair verify page route invalidation: {error}"
+                        ))
+                    })?;
+                let row = rows
+                    .next()
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(error.to_string()))?
+                    .ok_or_else(|| {
+                        WenlanError::VectorDb(
+                            "repair target page route invalidation state missing".to_string(),
+                        )
+                    })?;
+                let actual_space = row
+                    .get::<String>(0)
+                    .map_err(|error| WenlanError::VectorDb(error.to_string()))?;
+                let actual_page_generation = row
+                    .get::<i64>(1)
+                    .map_err(|error| WenlanError::VectorDb(error.to_string()))?;
+                let actual_space_generation = row
+                    .get::<i64>(2)
+                    .map_err(|error| WenlanError::VectorDb(error.to_string()))?;
+                if actual_space != expected_space
+                    || actual_page_generation != page_generation.saturating_add(1)
+                    || actual_space_generation != space_generation
+                {
+                    return Err(WenlanError::VectorDb(
+                        "repair target page route invalidation unproven".to_string(),
+                    ));
+                }
+                1
+            } else {
+                0
+            };
+        let allowed_changes = affected
+            .checked_add(allowed_derived_changes)
+            .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_overflow".to_string()))?;
         let normalized_total_changes = conn
             .total_changes()
-            .checked_sub(affected)
+            .checked_sub(allowed_changes)
             .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_underflow".to_string()))?;
         let non_target_after = crate::repair::effect_guard_receipt(normalized_total_changes);
         if non_target_after != non_target_before {

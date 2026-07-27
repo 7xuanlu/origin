@@ -665,6 +665,53 @@ fn posthoc_isolated_attachments(
     attached
 }
 
+pub(crate) fn expected_community_participant_ids(
+    grounded_edges: &[ProjectionInputEdge],
+    ungrounded_edges: &[ProjectionInputEdge],
+    entity_embeddings: &BTreeMap<String, Vec<f32>>,
+) -> BTreeSet<String> {
+    let grounded = project_grounded_relates(grounded_edges, ProjectionConfig::default());
+    if grounded.node_ids().len() < MIN_COMMUNITY_PARTICIPANTS {
+        return BTreeSet::new();
+    }
+    let core = grounded.node_ids().iter().cloned().collect::<BTreeSet<_>>();
+    let core_community = core
+        .iter()
+        .map(|node_id| (node_id.clone(), "__coverage-core".to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let ungrounded = project_grounded_relates(ungrounded_edges, ProjectionConfig::default());
+    let mut strongest_neighbor = BTreeMap::<String, (f64, String)>::new();
+    for edge in ungrounded.edges() {
+        let src = &ungrounded.node_ids()[edge.src];
+        let dst = &ungrounded.node_ids()[edge.dst];
+        update_strongest_neighbor(&mut strongest_neighbor, src, dst, edge.weight);
+        update_strongest_neighbor(&mut strongest_neighbor, dst, src, edge.weight);
+    }
+    let mut expected = core.clone();
+    expected.extend(
+        resolve_ungrounded_communities(
+            entity_embeddings.keys().map(String::as_str),
+            &strongest_neighbor,
+            &core_community,
+        )
+        .into_keys(),
+    );
+    let has_centroid = core.iter().any(|node_id| {
+        entity_embeddings
+            .get(node_id)
+            .is_some_and(|embedding| !embedding.is_empty())
+    });
+    if has_centroid {
+        expected.extend(
+            entity_embeddings
+                .iter()
+                .filter(|(_, embedding)| !embedding.is_empty())
+                .map(|(node_id, _)| node_id.clone()),
+        );
+    }
+    expected
+}
+
 fn update_strongest_neighbor(
     strongest: &mut BTreeMap<String, (f64, String)>,
     node_id: &str,
@@ -757,6 +804,108 @@ fn community_centroids(
             Some((community_id, sum))
         })
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommunityIdentityEvent {
+    pub(crate) action: &'static str,
+    pub(crate) subject_id: String,
+    pub(crate) old_community_ids: Vec<String>,
+    pub(crate) new_community_ids: Vec<String>,
+}
+
+pub(crate) fn detect_community_identity_events(
+    previous_ids: &BTreeMap<String, String>,
+    next_members: &[ComputedCommunityMember],
+) -> Vec<CommunityIdentityEvent> {
+    let mut old_to_new = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut new_to_old = BTreeMap::<String, BTreeSet<String>>::new();
+    for member in next_members {
+        let Some(old_id) = previous_ids.get(&member.node_id) else {
+            continue;
+        };
+        old_to_new
+            .entry(old_id.clone())
+            .or_default()
+            .insert(member.community_id.clone());
+        new_to_old
+            .entry(member.community_id.clone())
+            .or_default()
+            .insert(old_id.clone());
+    }
+
+    let mut events = Vec::new();
+    for (old_id, new_ids) in old_to_new {
+        if new_ids.len() >= 2 {
+            events.push(CommunityIdentityEvent {
+                action: "community_split",
+                subject_id: old_id.clone(),
+                old_community_ids: vec![old_id],
+                new_community_ids: new_ids.into_iter().collect(),
+            });
+        }
+    }
+    for (new_id, old_ids) in new_to_old {
+        if old_ids.len() >= 2 {
+            events.push(CommunityIdentityEvent {
+                action: "community_merge",
+                subject_id: new_id.clone(),
+                old_community_ids: old_ids.into_iter().collect(),
+                new_community_ids: vec![new_id],
+            });
+        }
+    }
+    events
+}
+
+#[cfg(test)]
+mod identity_event_tests {
+    use super::*;
+
+    #[test]
+    fn split_and_merge_identity_changes_are_explicit_review_events() {
+        let split = detect_community_identity_events(
+            &BTreeMap::from([
+                ("node-a".to_string(), "old-a".to_string()),
+                ("node-b".to_string(), "old-a".to_string()),
+            ]),
+            &[
+                ComputedCommunityMember {
+                    node_id: "node-a".to_string(),
+                    community_id: "old-a".to_string(),
+                    attachment: "core",
+                },
+                ComputedCommunityMember {
+                    node_id: "node-b".to_string(),
+                    community_id: "new-b".to_string(),
+                    attachment: "core",
+                },
+            ],
+        );
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].action, "community_split");
+
+        let merge = detect_community_identity_events(
+            &BTreeMap::from([
+                ("node-a".to_string(), "old-a".to_string()),
+                ("node-b".to_string(), "old-b".to_string()),
+            ]),
+            &[
+                ComputedCommunityMember {
+                    node_id: "node-a".to_string(),
+                    community_id: "old-a".to_string(),
+                    attachment: "core",
+                },
+                ComputedCommunityMember {
+                    node_id: "node-b".to_string(),
+                    community_id: "old-a".to_string(),
+                    attachment: "core",
+                },
+            ],
+        );
+        assert_eq!(merge.len(), 1);
+        assert_eq!(merge[0].action, "community_merge");
+    }
 }
 
 fn nearest_centroid(embedding: &[f32], centroids: &BTreeMap<String, Vec<f64>>) -> Option<String> {
@@ -854,6 +1003,13 @@ impl MemoryDB {
                 .transpose()?
         };
         let Some(space) = space else {
+            self.refresh_next_stale_page_community_routes()
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "refresh stale page community routes: {error}"
+                    ))
+                })?;
             return Ok(None);
         };
 
@@ -870,7 +1026,18 @@ impl MemoryDB {
         let work = compute_community_grouping(&attempt, runtime.runtime_mut())?;
         let result = work.finalize(self, attempt, runtime.runtime_mut()).await;
         match result {
-            Ok(outcome) => Ok(Some(outcome)),
+            Ok(outcome) => {
+                if let CommunityGroupingOutcome::Published(receipt) = &outcome {
+                    self.refresh_page_community_routes(&space, receipt.published_generation)
+                        .await
+                        .map_err(|error| {
+                            CommunityGroupingError::Database(format!(
+                                "refresh page community routes: {error}"
+                            ))
+                        })?;
+                }
+                Ok(Some(outcome))
+            }
             Err(error) => Err(error),
         }
     }

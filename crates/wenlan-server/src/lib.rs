@@ -4,6 +4,7 @@
 //! Only the modules needed by `tests/` are re-exported here. The binary
 //! entry-point (`main.rs`) continues to own the daemon lifecycle.
 
+pub mod community_routes;
 pub mod config_routes;
 pub mod error;
 mod host_activity;

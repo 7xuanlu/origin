@@ -7,6 +7,7 @@
 
 pub mod brand;
 pub mod briefing;
+pub mod communities;
 pub mod entities;
 pub mod events;
 pub mod import;
@@ -27,6 +28,13 @@ pub mod working_memory;
 
 // Re-export commonly used types at crate root for convenience.
 pub use briefing::{BriefingResponse, ContradictionItem};
+pub use communities::{
+    CommunityListResponse, CommunityMember, CommunityMemberCursor, CommunityMembersResponse,
+    CommunityPageAssignment, CommunityPageAssignmentsResponse, CommunityProposalAcceptResponse,
+    CommunityProposalAction, CommunityProposalPayload, CommunityProposalRejectResponse,
+    CommunityProposalSummary, CommunityReadScope, CommunitySummary, ListCommunityProposalsResponse,
+    PageCommunityAssignmentState,
+};
 pub use entities::{
     Entity, EntityDetail, EntitySearchResult, EntitySuggestion, Observation, RecentRelation,
     Relation, RelationWithEntity,

@@ -3,7 +3,7 @@
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -1250,6 +1250,128 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         foreground_p95.as_secs_f64() * 1_000.0,
     );
     assert_m4_job_phase_structure();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "M4 PR-2 graded 100k-memory / 5k-page routing and consistency receipt"]
+async fn m4_pr2_routing_consistency_and_index_scale_receipt() {
+    let dir = tempfile::tempdir().expect("M4 PR-2 scale tempdir");
+    let db = Arc::new(
+        MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+            .await
+            .expect("open M4 PR-2 scale database"),
+    );
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open independent M4 PR-2 observer");
+    let observer = observer_db.connect().expect("connect M4 PR-2 observer");
+    seed_m4_graded_corpus(&observer).await;
+
+    let mut runtime = CommunityGroupingRuntime::default();
+    let mut routed_pages = 0usize;
+    let mut stale_writes = 0usize;
+    for index in 0..3 {
+        let space = format!("space-{index}");
+        let outcome = run_community_grouping_cycle(&db, &mut runtime, &space)
+            .await
+            .expect("publish M4 PR-2 community snapshot");
+        let generation = match outcome {
+            CommunityGroupingOutcome::Published(receipt) => receipt.published_generation,
+            CommunityGroupingOutcome::Stale(_) => panic!("graded snapshot unexpectedly stale"),
+        };
+        let routing = db
+            .refresh_page_community_routes(&space, generation)
+            .await
+            .expect("route M4 PR-2 pages");
+        routed_pages += routing.assignments_published;
+        stale_writes += routing.stale_writes;
+    }
+
+    let consistency = db
+        .reconcile_community_consistency()
+        .await
+        .expect("M4 PR-2 consistency sweep");
+    assert_eq!(
+        consistency.violation_count(),
+        0,
+        "Gate 4.9 requires exact-zero consistency violations: {consistency:?}"
+    );
+    assert_eq!(routed_pages, 5_000);
+    assert_eq!(stale_writes, 0);
+
+    let mut assignment_rows = observer
+        .query("SELECT COUNT(*) FROM page_community_assignments", ())
+        .await
+        .expect("count M4 PR-2 assignments");
+    let assignment_count = assignment_rows
+        .next()
+        .await
+        .expect("read M4 PR-2 assignment count")
+        .expect("M4 PR-2 assignment count row")
+        .get::<i64>(0)
+        .expect("decode M4 PR-2 assignment count");
+    assert_eq!(assignment_count, 5_000);
+
+    let mut assignment_state_rows = observer
+        .query(
+            "SELECT state, COUNT(*)
+               FROM page_community_assignments
+              GROUP BY state ORDER BY state",
+            (),
+        )
+        .await
+        .expect("count M4 PR-2 assignment states");
+    let mut assignment_states = BTreeMap::new();
+    while let Some(row) = assignment_state_rows
+        .next()
+        .await
+        .expect("read M4 PR-2 assignment state")
+    {
+        assignment_states.insert(
+            row.get::<String>(0)
+                .expect("decode M4 PR-2 assignment state"),
+            row.get::<i64>(1)
+                .expect("decode M4 PR-2 assignment state count"),
+        );
+    }
+    assert_eq!(
+        assignment_states,
+        BTreeMap::from([("assigned".to_owned(), 5_000)]),
+        "the graded routing receipt must exercise native-edge assignments, not trivial drops"
+    );
+
+    for (sql, expected_index) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT edge_id FROM edges
+              WHERE space='space-0' AND edge_type='relates'
+                AND grounded=1 AND valid_until IS NULL
+                AND src_kind='entity' AND dst_kind='entity'
+                AND lineage='assertion'",
+            "idx_edges_active_grounded_space_type",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT node_id FROM community_members
+              WHERE community_id='missing'",
+            "idx_community_members_community",
+        ),
+    ] {
+        let mut rows = observer.query(sql, ()).await.expect("explain M4 hot read");
+        let mut details = Vec::new();
+        while let Some(row) = rows.next().await.expect("read M4 explain row") {
+            details.push(row.get::<String>(3).expect("decode M4 explain detail"));
+        }
+        assert!(
+            details.iter().any(|detail| detail.contains(expected_index)),
+            "Gate 4.10 expected {expected_index}, got {details:?}"
+        );
+    }
+
+    println!(
+        "[m4_pr2_scale] memories=100000 pages=5000 routed_pages={routed_pages} \
+         stale_writes={stale_writes} consistency_violations={} indexes=accepted",
+        consistency.violation_count()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2759,6 +2881,48 @@ async fn seed_m4_graded_corpus(observer: &libsql::Connection) {
             }
         }
         assert_eq!(edge_index, 6_151);
+
+        for page in (space..PAGES).step_by(SPACES) {
+            let cluster = (page / SPACES) % CLUSTERS_PER_SPACE;
+            let node = (page / (SPACES * CLUSTERS_PER_SPACE)) % NODES_PER_CLUSTER;
+            let page_entity_id = format!("space-{space}-cluster-{cluster:02}-node-{node:03}");
+            let memory_entity_id = format!(
+                "space-{space}-cluster-{cluster:02}-node-{:03}",
+                (node + 1) % NODES_PER_CLUSTER
+            );
+            let page_id = format!("m4-scale-page-{page}");
+            let memory_id = format!("m4-scale-memory-{page}");
+            observer
+                .execute(
+                    "UPDATE pages SET entity_id=?1 WHERE id=?2",
+                    libsql::params![page_entity_id, page_id.clone()],
+                )
+                .await
+                .expect("attach M4 scale page entity");
+            observer
+                .execute(
+                    "UPDATE memories SET entity_id=?1 WHERE id=?2",
+                    libsql::params![memory_entity_id, memory_id.clone()],
+                )
+                .await
+                .expect("attach M4 scale memory entity");
+            observer
+                .execute(
+                    "INSERT INTO edges
+                        (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                         lineage, grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'page', ?3, 'memory', 'cites',
+                             'evidence', 0, NULL, ?4, 1712707200)",
+                    libsql::params![
+                        format!("m4-scale-cite-{page}"),
+                        page_id,
+                        memory_id,
+                        format!("space-{space}")
+                    ],
+                )
+                .await
+                .expect("seed M4 native page citation");
+        }
     }
     observer
         .execute("COMMIT", ())
@@ -3038,7 +3202,7 @@ async fn assert_m4_schema(observer: &libsql::Connection) {
             .expect("M4 schema version row")
             .get::<i64>(0)
             .expect("decode M4 schema version"),
-        95
+        i64::from(wenlan_core::db::SCHEMA_VERSION)
     );
 
     for (table, required_columns) in [
