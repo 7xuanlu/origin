@@ -110,12 +110,12 @@ relation the user did not state.
 
 Use the explicit KG tools only when the user directly states a durable relation:
 
-1. Call `capture` first with the complete relation statement.
-2. Call `create_entity` for both named endpoints to resolve stable entity ids.
-   This is idempotent and may return an existing id.
-3. Call `create_relation(from_entity_id=..., to_entity_id=...,
-   relation_type=..., source_memory_id=...)`, using the capture result's
-   `source_memory_id`.
+1. Call `create_entity` for both named endpoints first and collect their stable
+   ids. This is idempotent and may return an existing id.
+2. Call `capture` with the complete relation statement and pass the primary
+   entity name as `entity` so the memory resolves and links to it.
+3. Call `create_relation` with `from_entity_id`, `to_entity_id`,
+   `relation_type`, and the capture result's required `source_memory_id`.
 
 For a durable named entity explicitly established by the user, `create_entity`
 may also be used alone when its stable id is needed. Its `Entity <id> ready`

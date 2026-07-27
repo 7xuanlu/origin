@@ -106,6 +106,49 @@ ENRICHMENT_CONSENT_GUARDRAILS = [
 ]
 
 
+def validate_capture_relation_flow(
+    root: Path,
+    surface: str,
+    skill_path: Path,
+    expected_prefix: str,
+    text: str,
+) -> None:
+    def tool(name: str) -> str:
+        return name if surface == "claude" else f"{expected_prefix}{name}"
+
+    steps = [
+        (
+            f"1. Call `{tool('create_entity')}` for both named endpoints first "
+            "and collect their stable ids."
+        ),
+        (
+            f"2. Call `{tool('capture')}` with the complete relation statement "
+            "and pass the primary entity name as `entity` so the memory resolves "
+            "and links to it."
+        ),
+        (
+            f"3. Call `{tool('create_relation')}` with `from_entity_id`, "
+            "`to_entity_id`, `relation_type`, and the capture result's required "
+            "`source_memory_id`."
+        ),
+    ]
+    normalized_text = " ".join(text.split())
+    positions = []
+    for step in steps:
+        position = normalized_text.find(step)
+        if position < 0:
+            fail(
+                f"{rel(root, skill_path)} must contain ordered relation step "
+                f"{step!r}"
+            )
+        positions.append(position)
+    if positions != sorted(positions):
+        fail(
+            f"{rel(root, skill_path)} must resolve entities, capture the linked "
+            "memory, then create the relation"
+        )
+
+
 def fail(message: str) -> None:
     print(f"plugin contract validation failed: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -412,6 +455,14 @@ def validate_skill_surface(
             fail(f"{rel(root, skill_path)} contains unexpected MCP tools: {wrong_tools}")
         if mcp_tools and not any(token.startswith(expected_prefix) for token in mcp_tools):
             fail(f"{rel(root, skill_path)} must use MCP prefix {expected_prefix!r}")
+        if name == "capture":
+            validate_capture_relation_flow(
+                root,
+                surface,
+                skill_path,
+                expected_prefix,
+                text,
+            )
         if name == "lint":
             require_equal(
                 f"{rel(root, skill_path)} argument-hint",

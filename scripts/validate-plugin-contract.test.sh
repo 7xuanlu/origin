@@ -113,6 +113,14 @@ assert_rejects "codex lint agent-submit drift" \
     perl -0pi -e 's/submit verdicts exactly once/submit verdicts when useful/g' \
     "$TMPDIR_TEST/root/plugin-codex/skills/lint/SKILL.md"
 
+assert_rejects "claude capture relation order drift" \
+    perl -0pi -e 's/for both named endpoints first/for both named endpoints after capture/' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture relation order drift" \
+    perl -0pi -e 's/for both named endpoints first/for both named endpoints after capture/' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
+
 assert_rejects "claude lint counterevidence authorization drift" \
     perl -0pi -e 's/authorized\s+record refs \(`evidence_refs` plus `counterevidence_refs`\)/unbounded record refs/' \
     "$TMPDIR_TEST/root/plugin/skills/lint/SKILL.md"

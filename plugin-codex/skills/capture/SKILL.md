@@ -89,9 +89,10 @@ user did not state.
 
 Only when the user explicitly states a durable relation:
 
-1. Call `mcp__wenlan__capture` first with the complete relation statement.
-2. Call `mcp__wenlan__create_entity` for both named endpoints to resolve their
-   stable ids. The call is idempotent and may return an existing id.
+1. Call `mcp__wenlan__create_entity` for both named endpoints first and collect
+   their stable ids. The call is idempotent and may return an existing id.
+2. Call `mcp__wenlan__capture` with the complete relation statement and pass
+   the primary entity name as `entity` so the memory resolves and links to it.
 3. Call `mcp__wenlan__create_relation` with `from_entity_id`, `to_entity_id`,
    `relation_type`, and the capture result's required `source_memory_id`.
 
