@@ -953,7 +953,9 @@ async fn run_periodic_steep_with_api_scope(
                     Some(crate::community_grouping::CommunityGroupingOutcome::Published(
                         receipt,
                     )) => receipt.member_count,
-                    Some(crate::community_grouping::CommunityGroupingOutcome::Stale(_)) | None => 0,
+                    Some(crate::community_grouping::CommunityGroupingOutcome::Held(_))
+                    | Some(crate::community_grouping::CommunityGroupingOutcome::Stale(_))
+                    | None => 0,
                 }
             } else {
                 0

@@ -12106,7 +12106,7 @@ impl MemoryDB {
 
     /// Publish one computed community snapshot only when the graph generation
     /// still matches the leased input. The consume-once attempt releases its
-    /// lease on both the success and stale paths.
+    /// lease on the published, held, and stale paths.
     pub async fn finalize_community_grouping(
         &self,
         mut attempt: crate::community_grouping::CommunityGroupingAttempt,
@@ -12130,13 +12130,14 @@ impl MemoryDB {
             })?;
 
         let member_count = computed.members.len();
+        let held_below_floor = computed.held_below_floor;
         let projected_edge_count = computed.projected_edge_count;
         let compute_mode = computed.compute_mode;
         let input_rows_loaded = attempt.edges.len()
             + attempt.ungrounded_edges.len()
             + attempt.entity_embeddings.len()
             + attempt.previous_ids.len();
-        let result: Result<bool, CommunityGroupingError> = async {
+        let result: Result<(bool, bool), CommunityGroupingError> = async {
             let mut lease_rows = tx
                 .query(
                     "SELECT 1 FROM grouping_leases \
@@ -12163,7 +12164,9 @@ impl MemoryDB {
                 )));
             }
 
-            let matched =
+            let matched = if held_below_floor {
+                false
+            } else {
                 tx.execute(
                     "UPDATE space_graph_state \
                      SET published_generation = ?2, dirty = 0 \
@@ -12173,7 +12176,8 @@ impl MemoryDB {
                 .await
                 .map_err(|error| {
                     CommunityGroupingError::Database(format!("finalize generation CAS: {error}"))
-                })? > 0;
+                })? > 0
+            };
 
             if matched {
                 let now = chrono::Utc::now().timestamp();
@@ -12270,16 +12274,16 @@ impl MemoryDB {
             .map_err(|error| {
                 CommunityGroupingError::Database(format!("finalize consume lease: {error}"))
             })?;
-            Ok(matched)
+            Ok((matched, held_below_floor))
         }
         .await;
 
-        let matched = match result {
-            Ok(matched) => {
+        let (matched, held_below_floor) = match result {
+            Ok(result) => {
                 tx.commit().await.map_err(|error| {
                     CommunityGroupingError::Database(format!("finalize commit: {error}"))
                 })?;
-                matched
+                result
             }
             Err(error) => return Err(error),
         };
@@ -12304,7 +12308,9 @@ impl MemoryDB {
             member_rows_written: if matched { member_count } else { 0 },
             compute_mode,
         };
-        if matched {
+        if held_below_floor {
+            Ok(CommunityGroupingOutcome::Held(receipt))
+        } else if matched {
             Ok(CommunityGroupingOutcome::Published(receipt))
         } else {
             Ok(CommunityGroupingOutcome::Stale(receipt))
@@ -45188,6 +45194,9 @@ pub(crate) mod tests {
         let initial_generation = match first {
             crate::community_grouping::CommunityGroupingOutcome::Published(receipt) => {
                 receipt.published_generation
+            }
+            crate::community_grouping::CommunityGroupingOutcome::Held(receipt) => {
+                panic!("initial M4 overlap publication unexpectedly held: {receipt:?}")
             }
             crate::community_grouping::CommunityGroupingOutcome::Stale(receipt) => {
                 panic!("initial M4 overlap publication went stale: {receipt:?}")

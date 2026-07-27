@@ -1926,6 +1926,283 @@ async fn m4_raw_grounded_writes_force_full_recovery_instead_of_reusing_stale_cor
 }
 
 #[tokio::test]
+async fn m4_below_floor_holds_prior_publication_and_stays_queued() {
+    const SPACE: &str = "m4-below-floor-space";
+    const PARTICIPANTS: usize = 10;
+
+    let dir = tempfile::tempdir().expect("M4 below-floor tempdir");
+    let db = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("open M4 below-floor database");
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open below-floor observer");
+    let observer = observer_db.connect().expect("connect below-floor observer");
+
+    observer
+        .execute(
+            "INSERT INTO provenance_roots
+             (root_id, identity_version, identity_digest, root_kind,
+              independence_group_id, status, created_at)
+             VALUES ('m4-below-floor-root', 1, 'm4-below-floor-digest',
+                     'generated', 'm4-below-floor-group', 'active', 1712707200)",
+            (),
+        )
+        .await
+        .expect("seed below-floor provenance root");
+    for node in 0..PARTICIPANTS {
+        let node_id = format!("below-floor-node-{node:02}");
+        observer
+            .execute(
+                "INSERT INTO entities
+                 (id, name, entity_type, space, created_at, updated_at)
+                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                libsql::params![node_id, SPACE],
+            )
+            .await
+            .expect("seed below-floor entity");
+    }
+    for node in 0..PARTICIPANTS {
+        observer
+            .execute(
+                "INSERT INTO edges
+                 (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                  grounded, root_id, space, created_at)
+                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                         1, 'm4-below-floor-root', ?4, 1712707200)",
+                libsql::params![
+                    format!("below-floor-edge-{node:02}"),
+                    format!("below-floor-node-{node:02}"),
+                    format!("below-floor-node-{:02}", (node + 1) % PARTICIPANTS),
+                    SPACE,
+                ],
+            )
+            .await
+            .expect("seed below-floor grounded edge");
+    }
+
+    let mut runtime = CommunityGroupingRuntime::default();
+    let first = run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("publish viable baseline");
+    assert!(
+        matches!(first, CommunityGroupingOutcome::Published(_)),
+        "ten participants are the positive floor control: {first:?}"
+    );
+    let before = read_m4_persisted_snapshot(&observer, SPACE).await;
+    let published_generation = before
+        .published_generation
+        .expect("positive floor control publishes");
+    assert_eq!(before.members.len(), PARTICIPANTS);
+
+    observer
+        .execute(
+            "UPDATE edges SET grounded = 0
+             WHERE space = ?1 AND edge_id <> 'below-floor-edge-00'",
+            libsql::params![SPACE],
+        )
+        .await
+        .expect("drop grounded graph below the viability floor");
+    let held_generation = read_m4_grouping_generation(&observer, SPACE).await;
+
+    let below_floor = run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("run below-floor generation");
+    assert!(
+        matches!(below_floor, CommunityGroupingOutcome::Held(_)),
+        "below-floor input must return Held instead of publishing empty: {below_floor:?}"
+    );
+    let after = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert_eq!(
+        after.published_generation,
+        Some(published_generation),
+        "a hold must not advance the publication generation"
+    );
+    assert_eq!(
+        after.members, before.members,
+        "a hold must preserve the prior durable publication"
+    );
+    assert!(after.dirty, "a held generation must stay queued");
+    assert_eq!(
+        read_m4_grouping_generation(&observer, SPACE).await,
+        held_generation,
+        "a hold must preserve the queued grouping generation"
+    );
+    assert_eq!(
+        runtime.published_generation(SPACE),
+        Some(published_generation),
+        "a hold must restore the prior runtime partition"
+    );
+    assert!(
+        read_m4_lease_generations(&observer, SPACE).await.is_empty(),
+        "a hold must consume its durable lease"
+    );
+
+    let repeated = run_community_grouping_cycle(&db, &mut runtime, SPACE)
+        .await
+        .expect("repeat held generation");
+    assert!(
+        matches!(repeated, CommunityGroupingOutcome::Held(_)),
+        "repeated phase firing must hold again, never publish empty: {repeated:?}"
+    );
+    let repeated_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert_eq!(repeated_snapshot, after);
+    assert!(
+        read_m4_lease_generations(&observer, SPACE).await.is_empty(),
+        "a repeated hold must also consume its durable lease"
+    );
+}
+
+#[tokio::test]
+async fn m4_phase_round_robin_reaches_later_dirty_space_after_held_restart() {
+    const HELD_SPACE: &str = "a-m4-held-space";
+    const VIABLE_SPACE: &str = "z-m4-viable-space";
+    const ROOT: &str = "m4-round-robin-root";
+    const VIABLE_PARTICIPANTS: usize = 10;
+
+    let dir = tempfile::tempdir().expect("M4 round-robin tempdir");
+    let db = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("open M4 round-robin database");
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open M4 round-robin observer");
+    let observer = observer_db
+        .connect()
+        .expect("connect M4 round-robin observer");
+
+    observer
+        .execute(
+            "INSERT INTO provenance_roots
+             (root_id, identity_version, identity_digest, root_kind,
+              independence_group_id, status, created_at)
+             VALUES (?1, 1, 'm4-round-robin-digest',
+                     'generated', 'm4-round-robin-group', 'active', 1712707200)",
+            libsql::params![ROOT],
+        )
+        .await
+        .expect("seed round-robin provenance root");
+
+    for (space, participants, prefix) in [
+        (HELD_SPACE, 2usize, "held"),
+        (VIABLE_SPACE, VIABLE_PARTICIPANTS, "viable"),
+    ] {
+        for node in 0..participants {
+            observer
+                .execute(
+                    "INSERT INTO entities
+                     (id, name, entity_type, space, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                    libsql::params![format!("{prefix}-node-{node:02}"), space],
+                )
+                .await
+                .expect("seed round-robin entity");
+        }
+        for node in 0..participants {
+            observer
+                .execute(
+                    "INSERT INTO edges
+                     (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                      grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                             1, ?4, ?5, 1712707200)",
+                    libsql::params![
+                        format!("{prefix}-edge-{node:02}"),
+                        format!("{prefix}-node-{node:02}"),
+                        format!("{prefix}-node-{:02}", (node + 1) % participants),
+                        ROOT,
+                        space,
+                    ],
+                )
+                .await
+                .expect("seed round-robin grounded edge");
+        }
+    }
+
+    let held_generation = read_m4_grouping_generation(&observer, HELD_SPACE).await;
+    let first = db
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run first round-robin phase")
+        .expect("held space must be selected");
+    assert!(
+        matches!(first, CommunityGroupingOutcome::Held(_)),
+        "lexicographically early below-floor space must hold first: {first:?}"
+    );
+    let held_after_first = read_m4_persisted_snapshot(&observer, HELD_SPACE).await;
+    assert_eq!(held_after_first.published_generation, None);
+    assert!(held_after_first.dirty);
+    assert!(held_after_first.members.is_empty());
+    assert_eq!(
+        read_m4_grouping_generation(&observer, HELD_SPACE).await,
+        held_generation,
+        "held queue entry must preserve its grouping generation"
+    );
+    assert!(
+        read_m4_lease_generations(&observer, HELD_SPACE)
+            .await
+            .is_empty(),
+        "held attempt must consume its durable lease"
+    );
+
+    drop(observer);
+    drop(observer_db);
+    drop(db);
+
+    let reopened = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("reopen M4 round-robin database");
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("reopen M4 round-robin observer");
+    let observer = observer_db
+        .connect()
+        .expect("reconnect M4 round-robin observer");
+    let held_generation_after_restart = read_m4_grouping_generation(&observer, HELD_SPACE).await;
+    let second = reopened
+        .run_next_community_grouping_cycle()
+        .await
+        .expect("run second round-robin phase after restart")
+        .expect("later viable space must remain queued");
+    assert!(
+        matches!(
+            second,
+            CommunityGroupingOutcome::Published(ref receipt)
+                if receipt.member_count == VIABLE_PARTICIPANTS
+        ),
+        "durable cursor must advance past the held space after restart: {second:?}"
+    );
+
+    let held_after_second = read_m4_persisted_snapshot(&observer, HELD_SPACE).await;
+    assert_eq!(held_after_second, held_after_first);
+    assert_eq!(
+        read_m4_grouping_generation(&observer, HELD_SPACE).await,
+        held_generation_after_restart,
+        "later publication must not consume or rewrite the held generation"
+    );
+    let viable_after_second = read_m4_persisted_snapshot(&observer, VIABLE_SPACE).await;
+    assert_eq!(
+        viable_after_second.members.len(),
+        VIABLE_PARTICIPANTS,
+        "later viable space must publish its complete membership"
+    );
+    assert!(viable_after_second.published_generation.is_some());
+    assert!(!viable_after_second.dirty);
+    assert!(
+        read_m4_lease_generations(&observer, HELD_SPACE)
+            .await
+            .is_empty()
+            && read_m4_lease_generations(&observer, VIABLE_SPACE)
+                .await
+                .is_empty(),
+        "neither held nor published attempt may leak a lease"
+    );
+}
+
+#[tokio::test]
 async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge() {
     const SPACE: &str = "m4-correction-space";
     const SOURCE_ID: &str = "m4-correction-source";
@@ -2106,27 +2383,26 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
     );
     let merged_grouping_generation = read_m4_grouping_generation(&observer, SPACE).await;
 
-    let published = db
+    let below_floor = db
         .run_next_community_grouping_cycle()
         .await
         .expect("run the phase-slot M4 wrapper")
         .expect("the corrected space is dirty");
-    match published {
-        CommunityGroupingOutcome::Published(receipt) => {
-            assert_eq!(receipt.published_generation, merged_grouping_generation);
-            assert_eq!(
-                receipt.member_count, 0,
-                "five participants stay below the authored viability floor"
-            );
-        }
-        other => panic!("phase-slot wrapper must publish the corrected generation: {other:?}"),
-    }
     assert!(
-        db.run_next_community_grouping_cycle()
-            .await
-            .expect("query clean phase slot")
-            .is_none(),
-        "one phase firing drains at most one dirty space and leaves it clean"
+        matches!(below_floor, CommunityGroupingOutcome::Held(_)),
+        "five participants must hold below the authored viability floor: {below_floor:?}"
+    );
+    let held_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert_eq!(held_snapshot.published_generation, None);
+    assert!(held_snapshot.dirty);
+    assert!(held_snapshot.members.is_empty());
+    assert_eq!(
+        read_m4_grouping_generation(&observer, SPACE).await,
+        merged_grouping_generation
+    );
+    assert!(
+        read_m4_lease_generations(&observer, SPACE).await.is_empty(),
+        "a hold must consume its durable lease"
     );
 
     let restart_left = db
@@ -2196,15 +2472,15 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .expect("restart routes missing volatile state to full partition")
         .expect("durable dirty generation survives restart");
     let restarted_generation = match restarted {
-        CommunityGroupingOutcome::Published(receipt) => {
+        CommunityGroupingOutcome::Held(receipt) => {
             assert!(
-                receipt.published_generation >= restart_grouping_generation,
+                receipt.input_generation >= restart_grouping_generation,
                 "startup embedding recovery may advance the broader grouping input generation"
             );
             assert_eq!(receipt.projected_edge_count, 3);
-            receipt.published_generation
+            receipt.input_generation
         }
-        other => panic!("restart must publish via full fallback: {other:?}"),
+        other => panic!("restart must preserve the below-floor hold: {other:?}"),
     };
 
     let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
@@ -2217,7 +2493,15 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
     assert_eq!(
         read_m4_grouping_generation(&observer, SPACE).await,
         restarted_generation,
-        "restart must publish the exact durable grouping input it observed"
+        "restart must keep the exact durable grouping input queued"
+    );
+    let restarted_snapshot = read_m4_persisted_snapshot(&observer, SPACE).await;
+    assert_eq!(restarted_snapshot.published_generation, None);
+    assert!(restarted_snapshot.dirty);
+    assert!(restarted_snapshot.members.is_empty());
+    assert!(
+        read_m4_lease_generations(&observer, SPACE).await.is_empty(),
+        "a restart hold must consume its durable lease"
     );
 
     const DELETE_SOURCE: &str = "m4-delete-cascade-source";

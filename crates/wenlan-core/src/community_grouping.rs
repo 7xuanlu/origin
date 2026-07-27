@@ -22,6 +22,8 @@ use crate::{
 pub(crate) const COMMUNITY_ALGO_VERSION: &str = "leiden-m4-v1";
 pub(crate) const COMMUNITY_PROJECTION_VERSION: &str = "grounded-relates-v1";
 const MIN_COMMUNITY_PARTICIPANTS: usize = 10;
+/// Durable queue position only; advancing it never acknowledges publication.
+const COMMUNITY_GROUPING_SPACE_CURSOR_KEY: &str = "community_grouping_space_cursor";
 
 #[derive(Debug, Error)]
 pub enum CommunityGroupingError {
@@ -137,6 +139,7 @@ impl Drop for CommunityGroupingLeaseCleanup {
 #[derive(Debug)]
 pub struct CommunityGroupingComputed {
     pub(crate) members: Vec<ComputedCommunityMember>,
+    pub(crate) held_below_floor: bool,
     pub(crate) projected_edge_count: usize,
     pub(crate) compute_mode: CommunityGroupingComputeMode,
 }
@@ -170,6 +173,7 @@ pub struct CommunityGroupingReceipt {
 #[derive(Debug)]
 pub enum CommunityGroupingOutcome {
     Published(CommunityGroupingReceipt),
+    Held(CommunityGroupingReceipt),
     Stale(CommunityGroupingReceipt),
 }
 
@@ -543,7 +547,8 @@ pub fn compute_community_grouping(
         }
     };
 
-    let members = if graph.node_ids().len() < MIN_COMMUNITY_PARTICIPANTS {
+    let held_below_floor = graph.node_ids().len() < MIN_COMMUNITY_PARTICIPANTS;
+    let members = if held_below_floor {
         Vec::new()
     } else {
         let previous_ids = graph
@@ -593,6 +598,7 @@ pub fn compute_community_grouping(
     Ok(CommunityGroupingWork {
         computed: CommunityGroupingComputed {
             members,
+            held_below_floor,
             projected_edge_count: attempt.edges.len(),
             compute_mode,
         },
@@ -828,8 +834,14 @@ impl MemoryDB {
             let mut rows = conn
                 .query(
                     "SELECT space FROM space_graph_state \
-                     WHERE dirty = 1 ORDER BY space LIMIT 1",
-                    (),
+                     WHERE dirty = 1 \
+                     ORDER BY CASE \
+                         WHEN space > ( \
+                             SELECT value FROM app_metadata WHERE key = ?1) \
+                         THEN 0 ELSE 1 \
+                     END, space \
+                     LIMIT 1",
+                    libsql::params![COMMUNITY_GROUPING_SPACE_CURSOR_KEY],
                 )
                 .await
                 .map_err(|error| {
@@ -837,7 +849,8 @@ impl MemoryDB {
                         "select next dirty community space: {error}"
                     ))
                 })?;
-            rows.next()
+            let space = rows
+                .next()
                 .await
                 .map_err(|error| {
                     CommunityGroupingError::Database(format!(
@@ -851,7 +864,22 @@ impl MemoryDB {
                         ))
                     })
                 })
-                .transpose()?
+                .transpose()?;
+            drop(rows);
+            if let Some(selected_space) = space.as_deref() {
+                conn.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    libsql::params![COMMUNITY_GROUPING_SPACE_CURSOR_KEY, selected_space],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "advance dirty community space cursor: {error}"
+                    ))
+                })?;
+            }
+            space
         };
         let Some(space) = space else {
             return Ok(None);
