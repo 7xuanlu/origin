@@ -131,6 +131,7 @@ enum Commands {
     /// Capture a memory. Provide text positionally, or use --file, or pipe via stdin.
     Capture {
         /// Content text. If omitted and --file unset, read from stdin.
+        #[arg(conflicts_with = "file")]
         text: Option<String>,
         /// Read content from a file.
         #[arg(short, long)]

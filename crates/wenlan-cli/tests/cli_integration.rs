@@ -719,13 +719,14 @@ fn invalid_subcommand_fails() {
 }
 
 #[test]
-fn capture_text_and_file_conflict_bails() {
-    // text=Some, file=Some -> bail at runtime (mutual exclusion)
+fn capture_text_and_file_conflict_bails_before_daemon_access() {
+    // Invalid local syntax must be rejected before Space resolution contacts the daemon.
     cli()
+        .env("WENLAN_HOST", "http://127.0.0.1:9")
         .args(["capture", "some text", "--file", "/dev/null"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("either"));
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
