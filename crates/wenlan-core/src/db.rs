@@ -22782,6 +22782,140 @@ impl MemoryDB {
         Ok(results)
     }
 
+    /// Return the already-prepared chunks for one exact document generation.
+    ///
+    /// A generation is exact only when every canonical `source='memory'` row
+    /// has the claimed content hash, chunk indexes are exactly `0..N`, and all
+    /// rows share one version. Any partial, mixed, or legacy shape returns
+    /// `None` so the caller takes the normal atomic replacement path.
+    pub(crate) async fn prepared_document_generation(
+        &self,
+        source_id: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<MemoryDetail>>, WenlanError> {
+        fn required_text(row: &libsql::Row, index: i32) -> Option<String> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Text(value) => Some(value),
+                _ => None,
+            }
+        }
+
+        fn optional_text(row: &libsql::Row, index: i32) -> Option<Option<String>> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Null => Some(None),
+                libsql::Value::Text(value) => Some(Some(value)),
+                _ => None,
+            }
+        }
+
+        fn required_i64(row: &libsql::Row, index: i32) -> Option<i64> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Integer(value) => Some(value),
+                _ => None,
+            }
+        }
+
+        fn optional_i64(row: &libsql::Row, index: i32) -> Option<Option<i64>> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Null => Some(None),
+                libsql::Value::Integer(value) => Some(Some(value)),
+                _ => None,
+            }
+        }
+
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, title, source_id, chunk_index, chunk_type, language,
+                        semantic_unit, byte_start, byte_end, summary, content_hash, version
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY chunk_index ASC, id ASC",
+                [source_id],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("prepared_document_generation query: {e}"))
+            })?;
+
+        let mut chunks = Vec::new();
+        let mut expected_chunk_index = 0_i64;
+        let mut generation_version = None;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("prepared_document_generation row: {e}")))?
+        {
+            let Some(id) = required_text(&row, 0) else {
+                return Ok(None);
+            };
+            let Some(content) = required_text(&row, 1) else {
+                return Ok(None);
+            };
+            let Some(title) = required_text(&row, 2) else {
+                return Ok(None);
+            };
+            let Some(row_source_id) = required_text(&row, 3) else {
+                return Ok(None);
+            };
+            let Some(chunk_index) =
+                required_i64(&row, 4).and_then(|value| i32::try_from(value).ok())
+            else {
+                return Ok(None);
+            };
+            let Some(chunk_type) = optional_text(&row, 5) else {
+                return Ok(None);
+            };
+            let Some(language) = optional_text(&row, 6) else {
+                return Ok(None);
+            };
+            let Some(semantic_unit) = optional_text(&row, 7) else {
+                return Ok(None);
+            };
+            let Some(byte_start) = optional_i64(&row, 8) else {
+                return Ok(None);
+            };
+            let Some(byte_end) = optional_i64(&row, 9) else {
+                return Ok(None);
+            };
+            let Some(summary) = optional_text(&row, 10) else {
+                return Ok(None);
+            };
+            let Some(row_hash) = required_text(&row, 11) else {
+                return Ok(None);
+            };
+            let Some(version) = required_i64(&row, 12) else {
+                return Ok(None);
+            };
+
+            if i64::from(chunk_index) != expected_chunk_index
+                || row_source_id != source_id
+                || row_hash != content_hash
+                || version < 1
+                || generation_version.is_some_and(|expected| expected != version)
+            {
+                return Ok(None);
+            }
+            generation_version = Some(version);
+            expected_chunk_index += 1;
+            chunks.push(MemoryDetail {
+                id,
+                content,
+                title,
+                source_id: row_source_id,
+                chunk_index,
+                chunk_type,
+                language,
+                semantic_unit,
+                byte_start,
+                byte_end,
+                summary,
+            });
+        }
+
+        Ok((!chunks.is_empty()).then_some(chunks))
+    }
+
     pub async fn get_chunks_scoped(
         &self,
         source_id: &str,

@@ -154,6 +154,7 @@ async fn run_document_enrichment_with_request_budget(
     let doc_source_id = document_source_id(&source_id, Path::new(&file_path), knowledge_path);
 
     let is_fresh = entry.last_completed_chunk < 0;
+    let mut prepared_chunks = None;
     let mut title = Path::new(&file_path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -227,6 +228,22 @@ async fn run_document_enrichment_with_request_budget(
                 paused: false,
             };
         }
+        match db
+            .prepared_document_generation(&doc_source_id, parsed_hash)
+            .await
+        {
+            Ok(Some(chunks)) => {
+                prepared_chunks = Some(chunks);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!(
+                    "[doc-enrich] {file_path}: prepared generation check failed: {error}; pausing"
+                );
+                pause(db, entry, "prepared generation check failed").await;
+                return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+            }
+        }
         let last_modified = docs
             .first()
             .map(|d| d.last_modified)
@@ -248,21 +265,26 @@ async fn run_document_enrichment_with_request_budget(
             content_hash,
             ..Default::default()
         };
-        if let Err(e) = db.upsert_documents(vec![doc]).await {
-            log::warn!("[doc-enrich] {file_path}: upsert failed: {e}; pausing");
-            pause(db, entry, "upsert failed").await;
-            return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+        if prepared_chunks.is_none() {
+            if let Err(e) = db.upsert_documents(vec![doc]).await {
+                log::warn!("[doc-enrich] {file_path}: upsert failed: {e}; pausing");
+                pause(db, entry, "upsert failed").await;
+                return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+            }
         }
     }
 
     // ── read the stored chunks (ordered by chunk_index) ──
-    let chunks = match db.get_memories_by_source_id("memory", &doc_source_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[doc-enrich] {file_path}: read chunks failed: {e}; pausing");
-            pause(db, entry, "read chunks failed").await;
-            return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
-        }
+    let chunks = match prepared_chunks {
+        Some(chunks) => chunks,
+        None => match db.get_memories_by_source_id("memory", &doc_source_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[doc-enrich] {file_path}: read chunks failed: {e}; pausing");
+                pause(db, entry, "read chunks failed").await;
+                return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+            }
+        },
     };
     let chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
     let page_id = source_page_id(&source_id, &file_path);
@@ -892,6 +914,245 @@ mod tests {
         ))
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MemoryInventoryRow {
+        id: String,
+        content: String,
+        title: String,
+        source: String,
+        source_id: String,
+        chunk_index: i64,
+        content_hash: Option<String>,
+        space: Option<String>,
+        version: i64,
+        summary: Option<String>,
+    }
+
+    async fn memory_inventory(db: &MemoryDB, source_id: &str) -> Vec<MemoryInventoryRow> {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, title, source, source_id, chunk_index,
+                        content_hash, space, version, summary
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY chunk_index ASC, id ASC",
+                [source_id],
+            )
+            .await
+            .unwrap();
+        let mut inventory = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            inventory.push(MemoryInventoryRow {
+                id: row.get::<String>(0).unwrap(),
+                content: row.get::<String>(1).unwrap(),
+                title: row.get::<String>(2).unwrap(),
+                source: row.get::<String>(3).unwrap(),
+                source_id: row.get::<String>(4).unwrap(),
+                chunk_index: row.get::<i64>(5).unwrap(),
+                content_hash: row.get::<Option<String>>(6).unwrap(),
+                space: row.get::<Option<String>>(7).unwrap(),
+                version: row.get::<i64>(8).unwrap(),
+                summary: row.get::<Option<String>>(9).unwrap(),
+            });
+        }
+        inventory
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PreparedGenerationCorruption {
+        BlobContentHash,
+        BlobContent,
+        BlobSummary,
+        NullVersion,
+        MixedVersion,
+        ZeroVersion,
+        DuplicateChunkIndex,
+        GappedChunkIndex,
+        NonzeroStartChunkIndex,
+    }
+
+    impl PreparedGenerationCorruption {
+        fn expected_replacement_version(self) -> i64 {
+            match self {
+                Self::MixedVersion => 3,
+                Self::ZeroVersion => 1,
+                _ => 2,
+            }
+        }
+    }
+
+    async fn assert_corrupt_prepared_generation_is_replaced(
+        corruption: PreparedGenerationCorruption,
+    ) {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
+            .await
+            .unwrap();
+        let first_entry = db.claim_next_pending().await.unwrap().expect("first claim");
+        let llm: Arc<dyn LlmProvider> = Arc::new(FailingProvider);
+        let first = run_document_enrichment(
+            &db,
+            &first_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(
+            first.paused,
+            "{corruption:?}: first attempt prepares chunks"
+        );
+        let mut expected_inventory = memory_inventory(&db, &first.doc_source_id).await;
+        assert!(
+            expected_inventory.len() >= 3,
+            "{corruption:?}: fixture is multi-chunk"
+        );
+        let first_id = expected_inventory[0].id.clone();
+        let second_id = expected_inventory[1].id.clone();
+        let last_id = expected_inventory.last().unwrap().id.clone();
+
+        {
+            let conn = db.conn.lock().await;
+            match corruption {
+                PreparedGenerationCorruption::BlobContentHash => {
+                    conn.execute(
+                        "UPDATE memories SET content_hash = x'80' WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::BlobContent => {
+                    conn.execute(
+                        "UPDATE memories SET content = x'80' WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::BlobSummary => {
+                    conn.execute(
+                        "UPDATE memories SET summary = x'80' WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::NullVersion => {
+                    conn.execute(
+                        "UPDATE memories SET version = NULL WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::MixedVersion => {
+                    conn.execute(
+                        "UPDATE memories SET version = 2 WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::ZeroVersion => {
+                    conn.execute(
+                        "UPDATE memories SET version = 0
+                         WHERE source = 'memory' AND source_id = ?1",
+                        [first.doc_source_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::DuplicateChunkIndex => {
+                    conn.execute(
+                        "UPDATE memories SET chunk_index = 0 WHERE id = ?1",
+                        [second_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::GappedChunkIndex => {
+                    conn.execute(
+                        "UPDATE memories SET chunk_index = ?2 WHERE id = ?1",
+                        libsql::params![last_id.as_str(), expected_inventory.len() as i64],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::NonzeroStartChunkIndex => {
+                    conn.execute(
+                        "UPDATE memories SET chunk_index = chunk_index + 1
+                         WHERE source = 'memory' AND source_id = ?1",
+                        [first.doc_source_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            conn.execute(
+                "UPDATE document_enrichment_queue
+                 SET next_retry_at = ?3
+                 WHERE source_id = ?1 AND file_path = ?2",
+                libsql::params![
+                    "folder-notes",
+                    file_path.as_str(),
+                    chrono::Utc::now().timestamp() - 1
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        let retry_entry = db
+            .claim_next_pending()
+            .await
+            .unwrap()
+            .expect("same-hash retry claim");
+        let retry = run_document_enrichment(
+            &db,
+            &retry_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(
+            retry.paused,
+            "{corruption:?}: replacement reaches the expected provider failure"
+        );
+        let queue = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queue.error_detail.as_deref(),
+            Some("analysis LLM failed"),
+            "{corruption:?}: corrupt preparation falls back to replacement before inference"
+        );
+
+        let expected_version = corruption.expected_replacement_version();
+        for row in &mut expected_inventory {
+            row.version = expected_version;
+        }
+        let repaired_inventory = memory_inventory(&db, &first.doc_source_id).await;
+        assert_eq!(
+            repaired_inventory, expected_inventory,
+            "{corruption:?}: atomic replacement restores the parsed inventory"
+        );
+        assert!(
+            db.prepared_document_generation(&first.doc_source_id, &content_hash)
+                .await
+                .unwrap()
+                .is_some(),
+            "{corruption:?}: repaired rows form one exact generation"
+        );
+    }
+
     // ── pure-helper unit tests ───────────────────────────────────────────────
 
     #[test]
@@ -1124,6 +1385,81 @@ mod tests {
         assert_eq!(provider.call_count(), 0);
         assert!(!outcome.completed);
         assert!(!outcome.paused);
+        let queued = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.status, "pending");
+        assert_eq!(queued.content_hash.as_deref(), Some(new_hash.as_str()));
+        assert_eq!(queued.last_completed_chunk, -1);
+    }
+
+    #[tokio::test]
+    async fn changed_file_after_failed_preparation_requeues_before_any_retry_inference() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let queued_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&queued_hash))
+            .await
+            .unwrap();
+        let first_entry = db.claim_next_pending().await.unwrap().expect("first claim");
+        let failing_llm: Arc<dyn LlmProvider> = Arc::new(FailingProvider);
+
+        let first = run_document_enrichment(
+            &db,
+            &first_entry,
+            None,
+            Some(&failing_llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(first.paused, "first attempt prepares chunks, then pauses");
+
+        std::fs::write(
+            &path,
+            "The file changed after failed preparation and must be requeued before inference. "
+                .repeat(80),
+        )
+        .unwrap();
+        let new_hash = file_hash(&path);
+        assert_ne!(new_hash, queued_hash);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE document_enrichment_queue
+                 SET next_retry_at = ?3
+                 WHERE source_id = ?1 AND file_path = ?2",
+                libsql::params![
+                    "folder-notes",
+                    file_path.as_str(),
+                    chrono::Utc::now().timestamp() - 1
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let retry_entry = db.claim_next_pending().await.unwrap().expect("retry claim");
+        assert_eq!(
+            retry_entry.content_hash.as_deref(),
+            Some(queued_hash.as_str())
+        );
+        let provider = Arc::new(SequencedMockProvider::new(vec!["must not be called"]));
+        let retry_llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let retry = run_document_enrichment_slice(
+            &db,
+            &retry_entry,
+            None,
+            Some(&retry_llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+
+        assert_eq!(provider.call_count(), 0);
+        assert!(!retry.completed);
+        assert!(!retry.paused);
         let queued = db
             .get_queue_entry("folder-notes", &file_path)
             .await
@@ -1426,6 +1762,125 @@ mod tests {
         assert_eq!(q.status, "paused");
         assert_eq!(q.attempt_count, 1);
         assert!(q.next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_does_not_reupsert_prepared_generation_after_first_llm_failure() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
+            .await
+            .unwrap();
+        let first_entry = db.claim_next_pending().await.unwrap().expect("first claim");
+        let llm: Arc<dyn LlmProvider> = Arc::new(FailingProvider);
+
+        let first = run_document_enrichment(
+            &db,
+            &first_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(first.paused, "first attempt prepares chunks, then pauses");
+        let inventory_v1 = memory_inventory(&db, &first.doc_source_id).await;
+        assert!(!inventory_v1.is_empty(), "prepared generation is durable");
+        assert!(
+            inventory_v1.iter().all(|row| row.version == 1),
+            "fresh prepared generation starts at v1"
+        );
+        let first_queue = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_queue.attempt_count, 1);
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE document_enrichment_queue
+                 SET next_retry_at = ?3
+                 WHERE source_id = ?1 AND file_path = ?2",
+                libsql::params![
+                    "folder-notes",
+                    file_path.as_str(),
+                    chrono::Utc::now().timestamp() - 1
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let retry_entry = db
+            .claim_next_pending()
+            .await
+            .unwrap()
+            .expect("same-hash retry claim");
+        assert_eq!(
+            retry_entry.content_hash.as_deref(),
+            Some(content_hash.as_str())
+        );
+        let second = run_document_enrichment(
+            &db,
+            &retry_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(second.paused, "second provider failure pauses again");
+
+        let inventory_after_retry = memory_inventory(&db, &second.doc_source_id).await;
+        assert_eq!(
+            inventory_after_retry, inventory_v1,
+            "same-hash retry must not semantically replace the prepared generation"
+        );
+        assert!(
+            inventory_after_retry.iter().all(|row| row.version == 1),
+            "same-hash retry keeps the source-wide generation at v1"
+        );
+        let retry_queue = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry_queue.attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_malformed_hash_storage_type() {
+        assert_corrupt_prepared_generation_is_replaced(
+            PreparedGenerationCorruption::BlobContentHash,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_malformed_required_text() {
+        assert_corrupt_prepared_generation_is_replaced(PreparedGenerationCorruption::BlobContent)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_malformed_optional_text() {
+        assert_corrupt_prepared_generation_is_replaced(PreparedGenerationCorruption::BlobSummary)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_invalid_version_or_chunk_shape() {
+        for corruption in [
+            PreparedGenerationCorruption::NullVersion,
+            PreparedGenerationCorruption::MixedVersion,
+            PreparedGenerationCorruption::DuplicateChunkIndex,
+            PreparedGenerationCorruption::GappedChunkIndex,
+            PreparedGenerationCorruption::NonzeroStartChunkIndex,
+            PreparedGenerationCorruption::ZeroVersion,
+        ] {
+            assert_corrupt_prepared_generation_is_replaced(corruption).await;
+        }
     }
 
     #[tokio::test]
