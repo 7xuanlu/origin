@@ -168,7 +168,7 @@ fn lint_is_the_only_public_repair_flow_on_both_surfaces() {
             "apply repair <manifest-id> <manifest-digest>",
             "Never call apply_lint_repair in the same turn as prepare_lint_repair",
             "applied_unverified",
-            "no CLI or HTTP fallback",
+            "CLI fallback: `wenlan lint --profile deep --agent-assist`",
         ] {
             assert!(text.contains(needle), "{path} missing guardrail: {needle}");
         }

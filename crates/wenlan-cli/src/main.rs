@@ -107,6 +107,9 @@ enum Commands {
         /// Max pages to list (newest-first). 0 = all. Ignored when a query opens a page.
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
+        /// Print the matched page's stable internal id instead of opening it.
+        #[arg(long)]
+        resolve_id: bool,
     },
     /// Manage folders and files Wenlan should learn from.
     Sources {
@@ -204,7 +207,11 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Recall { query } => {
             commands::recall::run(&client, format, cli.quiet, query).await?
         }
-        Commands::Pages { query, limit } => commands::pages::run(format, cli.quiet, query, limit)?,
+        Commands::Pages {
+            query,
+            limit,
+            resolve_id,
+        } => commands::pages::run(format, cli.quiet, query, limit, resolve_id)?,
         Commands::Sources { command } => {
             commands::ingest::run_sources(&client, format, cli.quiet, command).await?
         }

@@ -1,11 +1,11 @@
 ---
 name: curate
 description: >
-  Review pending Wenlan captures or revisions from Codex. Use for explicit
-  audit walks after /brief or /handoff surfaces pending work. Invoked as
-  /curate captures or /curate revisions.
-argument-hint: "captures | revisions"
-allowed-tools: ["Bash", "mcp__wenlan__list_pending", "mcp__wenlan__confirm_memory", "mcp__wenlan__forget", "mcp__wenlan__capture", "mcp__wenlan__recall"]
+  Review pending Wenlan captures, revisions, or daemon refinements from Codex.
+  Use for explicit audit walks after /brief or /handoff surfaces pending work.
+  Invoked as /curate captures, /curate revisions, or /curate refinements.
+argument-hint: "captures | revisions | refinements"
+allowed-tools: ["Bash", "mcp__wenlan__list_pending", "mcp__wenlan__confirm_memory", "mcp__wenlan__forget", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__list_refinements", "mcp__wenlan__accept_refinement", "mcp__wenlan__reject_refinement"]
 user-invocable: true
 ---
 
@@ -122,6 +122,27 @@ Apply only explicit actions:
 
 Reject and edit delete the original pending capture, so require the numbered
 item and action verb in the same reply.
+
+## `/curate refinements`
+
+Use `/curate refinements` only when the user explicitly asks to inspect or
+review the daemon proposal/refinement queue. Never poll the refinement queue
+ambiently.
+
+List first with `mcp__wenlan__list_refinements(limit=50)` and show at most four
+items. Include each proposal id, action, confidence, and a bounded payload
+summary. The queue includes `vocab_promote` proposals.
+
+Perform no mutation until the user gives an unambiguous item-level accept or
+reject decision. Apply only numbered item decisions:
+
+- `accept`: `mcp__wenlan__accept_refinement(id="<proposal-id>")`
+  (include `space` for `cross_space_discovery`).
+- `reject`: `mcp__wenlan__reject_refinement(id="<proposal-id>")`
+- `skip`: no call
+
+Skip or cancel is a no-op. Do not generically accept `lint_repair_review`;
+route it through `/lint repair`. Re-list after every mutation batch.
 
 ## Bare `/curate`
 

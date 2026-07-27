@@ -2278,23 +2278,26 @@ pub async fn create_relation_with_span(
         )));
     }
 
-    // Idempotency: if an identical (from, to, type) triple already exists,
-    // return its id immediately — no log, no refinery enqueue.
-    if let Ok(existing) = db
-        .list_relations_between(&req.from_entity, &req.to_entity)
-        .await
-    {
-        if let Some((existing_id, _)) = existing.into_iter().find(|(_, t)| t == rt) {
-            return Ok(WriteResult {
-                id: existing_id,
-                attached_to: None,
-                warnings: vec![],
-                wrote: false,
-                revision_card_id: None,
-                gated: false,
-                outcome: WriteOutcome::Unchanged,
-                acknowledged: false,
-            });
+    // Source-less retries can return immediately. A source-backed retry must
+    // reach the DB upsert so an existing unbacked triple gains provenance and
+    // the canonical edge dual-write runs.
+    if req.source_memory_id.is_none() {
+        if let Ok(existing) = db
+            .list_relations_between(&req.from_entity, &req.to_entity)
+            .await
+        {
+            if let Some((existing_id, _)) = existing.into_iter().find(|(_, t)| t == rt) {
+                return Ok(WriteResult {
+                    id: existing_id,
+                    attached_to: None,
+                    warnings: vec![],
+                    wrote: false,
+                    revision_card_id: None,
+                    gated: false,
+                    outcome: WriteOutcome::Unchanged,
+                    acknowledged: false,
+                });
+            }
         }
     }
 
@@ -3169,11 +3172,13 @@ pub(crate) async fn update_page_growth_at_versions(
     .await
 }
 
-/// Test-only seam. A test installs a `(parked, go)` handshake here and
-/// `update_page_impl` uses it once, *after* deciding ownership and *before*
-/// writing — i.e. in the exact window a competing edit has to land in. It
-/// announces that it is parked, then blocks until released, so the test can
-/// land a full competing write in between with no ordering guesswork.
+/// Test-only seam. A test installs a `(page_id, parked, go)` handshake here and
+/// `update_page_impl` uses it once for that page only, *after* deciding
+/// ownership and *before* writing — i.e. in the exact window a competing edit
+/// has to land in. It announces that it is parked, then blocks until released,
+/// so the test can land a full competing write in between with no ordering
+/// guesswork. Binding the seam to a page keeps unrelated parallel tests from
+/// consuming it.
 ///
 /// This is the only way to deterministically exercise the version CAS: with no
 /// interleaving edit, a guarded write and an unguarded one behave identically.
@@ -3182,6 +3187,7 @@ pub(crate) async fn update_page_growth_at_versions(
 /// Compiled out entirely in non-test builds.
 #[cfg(test)]
 type PreWriteGate = (
+    String,
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 );
@@ -3191,9 +3197,19 @@ pub(crate) static PRE_WRITE_GATE: std::sync::Mutex<Option<PreWriteGate>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-async fn pre_write_pause() {
-    let gate = PRE_WRITE_GATE.lock().unwrap().take();
-    if let Some((parked, go)) = gate {
+async fn pre_write_pause(page_id: &str) {
+    let gate = {
+        let mut slot = PRE_WRITE_GATE.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|(target, _, _)| target == page_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, parked, go)) = gate {
         let _ = parked.send(());
         let _ = go.await;
     }
@@ -3201,7 +3217,7 @@ async fn pre_write_pause() {
 
 #[cfg(not(test))]
 #[inline(always)]
-async fn pre_write_pause() {}
+async fn pre_write_pause(_page_id: &str) {}
 
 #[allow(clippy::too_many_arguments)]
 /// The advisory line a successful page update returns. Shared between the
@@ -3690,7 +3706,7 @@ async fn update_page_impl(
                 _ => None,
             };
 
-            pre_write_pause().await;
+            pre_write_pause(page_id).await;
             // citations: None -> resets `citations` to SQL NULL (no fresh
             // citation source for this write; a stale claim-map must not
             // survive a content change, and the new body re-enters bounded
@@ -4342,6 +4358,105 @@ mod tests {
         assert!(
             second.warnings.is_empty(),
             "idempotent resolve should have no warnings"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_unbacked_relation_becomes_source_backed() {
+        let (db, _dir) = test_db().await;
+        let alice = db
+            .store_entity("Alice", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        let wenlan = db
+            .store_entity("Wenlan", "project", None, Some("test"), None)
+            .await
+            .unwrap();
+
+        let first = create_relation(
+            &db,
+            CreateRelationRequest {
+                from_entity: alice.clone(),
+                to_entity: wenlan.clone(),
+                relation_type: "works_on".to_string(),
+                source_agent: Some("test".to_string()),
+                confidence: None,
+                explanation: None,
+                source_memory_id: None,
+                span: None,
+                model_version: None,
+                prompt_version: None,
+            },
+            "test-agent",
+        )
+        .await
+        .unwrap();
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM edges
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![alice.clone(), wenlan.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let second = create_relation(
+            &db,
+            CreateRelationRequest {
+                from_entity: alice.clone(),
+                to_entity: wenlan.clone(),
+                relation_type: "works_on".to_string(),
+                source_agent: Some("test".to_string()),
+                confidence: None,
+                explanation: None,
+                source_memory_id: Some("mem_explicit_relation".to_string()),
+                span: None,
+                model_version: None,
+                prompt_version: None,
+            },
+            "test-agent",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.id, first.id, "upsert must preserve the relation id");
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_memory_id FROM relations WHERE id = ?1",
+                libsql::params![first.id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("relation row");
+        let source_memory_id: Option<String> = row.get(0).unwrap();
+        assert_eq!(
+            source_memory_id.as_deref(),
+            Some("mem_explicit_relation"),
+            "the source-backed retry must attach provenance to the existing triple"
+        );
+        drop(rows);
+        let mut edge_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM edges
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![alice, wenlan],
+            )
+            .await
+            .unwrap();
+        let edge_count = edge_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            edge_count, 1,
+            "the source-backed retry must restore the canonical edge dual-write"
         );
     }
 
@@ -7547,7 +7662,7 @@ mod tests {
         // (page is still machine-owned) and before writing.
         let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
         let (go_tx, go_rx) = tokio::sync::oneshot::channel();
-        *PRE_WRITE_GATE.lock().unwrap() = Some((parked_tx, go_rx));
+        *PRE_WRITE_GATE.lock().unwrap() = Some((page_id.to_string(), parked_tx, go_rx));
 
         // Close to the seeded source: `fs_edit` is not exempt from the
         // hallucination guard, so an unrelated body would be rejected before

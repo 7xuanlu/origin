@@ -4,13 +4,15 @@ description: >
   One-screen quick reference for the Wenlan plugin. Lists the daily
   verbs, the daily flow, where data lives, and how to view it without a
   GUI. Use when the user says "help", "what can I do", "list wenlan
-  commands", "how do I use wenlan", or invokes `/help`.
-allowed-tools: []
+  commands", "how do I use wenlan", invokes `/help`, or explicitly asks
+  about import progress.
+allowed-tools: ["mcp__plugin_wenlan_wenlan__list_pending_imports"]
 ---
 
 # /help
 
-Print the Wenlan plugin reference card. Read-only — never calls a tool.
+Print the Wenlan plugin reference card. The default help path is read-only and
+never calls a tool.
 
 ## How to invoke
 
@@ -31,6 +33,8 @@ Wenlan plugin — daily verbs
   /forget <id>  delete a memory by ID
   /handoff      end-of-session ritual (session log + captures)
   /help         this card
+
+Import progress: ask explicitly; Wenlan checks `list_pending_imports` on demand.
 
 Daily flow (~1 min overhead per session):
 
@@ -55,9 +59,10 @@ View it without a GUI:
   git -C ~/.wenlan log --oneline   timeline of every memory + distill pass
   ln -s ~/.wenlan/pages ~/Vault/wenlan   # symlink into Obsidian for graph view
 
-~/.wenlan/ is a git repo. Skills auto-commit per logical batch (one per
-session, distill pass, or forget). Use git log / git diff / git revert
-as a free audit trail. No remote — purely local history.
+~/.wenlan/ is a git repo. Commits land at session boundaries (handoff
+or daemon events), not per capture; uncommitted page edits between
+sessions are normal. Use git log / git diff / git revert as a free
+audit trail. No remote — purely local history.
 
 Three classes of artifact:
   - memories: granular, queryable, live in DB only (confirmed = stays in DB)
@@ -76,6 +81,12 @@ Models and keys do not enable background inference by themselves:
                                   review the exact mapping, disclosure, and confirm
   wenlan enrichment disable       turn model-backed background work off
 ```
+
+## Import progress (explicit only)
+
+Only when the user explicitly asks whether an import/export is still running,
+call `mcp__plugin_wenlan_wenlan__list_pending_imports`. Never call it during
+ordinary `/help`, `/brief`, setup, or session-start flows.
 
 ## When to use
 

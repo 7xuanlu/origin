@@ -5,7 +5,7 @@ description: >
   configures local memory, and verifies the full plugin -> MCP -> local runtime
   round-trip. Run after `/plugin install wenlan@7xuanlu-wenlan`, or any time the user
   says "set up wenlan", "is wenlan working", "fix wenlan".
-allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__doctor", "mcp__plugin_wenlan_wenlan__context"]
+allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__context"]
 ---
 
 # /setup
@@ -125,10 +125,11 @@ code.
 
 ### 5. Doctor
 
-Call the Wenlan MCP `doctor` tool.
+Run the Wenlan CLI doctor through the resolved binary path:
 
-```text
-doctor()
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" doctor
 ```
 
 Expected: local memory configured. Capture the mode string for the final report.
@@ -152,7 +153,7 @@ Print:
 ```text
 Wenlan ready.
   Runtime:  up on 127.0.0.1:7878
-  Mode:     <mode from doctor()>
+  Mode:     <mode from CLI doctor>
   MCP:      connected
   Data:     ~/.wenlan/  (pages, sessions, db symlink)
   Try:      /brief, /capture <thing>, /recall <query>, /help
@@ -191,4 +192,5 @@ background enrichment is off.
 ## When NOT to use
 
 - Runtime already verified this session: `/brief` instead.
-- Editing one config field: `wenlan doctor` or settings file directly.
+- Editing one config field: rerun the CLI doctor command from Step 5 or edit the
+  settings file directly.
