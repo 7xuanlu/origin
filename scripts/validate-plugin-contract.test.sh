@@ -61,6 +61,62 @@ assert_rejects "missing curate ambiguity guardrail" \
     perl -0pi -e 's/Ambiguous replies do not mutate/Ambiguous replies are clarified/' \
     "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
 
+assert_rejects "claude curate refinements explicit-only drift" \
+    perl -0pi -e 's/Use `\/curate refinements` only when the user explicitly asks to inspect or\s+review the daemon proposal\/refinement queue\./Inspect refinements whenever useful./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate refinements explicit-only drift" \
+    perl -0pi -e 's/Use `\/curate refinements` only when the user explicitly asks to inspect or\s+review the daemon proposal\/refinement queue\./Inspect refinements whenever useful./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate refinements mutation gate drift" \
+    perl -0pi -e 's/Perform no mutation until the user gives an unambiguous item-level accept or\s+reject decision\./Apply likely decisions immediately./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate refinements mutation gate drift" \
+    perl -0pi -e 's/Perform no mutation until the user gives an unambiguous item-level accept or\s+reject decision\./Apply likely decisions immediately./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate refinements skip drift" \
+    perl -0pi -e 's/Skip or cancel is a no-op\./Skip accepts the proposal./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate refinements skip drift" \
+    perl -0pi -e 's/Skip or cancel is a no-op\./Skip accepts the proposal./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate missing refinement accept permission" \
+    perl -0pi -e 's/, "mcp__plugin_wenlan_wenlan__accept_refinement"//' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate missing refinement reject permission" \
+    perl -0pi -e 's/, "mcp__wenlan__reject_refinement"//' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate missing existing capture permission" \
+    perl -0pi -e 's/, "mcp__plugin_wenlan_wenlan__capture"//' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate missing existing list permission" \
+    perl -0pi -e 's/, "mcp__wenlan__list_pending"//' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate added unintended mutation permission" \
+    perl -0pi -e 's/"Bash",/"Bash", "mcp__plugin_wenlan_wenlan__delete_page",/' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate added unintended mutation permission" \
+    perl -0pi -e 's/"Bash",/"Bash", "mcp__wenlan__delete_page",/' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate lint repair review route drift" \
+    perl -0pi -e 's/A generic accept does not apply\s+`lint_repair_review`; route that action through `\/lint repair` instead\./A generic accept applies `lint_repair_review` directly./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate lint repair review route drift" \
+    perl -0pi -e 's/Do not generically accept `lint_repair_review`;\s+route it through `\/lint repair`\./Accept `lint_repair_review` directly./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
 assert_rejects "setup autocomplete drift" \
     perl -0pi -e 's/user-invocable: true/user-invocable: false/' \
     "$TMPDIR_TEST/root/plugin-codex/skills/setup/SKILL.md"
@@ -112,6 +168,38 @@ assert_rejects "claude lint general-call drift" \
 assert_rejects "codex lint agent-submit drift" \
     perl -0pi -e 's/submit verdicts exactly once/submit verdicts when useful/g' \
     "$TMPDIR_TEST/root/plugin-codex/skills/lint/SKILL.md"
+
+assert_rejects "claude capture relation order drift" \
+    perl -0pi -e 's/for both named endpoints first/for both named endpoints after capture/' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture relation order drift" \
+    perl -0pi -e 's/for both named endpoints first/for both named endpoints after capture/' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
+
+assert_rejects "claude capture explicit-relation policy drift" \
+    perl -0pi -e 's/only when the user explicitly states a durable relation/whenever a relation seems useful/' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture explicit-relation policy drift" \
+    perl -0pi -e 's/only when the user explicitly states a durable relation/whenever a relation seems useful/' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
+
+assert_rejects "claude capture ordinary entity policy drift" \
+    perl -0pi -e 's/Do not call\s+`create_entity` for ordinary captures\./Call `create_entity` for ordinary captures./' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture ordinary entity policy drift" \
+    perl -0pi -e 's/Do not call\s+`mcp__wenlan__create_entity` for ordinary captures\./Call `mcp__wenlan__create_entity` for ordinary captures./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
+
+assert_rejects "claude capture inference policy drift" \
+    perl -0pi -e 's/Never infer a\s+relation the\s+user did not state\./Infer likely relations./' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture inference policy drift" \
+    perl -0pi -e 's/Never infer a\s+relation the\s+user did not state\./Infer likely relations./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
 
 assert_rejects "claude lint counterevidence authorization drift" \
     perl -0pi -e 's/authorized\s+record refs \(`evidence_refs` plus `counterevidence_refs`\)/unbounded record refs/' \
@@ -242,8 +330,16 @@ assert_rejects "codex lint daemon handoff drift" \
     "$TMPDIR_TEST/root/plugin-codex/skills/lint/SKILL.md"
 
 assert_rejects "claude lint fallback drift" \
-    perl -0pi -e 's/There is no CLI or\s+HTTP fallback\./There is a CLI fallback./g' \
+    perl -0pi -e 's/CLI fallback: `wenlan lint --profile deep --agent-assist`/There is no CLI fallback./g' \
     "$TMPDIR_TEST/root/plugin/skills/lint/SKILL.md"
+
+assert_rejects "claude pages revision-id resolver drift" \
+    perl -0pi -e 's/--resolve-id/--show-id/g' \
+    "$TMPDIR_TEST/root/plugin/skills/pages/SKILL.md"
+
+assert_rejects "codex pages revision-id resolver drift" \
+    perl -0pi -e 's/--resolve-id/--show-id/g' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/pages/SKILL.md"
 
 assert_rejects "codex lint repair mode drift" \
     perl -0pi -e 's|/lint repair|/lint-repair|g' \

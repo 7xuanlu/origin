@@ -2812,6 +2812,7 @@ END;
 pub struct MemoryDB {
     pub(crate) _db: libsql::Database,
     pub(crate) conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
+    entity_resolution_lock: tokio::sync::Mutex<()>,
     pub(crate) lint_freshness: Arc<crate::lint::snapshot::LintFreshnessClock>,
     page_projection_tracker: Arc<crate::page_projection_tracker::PageProjectionTracker>,
     pub(crate) derived_artifact_state: Arc<crate::derived_artifact_state::DerivedArtifactState>,
@@ -2931,6 +2932,7 @@ impl MemoryDB {
         Ok(Self {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3130,6 +3132,7 @@ impl MemoryDB {
         let instance = Self {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3213,6 +3216,7 @@ impl MemoryDB {
         let instance = Self {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -11169,8 +11173,8 @@ impl MemoryDB {
         })?;
 
         // A consumer-relevant entity-only space has no grounded edge to create
-        // M95 graph state. Queue an honest empty snapshot so semantic parity,
-        // rather than a missing control-plane row, decides whether it can flip.
+        // M95 graph state. Queue it for viability evaluation; a below-floor
+        // result HOLDS without publishing and keeps global readers on legacy.
         conn.execute(
             "INSERT INTO space_graph_state
                 (space, graph_generation, grouping_generation, published_generation, dirty)
@@ -13309,7 +13313,7 @@ impl MemoryDB {
 
     /// Publish one computed community snapshot only when the graph generation
     /// still matches the leased input. The consume-once attempt releases its
-    /// lease on both the success and stale paths.
+    /// lease on the published, held, and stale paths.
     pub async fn finalize_community_grouping(
         &self,
         mut attempt: crate::community_grouping::CommunityGroupingAttempt,
@@ -13345,13 +13349,14 @@ impl MemoryDB {
             })?;
 
         let member_count = computed.members.len();
+        let held_below_floor = computed.held_below_floor;
         let projected_edge_count = computed.projected_edge_count;
         let compute_mode = computed.compute_mode;
         let input_rows_loaded = attempt.edges.len()
             + attempt.ungrounded_edges.len()
             + attempt.entity_embeddings.len()
             + attempt.previous_ids.len();
-        let result: Result<bool, CommunityGroupingError> = async {
+        let result: Result<(bool, bool), CommunityGroupingError> = async {
             let mut lease_rows = tx
                 .query(
                     "SELECT 1 FROM grouping_leases \
@@ -13378,7 +13383,9 @@ impl MemoryDB {
                 )));
             }
 
-            let matched =
+            let matched = if held_below_floor {
+                false
+            } else {
                 tx.execute(
                     "UPDATE space_graph_state \
                      SET published_generation = ?2 \
@@ -13388,7 +13395,8 @@ impl MemoryDB {
                 .await
                 .map_err(|error| {
                     CommunityGroupingError::Database(format!("finalize generation CAS: {error}"))
-                })? > 0;
+                })? > 0
+            };
 
             if matched {
                 let now = chrono::Utc::now().timestamp();
@@ -13586,16 +13594,16 @@ impl MemoryDB {
             .map_err(|error| {
                 CommunityGroupingError::Database(format!("finalize consume lease: {error}"))
             })?;
-            Ok(matched)
+            Ok((matched, held_below_floor))
         }
         .await;
 
-        let matched = match result {
-            Ok(matched) => {
+        let (matched, held_below_floor) = match result {
+            Ok(result) => {
                 tx.commit().await.map_err(|error| {
                     CommunityGroupingError::Database(format!("finalize commit: {error}"))
                 })?;
-                matched
+                result
             }
             Err(error) => return Err(error),
         };
@@ -13620,7 +13628,9 @@ impl MemoryDB {
             member_rows_written: if matched { member_count } else { 0 },
             compute_mode,
         };
-        if matched {
+        if held_below_floor {
+            Ok(CommunityGroupingOutcome::Held(receipt))
+        } else if matched {
             Ok(CommunityGroupingOutcome::Published(receipt))
         } else {
             Ok(CommunityGroupingOutcome::Stale(receipt))
@@ -13713,30 +13723,23 @@ impl MemoryDB {
         )
     }
 
-    /// Test-only: re-assert the same (from,to,type) triple from a DIFFERENT
-    /// source memory via the REAL `create_relation` upsert, so the §C2
-    /// linkage-move race test can simulate a same-triple re-assert landing DURING
-    /// entailment. The ON CONFLICT COALESCE moves `source_memory_id` to
-    /// `new_source_id` while keeping the SAME `relations.id` — the flip's
-    /// `source_memory_id` term must then reject the stale verdict.
+    /// Test-only: move an existing relation to a different source while keeping
+    /// the same relation id, so the §C2 linkage guard can exercise a concurrent
+    /// provenance migration independently of create-retry semantics.
     #[cfg(test)]
-    pub(crate) async fn reassert_relation_from_other_source_for_test(
+    pub(crate) async fn move_relation_linkage_for_test(
         &self,
         old_source_id: &str,
         new_source_id: &str,
     ) {
-        let (_id, from, to, rt) = self.relation_triple_for_test(old_source_id).await;
-        self.create_relation(
-            &from,
-            &to,
-            &rt,
-            Some("post_ingest"),
-            Some(0.99),
-            None,
-            Some(new_source_id),
+        let (id, _, _, _) = self.relation_triple_for_test(old_source_id).await;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE relations SET source_memory_id = ?1 WHERE id = ?2",
+            libsql::params![new_source_id, id],
         )
         .await
-        .expect("test re-assert relation from other source");
+        .expect("test move relation linkage");
     }
 
     /// Test-only: supersede-then-reactivate the relation for `source_id` via the
@@ -20361,11 +20364,20 @@ impl MemoryDB {
             // under the same write transaction as delete + insert. Fresh
             // sources begin at v1; semantic replacements advance old + 1.
             let mut replacement_versions: HashMap<(String, String), i64> = HashMap::new();
+            let mut replacement_spaces: HashMap<(String, String), String> = HashMap::new();
+            let explicit_replacement_spaces: HashSet<(String, String)> = docs
+                .iter()
+                .filter(|doc| doc.space.is_some())
+                .map(|doc| (doc.source.clone(), doc.source_id.clone()))
+                .collect();
+            let mut ambiguous_replacement_spaces: HashSet<(String, String)> = HashSet::new();
             let mut changed_page_sources: HashSet<String> = HashSet::new();
             for (source, source_id) in &source_ids_to_delete {
                 let mut rows = conn
                     .query(
-                        "SELECT MAX(version) FROM memories
+                        "SELECT MAX(version), COUNT(*), COUNT(space),
+                                COUNT(DISTINCT space), MIN(space)
+                         FROM memories
                          WHERE source = ?1 AND source_id = ?2",
                         libsql::params![source.clone(), source_id.clone()],
                     )
@@ -20373,20 +20385,83 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("read replacement version: {e}"))
                     })?;
-                let old_version = rows
-                    .next()
-                    .await
-                    .map_err(|e| {
-                        WenlanError::VectorDb(format!("read replacement version row: {e}"))
-                    })?
-                    .and_then(|row| row.get::<Option<i64>>(0).ok().flatten());
+                let row = rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("read replacement version row: {e}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb(
+                        "read replacement version row: aggregate returned no row".to_string(),
+                    )
+                })?;
+                let old_version = row.get::<Option<i64>>(0).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement version: {e}"))
+                })?;
+                let total = row.get::<i64>(1).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement row count: {e}"))
+                })?;
+                let non_null_spaces = row.get::<i64>(2).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement non-NULL space count: {e}"))
+                })?;
+                let distinct_spaces = row.get::<i64>(3).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement distinct space count: {e}"))
+                })?;
+                let old_space = row.get::<Option<String>>(4).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement space: {e}"))
+                })?;
                 if old_version.is_some() && source != "episode" {
                     changed_page_sources.insert(source_id.clone());
+                }
+                if total > 0 {
+                    if non_null_spaces == total && distinct_spaces == 1 {
+                        let old_space = old_space.ok_or_else(|| {
+                            WenlanError::VectorDb(format!(
+                                "decode replacement space: aggregate for {source}/{source_id} \
+                                 reported one non-NULL space without a value"
+                            ))
+                        })?;
+                        replacement_spaces
+                            .insert((source.clone(), source_id.clone()), old_space);
+                    } else {
+                        ambiguous_replacement_spaces
+                            .insert((source.clone(), source_id.clone()));
+                    }
                 }
                 replacement_versions.insert(
                     (source.clone(), source_id.clone()),
                     old_version.map_or(1, |version| version.saturating_add(1)),
                 );
+            }
+            let effective_memory_spaces: HashMap<String, String> = docs
+                .iter()
+                .filter(|doc| doc.source == "memory")
+                .map(|doc| {
+                    let space = doc
+                        .space
+                        .clone()
+                        .or_else(|| {
+                            replacement_spaces
+                                .get(&("memory".to_string(), doc.source_id.clone()))
+                                .cloned()
+                        })
+                        .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
+                    (doc.source_id.clone(), space)
+                })
+                .collect();
+            for (source, source_id) in &ambiguous_replacement_spaces {
+                let derived_episode_has_parent_space = source == "episode"
+                    && docs
+                        .iter()
+                        .any(|doc| doc.source == "memory" && doc.source_id == *source_id)
+                    && effective_memory_spaces.contains_key(source_id);
+                if !explicit_replacement_spaces
+                    .contains(&(source.clone(), source_id.clone()))
+                    && !derived_episode_has_parent_space
+                {
+                    return Err(WenlanError::Conflict(format!(
+                        "ambiguous replacement space for {source}/{source_id}: \
+                         omitted space cannot inherit from conflicting or NULL existing rows"
+                    )));
+                }
             }
             let replaced_sources: Vec<(String, String)> = source_ids_to_delete
                 .iter()
@@ -20462,14 +20537,22 @@ impl MemoryDB {
                     .memory_type
                     .map(|s| s.into())
                     .unwrap_or(libsql::Value::Null);
-                // M3 PR-1 stage e: `space` is NOT NULL as of migration 91 --
-                // an unset doc.space folds to the reserved sentinel here
-                // rather than landing NULL. Covers both source='memory' rows
-                // and their co-written source='episode' rows (both flow
-                // through this one loop; see `memory_rows.extend(episode_rows)`
-                // above).
+                // An explicit replacement space is authoritative. When omitted,
+                // inherit the source-wide assignment read inside this replacement
+                // transaction; only a fresh unscoped source folds to the sentinel.
                 let space_val: libsql::Value = row
                     .space
+                    .or_else(|| match row.source.as_str() {
+                        "memory" | "episode" => {
+                            effective_memory_spaces.get(&row.source_id).cloned()
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        replacement_spaces
+                            .get(&(row.source.clone(), row.source_id.clone()))
+                            .cloned()
+                    })
                     .unwrap_or_else(|| UNFILED_SPACE_ID.to_string())
                     .into();
                 let source_agent_val: libsql::Value = row
@@ -20631,14 +20714,10 @@ impl MemoryDB {
             for doc in &docs {
                 if let Some(ref superseded_id) = doc.supersedes {
                     if !doc.pending_revision {
-                        // M3 PR-1 stage e: `space` is NOT NULL as of migration
-                        // 85 -- match the same fold the row insert above
-                        // applies (an unset doc.space lands as the sentinel,
-                        // never NULL), so this comparison still matches the
-                        // superseded row.
-                        let superseder_space = doc
-                            .space
-                            .clone()
+                        let superseder_space = effective_memory_spaces
+                            .get(&doc.source_id)
+                            .cloned()
+                            .or_else(|| doc.space.clone())
                             .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
                         conn.execute(
                             "UPDATE memories SET confirmed = 0
@@ -26164,6 +26243,140 @@ impl MemoryDB {
         Ok(results)
     }
 
+    /// Return the already-prepared chunks for one exact document generation.
+    ///
+    /// A generation is exact only when every canonical `source='memory'` row
+    /// has the claimed content hash, chunk indexes are exactly `0..N`, and all
+    /// rows share one version. Any partial, mixed, or legacy shape returns
+    /// `None` so the caller takes the normal atomic replacement path.
+    pub(crate) async fn prepared_document_generation(
+        &self,
+        source_id: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<MemoryDetail>>, WenlanError> {
+        fn required_text(row: &libsql::Row, index: i32) -> Option<String> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Text(value) => Some(value),
+                _ => None,
+            }
+        }
+
+        fn optional_text(row: &libsql::Row, index: i32) -> Option<Option<String>> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Null => Some(None),
+                libsql::Value::Text(value) => Some(Some(value)),
+                _ => None,
+            }
+        }
+
+        fn required_i64(row: &libsql::Row, index: i32) -> Option<i64> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Integer(value) => Some(value),
+                _ => None,
+            }
+        }
+
+        fn optional_i64(row: &libsql::Row, index: i32) -> Option<Option<i64>> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Null => Some(None),
+                libsql::Value::Integer(value) => Some(Some(value)),
+                _ => None,
+            }
+        }
+
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, title, source_id, chunk_index, chunk_type, language,
+                        semantic_unit, byte_start, byte_end, summary, content_hash, version
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY chunk_index ASC, id ASC",
+                [source_id],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("prepared_document_generation query: {e}"))
+            })?;
+
+        let mut chunks = Vec::new();
+        let mut expected_chunk_index = 0_i64;
+        let mut generation_version = None;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("prepared_document_generation row: {e}")))?
+        {
+            let Some(id) = required_text(&row, 0) else {
+                return Ok(None);
+            };
+            let Some(content) = required_text(&row, 1) else {
+                return Ok(None);
+            };
+            let Some(title) = required_text(&row, 2) else {
+                return Ok(None);
+            };
+            let Some(row_source_id) = required_text(&row, 3) else {
+                return Ok(None);
+            };
+            let Some(chunk_index) =
+                required_i64(&row, 4).and_then(|value| i32::try_from(value).ok())
+            else {
+                return Ok(None);
+            };
+            let Some(chunk_type) = optional_text(&row, 5) else {
+                return Ok(None);
+            };
+            let Some(language) = optional_text(&row, 6) else {
+                return Ok(None);
+            };
+            let Some(semantic_unit) = optional_text(&row, 7) else {
+                return Ok(None);
+            };
+            let Some(byte_start) = optional_i64(&row, 8) else {
+                return Ok(None);
+            };
+            let Some(byte_end) = optional_i64(&row, 9) else {
+                return Ok(None);
+            };
+            let Some(summary) = optional_text(&row, 10) else {
+                return Ok(None);
+            };
+            let Some(row_hash) = required_text(&row, 11) else {
+                return Ok(None);
+            };
+            let Some(version) = required_i64(&row, 12) else {
+                return Ok(None);
+            };
+
+            if i64::from(chunk_index) != expected_chunk_index
+                || row_source_id != source_id
+                || row_hash != content_hash
+                || version < 1
+                || generation_version.is_some_and(|expected| expected != version)
+            {
+                return Ok(None);
+            }
+            generation_version = Some(version);
+            expected_chunk_index += 1;
+            chunks.push(MemoryDetail {
+                id,
+                content,
+                title,
+                source_id: row_source_id,
+                chunk_index,
+                chunk_type,
+                language,
+                semantic_unit,
+                byte_start,
+                byte_end,
+                summary,
+            });
+        }
+
+        Ok((!chunks.is_empty()).then_some(chunks))
+    }
+
     pub async fn get_chunks_scoped(
         &self,
         source_id: &str,
@@ -28356,6 +28569,7 @@ impl MemoryDB {
         source_agent: Option<&str>,
         confidence: Option<f32>,
     ) -> Result<(String, bool), WenlanError> {
+        let _resolution_guard = self.entity_resolution_lock.lock().await;
         let name_lower = name.to_lowercase();
 
         // Step 1: alias lookup (exact, case-insensitive).
@@ -29623,7 +29837,7 @@ impl MemoryDB {
                      explanation = CASE
                          WHEN EXCLUDED.confidence IS NOT NULL AND (confidence IS NULL OR EXCLUDED.confidence > confidence)
                          THEN COALESCE(EXCLUDED.explanation, explanation) ELSE explanation END,
-                     source_memory_id = COALESCE(EXCLUDED.source_memory_id, source_memory_id)",
+                     source_memory_id = COALESCE(source_memory_id, EXCLUDED.source_memory_id)",
                 libsql::params![
                     id.clone(),
                     from_entity.to_string(),
@@ -48401,6 +48615,7 @@ pub(crate) mod tests {
         let memory_db = MemoryDB {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -48700,6 +48915,9 @@ pub(crate) mod tests {
         let initial_generation = match first {
             crate::community_grouping::CommunityGroupingOutcome::Published(receipt) => {
                 receipt.published_generation
+            }
+            crate::community_grouping::CommunityGroupingOutcome::Held(receipt) => {
+                panic!("initial M4 overlap publication unexpectedly held: {receipt:?}")
             }
             crate::community_grouping::CommunityGroupingOutcome::Stale(receipt) => {
                 panic!("initial M4 overlap publication went stale: {receipt:?}")
@@ -49820,49 +50038,118 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn entity_only_space_publishes_an_empty_current_community_snapshot() {
-        const SPACE: &str = "m96-empty-community-space";
+    async fn empty_grounded_space_holds_and_keeps_all_community_consumers_on_legacy() {
+        const SPACE: &str = "m96-held-community-space";
         let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
         {
             let conn = db.conn.lock().await;
-            conn.execute(
-                "INSERT INTO entities
-                    (id, name, entity_type, space, created_at, updated_at)
-                 VALUES ('m96-empty-entity', 'Empty', 'concept', ?1, 1, 1)",
-                libsql::params![SPACE],
-            )
-            .await
-            .unwrap();
+            for suffix in ["a", "b", "c"] {
+                let entity_id = format!("m96-held-entity-{suffix}");
+                let source_id = format!("m96-held-memory-{suffix}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, community_id, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 7, 1, 1)",
+                    libsql::params![entity_id.clone(), SPACE],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index, last_modified,
+                         chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                     VALUES (?1, ?1, 'memory', ?1, ?1, 0, 1, 'text', ?2,
+                             vector32(?3), ?4, 0, 'hide')",
+                    libsql::params![source_id, SPACE, vector.clone(), entity_id],
+                )
+                .await
+                .unwrap();
+            }
         }
 
         let outcome = db
             .run_next_community_grouping_cycle()
             .await
             .unwrap()
-            .expect("entity-only space must have queued publication work");
+            .expect("empty-grounded space must have queued viability work");
         assert!(matches!(
             outcome,
-            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+            crate::community_grouping::CommunityGroupingOutcome::Held(ref receipt)
                 if receipt.member_count == 0 && receipt.projected_edge_count == 0
         ));
 
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT grouping_generation, published_generation, dirty
+                "SELECT published_generation, dirty,
+                        (SELECT COUNT(*) FROM community_members WHERE space=?1),
+                        (SELECT COUNT(*) FROM community_publication_receipts WHERE space=?1)
                    FROM space_graph_state WHERE space=?1",
                 libsql::params![SPACE],
             )
             .await
             .unwrap();
         let state = rows.next().await.unwrap().unwrap();
-        let grouping_generation = state.get::<i64>(0).unwrap();
         assert_eq!(
-            state.get::<Option<i64>>(1).unwrap(),
-            Some(grouping_generation),
-            "empty snapshot must publish the exact queued input generation"
+            state.get::<Option<i64>>(0).unwrap(),
+            None,
+            "a fresh held space must not acquire a published generation"
         );
-        assert_eq!(state.get::<i64>(2).unwrap(), 0);
+        assert_eq!(state.get::<i64>(1).unwrap(), 1, "a held space stays dirty");
+        assert_eq!(
+            state.get::<i64>(2).unwrap(),
+            0,
+            "a held space publishes no members"
+        );
+        assert_eq!(
+            state.get::<i64>(3).unwrap(),
+            0,
+            "a held space writes no publication receipt"
+        );
+        drop(rows);
+        drop(conn);
+
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "relevant held space must keep {consumer} on global legacy fallback"
+            );
+        }
+
+        let buckets = db.load_summary_buckets().await.unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].0, "7");
+        assert_eq!(buckets[0].1.len(), 3);
+
+        let conn = db.conn.lock().await;
+        let sql = format!(
+            "SELECT m.source_id FROM memories m
+              WHERE {}
+              ORDER BY m.source_id",
+            crate::derived_artifact_state::summary_eligible_predicate("m")
+        );
+        let mut rows = conn.query(&sql, ()).await.unwrap();
+        let mut eligible = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            eligible.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            eligible,
+            vec![
+                "m96-held-memory-a",
+                "m96-held-memory-b",
+                "m96-held-memory-c",
+            ],
+            "summary eligibility must also read legacy assignments while the space is held"
+        );
     }
 
     #[tokio::test]
@@ -51620,6 +51907,7 @@ pub(crate) mod tests {
                             attachment: "core",
                         },
                     ],
+                    held_below_floor: false,
                     projected_edge_count: 0,
                     compute_mode: CommunityGroupingComputeMode::Full {
                         reason: CommunityGroupingFullReason::RuntimeStateMissing,
@@ -52145,6 +52433,304 @@ pub(crate) mod tests {
             memories_after_retry[0].content,
             "Replacement content must not partially overwrite the original."
         );
+    }
+
+    async fn seed_conflicting_replacement_spaces(
+        db: &MemoryDB,
+        source_id: &str,
+    ) -> Vec<(String, String, Option<String>, i64)> {
+        let original =
+            "Original evidence must remain byte-for-byte available when replacement space inheritance is ambiguous. "
+                .repeat(200);
+        db.upsert_documents(vec![make_doc(
+            "memory",
+            source_id,
+            "Original document",
+            &original,
+        )])
+        .await
+        .unwrap();
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories
+                 SET space = CASE WHEN chunk_index = 0 THEN 'alpha-space' ELSE 'zeta-space' END
+                 WHERE source = 'memory' AND source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .unwrap();
+        }
+
+        let inventory = replacement_inventory(db, source_id).await;
+        assert!(
+            inventory.len() > 1,
+            "fixture must cover replacement of multiple chunks"
+        );
+        assert!(
+            inventory
+                .iter()
+                .any(|(_, _, space, _)| space.as_deref() == Some("alpha-space"))
+                && inventory
+                    .iter()
+                    .any(|(_, _, space, _)| space.as_deref() == Some("zeta-space")),
+            "fixture must contain conflicting non-NULL spaces"
+        );
+        inventory
+    }
+
+    async fn replacement_inventory(
+        db: &MemoryDB,
+        source_id: &str,
+    ) -> Vec<(String, String, Option<String>, i64)> {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, space, version
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY id",
+                libsql::params![source_id],
+            )
+            .await
+            .unwrap();
+        let mut inventory = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            inventory.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+                row.get(3).unwrap(),
+            ));
+        }
+        inventory
+    }
+
+    #[tokio::test]
+    async fn omitted_replacement_space_rejects_conflicting_existing_spaces_without_mutation() {
+        let (db, _dir) = test_db().await;
+        let source_id = "ambiguous-replacement-space";
+        let old_inventory = seed_conflicting_replacement_spaces(&db, source_id).await;
+
+        let replacement = make_doc(
+            "memory",
+            source_id,
+            "Replacement document",
+            "Replacement content must be rejected before the old chunks are mutated.",
+        );
+        assert!(replacement.space.is_none());
+        let error = db.upsert_documents(vec![replacement]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("ambiguous replacement space"),
+            "expected an ambiguity error, got {error}"
+        );
+        assert_eq!(
+            replacement_inventory(&db, source_id).await,
+            old_inventory,
+            "an ambiguous omitted-space replacement must preserve every old row exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_replacement_space_heals_conflicting_existing_spaces() {
+        let (db, _dir) = test_db().await;
+        let source_id = "explicit-heals-ambiguous-space";
+        seed_conflicting_replacement_spaces(&db, source_id).await;
+
+        let mut replacement = make_doc(
+            "memory",
+            source_id,
+            "Replacement document",
+            "An explicit incoming space remains authoritative.",
+        );
+        replacement.space = Some("healed-space".to_string());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let inventory = replacement_inventory(&db, source_id).await;
+        assert!(!inventory.is_empty());
+        assert!(
+            inventory.iter().all(
+                |(_, _, space, version)| space.as_deref() == Some("healed-space") && *version == 2
+            ),
+            "the explicit replacement must heal every new chunk into its authoritative space"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_new_episode_inherits_the_parent_assigned_space() {
+        let (db, _dir) = test_db().await;
+        let initial = make_doc(
+            "memory",
+            "episode-space-transition",
+            "Initial document",
+            "The initial document generation has enough words for an episode but keeps it disabled.",
+        );
+        db.upsert_documents_with_derived_channels_for_test(vec![initial], false, false)
+            .await
+            .unwrap();
+        db.update_memory_space("episode-space-transition", "m4-live")
+            .await
+            .unwrap();
+
+        let replacement = make_doc(
+            "memory",
+            "episode-space-transition",
+            "Replacement document",
+            "transitionepisodetoken appears in this replacement generation with enough words to create a new episode.",
+        );
+        assert!(replacement.space.is_none());
+        db.upsert_documents_with_derived_channels_for_test(vec![replacement], true, false)
+            .await
+            .unwrap();
+
+        let (parent_space, episode_space) = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT source, space FROM memories
+                     WHERE source_id = 'episode-space-transition'
+                     ORDER BY source",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut parent_space = None;
+            let mut episode_space = None;
+            while let Some(row) = rows.next().await.unwrap() {
+                let source: String = row.get(0).unwrap();
+                let space: String = row.get(1).unwrap();
+                match source.as_str() {
+                    "memory" => parent_space = Some(space),
+                    "episode" => episode_space = Some(space),
+                    _ => {}
+                }
+            }
+            (parent_space, episode_space)
+        };
+        assert_eq!(parent_space.as_deref(), Some("m4-live"));
+        assert_eq!(
+            episode_space, parent_space,
+            "a newly derived episode must inherit its replacement parent's effective space"
+        );
+
+        let in_scope = db
+            .search_episodes_scoped(
+                "transitionepisodetoken",
+                10,
+                &ReadScope::Space("m4-live".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            in_scope
+                .iter()
+                .any(|hit| hit.source_id == "episode-space-transition"),
+            "the new episode must be retrievable in the parent's assigned space"
+        );
+        let wrong_scope = db
+            .search_episodes_scoped(
+                "transitionepisodetoken",
+                10,
+                &ReadScope::Space("other-space".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_scope
+                .iter()
+                .all(|hit| hit.source_id != "episode-space-transition"),
+            "the new episode must not leak into another space"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_supersession_uses_the_inherited_space() {
+        let (db, _dir) = test_db().await;
+        let mut target = make_memory_doc(
+            "supersession-target",
+            "The original scoped preference remains confirmed until replaced.",
+            "preference",
+            "m4-live",
+            "test",
+        );
+        target.confirmed = Some(true);
+        db.upsert_documents(vec![target]).await.unwrap();
+
+        let initial_superseder = make_doc(
+            "memory",
+            "supersession-replacement",
+            "Initial superseder",
+            "The initial superseder generation does not yet replace the target.",
+        );
+        db.upsert_documents(vec![initial_superseder]).await.unwrap();
+        db.update_memory_space("supersession-replacement", "m4-live")
+            .await
+            .unwrap();
+
+        let mut replacement = make_doc(
+            "memory",
+            "supersession-replacement",
+            "Replacement superseder",
+            "The replacement generation now supersedes the original scoped preference.",
+        );
+        replacement.supersedes = Some("supersession-target".to_string());
+        assert!(replacement.space.is_none());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT confirmed FROM memories
+                 WHERE source = 'memory'
+                   AND source_id = 'supersession-target'
+                   AND space = 'm4-live'",
+                (),
+            )
+            .await
+            .unwrap();
+        let confirmed: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            confirmed, 0,
+            "an omitted-space replacement must suppress its target in the inherited scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_replacement_space_overrides_the_inherited_space() {
+        let (db, _dir) = test_db().await;
+        let initial = make_doc(
+            "memory",
+            "explicit-replacement-space",
+            "Initial document",
+            "Initial content before an explicit replacement space is supplied.",
+        );
+        db.upsert_documents(vec![initial]).await.unwrap();
+        db.update_memory_space("explicit-replacement-space", "m4-live")
+            .await
+            .unwrap();
+
+        let mut replacement = make_doc(
+            "memory",
+            "explicit-replacement-space",
+            "Replacement document",
+            "Replacement content with an explicitly authoritative space.",
+        );
+        replacement.space = Some("explicit-space".to_string());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT space FROM memories
+                 WHERE source = 'memory' AND source_id = 'explicit-replacement-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(space, "explicit-space");
+        assert!(rows.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -56098,6 +56684,84 @@ pub(crate) mod tests {
 
         assert!(!created, "alias match must resolve, not create");
         assert_eq!(id, existing_id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_or_create_entity_converges_on_one_identity() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        // Hold the connection until both tasks are queued at the first lookup.
+        // Tokio's fair mutex then alternates the old multi-lock cascade,
+        // deterministically exposing the resolve-then-create race.
+        let conn_guard = db.conn.lock().await;
+
+        let spawn_resolve = |db: Arc<MemoryDB>, barrier: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                db.resolve_or_create_entity(
+                    "Concurrent Canonical Entity",
+                    "concept",
+                    None,
+                    Some("test"),
+                    None,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        let first = spawn_resolve(Arc::clone(&db), Arc::clone(&barrier));
+        let second = spawn_resolve(Arc::clone(&db), Arc::clone(&barrier));
+        barrier.wait().await;
+        tokio::task::yield_now().await;
+        drop(conn_guard);
+
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.0, second.0, "both callers must receive one id");
+        assert_eq!(
+            usize::from(first.1) + usize::from(second.1),
+            1,
+            "exactly one caller must report created=true"
+        );
+
+        let conn = db.conn.lock().await;
+        let mut entity_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM entities WHERE name = ?1",
+                libsql::params!["Concurrent Canonical Entity"],
+            )
+            .await
+            .unwrap();
+        let entity_count = entity_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        drop(entity_rows);
+        let mut shadow_rows = conn
+            .query(
+                "SELECT COUNT(*)
+                 FROM entity_page_map m
+                 JOIN entities e ON e.id = m.entity_id
+                 JOIN pages p ON p.id = m.page_id
+                 WHERE e.name = ?1 AND p.kind = 'entity' AND p.status = 'active'",
+                libsql::params!["Concurrent Canonical Entity"],
+            )
+            .await
+            .unwrap();
+        let shadow_count = shadow_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(entity_count, 1, "one canonical entity row");
+        assert_eq!(shadow_count, 1, "one live shadow identity");
     }
 
     /// Differential oracle (discipline floor): both real callers must mint
@@ -83658,6 +84322,7 @@ pub(crate) mod tests {
         let db = MemoryDB {
             _db: raw_db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -91423,6 +92088,107 @@ pub(crate) mod tests {
         assert_eq!(
             payload["prompt_version"],
             serde_json::json!(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_backed_relation_retry_preserves_original_relation_and_edge_provenance() {
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .create_entity("Alice", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let e2 = db
+            .create_entity("Acme", "org", Some("space_a"))
+            .await
+            .unwrap();
+        let content_a = "Alice works at Acme.";
+        let content_b = "Acme employs Alice.";
+        seed_memory_with_source_id_and_space(&db, "mem_a", content_a, "space_a").await;
+        seed_memory_with_source_id_and_space(&db, "mem_b", content_b, "space_a").await;
+
+        let first_id = db
+            .create_relation_with_span(
+                &e1,
+                &e2,
+                "works_at",
+                Some("extractor"),
+                Some(0.8),
+                None,
+                Some("mem_a"),
+                Some(content_a),
+                Some(content_a),
+                Some("model-a"),
+                Some("prompt-a"),
+            )
+            .await
+            .unwrap();
+        let retry_id = db
+            .create_relation_with_span(
+                &e1,
+                &e2,
+                "works_at",
+                Some("extractor"),
+                Some(0.9),
+                None,
+                Some("mem_b"),
+                Some(content_b),
+                Some(content_b),
+                Some("model-b"),
+                Some("prompt-b"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_id, first_id, "retry must converge on one relation");
+
+        let conn = db.conn.lock().await;
+        let mut relation_rows = conn
+            .query(
+                "SELECT source_memory_id FROM relations WHERE id = ?1",
+                libsql::params![first_id],
+            )
+            .await
+            .unwrap();
+        let relation_source: String = relation_rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relation row")
+            .get(0)
+            .unwrap();
+        drop(relation_rows);
+
+        let mut edge_rows = conn
+            .query(
+                "SELECT payload FROM edges
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![e1, e2],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = edge_rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect("extraction edge payload");
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        let edge_source = payload["source_memory_id"].as_str().unwrap();
+
+        assert_eq!(relation_source, "mem_a");
+        assert_eq!(edge_source, "mem_a");
+        assert_eq!(payload["span"]["quote"], serde_json::json!(content_a));
+        assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+        assert_eq!(
+            payload["span"]["char_end"],
+            serde_json::json!(content_a.chars().count())
+        );
+        assert_eq!(payload["model_version"], serde_json::json!("model-a"));
+        assert_eq!(payload["prompt_version"], serde_json::json!("prompt-a"));
+        assert_eq!(
+            relation_source, edge_source,
+            "relation and extraction edge provenance must agree after retry"
         );
     }
 

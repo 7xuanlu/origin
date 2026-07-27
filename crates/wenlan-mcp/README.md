@@ -13,7 +13,7 @@ wenlan connect codex              # or: claude-code, cursor, claude-desktop, vsc
 wenlan connect cursor --dry-run   # preview before editing JSON config
 ```
 
-MCP-only setup gives agents tools for capture, recall, context, doctor, and page distillation. It does not install Claude Code slash skills like `/brief`, `/handoff`, `/distill`, or `/setup`; use the Wenlan plugin for that workflow.
+MCP-only setup gives agents tools for capture, recall, context, and page distillation. It does not install Claude Code slash skills like `/brief`, `/handoff`, `/distill`, or `/setup`; use the Wenlan plugin for that workflow.
 
 If you only need the raw MCP connector config, add this to your MCP client:
 
@@ -57,18 +57,28 @@ wenlan-mcp --origin-url http://127.0.0.1:7879
 
 ## Tools
 
+The local stdio surface is locked at exactly 29 tools. The table below calls
+out the primary memory loop and the unique refinement-review queue.
+
 | Tool | Purpose |
 | --- | --- |
 | `context` | Load session context. Use at session start or major topic shifts. |
-| `capture` | Save one durable memory: decision, lesson, gotcha, preference, fact, correction, or project context. |
+| `capture` | Save one durable memory and return its explicit `source_memory_id`. |
 | `recall` | Search memories and pages by natural-language query. |
 | `distill` | Trigger page distillation for new clusters or a specific `page_id`. |
 | `list_pending` | List unconfirmed memories waiting for review. |
 | `confirm_memory` | Confirm a pending memory by `source_id`. |
 | `forget` | Delete a memory by ID. Destructive. |
-| `doctor` | Diagnose daemon reachability, setup mode, API key state, and on-device model state. |
+| `list_refinements` | Explicitly inspect the daemon's unique proposal queue, including `vocab_promote`; never polled ambiently. |
+| `accept_refinement` | Accept one listed proposal after an unambiguous item-level decision. Local stdio only. |
+| `reject_refinement` | Reject one listed proposal after an unambiguous item-level decision. Local stdio only. |
 
-`doctor` mirrors `wenlan doctor`. It is diagnostic only and is not part of the memory loop.
+The refinement trio remains because this review queue has no CLI or replacement
+path. Remote HTTP clients can list it, but `accept_refinement` and
+`reject_refinement` are hidden and hard-rejected remotely.
+
+Runtime diagnostics live in the CLI: `wenlan doctor`. They are not part of the
+MCP memory loop.
 
 ## Setup Modes
 
