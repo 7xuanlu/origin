@@ -48,9 +48,10 @@ pub async fn run(
     match format {
         OutputFormat::Json => print_json(&resp)?,
         OutputFormat::Table => {
+            let destination = resp.space.as_deref().unwrap_or("Uncategorized");
             println!(
-                "Stored memory {} ({} chunk(s))",
-                resp.source_id, resp.chunks_created
+                "Stored memory {} in {} ({} chunk(s))",
+                resp.source_id, destination, resp.chunks_created
             );
         }
         OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),

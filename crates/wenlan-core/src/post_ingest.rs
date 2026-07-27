@@ -453,11 +453,14 @@ pub async fn run_post_ingest_enrichment(
         if let Some(llm_ref) = llm {
             // Look up source_agent from the DB for batch window queries
             let agent = db.get_memory_source_agent(source_id).await.unwrap_or(None);
+            let persisted_space = db.get_memory_space(source_id).await.unwrap_or(None);
 
-            // Check for recent memories from the same agent for batched extraction
+            // Check for recent memories from the same agent and persisted Space
+            // for batched extraction. Space is a provenance boundary for
+            // derived writes even though entity identity remains global.
             let batch = match &agent {
                 Some(a) => db
-                    .find_recent_batch(a, tuning.batch_window_secs)
+                    .find_recent_batch(a, tuning.batch_window_secs, persisted_space.as_deref())
                     .await
                     .unwrap_or_default(),
                 None => Vec::new(),
@@ -1238,7 +1241,10 @@ mod tests {
             .unwrap();
 
         let window_secs = 600; // 10 min — generous, covers any test timing jitter
-        let batch = db.find_recent_batch(agent, window_secs).await.unwrap();
+        let batch = db
+            .find_recent_batch(agent, window_secs, None)
+            .await
+            .unwrap();
         let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
         assert!(ids.contains(&"mem_batch_a".to_string()));
         assert!(ids.contains(&"mem_batch_b".to_string()));
@@ -1255,7 +1261,10 @@ mod tests {
         db.update_memory_entity_id("mem_batch_b", "entity_alice")
             .await
             .unwrap();
-        let batch_after = db.find_recent_batch(agent, window_secs).await.unwrap();
+        let batch_after = db
+            .find_recent_batch(agent, window_secs, None)
+            .await
+            .unwrap();
         let ids_after: Vec<String> = batch_after.iter().map(|(id, _)| id.clone()).collect();
         assert!(
             !ids_after.contains(&"mem_batch_b".to_string()),
@@ -1282,13 +1291,59 @@ mod tests {
             .await
             .unwrap();
 
-        let claude_batch = db.find_recent_batch("claude-code", 600).await.unwrap();
-        let cursor_batch = db.find_recent_batch("cursor", 600).await.unwrap();
+        let claude_batch = db
+            .find_recent_batch("claude-code", 600, None)
+            .await
+            .unwrap();
+        let cursor_batch = db.find_recent_batch("cursor", 600, None).await.unwrap();
         let claude_ids: Vec<String> = claude_batch.iter().map(|(id, _)| id.clone()).collect();
         let cursor_ids: Vec<String> = cursor_batch.iter().map(|(id, _)| id.clone()).collect();
 
         assert_eq!(claude_ids, vec!["mem_iso_claude"]);
         assert_eq!(cursor_ids, vec!["mem_iso_cursor"]);
+    }
+
+    #[tokio::test]
+    async fn find_recent_batch_never_mixes_persisted_spaces() {
+        let (db, _dir) = test_db().await;
+        db.create_space("work", None, false).await.unwrap();
+        db.create_space("personal", None, false).await.unwrap();
+
+        let agent = "space-partition-test";
+        let mut work_a = make_doc("mem_space_work_a", "Work Space batch item A.");
+        work_a.source_agent = Some(agent.to_string());
+        work_a.space = Some("work".to_string());
+        let mut work_b = make_doc("mem_space_work_b", "Work Space batch item B.");
+        work_b.source_agent = Some(agent.to_string());
+        work_b.space = Some("work".to_string());
+        let mut personal = make_doc("mem_space_personal", "Personal Space batch item.");
+        personal.source_agent = Some(agent.to_string());
+        personal.space = Some("personal".to_string());
+        let mut uncategorized =
+            make_doc("mem_space_uncategorized", "Uncategorized Space batch item.");
+        uncategorized.source_agent = Some(agent.to_string());
+
+        db.upsert_documents(vec![work_a, work_b, personal, uncategorized])
+            .await
+            .unwrap();
+
+        let work_batch = db
+            .find_recent_batch(agent, 600, Some("work"))
+            .await
+            .unwrap();
+        let work_ids: Vec<&str> = work_batch.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            work_ids,
+            vec!["mem_space_work_a", "mem_space_work_b"],
+            "derived extraction must stay inside the persisted work Space"
+        );
+
+        let uncategorized_batch = db.find_recent_batch(agent, 600, None).await.unwrap();
+        let uncategorized_ids: Vec<&str> = uncategorized_batch
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(uncategorized_ids, vec!["mem_space_uncategorized"]);
     }
 
     // ---- M3g Important-1: batch span base must be the anchor's own content ----
@@ -2477,7 +2532,7 @@ mod tests {
             content: format!("{v1_content}.[3]"),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_v1.to_string()],
             // Machine-owned kind on purpose: this test exercises the in-place
             // grow + citation-persistence path. An `authored` (human-owned) page
@@ -2560,7 +2615,7 @@ mod tests {
             content: v1_content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_v1.to_string()],
             creation_kind: Some("research".to_string()),
             workspace: None,
@@ -2633,7 +2688,7 @@ mod tests {
             content: v1_content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_v1.to_string()],
             creation_kind: Some("authored".to_string()),
             workspace: None,

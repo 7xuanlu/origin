@@ -2526,7 +2526,7 @@ async fn store_batch_distilled_page(
             content: page.content,
             summary: page.summary,
             entity_id: page.entity_id,
-            space: page.space.clone(),
+            space: page.space.clone().into(),
             source_memory_ids: page.source_memory_ids,
             creation_kind: Some("distilled".to_string()),
             workspace: page.space,

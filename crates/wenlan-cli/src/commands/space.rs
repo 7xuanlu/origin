@@ -7,57 +7,6 @@ use clap::Subcommand;
 use crate::client::WenlanClient;
 use crate::output::OutputFormat;
 
-fn set_default_in_toml(name: &str) -> anyhow::Result<()> {
-    use std::io::Write;
-    let home =
-        std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
-    let path = std::path::PathBuf::from(home).join(".wenlan/spaces.toml");
-    std::fs::create_dir_all(path.parent().unwrap())?;
-
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut found = false;
-    let mut new_body = String::with_capacity(existing.len() + 32);
-    for line in existing.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("default") && trimmed.contains('=') {
-            new_body.push_str(&format!("default = \"{}\"\n", name));
-            found = true;
-        } else {
-            new_body.push_str(line);
-            new_body.push('\n');
-        }
-    }
-    if !found {
-        if !new_body.is_empty() && !new_body.ends_with("\n\n") {
-            new_body.push('\n');
-        }
-        new_body.push_str(&format!("default = \"{}\"\n", name));
-    }
-
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(new_body.as_bytes())?;
-    Ok(())
-}
-
-fn read_default_from_toml() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::PathBuf::from(home).join(".wenlan/spaces.toml");
-    let body = std::fs::read_to_string(&path).ok()?;
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("default") {
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix('=') {
-                let val = rest.trim().trim_matches('"').to_string();
-                if !val.is_empty() {
-                    return Some(val);
-                }
-            }
-        }
-    }
-    None
-}
-
 #[derive(Subcommand)]
 pub enum SpaceCmd {
     /// List all registered spaces.
@@ -73,7 +22,11 @@ pub enum SpaceCmd {
     /// Get or set the default space.
     Default {
         /// Space name to set as default. Omit to print the current default.
+        #[arg(conflicts_with = "clear")]
         name: Option<String>,
+        /// Clear the daemon-owned default save space.
+        #[arg(long)]
+        clear: bool,
     },
     /// Bulk-reassign all memories from one space to another.
     Move {
@@ -98,7 +51,9 @@ pub async fn run(
     match cmd {
         SpaceCmd::List => list(client, format, quiet).await,
         SpaceCmd::Add { name, default } => add(client, format, quiet, &name, default).await,
-        SpaceCmd::Default { name } => default_cmd(client, format, quiet, name.as_deref()).await,
+        SpaceCmd::Default { name, clear } => {
+            default_cmd(client, format, quiet, name.as_deref(), clear).await
+        }
         SpaceCmd::Move { from, to } => move_cmd(client, format, quiet, &from, &to).await,
         SpaceCmd::Show { name } => show(client, format, quiet, &name).await,
     }
@@ -106,7 +61,6 @@ pub async fn run(
 
 async fn list(client: &WenlanClient, format: OutputFormat, quiet: bool) -> Result<()> {
     let spaces = client.list_spaces().await?;
-    let default = read_default_from_toml();
     if quiet {
         return Ok(());
     }
@@ -122,13 +76,12 @@ async fn list(client: &WenlanClient, format: OutputFormat, quiet: bool) -> Resul
                 "NAME", "MEMORIES", "ENTITIES", "DEFAULT?"
             );
             for s in &spaces {
-                let is_default = default.as_deref() == Some(s.name.as_str());
                 println!(
                     "{:<20} {:<10} {:<10} {:<8}",
                     s.name,
                     s.memory_count,
                     s.entity_count,
-                    if is_default { "yes" } else { "" }
+                    if s.is_default { "yes" } else { "" }
                 );
             }
         }
@@ -167,38 +120,54 @@ async fn add(
         }
     }
     if set_default {
-        set_default_in_toml(name)?;
+        let space = client.get_space(name).await?;
+        client.set_default_space(space.id).await?;
         if !quiet {
-            println!("Set '{}' as the default in ~/.wenlan/spaces.toml.", name);
+            println!("Set '{}' as the Default save space.", name);
         }
     }
     Ok(())
 }
 async fn default_cmd(
-    _client: &WenlanClient,
-    _format: OutputFormat,
+    client: &WenlanClient,
+    format: OutputFormat,
     quiet: bool,
     name: Option<&str>,
+    clear: bool,
 ) -> Result<()> {
-    match name {
-        Some(n) => {
-            set_default_in_toml(n)?;
-            if !quiet {
-                println!("Set default space to '{}' in ~/.wenlan/spaces.toml.", n);
-            }
+    if clear {
+        client.clear_default_space().await?;
+        if !quiet {
+            println!("Cleared the Default save space.");
         }
-        None => match read_default_from_toml() {
-            Some(n) => {
-                if !quiet {
-                    println!("{}", n);
+        return Ok(());
+    }
+
+    let response = match name {
+        Some(name) => {
+            let space = client.get_space(name).await?;
+            client.set_default_space(space.id).await?
+        }
+        None => client.get_default_space().await?,
+    };
+    if quiet {
+        return Ok(());
+    }
+    match format {
+        OutputFormat::Json => crate::output::print_json(&response)?,
+        OutputFormat::Table => match response.space {
+            Some(space) => {
+                if name.is_some() {
+                    println!("Set Default save space to '{}'.", space.name);
+                } else {
+                    println!("{}", space.name);
                 }
             }
             None => {
-                if !quiet {
-                    println!("(no default space set; unscoped calls omit the space)");
-                }
+                println!("(no Default save space set; new writes use Uncategorized)");
             }
         },
+        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }
@@ -220,7 +189,6 @@ async fn move_cmd(
 }
 async fn show(client: &WenlanClient, format: OutputFormat, quiet: bool, name: &str) -> Result<()> {
     let space = client.get_space(name).await?;
-    let default = read_default_from_toml();
     if quiet {
         return Ok(());
     }
@@ -236,8 +204,8 @@ async fn show(client: &WenlanClient, format: OutputFormat, quiet: bool, name: &s
             if space.starred {
                 println!("Starred:        yes");
             }
-            if default.as_deref() == Some(space.name.as_str()) {
-                println!("Default:        yes (~/.wenlan/spaces.toml)");
+            if space.is_default {
+                println!("Default:        yes");
             }
         }
         OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),

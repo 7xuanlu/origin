@@ -94,7 +94,7 @@ cargo test -p wenlan-core --lib write_space_resolution_carries -- --nocapture
 
 Expected: compilation fails because the default-space methods and migration are absent.
 
-- [ ] **Step 7: Implement migration 81 and the core resolver**
+- [ ] **Step 7: Implement migration 95 and the core resolver**
 
 Add `spaces.is_default INTEGER NOT NULL DEFAULT 0`, a partial unique index excluding the unfiled sentinel, and a durable app-metadata watermark. Resolve names to stable IDs before async work; at finalization, query the current name by ID while holding the DB connection. Return validation failure for deleted explicit/header IDs and Uncategorized for a deleted default ID.
 

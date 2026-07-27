@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand};
 use output::OutputFormat;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use wenlan_cli::space_context::{
+    resolve_agent_name, resolve_cli_space, resolve_native_read_space, CliSpaceOperation,
+};
 use wenlan_cli::{client, commands, output};
 use wenlan_types::lint::LintProfile;
 
@@ -23,6 +26,18 @@ struct Cli {
     /// Suppress all non-error output. Useful for scripts.
     #[arg(long, short, global = true)]
     quiet: bool,
+
+    /// Identify the caller in X-Agent-Name audit metadata.
+    #[arg(long, global = true)]
+    agent_name: Option<String>,
+
+    /// Use one registered Space for scope-aware reads and writes.
+    #[arg(long, global = true, conflicts_with = "all_spaces")]
+    space: Option<String>,
+
+    /// Read across every Space. Invalid for writes and strict WENLAN_SPACE pins.
+    #[arg(long, global = true)]
+    all_spaces: bool,
 }
 
 #[derive(Subcommand)]
@@ -57,9 +72,6 @@ enum Commands {
     Lint {
         #[arg(long)]
         profile: Option<LintProfile>,
-        /// Limit checks to one registered space, or `uncategorized`.
-        #[arg(long)]
-        space: Option<String>,
         /// Permit a deep semantic pass to use an already configured external provider.
         #[arg(long)]
         allow_external: bool,
@@ -156,7 +168,51 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    let client = client::WenlanClient::from_env();
+    let environment_agent = std::env::var("WENLAN_AGENT_NAME").ok();
+    let agent_name = resolve_agent_name(cli.agent_name.as_deref(), environment_agent.as_deref());
+    let base_client = client::WenlanClient::from_env_with_context(agent_name.as_deref(), None)?;
+    let operation = match &cli.command {
+        Commands::Search { .. } | Commands::Recall { .. } | Commands::Memories { .. } => {
+            Some(CliSpaceOperation::Read)
+        }
+        Commands::Capture { .. } => Some(CliSpaceOperation::Write),
+        _ => None,
+    };
+    let is_lint = matches!(&cli.command, Commands::Lint { .. });
+    let mut effective_cli_space = cli.space.clone();
+    let client = if let Some(operation) = operation {
+        let registered = base_client
+            .list_spaces()
+            .await?
+            .into_iter()
+            .map(|space| space.name)
+            .collect();
+        let context = resolve_cli_space(
+            cli.space.clone(),
+            cli.all_spaces,
+            std::env::current_dir().ok(),
+            operation,
+            &registered,
+        )?;
+        effective_cli_space = context.space.clone();
+        client::WenlanClient::from_env_with_context(
+            agent_name.as_deref(),
+            context.space.as_deref(),
+        )?
+    } else if is_lint {
+        let strict_space = std::env::var("WENLAN_SPACE").ok();
+        effective_cli_space = resolve_native_read_space(
+            strict_space.as_deref(),
+            cli.space.as_deref(),
+            cli.all_spaces,
+        )?;
+        base_client
+    } else {
+        if cli.space.is_some() || cli.all_spaces {
+            anyhow::bail!("--space/--all-spaces are not supported by this command");
+        }
+        base_client
+    };
     // Resolve Auto once based on stdout TTY state. Subcommands receive Json or Table only.
     let format = cli.format.resolve();
     match cli.command {
@@ -180,7 +236,6 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Doctor => commands::setup::run_doctor().await?,
         Commands::Lint {
             profile,
-            space,
             allow_external,
             agent_assist,
             agent_submission,
@@ -190,7 +245,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 format,
                 cli.quiet,
                 profile,
-                space,
+                effective_cli_space,
                 allow_external,
                 agent_assist,
                 agent_submission,

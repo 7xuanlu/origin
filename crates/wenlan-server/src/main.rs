@@ -1694,6 +1694,41 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
         }
     }
 
+    // One-time compatibility import for the pre-daemon top-level
+    // `default = "..."` key. The file remains user-owned mapping config and
+    // is never rewritten; the durable watermark prevents stale older clients
+    // from resurrecting it after this first check.
+    if !repair_recovery_pending {
+        if let Some(home) = dirs::home_dir() {
+            let legacy_default_path = home.join(".wenlan/spaces.toml");
+            match db_arc
+                .import_legacy_default_once(&legacy_default_path)
+                .await
+            {
+                Ok(outcome) => {
+                    if let Some(space) = outcome.imported_space {
+                        tracing::info!(
+                            "[startup] imported legacy Default save space '{}'",
+                            space.name
+                        );
+                    } else if let Some(name) = outcome.invalid_name {
+                        tracing::warn!(
+                            "[startup] legacy Default save space '{}' is not registered; \
+                             leaving Default save space unset. Run `wenlan spaces add {}` \
+                             and then `wenlan spaces default {}`.",
+                            name,
+                            name,
+                            name
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("[startup] legacy Default save space import failed: {error}")
+                }
+            }
+        }
+    }
+
     // Import any legacy tag data from the pre-PR-B2 spaces.db file.
     if !repair_recovery_pending {
         match wenlan_core::spaces::import_legacy_tags(&db_arc).await {
@@ -1720,7 +1755,11 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
         let gate_for_batcher = server_state.quality_gate.clone();
         let maintenance_for_batcher = server_state.maintenance_coordinator.clone();
         let process: ingest_batcher::BatchProcessFn = Arc::new(
-            move |items: Vec<(wenlan_core::sources::RawDocument, usize)>| {
+            move |items: Vec<(
+                wenlan_core::sources::RawDocument,
+                usize,
+                Option<wenlan_core::space_context::ResolvedWriteSpace>,
+            )>| {
                 let db = db_for_batcher.clone();
                 let gate = gate_for_batcher.clone();
                 let maintenance = maintenance_for_batcher.clone();
@@ -2047,7 +2086,11 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
 async fn ingest_batch_process(
     db: std::sync::Arc<wenlan_core::db::MemoryDB>,
     gate: wenlan_core::quality_gate::QualityGate,
-    items: Vec<(wenlan_core::sources::RawDocument, usize)>,
+    items: Vec<(
+        wenlan_core::sources::RawDocument,
+        usize,
+        Option<wenlan_core::space_context::ResolvedWriteSpace>,
+    )>,
 ) -> Vec<ingest_batcher::StoreOutcome> {
     use ingest_batcher::StoreOutcome;
     use wenlan_core::quality_gate::{GateResult, GateScores};
@@ -2057,7 +2100,10 @@ async fn ingest_batch_process(
     }
 
     // Batch gate evaluate. One FastEmbed call, N vector queries, one pass.
-    let contents: Vec<&str> = items.iter().map(|(d, _)| d.content.as_str()).collect();
+    let contents: Vec<&str> = items
+        .iter()
+        .map(|(document, _, _)| document.content.as_str())
+        .collect();
     let gate_results = match gate.evaluate_batch(&contents, &db).await {
         Ok(r) => r,
         Err(e) => {
@@ -2091,13 +2137,18 @@ async fn ingest_batch_process(
     let n = items.len();
     let mut outcomes: Vec<Option<StoreOutcome>> = (0..n).map(|_| None).collect();
     // (original_position, doc, chunks_predicted) for every admitted doc.
-    let mut survivors: Vec<(usize, wenlan_core::sources::RawDocument, usize)> = Vec::new();
+    let mut survivors: Vec<(
+        usize,
+        wenlan_core::sources::RawDocument,
+        usize,
+        Option<wenlan_core::space_context::ResolvedWriteSpace>,
+    )> = Vec::new();
 
-    for (i, ((doc, chunks), (gate_result, similar_id))) in
+    for (i, ((doc, chunks, write_space), (gate_result, similar_id))) in
         items.into_iter().zip(gate_results).enumerate()
     {
         if gate_result.admitted {
-            survivors.push((i, doc, chunks));
+            survivors.push((i, doc, chunks, write_space));
         } else {
             let (reason_str, detail_str) = gate_result
                 .reason
@@ -2113,20 +2164,27 @@ async fn ingest_batch_process(
     }
 
     if !survivors.is_empty() {
-        let docs: Vec<wenlan_core::sources::RawDocument> =
-            survivors.iter().map(|(_, d, _)| d.clone()).collect();
-        match db.upsert_documents(docs).await {
+        let docs = survivors
+            .iter()
+            .map(|(_, document, _, write_space)| (document.clone(), write_space.clone()))
+            .collect();
+        match db.upsert_documents_with_write_spaces(docs).await {
             Ok(_total) => {
-                for (pos, _, chunks) in &survivors {
+                for (pos, _, chunks, _) in &survivors {
                     outcomes[*pos] = Some(StoreOutcome::Stored {
                         chunks_created: *chunks,
                     });
                 }
             }
             Err(e) => {
-                let msg = e.to_string();
-                for (pos, _, _) in &survivors {
-                    outcomes[*pos] = Some(StoreOutcome::UpsertFailed(msg.clone()));
+                let validation = matches!(e, wenlan_core::WenlanError::Validation(_));
+                let message = e.to_string();
+                for (pos, _, _, _) in &survivors {
+                    outcomes[*pos] = Some(if validation {
+                        StoreOutcome::WriteSpaceInvalid(message.clone())
+                    } else {
+                        StoreOutcome::UpsertFailed(message.clone())
+                    });
                 }
             }
         }

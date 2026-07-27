@@ -85,7 +85,7 @@ async fn create_page_fixture(db: &MemoryDB, fixture: PageFixture<'_>) -> String 
         content: content.to_string(),
         summary: summary.map(str::to_string),
         entity_id: None,
-        space: space.map(str::to_string),
+        space: (space.map(str::to_string)).into(),
         source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
         creation_kind: Some(creation_kind.to_string()),
         workspace: workspace.map(str::to_string),
@@ -160,20 +160,16 @@ async fn pagewrite_create_records_resolved_source_kinds_for_file_and_url_sources
         "Web docs explain Rust workspace member crates.",
     )
     .await;
-    let req = CreateConceptRequest {
-        title: "Rust Workspaces".to_string(),
-        content: "Rust workspaces share Cargo configuration. Folder documents describe Rust workspace layouts. Web docs explain Rust workspace member crates.".to_string(),
-        summary: Some("Rust workspace sources".to_string()),
-        entity_id: None,
-        space: Some("technology".to_string()),
-        source_memory_ids: vec![
-            "mem_a".to_string(),
-            "folder-notes::rust/workspace.md".to_string(),
-            "https://example.com/rust-workspaces".to_string(),
-        ],
-        creation_kind: Some("distilled".to_string()),
-        workspace: None,
-    };
+    let req = CreateConceptRequest { title: "Rust Workspaces".to_string(),
+    content: "Rust workspaces share Cargo configuration. Folder documents describe Rust workspace layouts. Web docs explain Rust workspace member crates.".to_string(),
+    summary: Some("Rust workspace sources".to_string()),
+    entity_id: None, space: (Some("technology".to_string())).into(), source_memory_ids: vec![
+        "mem_a".to_string(),
+        "folder-notes::rust/workspace.md".to_string(),
+        "https://example.com/rust-workspaces".to_string(),
+    ],
+    creation_kind: Some("distilled".to_string()),
+    workspace: None, };
 
     let result = wenlan_core::post_write::create_page(&db, req, "test", None)
         .await
@@ -483,7 +479,7 @@ async fn distilled_zero_source_page_rejected() {
         content: "body".into(),
         summary: Some("s".into()),
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: vec![],
         creation_kind: Some("distilled".into()),
         workspace: None,
@@ -503,7 +499,7 @@ async fn authored_zero_source_page_accepted_unconfirmed() {
         content: "hand written body".into(),
         summary: Some("sum".into()),
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: vec![],
         creation_kind: Some("authored".into()),
         workspace: None,
@@ -528,7 +524,7 @@ async fn garbage_creation_kind_rejected() {
         content: "body".into(),
         summary: None,
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: vec![],
         creation_kind: Some("garbage".into()),
         workspace: None,

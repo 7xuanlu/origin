@@ -130,8 +130,8 @@ assert_rejects "codex README setup command drift" \
     "$TMPDIR_TEST/root/plugin-codex/README.md"
 
 assert_rejects "codex resolver parity drift" \
-    perl -0pi -e 's/cwd-config-default/codex-default/' \
-    "$TMPDIR_TEST/root/plugin-codex/bin/resolve-space.sh"
+    perl -0pi -e 's/locked-env/codex-locked-env/' \
+        "$TMPDIR_TEST/root/plugin-codex/bin/resolve-space.sh"
 
 assert_rejects "codex MCP plugin-relative cwd drift" \
     perl -0pi -e 's/"cwd": "\."/"cwd": ".."/' \

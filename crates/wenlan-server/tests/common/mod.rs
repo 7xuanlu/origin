@@ -47,7 +47,7 @@ pub async fn create_page_fixture(
         content: content.to_string(),
         summary: None,
         entity_id: None,
-        space: space.map(str::to_string),
+        space: (space.map(str::to_string)).into(),
         source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
         creation_kind: Some(creation_kind.to_string()),
         workspace: space.map(str::to_string),

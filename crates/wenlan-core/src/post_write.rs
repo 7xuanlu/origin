@@ -5,7 +5,7 @@
 //! enqueue). Both HTTP route handlers and daemon-internal extractors call
 //! these -- eliminating drift between agent-LLM and daemon-LLM trigger paths.
 
-use crate::db::MemoryDB;
+use crate::db::{MemoryDB, UNFILED_SPACE_ID};
 use crate::error::WenlanError;
 use std::{collections::HashSet, fmt::Write as _, path::Path, str::FromStr};
 use wenlan_types::{
@@ -1679,6 +1679,16 @@ pub async fn update_memory(
     source_id: &str,
     update: MemoryUpdate<'_>,
 ) -> Result<(), WenlanError> {
+    let _space_write_guard = if update.space.is_some() {
+        Some(db.lock_space_writes().await)
+    } else {
+        None
+    };
+    let registered_space = match update.space {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(requested)) => Some(db.registered_space_or_none(Some(requested)).await?),
+    };
     let parsed_memory_type = update
         .memory_type
         .map(MemoryType::from_str)
@@ -1689,7 +1699,9 @@ pub async fn update_memory(
     db.apply_memory_update(
         source_id,
         update.content,
-        update.space,
+        registered_space
+            .as_ref()
+            .map(|space| space.as_ref().map(String::as_str)),
         update.confirm,
         normalized_memory_type.as_deref(),
         None,
@@ -2657,7 +2669,14 @@ async fn create_page_impl(
                 None
             }
         };
-        let workspace = req.workspace.as_deref().or(req.space.as_deref());
+        let workspace = req
+            .workspace
+            .as_deref()
+            .or(req.space.as_deref())
+            .or_else(|| {
+                matches!(req.space, wenlan_types::WriteSpaceTarget::Uncategorized)
+                    .then_some(UNFILED_SPACE_ID)
+            });
         if let (Some(embedding), Some(workspace)) = (embedding, workspace) {
             if let Some(matched) = db
                 .find_matching_page_scoped(
@@ -2693,7 +2712,7 @@ async fn create_page_impl(
         summary: req.summary.clone(),
         content: req.content.clone(),
         entity_id: req.entity_id.clone(),
-        space: req.space.clone(),
+        space: req.space.named().map(str::to_string),
         source_memory_ids: req.source_memory_ids.clone(),
         version: 1,
         status: "active".to_string(),
@@ -4157,7 +4176,7 @@ mod tests {
         let req = CreateEntityRequest {
             name: "".to_string(),
             entity_type: "person".to_string(),
-            space: None,
+            space: wenlan_types::WriteSpaceTarget::Uncategorized,
             source_agent: Some("test".to_string()),
             confidence: None,
         };
@@ -4173,7 +4192,7 @@ mod tests {
         let req = CreateEntityRequest {
             name: "Alice".to_string(),
             entity_type: "".to_string(),
-            space: None,
+            space: (None).into(),
             source_agent: Some("test".to_string()),
             confidence: None,
         };
@@ -4189,7 +4208,7 @@ mod tests {
         let req = CreateEntityRequest {
             name: "Alice".to_string(),
             entity_type: "person".to_string(),
-            space: None,
+            space: (None).into(),
             source_agent: Some("test".to_string()),
             confidence: Some(1.5),
         };
@@ -4205,7 +4224,7 @@ mod tests {
         let req = CreateEntityRequest {
             name: "Alice".to_string(),
             entity_type: "person".to_string(),
-            space: None,
+            space: (None).into(),
             source_agent: Some("test".to_string()),
             confidence: Some(0.9),
         };
@@ -4219,7 +4238,7 @@ mod tests {
         let req1 = CreateEntityRequest {
             name: "Alice".to_string(),
             entity_type: "person".to_string(),
-            space: None,
+            space: (None).into(),
             source_agent: Some("test".to_string()),
             confidence: None,
         };
@@ -4227,7 +4246,7 @@ mod tests {
         let req2 = CreateEntityRequest {
             name: "Alice".to_string(),
             entity_type: "person".to_string(),
-            space: None,
+            space: (None).into(),
             source_agent: Some("test".to_string()),
             confidence: None,
         };
@@ -4785,7 +4804,7 @@ mod tests {
             content: "body content that is long enough".to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec!["mem_does_not_exist".to_string()],
             creation_kind: Some("authored".to_string()),
             workspace: None,
@@ -4807,7 +4826,7 @@ mod tests {
             content: "Pasta carbonara needs eggs and pancetta".to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![
                 "mem-rust-a".to_string(),
                 "mem-rust-b".to_string(),
@@ -4850,7 +4869,7 @@ mod tests {
                 .to_string(),
             summary: Some("memory-safe systems language".to_string()),
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![
                 "mem-rust-happy-a".to_string(),
                 "mem-rust-happy-b".to_string(),
@@ -4891,7 +4910,7 @@ mod tests {
                     .to_string(),
             summary: Some("Rust memory safety".to_string()),
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![
                 "mem-rust-floor-a".to_string(),
                 "mem-rust-floor-b".to_string(),
@@ -4932,7 +4951,7 @@ mod tests {
             content: "Rust ownership and borrowing validate memory-safe references".to_string(),
             summary: Some("Rust source floor".to_string()),
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![
                 "mem-rust-distinct-a".to_string(),
                 "mem-rust-distinct-a".to_string(),
@@ -4967,7 +4986,7 @@ mod tests {
             content: "Rust ownership prevents memory safety bugs".to_string(),
             summary: Some("Rust authored page".to_string()),
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec!["mem-rust-authored-a".to_string()],
             creation_kind: Some("authored".to_string()),
             workspace: None,
@@ -4986,7 +5005,7 @@ mod tests {
             content: "Rust is a systems programming language".to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![],
             creation_kind: Some("distilled".to_string()),
             workspace: None,
@@ -5011,7 +5030,7 @@ mod tests {
             content: "Rust ownership prevents memory safety bugs".to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![],
             creation_kind: Some("authored".to_string()),
             workspace: None,
@@ -5033,7 +5052,7 @@ mod tests {
             content: format!("before {SOURCES_BLOCK_START} after"),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: Vec::new(),
             creation_kind: Some("authored".to_string()),
             workspace: None,
@@ -5098,7 +5117,7 @@ mod tests {
             content: format!("{grounded}\n\n{SOURCES_BLOCK_END}"),
             summary: None,
             entity_id: None,
-            space: Some("work".to_string()),
+            space: (Some("work".to_string())).into(),
             source_memory_ids: vec![candidate_source.to_string()],
             creation_kind: Some("distilled".to_string()),
             workspace: Some("work".to_string()),
@@ -5166,7 +5185,7 @@ mod tests {
                 .to_string(),
             summary: Some("Rust reference safety".to_string()),
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![
                 "mem-rust-birth-a".to_string(),
                 "mem-rust-birth-b".to_string(),
@@ -5210,7 +5229,7 @@ mod tests {
             content: "Authored notes about Rust references and workspace conventions.".to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![],
             creation_kind: Some("authored".to_string()),
             workspace: None,
@@ -5301,7 +5320,7 @@ mod tests {
                     .to_string(),
             summary: Some("Rust workspace operations".to_string()),
             entity_id: None,
-            space: Some("recap".to_string()),
+            space: (Some("recap".to_string())).into(),
             source_memory_ids: vec![
                 "mem-pagewrite-candidate-a".to_string(),
                 "mem-pagewrite-candidate-b".to_string(),
@@ -5405,6 +5424,26 @@ mod tests {
         )
         .await
         .unwrap();
+        db.insert_page_with_kind(
+            "page_pagewrite_uncategorized_existing",
+            "Rust Workspace Operations",
+            Some("Rust workspace operations"),
+            "Rust workspaces share Cargo lockfiles, inherited metadata, and all-crate checks",
+            None,
+            None,
+            &[
+                "mem-pagewrite-cross-existing-a",
+                "mem-pagewrite-cross-existing-b",
+                "mem-pagewrite-cross-existing-c",
+            ],
+            &now,
+            "distilled",
+            "confirmed",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let req = CreateConceptRequest {
             title: "Rust Workspace Operations".to_string(),
             content:
@@ -5412,7 +5451,7 @@ mod tests {
                     .to_string(),
             summary: Some("Rust workspace operations".to_string()),
             entity_id: None,
-            space: None,
+            space: wenlan_types::WriteSpaceTarget::Uncategorized,
             source_memory_ids: vec![
                 "mem-pagewrite-cross-candidate-a".to_string(),
                 "mem-pagewrite-cross-candidate-b".to_string(),
@@ -5424,19 +5463,17 @@ mod tests {
 
         let result = create_page(&db, req, "test", None).await.unwrap();
 
-        assert_ne!(
-            result.id, "page_pagewrite_cross_existing",
-            "space-scoped dedup must not attach a no-space candidate to a workspace page"
-        );
         assert_eq!(
-            result.attached_to, None,
-            "cross-space create must report a new page, not an attachment"
+            result.attached_to.as_deref(),
+            Some("page_pagewrite_uncategorized_existing"),
+            "Uncategorized dedup must attach to the Uncategorized page"
         );
+        assert_ne!(result.id, "page_pagewrite_cross_existing");
         let pages = db.list_pages("active", 10, 0).await.unwrap();
         assert_eq!(
             pages.len(),
             2,
-            "cross-space near-duplicate must mint a second page"
+            "Uncategorized dedup must not mint a third page or attach across Space"
         );
     }
 
@@ -5502,7 +5539,7 @@ mod tests {
                     .to_string(),
             summary: Some("Rust workspace operations".to_string()),
             entity_id: None,
-            space: Some("recap".to_string()),
+            space: (Some("recap".to_string())).into(),
             source_memory_ids: vec![
                 "mem-pagewrite-diffspace-candidate-a".to_string(),
                 "mem-pagewrite-diffspace-candidate-b".to_string(),
@@ -5555,7 +5592,7 @@ mod tests {
             content: content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![source_id.to_string()],
             creation_kind: Some("research".to_string()),
             workspace: None,
@@ -6687,7 +6724,7 @@ mod tests {
             content: body.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: (None).into(),
             source_memory_ids: vec![mem_id.to_string()],
             creation_kind: Some("source".to_string()),
             workspace: None,
@@ -8420,7 +8457,7 @@ mod tests {
         CreateEntityRequest {
             name: name.to_string(),
             entity_type: etype.to_string(),
-            space: None,
+            space: (None).into(),
             source_agent: Some("test".to_string()),
             confidence: None,
         }

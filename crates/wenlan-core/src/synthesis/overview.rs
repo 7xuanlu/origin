@@ -80,7 +80,7 @@ async fn ensure_overview_page(
         content: OVERVIEW_PLACEHOLDER_CONTENT.to_string(),
         summary: None,
         entity_id: None,
-        space: None,
+        space: None.into(),
         source_memory_ids: Vec::new(),
         // "research" is machine-owned (never `user_edited`/"authored") and
         // floor-exempt (spec §5.1: only `distilled` requires >=
@@ -236,7 +236,7 @@ mod tests {
             content: content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_id.to_string()],
             creation_kind: Some("research".to_string()),
             workspace: None,

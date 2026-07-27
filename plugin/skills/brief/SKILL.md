@@ -55,13 +55,12 @@ Before any MCP call, resolve the active space by invoking the bundled
 resolver script via Bash:
 
     "$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" \
-        ${SPACE_ARG:+--arg "$SPACE_ARG"} \
-        ${TOPIC_ARG:+--topic "$TOPIC_ARG"}
+        ${SPACE_ARG:+--arg "$SPACE_ARG"}
 
 The script prints `<space>\t<source-layer>` on stdout. Capture both:
 the `<space>` value is what you pass as `space=...` to MCP tools when
-non-empty; the `<source-layer>` value is one of `arg`, `env`,
-`cwd-config`, `cwd-config-default`, `cwd-repo`, `topic`, `unscoped`.
+non-empty; the `<source-layer>` value is one of `locked-env`, `arg`,
+`default-env`, `cwd-config`, `cwd-repo`, `unscoped`.
 
 Print one line to the user before the MCP call:
 
