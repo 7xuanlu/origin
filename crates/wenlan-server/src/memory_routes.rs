@@ -3,7 +3,7 @@ use crate::error::ServerError;
 use crate::state::ServerState;
 use axum::{
     extract::{Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
@@ -15,14 +15,15 @@ use wenlan_core::sources::compute_effective_confidence;
 use wenlan_types::requests::{
     AddObservationRequest, ConfirmRequest, CreateConceptRequest, CreateEntityRequest,
     CreateRelationRequest, ExportPagesRequest, ListMemoriesRequest, SearchMemoryRequest,
-    SearchPagesRequest, StoreMemoryRequest,
+    SearchPagesRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
 };
 use wenlan_types::responses::{
     AddObservationResponse, ConfirmResponse, CreateEntityResponse, CreatePageResponse,
-    CreateRelationResponse, DeleteResponse, ListMemoriesResponse, SearchMemoryResponse,
-    StoreMemoryResponse,
+    CreateRelationResponse, DefaultSpaceResponse, DeleteResponse, ListMemoriesResponse,
+    SearchMemoryResponse, StoreMemoryResponse,
 };
 use wenlan_types::sources::{stability_tier, MemoryType, RawDocument, StabilityTier};
+use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 pub(crate) async fn registered_request_space(
     db: &wenlan_core::db::MemoryDB,
@@ -278,42 +279,15 @@ pub async fn handle_store_memory(
     State(state): State<Arc<RwLock<ServerState>>>,
     headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(mut req): Json<StoreMemoryRequest>,
+    Json(req): Json<StoreMemoryRequest>,
 ) -> Result<Json<StoreMemoryResponse>, ServerError> {
-    // Apply X-Origin-Space header as fallback only when body omits `space`.
-    if req.space.is_none() {
-        req.space = header_space;
-    }
-    let requested_space = req
-        .space
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let ignored_unregistered_space = if let Some(space) = requested_space {
-        let db = {
-            let s = state.read().await;
-            s.db.clone().ok_or(ServerError::DbNotInitialized)?
-        };
-        if let Some(registered_space) = db
-            .registered_space_or_none(Some(&space))
-            .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?
-        {
-            req.space = Some(registered_space);
-            None
-        } else {
-            tracing::warn!(
-                "[memory] ignoring unregistered space {:?}; storing memory uncategorized",
-                space
-            );
-            req.space = None;
-            Some(space)
-        }
-    } else {
-        req.space = None;
-        None
+    let db = {
+        let state = state.read().await;
+        state.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
+    let resolved_write_space = db
+        .resolve_write_space(&req.space, header_space.as_deref())
+        .await?;
     let trimmed_content = req.content.trim();
     if trimmed_content.len() < 10 {
         return Err(ServerError::ValidationError(
@@ -322,18 +296,12 @@ pub async fn handle_store_memory(
     }
 
     // Dedup check
-    let db = {
-        let s = state.read().await;
-        s.db.clone()
-    };
-    if let Some(db) = db {
-        #[cfg(test)]
-        wait_at_store_lock_test_hook(StoreLockTestStage::Dedup).await;
-        if db.has_memory_content(&req.content).await.unwrap_or(false) {
-            return Err(ServerError::ValidationError(
-                "Duplicate: a memory with this content already exists".into(),
-            ));
-        }
+    #[cfg(test)]
+    wait_at_store_lock_test_hook(StoreLockTestStage::Dedup).await;
+    if db.has_memory_content(&req.content).await.unwrap_or(false) {
+        return Err(ServerError::ValidationError(
+            "Duplicate: a memory with this content already exists".into(),
+        ));
     }
 
     // Validate caller-supplied memory_type — parse and keep it as-is. Profile
@@ -440,21 +408,15 @@ pub async fn handle_store_memory(
         caller_supplied_memory_type,
         caller_supplied_a_profile_alias,
         caller_supplied_structured_fields,
-        ignored_unregistered_space.is_some(),
+        false,
     );
 
     // Phase 2b-validate: split into warnings (schema-validation only) and extraction_method (status label).
-    let (mut warnings, extraction_method) = compute_warnings_and_extraction(
+    let (warnings, extraction_method) = compute_warnings_and_extraction(
         extracted_fields.as_deref(),
         req.structured_fields.as_ref(),
         &memory_type_str,
     );
-    if let Some(space) = ignored_unregistered_space.as_deref() {
-        warnings.push(format!(
-            "Space '{space}' is not registered; stored uncategorized. Run `wenlan spaces add {space}` before using it."
-        ));
-    }
-
     // Phase 2c: Entity resolution
     let resolved_entity_id = if let Some(ref direct_id) = req.entity_id {
         Some(direct_id.clone())
@@ -532,7 +494,7 @@ pub async fn handle_store_memory(
         "hide".to_string()
     };
 
-    let final_domain = req.space;
+    let final_domain = resolved_write_space.space_name.clone();
     let doc = RawDocument {
         source: "memory".to_string(),
         source_id: source_id.clone(),
@@ -612,7 +574,10 @@ pub async fn handle_store_memory(
         // one libSQL transaction. Gate runs inside the coalescer flush.
         // See `ingest_batcher.rs` for details.
         use crate::ingest_batcher::StoreOutcome;
-        let outcome = match batcher.submit(doc, chunks_predicted).await {
+        let outcome = match batcher
+            .submit_with_space(doc, chunks_predicted, resolved_write_space.clone())
+            .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 let _ = origin_db.delete_enrichment_origin(&source_id).await;
@@ -671,6 +636,10 @@ pub async fn handle_store_memory(
             StoreOutcome::UpsertFailed(msg) => {
                 let _ = origin_db.delete_enrichment_origin(&source_id).await;
                 return Err(ServerError::IngestFailed(msg));
+            }
+            StoreOutcome::WriteSpaceInvalid(msg) => {
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
+                return Err(ServerError::ValidationError(msg));
             }
         }
     } else {
@@ -745,8 +714,15 @@ pub async fn handle_store_memory(
                 similar_to: similar_source_id,
             });
         }
-        match db.upsert_documents(vec![doc]).await {
+        match db
+            .upsert_documents_with_write_spaces(vec![(doc, Some(resolved_write_space.clone()))])
+            .await
+        {
             Ok(chunks) => chunks,
+            Err(wenlan_core::WenlanError::Validation(message)) => {
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
+                return Err(ServerError::ValidationError(message));
+            }
             Err(error) => {
                 let _ = origin_db.delete_enrichment_origin(&source_id).await;
                 return Err(ServerError::IngestFailed(error.to_string()));
@@ -760,6 +736,16 @@ pub async fn handle_store_memory(
             "Memory produced no indexable content after processing".into(),
         ));
     }
+
+    let persisted_space = origin_db
+        .get_memory_space(&source_id)
+        .await
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    let persisted_space_source = if persisted_space.is_some() {
+        resolved_write_space.source
+    } else {
+        WriteSpaceSource::Uncategorized
+    };
 
     // Classified tags are now written by the ambient classification lane —
     // `classified_tags` is always empty at this point because classify moved
@@ -883,6 +869,9 @@ pub async fn handle_store_memory(
         extraction_method,
         enrichment,
         hint,
+        space: persisted_space,
+        space_source: Some(persisted_space_source),
+        write_outcome: Some(WriteOutcome::Created),
     }))
 }
 
@@ -1174,10 +1163,6 @@ pub async fn handle_create_entity(
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Json(mut req): Json<CreateEntityRequest>,
 ) -> Result<Json<CreateEntityResponse>, ServerError> {
-    // Apply X-Origin-Space header as fallback only when body omits `space`.
-    if req.space.is_none() {
-        req.space = header_space;
-    }
     let agent = extract_agent_name(&headers, None);
     let db = {
         let s = state.read().await;
@@ -1185,11 +1170,34 @@ pub async fn handle_create_entity(
             .cloned()
             .ok_or(ServerError::DbNotInitialized)?
     };
-    req.space = registered_request_space(&db, &req.space, "create_entity").await?;
+    let _space_write_guard = db.lock_space_writes().await;
+    let resolved = db
+        .resolve_write_space(&req.space, header_space.as_deref())
+        .await?;
+    req.space = match resolved.space_name.as_ref() {
+        Some(name) => WriteSpaceTarget::Named(name.clone()),
+        None => WriteSpaceTarget::Uncategorized,
+    };
     let result = wenlan_core::post_write::create_entity(&db, req, &agent).await?;
+    let persisted_space = db.get_entity_detail(&result.id).await?.entity.space;
+    let (space_source, write_outcome) = if result.wrote {
+        (
+            if persisted_space.is_some() {
+                resolved.source
+            } else {
+                WriteSpaceSource::Uncategorized
+            },
+            WriteOutcome::Created,
+        )
+    } else {
+        (WriteSpaceSource::Existing, WriteOutcome::ResolvedExisting)
+    };
     Ok(Json(CreateEntityResponse {
         id: result.id,
         warnings: result.warnings,
+        space: persisted_space,
+        space_source: Some(space_source),
+        write_outcome: Some(write_outcome),
     }))
 }
 
@@ -1770,6 +1778,42 @@ pub struct UpdateSpaceRequest {
     pub description: Option<String>,
 }
 
+pub async fn handle_get_default_space(
+    State(state): State<Arc<RwLock<ServerState>>>,
+) -> Result<Json<DefaultSpaceResponse>, ServerError> {
+    let db = {
+        let state = state.read().await;
+        state.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    Ok(Json(DefaultSpaceResponse {
+        space: db.get_default_space().await?,
+    }))
+}
+
+pub async fn handle_set_default_space(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Json(request): Json<SetDefaultSpaceRequest>,
+) -> Result<Json<DefaultSpaceResponse>, ServerError> {
+    let db = {
+        let state = state.read().await;
+        state.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    Ok(Json(DefaultSpaceResponse {
+        space: Some(db.set_default_space(&request.space_id).await?),
+    }))
+}
+
+pub async fn handle_clear_default_space(
+    State(state): State<Arc<RwLock<ServerState>>>,
+) -> Result<StatusCode, ServerError> {
+    let db = {
+        let state = state.read().await;
+        state.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    db.clear_default_space().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn handle_list_spaces(
     State(state): State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<Vec<wenlan_core::db::Space>>, ServerError> {
@@ -2109,18 +2153,16 @@ pub async fn handle_create_page(
         )
     };
 
-    // Apply X-Origin-Space header as fallback only when body omits `space`.
-    if req.space.is_none() {
-        req.space = header_space.clone();
-    }
-    // HTTP/MCP `space` is the legacy scope input; `workspace` is the
-    // authoritative P3 axis (spec line 518). Validate each independently
-    // against registered spaces, dropping garbage/category values with a
-    // warning -- reconciling the two into the honest `pages.space`/
-    // `pages.workspace` columns (workspace wins when present) is
-    // insert_page_with_kind's job now, not this handler's.
-    req.space = registered_request_space(&db, &req.space, "create_page space").await?;
-    req.workspace = registered_request_space(&db, &req.workspace, "create_page workspace").await?;
+    let _space_write_guard = db.lock_space_writes().await;
+    let target = normalize_page_write_target(&req.space, req.workspace.as_deref())?;
+    let resolved = db
+        .resolve_write_space(&target, header_space.as_deref())
+        .await?;
+    req.space = match resolved.space_name.as_ref() {
+        Some(name) => WriteSpaceTarget::Named(name.clone()),
+        None => WriteSpaceTarget::Uncategorized,
+    };
+    req.workspace = resolved.space_name.clone();
     let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
     let result = wenlan_core::post_write::create_page_with_tuning(
         &db,
@@ -2131,11 +2173,55 @@ pub async fn handle_create_page(
         page_match_threshold,
     )
     .await?;
+    let persisted_page_id = result.attached_to.as_deref().unwrap_or(&result.id);
+    let persisted_space = db
+        .get_page(persisted_page_id)
+        .await?
+        .ok_or_else(|| ServerError::Internal("Page disappeared after create".into()))?
+        .space;
+    let attached_existing = result.attached_to.is_some();
     Ok(Json(CreatePageResponse {
         id: result.id,
         attached_to: result.attached_to,
         warnings: result.warnings,
+        space: persisted_space.clone(),
+        space_source: Some(if attached_existing {
+            WriteSpaceSource::Existing
+        } else if persisted_space.is_some() {
+            resolved.source
+        } else {
+            WriteSpaceSource::Uncategorized
+        }),
+        write_outcome: Some(if attached_existing {
+            WriteOutcome::AttachedExisting
+        } else {
+            WriteOutcome::Created
+        }),
     }))
+}
+
+fn normalize_page_write_target(
+    space: &WriteSpaceTarget,
+    workspace: Option<&str>,
+) -> Result<WriteSpaceTarget, ServerError> {
+    let workspace = workspace.map(str::trim).filter(|value| !value.is_empty());
+    match (space, workspace) {
+        (WriteSpaceTarget::Inherit, Some(workspace)) => {
+            Ok(WriteSpaceTarget::Named(workspace.to_string()))
+        }
+        (WriteSpaceTarget::Named(space), Some(workspace)) if space == workspace => {
+            Ok(WriteSpaceTarget::Named(space.clone()))
+        }
+        (WriteSpaceTarget::Named(space), Some(workspace)) => Err(ServerError::ValidationError(
+            format!("page space aliases conflict: space='{space}' and workspace='{workspace}'"),
+        )),
+        (WriteSpaceTarget::Uncategorized, Some(workspace)) => {
+            Err(ServerError::ValidationError(format!(
+                "page space aliases conflict: explicit Uncategorized and workspace='{workspace}'"
+            )))
+        }
+        (target, None) => Ok(target.clone()),
+    }
 }
 
 /// POST /api/pages/export
@@ -2795,19 +2881,12 @@ pub async fn handle_update_memory(
         .transpose()
         .map_err(ServerError::BadRequest)?
         .map(|memory_type| memory_type.to_string());
-    let registered_space = match &req.space {
-        Some(space) => {
-            Some(registered_request_space(&db, &Some(space.clone()), "update_memory").await?)
-        }
-        None => None,
-    };
-
     wenlan_core::post_write::update_memory(
         &db,
         &id,
         wenlan_core::post_write::MemoryUpdate {
             content: req.content.as_deref(),
-            space: registered_space.as_ref().map(|space| space.as_deref()),
+            space: req.space.as_deref().map(Some),
             confirm: req.confirmed == Some(true),
             memory_type: memory_type.as_deref(),
         },
@@ -3948,7 +4027,7 @@ mod store_scheduler_handoff_tests {
                     "Store lock stage {stage:?} must release ServerState before DB await {index}."
                 ),
                 memory_type: None,
-                space: None,
+                space: (None).into(),
                 source_agent: Some(format!("lock-lifetime-test-agent-{index}")),
                 title: None,
                 confidence: None,
@@ -4021,7 +4100,7 @@ mod store_scheduler_handoff_tests {
         let req = StoreMemoryRequest {
             content: "Store must hand enrichment to the ambient scheduler only.".to_string(),
             memory_type: None,
-            space: None,
+            space: (None).into(),
             source_agent: Some("test-agent".to_string()),
             title: None,
             confidence: None,
@@ -4093,7 +4172,7 @@ mod store_scheduler_handoff_tests {
             content: "A healthy explicit pin should authorize only deferred enrichment."
                 .to_string(),
             memory_type: None,
-            space: None,
+            space: (None).into(),
             source_agent: Some("test-agent".to_string()),
             title: None,
             confidence: None,
@@ -4426,7 +4505,7 @@ mod create_page_endpoint_tests {
                 content: content.to_string(),
                 summary: summary.map(str::to_string),
                 entity_id: None,
-                space: space.map(str::to_string),
+                space: (space.map(str::to_string)).into(),
                 source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
                 creation_kind: Some("distilled".to_string()),
                 workspace: space.map(str::to_string),
@@ -5048,7 +5127,7 @@ mod search_quick_path_page_tests {
                 entity_id: None,
                 source_memory_ids: vec![source_id.to_string()],
                 creation_kind: Some("distilled".to_string()),
-                space: Some(space.to_string()),
+                space: (Some(space.to_string())).into(),
                 workspace: Some(space.to_string()),
             },
             "test",

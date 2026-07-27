@@ -2,35 +2,18 @@
 use crate::error::ServerError;
 use crate::state::ServerState;
 use axum::{extract::State, response::Json};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use wenlan_types::import::{ImportChatExportRequest, ImportChatExportResponse};
-
-#[derive(Debug, Deserialize)]
-pub struct ImportMemoriesRequest {
-    pub source: String,
-    pub content: String,
-    #[serde(default)]
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ImportMemoriesResponse {
-    pub imported: usize,
-    pub skipped: usize,
-    pub breakdown: HashMap<String, usize>,
-    pub entities_created: usize,
-    pub observations_added: usize,
-    pub relations_created: usize,
-    pub batch_id: String,
-}
+use wenlan_types::requests::ImportMemoriesRequest;
+use wenlan_types::responses::ImportMemoriesResponse;
+use wenlan_types::WriteSpaceSource;
 
 /// POST /api/import/memories
 pub async fn handle_import_memories(
     State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Json(req): Json<ImportMemoriesRequest>,
 ) -> Result<Json<ImportMemoriesResponse>, ServerError> {
     let valid_sources = ["chatgpt", "claude", "other"];
@@ -41,19 +24,31 @@ pub async fn handle_import_memories(
         )));
     }
 
-    let result = {
+    let (db, confidence_cfg) = {
         let s = state.read().await;
-        let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-        let confidence_cfg = &s.tuning.confidence;
-        wenlan_core::importer::import_memories_no_llm(
-            db,
-            &req.content,
-            &req.source,
-            req.label.as_deref(),
-            confidence_cfg,
+        (
+            s.db.clone().ok_or(ServerError::DbNotInitialized)?,
+            s.tuning.confidence.clone(),
         )
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
+    };
+    let _space_write_guard = db.lock_space_writes().await;
+    let resolved = db
+        .resolve_write_space(&req.space, header_space.as_deref())
+        .await?;
+    let result = wenlan_core::importer::import_memories_no_llm_in_space(
+        &db,
+        &req.content,
+        &req.source,
+        req.label.as_deref(),
+        &confidence_cfg,
+        &resolved,
+    )
+    .await?;
+    let persisted = db.finalize_write_space(&resolved).await?;
+    let space_source = if persisted.space_name.is_some() {
+        persisted.source
+    } else {
+        WriteSpaceSource::Uncategorized
     };
 
     Ok(Json(ImportMemoriesResponse {
@@ -64,6 +59,8 @@ pub async fn handle_import_memories(
         observations_added: result.observations_added,
         relations_created: result.relations_created,
         batch_id: result.batch_id,
+        space: persisted.space_name,
+        space_source: Some(space_source),
     }))
 }
 

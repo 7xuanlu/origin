@@ -35,6 +35,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 use wenlan_core::sources::RawDocument;
+use wenlan_core::space_context::ResolvedWriteSpace;
 
 /// Per-document result from a batched ingest flush.
 #[derive(Debug, Clone)]
@@ -52,6 +53,10 @@ pub enum StoreOutcome {
         detail: String,
         similar_to: Option<String>,
     },
+    /// Stable write destination was deleted after request resolution but
+    /// before the transaction. The handler maps this back to a validation
+    /// response instead of mislabeling it as an ingest infrastructure fault.
+    WriteSpaceInvalid(String),
     /// Upsert failed for the whole batch (libSQL transaction aborted).
     /// All survivors in the same batch get this outcome — per-doc
     /// granularity isn't possible at the transactional layer.
@@ -60,13 +65,19 @@ pub enum StoreOutcome {
 
 /// Backend the coalescer invokes per flush. Takes `(doc, chunks_predicted)`
 /// tuples, returns outcomes in the same order.
-pub type BatchProcessFn =
-    Arc<dyn Fn(Vec<(RawDocument, usize)>) -> BoxFuture<'static, Vec<StoreOutcome>> + Send + Sync>;
+pub type BatchProcessFn = Arc<
+    dyn Fn(
+            Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)>,
+        ) -> BoxFuture<'static, Vec<StoreOutcome>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug)]
 struct CoalescedRequest {
     doc: RawDocument,
     chunks_predicted: usize,
+    write_space: Option<ResolvedWriteSpace>,
     response: oneshot::Sender<StoreOutcome>,
 }
 
@@ -142,9 +153,9 @@ async fn run_coalescer(
 
         let batch_size = batch.len();
         let fill_elapsed = batch_started.elapsed();
-        let items: Vec<(RawDocument, usize)> = batch
+        let items: Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)> = batch
             .iter()
-            .map(|r| (r.doc.clone(), r.chunks_predicted))
+            .map(|r| (r.doc.clone(), r.chunks_predicted, r.write_space.clone()))
             .collect();
 
         let process_started = tokio::time::Instant::now();
@@ -159,6 +170,7 @@ async fn run_coalescer(
             match o {
                 StoreOutcome::Stored { .. } => stored += 1,
                 StoreOutcome::GateRejected { .. } => rejected += 1,
+                StoreOutcome::WriteSpaceInvalid(_) => failed += 1,
                 StoreOutcome::UpsertFailed(_) => failed += 1,
             }
         }
@@ -252,20 +264,22 @@ mod tests {
 
         let invocations_cb = invocations.clone();
         let sizes_cb = observed_batch_sizes.clone();
-        let process: BatchProcessFn = Arc::new(move |items: Vec<(RawDocument, usize)>| {
-            let invocations = invocations_cb.clone();
-            let sizes = sizes_cb.clone();
-            Box::pin(async move {
-                invocations.fetch_add(1, Ordering::SeqCst);
-                sizes.lock().unwrap().push(items.len());
-                items
-                    .into_iter()
-                    .map(|(_, chunks)| StoreOutcome::Stored {
-                        chunks_created: chunks,
-                    })
-                    .collect()
-            })
-        });
+        let process: BatchProcessFn = Arc::new(
+            move |items: Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)>| {
+                let invocations = invocations_cb.clone();
+                let sizes = sizes_cb.clone();
+                Box::pin(async move {
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                    sizes.lock().unwrap().push(items.len());
+                    items
+                        .into_iter()
+                        .map(|(_, chunks, _)| StoreOutcome::Stored {
+                            chunks_created: chunks,
+                        })
+                        .collect()
+                })
+            },
+        );
 
         let batcher = IngestBatcher::spawn(
             process,
@@ -305,27 +319,29 @@ mod tests {
     /// that corresponds to its own doc, identified by position.
     #[tokio::test]
     async fn per_doc_outcomes_are_delivered_in_order() {
-        let process: BatchProcessFn = Arc::new(|items: Vec<(RawDocument, usize)>| {
-            Box::pin(async move {
-                items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (_, chunks))| {
-                        if i % 2 == 0 {
-                            StoreOutcome::Stored {
-                                chunks_created: chunks,
+        let process: BatchProcessFn = Arc::new(
+            |items: Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)>| {
+                Box::pin(async move {
+                    items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (_, chunks, _))| {
+                            if i % 2 == 0 {
+                                StoreOutcome::Stored {
+                                    chunks_created: chunks,
+                                }
+                            } else {
+                                StoreOutcome::GateRejected {
+                                    reason: "not_novel".into(),
+                                    detail: "too similar to existing".into(),
+                                    similar_to: Some(format!("mem_existing_{i}")),
+                                }
                             }
-                        } else {
-                            StoreOutcome::GateRejected {
-                                reason: "not_novel".into(),
-                                detail: "too similar to existing".into(),
-                                similar_to: Some(format!("mem_existing_{i}")),
-                            }
-                        }
-                    })
-                    .collect()
-            })
-        });
+                        })
+                        .collect()
+                })
+            },
+        );
         let batcher = IngestBatcher::spawn(
             process,
             BatcherConfig {
@@ -369,18 +385,20 @@ mod tests {
     async fn single_submit_flushes_after_window_not_after_timeout() {
         let invocations = Arc::new(AtomicUsize::new(0));
         let invocations_cb = invocations.clone();
-        let process: BatchProcessFn = Arc::new(move |items: Vec<(RawDocument, usize)>| {
-            let invocations = invocations_cb.clone();
-            Box::pin(async move {
-                invocations.fetch_add(1, Ordering::SeqCst);
-                items
-                    .into_iter()
-                    .map(|(_, chunks)| StoreOutcome::Stored {
-                        chunks_created: chunks,
-                    })
-                    .collect()
-            })
-        });
+        let process: BatchProcessFn = Arc::new(
+            move |items: Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)>| {
+                let invocations = invocations_cb.clone();
+                Box::pin(async move {
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                    items
+                        .into_iter()
+                        .map(|(_, chunks, _)| StoreOutcome::Stored {
+                            chunks_created: chunks,
+                        })
+                        .collect()
+                })
+            },
+        );
         let batcher = IngestBatcher::spawn(
             process,
             BatcherConfig {
@@ -411,18 +429,20 @@ mod tests {
     async fn flushes_at_max_batch_size_then_starts_next_batch() {
         let observed_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
         let sizes_cb = observed_sizes.clone();
-        let process: BatchProcessFn = Arc::new(move |items: Vec<(RawDocument, usize)>| {
-            let sizes = sizes_cb.clone();
-            Box::pin(async move {
-                sizes.lock().unwrap().push(items.len());
-                items
-                    .into_iter()
-                    .map(|(_, chunks)| StoreOutcome::Stored {
-                        chunks_created: chunks,
-                    })
-                    .collect()
-            })
-        });
+        let process: BatchProcessFn = Arc::new(
+            move |items: Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)>| {
+                let sizes = sizes_cb.clone();
+                Box::pin(async move {
+                    sizes.lock().unwrap().push(items.len());
+                    items
+                        .into_iter()
+                        .map(|(_, chunks, _)| StoreOutcome::Stored {
+                            chunks_created: chunks,
+                        })
+                        .collect()
+                })
+            },
+        );
         let batcher = IngestBatcher::spawn(
             process,
             BatcherConfig {
@@ -456,11 +476,13 @@ mod tests {
     /// hanging.
     #[tokio::test]
     async fn fills_missing_outcome_slots_with_upsert_failed() {
-        let process: BatchProcessFn = Arc::new(|_items: Vec<(RawDocument, usize)>| {
-            Box::pin(async move {
-                Vec::new() /* intentional contract violation */
-            })
-        });
+        let process: BatchProcessFn = Arc::new(
+            |_items: Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)>| {
+                Box::pin(async move {
+                    Vec::new() /* intentional contract violation */
+                })
+            },
+        );
         let batcher = IngestBatcher::spawn(
             process,
             BatcherConfig {

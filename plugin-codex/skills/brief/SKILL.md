@@ -60,7 +60,7 @@ topic_arg="$(printf '%s\n' "$raw_args" | sed -E 's/[[:space:]]*space:[A-Za-z0-9_
 Call the Codex resolver:
 
 ```bash
-resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} ${topic_arg:+--topic "$topic_arg"} 2>/dev/null)"
+resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 ```

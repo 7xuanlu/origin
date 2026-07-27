@@ -576,7 +576,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 94;
+pub const SCHEMA_VERSION: u32 = 95;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -2740,6 +2740,7 @@ pub struct MemoryDB {
     pub(crate) _db: libsql::Database,
     pub(crate) conn: tokio::sync::Mutex<libsql::Connection>,
     entity_resolution_lock: tokio::sync::Mutex<()>,
+    space_write_lock: tokio::sync::Mutex<()>,
     pub(crate) lint_freshness: Arc<crate::lint::snapshot::LintFreshnessClock>,
     page_projection_tracker: Arc<crate::page_projection_tracker::PageProjectionTracker>,
     pub(crate) derived_artifact_state: Arc<crate::derived_artifact_state::DerivedArtifactState>,
@@ -2777,6 +2778,13 @@ fn title_looks_garbage(title: &str) -> bool {
 }
 
 impl MemoryDB {
+    /// Serialize a top-level Entity/Page destination from resolution through
+    /// persistence with Space rename/delete. Memory/import writes instead
+    /// carry stable IDs into their own DB transaction.
+    pub async fn lock_space_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.space_write_lock.lock().await
+    }
+
     pub fn page_projection_tracker(
         &self,
     ) -> Arc<crate::page_projection_tracker::PageProjectionTracker> {
@@ -2856,6 +2864,7 @@ impl MemoryDB {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
+            space_write_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3052,6 +3061,7 @@ impl MemoryDB {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
+            space_write_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3132,6 +3142,7 @@ impl MemoryDB {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
+            space_write_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -8146,6 +8157,14 @@ impl MemoryDB {
             if version < 94 {
                 self.migrate_94_entity_reader_cutover(version).await?;
             }
+
+            // Migration 95: daemon-owned Default save space. The stable Space
+            // row carries the bit so renames preserve the selection and deletes
+            // clear it through ordinary row deletion. A partial unique index
+            // makes "at most one" a database invariant.
+            if version < 95 {
+                self.migrate_95_default_save_space(version).await?;
+            }
         }
 
         Ok(())
@@ -10141,6 +10160,56 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 94 applied: entity reader-cutover control plane (M3 PR-2 stage a)"
         );
+        Ok(())
+    }
+
+    async fn migrate_95_default_save_space(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(95, prior_version).await?;
+
+        let columns = self.get_table_columns("spaces").await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m95 begin: {e}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            if !columns.contains("is_default") {
+                conn.execute(
+                    "ALTER TABLE spaces ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m95 add is_default: {e}")))?;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_spaces_single_default
+                 ON spaces(is_default) WHERE is_default = 1",
+                (),
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m95 default index: {e}")))?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m95 commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+        drop(conn);
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 95", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m95 bump: {e}")))?;
+        log::info!("[migration] Migration 95 applied: daemon-owned Default save space");
         Ok(())
     }
 }
@@ -13523,7 +13592,7 @@ impl MemoryDB {
                 "SELECT s.id, s.name, s.description, s.suggested, s.created_at, s.updated_at,
                         (SELECT COUNT(DISTINCT c.source_id) FROM memories c WHERE c.space = s.name AND c.source = 'memory' AND c.pending_revision = 0 AND COALESCE(c.is_recap, 0) = 0 AND c.source_id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL AND pending_revision = 0 AND source = 'memory' GROUP BY supersedes)) as mem_count,
                         (SELECT COUNT(*) FROM entities e WHERE e.space = s.name) as ent_count,
-                        s.sort_order, s.starred
+                        s.sort_order, s.starred, s.is_default
                  FROM spaces s
                  WHERE s.id != ?1
                  ORDER BY s.starred DESC, s.sort_order, s.name",
@@ -13549,6 +13618,7 @@ impl MemoryDB {
                 entity_count: row.get::<u64>(7).unwrap_or(0),
                 sort_order: row.get::<i64>(8).unwrap_or(0),
                 starred: row.get::<i32>(9).unwrap_or(0) != 0,
+                is_default: row.get::<i32>(10).unwrap_or(0) != 0,
             });
         }
         Ok(spaces)
@@ -13561,7 +13631,7 @@ impl MemoryDB {
                 "SELECT s.id, s.name, s.description, s.suggested, s.created_at, s.updated_at,
                         (SELECT COUNT(DISTINCT c.source_id) FROM memories c WHERE c.space = s.name AND c.source = 'memory' AND c.pending_revision = 0 AND COALESCE(c.is_recap, 0) = 0 AND c.source_id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL AND pending_revision = 0 AND source = 'memory' GROUP BY supersedes)) as mem_count,
                         (SELECT COUNT(*) FROM entities e WHERE e.space = s.name) as ent_count,
-                        s.sort_order
+                        s.sort_order, s.starred, s.is_default
                  FROM spaces s WHERE s.name = ?1",
                 libsql::params![name],
             )
@@ -13584,6 +13654,7 @@ impl MemoryDB {
                 entity_count: row.get::<u64>(7).unwrap_or(0),
                 sort_order: row.get::<i64>(8).unwrap_or(0),
                 starred: row.get::<i32>(9).unwrap_or(0) != 0,
+                is_default: row.get::<i32>(10).unwrap_or(0) != 0,
             }))
         } else {
             Ok(None)
@@ -13654,6 +13725,7 @@ impl MemoryDB {
             suggested,
             sort_order: next_order,
             starred: false,
+            is_default: false,
             memory_count: 0,
             entity_count: 0,
             created_at: now,
@@ -13667,6 +13739,7 @@ impl MemoryDB {
         new_name: &str,
         description: Option<&str>,
     ) -> Result<Space, WenlanError> {
+        let _space_write_guard = self.space_write_lock.lock().await;
         // Renaming a space TO the reserved sentinel id would re-open the M1
         // collision (see `create_space`); reject it. The word "unfiled" stays a
         // legal rename target.
@@ -13755,6 +13828,7 @@ impl MemoryDB {
     /// - "delete" = memories are deleted entirely
     /// - "move:target" = memories moved to target space
     pub async fn delete_space(&self, name: &str, memory_action: &str) -> Result<(), WenlanError> {
+        let _space_write_guard = self.space_write_lock.lock().await;
         let conn = self.conn.lock().await;
         let now_ts = chrono::Utc::now().timestamp();
         let page_now = chrono::Utc::now().to_rfc3339();
@@ -14061,6 +14135,7 @@ impl MemoryDB {
                 "destination space must differ from source space".to_string(),
             ));
         }
+        let _space_write_guard = self.space_write_lock.lock().await;
         let conn = self.conn.lock().await;
         let now_ts = chrono::Utc::now().timestamp();
         let page_now = chrono::Utc::now().to_rfc3339();
@@ -14721,6 +14796,7 @@ impl MemoryDB {
         source_id: &str,
         space: Option<&str>,
     ) -> Result<(), WenlanError> {
+        let _space_write_guard = self.space_write_lock.lock().await;
         // memories.space is NOT NULL since migration 91 — unfiled folds to the
         // reserved UNFILED_SPACE_ID sentinel rather than SQL NULL.
         let space = Some(space.unwrap_or(UNFILED_SPACE_ID));
@@ -14974,8 +15050,54 @@ impl MemoryDB {
         let episode_enabled = has_memory_docs && episode_channel_enabled();
         let fact_enabled =
             has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
-        self.upsert_documents_with_derived_channels(docs, episode_enabled, fact_enabled, None, None)
-            .await
+        self.upsert_documents_with_derived_channels(
+            docs,
+            episode_enabled,
+            fact_enabled,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Upsert top-level writes while resolving their stable Space IDs inside
+    /// the same transaction that persists the rows. The provisional names on
+    /// `RawDocument` are used for embedding context; the transaction re-reads
+    /// the current names so a concurrent rename cannot file rows under an
+    /// orphaned name, and applies the explicit-vs-default deletion policy.
+    pub async fn upsert_documents_with_write_spaces(
+        &self,
+        docs: Vec<(
+            RawDocument,
+            Option<crate::space_context::ResolvedWriteSpace>,
+        )>,
+    ) -> Result<usize, WenlanError> {
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let write_spaces: HashMap<String, crate::space_context::ResolvedWriteSpace> = docs
+            .iter()
+            .filter_map(|(doc, resolved)| {
+                resolved
+                    .as_ref()
+                    .map(|resolved| (doc.source_id.clone(), resolved.clone()))
+            })
+            .collect();
+        let docs: Vec<RawDocument> = docs.into_iter().map(|(doc, _)| doc).collect();
+        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
+        let episode_enabled = has_memory_docs && episode_channel_enabled();
+        let fact_enabled =
+            has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
+        self.upsert_documents_with_derived_channels(
+            docs,
+            episode_enabled,
+            fact_enabled,
+            None,
+            None,
+            Some(write_spaces),
+        )
+        .await
     }
 
     /// Chunk, embed, and upsert documents while committing a retry receipt in
@@ -15000,6 +15122,7 @@ impl MemoryDB {
             fact_enabled,
             None,
             Some(receipt),
+            None,
         )
         .await
     }
@@ -15027,6 +15150,44 @@ impl MemoryDB {
             fact_enabled,
             Some(origin),
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Import/bulk-write variant that preserves both the enrichment-origin
+    /// receipt and stable Space identity through the persistence transaction.
+    pub async fn upsert_documents_with_enrichment_origin_and_write_spaces(
+        &self,
+        docs: Vec<(
+            RawDocument,
+            Option<crate::space_context::ResolvedWriteSpace>,
+        )>,
+        origin: EnrichmentOrigin,
+    ) -> Result<usize, WenlanError> {
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let write_spaces: HashMap<String, crate::space_context::ResolvedWriteSpace> = docs
+            .iter()
+            .filter_map(|(doc, resolved)| {
+                resolved
+                    .as_ref()
+                    .map(|resolved| (doc.source_id.clone(), resolved.clone()))
+            })
+            .collect();
+        let docs: Vec<RawDocument> = docs.into_iter().map(|(doc, _)| doc).collect();
+        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
+        let episode_enabled = has_memory_docs && episode_channel_enabled();
+        let fact_enabled =
+            has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
+        self.upsert_documents_with_derived_channels(
+            docs,
+            episode_enabled,
+            fact_enabled,
+            Some(origin),
+            None,
+            Some(write_spaces),
         )
         .await
     }
@@ -15045,17 +15206,19 @@ impl MemoryDB {
             has_memory_docs && fact_enabled,
             None,
             None,
+            None,
         )
         .await
     }
 
     async fn upsert_documents_with_derived_channels(
         &self,
-        docs: Vec<RawDocument>,
+        mut docs: Vec<RawDocument>,
         episode_enabled: bool,
         fact_enabled: bool,
         enrichment_origin: Option<EnrichmentOrigin>,
         operation_receipt: Option<OperationReceipt<'_>>,
+        write_spaces: Option<HashMap<String, crate::space_context::ResolvedWriteSpace>>,
     ) -> Result<usize, WenlanError> {
         if docs.is_empty() {
             return Ok(0);
@@ -15402,6 +15565,69 @@ impl MemoryDB {
 
         let total = memory_rows.len();
         let transaction_result: Result<(), WenlanError> = async {
+            if let Some(write_spaces) = write_spaces.as_ref() {
+                let mut finalized_names: HashMap<String, Option<String>> = HashMap::new();
+                for (source_id, resolved) in write_spaces {
+                    let finalized_name = if let Some(space_id) = resolved.space_id.as_deref() {
+                        let mut rows = conn
+                            .query(
+                                "SELECT name FROM spaces WHERE id = ?1 AND id != ?2",
+                                libsql::params![space_id, UNFILED_SPACE_ID],
+                            )
+                            .await
+                            .map_err(|e| {
+                                WenlanError::VectorDb(format!(
+                                    "finalize write Space lookup: {e}"
+                                ))
+                            })?;
+                        let name = rows
+                            .next()
+                            .await
+                            .map_err(|e| {
+                                WenlanError::VectorDb(format!(
+                                    "finalize write Space lookup row: {e}"
+                                ))
+                            })?
+                            .map(|row| row.get::<String>(0))
+                            .transpose()
+                            .map_err(|e| {
+                                WenlanError::VectorDb(format!(
+                                    "finalize write Space name: {e}"
+                                ))
+                            })?;
+                        drop(rows);
+                        match name {
+                            Some(name) => Some(name),
+                            None
+                                if resolved.source
+                                    == wenlan_types::WriteSpaceSource::Default =>
+                            {
+                                None
+                            }
+                            None => {
+                                return Err(WenlanError::Validation(format!(
+                                    "Selected Space no longer exists (id '{space_id}'); choose another destination"
+                                )));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    finalized_names.insert(source_id.clone(), finalized_name);
+                }
+
+                for doc in &mut docs {
+                    if let Some(name) = finalized_names.get(&doc.source_id) {
+                        doc.space = name.clone();
+                    }
+                }
+                for row in &mut memory_rows {
+                    if let Some(name) = finalized_names.get(&row.source_id) {
+                        row.space = name.clone();
+                    }
+                }
+            }
+
             // Replacement rows inherit one source-wide generation computed
             // under the same write transaction as delete + insert. Fresh
             // sources begin at v1; semantic replacements advance old + 1.
@@ -25961,6 +26187,7 @@ impl MemoryDB {
         &self,
         source_agent: &str,
         window_secs: i64,
+        space: Option<&str>,
     ) -> Result<Vec<(String, String)>, WenlanError> {
         let conn = self.conn.lock().await;
         let now = std::time::SystemTime::now()
@@ -25968,6 +26195,7 @@ impl MemoryDB {
             .unwrap_or_default()
             .as_secs() as i64;
         let cutoff = now - window_secs;
+        let persisted_space = space.unwrap_or(UNFILED_SPACE_ID);
 
         let mut rows = conn
             .query(
@@ -25976,9 +26204,10 @@ impl MemoryDB {
                    AND source_agent = ?1 \
                    AND entity_id IS NULL \
                    AND last_modified > ?2 \
+                   AND space = ?3 \
                  ORDER BY last_modified ASC \
                  LIMIT 10",
-                libsql::params![source_agent, cutoff],
+                libsql::params![source_agent, cutoff, persisted_space],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("find_recent_batch: {}", e)))?;
@@ -37086,10 +37315,10 @@ impl MemoryDB {
                      FROM pages
                      WHERE entity_id = ?1 AND status = 'active'
                        AND COALESCE(review_status, 'confirmed') = 'confirmed'
-                       AND (?2 IS NULL OR space = ?2)
+                       AND (?2 IS NULL OR (?2 = ?4 AND space IS NULL) OR space = ?2)
                        AND (?3 != 0 OR (COALESCE(user_edited, 0) = 0 AND COALESCE(creation_kind, 'distilled') <> 'authored'))
                      ORDER BY id ASC LIMIT 1",
-                    libsql::params![eid, workspace, allow_human_owned],
+                    libsql::params![eid, workspace, allow_human_owned, UNFILED_SPACE_ID],
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("scoped page entity match: {e}")))?;
@@ -37116,10 +37345,10 @@ impl MemoryDB {
                  FROM pages c
                  WHERE c.status = 'active' AND c.embedding IS NOT NULL
                    AND COALESCE(c.review_status, 'confirmed') = 'confirmed'
-                   AND (?2 IS NULL OR c.space = ?2)
+                   AND (?2 IS NULL OR (?2 = ?4 AND c.space IS NULL) OR c.space = ?2)
                    AND (?3 != 0 OR (COALESCE(c.user_edited, 0) = 0 AND COALESCE(c.creation_kind, 'distilled') <> 'authored'))
                  ORDER BY dist ASC LIMIT 1",
-                libsql::params![emb_sql, workspace, allow_human_owned],
+                libsql::params![emb_sql, workspace, allow_human_owned, UNFILED_SPACE_ID],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("scoped page similarity: {e}")))?;
@@ -43018,6 +43247,7 @@ pub(crate) mod tests {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
+            space_write_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -47550,7 +47780,7 @@ pub(crate) mod tests {
         let req = wenlan_types::requests::CreateEntityRequest {
             name: "Convergence Test Entity".to_string(),
             entity_type: "concept".to_string(),
-            space: None,
+            space: None.into(),
             source_agent: Some("test".to_string()),
             confidence: None,
         };
@@ -48352,6 +48582,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            db.create_space("new-space", None, false).await.unwrap();
             {
                 let conn = db.conn.lock().await;
                 conn.execute(
@@ -67864,7 +68095,7 @@ pub(crate) mod tests {
                 wenlan_types::requests::CreateEntityRequest {
                     name: "Vorpalblade Jabberwock Inc".to_string(),
                     entity_type: "project".to_string(),
-                    space: None,
+                    space: None.into(),
                     source_agent: Some("test".to_string()),
                     confidence: None,
                 },
@@ -75071,6 +75302,7 @@ pub(crate) mod tests {
             _db: raw_db,
             conn: tokio::sync::Mutex::new(conn),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
+            space_write_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),

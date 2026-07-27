@@ -22,6 +22,7 @@ pub mod repair_plan;
 pub mod requests;
 pub mod responses;
 pub mod sources;
+pub mod space_context;
 pub mod system_info;
 pub mod working_memory;
 
@@ -57,6 +58,7 @@ pub use responses::{
     RevisionAcceptResponse, RevisionDismissResponse,
 };
 pub use sources::{MemoryType, RawDocument, SourceType, StabilityTier, SyncStatus};
+pub use space_context::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 use serde::{Deserialize, Serialize};
 

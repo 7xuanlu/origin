@@ -89,7 +89,7 @@ impl ScopeFixture {
                 content: format!("page canary {title}"),
                 summary: None,
                 entity_id: None,
-                space: Some(workspace.to_string()),
+                space: (Some(workspace.to_string())).into(),
                 source_memory_ids: Vec::new(),
                 creation_kind: Some("authored".to_string()),
                 workspace: Some(workspace.to_string()),

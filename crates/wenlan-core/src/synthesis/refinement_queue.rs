@@ -296,7 +296,7 @@ async fn apply_cross_space_discovery(
         content,
         summary: None,
         entity_id: None,
-        space: Some(space.to_string()),
+        space: (Some(space.to_string())).into(),
         source_memory_ids: source_ids.to_vec(),
         creation_kind: Some("distilled".to_string()),
         workspace: Some(space.to_string()),

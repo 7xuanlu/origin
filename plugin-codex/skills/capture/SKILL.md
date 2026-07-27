@@ -32,7 +32,7 @@ If `content` is empty, ask the user what they want to capture.
 Call the Codex resolver:
 
 ```bash
-resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} --topic "$content" 2>/dev/null)"
+resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 ```
@@ -41,11 +41,9 @@ If `space` is non-empty, print `Resolved space: <space> (from <source-layer>)`
 and pass it to the `capture` MCP tool. If `space` is empty, print
 `Resolved space: none (unscoped)` and omit the `space` parameter.
 
-If `source_layer` is `arg`, also print:
-
-```text
-Created new space '<space>' from arg. Register it later if you want it pinned.
-```
+After capture, relay the tool's returned `space`, `space_source`, and
+`write_outcome`; those fields describe what the daemon actually persisted and
+are authoritative.
 
 ## How to invoke
 

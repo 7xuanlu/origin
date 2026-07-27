@@ -134,7 +134,7 @@ async fn create_page_fixture(db: &MemoryDB, fixture: PageFixture<'_>) -> String 
         content: content.to_string(),
         summary: summary.map(str::to_string),
         entity_id: None,
-        space: space.map(str::to_string),
+        space: (space.map(str::to_string)).into(),
         source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
         creation_kind: Some(creation_kind.to_string()),
         workspace: workspace.map(str::to_string),
@@ -589,7 +589,7 @@ async fn create_page_persists_workspace() {
             .to_string(),
         summary: Some("quarterly review planning".to_string()),
         entity_id: None,
-        space: None, // space is the category column; workspace is the new axis
+        space: (None).into(), // space is the category column; workspace is the new axis
         source_memory_ids: vec![],
         creation_kind: Some("authored".to_string()),
         workspace: Some("work".to_string()),

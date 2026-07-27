@@ -5979,7 +5979,7 @@ mod tests {
                 entity_id: None,
                 source_memory_ids,
                 creation_kind: Some(creation_kind.to_string()),
-                space: Some("work".to_string()),
+                space: Some("work".to_string()).into(),
                 workspace: Some("work".to_string()),
             },
             "test",

@@ -203,6 +203,12 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
             get(memory_routes::handle_list_spaces).post(memory_routes::handle_create_space),
         )
         .route(
+            "/api/spaces/default",
+            get(memory_routes::handle_get_default_space)
+                .put(memory_routes::handle_set_default_space)
+                .delete(memory_routes::handle_clear_default_space),
+        )
+        .route(
             "/api/spaces/{name}",
             put(memory_routes::handle_update_space).delete(memory_routes::handle_delete_space),
         )

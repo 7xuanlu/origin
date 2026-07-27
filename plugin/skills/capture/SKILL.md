@@ -43,6 +43,10 @@ If `space` is empty, print:
 
     Resolved space: none (unscoped)
 
+This line reports the proposed client context. After capture, relay the tool's
+returned `space`, `space_source`, and `write_outcome`; those fields describe
+what the daemon actually persisted and are authoritative.
+
 Unknown spaces are not auto-created. Register one through the resolved CLI
 binary, or omit `space` to store uncategorized:
 
@@ -89,10 +93,11 @@ project, tool, place. Use the exact name. Example: "Alice prefers TDD
 because…" → `entity="Alice"`. If the content has no named anchor,
 omit `entity`.
 
-### `topic` / `space` inference
+### Space inference
 
 - cwd inside a repo → repo name (e.g. `~/Repos/wenlan/...` → `"wenlan"`).
-- Outside any repo → most recent topic from the conversation, or omit.
+- Outside configured or registered repo context → omit the client Space and
+  let the daemon Default decide the write.
 - Pass `space` only when scope is known. If uncertain, omit it or inspect the
   registered spaces first:
 
