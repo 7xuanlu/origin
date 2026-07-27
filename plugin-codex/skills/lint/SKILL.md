@@ -1,6 +1,6 @@
 ---
 name: lint
-description: Run Wenlan diagnostics or resolve every finding into a ready repair, review item, system action, or blocker.
+description: Lint Wenlan memory quality and hygiene, check vocabulary, or resolve every finding into a ready repair, review item, system action, or blocker.
 argument-hint: "[deep|repair] [global|uncategorized|space:<name>]"
 allowed-tools: ["Bash", "mcp__wenlan__lint", "mcp__wenlan__get_lint_agent_work_page", "mcp__wenlan__prepare_lint_repair", "mcp__wenlan__prepare_lint_repair_plan", "mcp__wenlan__get_lint_repair_plan_entries", "mcp__wenlan__apply_lint_repair", "mcp__wenlan__verify_lint_repair"]
 user-invocable: true
@@ -19,7 +19,9 @@ For `global`, omit `space`. For `uncategorized`, pass
 `space="uncategorized"`. For `space:<name>`, pass that name. With no explicit
 scope, call `plugin-codex/bin/resolve-space.sh --cwd "$PWD"`; use a non-empty
 result, otherwise omit `space`. Bash is allowed only for that exact resolver.
-There is no CLI or HTTP fallback.
+CLI fallback: `wenlan lint --profile deep --agent_assist` (submissions via
+`--agent-submission <file>`); the MCP repair-manifest tools have no CLI
+equivalent yet.
 
 Plain `/lint`, `/lint deep`, the lint MCP tool, and `/api/lint` are fully
 read-only. `/lint repair` begins with the same read-only diagnostics;

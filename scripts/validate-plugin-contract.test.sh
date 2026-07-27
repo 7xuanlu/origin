@@ -242,7 +242,7 @@ assert_rejects "codex lint daemon handoff drift" \
     "$TMPDIR_TEST/root/plugin-codex/skills/lint/SKILL.md"
 
 assert_rejects "claude lint fallback drift" \
-    perl -0pi -e 's/There is no CLI or\s+HTTP fallback\./There is a CLI fallback./g' \
+    perl -0pi -e 's/CLI fallback: `wenlan lint --profile deep --agent_assist`/There is no CLI fallback./g' \
     "$TMPDIR_TEST/root/plugin/skills/lint/SKILL.md"
 
 assert_rejects "codex lint repair mode drift" \

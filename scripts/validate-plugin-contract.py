@@ -61,7 +61,7 @@ LINT_SHARED_GUARDRAILS = [
     "Do not compare General and Deep Page digests across profiles because their Page scan coverage intentionally differs.",
     "Lead repair output with exactly one compact typed-count funnel",
     "Never substitute check, family, or candidate counts for occurrence counts",
-    "no CLI or HTTP fallback",
+    "CLI fallback: `wenlan lint --profile deep --agent_assist`",
     "global",
     "uncategorized",
     "Plain `/lint`, `/lint deep`, the lint MCP tool, and `/api/lint` are fully read-only",
@@ -97,7 +97,7 @@ LINT_SHARED_GUARDRAILS = [
     "Never call `apply_lint_repair` in the same turn as `prepare_lint_repair_plan`",
     "applied_unverified",
     "Match every line byte-for-byte",
-    "no CLI or HTTP fallback",
+    "the MCP repair-manifest tools have no CLI equivalent yet",
 ]
 ENRICHMENT_CONSENT_GUARDRAILS = [
     "wenlan enrichment status",
