@@ -1985,7 +1985,7 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Load session context — identity, preferences, goals, and topic-relevant memories. Call this FIRST at the start of every session before doing anything else. Also call on major topic shifts or when the user says 'catch me up' or 'what's the background on'.\n\nThis returns a curated blend of who the user is and what's relevant. For specific factual lookups, use recall instead. Use the result to model how the user thinks, not just to look things up — their preferences and corrections tell you how they want to be helped.",
+        description = "Load session context — identity, preferences, and topic-relevant memories. Call this FIRST at the start of every session before doing anything else. Also call on major topic shifts or when the user says 'catch me up' or 'what's the background on'.\n\nThis returns a curated blend of who the user is and what's relevant. For specific factual lookups, use recall instead. Use the result to model how the user thinks, not just to look things up — their preferences and corrections tell you how they want to be helped.",
         annotations(title = "Context", read_only_hint = true, open_world_hint = false)
     )]
     async fn context(
@@ -2472,7 +2472,7 @@ impl ServerHandler for WenlanMcpServer {
              Wenlan is cumulative: each memory you store can be recalled, linked, and distilled into knowledge over time. \
              It's also shared across all the user's tools: what you write, other agents (Claude Desktop, Claude Code, \
              ChatGPT, Cursor, etc.) will read later. Write for any future reader, not just this conversation.\n\n\
-             FIRST THING EVERY SESSION: Call context to load the user's identity, preferences, goals, and\n\
+             FIRST THING EVERY SESSION: Call context to load the user's identity, preferences, and\n\
              topic-relevant memories. This is how you know who you're talking to. Use the result to model how the \
              user thinks — their preferences, corrections, and past decisions tell you how they want to be helped, \
              not just what they already know.\n\n\
