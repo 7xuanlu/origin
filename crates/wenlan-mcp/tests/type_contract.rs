@@ -11,8 +11,11 @@
 use rmcp::model::{CallToolResult, RawContent};
 use wenlan_mcp::client::WenlanClient;
 use wenlan_mcp::tools::{
-    CaptureParams, ContextParams, ListPendingParams, RecallParams, TransportMode, WenlanMcpServer,
+    CaptureParams, ContextParams, ListPendingImportsParams, ListPendingParams,
+    ListRejectionsParams, RecallParams, TransportMode, WenlanMcpServer,
 };
+use wenlan_types::import::PendingImport;
+use wenlan_types::memory::RejectionRecord;
 use wenlan_types::memory::{IndexedFileInfo, SearchResult};
 use wenlan_types::responses::{
     ChatContextResponse, DeleteResponse, KnowledgeContext, ListMemoriesResponse, ProfileContext,
@@ -844,6 +847,150 @@ async fn origin_client_omits_x_agent_name_when_unset() {
         headers.get("x-agent-name").is_none(),
         "x-agent-name header must be absent when agent_name is not set"
     );
+}
+
+// ===== list_pending_imports =====
+
+fn sample_pending_import(id: &str) -> PendingImport {
+    PendingImport {
+        id: id.into(),
+        vendor: "claude".into(),
+        stage: "ingest".into(),
+        source_path: "/tmp/import.zip".into(),
+        processed_conversations: 5,
+        total_conversations: Some(20),
+    }
+}
+
+#[tokio::test]
+async fn list_pending_imports_happy_path() {
+    let (mock, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/import/state"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(vec![sample_pending_import("imp_1")]),
+        )
+        .mount(&mock)
+        .await;
+
+    let result = make_server(client)
+        .list_pending_imports_impl(ListPendingImportsParams {})
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(text.starts_with("1 pending import(s)"), "got: {text}");
+    assert!(text.contains("imp_1"), "got: {text}");
+}
+
+#[tokio::test]
+async fn list_pending_imports_envelope_guard() {
+    let (mock, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/import/state"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": []})))
+        .mount(&mock)
+        .await;
+
+    let result = make_server(client)
+        .list_pending_imports_impl(ListPendingImportsParams {})
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(
+        result.is_error.unwrap_or(false),
+        "wrong response shape must surface as a tool error; got: {text}"
+    );
+    assert!(text.contains("Failed to parse"), "got: {text}");
+}
+
+// ===== list_rejections =====
+
+fn sample_rejection_record(id: &str) -> RejectionRecord {
+    RejectionRecord {
+        id: id.into(),
+        content: "Low quality content.".into(),
+        source_agent: Some("test-agent".into()),
+        rejection_reason: "low_quality".into(),
+        rejection_detail: Some("Quality score below threshold.".into()),
+        similarity_score: None,
+        similar_to_source_id: None,
+        created_at: 1_715_000_000,
+    }
+}
+
+#[tokio::test]
+async fn list_rejections_happy_path() {
+    let (mock, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/memory/rejections"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(vec![sample_rejection_record("rej_abc1")]),
+        )
+        .mount(&mock)
+        .await;
+
+    let result = make_server(client)
+        .list_rejections_impl(ListRejectionsParams {
+            limit: None,
+            reason: None,
+        })
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(text.starts_with("1 rejection(s)"), "got: {text}");
+    assert!(text.contains("rej_abc1"), "got: {text}");
+    assert!(text.contains("low_quality"), "got: {text}");
+}
+
+#[tokio::test]
+async fn list_rejections_envelope_guard() {
+    let (mock, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/memory/rejections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+        .mount(&mock)
+        .await;
+
+    let result = make_server(client)
+        .list_rejections_impl(ListRejectionsParams {
+            limit: None,
+            reason: None,
+        })
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(
+        result.is_error.unwrap_or(false),
+        "envelope-wrapped response must surface as tool error; got: {text}"
+    );
+    assert!(text.contains("Failed to parse"), "got: {text}");
+}
+
+#[tokio::test]
+async fn list_rejections_passes_query_params() {
+    let (mock, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/memory/rejections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<RejectionRecord>::new()))
+        .mount(&mock)
+        .await;
+
+    make_server(client)
+        .list_rejections_impl(ListRejectionsParams {
+            limit: Some(30),
+            reason: Some("duplicate".into()),
+        })
+        .await
+        .unwrap();
+
+    let received = mock
+        .received_requests()
+        .await
+        .expect("wiremock captured no requests");
+    assert_eq!(received.len(), 1);
+    let url = received[0].url.to_string();
+    assert!(url.contains("limit=30"), "got: {url}");
+    assert!(url.contains("reason=duplicate"), "got: {url}");
 }
 
 // ===== list_pending_revisions =====

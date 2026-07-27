@@ -863,6 +863,22 @@ pub struct GetPageSourcesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetMemoryRevisionsParams {
+    #[schemars(
+        description = "Memory source id (e.g. 'mem_abc' or 'merged_<uuid>'). Returns the full supersede chain ordered by depth (0 = current)."
+    )]
+    pub memory_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPageRevisionsParams {
+    #[schemars(
+        description = "Page id (e.g. 'page_abc'). Returns the version changelog ordered newest-first."
+    )]
+    pub page_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AcceptRevisionRequest {
     /// The source_id of the memory whose pending revision should be accepted.
     pub target_source_id: String,
@@ -872,6 +888,19 @@ pub struct AcceptRevisionRequest {
 pub struct DismissRevisionRequest {
     /// The source_id of the memory whose pending revision should be dismissed.
     pub target_source_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListPendingImportsParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListRejectionsParams {
+    /// Maximum records to return. Default 50. Clamped to 1..=500.
+    #[serde(default, deserialize_with = "deserialize_optional_usize_lenient")]
+    pub limit: Option<usize>,
+    /// Filter by rejection reason code (e.g. "duplicate", "low_quality").
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1707,6 +1736,35 @@ impl WenlanMcpServer {
         ))]))
     }
 
+    pub async fn get_memory_revisions_impl(
+        &self,
+        memory_id: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("/api/memory/{}/revisions", memory_id);
+        let resp: ListMemoryRevisionsResponse =
+            try_call!(self.client.get(&path), "get_memory_revisions");
+        let pretty = serde_json::to_string_pretty(&resp)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "chain depth {}\n{}",
+            resp.chain_depth, pretty
+        ))]))
+    }
+
+    pub async fn get_page_revisions_impl(&self, page_id: &str) -> Result<CallToolResult, McpError> {
+        let path = format!("/api/pages/{}/revisions", page_id);
+        let resp: ListPageRevisionsResponse =
+            try_call!(self.client.get(&path), "get_page_revisions");
+        let pretty = serde_json::to_string_pretty(&resp)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "version {} ({} entries)\n{}",
+            resp.current_version,
+            resp.entries.len(),
+            pretty
+        ))]))
+    }
+
     pub async fn accept_revision_impl(
         &self,
         req: AcceptRevisionRequest,
@@ -1747,6 +1805,49 @@ impl WenlanMcpServer {
         let pretty = serde_json::to_string_pretty(&response)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(pretty)]))
+    }
+
+    pub async fn list_pending_imports_impl(
+        &self,
+        _params: ListPendingImportsParams,
+    ) -> Result<CallToolResult, McpError> {
+        let resp: Vec<wenlan_types::import::PendingImport> =
+            try_call!(self.client.get("/api/import/state"), "list_pending_imports");
+        let pretty = serde_json::to_string_pretty(&resp)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} pending import(s)\n{}",
+            resp.len(),
+            pretty
+        ))]))
+    }
+
+    pub async fn list_rejections_impl(
+        &self,
+        params: ListRejectionsParams,
+    ) -> Result<CallToolResult, McpError> {
+        let mut path = String::from("/api/memory/rejections");
+        let mut query = Vec::new();
+        if let Some(limit) = params.limit {
+            query.push(format!("limit={}", limit.clamp(1, 500)));
+        }
+        if let Some(reason) = params.reason.as_deref().filter(|reason| !reason.is_empty()) {
+            query.push(format!("reason={}", url_encode_simple(reason)));
+        }
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(&query.join("&"));
+        }
+
+        let resp: Vec<wenlan_types::memory::RejectionRecord> =
+            try_call!(self.client.get(&path), "list_rejections");
+        let pretty = serde_json::to_string_pretty(&resp)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} rejection(s)\n{}",
+            resp.len(),
+            pretty
+        ))]))
     }
 
     pub async fn list_pending_revisions_impl(
@@ -1812,6 +1913,19 @@ fn format_relation_ready_response(resp: CreateRelationResponse) -> String {
         text.push_str(&format!("\nwarning: {warning}"));
     }
     text
+}
+
+fn url_encode_simple(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte))
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 // ===== Tool Registrations =====
@@ -2140,6 +2254,40 @@ impl WenlanMcpServer {
     }
 
     #[tool(
+        description = "Fetch the supersede chain for one memory, ordered by depth (0 = current). Use after recall only when the user explicitly asks for that memory's history or evolution, or to verify that a correction was recorded.",
+        annotations(
+            title = "Get memory revisions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_memory_revisions(
+        &self,
+        Parameters(params): Parameters<GetMemoryRevisionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.get_memory_revisions_impl(&params.memory_id).await
+    }
+
+    #[tool(
+        description = "Fetch the version changelog for one page, ordered newest-first. Use only when the user explicitly asks for a page's changelog, version history, or which source memories triggered a re-distill.",
+        annotations(
+            title = "Get page revisions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_page_revisions(
+        &self,
+        Parameters(params): Parameters<GetPageRevisionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.get_page_revisions_impl(&params.page_id).await
+    }
+
+    #[tool(
         description = "Accept a pending memory revision. Replaces the target memory's content \
                        with the proposed revision content and removes the revision row from the \
                        pending list. Returns the consumed revision id. Returns an error if no \
@@ -2176,6 +2324,38 @@ impl WenlanMcpServer {
         Parameters(req): Parameters<DismissRevisionRequest>,
     ) -> Result<CallToolResult, McpError> {
         self.dismiss_revision_impl(req).await
+    }
+
+    #[tool(
+        description = "List in-flight chat-history imports awaiting processing or completion. Use only when the user asks what imports are running, whether an export is done, or requests import progress. Returns id, vendor, stage, source path, and processed/total conversation counts.",
+        annotations(
+            title = "List pending imports",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_pending_imports(
+        &self,
+        Parameters(params): Parameters<ListPendingImportsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.list_pending_imports_impl(params).await
+    }
+
+    #[tool(
+        description = "List quality-gate rejections: memories the daemon discarded before storing due to duplication, low quality, or another filter. Use only to diagnose a missing capture or when the user asks what Wenlan rejected. Returns reason codes, detail, and similarity info; optional limit and reason filters narrow the audit.",
+        annotations(
+            title = "List rejections",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_rejections(
+        &self,
+        Parameters(params): Parameters<ListRejectionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.list_rejections_impl(params).await
     }
 
     #[tool(
@@ -4818,6 +4998,57 @@ mod tests {
     }
 
     #[test]
+    fn unique_read_only_detail_tools_are_registered_for_explicit_queries() {
+        let tools = WenlanMcpServer::tool_router().list_all();
+        for (name, trigger) in [
+            ("get_memory_revisions", "history"),
+            ("get_page_revisions", "changelog"),
+            ("list_pending_imports", "import progress"),
+            ("list_rejections", "missing capture"),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert_eq!(
+                tool.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.read_only_hint),
+                Some(true),
+                "{name} must remain read-only"
+            );
+            assert!(
+                tool.description
+                    .as_deref()
+                    .is_some_and(|description| description.contains(trigger)),
+                "{name} must advertise explicit trigger phrase {trigger:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unique_detail_tool_params_enforce_ids_and_accept_filters() {
+        let memory: GetMemoryRevisionsParams =
+            serde_json::from_value(serde_json::json!({"memory_id": "mem_1"})).unwrap();
+        assert_eq!(memory.memory_id, "mem_1");
+        assert!(serde_json::from_value::<GetMemoryRevisionsParams>(serde_json::json!({})).is_err());
+
+        let page: GetPageRevisionsParams =
+            serde_json::from_value(serde_json::json!({"page_id": "page_1"})).unwrap();
+        assert_eq!(page.page_id, "page_1");
+        assert!(serde_json::from_value::<GetPageRevisionsParams>(serde_json::json!({})).is_err());
+
+        serde_json::from_value::<ListPendingImportsParams>(serde_json::json!({})).unwrap();
+        let rejections: ListRejectionsParams = serde_json::from_value(serde_json::json!({
+            "limit": "30",
+            "reason": "duplicate"
+        }))
+        .unwrap();
+        assert_eq!(rejections.limit, Some(30));
+        assert_eq!(rejections.reason.as_deref(), Some("duplicate"));
+    }
+
+    #[test]
     fn capture_memory_type_schema_lists_every_canonical_type() {
         let params_schema = serde_json::to_string(&schemars::schema_for!(CaptureParams))
             .expect("CaptureParams schema serializes");
@@ -5128,7 +5359,7 @@ mod tests {
         );
     }
 
-    /// The 25 tools that remain after the 2026-07 consolidation Tranche 1.
+    /// The 26 tools in the final 2026-07 Phase A MCP surface.
     /// Deleting or adding a tool must edit this list deliberately.
     fn expected_tool_surface() -> Vec<&'static str> {
         vec![
@@ -5145,10 +5376,14 @@ mod tests {
             "forget",
             "get_lint_agent_work_page",
             "get_lint_repair_plan_entries",
+            "get_memory_revisions",
+            "get_page_revisions",
             "get_page_sources",
             "lint",
             "list_pending",
+            "list_pending_imports",
             "list_pending_revisions",
+            "list_rejections",
             "prepare_lint_repair",
             "prepare_lint_repair_plan",
             "recall",

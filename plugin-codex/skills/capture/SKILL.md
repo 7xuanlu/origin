@@ -5,7 +5,7 @@ description: >
   states a preference, makes a decision, corrects you, or shares a durable
   fact. Invoked as /capture <content>.
 argument-hint: "<content>"
-allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__create_entity", "mcp__wenlan__create_relation", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
+allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__create_entity", "mcp__wenlan__create_relation", "mcp__wenlan__list_rejections", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
 user-invocable: true
 ---
 
@@ -113,6 +113,10 @@ needed. `Entity <id> ready` does not imply that a new row was created.
 - File paths or git history the user can re-derive.
 - Agent operating rules that belong in AGENTS.md or another obey-tier file.
 - Single-word acknowledgments.
+
+If a capture the user expected is missing or the user explicitly asks why it
+was rejected, call `mcp__wenlan__list_rejections`. Do not list rejections after
+successful ordinary captures.
 
 ## Post-capture contradiction signal
 
