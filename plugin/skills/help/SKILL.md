@@ -59,9 +59,10 @@ View it without a GUI:
   git -C ~/.wenlan log --oneline   timeline of every memory + distill pass
   ln -s ~/.wenlan/pages ~/Vault/wenlan   # symlink into Obsidian for graph view
 
-~/.wenlan/ is a git repo. Skills auto-commit per logical batch (one per
-session, distill pass, or forget). Use git log / git diff / git revert
-as a free audit trail. No remote — purely local history.
+~/.wenlan/ is a git repo. Commits land at session boundaries (handoff
+or daemon events), not per capture; uncommitted page edits between
+sessions are normal. Use git log / git diff / git revert as a free
+audit trail. No remote — purely local history.
 
 Three classes of artifact:
   - memories: granular, queryable, live in DB only (confirmed = stays in DB)

@@ -394,8 +394,10 @@ Bash: git -C ~/.wenlan add -A && \
 ```
 
 The retry handles index.lock races — the daemon may be writing to
-`~/.wenlan/` at the same moment (auto-commit from captures). One-second
-wait is enough for the daemon to release the lock.
+`~/.wenlan/` at the same moment. Commits land at session boundaries
+(handoff or daemon events), not per capture; uncommitted page edits
+between sessions are normal. One second is enough for the daemon to
+release the lock.
 
 ## When to use
 
