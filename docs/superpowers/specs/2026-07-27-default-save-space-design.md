@@ -57,12 +57,19 @@ surfaces. A read without explicit or local context remains All Spaces.
 This separation preserves the app's whole-library overview while still making
 new writes predictable.
 
-### Explicit choice beats every default
+### Strict pins and overridable defaults are different controls
 
-The client-side write resolution order is:
+`WENLAN_SPACE` keeps its existing released meaning: it is a strict process
+pin for official clients. A conflicting explicit Space or All Spaces request
+is rejected, and MCP tool schemas omit caller-controlled Space fields while
+the pin is active. This is an agent guardrail, not an authorization boundary:
+Spaces organize one user's knowledge and do not isolate tenants or secrets.
 
-1. Explicit per-call space.
-2. `WENLAN_SPACE`.
+`WENLAN_DEFAULT_SPACE` is the overridable process context. When no strict pin
+is active, the client-side write resolution order is:
+
+1. Explicit per-call Space, including an explicit Uncategorized selection.
+2. `WENLAN_DEFAULT_SPACE`.
 3. Longest matching cwd mapping from `~/.wenlan/spaces.toml`.
 4. Current git repository basename, only when a registered Space has that
    exact name.
@@ -71,26 +78,30 @@ The client-side write resolution order is:
 
 The daemon-side write resolution order is:
 
-1. Request-body `space`.
+1. An explicit request-body `space`, including explicit `null` for
+   Uncategorized.
 2. `X-Wenlan-Space` header.
 3. Daemon-owned Default save space.
 4. Uncategorized.
 
-An explicit request-body value therefore overrides `WENLAN_SPACE`, because the
-environment value reaches the daemon as a fallback header or a lower-priority
-client resolution input. `WENLAN_SPACE` is a process context, not a lock.
+The daemon does not know whether a header came from a strict pin or an
+overridable context. Official clients enforce `WENLAN_SPACE` before sending
+the request; direct HTTP callers remain responsible for their own policy.
 
 ### Reads do not consult Default save space
 
-The read resolution order is:
+When no strict pin is active, the read resolution order is:
 
 1. Explicit per-call space.
-2. `X-Wenlan-Space` or an equivalent client-resolved local context.
-3. All Spaces.
+2. `WENLAN_DEFAULT_SPACE`.
+3. Longest matching cwd mapping.
+4. Registered repository basename.
+5. All Spaces.
 
 CLI read commands expose `--all-spaces` so a user can bypass
-`WENLAN_SPACE`, cwd mapping, or repo inference. Default save space is never in
-the read chain.
+`WENLAN_DEFAULT_SPACE`, cwd mapping, or repo inference. `--all-spaces` cannot
+bypass a strict `WENLAN_SPACE` pin. Default save space is never in the read
+chain.
 
 ### Uncategorized is the safe fallback
 
@@ -191,16 +202,21 @@ store.
 
 For the first release carrying this contract:
 
-1. After database initialization, the daemon checks the legacy top-level
-   `default` only when no database default exists.
-2. If the name resolves to a registered Space, the daemon marks that Space as
-   default.
-3. If the name is missing or unregistered, the daemon leaves the default
-   unset, logs one actionable warning, and writes nothing.
-4. The new default API mirrors set and clear operations to the legacy key so a
-   same-machine older CLI does not immediately display contradictory state.
-5. Rename rewrites the mirrored legacy name. Clear removes the legacy key, so a
-   later restart cannot re-import a value the user cleared.
+1. The database stores a durable `legacy_default_imported` migration watermark.
+2. After database initialization, the daemon checks the legacy top-level
+   `default` only when the watermark is absent and no database default exists.
+3. If the name resolves to a registered Space, one transaction marks that
+   Space as default and records the watermark.
+4. If the name is missing or unregistered, the daemon leaves the default
+   unset, emits one actionable warning only for a non-empty invalid value, and
+   still records the watermark.
+5. If a database default already exists, the daemon records the watermark
+   without reading or changing the legacy value.
+
+The daemon and new CLI never write the legacy top-level key. This avoids a
+dual-writer race with older CLIs that rewrite the whole TOML file without
+locking. An older CLI may display a stale legacy value, but it cannot
+resurrect that value in the daemon after the watermark exists.
 
 New CLI code reads and writes the daemon API. Resolver scripts continue reading
 only `[[mapping]]` blocks from `spaces.toml`; they no longer treat its
@@ -220,14 +236,42 @@ pub enum WriteSpaceSource {
 }
 
 pub struct ResolvedWriteSpace {
-    pub space: Option<String>,
+    pub space_id: Option<String>,
+    pub space_name: Option<String>,
     pub source: WriteSpaceSource,
 }
 ```
 
-The resolver accepts body and header candidates, validates any named candidate
-against registered Spaces, reads the daemon default when both are absent, and
-returns `None` plus `Uncategorized` when no default exists.
+Request bodies use a typed three-state target with a custom Serde visitor:
+
+```rust
+pub enum WriteSpaceTarget {
+    Inherit,
+    Uncategorized,
+    Named(String),
+}
+```
+
+A missing `space` key deserializes to `Inherit`, explicit JSON `null`
+deserializes to `Uncategorized`, and a non-empty JSON string deserializes to
+`Named`. This preserves the existing ergonomic JSON shape while distinguishing
+an explicit Uncategorized choice from omission. Empty or whitespace-only
+strings fail validation.
+
+The resolver accepts the body target and optional header candidate, validates
+any named candidate against registered Spaces, reads the daemon default only
+for `Inherit`, and returns no ID/name plus `Uncategorized` when no default
+exists.
+
+Named/default resolution carries the stable Space ID through asynchronous
+work. The final database transaction re-resolves the current name from that ID
+before persisting the existing name-backed scope columns:
+
+- A rename follows the stable ID and writes the new name.
+- If an explicitly named or header-selected Space was deleted, the write fails
+  with a validation error.
+- If the daemon Default save space was deleted, the write falls back to
+  Uncategorized.
 
 `Existing` is used only when an idempotent top-level create resolves an object
 that already exists. The response reports the object's persisted Space; the
@@ -259,6 +303,11 @@ It is not used by:
 Entity identity resolution remains global. Supplying or resolving a write
 destination does not force a duplicate Entity into that Space.
 
+Spaces are filing and retrieval context, not authorization, privacy, or tenant
+boundaries. A canonical Entity may therefore connect facts whose source
+Memories live in different Spaces. Clients must not describe a Space pin as a
+security sandbox.
+
 For `create_entity`:
 
 - A genuinely new Entity is created in the resolved write destination.
@@ -282,6 +331,9 @@ For daemon-derived Entities:
 
 - Post-ingest extraction and Memory import thread the source Memory's persisted
   Space into genuinely new Entities.
+- Time-windowed extraction batches are partitioned by the persisted source
+  Memory Space ID, including a distinct Uncategorized partition. A batch never
+  combines source Memories from different Spaces.
 - Existing Entity resolution remains global and never moves the match.
 - A derived write never re-runs Default save space after its source Memory has
   already been filed.
@@ -291,6 +343,18 @@ refinement actions:
 
 - Existing scope stays unchanged unless the operation is an explicit move or
   an explicit curation action whose contract already asks for a destination.
+
+For top-level Page creation, the existing `workspace` and `space` request
+fields are compatibility aliases for one write target:
+
+- If only one is present, use it.
+- If both are present with the same value, accept them.
+- If both are present with different values, reject the request instead of
+  silently choosing one.
+- After resolution, persist the same resolved destination to both
+  `pages.workspace` and `pages.space`.
+- Deduplication uses that resolved destination. An existing Page match reports
+  its own persisted destination through `attached_existing`.
 
 ## Truthful Write Receipts
 
@@ -344,6 +408,13 @@ Allowed top-level `write_outcome` values in this feature are:
 - `resolved_existing`
 - `attached_existing`
 
+`wenlan-types` owns `WriteSpaceSource` and `WriteOutcome` wire enums with
+snake-case serialization. Additive receipt fields are
+`Option<WriteSpaceSource>` / `Option<WriteOutcome>` with Serde defaults so new
+clients can read old-daemon responses. Each enum includes an unknown/future
+variant so a newer daemon does not make an older client reject an otherwise
+usable success response.
+
 Human-facing clients translate these fields, for example:
 
 ```text
@@ -385,10 +456,15 @@ Add global context options:
 --all-spaces
 ```
 
-`--space` is the explicit highest-priority context for scope-aware commands.
-`--all-spaces` is accepted only by reads and bypasses environment, cwd, and
-repo context. Passing both is a usage error. Passing `--all-spaces` to a write
-is a usage error.
+Without a strict pin, `--space` is the explicit highest-priority context for
+scope-aware commands.
+`--all-spaces` is accepted only by reads and bypasses
+`WENLAN_DEFAULT_SPACE`, cwd, and repo context. Passing both is a usage error.
+Passing `--all-spaces` to a write is a usage error.
+
+When `WENLAN_SPACE` is set, it is a strict pin: a conflicting `--space` or any
+`--all-spaces` request is a usage error. `WENLAN_DEFAULT_SPACE` is the
+overridable environment fallback and is ignored when a strict pin is active.
 
 Write commands send no space when all client-local layers miss; the daemon then
 applies Default save space or Uncategorized.
@@ -416,19 +492,28 @@ render `is_default` from daemon data rather than reading the TOML file.
 
 ## MCP and Plugin Design
 
-`WENLAN_SPACE` becomes a fallback:
+`WENLAN_SPACE` remains the released strict pin:
 
-- Keep the `space` property in tool schemas even when the environment variable
-  exists.
+- Omit the `space` property from tool schemas while the pin is active.
+- Runtime guards ignore any conflicting inbound Space even if a client uses a
+  cached schema.
+- Attach the pin through the common Space header.
+- Startup and documentation call it a strict process pin and clarify that it
+  is a guardrail, not authorization.
+
+`WENLAN_DEFAULT_SPACE` is the new overridable fallback:
+
+- Keep the `space` property in tool schemas.
 - `effective_space` returns an explicit non-empty tool argument first, then
-  `WENLAN_SPACE`.
-- The common `X-Wenlan-Space` header may continue carrying the environment
-  value because the daemon gives a request-body space higher priority.
-- Startup and documentation call this a process default/context, never a lock.
+  `WENLAN_DEFAULT_SPACE`.
+- The common Space header may carry the fallback only when the tool request
+  does not contain an explicit body target.
 
 The Claude and Codex resolver scripts:
 
-- Keep explicit argument, environment, and longest-prefix cwd mapping layers.
+- Treat `WENLAN_SPACE` as an unoverrideable pin.
+- Keep explicit argument, `WENLAN_DEFAULT_SPACE`, and longest-prefix cwd
+  mapping layers when no pin is active.
 - Check that a repo basename is registered before returning it.
 - Remove the top-level TOML default and topic fallback layers.
 - Return no client space when no local layer resolves, allowing the daemon
@@ -459,6 +544,12 @@ The Spaces management surface shows one Default badge and provides:
 
 The app reads and mutates the daemon default API. It does not read
 `~/.wenlan/spaces.toml`.
+
+The app feature-detects support through a `default_save_space` capability in
+`GET /api/status`. Capability absence means an older daemon: hide the default
+management controls and keep the existing write paths. Capability presence
+enables the default API, canonical Quick Capture path, and destination-aware
+receipts.
 
 ### Add Memory
 
@@ -497,12 +588,22 @@ semantics:
 
 - Unknown explicit, environment, or cwd-mapped Space: reject the operation and
   name the invalid value.
+- Conflicting explicit Space or All Spaces under `WENLAN_SPACE`: reject the
+  operation and name the active strict pin.
+- Empty or whitespace-only write-space strings: reject instead of treating
+  them as omission.
+- Explicit body `null`: write to Uncategorized and do not consult the header or
+  daemon default.
 - Unknown repo basename: skip repo inference and continue.
 - Invalid legacy default during migration: warn and leave default unset.
-- Default deleted: the database invariant clears it; the next write goes to
-  Uncategorized.
+- Default deleted before resolution: the database invariant clears it; the
+  next write goes to Uncategorized.
+- Space deleted after resolution: an explicit/header target fails; a daemon
+  default target falls back to Uncategorized at the final transaction.
 - Explicit body/header conflict: body wins and the receipt reports the body
   destination.
+- Page `workspace`/`space` conflict: reject instead of silently choosing an
+  axis.
 - Existing Entity in another Space: return `resolved_existing` and the actual
   Space; do not move or duplicate it.
 - App default lookup failure because the daemon is unavailable: preserve the
@@ -517,12 +618,16 @@ semantics:
 ### Stage 1: daemon and shared wire contract
 
 - Add default persistence and API.
+- Advertise `default_save_space` in the additive `/api/status` capabilities
+  array.
 - Add the write-space resolver.
 - Apply it to canonical Memory, Memory import, new Entity, and new Page writes.
 - Add truthful response fields.
 - Preserve current read behavior.
 
 This stage must ship before clients rely on the default API or response fields.
+It activates daemon-side defaults immediately for the canonical endpoints it
+owns; the capability is version negotiation, not a global activation gate.
 
 ### Stage 2: CLI, MCP, and plugin surfaces
 
@@ -536,6 +641,8 @@ This stage must ship before clients rely on the default API or response fields.
 
 - Update the app's pinned shared wire dependency to a release containing Stage
   1.
+- Feature-detect `default_save_space`; preserve old behavior against an older
+  daemon.
 - Add default management and one-off selectors.
 - Move Quick Capture to canonical Memory store.
 - Add destination-aware success UI.
@@ -551,23 +658,34 @@ local changes.
 - Migration produces at most one default and excludes the Uncategorized
   sentinel.
 - Set, replace, clear, rename, and delete preserve the lifecycle above.
-- Legacy valid default imports; invalid default does not.
-- Body beats header; header beats default; default beats Uncategorized.
+- Legacy valid default imports once; invalid default records the watermark and
+  does not retry; the daemon never rewrites TOML.
+- Body Named/Uncategorized beats header; header beats default; default beats
+  Uncategorized.
+- Missing, explicit null, and a named Space deserialize as three distinct write
+  targets.
 - Named unknown inputs fail.
+- Resolved stable IDs follow rename; explicit deletion fails while default
+  deletion falls back to Uncategorized.
 - Reads without body/header remain global even when a default exists.
 - Memory store, Memory import, Entity create, and Page create return persisted
   destination and outcome.
 - Existing Entity resolution reports its actual Space without moving it.
 - Page dedup reports `attached_existing` and the matched Page's actual Space.
+- Page `workspace` and `space` aliases agree or fail and persist one mirrored
+  destination.
 - Entity extraction and Memory import derive new Entity scope from the
   persisted source Memory instead of consulting the default a second time.
+- Time-windowed extraction batches do not mix Space IDs.
 - Relation and observation writes do not consume the default.
 
 ### CLI
 
 - `--agent-name` beats `WENLAN_AGENT_NAME`; absence sends no header.
-- Explicit space beats environment, mapping, repo, and daemon default.
-- Environment beats mapping and repo.
+- `WENLAN_SPACE` rejects conflicting explicit/All Spaces requests.
+- Without a strict pin, explicit Space beats `WENLAN_DEFAULT_SPACE`, mapping,
+  repo, and daemon default.
+- `WENLAN_DEFAULT_SPACE` beats mapping and repo.
 - Longest cwd mapping wins.
 - Registered repo basename resolves; unregistered basename is skipped.
 - `--all-spaces` bypasses local read context and is rejected for writes.
@@ -576,9 +694,11 @@ local changes.
 
 ### MCP and plugins
 
-- Tool schemas retain explicit `space` under `WENLAN_SPACE`.
-- Explicit tool space beats the environment fallback.
-- Header fallback still scopes calls without explicit tool space.
+- Tool schemas hide explicit `space` under strict `WENLAN_SPACE`.
+- Cached-schema runtime arguments cannot bypass the strict pin.
+- Tool schemas retain explicit `space` under `WENLAN_DEFAULT_SPACE`.
+- Explicit tool Space beats `WENLAN_DEFAULT_SPACE`.
+- Header fallback still scopes calls without explicit tool Space.
 - Resolver parity tests cover the new layer order.
 - No resolver returns a top-level TOML default or topic as a Space.
 - Capture, Entity, and Page outputs show actual destinations.
@@ -619,6 +739,7 @@ then the repository's documented build/test floor in its own clean worktree.
 - Do not make Default save space a read filter.
 - Do not auto-create Spaces from repository names.
 - Do not infer a repository inside `wenlan-app`.
+- Do not treat a Space or `WENLAN_SPACE` as authorization or tenant isolation.
 - Do not add an independent space to Relation or Observation.
 - Do not move an existing Entity when create resolves it.
 - Do not make an app one-off selector mutate the global default.
