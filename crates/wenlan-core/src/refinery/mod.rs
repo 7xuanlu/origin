@@ -940,7 +940,29 @@ async fn run_periodic_steep_with_api_scope(
         }
     {
         let phase = run_phase(Phase::CommunityDetection, || async {
-            let count = db_ref.detect_communities().await?;
+            // Keep the legacy label-prop producer live throughout PR-1 so the
+            // default-OFF flag and rollback path remain byte-compatible.
+            let legacy_count = db_ref.detect_communities().await?;
+            let shadow_count = if crate::db::community_leiden_enabled() {
+                let published_members = match db_ref
+                    .run_next_community_grouping_cycle()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("M4 community grouping: {error}"))
+                    })? {
+                    Some(crate::community_grouping::CommunityGroupingOutcome::Published(
+                        receipt,
+                    )) => receipt.member_count,
+                    Some(crate::community_grouping::CommunityGroupingOutcome::Held(_))
+                    | Some(crate::community_grouping::CommunityGroupingOutcome::Stale(_))
+                    | None => 0,
+                };
+                db_ref.reconcile_pending_community_readers().await?;
+                published_members
+            } else {
+                0
+            };
+            let count = legacy_count + shadow_count;
             let (nudge, headline) = classify_backfill(count);
             Ok(PhaseOutput {
                 items_processed: count,

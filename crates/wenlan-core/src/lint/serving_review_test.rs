@@ -114,6 +114,10 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         (Method::Get, "/api/memory/entities/{entity_id}"),
         (Method::Get, "/api/memory/entity-suggestions"),
         (Method::Get, "/api/knowledge/recent-relations"),
+        (Method::Get, "/api/communities"),
+        (Method::Get, "/api/communities/members"),
+        (Method::Get, "/api/communities/page-assignments"),
+        (Method::Get, "/api/communities/proposals"),
     ];
 
     let rows = sensitive_read_routes().collect::<Vec<_>>();
@@ -132,8 +136,8 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         .map(|row| (row.method, row.path))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(rows.len(), 58);
-    assert_eq!(keys.len(), 58, "duplicate sensitive route key");
+    assert_eq!(rows.len(), 62);
+    assert_eq!(keys.len(), 62, "duplicate sensitive route key");
     assert_eq!(global, GLOBAL.iter().copied().collect());
     assert_eq!(scoped, SCOPED.iter().copied().collect());
 }

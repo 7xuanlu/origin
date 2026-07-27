@@ -209,6 +209,7 @@ const NON_SENSITIVE_PATHS: &[&str] = &[
     "/api/pages/{id}/map/layout", "/api/pages/{id}/map/nodes", "/api/pages/{id}/map/edges",
     "/api/pages/{id}/map/nodes/{node_id}", "/api/pages/{id}/map/edges/{edge_id}",
     "/api/pages/{id}/map/improve",
+    "/api/communities/proposals/{id}/accept", "/api/communities/proposals/{id}/reject",
 ];
 
 const NON_SENSITIVE_MIXED_ROUTES: &[(RegisteredMethod, &str)] = &[

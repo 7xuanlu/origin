@@ -2496,6 +2496,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
+name = "leiden-rs"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7bbf4703fdbd25078c1842083c8f4e5551ed118a9d00342e309fee0bea46d42"
+dependencies = [
+ "rand 0.9.2",
+ "rustc-hash 2.1.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.184"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5694,6 +5705,7 @@ dependencies = [
  "futures",
  "hex",
  "hf-hub",
+ "leiden-rs",
  "libsql",
  "llama-cpp-2",
  "log",

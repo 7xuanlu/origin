@@ -12,10 +12,13 @@ use crate::sources::{stability_tier, RawDocument};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+
+#[cfg(test)]
+static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 mod count;
 mod entity_page_adapter;
@@ -576,7 +579,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 94;
+pub const SCHEMA_VERSION: u32 = 96;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -1611,6 +1614,25 @@ fn edge_grounding_promote_enabled_value(value: Option<&str>) -> bool {
     })
 }
 
+/// Gate for the M4 Leiden write-only community shadow. Opt-in: default OFF;
+/// enable with WENLAN_ENABLE_COMMUNITY_LEIDEN=1/true/yes. When enabled, the
+/// existing CommunityDetection phase runs one dirty space through the
+/// generation-guarded M4 job while keeping the legacy label-propagation shadow
+/// live for rollback. No new ambient scheduler lane is created.
+pub fn community_leiden_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_COMMUNITY_LEIDEN").ok();
+    community_leiden_enabled_value(value.as_deref())
+}
+
+fn community_leiden_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 /// True iff `WENLAN_RERANK_SKIP_PREFERENCE` is truthy. OPT-IN, default OFF.
 ///
 /// When ON, preference/recommendation-seeking queries (per
@@ -2359,6 +2381,265 @@ pub struct RefinementProposal {
     pub created_at: String,
 }
 
+pub(crate) const COMMUNITY_SUMMARY_BUCKETS_CONSUMER: &str = "summary_buckets";
+pub(crate) const COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER: &str = "summary_eligibility";
+
+fn community_relevant_spaces_digest(spaces: impl IntoIterator<Item = String>) -> String {
+    let mut spaces = spaces.into_iter().collect::<Vec<_>>();
+    spaces.sort();
+    spaces.dedup();
+    let mut digest = Sha256::new();
+    for space in spaces {
+        let bytes = space.as_bytes();
+        digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(bytes);
+    }
+    hex::encode(digest.finalize())
+}
+
+/// The parity-counter integrity guards, written once so the installer and every
+/// validator read the same text and cannot drift apart.
+///
+/// The repair effect guard proves write scope by differencing `total_changes()`
+/// and subtracting the measured generation delta, which is exact only while a
+/// unit of compensation costs a row write. These three guards make that true
+/// across the table's whole DML surface:
+///
+/// * `unit_bump` — an UPDATE advancing the counter by more than one would buy
+///   compensation without paying a row change, letting an escaped write hide
+///   under the subtraction. The only legal shapes are the triggers' `+1` and
+///   reconciliation's digest-only CAS, which leaves the generation untouched.
+/// * `seed_only_insert` — `INSERT OR REPLACE` resolves its conflict by
+///   *replacing* the row, so `unit_bump` never fires, while the replacement
+///   costs one row change and can carry the generation arbitrarily far forward.
+///   The only legitimate insert is the seed, always at generation 0. (A replace
+///   carrying 0 moves the counter backwards, which yields negative compensation
+///   and so makes an escape easier to see, besides invalidating every proof.)
+/// * `no_delete` — DELETE+INSERT is the same bypass by a longer route. Note it
+///   does NOT fire for `INSERT OR REPLACE` unless `recursive_triggers` is on,
+///   which Wenlan never enables; `seed_only_insert` is what closes that route.
+pub(crate) const PARITY_GUARD_TRIGGERS: [(&str, &str); 3] = [
+    (
+        "m4_parity_input_state_unit_bump",
+        "CREATE TRIGGER m4_parity_input_state_unit_bump
+         BEFORE UPDATE ON community_parity_input_state
+         WHEN NEW.generation <> OLD.generation
+          AND NEW.generation <> OLD.generation + 1
+         BEGIN
+           SELECT RAISE(ABORT, 'community_parity_input_state generation must advance by at most 1 per write');
+         END",
+    ),
+    (
+        "m4_parity_input_state_seed_only_insert",
+        "CREATE TRIGGER m4_parity_input_state_seed_only_insert
+         BEFORE INSERT ON community_parity_input_state
+         WHEN NEW.generation <> 0
+         BEGIN
+           SELECT RAISE(ABORT, 'community_parity_input_state may only be inserted at generation 0');
+         END",
+    ),
+    (
+        "m4_parity_input_state_no_delete",
+        "CREATE TRIGGER m4_parity_input_state_no_delete
+         BEFORE DELETE ON community_parity_input_state
+         BEGIN
+           SELECT RAISE(ABORT, 'community_parity_input_state singleton must not be deleted');
+         END",
+    ),
+];
+
+/// Canonical DDL for the parity counter table, shared with the repair-open
+/// fixture. `PARITY_GUARD_TRIGGERS` already binds the guards to one source;
+/// this binds the table they guard, so a hand-copied shape in a test cannot
+/// drift from the installer. A single added column would otherwise leave the
+/// copy stale while the generation-only guards still installed cleanly against
+/// it -- a silent false PASS.
+pub(crate) const PARITY_INPUT_STATE_TABLE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS community_parity_input_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    generation INTEGER NOT NULL,
+    relevant_spaces_digest TEXT NOT NULL
+);
+";
+
+/// Whitespace- and case-insensitive form for comparing stored DDL against its
+/// canonical text.
+///
+/// The normalization also reaches inside string literals, so the RAISE message
+/// text is pinned only up to case and spacing. That is deliberate: what makes a
+/// guard enforce anything is its timing, target table, and WHEN predicate, and
+/// none of those live in a literal -- they are pinned exactly. The message is
+/// diagnostic only, and demanding byte equality there would make the check fail
+/// on reformatting rather than on a real weakening.
+fn normalized_ddl(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Name of the first parity guard whose installed shape differs from its
+/// canonical definition, or `None` when all three are intact.
+///
+/// Compares whole normalized DDL rather than a name or a message substring: a
+/// trigger keeping its name and RAISE text but flipping its WHEN predicate,
+/// timing, or target table would otherwise read as healthy while enforcing
+/// nothing.
+pub(crate) async fn parity_guard_shape_drift(
+    conn: &libsql::Connection,
+) -> Result<Option<&'static str>, WenlanError> {
+    for (name, canonical) in PARITY_GUARD_TRIGGERS {
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 LIMIT 1",
+                libsql::params![name],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("inspect parity guard {name}: {error}"))
+            })?;
+        let installed = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("read parity guard {name}: {error}")))?
+            .and_then(|row| row.get::<String>(0).ok());
+        if installed
+            .as_deref()
+            .map(normalized_ddl)
+            .is_none_or(|found| found != normalized_ddl(canonical))
+        {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// The consumer-behaviour contract a proof was taken under. The global input
+/// generation only advances on DB mutations, so a proof stays "current" across
+/// a restart that changes a tuning knob the consumer predicate actually reads.
+/// `summary_eligibility` inlines `min_bucket_members()` into its SQL, so a
+/// changed threshold silently redefines eligibility with no mutation behind it.
+/// Folding the value into a cached token the gate compares as a literal closes
+/// that without any read-time computation -- same shape as the algo/projection
+/// version literals below.
+pub(crate) fn community_consumer_contract_version() -> String {
+    // Digits only: safe to inline, and no consumer can smuggle SQL through it.
+    format!(
+        "min_members={}",
+        crate::refinery::summary::min_bucket_members()
+    )
+}
+
+/// The one fail-closed durable-reader invariant used by the direct reader,
+/// summary eligibility SQL, and pending-reconcile detection. The expensive
+/// membership digest is reconciliation-time work: reads compare only cached
+/// digest/generation tokens whose complete mutation triggers advance the
+/// global input generation.
+pub(crate) fn community_reader_durable_gate_sql(consumer: &str) -> String {
+    if !matches!(
+        consumer,
+        COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+    ) {
+        // Fail closed rather than interpolate an unvetted string into SQL.
+        return "0=1".to_string();
+    }
+    format!(
+        "EXISTS (
+             SELECT 1
+               FROM community_reader_cutover cutover
+               JOIN community_parity_input_state input ON input.singleton=1
+               JOIN community_reader_current_input current_input
+                 ON current_input.consumer=cutover.consumer
+                AND current_input.input_generation=input.generation
+               JOIN community_reader_watermark watermark
+                 ON watermark.consumer=cutover.consumer
+                AND watermark.proven_input_generation=input.generation
+                AND watermark.relevant_spaces_digest=current_input.relevant_spaces_digest
+              WHERE cutover.consumer='{consumer}'
+                AND cutover.enabled=1
+                AND watermark.consumer_contract_version='{contract}'
+                AND watermark.unexplained_drift_count=0
+                AND watermark.relevant_space_count=(
+                    SELECT COUNT(*) FROM community_reader_space_proof proof
+                     WHERE proof.consumer='{consumer}'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM community_reader_space_proof proof
+                      LEFT JOIN space_graph_state state ON state.space=proof.space
+                      LEFT JOIN community_publication_receipts receipt
+                        ON receipt.space=proof.space
+                       AND receipt.published_generation=proof.proven_published_generation
+                     WHERE proof.consumer='{consumer}'
+                       AND (
+                            state.space IS NULL
+                         OR state.dirty<>0
+                         OR state.published_generation IS NULL
+                         OR state.grouping_generation<>state.published_generation
+                         OR state.published_generation<>proof.proven_published_generation
+                         OR receipt.space IS NULL
+                         OR receipt.membership_digest<>proof.proven_membership_digest
+                         OR receipt.algo_version<>'{algorithm}'
+                         OR receipt.projection_version<>'{projection}'
+                       )
+                )
+        )",
+        algorithm = crate::community_grouping::COMMUNITY_ALGO_VERSION,
+        projection = crate::community_grouping::COMMUNITY_PROJECTION_VERSION,
+        contract = community_consumer_contract_version()
+    )
+}
+
+fn community_membership_digest(
+    members: impl IntoIterator<Item = (String, String, String)>,
+) -> String {
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    members.sort();
+    let mut digest = Sha256::new();
+    for (node_id, community_id, attachment) in members {
+        for value in [node_id, community_id, attachment] {
+            let bytes = value.as_bytes();
+            digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+            digest.update(bytes);
+        }
+    }
+    hex::encode(digest.finalize())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommunityReaderParityReceipt {
+    pub consumer: String,
+    pub ready: bool,
+    pub spaces_checked: usize,
+    pub unexplained_drift_count: usize,
+    pub explained_structural_delta_count: usize,
+    pub canonical_mutex_hold: std::time::Duration,
+    pub reconcile_elapsed: std::time::Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommunityConsistencyReport {
+    pub missing_expected_members: u64,
+    pub unexpected_members: u64,
+    pub orphan_members: u64,
+    pub retired_community_members: u64,
+    pub member_generation_mismatches: u64,
+    pub publication_generation_mismatches: u64,
+    pub invalid_page_assignments: u64,
+}
+
+impl CommunityConsistencyReport {
+    pub const fn violation_count(self) -> u64 {
+        self.missing_expected_members
+            + self.unexpected_members
+            + self.orphan_members
+            + self.retired_community_members
+            + self.member_generation_mismatches
+            + self.publication_generation_mismatches
+            + self.invalid_page_assignments
+    }
+}
+
 /// Decode and verify the full identity/ownership contract of a lint Review Item.
 ///
 /// This is shared by storage, diagnostics, and HTTP surfacing so a typed payload
@@ -2738,7 +3019,7 @@ END;
 
 pub struct MemoryDB {
     pub(crate) _db: libsql::Database,
-    pub(crate) conn: tokio::sync::Mutex<libsql::Connection>,
+    pub(crate) conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
     entity_resolution_lock: tokio::sync::Mutex<()>,
     pub(crate) lint_freshness: Arc<crate::lint::snapshot::LintFreshnessClock>,
     page_projection_tracker: Arc<crate::page_projection_tracker::PageProjectionTracker>,
@@ -2746,6 +3027,10 @@ pub struct MemoryDB {
     embedder: Option<Arc<std::sync::Mutex<TextEmbedding>>>,
     chunker: ChunkingEngine,
     embedding_cache: std::sync::Mutex<EmbeddingCache>,
+    pub(crate) community_dirty_nodes:
+        std::sync::Mutex<BTreeMap<String, BTreeMap<i64, BTreeSet<String>>>>,
+    pub(crate) community_grouping_runtime:
+        std::sync::Mutex<crate::community_grouping::CommunityGroupingRuntime>,
 }
 
 /// Returns true when a memory title looks like it would make a poor snippet —
@@ -2847,6 +3132,32 @@ impl MemoryDB {
             ));
         }
 
+        // A matching user_version is not proof the parity guards are installed:
+        // a database written by an earlier build of this schema version carries
+        // 96 without them. This path deliberately skips migrations and the
+        // startup trigger inventory, then exposes the approved apply endpoint,
+        // so opening an unguarded database here is exactly where the repair
+        // effect guard could be laundered. Refuse rather than repair -- the
+        // repair contract does not mutate schema outside the approved manifest,
+        // and `repair_open_requires_an_existing_current_schema_without_bootstrap_or_embedder`
+        // pins that this path creates nothing.
+        //
+        // Refusing does leave an operator no way out if their repair manifest is
+        // already applied-but-unverified, since startup then forces this path.
+        // That is acceptable only because the unguarded shape is unreachable in
+        // the field: no released build has written schema 96 *without* these
+        // guards, and migration 96 commits the guards before it stamps the
+        // version, so an interrupted upgrade leaves <=95, never an unguarded 96.
+        // The state therefore exists only in development trees, where rebuilding
+        // the database is the recovery. Should a build ever ship 96 without the
+        // guards, this must become a narrow guard-only bootstrap instead.
+        if let Some(missing) = parity_guard_shape_drift(&conn).await? {
+            log::error!("[repair] refusing to open: parity guard {missing} missing or altered");
+            return Err(WenlanError::Validation(
+                "repair_database_parity_guard_missing".to_string(),
+            ));
+        }
+
         let lint_freshness = Arc::new(
             crate::lint::snapshot::LintFreshnessClock::new(&db).map_err(|error| {
                 WenlanError::VectorDb(format!("lint freshness observer: {error}"))
@@ -2854,7 +3165,7 @@ impl MemoryDB {
         );
         Ok(Self {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
@@ -2862,6 +3173,10 @@ impl MemoryDB {
             embedder: None,
             chunker: ChunkingEngine::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         })
     }
 
@@ -3050,7 +3365,7 @@ impl MemoryDB {
         );
         let instance = Self {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
@@ -3058,6 +3373,10 @@ impl MemoryDB {
             embedder: Some(Arc::new(std::sync::Mutex::new(embedder))),
             chunker: build_chunker(db_path),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
 
         // Run schema migrations for existing databases
@@ -3130,7 +3449,7 @@ impl MemoryDB {
         );
         let instance = Self {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
@@ -3138,6 +3457,10 @@ impl MemoryDB {
             embedder: Some(embedder),
             chunker: build_chunker(db_path),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
 
         instance.run_migrations(emitter.as_ref()).await?;
@@ -8146,6 +8469,35 @@ impl MemoryDB {
             if version < 94 {
                 self.migrate_94_entity_reader_cutover(version).await?;
             }
+
+            // Migration 95 (M4 PR-1): durable community publication
+            // substrate plus the per-space graph-generation and phase-lease
+            // control plane. The tables start empty; PR-1 remains a
+            // write-only shadow and does not touch entities.community_id.
+            if version < 95 {
+                self.migrate_95_community_substrate(version).await?;
+            }
+            // A private/staged M95 file may carry user_version=95 after only
+            // part of its DDL committed. Repair that substrate before M96
+            // creates foreign-keyed routing tables or scans graph state.
+            if self.community_substrate_needs_repair().await? {
+                self.repair_community_substrate().await?;
+            }
+            if version < 96 {
+                self.migrate_96_community_cutover(version).await?;
+            }
+        }
+
+        // Private M4 builds could already have stamped user_version=95 before
+        // the broader publication generation and bootstrap were added. Inspect
+        // the schema shape outside `version < 95` so those experimental files
+        // are repaired once without making every later startup repeat the
+        // grounded-edge bootstrap scan.
+        if self.community_substrate_needs_repair().await? {
+            self.repair_community_substrate().await?;
+        }
+        if self.community_cutover_needs_repair().await? {
+            self.repair_community_cutover().await?;
         }
 
         Ok(())
@@ -10143,6 +10495,1846 @@ impl MemoryDB {
         );
         Ok(())
     }
+
+    async fn ensure_community_substrate_tables(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS communities (
+                community_id TEXT PRIMARY KEY,
+                space TEXT NOT NULL,
+                display_name TEXT,
+                algo_version TEXT NOT NULL,
+                projection_version TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                retired_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_communities_space
+                ON communities(space) WHERE retired_at IS NULL;
+
+            CREATE TABLE IF NOT EXISTS community_members (
+                space TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                node_kind TEXT NOT NULL DEFAULT 'entity',
+                community_id TEXT NOT NULL REFERENCES communities(community_id),
+                published_generation INTEGER NOT NULL,
+                attachment TEXT NOT NULL,
+                PRIMARY KEY(space, node_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_community_members_community
+                ON community_members(community_id);
+
+            CREATE TABLE IF NOT EXISTS space_graph_state (
+                space TEXT PRIMARY KEY,
+                graph_generation INTEGER NOT NULL DEFAULT 0,
+                grouping_generation INTEGER NOT NULL DEFAULT 0,
+                published_generation INTEGER,
+                dirty INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS grouping_leases (
+                phase TEXT NOT NULL,
+                space TEXT NOT NULL,
+                input_generation INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(phase, space, input_generation)
+            );",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("ensure community substrate tables: {error}"))
+        })?;
+
+        // Replay an interrupted development build of migration 95 that may
+        // have created the first table shape before grouping_generation was
+        // added. Migration 95 has not shipped, so this preserves idempotence
+        // without consuming another schema number.
+        let mut columns = conn
+            .query("PRAGMA table_info(space_graph_state)", ())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("inspect community graph state columns: {error}"))
+            })?;
+        let mut has_grouping_generation = false;
+        while let Some(row) = columns.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("read community graph state column: {error}"))
+        })? {
+            has_grouping_generation |=
+                row.get::<String>(1).ok().as_deref() == Some("grouping_generation");
+        }
+        drop(columns);
+        if !has_grouping_generation {
+            conn.execute(
+                "ALTER TABLE space_graph_state \
+                 ADD COLUMN grouping_generation INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("add community grouping generation: {error}"))
+            })?;
+            conn.execute(
+                "UPDATE space_graph_state \
+                 SET grouping_generation = \
+                         MAX(graph_generation, COALESCE(published_generation, 0)) + 1, \
+                     dirty = 1",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "invalidate repaired community grouping generation: {error}"
+                ))
+            })?;
+        }
+
+        // `grouping_generation` is the publication input version. It covers
+        // the union of both edge scans plus the entity rows/embeddings used by
+        // post-hoc attachment. A grounded edge change atomically advances both
+        // graph and grouping generations, including the first raw SQL write.
+        // Ungrounded-only changes advance grouping on an existing graph state.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m4_grouping_edge_insert;
+             DROP TRIGGER IF EXISTS m4_grouping_edge_delete;
+             DROP TRIGGER IF EXISTS m4_grouping_edge_update;
+
+             CREATE TRIGGER m4_grouping_edge_insert
+             AFTER INSERT ON edges
+             WHEN NEW.edge_type = 'relates'
+               AND NEW.valid_until IS NULL
+               AND NEW.src_kind = 'entity'
+               AND NEW.dst_kind = 'entity'
+               AND NEW.lineage = 'assertion'
+             BEGIN
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT NEW.space, 1, 1, NULL, 1
+                WHERE NEW.grounded = 1
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space AND NEW.grounded = 0;
+             END;
+
+             CREATE TRIGGER m4_grouping_edge_delete
+             AFTER DELETE ON edges
+             WHEN OLD.edge_type = 'relates'
+               AND OLD.valid_until IS NULL
+               AND OLD.src_kind = 'entity'
+               AND OLD.dst_kind = 'entity'
+               AND OLD.lineage = 'assertion'
+             BEGIN
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT OLD.space, 1, 1, NULL, 1
+                WHERE OLD.grounded = 1
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space AND OLD.grounded = 0;
+             END;
+
+             CREATE TRIGGER m4_grouping_edge_update
+             AFTER UPDATE ON edges
+             WHEN (
+                    OLD.edge_type = 'relates'
+                AND OLD.valid_until IS NULL
+                AND OLD.src_kind = 'entity'
+                AND OLD.dst_kind = 'entity'
+                AND OLD.lineage = 'assertion'
+             ) OR (
+                    NEW.edge_type = 'relates'
+                AND NEW.valid_until IS NULL
+                AND NEW.src_kind = 'entity'
+                AND NEW.dst_kind = 'entity'
+                AND NEW.lineage = 'assertion'
+             )
+             BEGIN
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT OLD.space, 1, 1, NULL, 1
+                WHERE OLD.grounded = 1
+                  AND (
+                         NOT (
+                                NEW.edge_type = 'relates'
+                            AND NEW.valid_until IS NULL
+                            AND NEW.src_kind = 'entity'
+                            AND NEW.dst_kind = 'entity'
+                            AND NEW.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT NEW.space, 1, 1, NULL, 1
+                WHERE NEW.grounded = 1
+                  AND (
+                         NOT (
+                                OLD.edge_type = 'relates'
+                            AND OLD.valid_until IS NULL
+                            AND OLD.src_kind = 'entity'
+                            AND OLD.dst_kind = 'entity'
+                            AND OLD.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT OLD.space, 1, 1, NULL, 1
+                WHERE OLD.space IS NEW.space
+                  AND (OLD.grounded = 1 OR NEW.grounded = 1)
+                  AND OLD.edge_type = 'relates'
+                  AND OLD.valid_until IS NULL
+                  AND OLD.src_kind = 'entity'
+                  AND OLD.dst_kind = 'entity'
+                  AND OLD.lineage = 'assertion'
+                  AND NEW.edge_type = 'relates'
+                  AND NEW.valid_until IS NULL
+                  AND NEW.src_kind = 'entity'
+                  AND NEW.dst_kind = 'entity'
+                  AND NEW.lineage = 'assertion'
+                  AND (
+                         OLD.edge_id IS NOT NEW.edge_id
+                      OR OLD.src_id IS NOT NEW.src_id
+                      OR OLD.dst_id IS NOT NEW.dst_id
+                      OR OLD.grounded IS NOT NEW.grounded
+                  )
+               ON CONFLICT(space) DO UPDATE SET
+                    graph_generation = graph_generation + 1,
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space
+                  AND (
+                         OLD.edge_type = 'relates'
+                     AND OLD.valid_until IS NULL
+                     AND OLD.src_kind = 'entity'
+                     AND OLD.dst_kind = 'entity'
+                     AND OLD.lineage = 'assertion'
+                  )
+                  AND (
+                         NOT (
+                                NEW.edge_type = 'relates'
+                            AND NEW.valid_until IS NULL
+                            AND NEW.src_kind = 'entity'
+                            AND NEW.dst_kind = 'entity'
+                            AND NEW.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+                  AND OLD.grounded = 0;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space
+                  AND (
+                         NEW.edge_type = 'relates'
+                     AND NEW.valid_until IS NULL
+                     AND NEW.src_kind = 'entity'
+                     AND NEW.dst_kind = 'entity'
+                     AND NEW.lineage = 'assertion'
+                  )
+                  AND (
+                         NOT (
+                                OLD.edge_type = 'relates'
+                            AND OLD.valid_until IS NULL
+                            AND OLD.src_kind = 'entity'
+                            AND OLD.dst_kind = 'entity'
+                            AND OLD.lineage = 'assertion'
+                         )
+                      OR OLD.space IS NOT NEW.space
+                  )
+                  AND NEW.grounded = 0;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space
+                  AND OLD.space IS NEW.space
+                  AND OLD.edge_type = 'relates'
+                  AND OLD.valid_until IS NULL
+                  AND OLD.src_kind = 'entity'
+                  AND OLD.dst_kind = 'entity'
+                  AND OLD.lineage = 'assertion'
+                  AND NEW.edge_type = 'relates'
+                  AND NEW.valid_until IS NULL
+                  AND NEW.src_kind = 'entity'
+                  AND NEW.dst_kind = 'entity'
+                  AND NEW.lineage = 'assertion'
+                  AND OLD.grounded = 0
+                  AND NEW.grounded = 0
+                  AND (
+                         OLD.edge_id IS NOT NEW.edge_id
+                      OR OLD.src_id IS NOT NEW.src_id
+                      OR OLD.dst_id IS NOT NEW.dst_id
+                      OR OLD.grounded IS NOT NEW.grounded
+                  );
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_insert
+             AFTER INSERT ON entities
+             WHEN NEW.space IS NOT NULL
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space;
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_delete
+             AFTER DELETE ON entities
+             WHEN OLD.space IS NOT NULL
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space;
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_update
+             AFTER UPDATE ON entities
+             WHEN OLD.space IS NOT NEW.space OR OLD.embedding IS NOT NEW.embedding
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space
+                  AND OLD.space IS NOT NULL
+                  AND OLD.space IS NOT NEW.space;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space
+                  AND NEW.space IS NOT NULL
+                  AND OLD.space IS NOT NEW.space;
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = NEW.space
+                  AND NEW.space IS NOT NULL
+                  AND OLD.space IS NEW.space
+                  AND OLD.embedding IS NOT NEW.embedding;
+             END;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("ensure community input triggers: {error}"))
+        })?;
+
+        // M3g may already have grounded a corpus before M4 is installed.
+        // Seed one dirty baseline for every such space; without this, triggers
+        // that deliberately update only existing state would wait forever for
+        // a future mutation and the existing corpus would never publish.
+        conn.execute(
+            "INSERT INTO space_graph_state (
+                 space, graph_generation, grouping_generation, published_generation, dirty
+             )
+             SELECT space, 1, 1, NULL, 1
+               FROM edges
+              WHERE edge_type = 'relates'
+                AND grounded = 1
+                AND valid_until IS NULL
+                AND src_kind = 'entity'
+                AND dst_kind = 'entity'
+                AND lineage = 'assertion'
+              GROUP BY space
+             ON CONFLICT(space) DO NOTHING",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("bootstrap community graph states: {error}"))
+        })?;
+        Ok(())
+    }
+
+    async fn migrate_95_community_substrate(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(95, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m95 begin: {error}")))?;
+        let result = Self::ensure_community_substrate_tables(&conn).await;
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("m95 commit: {error}")))?;
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        }
+        drop(conn);
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 95", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m95 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 95 applied: M4 community publication substrate and control plane"
+        );
+        Ok(())
+    }
+
+    async fn ensure_community_cutover_tables(conn: &libsql::Connection) -> Result<(), WenlanError> {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m4_parity_input_entity_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_update;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!(
+                "disable global community parity triggers for repair: {error}"
+            ))
+        })?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS page_community_assignments (
+                page_id TEXT PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+                space TEXT NOT NULL,
+                community_id TEXT REFERENCES communities(community_id),
+                state TEXT NOT NULL CHECK(state IN ('assigned','held','dropped')),
+                score REAL NOT NULL,
+                page_version INTEGER NOT NULL,
+                routing_input_generation INTEGER NOT NULL,
+                routing_space_generation INTEGER NOT NULL,
+                community_published_generation INTEGER NOT NULL,
+                route_version TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                CHECK (
+                    (state = 'dropped' AND community_id IS NULL)
+                    OR
+                    (state IN ('assigned','held') AND community_id IS NOT NULL)
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_page_community_assignments_community
+                ON page_community_assignments(community_id);
+            CREATE INDEX IF NOT EXISTS idx_page_community_assignments_space
+                ON page_community_assignments(space);
+
+            CREATE TABLE IF NOT EXISTS page_community_route_inputs (
+                page_id TEXT PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+                space TEXT NOT NULL,
+                generation INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_page_community_route_inputs_space
+                ON page_community_route_inputs(space);
+
+            CREATE TABLE IF NOT EXISTS community_route_space_inputs (
+                space TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS community_reader_cutover (
+                consumer TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS community_reader_parity (
+                consumer TEXT NOT NULL,
+                space TEXT NOT NULL,
+                proven_published_generation INTEGER NOT NULL,
+                unexplained_drift_count INTEGER NOT NULL,
+                checked_at INTEGER NOT NULL,
+                report_json TEXT,
+                PRIMARY KEY(consumer, space)
+            );
+
+            CREATE TABLE IF NOT EXISTS community_publication_receipts (
+                space TEXT PRIMARY KEY,
+                published_generation INTEGER NOT NULL,
+                membership_digest TEXT NOT NULL,
+                algo_version TEXT NOT NULL,
+                projection_version TEXT NOT NULL,
+                published_at INTEGER NOT NULL
+            );
+
+            DROP TRIGGER IF EXISTS m4_page_community_insert_fence;
+            DROP TRIGGER IF EXISTS m4_page_community_update_fence;
+            DROP TRIGGER IF EXISTS m4_page_community_page_insert_input;
+            DROP TRIGGER IF EXISTS m4_page_community_page_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_page_delete_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_map_insert_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_map_delete_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_map_update_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_edge_insert_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_edge_delete_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_edge_update_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_memory_insert_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_memory_delete_invalidate;
+            DROP TRIGGER IF EXISTS m4_page_community_memory_update_invalidate;
+            DROP TRIGGER IF EXISTS m4_community_member_insert_invalidate;
+            DROP TRIGGER IF EXISTS m4_community_member_delete_invalidate;
+            DROP TRIGGER IF EXISTS m4_community_member_update_invalidate;
+            DROP TRIGGER IF EXISTS m4_community_member_insert_fence;
+            DROP TRIGGER IF EXISTS m4_community_member_update_fence;
+
+            CREATE TRIGGER m4_page_community_insert_fence
+            BEFORE INSERT ON page_community_assignments
+            WHEN NEW.community_id IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM communities c
+                  WHERE c.community_id = NEW.community_id
+                    AND c.space = NEW.space
+                    AND c.retired_at IS NULL
+             )
+            BEGIN
+              SELECT RAISE(ABORT, 'page_community_assignments: community is missing, retired, or cross-space');
+            END;
+
+            CREATE TRIGGER m4_page_community_update_fence
+            BEFORE UPDATE ON page_community_assignments
+            WHEN NEW.community_id IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM communities c
+                  WHERE c.community_id = NEW.community_id
+                    AND c.space = NEW.space
+                    AND c.retired_at IS NULL
+             )
+            BEGIN
+              SELECT RAISE(ABORT, 'page_community_assignments: community is missing, retired, or cross-space');
+            END;
+
+            CREATE TRIGGER m4_page_community_page_insert_input
+            AFTER INSERT ON pages
+            BEGIN
+              INSERT INTO page_community_route_inputs (page_id, space, generation)
+              VALUES (NEW.id, COALESCE(NEW.space, '00000000-0000-4000-8000-000000000001'), 0)
+              ON CONFLICT(page_id) DO UPDATE SET
+                space=excluded.space,
+                generation=page_community_route_inputs.generation + 1;
+              INSERT OR IGNORE INTO community_route_space_inputs (space, generation)
+              VALUES (COALESCE(NEW.space, '00000000-0000-4000-8000-000000000001'), 0);
+            END;
+
+            CREATE TRIGGER m4_page_community_page_invalidate
+            AFTER UPDATE OF version, space, status, source_revision,
+                            entity_id, embedding, kind ON pages
+            WHEN OLD.version IS NOT NEW.version
+              OR OLD.space IS NOT NEW.space
+              OR OLD.status IS NOT NEW.status
+              OR OLD.source_revision IS NOT NEW.source_revision
+              OR OLD.entity_id IS NOT NEW.entity_id
+              OR OLD.embedding IS NOT NEW.embedding
+              OR OLD.kind IS NOT NEW.kind
+            BEGIN
+              INSERT OR IGNORE INTO community_route_space_inputs (space, generation)
+              VALUES (COALESCE(NEW.space, '00000000-0000-4000-8000-000000000001'), 0);
+              UPDATE page_community_route_inputs
+                 SET space=COALESCE(NEW.space, '00000000-0000-4000-8000-000000000001'),
+                     generation=generation + 1
+               WHERE page_id=NEW.id;
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE (OLD.kind='entity' OR NEW.kind='entity')
+                 AND (space=OLD.space OR space=NEW.space);
+            END;
+
+            CREATE TRIGGER m4_page_community_page_delete_invalidate
+            AFTER DELETE ON pages
+            WHEN OLD.kind='entity'
+            BEGIN
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE space=OLD.space;
+            END;
+
+            CREATE TRIGGER m4_page_community_map_insert_invalidate
+            AFTER INSERT ON entity_page_map
+            BEGIN
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE space=(SELECT space FROM pages WHERE id=NEW.page_id);
+            END;
+
+            CREATE TRIGGER m4_page_community_map_delete_invalidate
+            AFTER DELETE ON entity_page_map
+            BEGIN
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE space=(SELECT space FROM pages WHERE id=OLD.page_id);
+            END;
+
+            CREATE TRIGGER m4_page_community_map_update_invalidate
+            AFTER UPDATE OF entity_id, page_id ON entity_page_map
+            BEGIN
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE space=(SELECT space FROM pages WHERE id=OLD.page_id)
+                  OR space=(SELECT space FROM pages WHERE id=NEW.page_id);
+            END;
+
+            CREATE TRIGGER m4_page_community_edge_insert_invalidate
+            AFTER INSERT ON edges
+            WHEN NEW.edge_type IN ('mentions','cites')
+            BEGIN
+              UPDATE page_community_route_inputs
+                 SET generation=generation + 1
+               WHERE NEW.valid_until IS NULL
+                 AND (
+                      (NEW.src_kind='page' AND NEW.dst_kind='memory'
+                       AND page_id=NEW.src_id)
+                   OR (NEW.src_kind='memory' AND NEW.dst_kind='page'
+                       AND page_id=NEW.dst_id)
+                 );
+            END;
+
+            CREATE TRIGGER m4_page_community_edge_delete_invalidate
+            AFTER DELETE ON edges
+            WHEN OLD.edge_type IN ('mentions','cites')
+            BEGIN
+              UPDATE page_community_route_inputs
+                 SET generation=generation + 1
+               WHERE OLD.valid_until IS NULL
+                 AND (
+                      (OLD.src_kind='page' AND OLD.dst_kind='memory'
+                       AND page_id=OLD.src_id)
+                   OR (OLD.src_kind='memory' AND OLD.dst_kind='page'
+                       AND page_id=OLD.dst_id)
+                 );
+            END;
+
+            CREATE TRIGGER m4_page_community_edge_update_invalidate
+            AFTER UPDATE OF src_id, src_kind, dst_id, dst_kind, edge_type,
+                            grounded, valid_until, lineage, space ON edges
+            WHEN OLD.edge_type IN ('mentions','cites')
+              OR NEW.edge_type IN ('mentions','cites')
+            BEGIN
+              UPDATE page_community_route_inputs
+                 SET generation=generation + 1
+               WHERE (
+                        OLD.edge_type IN ('mentions','cites')
+                    AND OLD.valid_until IS NULL
+                    AND (
+                         (OLD.src_kind='page' AND OLD.dst_kind='memory'
+                          AND page_id=OLD.src_id)
+                      OR (OLD.src_kind='memory' AND OLD.dst_kind='page'
+                          AND page_id=OLD.dst_id)
+                    )
+                 )
+                  OR (
+                        NEW.edge_type IN ('mentions','cites')
+                    AND NEW.valid_until IS NULL
+                    AND (
+                         (NEW.src_kind='page' AND NEW.dst_kind='memory'
+                          AND page_id=NEW.src_id)
+                      OR (NEW.src_kind='memory' AND NEW.dst_kind='page'
+                          AND page_id=NEW.dst_id)
+                    )
+                 );
+            END;
+
+            CREATE TRIGGER m4_page_community_memory_insert_invalidate
+            AFTER INSERT ON memories
+            BEGIN
+              UPDATE page_community_route_inputs
+                 SET generation=generation + 1
+               WHERE page_id IN (
+                    SELECT CASE WHEN e.src_kind='page' THEN e.src_id ELSE e.dst_id END
+                      FROM edges e
+                     WHERE e.space=NEW.space
+                       AND e.edge_type IN ('mentions','cites')
+                       AND e.valid_until IS NULL
+                       AND (
+                            (e.src_kind='page' AND e.dst_kind='memory'
+                             AND e.dst_id=NEW.source_id)
+                         OR (e.src_kind='memory' AND e.dst_kind='page'
+                             AND e.src_id=NEW.source_id)
+                       )
+               );
+            END;
+
+            CREATE TRIGGER m4_page_community_memory_delete_invalidate
+            AFTER DELETE ON memories
+            BEGIN
+              UPDATE page_community_route_inputs
+                 SET generation=generation + 1
+               WHERE page_id IN (
+                    SELECT CASE WHEN e.src_kind='page' THEN e.src_id ELSE e.dst_id END
+                      FROM edges e
+                     WHERE e.space=OLD.space
+                       AND e.edge_type IN ('mentions','cites')
+                       AND e.valid_until IS NULL
+                       AND (
+                            (e.src_kind='page' AND e.dst_kind='memory'
+                             AND e.dst_id=OLD.source_id)
+                         OR (e.src_kind='memory' AND e.dst_kind='page'
+                             AND e.src_id=OLD.source_id)
+                       )
+               );
+            END;
+
+            CREATE TRIGGER m4_page_community_memory_update_invalidate
+            AFTER UPDATE OF source_id, source, chunk_index, space, entity_id ON memories
+            WHEN OLD.source_id IS NOT NEW.source_id
+              OR OLD.source IS NOT NEW.source
+              OR OLD.chunk_index IS NOT NEW.chunk_index
+              OR OLD.space IS NOT NEW.space
+              OR OLD.entity_id IS NOT NEW.entity_id
+            BEGIN
+              UPDATE page_community_route_inputs
+                 SET generation=generation + 1
+               WHERE page_id IN (
+                    SELECT CASE WHEN e.src_kind='page' THEN e.src_id ELSE e.dst_id END
+                      FROM edges e
+                     WHERE e.edge_type IN ('mentions','cites')
+                       AND e.valid_until IS NULL
+                       AND (
+                            (e.space=OLD.space AND (
+                                 (e.src_kind='page' AND e.dst_kind='memory'
+                                  AND e.dst_id=OLD.source_id)
+                              OR (e.src_kind='memory' AND e.dst_kind='page'
+                                  AND e.src_id=OLD.source_id)
+                            ))
+                         OR (e.space=NEW.space AND (
+                                 (e.src_kind='page' AND e.dst_kind='memory'
+                                  AND e.dst_id=NEW.source_id)
+                              OR (e.src_kind='memory' AND e.dst_kind='page'
+                                  AND e.src_id=NEW.source_id)
+                            ))
+                       )
+               );
+            END;
+
+            CREATE TRIGGER m4_community_member_insert_fence
+            BEFORE INSERT ON community_members
+            WHEN NOT EXISTS (
+                SELECT 1 FROM communities c
+                 WHERE c.community_id = NEW.community_id
+                   AND c.space = NEW.space
+                   AND c.retired_at IS NULL
+            )
+            BEGIN
+              SELECT RAISE(ABORT, 'community_members: community is missing, retired, or cross-space');
+            END;
+
+            CREATE TRIGGER m4_community_member_update_fence
+            BEFORE UPDATE ON community_members
+            WHEN NOT EXISTS (
+                SELECT 1 FROM communities c
+                 WHERE c.community_id = NEW.community_id
+                   AND c.space = NEW.space
+                   AND c.retired_at IS NULL
+            )
+            BEGIN
+              SELECT RAISE(ABORT, 'community_members: community is missing, retired, or cross-space');
+            END;
+
+            CREATE TRIGGER m4_community_member_insert_invalidate
+            AFTER INSERT ON community_members
+            BEGIN
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE space=NEW.space
+                 AND EXISTS (
+                     SELECT 1 FROM space_graph_state s
+                      WHERE s.space=NEW.space AND s.dirty=0
+                 );
+            END;
+
+            CREATE TRIGGER m4_community_member_delete_invalidate
+            AFTER DELETE ON community_members
+            BEGIN
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE space=OLD.space
+                 AND EXISTS (
+                     SELECT 1 FROM space_graph_state s
+                      WHERE s.space=OLD.space AND s.dirty=0
+                 );
+            END;
+
+            CREATE TRIGGER m4_community_member_update_invalidate
+            AFTER UPDATE ON community_members
+            BEGIN
+              UPDATE community_route_space_inputs
+                 SET generation=generation + 1
+               WHERE (space=OLD.space OR space=NEW.space)
+                 AND EXISTS (
+                     SELECT 1 FROM space_graph_state s
+                      WHERE s.space=community_route_space_inputs.space
+                        AND s.dirty=0
+                 );
+            END;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("ensure community cutover tables: {error}"))
+        })?;
+
+        let mut assignment_columns = conn
+            .query("PRAGMA table_info(page_community_assignments)", ())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "inspect page community assignment generation column: {error}"
+                ))
+            })?;
+        let mut has_routing_input_generation = false;
+        let mut has_routing_space_generation = false;
+        while let Some(row) = assignment_columns.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!(
+                "read page community assignment generation column: {error}"
+            ))
+        })? {
+            let column = row.get::<String>(1).ok();
+            has_routing_input_generation |= column.as_deref() == Some("routing_input_generation");
+            has_routing_space_generation |= column.as_deref() == Some("routing_space_generation");
+        }
+        drop(assignment_columns);
+        if !has_routing_input_generation {
+            conn.execute(
+                "ALTER TABLE page_community_assignments
+                 ADD COLUMN routing_input_generation INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "add page community assignment generation column: {error}"
+                ))
+            })?;
+        }
+        if !has_routing_space_generation {
+            conn.execute(
+                "ALTER TABLE page_community_assignments
+                 ADD COLUMN routing_space_generation INTEGER NOT NULL DEFAULT -1",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "add page community assignment space generation column: {error}"
+                ))
+            })?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO page_community_route_inputs (page_id, space, generation)
+             SELECT id, space, 0 FROM pages",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("backfill page community route inputs: {error}"))
+        })?;
+        conn.execute(
+            "INSERT OR IGNORE INTO community_route_space_inputs (space, generation)
+             SELECT DISTINCT space, 0 FROM pages",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("backfill community route space inputs: {error}"))
+        })?;
+        conn.execute(
+            "UPDATE page_community_route_inputs
+                SET space=(SELECT p.space FROM pages p
+                            WHERE p.id=page_community_route_inputs.page_id)
+              WHERE EXISTS (
+                    SELECT 1 FROM pages p
+                     WHERE p.id=page_community_route_inputs.page_id
+                       AND p.space<>page_community_route_inputs.space
+              )",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("repair page community route input spaces: {error}"))
+        })?;
+        let now = chrono::Utc::now().timestamp();
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            conn.execute(
+                "INSERT OR IGNORE INTO community_reader_cutover
+                    (consumer, enabled, updated_at)
+                 VALUES (?1, 1, ?2)",
+                libsql::params![consumer, now],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "seed community reader cutover intent for {consumer}: {error}"
+                ))
+            })?;
+        }
+
+        // A PR-1 snapshot predating publication receipts cannot prove that its
+        // current member rows are the exact generation-CAS output. Requeue it
+        // once; the next publication writes the receipt atomically.
+        conn.execute(
+            "DELETE FROM community_reader_parity
+              WHERE space IN (
+                    SELECT s.space
+                      FROM space_graph_state s
+                      LEFT JOIN community_publication_receipts r
+                        ON r.space=s.space
+                       AND r.published_generation=s.published_generation
+                     WHERE s.published_generation IS NOT NULL
+                       AND r.space IS NULL
+              )",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("invalidate unreceipted community parity: {error}"))
+        })?;
+        conn.execute(
+            "UPDATE space_graph_state
+                SET grouping_generation=grouping_generation + 1, dirty=1
+              WHERE dirty=0
+                AND published_generation IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM community_publication_receipts r
+                     WHERE r.space=space_graph_state.space
+                       AND r.published_generation=space_graph_state.published_generation
+                )",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!(
+                "requeue unreceipted community publication: {error}"
+            ))
+        })?;
+
+        // A consumer-relevant entity-only space has no grounded edge to create
+        // M95 graph state. Queue it for viability evaluation; a below-floor
+        // result HOLDS without publishing and keeps global readers on legacy.
+        conn.execute(
+            "INSERT INTO space_graph_state
+                (space, graph_generation, grouping_generation, published_generation, dirty)
+             SELECT DISTINCT space, 0, 1, NULL, 1
+               FROM entities
+              WHERE space IS NOT NULL
+             ON CONFLICT(space) DO NOTHING",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("bootstrap entity-only community spaces: {error}"))
+        })?;
+
+        // M95 used UPDATE-only entity invalidation because its state universe
+        // was grounded-edge spaces. PR-2's fail-closed cutover universe also
+        // includes legacy-only entity spaces, so first insert and space moves
+        // must create state. Any entity input change invalidates parity.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m4_grouping_entity_insert;
+             DROP TRIGGER IF EXISTS m4_grouping_entity_delete;
+             DROP TRIGGER IF EXISTS m4_grouping_entity_update;
+
+             CREATE TRIGGER m4_grouping_entity_insert
+             AFTER INSERT ON entities
+             WHEN NEW.space IS NOT NULL
+             BEGIN
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               VALUES (NEW.space, 0, 1, NULL, 1)
+               ON CONFLICT(space) DO UPDATE SET
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+             END;
+
+             CREATE TRIGGER m4_grouping_entity_delete
+             AFTER DELETE ON entities
+             WHEN OLD.space IS NOT NULL
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space;
+             END;
+
+             CREATE TRIGGER m4_grouping_entity_update
+             AFTER UPDATE ON entities
+             WHEN OLD.space IS NOT NEW.space OR OLD.embedding IS NOT NEW.embedding
+             BEGIN
+               UPDATE space_graph_state
+                  SET grouping_generation = grouping_generation + 1, dirty = 1
+                WHERE space = OLD.space
+                  AND OLD.space IS NOT NULL
+                  AND OLD.space IS NOT NEW.space;
+               INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+               SELECT NEW.space, 0, 1, NULL, 1
+                WHERE NEW.space IS NOT NULL
+                  AND (
+                         OLD.space IS NOT NEW.space
+                      OR OLD.embedding IS NOT NEW.embedding
+                  )
+               ON CONFLICT(space) DO UPDATE SET
+                    grouping_generation = grouping_generation + 1,
+                    dirty = 1;
+             END;
+
+             DROP TRIGGER IF EXISTS m4_community_parity_entity_update;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_insert;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_delete;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_update;
+
+             CREATE TRIGGER m4_community_parity_entity_update
+             AFTER UPDATE OF community_id ON entities
+             WHEN OLD.community_id IS NOT NEW.community_id
+             BEGIN
+               DELETE FROM community_reader_parity
+                WHERE space=OLD.space OR space=NEW.space;
+             END;
+
+             CREATE TRIGGER m4_community_parity_memory_insert
+             AFTER INSERT ON memories
+             BEGIN
+               DELETE FROM community_reader_parity
+                WHERE space=NEW.space
+                   OR space=(
+                        SELECT space FROM memories
+                         WHERE source='memory' AND source_id=NEW.supersedes
+                         LIMIT 1
+                   );
+             END;
+
+             CREATE TRIGGER m4_community_parity_memory_delete
+             AFTER DELETE ON memories
+             BEGIN
+               DELETE FROM community_reader_parity
+                WHERE space=OLD.space
+                   OR space=(
+                        SELECT space FROM memories
+                         WHERE source='memory' AND source_id=OLD.supersedes
+                         LIMIT 1
+                   );
+             END;
+
+             CREATE TRIGGER m4_community_parity_memory_update
+             AFTER UPDATE OF source_id, source, chunk_index, space, entity_id,
+                             pending_revision, supersedes, is_recap,
+                             supersede_mode, embedding ON memories
+             BEGIN
+               DELETE FROM community_reader_parity
+                WHERE space=OLD.space OR space=NEW.space
+                   OR space=(
+                        SELECT space FROM memories
+                         WHERE source='memory' AND source_id=OLD.supersedes
+                         LIMIT 1
+                   )
+                   OR space=(
+                        SELECT space FROM memories
+                         WHERE source='memory' AND source_id=NEW.supersedes
+                         LIMIT 1
+                   );
+             END;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("install community cutover input triggers: {error}"))
+        })?;
+
+        conn.execute_batch(PARITY_INPUT_STATE_TABLE_DDL)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("install community parity input state: {error}"))
+            })?;
+
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO community_parity_input_state
+                 (singleton, generation, relevant_spaces_digest)
+             VALUES (1, 0, '');
+
+             CREATE TABLE IF NOT EXISTS community_reader_current_input (
+                 consumer TEXT PRIMARY KEY,
+                 input_generation INTEGER NOT NULL,
+                 relevant_spaces_digest TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS community_reader_watermark (
+                 consumer TEXT PRIMARY KEY,
+                 proven_input_generation INTEGER NOT NULL,
+                 relevant_spaces_digest TEXT NOT NULL,
+                 relevant_space_count INTEGER NOT NULL,
+                 consumer_contract_version TEXT NOT NULL,
+                 source_coverage_delta_count INTEGER NOT NULL,
+                 output_delta_count INTEGER NOT NULL,
+                 unexplained_drift_count INTEGER NOT NULL,
+                 checked_at INTEGER NOT NULL,
+                 report_json TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS community_reader_space_proof (
+                 consumer TEXT NOT NULL,
+                 space TEXT NOT NULL,
+                 proven_published_generation INTEGER NOT NULL,
+                 proven_membership_digest TEXT NOT NULL,
+                 PRIMARY KEY(consumer, space)
+             );
+
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_update;
+
+             CREATE TRIGGER m4_parity_input_entity_insert AFTER INSERT ON entities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_entity_delete AFTER DELETE ON entities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_entity_update AFTER UPDATE ON entities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_memory_insert AFTER INSERT ON memories BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_memory_delete AFTER DELETE ON memories BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_memory_update AFTER UPDATE ON memories BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_member_insert AFTER INSERT ON community_members BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_member_delete AFTER DELETE ON community_members BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_member_update AFTER UPDATE ON community_members BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_community_insert AFTER INSERT ON communities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_community_delete AFTER DELETE ON communities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_community_update AFTER UPDATE ON communities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_receipt_insert
+             AFTER INSERT ON community_publication_receipts BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_receipt_delete
+             AFTER DELETE ON community_publication_receipts BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_receipt_update
+             AFTER UPDATE ON community_publication_receipts BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_state_insert AFTER INSERT ON space_graph_state BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_state_delete AFTER DELETE ON space_graph_state BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_state_update AFTER UPDATE ON space_graph_state BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("install global community parity model: {error}"))
+        })?;
+
+        // Installed from the same canonical text the validators compare
+        // against, so installer/validator drift is not expressible.
+        for (name, canonical) in PARITY_GUARD_TRIGGERS {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}; {canonical};"))
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("install parity guard {name}: {error}"))
+                })?;
+        }
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m4_community_parity_entity_update;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_insert;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_delete;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_update;
+             DROP TABLE IF EXISTS community_reader_parity;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("retire local-only community parity model: {error}"))
+        })?;
+
+        Ok(())
+    }
+
+    async fn migrate_96_community_cutover(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(96, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m96 begin: {error}")))?;
+        Self::ensure_community_cutover_tables(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m96 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 96", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m96 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 96 applied: M4 routing and per-consumer cutover control plane"
+        );
+        Ok(())
+    }
+
+    async fn repair_community_cutover(&self) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("M4 cutover startup repair begin: {error}"))
+            })?;
+        let result = async {
+            tx.execute_batch(
+                "DROP INDEX IF EXISTS idx_page_community_assignments_community;
+                 DROP INDEX IF EXISTS idx_page_community_assignments_space;
+                 DROP INDEX IF EXISTS idx_page_community_route_inputs_space;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("M4 cutover startup repair reset indexes: {error}"))
+            })?;
+            Self::ensure_community_cutover_tables(&tx).await?;
+            tx.execute_batch(
+                "DELETE FROM community_reader_current_input;
+                 DELETE FROM community_reader_watermark;
+                 DELETE FROM community_reader_space_proof;
+                 UPDATE community_parity_input_state
+                    SET generation=generation+1, relevant_spaces_digest=''
+                  WHERE singleton=1;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "M4 cutover startup repair invalidate old proofs: {error}"
+                ))
+            })?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(|error| {
+                WenlanError::VectorDb(format!("M4 cutover startup repair commit: {error}"))
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn repair_community_substrate(&self) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("M4 startup repair begin: {error}")))?;
+        let result = Self::ensure_community_substrate_tables(&conn).await;
+        match result {
+            Ok(()) => conn
+                .execute("COMMIT", ())
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M4 startup repair commit: {error}"))
+                })
+                .map(|_| ()),
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn community_substrate_needs_repair(&self) -> Result<bool, WenlanError> {
+        const REQUIRED_TABLES: [&str; 4] = [
+            "communities",
+            "community_members",
+            "space_graph_state",
+            "grouping_leases",
+        ];
+        const REQUIRED_TRIGGERS: [&str; 6] = [
+            "m4_grouping_edge_insert",
+            "m4_grouping_edge_delete",
+            "m4_grouping_edge_update",
+            "m4_grouping_entity_insert",
+            "m4_grouping_entity_delete",
+            "m4_grouping_entity_update",
+        ];
+
+        let conn = self.conn.lock().await;
+        for table in REQUIRED_TABLES {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = ?1 LIMIT 1",
+                    libsql::params![table],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community substrate table {table}: {error}"
+                    ))
+                })?;
+            if rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "read community substrate table {table}: {error}"
+                    ))
+                })?
+                .is_none()
+            {
+                return Ok(true);
+            }
+        }
+
+        let mut columns = conn
+            .query("PRAGMA table_info(space_graph_state)", ())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("inspect community graph state shape: {error}"))
+            })?;
+        let mut has_grouping_generation = false;
+        while let Some(row) = columns.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("read community graph state shape: {error}"))
+        })? {
+            has_grouping_generation |=
+                row.get::<String>(1).ok().as_deref() == Some("grouping_generation");
+        }
+        if !has_grouping_generation {
+            return Ok(true);
+        }
+
+        for trigger in REQUIRED_TRIGGERS {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master \
+                     WHERE type = 'trigger' AND name = ?1 LIMIT 1",
+                    libsql::params![trigger],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community substrate trigger {trigger}: {error}"
+                    ))
+                })?;
+            if rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "read community substrate trigger {trigger}: {error}"
+                    ))
+                })?
+                .is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn community_cutover_needs_repair(&self) -> Result<bool, WenlanError> {
+        const REQUIRED_TABLES: [(&str, &[&str]); 9] = [
+            (
+                "page_community_assignments",
+                &[
+                    "page_id text primary key references pages(id) on delete cascade",
+                    "space text not null",
+                    "community_id text references communities(community_id)",
+                    "state text not null check(state in ('assigned','held','dropped'))",
+                    "score real not null",
+                    "page_version integer not null",
+                    "routing_input_generation integer not null",
+                    "routing_space_generation integer not null",
+                    "community_published_generation integer not null",
+                    "route_version text not null",
+                    "updated_at integer not null",
+                    "state = 'dropped' and community_id is null",
+                    "state in ('assigned','held') and community_id is not null",
+                ],
+            ),
+            (
+                "page_community_route_inputs",
+                &[
+                    "page_id text primary key references pages(id) on delete cascade",
+                    "space text not null",
+                    "generation integer not null default 0",
+                ],
+            ),
+            (
+                "community_route_space_inputs",
+                &[
+                    "space text primary key",
+                    "generation integer not null default 0",
+                ],
+            ),
+            (
+                "community_reader_cutover",
+                &[
+                    "consumer text primary key",
+                    "enabled integer not null default 0 check(enabled in (0,1))",
+                    "updated_at integer not null",
+                ],
+            ),
+            (
+                "community_publication_receipts",
+                &[
+                    "space text primary key",
+                    "published_generation integer not null",
+                    "membership_digest text not null",
+                    "algo_version text not null",
+                    "projection_version text not null",
+                    "published_at integer not null",
+                ],
+            ),
+            (
+                "community_parity_input_state",
+                &[
+                    "singleton integer primary key check(singleton=1)",
+                    "generation integer not null",
+                    "relevant_spaces_digest text not null",
+                ],
+            ),
+            (
+                "community_reader_current_input",
+                &[
+                    "consumer text primary key",
+                    "input_generation integer not null",
+                    "relevant_spaces_digest text not null",
+                ],
+            ),
+            (
+                "community_reader_watermark",
+                &[
+                    "consumer text primary key",
+                    "proven_input_generation integer not null",
+                    "relevant_spaces_digest text not null",
+                    "relevant_space_count integer not null",
+                    "consumer_contract_version text not null",
+                    "source_coverage_delta_count integer not null",
+                    "output_delta_count integer not null",
+                    "unexplained_drift_count integer not null",
+                    "checked_at integer not null",
+                    "report_json text not null",
+                ],
+            ),
+            (
+                "community_reader_space_proof",
+                &[
+                    "consumer text not null",
+                    "space text not null",
+                    "proven_published_generation integer not null",
+                    "proven_membership_digest text not null",
+                    "primary key(consumer, space)",
+                ],
+            ),
+        ];
+        const REQUIRED_INDEXES: [(&str, &str); 3] = [
+            (
+                "idx_page_community_assignments_community",
+                "on page_community_assignments(community_id)",
+            ),
+            (
+                "idx_page_community_assignments_space",
+                "on page_community_assignments(space)",
+            ),
+            (
+                "idx_page_community_route_inputs_space",
+                "on page_community_route_inputs(space)",
+            ),
+        ];
+        const REQUIRED_TRIGGERS: [(&str, &[&str]); 19] = [
+            (
+                "m4_page_community_insert_fence",
+                &[
+                    "before insert on page_community_assignments",
+                    "c.space = new.space",
+                    "c.retired_at is null",
+                ],
+            ),
+            (
+                "m4_page_community_update_fence",
+                &[
+                    "before update on page_community_assignments",
+                    "c.space = new.space",
+                    "c.retired_at is null",
+                ],
+            ),
+            (
+                "m4_page_community_page_insert_input",
+                &[
+                    "after insert on pages",
+                    "insert into page_community_route_inputs",
+                    "insert or ignore into community_route_space_inputs",
+                ],
+            ),
+            (
+                "m4_page_community_page_invalidate",
+                &[
+                    "source_revision",
+                    "entity_id",
+                    "embedding",
+                    "update page_community_route_inputs",
+                    "old.embedding is not new.embedding",
+                    "update community_route_space_inputs",
+                ],
+            ),
+            (
+                "m4_page_community_page_delete_invalidate",
+                &[
+                    "after delete on pages",
+                    "old.kind='entity'",
+                    "update community_route_space_inputs",
+                ],
+            ),
+            (
+                "m4_page_community_map_insert_invalidate",
+                &[
+                    "after insert on entity_page_map",
+                    "update community_route_space_inputs",
+                ],
+            ),
+            (
+                "m4_page_community_map_delete_invalidate",
+                &[
+                    "after delete on entity_page_map",
+                    "update community_route_space_inputs",
+                ],
+            ),
+            (
+                "m4_page_community_map_update_invalidate",
+                &[
+                    "after update of entity_id, page_id on entity_page_map",
+                    "update community_route_space_inputs",
+                ],
+            ),
+            (
+                "m4_page_community_edge_insert_invalidate",
+                &[
+                    "after insert on edges",
+                    "update page_community_route_inputs",
+                    "page_id=new.src_id",
+                ],
+            ),
+            (
+                "m4_page_community_edge_delete_invalidate",
+                &[
+                    "after delete on edges",
+                    "update page_community_route_inputs",
+                    "page_id=old.src_id",
+                ],
+            ),
+            (
+                "m4_page_community_edge_update_invalidate",
+                &[
+                    "after update of src_id",
+                    "update page_community_route_inputs",
+                    "page_id=old.src_id",
+                    "page_id=new.src_id",
+                ],
+            ),
+            (
+                "m4_page_community_memory_insert_invalidate",
+                &[
+                    "after insert on memories",
+                    "update page_community_route_inputs",
+                    "e.dst_id=new.source_id",
+                ],
+            ),
+            (
+                "m4_page_community_memory_delete_invalidate",
+                &[
+                    "after delete on memories",
+                    "update page_community_route_inputs",
+                    "e.dst_id=old.source_id",
+                ],
+            ),
+            (
+                "m4_page_community_memory_update_invalidate",
+                &[
+                    "after update of source_id",
+                    "update page_community_route_inputs",
+                    "e.dst_id=old.source_id",
+                    "e.dst_id=new.source_id",
+                ],
+            ),
+            (
+                "m4_community_member_insert_fence",
+                &[
+                    "before insert on community_members",
+                    "c.space = new.space",
+                    "c.retired_at is null",
+                ],
+            ),
+            (
+                "m4_community_member_update_fence",
+                &[
+                    "before update on community_members",
+                    "c.space = new.space",
+                    "c.retired_at is null",
+                ],
+            ),
+            (
+                "m4_community_member_insert_invalidate",
+                &[
+                    "after insert on community_members",
+                    "update community_route_space_inputs",
+                    "where space=new.space",
+                    "s.dirty=0",
+                ],
+            ),
+            (
+                "m4_community_member_delete_invalidate",
+                &[
+                    "after delete on community_members",
+                    "update community_route_space_inputs",
+                    "where space=old.space",
+                    "s.dirty=0",
+                ],
+            ),
+            (
+                "m4_community_member_update_invalidate",
+                &[
+                    "after update on community_members",
+                    "update community_route_space_inputs",
+                    "where (space=old.space or space=new.space)",
+                    "s.dirty=0",
+                ],
+            ),
+        ];
+
+        let conn = self.conn.lock().await;
+        for (table, signatures) in REQUIRED_TABLES {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master
+                      WHERE type='table' AND name=?1 LIMIT 1",
+                    libsql::params![table],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community cutover table {table}: {error}"
+                    ))
+                })?;
+            let sql = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("read community cutover table {table}: {error}"))
+                })?
+                .and_then(|row| row.get::<String>(0).ok());
+            let Some(sql) = sql else {
+                return Ok(true);
+            };
+            let normalized = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let missing = signatures
+                .iter()
+                .copied()
+                .filter(|signature| !normalized.contains(signature))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                continue;
+            }
+            if table == "page_community_assignments"
+                && (missing
+                    == [
+                        "routing_input_generation integer not null",
+                        "routing_space_generation integer not null",
+                    ]
+                    || missing == ["routing_space_generation integer not null"])
+            {
+                return Ok(true);
+            }
+            return Err(WenlanError::VectorDb(format!(
+                "malformed community cutover table {table}: \
+                 missing schema signature {:?}",
+                missing[0]
+            )));
+        }
+
+        for (index, signature) in REQUIRED_INDEXES {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master
+                      WHERE type='index' AND name=?1 LIMIT 1",
+                    libsql::params![index],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community cutover index {index}: {error}"
+                    ))
+                })?;
+            let sql = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("read community cutover index {index}: {error}"))
+                })?
+                .and_then(|row| row.get::<String>(0).ok());
+            let Some(sql) = sql else {
+                return Ok(true);
+            };
+            let normalized = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            if !normalized.contains(signature) {
+                return Ok(true);
+            }
+        }
+
+        for (trigger, signatures) in REQUIRED_TRIGGERS {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master
+                      WHERE type='trigger' AND name=?1 LIMIT 1",
+                    libsql::params![trigger],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community cutover trigger {trigger}: {error}"
+                    ))
+                })?;
+            let sql = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "read community cutover trigger {trigger}: {error}"
+                    ))
+                })?
+                .and_then(|row| row.get::<String>(0).ok());
+            let Some(sql) = sql else {
+                return Ok(true);
+            };
+            let normalized = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            if signatures
+                .iter()
+                .any(|signature| !normalized.contains(signature))
+            {
+                return Ok(true);
+            }
+        }
+
+        for trigger in [
+            "m4_parity_input_entity_insert",
+            "m4_parity_input_entity_delete",
+            "m4_parity_input_entity_update",
+            "m4_parity_input_memory_insert",
+            "m4_parity_input_memory_delete",
+            "m4_parity_input_memory_update",
+            "m4_parity_input_member_insert",
+            "m4_parity_input_member_delete",
+            "m4_parity_input_member_update",
+            "m4_parity_input_community_insert",
+            "m4_parity_input_community_delete",
+            "m4_parity_input_community_update",
+            "m4_parity_input_receipt_insert",
+            "m4_parity_input_receipt_delete",
+            "m4_parity_input_receipt_update",
+            "m4_parity_input_state_insert",
+            "m4_parity_input_state_delete",
+            "m4_parity_input_state_update",
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master
+                      WHERE type='trigger' AND name=?1 LIMIT 1",
+                    libsql::params![trigger],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect global community parity trigger {trigger}: {error}"
+                    ))
+                })?;
+            let sql = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "read global community parity trigger {trigger}: {error}"
+                    ))
+                })?
+                .and_then(|row| row.get::<String>(0).ok());
+            if !sql.as_deref().is_some_and(|value| {
+                value
+                    .to_ascii_lowercase()
+                    .contains("update community_parity_input_state")
+            }) {
+                return Ok(true);
+            }
+        }
+
+        // The integrity guards never bump the counter -- they forbid the write
+        // shapes that would let a bump be laundered past the repair effect
+        // guard -- so the substring check above cannot see them. Whole-shape
+        // comparison, because a guard keeping its name and RAISE text while
+        // losing its WHEN predicate, timing, or target table would enforce
+        // nothing and still read as healthy.
+        if parity_guard_shape_drift(&conn).await?.is_some() {
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 /// Per-store backfill tally for the M2 PR-1 migration report (spec §2
@@ -10158,6 +12350,30 @@ struct EdgeBackfillCounts {
     unknown_inserted: u64,
     unknown_skipped: u64,
 }
+
+#[derive(Debug)]
+struct CommunityGraphChange {
+    space: String,
+    src_id: String,
+    dst_id: String,
+}
+
+#[derive(Debug)]
+struct EntityMergeEdgePlan {
+    old_edge_id: String,
+    src_id: String,
+    dst_id: String,
+    relation_type: String,
+    lineage: String,
+    space: String,
+    cross_space_downgrade: bool,
+    grounded: bool,
+    root_id: Option<String>,
+    payload: Option<String>,
+}
+
+type CommunityGenerationUpdate = (String, i64, BTreeSet<String>);
+const COMMUNITY_READ_PAGE_SIZE: i64 = 512;
 
 impl EdgeBackfillCounts {
     fn to_json(&self) -> serde_json::Value {
@@ -10355,7 +12571,7 @@ impl MemoryDB {
         cross_space_downgrade: bool,
         operation_id: Option<&str>,
     ) -> Result<String, libsql::Error> {
-        Self::dual_write_edge_with_payload(
+        let (edge_id, _) = Self::dual_write_edge_with_payload(
             conn,
             edge_type,
             src_kind,
@@ -10369,7 +12585,8 @@ impl MemoryDB {
             operation_id,
             None,
         )
-        .await
+        .await?;
+        Ok(edge_id)
     }
 
     /// Like [`dual_write_edge`], plus an optional JSON `payload` written
@@ -10408,7 +12625,7 @@ impl MemoryDB {
         cross_space_downgrade: bool,
         operation_id: Option<&str>,
         payload: Option<&str>,
-    ) -> Result<String, libsql::Error> {
+    ) -> Result<(String, Vec<CommunityGraphChange>), libsql::Error> {
         let edge_id = crate::provenance::compute_edge_id(
             edge_type,
             src_kind,
@@ -10418,6 +12635,29 @@ impl MemoryDB {
             discriminator,
         );
         let now = chrono::Utc::now().timestamp();
+        let prior = if edge_type == "relates" {
+            let mut prior_rows = conn
+                .query(
+                    "SELECT grounded, valid_until, lineage, space, src_id, dst_id \
+                     FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.clone()],
+                )
+                .await?;
+            let prior = prior_rows.next().await?.map(|row| {
+                (
+                    row.get::<i64>(0).unwrap_or(0),
+                    row.get::<Option<i64>>(1).unwrap_or(None),
+                    row.get::<String>(2).unwrap_or_default(),
+                    row.get::<String>(3).unwrap_or_default(),
+                    row.get::<String>(4).unwrap_or_default(),
+                    row.get::<String>(5).unwrap_or_default(),
+                )
+            });
+            drop(prior_rows);
+            prior
+        } else {
+            None
+        };
         // ON CONFLICT resolves the shadow edge independent of dual-write CALL
         // ORDER, reconciling three things a re-write can change:
         //   1. Reactivation -- a soft-invalidated edge (`valid_until` set) is
@@ -10468,7 +12708,8 @@ impl MemoryDB {
         // reconciles to a cross-space typed row is rejected here just as the
         // AFTER INSERT fence rejects it on first write (an earlier version only
         // fenced INSERTs, letting a stale-space reactivation slip through).
-        conn.execute(
+        let affected = conn
+            .execute(
             "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, ?12, NULL, ?9, ?10, NULL, NULL)
              ON CONFLICT(edge_id) DO UPDATE SET
@@ -10506,7 +12747,36 @@ impl MemoryDB {
             ],
         )
         .await?;
-        Ok(edge_id)
+
+        let mut graph_changes = Vec::new();
+        if affected > 0 && edge_type == "relates" {
+            let prior_grounded = prior.as_ref().is_some_and(|prior| prior.0 == 1);
+            let prior_participates = prior
+                .as_ref()
+                .is_some_and(|prior| prior.0 == 1 && prior.1.is_none() && prior.2 == "assertion");
+            let current_participates = prior_grounded && lineage == "assertion";
+            if prior_participates {
+                let prior = prior.as_ref().expect("participating edge has prior row");
+                if !current_participates || prior.3 != space {
+                    graph_changes.push(CommunityGraphChange {
+                        space: prior.3.clone(),
+                        src_id: prior.4.clone(),
+                        dst_id: prior.5.clone(),
+                    });
+                }
+            }
+            if current_participates {
+                let moved_space = prior.as_ref().is_some_and(|prior| prior.3 != space);
+                if !prior_participates || moved_space {
+                    graph_changes.push(CommunityGraphChange {
+                        space: space.to_owned(),
+                        src_id: src_id.to_owned(),
+                        dst_id: dst_id.to_owned(),
+                    });
+                }
+            }
+        }
+        Ok((edge_id, graph_changes))
     }
 
     /// Soft-invalidate a dual-written edge on legacy-store
@@ -10519,14 +12789,66 @@ impl MemoryDB {
         conn: &libsql::Connection,
         edge_id: &str,
         superseded_by: Option<&str>,
-    ) -> Result<(), libsql::Error> {
+    ) -> Result<Option<CommunityGraphChange>, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT space, src_id, dst_id FROM edges \
+                 WHERE edge_id = ?1 AND edge_type = 'relates' \
+                   AND grounded = 1 AND valid_until IS NULL \
+                   AND lineage = 'assertion'",
+                libsql::params![edge_id],
+            )
+            .await?;
+        let graph_change = rows.next().await?.map(|row| CommunityGraphChange {
+            space: row.get::<String>(0).unwrap_or_default(),
+            src_id: row.get::<String>(1).unwrap_or_default(),
+            dst_id: row.get::<String>(2).unwrap_or_default(),
+        });
+        drop(rows);
         let now = chrono::Utc::now().timestamp();
-        conn.execute(
+        let affected = conn
+            .execute(
             "UPDATE edges SET valid_until = ?1, superseded_by = ?2 WHERE edge_id = ?3 AND valid_until IS NULL",
             libsql::params![now, superseded_by.map(|s| s.to_string()), edge_id],
         )
         .await?;
-        Ok(())
+        Ok((affected > 0).then_some(graph_change).flatten())
+    }
+
+    async fn bump_community_graph_generations(
+        conn: &libsql::Connection,
+        changes: Vec<CommunityGraphChange>,
+    ) -> Result<Vec<CommunityGenerationUpdate>, libsql::Error> {
+        let mut by_space = BTreeMap::<String, (i64, BTreeSet<String>)>::new();
+        for change in changes {
+            let (trigger_count, dirty) = by_space.entry(change.space).or_default();
+            *trigger_count += 1;
+            dirty.insert(change.src_id);
+            dirty.insert(change.dst_id);
+        }
+
+        let mut updates = Vec::with_capacity(by_space.len());
+        for (space, (trigger_count, dirty_nodes)) in by_space {
+            conn.execute(
+                "INSERT INTO space_graph_state \
+                    (space, graph_generation, grouping_generation, published_generation, dirty) \
+                 VALUES (?1, 1, 1, NULL, 1) \
+                 ON CONFLICT(space) DO UPDATE SET \
+                    graph_generation = MAX(graph_generation - ?2 + 1, 1), dirty = 1",
+                libsql::params![space.clone(), trigger_count],
+            )
+            .await?;
+            let mut rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![space.clone()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                updates.push((space, row.get::<i64>(0).unwrap_or_default(), dirty_nodes));
+            }
+        }
+        Ok(updates)
     }
 
     /// Fetch a bounded batch of `relates` promotion candidates for the M3g
@@ -10752,8 +13074,9 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("promote_edges_grounded begin: {e}")))?;
-        let result: Result<usize, WenlanError> = async {
+        let result: Result<(usize, Vec<CommunityGenerationUpdate>), WenlanError> = async {
             let mut flipped = 0usize;
+            let mut dirty_by_space = BTreeMap::<String, (i64, BTreeSet<String>)>::new();
             for promotion in survivors {
                 let affected = conn
                     .execute(
@@ -10782,21 +13105,957 @@ impl MemoryDB {
                         WenlanError::VectorDb(format!("promote_edges_grounded update: {e}"))
                     })?;
                 flipped += affected as usize;
+                if affected > 0 {
+                    let mut rows = conn
+                        .query(
+                            "SELECT space, src_id, dst_id FROM edges \
+                             WHERE edge_id = ?1 AND edge_type = 'relates'",
+                            libsql::params![promotion.edge_id.clone()],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded dirty endpoints: {error}"
+                            ))
+                        })?;
+                    if let Some(row) = rows.next().await.map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded dirty endpoint row: {error}"
+                        ))
+                    })? {
+                        let space: String = row.get(0).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded space decode: {error}"
+                            ))
+                        })?;
+                        let src_id: String = row.get(1).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded source decode: {error}"
+                            ))
+                        })?;
+                        let dst_id: String = row.get(2).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "promote_edges_grounded destination decode: {error}"
+                            ))
+                        })?;
+                        let (trigger_count, dirty) = dirty_by_space.entry(space).or_default();
+                        *trigger_count += 1;
+                        dirty.insert(src_id);
+                        dirty.insert(dst_id);
+                    }
+                }
             }
-            Ok(flipped)
+
+            let mut generation_updates = Vec::with_capacity(dirty_by_space.len());
+            for (space, (trigger_count, dirty_nodes)) in dirty_by_space {
+                let mut rows = conn
+                    .query(
+                        "INSERT INTO space_graph_state \
+                            (space, graph_generation, grouping_generation, published_generation, dirty) \
+                         VALUES (?1, 1, 1, NULL, 1) \
+                         ON CONFLICT(space) DO UPDATE SET \
+                            graph_generation = MAX(graph_generation - ?2 + 1, 1), dirty = 1 \
+                         RETURNING grouping_generation",
+                        libsql::params![space.clone(), trigger_count],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded graph generation: {error}"
+                        ))
+                    })?;
+                let generation = rows
+                    .next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded generation row: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        WenlanError::VectorDb(
+                            "promote_edges_grounded generation row missing".to_owned(),
+                        )
+                    })?
+                    .get::<i64>(0)
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "promote_edges_grounded generation decode: {error}"
+                        ))
+                    })?;
+                generation_updates.push((space, generation, dirty_nodes));
+            }
+            Ok((flipped, generation_updates))
         }
         .await;
         match result {
-            Ok(flipped) => {
+            Ok((flipped, generation_updates)) => {
                 conn.execute("COMMIT", ()).await.map_err(|e| {
                     WenlanError::VectorDb(format!("promote_edges_grounded commit: {e}"))
                 })?;
+                self.record_community_dirty_nodes(generation_updates);
                 Ok(flipped)
             }
             Err(error) => {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 Err(error)
             }
+        }
+    }
+
+    fn record_community_dirty_nodes(&self, generation_updates: Vec<CommunityGenerationUpdate>) {
+        let mut all_spaces = self
+            .community_dirty_nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (space, generation, nodes) in generation_updates {
+            all_spaces
+                .entry(space)
+                .or_default()
+                .entry(generation)
+                .or_default()
+                .extend(nodes);
+        }
+    }
+
+    fn community_dirty_nodes_through(&self, space: &str, generation: i64) -> BTreeSet<String> {
+        self.community_dirty_nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(space)
+            .into_iter()
+            .flat_map(|generations| generations.range(..=generation))
+            .flat_map(|(_, nodes)| nodes.iter().cloned())
+            .collect()
+    }
+
+    fn clear_community_dirty_nodes_through(&self, space: &str, generation: i64) {
+        let mut all_spaces = self
+            .community_dirty_nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove_space = if let Some(generations) = all_spaces.get_mut(space) {
+            generations.retain(|&seen_generation, _| seen_generation > generation);
+            generations.is_empty()
+        } else {
+            false
+        };
+        if remove_space {
+            all_spaces.remove(space);
+        }
+    }
+
+    async fn acquire_community_grouping_lease(
+        &self,
+        space: &str,
+    ) -> Result<
+        (i64, i64, Option<i64>, String, std::time::Duration),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let conn = self.conn.lock().await;
+        let held_at = std::time::Instant::now();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| CommunityGroupingError::Database(format!("prepare begin: {error}")))?;
+        let result: Result<(i64, i64, Option<i64>, String), CommunityGroupingError> = async {
+            let mut state_rows = tx
+                .query(
+                    "SELECT graph_generation, grouping_generation, published_generation \
+                     FROM space_graph_state WHERE space = ?1 AND dirty = 1",
+                    libsql::params![space.to_owned()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare graph state query: {error}"))
+                })?;
+            let state = state_rows
+                .next()
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare graph state row: {error}"))
+                })?
+                .ok_or_else(|| CommunityGroupingError::NotDirty {
+                    space: space.to_owned(),
+                })?;
+            let graph_generation = state.get::<i64>(0).map_err(|error| {
+                CommunityGroupingError::Database(format!(
+                    "prepare graph generation decode: {error}"
+                ))
+            })?;
+            let input_generation = state.get::<i64>(1).map_err(|error| {
+                CommunityGroupingError::Database(format!(
+                    "prepare grouping generation decode: {error}"
+                ))
+            })?;
+            let published_generation = state.get::<Option<i64>>(2).map_err(|error| {
+                CommunityGroupingError::Database(format!(
+                    "prepare published generation decode: {error}"
+                ))
+            })?;
+            drop(state_rows);
+
+            tx.execute(
+                "DELETE FROM grouping_leases \
+                 WHERE phase = 'community' AND space = ?1 \
+                   AND (expires_at <= unixepoch() OR input_generation <> ?2)",
+                libsql::params![space.to_owned(), input_generation],
+            )
+            .await
+            .map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare reap leases: {error}"))
+            })?;
+
+            let token = uuid::Uuid::new_v4().to_string();
+            let acquired = tx
+                .execute(
+                    "INSERT INTO grouping_leases \
+                        (phase, space, input_generation, token, expires_at, attempt) \
+                     VALUES ('community', ?1, ?2, ?3, unixepoch() + 300, 1) \
+                     ON CONFLICT(phase, space, input_generation) DO NOTHING",
+                    libsql::params![space.to_owned(), input_generation, token.clone()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare insert lease: {error}"))
+                })?;
+            if acquired == 0 {
+                return Err(CommunityGroupingError::LeaseHeld {
+                    space: space.to_owned(),
+                    input_generation,
+                });
+            }
+            Ok((
+                graph_generation,
+                input_generation,
+                published_generation,
+                token,
+            ))
+        }
+        .await;
+
+        match result {
+            Ok((graph_generation, input_generation, published_generation, token)) => {
+                tx.commit().await.map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare commit: {error}"))
+                })?;
+                Ok((
+                    graph_generation,
+                    input_generation,
+                    published_generation,
+                    token,
+                    held_at.elapsed(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn load_community_grounded_edges_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (
+            Vec<crate::community_partition::ProjectionInputEdge>,
+            std::time::Duration,
+        ),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = Vec::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
+                .query(
+                    "SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE edge_type = 'relates' AND grounded = 1 \
+                       AND valid_until IS NULL AND space = ?1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND lineage = 'assertion' AND edge_id > ?2 \
+                     ORDER BY edge_id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare grounded edges: {error}"))
+                })?;
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare grounded edge row: {error}"))
+            })? {
+                page.push(crate::community_partition::ProjectionInputEdge::new(
+                    row.get::<String>(0).map_err(|error| {
+                        CommunityGroupingError::Database(format!("prepare edge id decode: {error}"))
+                    })?,
+                    row.get::<String>(1).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare source id decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(2).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare destination id decode: {error}"
+                        ))
+                    })?,
+                ));
+            }
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some(last) = page.last() {
+                cursor.clone_from(&last.edge_id);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
+
+    async fn load_community_ungrounded_edges_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (
+            Vec<crate::community_partition::ProjectionInputEdge>,
+            std::time::Duration,
+        ),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = Vec::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
+                .query(
+                    "SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE edge_type = 'relates' AND grounded = 0 \
+                       AND valid_until IS NULL AND space = ?1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND lineage = 'assertion' AND edge_id > ?2 \
+                     ORDER BY edge_id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare ungrounded edges: {error}"))
+                })?;
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare ungrounded edge row: {error}"))
+            })? {
+                page.push(crate::community_partition::ProjectionInputEdge::new(
+                    row.get::<String>(0).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare ungrounded edge id decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(1).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare ungrounded source decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(2).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare ungrounded destination decode: {error}"
+                        ))
+                    })?,
+                ));
+            }
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some(last) = page.last() {
+                cursor.clone_from(&last.edge_id);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
+
+    async fn load_community_entities_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (BTreeMap<String, Vec<f32>>, std::time::Duration),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = BTreeMap::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
+                .query(
+                    "SELECT id, embedding FROM entities \
+                     WHERE space = ?1 AND id > ?2 \
+                     ORDER BY id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare entities: {error}"))
+                })?;
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare entity row: {error}"))
+            })? {
+                let node_id = row.get::<String>(0).map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare entity id decode: {error}"))
+                })?;
+                let embedding = row
+                    .get::<Option<Vec<u8>>>(1)
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare entity embedding decode: {error}"
+                        ))
+                    })?
+                    .unwrap_or_default()
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    .collect();
+                page.push((node_id, embedding));
+            }
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some((last, _)) = page.last() {
+                cursor.clone_from(last);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
+
+    async fn load_previous_community_members_paged(
+        &self,
+        space: &str,
+    ) -> Result<
+        (BTreeMap<String, String>, std::time::Duration),
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::CommunityGroupingError;
+
+        let mut all = BTreeMap::new();
+        let mut cursor = String::new();
+        let mut hold = std::time::Duration::ZERO;
+        loop {
+            let conn = self.conn.lock().await;
+            let held_at = std::time::Instant::now();
+            let mut rows = conn
+                .query(
+                    "SELECT node_id, community_id FROM community_members \
+                     WHERE space = ?1 AND node_id > ?2 \
+                     ORDER BY node_id LIMIT ?3",
+                    libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("prepare prior members: {error}"))
+                })?;
+            let mut page = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("prepare prior member row: {error}"))
+            })? {
+                page.push((
+                    row.get::<String>(0).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare prior node decode: {error}"
+                        ))
+                    })?,
+                    row.get::<String>(1).map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "prepare prior community decode: {error}"
+                        ))
+                    })?,
+                ));
+            }
+            drop(rows);
+            hold += held_at.elapsed();
+            drop(conn);
+            let done = page.len() < COMMUNITY_READ_PAGE_SIZE as usize;
+            if let Some((last, _)) = page.last() {
+                cursor.clone_from(last);
+            }
+            all.extend(page);
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((all, hold))
+    }
+
+    async fn release_community_grouping_lease(
+        &self,
+        space: &str,
+        input_generation: i64,
+        token: &str,
+    ) {
+        let conn = self.conn.lock().await;
+        let _ = conn
+            .execute(
+                "DELETE FROM grouping_leases \
+                 WHERE phase='community' AND space=?1 \
+                   AND input_generation=?2 AND token=?3",
+                libsql::params![space.to_owned(), input_generation, token.to_owned()],
+            )
+            .await;
+    }
+
+    /// Acquire one durable community-phase lease, then copy every potentially
+    /// large input through deterministic keyset pages. Each page releases the
+    /// single DB connection mutex before the next page and before all graph
+    /// computation.
+    pub async fn prepare_community_grouping(
+        &self,
+        space: &str,
+    ) -> Result<
+        crate::community_grouping::CommunityGroupingAttempt,
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::{CommunityGroupingAttempt, CommunityGroupingError};
+
+        let composer_started = std::time::Instant::now();
+        let (graph_generation, input_generation, published_generation, token, mut db_mutex_hold) =
+            self.acquire_community_grouping_lease(space).await?;
+        let mut lease_cleanup = crate::community_grouping::CommunityGroupingLeaseCleanup::new(
+            Arc::clone(&self.conn),
+            space.to_owned(),
+            input_generation,
+            token.clone(),
+        );
+        let loaded = async {
+            let (edges, edge_hold) = self.load_community_grounded_edges_paged(space).await?;
+            let (ungrounded_edges, ungrounded_hold) =
+                self.load_community_ungrounded_edges_paged(space).await?;
+            let (entity_embeddings, entity_hold) =
+                self.load_community_entities_paged(space).await?;
+            let (previous_ids, member_hold) =
+                self.load_previous_community_members_paged(space).await?;
+            Ok::<_, CommunityGroupingError>((
+                edges,
+                ungrounded_edges,
+                entity_embeddings,
+                previous_ids,
+                edge_hold + ungrounded_hold + entity_hold + member_hold,
+            ))
+        }
+        .await;
+        let (edges, ungrounded_edges, entity_embeddings, previous_ids, load_hold) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.release_community_grouping_lease(space, input_generation, &token)
+                    .await;
+                lease_cleanup.disarm();
+                return Err(error);
+            }
+        };
+        db_mutex_hold += load_hold;
+
+        // Serialize the volatile frontier snapshot behind the same connection
+        // mutex every graph writer retains through its dirty-node record.
+        let conn = self.conn.lock().await;
+        let held_at = std::time::Instant::now();
+        let dirty_node_ids = self.community_dirty_nodes_through(space, input_generation);
+        let published_versions = if published_generation.is_some() {
+            let mut rows = conn
+                .query(
+                    "SELECT algo_version, projection_version FROM communities \
+                     WHERE space = ?1 AND retired_at IS NULL \
+                     ORDER BY community_id LIMIT 1",
+                    libsql::params![space.to_owned()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "prepare published community versions: {error}"
+                    ))
+                })?;
+            rows.next()
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "read published community versions: {error}"
+                    ))
+                })?
+                .map(|row| {
+                    Ok::<_, CommunityGroupingError>((
+                        row.get::<String>(0).map_err(|error| {
+                            CommunityGroupingError::Database(format!(
+                                "decode published algorithm version: {error}"
+                            ))
+                        })?,
+                        row.get::<String>(1).map_err(|error| {
+                            CommunityGroupingError::Database(format!(
+                                "decode published projection version: {error}"
+                            ))
+                        })?,
+                    ))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        db_mutex_hold += held_at.elapsed();
+        drop(conn);
+
+        Ok(CommunityGroupingAttempt {
+            space: space.to_owned(),
+            composer_started,
+            graph_generation,
+            input_generation,
+            published_generation,
+            published_versions,
+            token,
+            lease_cleanup,
+            edges,
+            ungrounded_edges,
+            entity_embeddings,
+            previous_ids,
+            dirty_node_ids,
+            db_mutex_hold,
+        })
+    }
+
+    /// Publish one computed community snapshot only when the graph generation
+    /// still matches the leased input. The consume-once attempt releases its
+    /// lease on the published, held, and stale paths.
+    pub async fn finalize_community_grouping(
+        &self,
+        mut attempt: crate::community_grouping::CommunityGroupingAttempt,
+        computed: crate::community_grouping::CommunityGroupingComputed,
+    ) -> Result<
+        crate::community_grouping::CommunityGroupingOutcome,
+        crate::community_grouping::CommunityGroupingError,
+    > {
+        use crate::community_grouping::{
+            CommunityGroupingError, CommunityGroupingOutcome, CommunityGroupingReceipt,
+            COMMUNITY_ALGO_VERSION, COMMUNITY_PROJECTION_VERSION,
+        };
+
+        let finalize_started = std::time::Instant::now();
+        let identity_events = crate::community_grouping::detect_community_identity_events(
+            &attempt.previous_ids,
+            &computed.members,
+        );
+        let membership_digest =
+            community_membership_digest(computed.members.iter().map(|member| {
+                (
+                    member.node_id.clone(),
+                    member.community_id.clone(),
+                    member.attachment.to_string(),
+                )
+            }));
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                CommunityGroupingError::Database(format!("finalize begin: {error}"))
+            })?;
+
+        let member_count = computed.members.len();
+        let held_below_floor = computed.held_below_floor;
+        let projected_edge_count = computed.projected_edge_count;
+        let compute_mode = computed.compute_mode;
+        let input_rows_loaded = attempt.edges.len()
+            + attempt.ungrounded_edges.len()
+            + attempt.entity_embeddings.len()
+            + attempt.previous_ids.len();
+        let result: Result<(bool, bool), CommunityGroupingError> = async {
+            let mut lease_rows = tx
+                .query(
+                    "SELECT 1 FROM grouping_leases \
+                     WHERE phase = 'community' AND space = ?1 \
+                       AND input_generation = ?2 AND token = ?3 LIMIT 1",
+                    libsql::params![
+                        attempt.space.clone(),
+                        attempt.input_generation,
+                        attempt.token.clone()
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("finalize lease query: {error}"))
+                })?;
+            let owns_lease = lease_rows.next().await.map_err(|error| {
+                CommunityGroupingError::Database(format!("finalize lease row: {error}"))
+            })?;
+            drop(lease_rows);
+            if owns_lease.is_none() {
+                return Err(CommunityGroupingError::Database(format!(
+                    "community grouping lease token is no longer current for {} generation {}",
+                    attempt.space, attempt.input_generation
+                )));
+            }
+
+            let matched = if held_below_floor {
+                false
+            } else {
+                tx.execute(
+                    "UPDATE space_graph_state \
+                     SET published_generation = ?2 \
+                     WHERE space = ?1 AND grouping_generation = ?2 AND dirty = 1",
+                    libsql::params![attempt.space.clone(), attempt.input_generation],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!("finalize generation CAS: {error}"))
+                })? > 0
+            };
+
+            if matched {
+                let now = chrono::Utc::now().timestamp();
+                tx.execute(
+                    "DELETE FROM community_members WHERE space = ?1",
+                    libsql::params![attempt.space.clone()],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "finalize replace prior members: {error}"
+                    ))
+                })?;
+                #[cfg(test)]
+                tests::community_grouping_test_hooks::after_member_delete(&attempt.space).await;
+                tx.execute(
+                    "UPDATE communities SET retired_at = ?2, updated_at = ?2 \
+                     WHERE space = ?1 AND retired_at IS NULL",
+                    libsql::params![attempt.space.clone(), now],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "finalize retire prior communities: {error}"
+                    ))
+                })?;
+
+                let community_ids = computed
+                    .members
+                    .iter()
+                    .map(|member| member.community_id.clone())
+                    .collect::<BTreeSet<_>>();
+                for community_id in community_ids {
+                    tx.execute(
+                        "INSERT INTO communities \
+                            (community_id, space, display_name, algo_version, \
+                             projection_version, created_at, updated_at, retired_at) \
+                         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?5, NULL) \
+                         ON CONFLICT(community_id) DO UPDATE SET \
+                            space = excluded.space, \
+                            algo_version = excluded.algo_version, \
+                            projection_version = excluded.projection_version, \
+                            updated_at = excluded.updated_at, retired_at = NULL",
+                        libsql::params![
+                            community_id,
+                            attempt.space.clone(),
+                            COMMUNITY_ALGO_VERSION,
+                            COMMUNITY_PROJECTION_VERSION,
+                            now
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "finalize upsert community: {error}"
+                        ))
+                    })?;
+                }
+
+                for member in &computed.members {
+                    tx.execute(
+                        "INSERT INTO community_members \
+                            (space, node_id, node_kind, community_id, \
+                             published_generation, attachment) \
+                         VALUES (?1, ?2, 'entity', ?3, ?4, ?5)",
+                        libsql::params![
+                            attempt.space.clone(),
+                            member.node_id.clone(),
+                            member.community_id.clone(),
+                            attempt.input_generation,
+                            member.attachment
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "finalize insert community member: {error}"
+                        ))
+                    })?;
+                }
+
+                tx.execute(
+                    "INSERT INTO community_publication_receipts
+                        (space, published_generation, membership_digest,
+                         algo_version, projection_version, published_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(space) DO UPDATE SET
+                        published_generation=excluded.published_generation,
+                        membership_digest=excluded.membership_digest,
+                        algo_version=excluded.algo_version,
+                        projection_version=excluded.projection_version,
+                        published_at=excluded.published_at",
+                    libsql::params![
+                        attempt.space.clone(),
+                        attempt.input_generation,
+                        membership_digest.clone(),
+                        COMMUNITY_ALGO_VERSION,
+                        COMMUNITY_PROJECTION_VERSION,
+                        now
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "finalize publication receipt: {error}"
+                    ))
+                })?;
+                for event in &identity_events {
+                    let mut source_ids = event.old_community_ids.clone();
+                    source_ids.extend(event.new_community_ids.iter().cloned());
+                    source_ids.sort();
+                    source_ids.dedup();
+                    let proposal_id = format!(
+                        "{}:{}:{}:{}",
+                        event.action, attempt.space, attempt.input_generation, event.subject_id
+                    );
+                    let payload = serde_json::json!({
+                        "action": event.action,
+                        "space": attempt.space,
+                        "source_generation": attempt.input_generation,
+                        "subject_id": event.subject_id,
+                        "old_community_ids": event.old_community_ids,
+                        "new_community_ids": event.new_community_ids,
+                        "proposed_display_name": null,
+                    })
+                    .to_string();
+                    tx.execute(
+                        "INSERT OR IGNORE INTO refinement_queue
+                            (id, action, source_ids, payload, confidence, status)
+                         VALUES (?1, ?2, ?3, ?4, 1.0, 'awaiting_review')",
+                        libsql::params![
+                            proposal_id,
+                            event.action,
+                            serde_json::to_string(&source_ids).map_err(|error| {
+                                CommunityGroupingError::Database(format!(
+                                    "serialize community proposal sources: {error}"
+                                ))
+                            })?,
+                            payload
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "finalize insert community identity proposal: {error}"
+                        ))
+                    })?;
+                }
+                let cleared = tx
+                    .execute(
+                        "UPDATE space_graph_state
+                            SET dirty=0
+                          WHERE space=?1
+                            AND grouping_generation=?2
+                            AND published_generation=?2
+                            AND dirty=1",
+                        libsql::params![attempt.space.clone(), attempt.input_generation],
+                    )
+                    .await
+                    .map_err(|error| {
+                        CommunityGroupingError::Database(format!(
+                            "finalize clear community dirty state: {error}"
+                        ))
+                    })?;
+                if cleared == 0 {
+                    return Err(CommunityGroupingError::Database(format!(
+                        "community generation changed while finalizing {} generation {}",
+                        attempt.space, attempt.input_generation
+                    )));
+                }
+            }
+
+            tx.execute(
+                "DELETE FROM grouping_leases \
+                 WHERE phase = 'community' AND space = ?1 \
+                   AND input_generation = ?2 AND token = ?3",
+                libsql::params![
+                    attempt.space.clone(),
+                    attempt.input_generation,
+                    attempt.token.clone()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                CommunityGroupingError::Database(format!("finalize consume lease: {error}"))
+            })?;
+            Ok((matched, held_below_floor))
+        }
+        .await;
+
+        let (matched, held_below_floor) = match result {
+            Ok(result) => {
+                tx.commit().await.map_err(|error| {
+                    CommunityGroupingError::Database(format!("finalize commit: {error}"))
+                })?;
+                result
+            }
+            Err(error) => return Err(error),
+        };
+        attempt.disarm_lease_cleanup();
+        if matched {
+            self.clear_community_dirty_nodes_through(&attempt.space, attempt.input_generation);
+        }
+        drop(conn);
+
+        let receipt = CommunityGroupingReceipt {
+            input_generation: attempt.input_generation,
+            published_generation: if matched {
+                attempt.input_generation
+            } else {
+                attempt.published_generation.unwrap_or_default()
+            },
+            projected_edge_count,
+            member_count,
+            db_mutex_hold: attempt.db_mutex_hold + finalize_started.elapsed(),
+            composer_elapsed: attempt.composer_started.elapsed(),
+            input_rows_loaded,
+            member_rows_written: if matched { member_count } else { 0 },
+            compute_mode,
+        };
+        if held_below_floor {
+            Ok(CommunityGroupingOutcome::Held(receipt))
+        } else if matched {
+            Ok(CommunityGroupingOutcome::Published(receipt))
+        } else {
+            Ok(CommunityGroupingOutcome::Stale(receipt))
         }
     }
 
@@ -11145,6 +14404,2178 @@ impl MemoryDB {
             None => return Ok(false),
         };
         Ok(proven_epoch == current_epoch)
+    }
+
+    /// Record intent to move one community consumer onto the durable M4
+    /// substrate. Intent is deliberately separate from permission: the reader
+    /// stays on `entities.community_id` until every space that can contribute
+    /// actual legacy or durable rows has a clean, current parity receipt.
+    pub async fn set_community_reader_cutover(
+        &self,
+        consumer: &str,
+        enabled: bool,
+    ) -> Result<(), WenlanError> {
+        if !Self::is_known_community_reader(consumer) {
+            return Err(WenlanError::Validation(format!(
+                "unknown community reader consumer: {consumer}"
+            )));
+        }
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO community_reader_cutover (consumer, enabled, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(consumer) DO UPDATE SET
+                 enabled = excluded.enabled,
+                 updated_at = excluded.updated_at",
+            libsql::params![
+                consumer,
+                if enabled { 1i64 } else { 0i64 },
+                chrono::Utc::now().timestamp()
+            ],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("set_community_reader_cutover: {error}")))?;
+        Ok(())
+    }
+
+    fn is_known_community_reader(consumer: &str) -> bool {
+        matches!(
+            consumer,
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+        )
+    }
+
+    /// Fail-closed permission gate for a durable community reader.
+    ///
+    /// Relevant spaces are derived from the union of the consumer's actual
+    /// legacy and durable candidate rows. Control-plane rows cannot make a
+    /// space disappear from this set. Every relevant space must have a clean
+    /// published grouping state and a zero-drift receipt for that exact
+    /// published generation. Missing, corrupt, stale, or disabled state keeps
+    /// the reader on the legacy fallback.
+    async fn community_reader_uses_durable(conn: &libsql::Connection, consumer: &str) -> bool {
+        if !Self::is_known_community_reader(consumer) {
+            return false;
+        }
+        let sql = format!("SELECT {}", community_reader_durable_gate_sql(consumer));
+        let result = async {
+            let mut rows = conn.query(&sql, ()).await?;
+            Ok::<_, libsql::Error>(
+                rows.next().await?.and_then(|row| row.get::<i64>(0).ok()) == Some(1),
+            )
+        }
+        .await;
+        matches!(result, Ok(true))
+    }
+
+    async fn community_reader_parity_needs_reconcile(
+        &self,
+        consumer: &str,
+    ) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        let gate = community_reader_durable_gate_sql(consumer);
+        let sql = format!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM community_reader_cutover
+                  WHERE consumer=?1 AND enabled=1
+             ) AND NOT ({gate})"
+        );
+        let mut rows = conn
+            .query(&sql, libsql::params![consumer])
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "community parity pending check for {consumer}: {error}"
+                ))
+            })?;
+        Ok(rows
+            .next()
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "community parity pending row for {consumer}: {error}"
+                ))
+            })?
+            .and_then(|row| row.get::<i64>(0).ok())
+            == Some(1))
+    }
+
+    /// Production reconciliation hook for the existing CommunityDetection
+    /// phase. The migration seeds intent ON for both PR-2 consumers, while
+    /// their read gate remains fail-closed until these current receipts exist.
+    pub async fn reconcile_pending_community_readers(&self) -> Result<usize, WenlanError> {
+        let mut spaces_checked = 0usize;
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            if self
+                .community_reader_parity_needs_reconcile(consumer)
+                .await?
+            {
+                spaces_checked += self
+                    .reconcile_community_reader_parity(consumer)
+                    .await?
+                    .spaces_checked;
+            }
+        }
+        Ok(spaces_checked)
+    }
+
+    /// Recompute semantic parity for one community reader from independent
+    /// legacy and durable reads. Opaque community ids are intentionally ignored:
+    /// equality is over normalized source-member sets. A changed partition over
+    /// the same source universe is an explained rebinding delta. A source that
+    /// exists on only one side is unexplained and blocks cutover.
+    pub async fn reconcile_community_reader_parity(
+        &self,
+        consumer: &str,
+    ) -> Result<CommunityReaderParityReceipt, WenlanError> {
+        let reconcile_started = std::time::Instant::now();
+        if !Self::is_known_community_reader(consumer) {
+            return Err(WenlanError::Validation(format!(
+                "unknown community reader consumer: {consumer}"
+            )));
+        }
+        #[derive(Debug)]
+        struct CandidateSnapshot {
+            source_id: String,
+            space: String,
+            legacy_community_id: Option<String>,
+            raw_durable_community_id: Option<String>,
+            current_durable_community_id: Option<String>,
+        }
+        #[derive(Debug)]
+        struct SpaceSnapshot {
+            space: String,
+            published_generation: Option<i64>,
+            stored_digest: Option<String>,
+            algorithm: Option<String>,
+            projection: Option<String>,
+            members: Vec<(String, String, String)>,
+        }
+
+        let snapshot_conn = self
+            ._db
+            .connect()
+            .map_err(|error| WenlanError::VectorDb(format!("community parity connect: {error}")))?;
+        snapshot_conn
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON; BEGIN;")
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity snapshot begin: {error}"))
+            })?;
+        let snapshot_result: Result<
+            (i64, Vec<CandidateSnapshot>, Vec<SpaceSnapshot>),
+            WenlanError,
+        > = async {
+            let mut generation_rows = snapshot_conn
+                .query(
+                    "SELECT generation FROM community_parity_input_state WHERE singleton=1",
+                    (),
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity generation: {error}"))
+                })?;
+            let input_generation = generation_rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity generation row: {error}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb("community parity input generation missing".to_string())
+                })?
+                .get::<i64>(0)
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity generation decode: {error}"))
+                })?;
+            drop(generation_rows);
+
+            let mut candidate_rows = snapshot_conn
+                .query(
+                    "SELECT m.source_id, m.space, CAST(e.community_id AS TEXT),
+                                raw_member.community_id,
+                                CASE WHEN current_community.community_id IS NOT NULL
+                                     THEN raw_member.community_id END
+                           FROM memories m
+                           LEFT JOIN entities e ON e.id=m.entity_id
+                           LEFT JOIN community_members raw_member
+                             ON raw_member.node_id=m.entity_id
+                            AND raw_member.space=m.space
+                           LEFT JOIN space_graph_state current_state
+                             ON current_state.space=raw_member.space
+                            AND current_state.dirty=0
+                            AND current_state.published_generation IS NOT NULL
+                            AND current_state.grouping_generation=current_state.published_generation
+                            AND raw_member.published_generation=current_state.published_generation
+                           LEFT JOIN communities current_community
+                             ON current_community.community_id=raw_member.community_id
+                            AND current_community.space=raw_member.space
+                            AND current_community.retired_at IS NULL
+                          WHERE m.source='memory' AND m.chunk_index=0
+                            AND (
+                                ?1<>'summary_buckets'
+                                OR (
+                                    COALESCE(m.pending_revision,0)=0
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM memories superseder
+                                         WHERE superseder.supersedes=m.source_id
+                                           AND COALESCE(superseder.pending_revision,0)=0
+                                           AND superseder.source='memory'
+                                    )
+                                )
+                            )
+                            AND m.is_recap=0
+                            AND m.supersede_mode<>'archive'
+                            AND m.source_id NOT LIKE 'merged_%'
+                            AND m.source_id NOT LIKE 'recap_%'
+                            AND m.embedding IS NOT NULL
+                          ORDER BY m.source_id",
+                    libsql::params![consumer],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity candidates: {error}"))
+                })?;
+            let mut candidates = Vec::new();
+            let mut relevant_spaces = BTreeSet::new();
+            while let Some(row) = candidate_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("community parity candidate row: {error}"))
+            })? {
+                let candidate = CandidateSnapshot {
+                    source_id: row.get::<String>(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("community parity source decode: {error}"))
+                    })?,
+                    space: row.get::<String>(1).map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "community parity candidate space decode: {error}"
+                        ))
+                    })?,
+                    legacy_community_id: row.get::<String>(2).ok(),
+                    raw_durable_community_id: row.get::<String>(3).ok(),
+                    current_durable_community_id: row.get::<String>(4).ok(),
+                };
+                if candidate.legacy_community_id.is_some()
+                    || candidate.raw_durable_community_id.is_some()
+                {
+                    relevant_spaces.insert(candidate.space.clone());
+                }
+                candidates.push(candidate);
+            }
+            drop(candidate_rows);
+
+            let mut spaces = Vec::new();
+            for space in relevant_spaces {
+                let mut state_rows = snapshot_conn
+                    .query(
+                        "SELECT state.published_generation,
+                                    receipt.membership_digest,
+                                    receipt.algo_version,
+                                    receipt.projection_version
+                               FROM space_graph_state state
+                               LEFT JOIN community_publication_receipts receipt
+                                 ON receipt.space=state.space
+                                AND receipt.published_generation=state.published_generation
+                              WHERE state.space=?1
+                                AND state.dirty=0
+                                AND state.published_generation IS NOT NULL
+                                AND state.grouping_generation=state.published_generation",
+                        libsql::params![space.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "community parity publication snapshot: {error}"
+                        ))
+                    })?;
+                let state = state_rows
+                    .next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("community parity publication row: {error}"))
+                    })?
+                    .map(|row| {
+                        (
+                            row.get::<i64>(0).ok(),
+                            row.get::<String>(1).ok(),
+                            row.get::<String>(2).ok(),
+                            row.get::<String>(3).ok(),
+                        )
+                    })
+                    .unwrap_or((None, None, None, None));
+                drop(state_rows);
+                let mut members = Vec::new();
+                if let Some(published_generation) = state.0 {
+                    let mut member_rows = snapshot_conn
+                        .query(
+                            "SELECT node_id, community_id, attachment
+                                   FROM community_members
+                                  WHERE space=?1 AND published_generation=?2
+                                  ORDER BY node_id",
+                            libsql::params![space.clone(), published_generation],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "community parity membership snapshot: {error}"
+                            ))
+                        })?;
+                    while let Some(row) = member_rows.next().await.map_err(|error| {
+                        WenlanError::VectorDb(format!("community parity membership row: {error}"))
+                    })? {
+                        members.push((
+                            row.get::<String>(0).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "community parity member decode: {error}"
+                                ))
+                            })?,
+                            row.get::<String>(1).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "community parity member community decode: {error}"
+                                ))
+                            })?,
+                            row.get::<String>(2).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "community parity attachment decode: {error}"
+                                ))
+                            })?,
+                        ));
+                    }
+                }
+                spaces.push(SpaceSnapshot {
+                    space,
+                    published_generation: state.0,
+                    stored_digest: state.1,
+                    algorithm: state.2,
+                    projection: state.3,
+                    members,
+                });
+            }
+            Ok((input_generation, candidates, spaces))
+        }
+        .await;
+        let (input_generation, candidates, space_snapshots) = match snapshot_result {
+            Ok(snapshot) => {
+                snapshot_conn.execute("COMMIT", ()).await.map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity snapshot commit: {error}"))
+                })?;
+                snapshot
+            }
+            Err(error) => {
+                let _ = snapshot_conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        let read_connection_autocommit = snapshot_conn
+            .execute_batch("BEGIN; ROLLBACK;")
+            .await
+            .is_ok();
+        drop(snapshot_conn);
+        let relevant_spaces = space_snapshots
+            .iter()
+            .map(|space| space.space.clone())
+            .collect::<Vec<_>>();
+        let relevant_spaces_digest =
+            community_relevant_spaces_digest(relevant_spaces.iter().cloned());
+        #[cfg(test)]
+        tests::community_parity_test_hooks::after_snapshot(
+            consumer,
+            &relevant_spaces_digest,
+            read_connection_autocommit,
+        )
+        .await;
+
+        let mut legacy_groups = BTreeMap::<String, Vec<String>>::new();
+        let mut durable_groups = BTreeMap::<(String, String), Vec<String>>::new();
+        for candidate in candidates {
+            if let Some(community_id) = candidate.legacy_community_id {
+                legacy_groups
+                    .entry(community_id)
+                    .or_default()
+                    .push(candidate.source_id.clone());
+            }
+            if let Some(community_id) = candidate.current_durable_community_id {
+                durable_groups
+                    .entry((candidate.space, community_id))
+                    .or_default()
+                    .push(candidate.source_id);
+            }
+        }
+        let mut legacy = legacy_groups.into_values().collect::<Vec<_>>();
+        let mut durable = durable_groups.into_values().collect::<Vec<_>>();
+        for group in legacy.iter_mut().chain(durable.iter_mut()) {
+            group.sort();
+        }
+        legacy.sort();
+        durable.sort();
+        let legacy_sources = legacy.iter().flatten().cloned().collect::<BTreeSet<_>>();
+        let durable_sources = durable.iter().flatten().cloned().collect::<BTreeSet<_>>();
+        let source_coverage_delta = legacy_sources
+            .symmetric_difference(&durable_sources)
+            .count();
+        let output_delta = if consumer == COMMUNITY_SUMMARY_BUCKETS_CONSUMER {
+            let legacy_partitions = legacy.iter().cloned().collect::<BTreeSet<_>>();
+            let durable_partitions = durable.iter().cloned().collect::<BTreeSet<_>>();
+            legacy_partitions
+                .symmetric_difference(&durable_partitions)
+                .count()
+        } else {
+            let minimum = crate::refinery::summary::min_bucket_members();
+            let legacy_eligible = legacy
+                .iter()
+                .filter(|group| group.len() >= minimum)
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let durable_eligible = durable
+                .iter()
+                .filter(|group| group.len() >= minimum)
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            legacy_eligible
+                .symmetric_difference(&durable_eligible)
+                .count()
+        };
+
+        let mut valid_space_proofs = Vec::new();
+        let mut invalid_publication_proofs = 0usize;
+        for snapshot in space_snapshots {
+            let current_digest = community_membership_digest(snapshot.members);
+            let valid = snapshot.published_generation.is_some()
+                && snapshot.stored_digest.as_deref() == Some(current_digest.as_str())
+                && snapshot.algorithm.as_deref()
+                    == Some(crate::community_grouping::COMMUNITY_ALGO_VERSION)
+                && snapshot.projection.as_deref()
+                    == Some(crate::community_grouping::COMMUNITY_PROJECTION_VERSION);
+            if valid {
+                valid_space_proofs.push((
+                    snapshot.space,
+                    snapshot.published_generation.unwrap_or_default(),
+                    current_digest,
+                ));
+            } else {
+                invalid_publication_proofs += 1;
+            }
+        }
+        let unexplained_total = source_coverage_delta + invalid_publication_proofs;
+        let explained_total = if source_coverage_delta == 0 {
+            output_delta
+        } else {
+            0
+        };
+        let report = serde_json::json!({
+            "consumer": consumer,
+            "input_generation": input_generation,
+            "relevant_spaces": relevant_spaces,
+            "relevant_spaces_digest": relevant_spaces_digest,
+            "legacy_groups": legacy,
+            "durable_groups": durable,
+            "source_coverage_delta_count": source_coverage_delta,
+            "output_delta_count": output_delta,
+            "invalid_publication_proof_count": invalid_publication_proofs,
+            "explained_structural_delta_count": explained_total,
+            "unexplained_drift_count": unexplained_total,
+        })
+        .to_string();
+
+        let conn = self.conn.lock().await;
+        let canonical_mutex_started = std::time::Instant::now();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity finalize begin: {error}"))
+            })?;
+        let mut generation_rows = tx
+            .query(
+                "SELECT generation FROM community_parity_input_state WHERE singleton=1",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity finalize generation: {error}"))
+            })?;
+        let current_generation = generation_rows
+            .next()
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity finalize generation row: {error}"))
+            })?
+            .and_then(|row| row.get::<i64>(0).ok());
+        drop(generation_rows);
+        if current_generation != Some(input_generation) {
+            tx.rollback().await.map_err(|error| {
+                WenlanError::VectorDb(format!("community parity stale rollback: {error}"))
+            })?;
+            return Ok(CommunityReaderParityReceipt {
+                consumer: consumer.to_owned(),
+                ready: false,
+                spaces_checked: relevant_spaces.len(),
+                unexplained_drift_count: 0,
+                explained_structural_delta_count: 0,
+                canonical_mutex_hold: canonical_mutex_started.elapsed(),
+                reconcile_elapsed: reconcile_started.elapsed(),
+            });
+        }
+        for (space, published_generation, membership_digest) in &valid_space_proofs {
+            let mut proof_rows = tx
+                .query(
+                    "SELECT COUNT(*)
+                       FROM space_graph_state state
+                       JOIN community_publication_receipts receipt
+                         ON receipt.space=state.space
+                        AND receipt.published_generation=state.published_generation
+                      WHERE state.space=?1
+                        AND state.dirty=0
+                        AND state.grouping_generation=?2
+                        AND state.published_generation=?2
+                        AND receipt.membership_digest=?3
+                        AND receipt.algo_version=?4
+                        AND receipt.projection_version=?5",
+                    libsql::params![
+                        space.clone(),
+                        *published_generation,
+                        membership_digest.clone(),
+                        crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                        crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity finalize proof CAS: {error}"))
+                })?;
+            let matches = proof_rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity finalize proof row: {error}"))
+                })?
+                .and_then(|row| row.get::<i64>(0).ok())
+                == Some(1);
+            drop(proof_rows);
+            if !matches {
+                tx.rollback().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity proof-CAS rollback: {error}"))
+                })?;
+                return Ok(CommunityReaderParityReceipt {
+                    consumer: consumer.to_owned(),
+                    ready: false,
+                    spaces_checked: relevant_spaces.len(),
+                    unexplained_drift_count: 0,
+                    explained_structural_delta_count: 0,
+                    canonical_mutex_hold: canonical_mutex_started.elapsed(),
+                    reconcile_elapsed: reconcile_started.elapsed(),
+                });
+            }
+        }
+        let matched = tx
+            .execute(
+                "UPDATE community_parity_input_state
+                    SET relevant_spaces_digest=?2
+                  WHERE singleton=1 AND generation=?1",
+                libsql::params![input_generation, relevant_spaces_digest.clone()],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity digest CAS: {error}"))
+            })?;
+        if matched == 0 {
+            tx.rollback().await.map_err(|error| {
+                WenlanError::VectorDb(format!("community parity digest-CAS rollback: {error}"))
+            })?;
+            return Ok(CommunityReaderParityReceipt {
+                consumer: consumer.to_owned(),
+                ready: false,
+                spaces_checked: relevant_spaces.len(),
+                unexplained_drift_count: 0,
+                explained_structural_delta_count: 0,
+                canonical_mutex_hold: canonical_mutex_started.elapsed(),
+                reconcile_elapsed: reconcile_started.elapsed(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO community_reader_current_input
+                (consumer, input_generation, relevant_spaces_digest)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(consumer) DO UPDATE SET
+                input_generation=excluded.input_generation,
+                relevant_spaces_digest=excluded.relevant_spaces_digest",
+            libsql::params![consumer, input_generation, relevant_spaces_digest.clone()],
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("community parity current input: {error}"))
+        })?;
+        tx.execute(
+            "DELETE FROM community_reader_space_proof WHERE consumer=?1",
+            libsql::params![consumer],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("community parity proof reset: {error}")))?;
+        for (space, published_generation, membership_digest) in &valid_space_proofs {
+            tx.execute(
+                "INSERT INTO community_reader_space_proof
+                    (consumer, space, proven_published_generation, proven_membership_digest)
+                 VALUES (?1, ?2, ?3, ?4)",
+                libsql::params![
+                    consumer,
+                    space.clone(),
+                    *published_generation,
+                    membership_digest.clone()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity space proof: {error}"))
+            })?;
+        }
+        tx.execute(
+            "INSERT INTO community_reader_watermark
+                (consumer, proven_input_generation, relevant_spaces_digest,
+                 relevant_space_count, consumer_contract_version,
+                 source_coverage_delta_count, output_delta_count,
+                 unexplained_drift_count, checked_at, report_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(consumer) DO UPDATE SET
+                proven_input_generation=excluded.proven_input_generation,
+                relevant_spaces_digest=excluded.relevant_spaces_digest,
+                relevant_space_count=excluded.relevant_space_count,
+                consumer_contract_version=excluded.consumer_contract_version,
+                source_coverage_delta_count=excluded.source_coverage_delta_count,
+                output_delta_count=excluded.output_delta_count,
+                unexplained_drift_count=excluded.unexplained_drift_count,
+                checked_at=excluded.checked_at,
+                report_json=excluded.report_json",
+            libsql::params![
+                consumer,
+                input_generation,
+                relevant_spaces_digest,
+                i64::try_from(relevant_spaces.len()).unwrap_or(i64::MAX),
+                community_consumer_contract_version(),
+                i64::try_from(source_coverage_delta).unwrap_or(i64::MAX),
+                i64::try_from(output_delta).unwrap_or(i64::MAX),
+                i64::try_from(unexplained_total).unwrap_or(i64::MAX),
+                chrono::Utc::now().timestamp(),
+                report
+            ],
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("community parity global watermark: {error}"))
+        })?;
+        tx.commit().await.map_err(|error| {
+            WenlanError::VectorDb(format!("community parity finalize commit: {error}"))
+        })?;
+        let canonical_mutex_hold = canonical_mutex_started.elapsed();
+        Ok(CommunityReaderParityReceipt {
+            consumer: consumer.to_owned(),
+            ready: unexplained_total == 0,
+            spaces_checked: relevant_spaces.len(),
+            unexplained_drift_count: unexplained_total,
+            explained_structural_delta_count: explained_total,
+            canonical_mutex_hold,
+            reconcile_elapsed: reconcile_started.elapsed(),
+        })
+    }
+
+    /// Retry one clean space containing a stale route. Space-wide generation,
+    /// community-publication, and route-version mismatches refresh every active
+    /// page in the affected space. Missing assignments and page-local version
+    /// mismatches refresh only the selected page.
+    pub(crate) async fn refresh_next_stale_page_community_routes(
+        &self,
+    ) -> Result<Option<crate::community_routing::PageCommunityRoutingReceipt>, WenlanError> {
+        #[derive(Debug)]
+        struct RawAssignment {
+            page_version: i64,
+            routing_input_generation: i64,
+            routing_space_generation: i64,
+            community_published_generation: i64,
+            route_version: String,
+        }
+
+        #[derive(Debug)]
+        enum StaleRouteWork {
+            FullSpace {
+                space: String,
+                published_generation: i64,
+            },
+            TargetPage {
+                page_id: String,
+                space: String,
+                published_generation: i64,
+            },
+        }
+
+        let next = {
+            let conn = self.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT p.id, p.space, p.version, i.generation, ri.generation,
+                            s.published_generation, a.page_id, a.page_version,
+                            a.routing_input_generation, a.routing_space_generation,
+                            a.community_published_generation, a.route_version
+                       FROM pages p
+                       JOIN page_community_route_inputs i
+                         ON i.page_id=p.id AND i.space=p.space
+                       JOIN community_route_space_inputs ri
+                         ON ri.space=p.space
+                       JOIN space_graph_state s
+                         ON s.space=p.space
+                        AND s.dirty=0
+                        AND s.published_generation IS NOT NULL
+                        AND s.grouping_generation=s.published_generation
+                       LEFT JOIN page_community_assignments a
+                         ON a.page_id=p.id
+                      WHERE p.status='active'
+                        AND (
+                               a.page_id IS NULL
+                            OR a.page_version<>p.version
+                            OR a.routing_input_generation<>i.generation
+                            OR a.routing_space_generation<>ri.generation
+                            OR a.community_published_generation<>s.published_generation
+                            OR a.route_version<>?1
+                        )
+                      ORDER BY
+                        CASE WHEN a.page_id IS NOT NULL
+                                   AND (
+                                          a.routing_space_generation<>ri.generation
+                                       OR a.community_published_generation<>s.published_generation
+                                       OR a.route_version<>?1
+                                   )
+                             THEN 0 ELSE 1 END,
+                        p.space, p.id
+                      LIMIT 1",
+                    libsql::params![crate::community_routing::COMMUNITY_ROUTE_VERSION],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("select stale page community route: {error}"))
+                })?;
+            rows.next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("read stale page community route: {error}"))
+                })?
+                .map(|row| {
+                    let decode = |column, label| {
+                        row.get::<i64>(column).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "decode stale page community route {label}: {error}"
+                            ))
+                        })
+                    };
+                    let page_id = row.get::<String>(0).map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "decode stale page community route page: {error}"
+                        ))
+                    })?;
+                    let space = row.get::<String>(1).map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "decode stale page community route space: {error}"
+                        ))
+                    })?;
+                    let page_version = decode(2, "page version")?;
+                    let routing_input_generation = decode(3, "page input generation")?;
+                    let routing_space_generation = decode(4, "space input generation")?;
+                    let published_generation = decode(5, "community generation")?;
+                    let assignment = if row
+                        .get::<Option<String>>(6)
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "decode stale page community route assignment page: {error}"
+                            ))
+                        })?
+                        .is_some()
+                    {
+                        Some(RawAssignment {
+                            page_version: decode(7, "assignment page version")?,
+                            routing_input_generation: decode(
+                                8,
+                                "assignment page input generation",
+                            )?,
+                            routing_space_generation: decode(
+                                9,
+                                "assignment space input generation",
+                            )?,
+                            community_published_generation: decode(
+                                10,
+                                "assignment community generation",
+                            )?,
+                            route_version: row.get::<String>(11).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "decode stale page community route assignment version: {error}"
+                                ))
+                            })?,
+                        })
+                    } else {
+                        None
+                    };
+
+                    let global_stale = assignment.as_ref().is_some_and(|assignment| {
+                        assignment.routing_space_generation != routing_space_generation
+                            || assignment.community_published_generation != published_generation
+                            || assignment.route_version
+                                != crate::community_routing::COMMUNITY_ROUTE_VERSION
+                    });
+                    if global_stale {
+                        return Ok::<_, WenlanError>(StaleRouteWork::FullSpace {
+                            space,
+                            published_generation,
+                        });
+                    }
+
+                    let local_stale = assignment.as_ref().is_none_or(|assignment| {
+                        assignment.page_version != page_version
+                            || assignment.routing_input_generation != routing_input_generation
+                    });
+                    if local_stale {
+                        Ok(StaleRouteWork::TargetPage {
+                            page_id,
+                            space,
+                            published_generation,
+                        })
+                    } else {
+                        Err(WenlanError::VectorDb(
+                            "stale page community route had no classified cause".to_string(),
+                        ))
+                    }
+                })
+                .transpose()?
+        };
+        let Some(next) = next else {
+            return Ok(None);
+        };
+        match next {
+            StaleRouteWork::FullSpace {
+                space,
+                published_generation,
+            } => self
+                .refresh_page_community_routes(&space, published_generation)
+                .await
+                .map(Some),
+            StaleRouteWork::TargetPage {
+                page_id,
+                space,
+                published_generation,
+            } => self
+                .refresh_page_community_routes_inner(&space, published_generation, Some(&page_id))
+                .await
+                .map(Some),
+        }
+    }
+
+    /// Recompute every active page route in one space from the just-published
+    /// community snapshot. Vote weights are the member's within-community
+    /// grounded degree (with a floor of one); entity-poor pages use the nearest
+    /// centroid of entity-shadow page embeddings. All expensive scoring happens
+    /// after the snapshot connection guard is released.
+    pub async fn refresh_page_community_routes(
+        &self,
+        space: &str,
+        expected_community_generation: i64,
+    ) -> Result<crate::community_routing::PageCommunityRoutingReceipt, WenlanError> {
+        self.refresh_page_community_routes_inner(space, expected_community_generation, None)
+            .await
+    }
+
+    async fn refresh_page_community_routes_inner(
+        &self,
+        space: &str,
+        expected_community_generation: i64,
+        target_page_id: Option<&str>,
+    ) -> Result<crate::community_routing::PageCommunityRoutingReceipt, WenlanError> {
+        use crate::community_routing::{
+            community_embedding_centroids, decide_page_community_route, nearest_community_centroid,
+            PageCommunityRoutingReceipt,
+        };
+
+        #[derive(Debug)]
+        struct PageRouteSnapshot {
+            page_id: String,
+            version: i64,
+            routing_input_generation: i64,
+            routing_space_generation: i64,
+            embedding: Vec<f32>,
+        }
+
+        let decode_embedding = |bytes: Vec<u8>| {
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>()
+        };
+
+        let (pages, page_entities, membership, entity_weights, prior_assignments, centroids) = {
+            let conn = self.conn.lock().await;
+            let target_page = target_page_id
+                .map(|page_id| libsql::Value::Text(page_id.to_owned()))
+                .unwrap_or(libsql::Value::Null);
+            let mut pages = Vec::new();
+            let mut page_rows = conn
+                .query(
+                    "SELECT p.id, p.version, i.generation, ri.generation, p.embedding
+                       FROM pages p
+                       JOIN page_community_route_inputs i
+                         ON i.page_id=p.id AND i.space=p.space
+                       JOIN community_route_space_inputs ri
+                         ON ri.space=p.space
+                      WHERE p.space=?1 AND p.status='active'
+                        AND (?2 IS NULL OR p.id=?2)
+                      ORDER BY p.id",
+                    libsql::params![space, target_page.clone()],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("route pages snapshot: {error}")))?;
+            while let Some(row) = page_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("route page snapshot row: {error}"))
+            })? {
+                pages.push(PageRouteSnapshot {
+                    page_id: row.get(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("route page id decode: {error}"))
+                    })?,
+                    version: row.get(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("route page version decode: {error}"))
+                    })?,
+                    routing_input_generation: row.get(2).map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "route page input generation decode: {error}"
+                        ))
+                    })?,
+                    routing_space_generation: row.get(3).map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "route space input generation decode: {error}"
+                        ))
+                    })?,
+                    embedding: decode_embedding(
+                        row.get::<Option<Vec<u8>>>(4)
+                            .unwrap_or(None)
+                            .unwrap_or_default(),
+                    ),
+                });
+            }
+            drop(page_rows);
+
+            let mut membership = BTreeMap::<String, String>::new();
+            let mut member_rows = conn
+                .query(
+                    "SELECT cm.node_id, cm.community_id
+                       FROM community_members cm
+                       JOIN space_graph_state s
+                         ON s.space=cm.space
+                        AND cm.published_generation=s.published_generation
+                       JOIN communities c
+                         ON c.community_id=cm.community_id
+                        AND c.space=cm.space
+                        AND c.retired_at IS NULL
+                      WHERE cm.space=?1
+                        AND s.dirty=0
+                        AND s.published_generation=?2
+                      ORDER BY cm.node_id",
+                    libsql::params![space, expected_community_generation],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("route community membership: {error}"))
+                })?;
+            while let Some(row) = member_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("route community member row: {error}"))
+            })? {
+                membership.insert(
+                    row.get(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("route member node decode: {error}"))
+                    })?,
+                    row.get(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("route member community decode: {error}"))
+                    })?,
+                );
+            }
+            drop(member_rows);
+
+            let mut entity_weights = membership
+                .keys()
+                .map(|node_id| (node_id.clone(), 1.0f64))
+                .collect::<BTreeMap<_, _>>();
+            let mut edge_rows = conn
+                .query(
+                    "SELECT src_id, dst_id
+                       FROM edges
+                      WHERE space=?1 AND edge_type='relates'
+                        AND grounded=1 AND valid_until IS NULL
+                        AND src_kind='entity' AND dst_kind='entity'
+                        AND lineage='assertion'
+                      ORDER BY edge_id",
+                    libsql::params![space],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("route grounded degrees: {error}"))
+                })?;
+            while let Some(row) = edge_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("route grounded degree row: {error}"))
+            })? {
+                let src = row.get::<String>(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("route degree src decode: {error}"))
+                })?;
+                let dst = row.get::<String>(1).map_err(|error| {
+                    WenlanError::VectorDb(format!("route degree dst decode: {error}"))
+                })?;
+                if membership.get(&src) == membership.get(&dst) && membership.contains_key(&src) {
+                    *entity_weights.entry(src).or_insert(1.0) += 1.0;
+                    *entity_weights.entry(dst).or_insert(1.0) += 1.0;
+                }
+            }
+            drop(edge_rows);
+
+            let mut page_entities = BTreeMap::<String, BTreeSet<String>>::new();
+            let mut entity_rows = conn
+                .query(
+                    "WITH page_memory_edges(page_id, memory_source_id) AS (
+                         SELECT e.src_id, e.dst_id
+                           FROM edges e
+                          WHERE e.space=?1
+                            AND e.edge_type IN ('mentions','cites')
+                            AND e.src_kind='page' AND e.dst_kind='memory'
+                            AND e.valid_until IS NULL
+                            AND (?2 IS NULL OR e.src_id=?2)
+                         UNION
+                         SELECT e.dst_id, e.src_id
+                           FROM edges e
+                          WHERE e.space=?1
+                            AND e.edge_type IN ('mentions','cites')
+                            AND e.src_kind='memory' AND e.dst_kind='page'
+                            AND e.valid_until IS NULL
+                            AND (?2 IS NULL OR e.dst_id=?2)
+                     )
+                     SELECT page_id, entity_id FROM (
+                         SELECT p.id AS page_id, p.entity_id AS entity_id
+                           FROM pages p
+                          WHERE p.space=?1 AND p.status='active'
+                            AND p.entity_id IS NOT NULL
+                            AND (?2 IS NULL OR p.id=?2)
+                         UNION
+                         SELECT edge.page_id, m.entity_id
+                           FROM page_memory_edges edge
+                           JOIN pages p
+                             ON p.id=edge.page_id
+                            AND p.space=?1 AND p.status='active'
+                           JOIN memories m
+                             ON m.source_id=edge.memory_source_id
+                            AND m.source='memory' AND m.chunk_index=0
+                            AND m.space=p.space
+                          WHERE m.entity_id IS NOT NULL
+                     )
+                     ORDER BY page_id, entity_id",
+                    libsql::params![space, target_page.clone()],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("route page entities: {error}")))?;
+            while let Some(row) = entity_rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("route page entity row: {error}")))?
+            {
+                page_entities
+                    .entry(row.get::<String>(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("route page entity page decode: {error}"))
+                    })?)
+                    .or_default()
+                    .insert(row.get::<String>(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("route page entity id decode: {error}"))
+                    })?);
+            }
+            drop(entity_rows);
+
+            let mut prior_assignments = BTreeMap::<String, String>::new();
+            let mut prior_rows = conn
+                .query(
+                    "SELECT a.page_id, a.community_id
+                       FROM page_community_assignments a
+                       JOIN communities c
+                        ON c.community_id=a.community_id
+                        AND c.space=a.space AND c.retired_at IS NULL
+                      WHERE a.space=?1 AND a.community_id IS NOT NULL
+                        AND (?2 IS NULL OR a.page_id=?2)
+                        AND a.route_version=?3
+                        AND a.routing_input_generation>=0
+                        AND a.routing_space_generation>=0
+                      ORDER BY a.page_id",
+                    libsql::params![
+                        space,
+                        target_page,
+                        crate::community_routing::COMMUNITY_ROUTE_VERSION
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("route prior assignments: {error}"))
+                })?;
+            while let Some(row) = prior_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("route prior assignment row: {error}"))
+            })? {
+                prior_assignments.insert(
+                    row.get(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("route prior page decode: {error}"))
+                    })?,
+                    row.get(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("route prior community decode: {error}"))
+                    })?,
+                );
+            }
+            drop(prior_rows);
+
+            let mut centroid_members = Vec::new();
+            let mut embedding_rows = conn
+                .query(
+                    "SELECT epm.entity_id, cm.community_id, p.embedding
+                       FROM pages p
+                       JOIN entity_page_map epm ON epm.page_id=p.id
+                       JOIN community_members cm
+                         ON cm.node_id=epm.entity_id AND cm.space=p.space
+                       JOIN space_graph_state s
+                         ON s.space=cm.space
+                        AND cm.published_generation=s.published_generation
+                      WHERE p.space=?1 AND p.kind='entity'
+                        AND p.status='active' AND p.embedding IS NOT NULL
+                        AND s.published_generation=?2
+                      ORDER BY epm.entity_id",
+                    libsql::params![space, expected_community_generation],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("route centroid members: {error}"))
+                })?;
+            while let Some(row) = embedding_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("route centroid member row: {error}"))
+            })? {
+                centroid_members.push((
+                    row.get(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("route centroid node decode: {error}"))
+                    })?,
+                    row.get(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("route centroid community decode: {error}"))
+                    })?,
+                    decode_embedding(row.get::<Vec<u8>>(2).unwrap_or_default()),
+                ));
+            }
+            let centroids = community_embedding_centroids(centroid_members);
+            (
+                pages,
+                page_entities,
+                membership,
+                entity_weights,
+                prior_assignments,
+                centroids,
+            )
+        };
+
+        #[cfg(test)]
+        tests::community_routing_test_hooks::after_snapshot(space).await;
+
+        let mut assignments_published = 0usize;
+        let mut stale_writes = 0usize;
+        for page in &pages {
+            let entity_ids = page_entities
+                .get(&page.page_id)
+                .cloned()
+                .unwrap_or_default();
+            let best = if entity_ids.len() >= 2 {
+                let mut total_weight = 0.0;
+                let mut community_weights = BTreeMap::<String, f64>::new();
+                for entity_id in &entity_ids {
+                    let weight = entity_weights.get(entity_id).copied().unwrap_or(1.0);
+                    total_weight += weight;
+                    if let Some(community_id) = membership.get(entity_id) {
+                        *community_weights.entry(community_id.clone()).or_default() += weight;
+                    }
+                }
+                community_weights
+                    .into_iter()
+                    .map(|(community_id, weight)| (community_id, weight / total_weight))
+                    .max_by(|left, right| {
+                        left.1
+                            .total_cmp(&right.1)
+                            .then_with(|| right.0.cmp(&left.0))
+                    })
+            } else {
+                nearest_community_centroid(&page.embedding, &centroids)
+            };
+            let decision = decide_page_community_route(
+                prior_assignments.get(&page.page_id).map(String::as_str),
+                best.as_ref()
+                    .map(|(community_id, score)| (community_id.as_str(), *score)),
+            );
+            if self
+                .publish_page_community_route(
+                    &page.page_id,
+                    space,
+                    page.version,
+                    page.routing_input_generation,
+                    page.routing_space_generation,
+                    expected_community_generation,
+                    &decision,
+                )
+                .await?
+            {
+                assignments_published += 1;
+            } else {
+                stale_writes += 1;
+            }
+        }
+
+        Ok(PageCommunityRoutingReceipt {
+            pages_considered: pages.len(),
+            assignments_published,
+            stale_writes,
+        })
+    }
+
+    /// Publish one page-route decision only if every versioned input used to
+    /// compute it is still current: page version, page-local routing input,
+    /// space-wide routing input, and community publication. The single
+    /// INSERT..SELECT is the CAS; any mismatch makes it affect zero rows,
+    /// preserving the prior assignment for a fresh retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_page_community_route(
+        &self,
+        page_id: &str,
+        space: &str,
+        expected_page_version: i64,
+        expected_routing_input_generation: i64,
+        expected_routing_space_generation: i64,
+        expected_community_generation: i64,
+        decision: &crate::community_routing::PageCommunityRouteDecision,
+    ) -> Result<bool, WenlanError> {
+        if !decision.score().is_finite() {
+            return Err(WenlanError::Validation(
+                "page community route score must be finite".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "INSERT INTO page_community_assignments
+                    (page_id, space, community_id, state, score, page_version,
+                     routing_input_generation, routing_space_generation,
+                     community_published_generation, route_version, updated_at)
+                 SELECT p.id, ?2, ?7, ?8, ?9, p.version,
+                        i.generation, ri.generation, s.published_generation, ?10, ?11
+                   FROM pages p
+                   JOIN page_community_route_inputs i
+                     ON i.page_id=p.id AND i.space=p.space
+                   JOIN community_route_space_inputs ri ON ri.space=p.space
+                   JOIN space_graph_state s ON s.space=?2
+                  WHERE p.id=?1 AND p.space=?2 AND p.version=?3
+                    AND i.generation=?4
+                    AND ri.generation=?5
+                    AND p.status='active'
+                    AND s.dirty=0
+                    AND s.published_generation=?6
+                    AND s.grouping_generation=s.published_generation
+                 ON CONFLICT(page_id) DO UPDATE SET
+                    space=excluded.space,
+                    community_id=excluded.community_id,
+                    state=excluded.state,
+                    score=excluded.score,
+                    page_version=excluded.page_version,
+                    routing_input_generation=excluded.routing_input_generation,
+                    routing_space_generation=excluded.routing_space_generation,
+                    community_published_generation=excluded.community_published_generation,
+                    route_version=excluded.route_version,
+                    updated_at=excluded.updated_at",
+                libsql::params![
+                    page_id,
+                    space,
+                    expected_page_version,
+                    expected_routing_input_generation,
+                    expected_routing_space_generation,
+                    expected_community_generation,
+                    decision
+                        .community_id()
+                        .map(|value| libsql::Value::Text(value.to_owned()))
+                        .unwrap_or(libsql::Value::Null),
+                    decision.state(),
+                    decision.score(),
+                    crate::community_routing::COMMUNITY_ROUTE_VERSION,
+                    chrono::Utc::now().timestamp()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("publish page community route: {error}"))
+            })?;
+        Ok(affected > 0)
+    }
+
+    /// Paginated, scope-classified community summaries. Existing frozen
+    /// page/entity responses are not extended.
+    pub async fn list_communities(
+        &self,
+        scope: &crate::read_scope::ReadScope,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<wenlan_types::CommunityListResponse, WenlanError> {
+        use wenlan_types::{CommunityListResponse, CommunityReadScope, CommunitySummary};
+
+        let limit = limit.clamp(1, 500);
+        let fetch_limit = i64::try_from(limit + 1).unwrap_or(501);
+        let cursor = cursor.unwrap_or_default().to_owned();
+        let (scope_sql, scope_param) = match scope {
+            crate::read_scope::ReadScope::Global => ("", None),
+            crate::read_scope::ReadScope::Space(space) => (" AND c.space=?3", Some(space.clone())),
+            crate::read_scope::ReadScope::Uncategorized => {
+                (" AND c.space=?3", Some(UNFILED_SPACE_ID.to_string()))
+            }
+        };
+        let sql = format!(
+            "SELECT c.community_id, c.space, c.display_name,
+                    COUNT(cm.node_id), s.published_generation,
+                    c.algo_version, c.projection_version
+               FROM communities c
+               JOIN space_graph_state s
+                 ON s.space=c.space AND s.dirty=0
+                AND s.published_generation=s.grouping_generation
+               LEFT JOIN community_members cm
+                 ON cm.community_id=c.community_id
+                AND cm.space=c.space
+                AND cm.published_generation=s.published_generation
+              WHERE c.retired_at IS NULL AND c.community_id>?1
+                {scope_sql}
+              GROUP BY c.community_id, c.space, c.display_name,
+                       s.published_generation, c.algo_version, c.projection_version
+              ORDER BY c.community_id
+              LIMIT ?2"
+        );
+        let conn = self.conn.lock().await;
+        let mut params = vec![
+            libsql::Value::Text(cursor),
+            libsql::Value::Integer(fetch_limit),
+        ];
+        if let Some(space) = scope_param {
+            params.push(libsql::Value::Text(space));
+        }
+        let mut rows = conn
+            .query(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("list community snapshot: {error}")))?;
+        let mut communities = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("list community snapshot row: {error}"))
+        })? {
+            communities.push(CommunitySummary {
+                community_id: row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("community id decode: {error}"))
+                })?,
+                space: row.get(1).map_err(|error| {
+                    WenlanError::VectorDb(format!("community space decode: {error}"))
+                })?,
+                display_name: row.get(2).unwrap_or(None),
+                member_count: u64::try_from(row.get::<i64>(3).unwrap_or_default())
+                    .unwrap_or_default(),
+                published_generation: row.get(4).map_err(|error| {
+                    WenlanError::VectorDb(format!("community generation decode: {error}"))
+                })?,
+                algo_version: row.get(5).map_err(|error| {
+                    WenlanError::VectorDb(format!("community algo decode: {error}"))
+                })?,
+                projection_version: row.get(6).map_err(|error| {
+                    WenlanError::VectorDb(format!("community projection decode: {error}"))
+                })?,
+            });
+        }
+        let next_cursor = if communities.len() > limit {
+            communities.truncate(limit);
+            communities
+                .last()
+                .map(|community| community.community_id.clone())
+        } else {
+            None
+        };
+        let wire_scope = match scope {
+            crate::read_scope::ReadScope::Global => CommunityReadScope::Global,
+            crate::read_scope::ReadScope::Space(name) => {
+                CommunityReadScope::Space { name: name.clone() }
+            }
+            crate::read_scope::ReadScope::Uncategorized => CommunityReadScope::Uncategorized,
+        };
+        Ok(CommunityListResponse {
+            schema_version: wenlan_types::communities::COMMUNITY_READ_SCHEMA_VERSION.to_string(),
+            scope: wire_scope,
+            communities,
+            next_cursor,
+        })
+    }
+
+    pub async fn list_community_members(
+        &self,
+        scope: &crate::read_scope::ReadScope,
+        cursor: Option<&wenlan_types::CommunityMemberCursor>,
+        limit: usize,
+    ) -> Result<wenlan_types::CommunityMembersResponse, WenlanError> {
+        use wenlan_types::{
+            CommunityMember, CommunityMemberCursor, CommunityMembersResponse, CommunityReadScope,
+        };
+
+        let limit = limit.clamp(1, 500);
+        let fetch_limit = i64::try_from(limit + 1).unwrap_or(501);
+        let cursor_space = cursor.map(|value| value.space.clone()).unwrap_or_default();
+        let cursor_node = cursor
+            .map(|value| value.node_id.clone())
+            .unwrap_or_default();
+        let (scope_sql, scope_param) = match scope {
+            crate::read_scope::ReadScope::Global => ("", None),
+            crate::read_scope::ReadScope::Space(space) => (" AND cm.space=?4", Some(space.clone())),
+            crate::read_scope::ReadScope::Uncategorized => {
+                (" AND cm.space=?4", Some(UNFILED_SPACE_ID.to_string()))
+            }
+        };
+        let sql = format!(
+            "SELECT cm.space, cm.node_id, cm.node_kind, cm.community_id,
+                    cm.published_generation, cm.attachment
+               FROM community_members cm
+               JOIN space_graph_state s
+                 ON s.space=cm.space
+                AND s.dirty=0
+                AND s.grouping_generation=s.published_generation
+                AND cm.published_generation=s.published_generation
+               JOIN communities c
+                 ON c.community_id=cm.community_id
+                AND c.space=cm.space
+                AND c.retired_at IS NULL
+              WHERE (cm.space>?1 OR (cm.space=?1 AND cm.node_id>?2))
+                {scope_sql}
+              ORDER BY cm.space, cm.node_id
+              LIMIT ?3"
+        );
+        let conn = self.conn.lock().await;
+        let mut params = vec![
+            libsql::Value::Text(cursor_space),
+            libsql::Value::Text(cursor_node),
+            libsql::Value::Integer(fetch_limit),
+        ];
+        if let Some(space) = scope_param {
+            params.push(libsql::Value::Text(space));
+        }
+        let mut rows = conn
+            .query(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("list community members: {error}")))?;
+        let mut members = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("list community member row: {error}")))?
+        {
+            members.push(CommunityMember {
+                space: row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("community member space decode: {error}"))
+                })?,
+                node_id: row.get(1).map_err(|error| {
+                    WenlanError::VectorDb(format!("community member node decode: {error}"))
+                })?,
+                node_kind: row.get(2).map_err(|error| {
+                    WenlanError::VectorDb(format!("community member kind decode: {error}"))
+                })?,
+                community_id: row.get(3).map_err(|error| {
+                    WenlanError::VectorDb(format!("community member id decode: {error}"))
+                })?,
+                published_generation: row.get(4).map_err(|error| {
+                    WenlanError::VectorDb(format!("community member generation decode: {error}"))
+                })?,
+                attachment: row.get(5).map_err(|error| {
+                    WenlanError::VectorDb(format!("community member attachment decode: {error}"))
+                })?,
+            });
+        }
+        let next_cursor = if members.len() > limit {
+            members.truncate(limit);
+            members.last().map(|member| CommunityMemberCursor {
+                space: member.space.clone(),
+                node_id: member.node_id.clone(),
+            })
+        } else {
+            None
+        };
+        let wire_scope = match scope {
+            crate::read_scope::ReadScope::Global => CommunityReadScope::Global,
+            crate::read_scope::ReadScope::Space(name) => {
+                CommunityReadScope::Space { name: name.clone() }
+            }
+            crate::read_scope::ReadScope::Uncategorized => CommunityReadScope::Uncategorized,
+        };
+        Ok(CommunityMembersResponse {
+            schema_version: wenlan_types::communities::COMMUNITY_READ_SCHEMA_VERSION.to_string(),
+            scope: wire_scope,
+            members,
+            next_cursor,
+        })
+    }
+
+    pub async fn list_community_page_assignments(
+        &self,
+        scope: &crate::read_scope::ReadScope,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<wenlan_types::CommunityPageAssignmentsResponse, WenlanError> {
+        use wenlan_types::{
+            CommunityPageAssignment, CommunityPageAssignmentsResponse, CommunityReadScope,
+            PageCommunityAssignmentState,
+        };
+
+        let limit = limit.clamp(1, 500);
+        let fetch_limit = i64::try_from(limit + 1).unwrap_or(501);
+        let cursor = cursor.unwrap_or_default().to_owned();
+        let (scope_sql, scope_param) = match scope {
+            crate::read_scope::ReadScope::Global => ("", None),
+            crate::read_scope::ReadScope::Space(space) => {
+                (" AND p.workspace=?4", Some(space.clone()))
+            }
+            crate::read_scope::ReadScope::Uncategorized => {
+                (" AND p.workspace=?4", Some(UNFILED_SPACE_ID.to_string()))
+            }
+        };
+        let sql = format!(
+            "SELECT a.page_id, a.space, a.community_id, a.state, a.score,
+                    a.page_version, a.community_published_generation,
+                    a.route_version, a.updated_at
+               FROM page_community_assignments a
+               JOIN pages p
+                 ON p.id=a.page_id
+                AND p.space=a.space
+                AND p.version=a.page_version
+                AND p.status='active'
+               JOIN page_community_route_inputs i
+                 ON i.page_id=a.page_id
+                AND i.space=a.space
+                AND i.generation=a.routing_input_generation
+               JOIN community_route_space_inputs ri
+                 ON ri.space=a.space
+                AND ri.generation=a.routing_space_generation
+               JOIN space_graph_state s
+                 ON s.space=a.space
+                AND s.dirty=0
+                AND s.grouping_generation=s.published_generation
+                AND s.published_generation=a.community_published_generation
+              WHERE a.page_id>?1
+                AND a.route_version=?3
+                {scope_sql}
+              ORDER BY a.page_id
+              LIMIT ?2"
+        );
+        let conn = self.conn.lock().await;
+        let mut params = vec![
+            libsql::Value::Text(cursor),
+            libsql::Value::Integer(fetch_limit),
+            libsql::Value::Text(crate::community_routing::COMMUNITY_ROUTE_VERSION.to_string()),
+        ];
+        if let Some(space) = scope_param {
+            params.push(libsql::Value::Text(space));
+        }
+        let mut rows = conn
+            .query(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("list page community assignments: {error}"))
+            })?;
+        let mut page_assignments = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("list page community assignment row: {error}"))
+        })? {
+            let state = match row.get::<String>(3).as_deref() {
+                Ok("assigned") => PageCommunityAssignmentState::Assigned,
+                Ok("held") => PageCommunityAssignmentState::Held,
+                Ok("dropped") => PageCommunityAssignmentState::Dropped,
+                _ => continue,
+            };
+            page_assignments.push(CommunityPageAssignment {
+                page_id: row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("page assignment id decode: {error}"))
+                })?,
+                space: row.get(1).map_err(|error| {
+                    WenlanError::VectorDb(format!("page assignment space decode: {error}"))
+                })?,
+                community_id: row.get(2).unwrap_or(None),
+                state,
+                score: row.get(4).map_err(|error| {
+                    WenlanError::VectorDb(format!("page assignment score decode: {error}"))
+                })?,
+                page_version: row.get(5).map_err(|error| {
+                    WenlanError::VectorDb(format!("page assignment version decode: {error}"))
+                })?,
+                community_published_generation: row.get(6).map_err(|error| {
+                    WenlanError::VectorDb(format!("page assignment generation decode: {error}"))
+                })?,
+                route_version: row.get(7).map_err(|error| {
+                    WenlanError::VectorDb(format!("page assignment route version decode: {error}"))
+                })?,
+                updated_at: row.get(8).map_err(|error| {
+                    WenlanError::VectorDb(format!("page assignment timestamp decode: {error}"))
+                })?,
+            });
+        }
+        let next_cursor = if page_assignments.len() > limit {
+            page_assignments.truncate(limit);
+            page_assignments
+                .last()
+                .map(|assignment| assignment.page_id.clone())
+        } else {
+            None
+        };
+        let wire_scope = match scope {
+            crate::read_scope::ReadScope::Global => CommunityReadScope::Global,
+            crate::read_scope::ReadScope::Space(name) => {
+                CommunityReadScope::Space { name: name.clone() }
+            }
+            crate::read_scope::ReadScope::Uncategorized => CommunityReadScope::Uncategorized,
+        };
+        Ok(CommunityPageAssignmentsResponse {
+            schema_version: wenlan_types::communities::COMMUNITY_READ_SCHEMA_VERSION.to_string(),
+            scope: wire_scope,
+            page_assignments,
+            next_cursor,
+        })
+    }
+
+    pub async fn list_community_proposals(
+        &self,
+        scope: &crate::read_scope::ReadScope,
+        limit: usize,
+    ) -> Result<wenlan_types::ListCommunityProposalsResponse, WenlanError> {
+        use wenlan_types::{
+            CommunityProposalAction, CommunityProposalPayload, CommunityProposalSummary,
+            ListCommunityProposalsResponse,
+        };
+
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_value) = match scope {
+            crate::read_scope::ReadScope::Global => ("", None),
+            crate::read_scope::ReadScope::Space(space) => (
+                " AND json_extract(payload, '$.space')=?2",
+                Some(space.clone()),
+            ),
+            crate::read_scope::ReadScope::Uncategorized => (
+                " AND json_extract(payload, '$.space')=?2",
+                Some(UNFILED_SPACE_ID.to_string()),
+            ),
+        };
+        let sql = format!(
+            "SELECT id, action, payload, created_at
+               FROM refinement_queue
+              WHERE action IN (
+                    'community_split','community_merge','community_rename'
+              )
+                AND status='awaiting_review'
+                {scope_sql}
+              ORDER BY created_at, id
+              LIMIT ?1"
+        );
+        let mut params = vec![libsql::Value::Integer(
+            i64::try_from(limit.clamp(1, 500)).unwrap_or(500),
+        )];
+        if let Some(space) = scope_value {
+            params.push(libsql::Value::Text(space));
+        }
+        let mut rows = conn
+            .query(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("list community proposals: {error}")))?;
+        let mut proposals = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("list community proposal row: {error}"))
+        })? {
+            let action_raw = row.get::<String>(1).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal action decode: {error}"))
+            })?;
+            let action = match action_raw.as_str() {
+                "community_split" => CommunityProposalAction::CommunitySplit,
+                "community_merge" => CommunityProposalAction::CommunityMerge,
+                "community_rename" => CommunityProposalAction::CommunityRename,
+                _ => continue,
+            };
+            let payload_raw = row.get::<String>(2).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal payload decode: {error}"))
+            })?;
+            let payload = serde_json::from_str::<CommunityProposalPayload>(&payload_raw).map_err(
+                |error| {
+                    WenlanError::VectorDb(format!(
+                        "invalid stored community proposal payload: {error}"
+                    ))
+                },
+            )?;
+            if payload.action() != action {
+                return Err(WenlanError::Validation(format!(
+                    "community proposal {} action does not match its typed payload",
+                    row.get::<String>(0).unwrap_or_default()
+                )));
+            }
+            if !scope.matches(Some(payload.space())) {
+                continue;
+            }
+            proposals.push(CommunityProposalSummary {
+                id: row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("community proposal id decode: {error}"))
+                })?,
+                action,
+                payload,
+                created_at: row.get(3).map_err(|error| {
+                    WenlanError::VectorDb(format!("community proposal timestamp decode: {error}"))
+                })?,
+            });
+        }
+        Ok(ListCommunityProposalsResponse { proposals })
+    }
+
+    /// Accept a community identity proposal. Structural split/merge membership
+    /// was already published; acceptance acknowledges that event. A requested
+    /// display-name change is the only mutation and is protected by one atomic
+    /// open-status + source-generation CAS.
+    pub async fn accept_community_proposal(
+        &self,
+        id: &str,
+    ) -> Result<wenlan_types::CommunityProposalAcceptResponse, WenlanError> {
+        use wenlan_types::{
+            CommunityProposalAcceptResponse, CommunityProposalAction, CommunityProposalPayload,
+        };
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("accept community proposal begin: {error}"))
+            })?;
+        let result: Result<CommunityProposalAcceptResponse, WenlanError> = async {
+            let mut rows = tx
+                .query(
+                    "SELECT action, payload, status
+                       FROM refinement_queue WHERE id=?1",
+                    libsql::params![id],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("accept community proposal read: {error}"))
+                })?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("accept community proposal row: {error}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::NotFound(format!("community proposal {id} not found"))
+                })?;
+            let action_raw = row.get::<String>(0).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal action decode: {error}"))
+            })?;
+            let payload_raw = row.get::<String>(1).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal payload decode: {error}"))
+            })?;
+            let status = row.get::<String>(2).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal status decode: {error}"))
+            })?;
+            drop(rows);
+            if !matches!(status.as_str(), "pending" | "awaiting_review") {
+                return Err(WenlanError::Validation(format!(
+                    "community proposal {id} already resolved (status={status})"
+                )));
+            }
+            let action = match action_raw.as_str() {
+                "community_split" => CommunityProposalAction::CommunitySplit,
+                "community_merge" => CommunityProposalAction::CommunityMerge,
+                "community_rename" => CommunityProposalAction::CommunityRename,
+                _ => {
+                    return Err(WenlanError::Validation(format!(
+                        "proposal {id} is not a community proposal"
+                    )));
+                }
+            };
+            let payload = serde_json::from_str::<CommunityProposalPayload>(&payload_raw).map_err(
+                |error| {
+                    WenlanError::Validation(format!(
+                        "invalid community proposal payload for {id}: {error}"
+                    ))
+                },
+            )?;
+            if payload.action() != action {
+                return Err(WenlanError::Validation(format!(
+                    "community proposal {id} action does not match its typed payload"
+                )));
+            }
+            let resolved = tx
+                .execute(
+                    "UPDATE refinement_queue
+                        SET status='resolved', resolved_at=datetime('now')
+                      WHERE id=?1 AND status IN ('pending','awaiting_review')
+                        AND EXISTS (
+                            SELECT 1 FROM space_graph_state s
+                             WHERE s.space=?2 AND s.dirty=0
+                               AND s.grouping_generation=?3
+                               AND s.published_generation=?3
+                        )",
+                    libsql::params![id, payload.space(), payload.source_generation()],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("accept community proposal CAS: {error}"))
+                })?;
+            if resolved == 0 {
+                return Err(WenlanError::Validation(format!(
+                    "community proposal {id} is stale or no longer open"
+                )));
+            }
+
+            let mut display_name_updated = false;
+            if let Some(proposed_name) = payload.proposed_display_name() {
+                let proposed_name = proposed_name.trim();
+                if proposed_name.is_empty() {
+                    return Err(WenlanError::Validation(
+                        "community display name cannot be empty".to_string(),
+                    ));
+                }
+                let updated = tx
+                    .execute(
+                        "UPDATE communities
+                            SET display_name=?1, updated_at=?2
+                          WHERE community_id=?3 AND space=?4 AND retired_at IS NULL",
+                        libsql::params![
+                            proposed_name,
+                            chrono::Utc::now().timestamp(),
+                            payload.subject_id(),
+                            payload.space()
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "accept community proposal display name: {error}"
+                        ))
+                    })?;
+                if updated == 0 {
+                    return Err(WenlanError::Validation(format!(
+                        "community {} is missing, retired, or outside proposal space",
+                        payload.subject_id()
+                    )));
+                }
+                display_name_updated = true;
+            }
+            Ok(CommunityProposalAcceptResponse {
+                id: id.to_owned(),
+                action,
+                display_name_updated,
+            })
+        }
+        .await;
+        match result {
+            Ok(response) => {
+                tx.commit().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("accept community proposal commit: {error}"))
+                })?;
+                Ok(response)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn reject_community_proposal(&self, id: &str) -> Result<(), WenlanError> {
+        use wenlan_types::{CommunityProposalAction, CommunityProposalPayload};
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("reject community proposal begin: {error}"))
+            })?;
+        let result: Result<(), WenlanError> = async {
+            let mut rows = tx
+                .query(
+                    "SELECT action, payload, status
+                       FROM refinement_queue WHERE id=?1",
+                    libsql::params![id],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("reject community proposal read: {error}"))
+                })?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("reject community proposal row: {error}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::NotFound(format!("community proposal {id} not found"))
+                })?;
+            let action_raw = row.get::<String>(0).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal action decode: {error}"))
+            })?;
+            let payload_raw = row.get::<String>(1).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal payload decode: {error}"))
+            })?;
+            let status = row.get::<String>(2).map_err(|error| {
+                WenlanError::VectorDb(format!("community proposal status decode: {error}"))
+            })?;
+            drop(rows);
+            if !matches!(status.as_str(), "pending" | "awaiting_review") {
+                return Err(WenlanError::Validation(format!(
+                    "community proposal {id} already resolved (status={status})"
+                )));
+            }
+            let action = match action_raw.as_str() {
+                "community_split" => CommunityProposalAction::CommunitySplit,
+                "community_merge" => CommunityProposalAction::CommunityMerge,
+                "community_rename" => CommunityProposalAction::CommunityRename,
+                _ => {
+                    return Err(WenlanError::Validation(format!(
+                        "proposal {id} is not a community proposal"
+                    )));
+                }
+            };
+            let payload = serde_json::from_str::<CommunityProposalPayload>(&payload_raw).map_err(
+                |error| {
+                    WenlanError::Validation(format!(
+                        "invalid community proposal payload for {id}: {error}"
+                    ))
+                },
+            )?;
+            if payload.action() != action {
+                return Err(WenlanError::Validation(format!(
+                    "community proposal {id} action does not match its typed payload"
+                )));
+            }
+            let affected = tx
+                .execute(
+                    "UPDATE refinement_queue
+                        SET status='dismissed', resolved_at=datetime('now')
+                      WHERE id=?1
+                        AND status IN ('pending','awaiting_review')
+                        AND EXISTS (
+                            SELECT 1 FROM space_graph_state s
+                             WHERE s.space=?2 AND s.dirty=0
+                               AND s.grouping_generation=?3
+                               AND s.published_generation=?3
+                        )",
+                    libsql::params![id, payload.space(), payload.source_generation()],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("reject community proposal CAS: {error}"))
+                })?;
+            if affected == 0 {
+                return Err(WenlanError::Validation(format!(
+                    "community proposal {id} is stale or no longer open"
+                )));
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(|error| {
+                WenlanError::VectorDb(format!("reject community proposal commit: {error}"))
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Exact-zero M4 consistency oracle. The membership primary key already
+    /// enforces at most one assignment per entity/space; this sweep proves the
+    /// remaining cross-table and generation invariants over the live snapshot.
+    pub async fn reconcile_community_consistency(
+        &self,
+    ) -> Result<CommunityConsistencyReport, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT
+                    (SELECT COUNT(*)
+                       FROM community_members cm
+                       LEFT JOIN communities c
+                         ON c.community_id=cm.community_id
+                        AND c.space=cm.space
+                      WHERE c.community_id IS NULL),
+                    (SELECT COUNT(*)
+                       FROM community_members cm
+                       JOIN communities c
+                         ON c.community_id=cm.community_id
+                        AND c.space=cm.space
+                      WHERE c.retired_at IS NOT NULL),
+                    (SELECT COUNT(*)
+                       FROM community_members cm
+                       LEFT JOIN space_graph_state s ON s.space=cm.space
+                      WHERE s.space IS NULL
+                         OR s.published_generation IS NULL
+                         OR cm.published_generation<>s.published_generation),
+                    (SELECT COUNT(*)
+                       FROM space_graph_state s
+                      WHERE s.published_generation IS NOT NULL
+                        AND s.dirty=0
+                        AND s.published_generation<>s.grouping_generation),
+                    (SELECT COUNT(*)
+                       FROM page_community_assignments a
+                       LEFT JOIN pages p
+                         ON p.id=a.page_id
+                        AND p.space=a.space
+                        AND p.version=a.page_version
+                       LEFT JOIN page_community_route_inputs i
+                         ON i.page_id=a.page_id
+                        AND i.space=a.space
+                        AND i.generation=a.routing_input_generation
+                       LEFT JOIN community_route_space_inputs ri
+                         ON ri.space=a.space
+                        AND ri.generation=a.routing_space_generation
+                       LEFT JOIN space_graph_state s
+                         ON s.space=a.space
+                        AND s.published_generation=a.community_published_generation
+                       LEFT JOIN communities c
+                         ON c.community_id=a.community_id
+                        AND c.space=a.space
+                        AND c.retired_at IS NULL
+                      WHERE p.id IS NULL OR i.page_id IS NULL OR ri.space IS NULL
+                         OR s.space IS NULL
+                         OR (a.state='dropped' AND a.community_id IS NOT NULL)
+                         OR (a.state IN ('assigned','held')
+                             AND (a.community_id IS NULL OR c.community_id IS NULL)))",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community consistency sweep: {error}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("community consistency row: {error}")))?
+            .ok_or_else(|| {
+                WenlanError::VectorDb("community consistency returned no row".to_string())
+            })?;
+        let orphan_members =
+            u64::try_from(row.get::<i64>(0).unwrap_or(i64::MAX)).unwrap_or(u64::MAX);
+        let retired_community_members =
+            u64::try_from(row.get::<i64>(1).unwrap_or(i64::MAX)).unwrap_or(u64::MAX);
+        let member_generation_mismatches =
+            u64::try_from(row.get::<i64>(2).unwrap_or(i64::MAX)).unwrap_or(u64::MAX);
+        let publication_generation_mismatches =
+            u64::try_from(row.get::<i64>(3).unwrap_or(i64::MAX)).unwrap_or(u64::MAX);
+        let invalid_page_assignments =
+            u64::try_from(row.get::<i64>(4).unwrap_or(i64::MAX)).unwrap_or(u64::MAX);
+        drop(rows);
+
+        let mut state_rows = conn
+            .query(
+                "SELECT space, published_generation
+                   FROM space_graph_state
+                  WHERE dirty=0
+                    AND published_generation IS NOT NULL
+                    AND grouping_generation=published_generation
+                  ORDER BY space",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community consistency spaces: {error}"))
+            })?;
+        let mut spaces = Vec::new();
+        while let Some(row) = state_rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("community consistency space row: {error}"))
+        })? {
+            spaces.push((
+                row.get::<String>(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("community consistency space decode: {error}"))
+                })?,
+                row.get::<i64>(1).map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "community consistency generation decode: {error}"
+                    ))
+                })?,
+            ));
+        }
+        drop(state_rows);
+        drop(conn);
+
+        let mut missing_expected_members = 0u64;
+        let mut unexpected_members = 0u64;
+        for (space, published_generation) in spaces {
+            let (grounded, _) = self
+                .load_community_grounded_edges_paged(&space)
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "community consistency grounded input for {space}: {error}"
+                    ))
+                })?;
+            let (ungrounded, _) = self
+                .load_community_ungrounded_edges_paged(&space)
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "community consistency ungrounded input for {space}: {error}"
+                    ))
+                })?;
+            let (entity_embeddings, _) =
+                self.load_community_entities_paged(&space)
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "community consistency entities for {space}: {error}"
+                        ))
+                    })?;
+            let expected = crate::community_grouping::expected_community_participant_ids(
+                &grounded,
+                &ungrounded,
+                &entity_embeddings,
+            );
+            let conn = self.conn.lock().await;
+            let mut member_rows = conn
+                .query(
+                    "SELECT cm.node_id
+                       FROM community_members cm
+                       JOIN communities c
+                         ON c.community_id=cm.community_id
+                        AND c.space=cm.space
+                        AND c.retired_at IS NULL
+                      WHERE cm.space=?1 AND cm.published_generation=?2
+                      ORDER BY cm.node_id",
+                    libsql::params![space.clone(), published_generation],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "community consistency current members for {space}: {error}"
+                    ))
+                })?;
+            let mut actual = BTreeSet::new();
+            while let Some(row) = member_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "community consistency current member row for {space}: {error}"
+                ))
+            })? {
+                actual.insert(row.get::<String>(0).map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "community consistency current member decode for {space}: {error}"
+                    ))
+                })?);
+            }
+            missing_expected_members = missing_expected_members.saturating_add(
+                u64::try_from(expected.difference(&actual).count()).unwrap_or(u64::MAX),
+            );
+            unexpected_members = unexpected_members.saturating_add(
+                u64::try_from(actual.difference(&expected).count()).unwrap_or(u64::MAX),
+            );
+        }
+
+        Ok(CommunityConsistencyReport {
+            missing_expected_members,
+            unexpected_members,
+            orphan_members,
+            retired_community_members,
+            member_generation_mismatches,
+            publication_generation_mismatches,
+            invalid_page_assignments,
+        })
     }
 
     /// Stage-(d) reconciliation sweep (spec v3 §7 M2 row). Recomputes the
@@ -12003,6 +17434,9 @@ impl MemoryDB {
         &self,
         dest: &std::path::Path,
     ) -> Result<BackupReceipt, WenlanError> {
+        #[cfg(test)]
+        let _online_backup_test_guard = ONLINE_BACKUP_TEST_LOCK.lock().await;
+
         let dest_str = dest.to_string_lossy().to_string();
         let sidecar = |base: &std::path::Path, suffix: &str| {
             let mut s = base.as_os_str().to_os_string();
@@ -13874,7 +19308,8 @@ impl MemoryDB {
                 drop(rows);
                 Self::mark_pages_depending_on_memory_sources(&tx, &deleted_sources).await?;
                 for (source, source_id) in &deleted_sources {
-                    Self::delete_by_source_id_in_transaction(&tx, source, source_id, true).await?;
+                    self.delete_by_source_id_in_transaction(&tx, source, source_id, true)
+                        .await?;
                 }
                 // Tear the space's entities down the SAME way the single-entity
                 // `delete_entity` does (M3 PR-1), scoped to the space, BEFORE the
@@ -15406,11 +20841,20 @@ impl MemoryDB {
             // under the same write transaction as delete + insert. Fresh
             // sources begin at v1; semantic replacements advance old + 1.
             let mut replacement_versions: HashMap<(String, String), i64> = HashMap::new();
+            let mut replacement_spaces: HashMap<(String, String), String> = HashMap::new();
+            let explicit_replacement_spaces: HashSet<(String, String)> = docs
+                .iter()
+                .filter(|doc| doc.space.is_some())
+                .map(|doc| (doc.source.clone(), doc.source_id.clone()))
+                .collect();
+            let mut ambiguous_replacement_spaces: HashSet<(String, String)> = HashSet::new();
             let mut changed_page_sources: HashSet<String> = HashSet::new();
             for (source, source_id) in &source_ids_to_delete {
                 let mut rows = conn
                     .query(
-                        "SELECT MAX(version) FROM memories
+                        "SELECT MAX(version), COUNT(*), COUNT(space),
+                                COUNT(DISTINCT space), MIN(space)
+                         FROM memories
                          WHERE source = ?1 AND source_id = ?2",
                         libsql::params![source.clone(), source_id.clone()],
                     )
@@ -15418,20 +20862,83 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("read replacement version: {e}"))
                     })?;
-                let old_version = rows
-                    .next()
-                    .await
-                    .map_err(|e| {
-                        WenlanError::VectorDb(format!("read replacement version row: {e}"))
-                    })?
-                    .and_then(|row| row.get::<Option<i64>>(0).ok().flatten());
+                let row = rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("read replacement version row: {e}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb(
+                        "read replacement version row: aggregate returned no row".to_string(),
+                    )
+                })?;
+                let old_version = row.get::<Option<i64>>(0).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement version: {e}"))
+                })?;
+                let total = row.get::<i64>(1).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement row count: {e}"))
+                })?;
+                let non_null_spaces = row.get::<i64>(2).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement non-NULL space count: {e}"))
+                })?;
+                let distinct_spaces = row.get::<i64>(3).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement distinct space count: {e}"))
+                })?;
+                let old_space = row.get::<Option<String>>(4).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement space: {e}"))
+                })?;
                 if old_version.is_some() && source != "episode" {
                     changed_page_sources.insert(source_id.clone());
+                }
+                if total > 0 {
+                    if non_null_spaces == total && distinct_spaces == 1 {
+                        let old_space = old_space.ok_or_else(|| {
+                            WenlanError::VectorDb(format!(
+                                "decode replacement space: aggregate for {source}/{source_id} \
+                                 reported one non-NULL space without a value"
+                            ))
+                        })?;
+                        replacement_spaces
+                            .insert((source.clone(), source_id.clone()), old_space);
+                    } else {
+                        ambiguous_replacement_spaces
+                            .insert((source.clone(), source_id.clone()));
+                    }
                 }
                 replacement_versions.insert(
                     (source.clone(), source_id.clone()),
                     old_version.map_or(1, |version| version.saturating_add(1)),
                 );
+            }
+            let effective_memory_spaces: HashMap<String, String> = docs
+                .iter()
+                .filter(|doc| doc.source == "memory")
+                .map(|doc| {
+                    let space = doc
+                        .space
+                        .clone()
+                        .or_else(|| {
+                            replacement_spaces
+                                .get(&("memory".to_string(), doc.source_id.clone()))
+                                .cloned()
+                        })
+                        .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
+                    (doc.source_id.clone(), space)
+                })
+                .collect();
+            for (source, source_id) in &ambiguous_replacement_spaces {
+                let derived_episode_has_parent_space = source == "episode"
+                    && docs
+                        .iter()
+                        .any(|doc| doc.source == "memory" && doc.source_id == *source_id)
+                    && effective_memory_spaces.contains_key(source_id);
+                if !explicit_replacement_spaces
+                    .contains(&(source.clone(), source_id.clone()))
+                    && !derived_episode_has_parent_space
+                {
+                    return Err(WenlanError::Conflict(format!(
+                        "ambiguous replacement space for {source}/{source_id}: \
+                         omitted space cannot inherit from conflicting or NULL existing rows"
+                    )));
+                }
             }
             let replaced_sources: Vec<(String, String)> = source_ids_to_delete
                 .iter()
@@ -15443,7 +20950,7 @@ impl MemoryDB {
             // Delete existing rows for these source_ids
             for (source, source_id) in &source_ids_to_delete {
                 if source == "memory" && changed_page_sources.contains(source_id) {
-                    Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                    self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                         .await
                         .map_err(|e| {
                             WenlanError::VectorDb(format!(
@@ -15507,14 +21014,22 @@ impl MemoryDB {
                     .memory_type
                     .map(|s| s.into())
                     .unwrap_or(libsql::Value::Null);
-                // M3 PR-1 stage e: `space` is NOT NULL as of migration 91 --
-                // an unset doc.space folds to the reserved sentinel here
-                // rather than landing NULL. Covers both source='memory' rows
-                // and their co-written source='episode' rows (both flow
-                // through this one loop; see `memory_rows.extend(episode_rows)`
-                // above).
+                // An explicit replacement space is authoritative. When omitted,
+                // inherit the source-wide assignment read inside this replacement
+                // transaction; only a fresh unscoped source folds to the sentinel.
                 let space_val: libsql::Value = row
                     .space
+                    .or_else(|| match row.source.as_str() {
+                        "memory" | "episode" => {
+                            effective_memory_spaces.get(&row.source_id).cloned()
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        replacement_spaces
+                            .get(&(row.source.clone(), row.source_id.clone()))
+                            .cloned()
+                    })
                     .unwrap_or_else(|| UNFILED_SPACE_ID.to_string())
                     .into();
                 let source_agent_val: libsql::Value = row
@@ -15676,14 +21191,10 @@ impl MemoryDB {
             for doc in &docs {
                 if let Some(ref superseded_id) = doc.supersedes {
                     if !doc.pending_revision {
-                        // M3 PR-1 stage e: `space` is NOT NULL as of migration
-                        // 85 -- match the same fold the row insert above
-                        // applies (an unset doc.space lands as the sentinel,
-                        // never NULL), so this comparison still matches the
-                        // superseded row.
-                        let superseder_space = doc
-                            .space
-                            .clone()
+                        let superseder_space = effective_memory_spaces
+                            .get(&doc.source_id)
+                            .cloned()
+                            .or_else(|| doc.space.clone())
                             .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
                         conn.execute(
                             "UPDATE memories SET confirmed = 0
@@ -19537,42 +25048,67 @@ impl MemoryDB {
         self.get_or_compute_embedding(&truncated)
     }
 
-    /// Load eligible memories grouped by `entities.community_id` for the T18
-    /// summary-rollup build. Mirrors the distillation cluster-fetch filter
-    /// (active, non-recap, non-archived, embedded). Memories with no community
-    /// (NULL `community_id`) are skipped — they can't seed a content-derived
-    /// bucket. Returns `(community_id, members)` pairs.
+    /// Load eligible memories for the T18 summary-rollup build. The consumer
+    /// reads durable `community_members` only when its per-space parity proof is
+    /// clean and current; otherwise it falls back to label-prop
+    /// `entities.community_id`. Returns opaque string ids so the existing
+    /// integer labels and durable ids share one internal shape.
     pub async fn load_summary_buckets(
         &self,
-    ) -> Result<Vec<(u32, Vec<crate::refinery::summary::SummaryMember>)>, WenlanError> {
+    ) -> Result<Vec<(String, Vec<crate::refinery::summary::SummaryMember>)>, WenlanError> {
         use crate::refinery::summary::SummaryMember;
         let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT m.source_id, m.title, m.content, e.community_id \
-                 FROM memories m \
-                 JOIN entities e ON m.entity_id = e.id \
-                 WHERE m.source = 'memory' AND m.chunk_index = 0 \
-                   AND COALESCE(m.pending_revision, 0) = 0 \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM memories superseder \
-                       WHERE superseder.supersedes = m.source_id \
-                         AND COALESCE(superseder.pending_revision, 0) = 0 \
-                         AND superseder.source = 'memory' \
-                   ) \
-                   AND m.is_recap = 0 \
-                   AND m.supersede_mode <> 'archive' \
-                   AND m.source_id NOT LIKE 'merged_%' \
-                   AND m.source_id NOT LIKE 'recap_%' \
-                   AND m.embedding IS NOT NULL \
-                   AND e.community_id IS NOT NULL \
-                 ORDER BY e.community_id, m.last_modified DESC",
-                (),
+        let durable =
+            Self::community_reader_uses_durable(&conn, COMMUNITY_SUMMARY_BUCKETS_CONSUMER).await;
+        let (community_join, community_expr, community_filter, community_order) = if durable {
+            (
+                "JOIN community_members cm
+                   ON cm.node_id = m.entity_id AND cm.space = m.space
+                 JOIN space_graph_state s
+                   ON s.space = cm.space
+                  AND cm.published_generation = s.published_generation
+                 JOIN communities c
+                   ON c.community_id = cm.community_id
+                  AND c.space = cm.space
+                  AND c.retired_at IS NULL",
+                "cm.community_id",
+                "",
+                "cm.community_id",
             )
+        } else {
+            (
+                "JOIN entities e ON m.entity_id = e.id",
+                "CAST(e.community_id AS TEXT)",
+                "AND e.community_id IS NOT NULL",
+                "e.community_id",
+            )
+        };
+        let sql = format!(
+            "SELECT m.source_id, m.title, m.content, {community_expr}
+               FROM memories m
+               {community_join}
+              WHERE m.source = 'memory' AND m.chunk_index = 0
+                AND COALESCE(m.pending_revision, 0) = 0
+                AND NOT EXISTS (
+                    SELECT 1 FROM memories superseder
+                     WHERE superseder.supersedes = m.source_id
+                       AND COALESCE(superseder.pending_revision, 0) = 0
+                       AND superseder.source = 'memory'
+                )
+                AND m.is_recap = 0
+                AND m.supersede_mode <> 'archive'
+                AND m.source_id NOT LIKE 'merged_%'
+                AND m.source_id NOT LIKE 'recap_%'
+                AND m.embedding IS NOT NULL
+                {community_filter}
+              ORDER BY {community_order}, m.last_modified DESC"
+        );
+        let mut rows = conn
+            .query(&sql, ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("load_summary_buckets: {e}")))?;
 
-        let mut groups: std::collections::BTreeMap<u32, Vec<SummaryMember>> =
+        let mut groups: std::collections::BTreeMap<String, Vec<SummaryMember>> =
             std::collections::BTreeMap::new();
         while let Some(row) = rows
             .next()
@@ -19586,7 +25122,7 @@ impl MemoryDB {
             let content: String = row
                 .get(2)
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-            let community_id: u32 = match row.get::<u32>(3) {
+            let community_id: String = match row.get::<String>(3) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -19949,8 +25485,9 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_by_source_id BEGIN: {e}")))?;
-        let result =
-            Self::delete_by_source_id_in_transaction(&conn, source, source_id, false).await;
+        let result = self
+            .delete_by_source_id_in_transaction(&conn, source, source_id, false)
+            .await;
         if let Err(error) = result {
             let _ = conn.execute("ROLLBACK", ()).await;
             return Err(error);
@@ -19968,6 +25505,7 @@ impl MemoryDB {
     /// this separate lets space deletion reuse the exact forget semantics
     /// without committing between members of the space.
     async fn delete_by_source_id_in_transaction(
+        &self,
         conn: &libsql::Connection,
         source: &str,
         source_id: &str,
@@ -20146,6 +25684,9 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("delete summary nodes: {e}")))?;
+        self.invalidate_relation_edges_for_source_in_transaction(conn, source_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete source relation edges: {e}")))?;
         conn.execute(
             "DELETE FROM relations WHERE source_memory_id = ?1",
             libsql::params![source_id],
@@ -21179,6 +26720,140 @@ impl MemoryDB {
         Ok(results)
     }
 
+    /// Return the already-prepared chunks for one exact document generation.
+    ///
+    /// A generation is exact only when every canonical `source='memory'` row
+    /// has the claimed content hash, chunk indexes are exactly `0..N`, and all
+    /// rows share one version. Any partial, mixed, or legacy shape returns
+    /// `None` so the caller takes the normal atomic replacement path.
+    pub(crate) async fn prepared_document_generation(
+        &self,
+        source_id: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<MemoryDetail>>, WenlanError> {
+        fn required_text(row: &libsql::Row, index: i32) -> Option<String> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Text(value) => Some(value),
+                _ => None,
+            }
+        }
+
+        fn optional_text(row: &libsql::Row, index: i32) -> Option<Option<String>> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Null => Some(None),
+                libsql::Value::Text(value) => Some(Some(value)),
+                _ => None,
+            }
+        }
+
+        fn required_i64(row: &libsql::Row, index: i32) -> Option<i64> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Integer(value) => Some(value),
+                _ => None,
+            }
+        }
+
+        fn optional_i64(row: &libsql::Row, index: i32) -> Option<Option<i64>> {
+            match row.get_value(index).ok()? {
+                libsql::Value::Null => Some(None),
+                libsql::Value::Integer(value) => Some(Some(value)),
+                _ => None,
+            }
+        }
+
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, title, source_id, chunk_index, chunk_type, language,
+                        semantic_unit, byte_start, byte_end, summary, content_hash, version
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY chunk_index ASC, id ASC",
+                [source_id],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("prepared_document_generation query: {e}"))
+            })?;
+
+        let mut chunks = Vec::new();
+        let mut expected_chunk_index = 0_i64;
+        let mut generation_version = None;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("prepared_document_generation row: {e}")))?
+        {
+            let Some(id) = required_text(&row, 0) else {
+                return Ok(None);
+            };
+            let Some(content) = required_text(&row, 1) else {
+                return Ok(None);
+            };
+            let Some(title) = required_text(&row, 2) else {
+                return Ok(None);
+            };
+            let Some(row_source_id) = required_text(&row, 3) else {
+                return Ok(None);
+            };
+            let Some(chunk_index) =
+                required_i64(&row, 4).and_then(|value| i32::try_from(value).ok())
+            else {
+                return Ok(None);
+            };
+            let Some(chunk_type) = optional_text(&row, 5) else {
+                return Ok(None);
+            };
+            let Some(language) = optional_text(&row, 6) else {
+                return Ok(None);
+            };
+            let Some(semantic_unit) = optional_text(&row, 7) else {
+                return Ok(None);
+            };
+            let Some(byte_start) = optional_i64(&row, 8) else {
+                return Ok(None);
+            };
+            let Some(byte_end) = optional_i64(&row, 9) else {
+                return Ok(None);
+            };
+            let Some(summary) = optional_text(&row, 10) else {
+                return Ok(None);
+            };
+            let Some(row_hash) = required_text(&row, 11) else {
+                return Ok(None);
+            };
+            let Some(version) = required_i64(&row, 12) else {
+                return Ok(None);
+            };
+
+            if i64::from(chunk_index) != expected_chunk_index
+                || row_source_id != source_id
+                || row_hash != content_hash
+                || version < 1
+                || generation_version.is_some_and(|expected| expected != version)
+            {
+                return Ok(None);
+            }
+            generation_version = Some(version);
+            expected_chunk_index += 1;
+            chunks.push(MemoryDetail {
+                id,
+                content,
+                title,
+                source_id: row_source_id,
+                chunk_index,
+                chunk_type,
+                language,
+                semantic_unit,
+                byte_start,
+                byte_end,
+                summary,
+            });
+        }
+
+        Ok((!chunks.is_empty()).then_some(chunks))
+    }
+
     pub async fn get_chunks_scoped(
         &self,
         source_id: &str,
@@ -21372,7 +27047,8 @@ impl MemoryDB {
             drop(rows);
             Self::mark_pages_depending_on_memory_sources(&conn, &deleted_sources).await?;
             for (source, source_id) in &deleted_sources {
-                Self::delete_by_source_id_in_transaction(&conn, source, source_id, true).await?;
+                self.delete_by_source_id_in_transaction(&conn, source, source_id, true)
+                    .await?;
             }
             Ok(deleted_rows)
         }
@@ -21412,7 +27088,8 @@ impl MemoryDB {
         let result: Result<(), WenlanError> = async {
             Self::mark_pages_depending_on_memory_sources(&conn, &unique_items).await?;
             for (source, source_id) in &unique_items {
-                Self::delete_by_source_id_in_transaction(&conn, source, source_id, true).await?;
+                self.delete_by_source_id_in_transaction(&conn, source, source_id, true)
+                    .await?;
             }
             Ok(())
         }
@@ -21590,10 +27267,60 @@ impl MemoryDB {
     /// Entity rows themselves are shared/global and deliberately survive; the
     /// next versioned entity-enrichment slice rebuilds only this memory's links,
     /// observations, and relations.
-    async fn invalidate_memory_entity_projection_in_transaction(
+    async fn invalidate_relation_edges_for_source_in_transaction(
+        &self,
         conn: &libsql::Connection,
         source_id: &str,
     ) -> Result<(), libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT from_entity, to_entity, relation_type \
+                 FROM relations WHERE source_memory_id = ?1 \
+                 ORDER BY from_entity, to_entity, relation_type",
+                libsql::params![source_id],
+            )
+            .await?;
+        let mut relation_keys = Vec::new();
+        while let Some(row) = rows.next().await? {
+            relation_keys.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+            ));
+        }
+        drop(rows);
+
+        let mut graph_changes = Vec::new();
+        for (from_entity, to_entity, relation_type) in relation_keys {
+            let edge_id = crate::provenance::compute_edge_id(
+                "relates",
+                "entity",
+                &from_entity,
+                "entity",
+                &to_entity,
+                &relation_type,
+            );
+            if let Some(change) = Self::dual_write_invalidate_edge(conn, &edge_id, None).await? {
+                graph_changes.push(change);
+            }
+        }
+        let generation_updates =
+            Self::bump_community_graph_generations(conn, graph_changes).await?;
+        // The caller still owns `self.conn` here. Recording before the outer
+        // COMMIT is conservative on rollback (at worst a later generation gets
+        // a wider dirty frontier) and preserves the no COMMIT-to-volatile-map
+        // race required by the grouping prepare snapshot.
+        self.record_community_dirty_nodes(generation_updates);
+        Ok(())
+    }
+
+    async fn invalidate_memory_entity_projection_in_transaction(
+        &self,
+        conn: &libsql::Connection,
+        source_id: &str,
+    ) -> Result<(), libsql::Error> {
+        self.invalidate_relation_edges_for_source_in_transaction(conn, source_id)
+            .await?;
         conn.execute(
             "DELETE FROM relations WHERE source_memory_id = ?1",
             libsql::params![source_id],
@@ -21846,7 +27573,7 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("update_memory service-class promotion: {e}"))
             })?;
             if head.source == "memory" && new_content.is_some() {
-                Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                     .await
                     .map_err(|e| {
                         WenlanError::VectorDb(format!(
@@ -24012,11 +29739,133 @@ impl MemoryDB {
         let should_promote = is_generic(&canonical_type) && !is_generic(&alias_type);
         let now_iso = chrono::Utc::now().to_rfc3339();
 
+        // Snapshot the alias's active relation-edge shadows before endpoint
+        // rewrite. The merge transaction below invalidates each old
+        // content-addressed edge and reasserts the corrected endpoint edge;
+        // grounded status and provenance survive the identity correction.
+        let merge_edge_plans = {
+            let mut relation_rows = conn
+                .query(
+                    "SELECT from_entity, to_entity, relation_type FROM relations \
+                     WHERE from_entity = ?1 OR to_entity = ?1",
+                    libsql::params![alias_id],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("merge_entities edge plan relations: {error}"))
+                })?;
+            let mut relations = Vec::new();
+            while let Some(row) = relation_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("merge_entities edge plan relation row: {error}"))
+            })? {
+                relations.push((
+                    row.get::<String>(0).unwrap_or_default(),
+                    row.get::<String>(1).unwrap_or_default(),
+                    row.get::<String>(2).unwrap_or_default(),
+                ));
+            }
+            drop(relation_rows);
+
+            let mut plans = Vec::new();
+            for (old_src, old_dst, relation_type) in relations {
+                let old_edge_id = crate::provenance::compute_edge_id(
+                    "relates",
+                    "entity",
+                    &old_src,
+                    "entity",
+                    &old_dst,
+                    &relation_type,
+                );
+                let mut edge_rows = conn
+                    .query(
+                        "SELECT grounded, valid_until, root_id, payload FROM edges \
+                         WHERE edge_id = ?1",
+                        libsql::params![old_edge_id.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("merge_entities edge plan shadow: {error}"))
+                    })?;
+                let edge_state = edge_rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("merge_entities edge plan shadow row: {error}"))
+                })?;
+                let Some(edge_state) = edge_state else {
+                    continue;
+                };
+                let grounded = edge_state.get::<i64>(0).unwrap_or(0) == 1;
+                let valid_until = edge_state.get::<Option<i64>>(1).unwrap_or(None);
+                let root_id = edge_state.get::<Option<String>>(2).unwrap_or(None);
+                let payload = edge_state.get::<Option<String>>(3).unwrap_or(None);
+                drop(edge_rows);
+                if valid_until.is_some() {
+                    continue;
+                }
+
+                let src_id = if old_src == alias_id {
+                    canonical_id.to_owned()
+                } else {
+                    old_src
+                };
+                let dst_id = if old_dst == alias_id {
+                    canonical_id.to_owned()
+                } else {
+                    old_dst
+                };
+                let mut space_rows = conn
+                    .query(
+                        "SELECT source.space, destination.space \
+                         FROM entities source, entities destination \
+                         WHERE source.id = ?1 AND destination.id = ?2",
+                        libsql::params![src_id.clone(), dst_id.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("merge_entities edge plan spaces: {error}"))
+                    })?;
+                let (src_space, dst_space) = match space_rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("merge_entities edge plan space row: {error}"))
+                })? {
+                    Some(row) => (
+                        row.get::<Option<String>>(0).unwrap_or(None),
+                        row.get::<Option<String>>(1).unwrap_or(None),
+                    ),
+                    None => (None, None),
+                };
+                drop(space_rows);
+                let (lineage, space, cross_space_downgrade) =
+                    match (src_space.as_ref(), dst_space.as_ref()) {
+                        (Some(src_space), Some(dst_space)) if src_space == dst_space => {
+                            ("assertion".to_owned(), src_space.clone(), false)
+                        }
+                        _ => (
+                            "legacy".to_owned(),
+                            src_space
+                                .or(dst_space)
+                                .unwrap_or_else(|| UNFILED_SPACE_ID.to_owned()),
+                            true,
+                        ),
+                    };
+                plans.push(EntityMergeEdgePlan {
+                    old_edge_id,
+                    src_id,
+                    dst_id,
+                    relation_type,
+                    lineage,
+                    space,
+                    cross_space_downgrade,
+                    grounded,
+                    root_id,
+                    payload,
+                });
+            }
+            plans
+        };
+
         conn.execute("BEGIN TRANSACTION", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities begin: {e}")))?;
 
-        let result: Result<(), WenlanError> = async {
+        let result: Result<Vec<CommunityGenerationUpdate>, WenlanError> = async {
             conn.execute(
                 "UPDATE relations SET from_entity = ?1 WHERE from_entity = ?2",
                 libsql::params![canonical_id, alias_id],
@@ -24030,6 +29879,85 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities rel.to: {e}")))?;
+
+            let mut graph_changes = Vec::new();
+            for plan in &merge_edge_plans {
+                if let Some(change) =
+                    Self::dual_write_invalidate_edge(&conn, &plan.old_edge_id, None)
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "merge_entities invalidate old edge: {error}"
+                            ))
+                        })?
+                {
+                    graph_changes.push(change);
+                }
+                let (new_edge_id, reactivation_changes) = Self::dual_write_edge_with_payload(
+                    &conn,
+                    "relates",
+                    "entity",
+                    &plan.src_id,
+                    "entity",
+                    &plan.dst_id,
+                    &plan.relation_type,
+                    &plan.lineage,
+                    &plan.space,
+                    plan.cross_space_downgrade,
+                    None,
+                    plan.payload.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "merge_entities reassert corrected edge: {error}"
+                    ))
+                })?;
+                graph_changes.extend(reactivation_changes);
+
+                if plan.grounded {
+                    let grounded_transition = conn
+                        .execute(
+                        "UPDATE edges SET grounded = 1, root_id = ?1, \
+                            payload = COALESCE(payload, ?2) \
+                         WHERE edge_id = ?3 AND valid_until IS NULL AND grounded = 0",
+                        libsql::params![
+                            plan.root_id.clone(),
+                            plan.payload.clone(),
+                            new_edge_id.clone()
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "merge_entities preserve edge grounding: {error}"
+                        ))
+                    })?;
+                    if grounded_transition == 0 {
+                        conn.execute(
+                            "UPDATE edges SET root_id = ?1, payload = COALESCE(payload, ?2) \
+                             WHERE edge_id = ?3 AND valid_until IS NULL",
+                            libsql::params![
+                                plan.root_id.clone(),
+                                plan.payload.clone(),
+                                new_edge_id
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "merge_entities preserve grounded edge metadata: {error}"
+                            ))
+                        })?;
+                    } else if plan.lineage == "assertion" {
+                        graph_changes.push(CommunityGraphChange {
+                            space: plan.space.clone(),
+                            src_id: plan.src_id.clone(),
+                            dst_id: plan.dst_id.clone(),
+                        });
+                    }
+                }
+            }
 
             conn.execute(
                 "UPDATE observations SET entity_id = ?1 WHERE entity_id = ?2",
@@ -24143,15 +30071,22 @@ impl MemoryDB {
             // to the final entity state (M3 PR-1 item C).
             Self::update_entity_shadow_page(&conn, canonical_id, &now_iso).await?;
 
-            Ok(())
+            Self::bump_community_graph_generations(&conn, graph_changes)
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "merge_entities community generation: {error}"
+                    ))
+                })
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(generation_updates) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("merge_entities commit: {e}")))?;
+                self.record_community_dirty_nodes(generation_updates);
                 Ok(())
             }
             Err(e) => {
@@ -24218,6 +30153,7 @@ impl MemoryDB {
             // rather than hard-delete it (append-only-with-soft-supersession,
             // spec v3 §2). Same-id computation as the live create_relation
             // dual-write and the migration-81 relations backfill.
+            let mut graph_changes = Vec::new();
             if let Some(snap) = &snapshot {
                 if let (Some(fe), Some(te), Some(rt)) = (
                     snap["from_entity"].as_str(),
@@ -24227,19 +30163,26 @@ impl MemoryDB {
                     let edge_id = crate::provenance::compute_edge_id(
                         "relates", "entity", fe, "entity", te, rt,
                     );
-                    Self::dual_write_invalidate_edge(&conn, &edge_id, None).await?;
+                    if let Some(change) =
+                        Self::dual_write_invalidate_edge(&conn, &edge_id, None).await?
+                    {
+                        graph_changes.push(change);
+                    }
                 }
             }
+            let generation_updates =
+                Self::bump_community_graph_generations(&conn, graph_changes).await?;
 
-            Ok::<_, libsql::Error>(snapshot)
+            Ok::<_, libsql::Error>((snapshot, generation_updates))
         }
         .await;
 
         match exec {
-            Ok(snapshot) => {
+            Ok((snapshot, generation_updates)) => {
                 conn.execute("COMMIT", ()).await.map_err(|e| {
                     WenlanError::VectorDb(format!("supersede_relation commit: {e}"))
                 })?;
+                self.record_community_dirty_nodes(generation_updates);
                 Ok(snapshot)
             }
             Err(e) => {
@@ -24387,7 +30330,10 @@ impl MemoryDB {
             .await?;
 
             if affected == 0 {
-                return Ok::<Option<String>, libsql::Error>(None);
+                return Ok::<
+                    Option<(String, Vec<CommunityGenerationUpdate>)>,
+                    libsql::Error,
+                >(None);
             }
 
             // Check if this was an insert (the id we generated exists) vs an update.
@@ -24463,7 +30409,7 @@ impl MemoryDB {
                 None
             };
 
-            Self::dual_write_edge_with_payload(
+            let (_, graph_changes) = Self::dual_write_edge_with_payload(
                 &conn,
                 "relates",
                 "entity",
@@ -24478,16 +30424,19 @@ impl MemoryDB {
                 payload.as_deref(),
             )
             .await?;
+            let generation_updates =
+                Self::bump_community_graph_generations(&conn, graph_changes).await?;
 
-            Ok(Some(existing_id))
+            Ok(Some((existing_id, generation_updates)))
         }
         .await;
 
         match exec {
-            Ok(Some(existing_id)) => {
+            Ok(Some((existing_id, generation_updates))) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("create_relation commit: {e}")))?;
+                self.record_community_dirty_nodes(generation_updates);
                 drop(conn);
                 // Only count new inserts (our generated id matches the stored id).
                 if existing_id == id {
@@ -26589,18 +32538,27 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-        for (i, entity_id) in entity_ids.iter().enumerate() {
-            let community_id = label_to_community[&labels[i]];
-            conn.execute(
-                "UPDATE entities SET community_id = ?1 WHERE id = ?2",
-                libsql::params![community_id, entity_id.clone()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+        let update_result: Result<(), WenlanError> = async {
+            for (i, entity_id) in entity_ids.iter().enumerate() {
+                let community_id = label_to_community[&labels[i]];
+                conn.execute(
+                    "UPDATE entities SET community_id = ?1 WHERE id = ?2",
+                    libsql::params![community_id, entity_id.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            }
+            Ok(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+        .await;
+        if let Err(error) = update_result {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(error);
+        }
+        if let Err(error) = conn.execute("COMMIT", ()).await {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(WenlanError::VectorDb(error.to_string()));
+        }
 
         log::info!(
             "[community] detected {} communities across {} entities",
@@ -28876,7 +34834,7 @@ impl MemoryDB {
             )
             .await?;
             for source_id in [&target_source_id, &revision_source_id] {
-                Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                     .await
                     .map_err(|error| {
                         WenlanError::VectorDb(format!(
@@ -30977,10 +36935,19 @@ impl MemoryDB {
     /// Get all pending/awaiting_review refinement proposals.
     pub async fn get_pending_refinements(&self) -> Result<Vec<RefinementProposal>, WenlanError> {
         let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT id, action, source_ids, payload, confidence, status, created_at FROM refinement_queue WHERE status IN ('pending', 'awaiting_review') ORDER BY created_at",
-            (),
-        ).await.map_err(|e| WenlanError::VectorDb(format!("get_pending: {}", e)))?;
+        let mut rows = conn
+            .query(
+                "SELECT id, action, source_ids, payload, confidence, status, created_at
+               FROM refinement_queue
+              WHERE status IN ('pending', 'awaiting_review')
+                AND action NOT IN (
+                    'community_split','community_merge','community_rename'
+                )
+              ORDER BY created_at",
+                (),
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_pending: {}", e)))?;
         let mut results = vec![];
         while let Some(row) = rows
             .next()
@@ -36916,8 +42883,9 @@ impl MemoryDB {
                     "pending page revision was already consumed: {revision_id}"
                 )));
             }
-            if let Err(error) =
-                Self::delete_by_source_id_in_transaction(&conn, "memory", revision_id, false).await
+            if let Err(error) = self
+                .delete_by_source_id_in_transaction(&conn, "memory", revision_id, false)
+                .await
             {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 return Err(WenlanError::VectorDb(format!(
@@ -40624,7 +46592,7 @@ impl MemoryDB {
             let source_keys = [(saved.source.clone(), source_id.to_string())];
             let transaction_result: Result<(), WenlanError> = async {
                 Self::mark_pages_depending_on_memory_sources(&conn, &source_keys).await?;
-                Self::invalidate_memory_entity_projection_in_transaction(&conn, source_id)
+                self.invalidate_memory_entity_projection_in_transaction(&conn, source_id)
                     .await
                     .map_err(|e| {
                         WenlanError::VectorDb(format!(
@@ -42735,6 +48703,172 @@ pub(crate) mod tests {
     use std::sync::OnceLock;
     use tempfile::tempdir;
 
+    pub(crate) mod community_grouping_test_hooks {
+        use super::*;
+
+        struct Pause {
+            reached: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+        }
+
+        static AFTER_MEMBER_DELETE: OnceLock<std::sync::Mutex<HashMap<String, Pause>>> =
+            OnceLock::new();
+        static AFTER_RUNTIME_TAKE: OnceLock<std::sync::Mutex<HashMap<String, Pause>>> =
+            OnceLock::new();
+
+        fn install_pause(
+            pauses: &'static OnceLock<std::sync::Mutex<HashMap<String, Pause>>>,
+            space: &str,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            pauses.get_or_init(Default::default).lock().unwrap().insert(
+                space.to_owned(),
+                Pause {
+                    reached: Arc::clone(&reached),
+                    resume: Arc::clone(&resume),
+                },
+            );
+            (reached, resume)
+        }
+
+        pub(crate) fn pause_after_member_delete(
+            space: &str,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            install_pause(&AFTER_MEMBER_DELETE, space)
+        }
+
+        pub(crate) fn pause_after_runtime_take(
+            space: &str,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            install_pause(&AFTER_RUNTIME_TAKE, space)
+        }
+
+        async fn await_pause(
+            pauses: &'static OnceLock<std::sync::Mutex<HashMap<String, Pause>>>,
+            space: &str,
+        ) {
+            let pause = pauses
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(space);
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+
+        pub(crate) async fn after_member_delete(space: &str) {
+            await_pause(&AFTER_MEMBER_DELETE, space).await;
+        }
+
+        pub(crate) async fn after_runtime_take(space: &str) {
+            await_pause(&AFTER_RUNTIME_TAKE, space).await;
+        }
+    }
+
+    pub(crate) mod community_routing_test_hooks {
+        use super::*;
+
+        struct Pause {
+            reached: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+        }
+
+        static AFTER_SNAPSHOT: OnceLock<std::sync::Mutex<HashMap<String, Pause>>> = OnceLock::new();
+
+        pub(crate) fn pause_after_snapshot(
+            space: &str,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            AFTER_SNAPSHOT
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(
+                    space.to_owned(),
+                    Pause {
+                        reached: Arc::clone(&reached),
+                        resume: Arc::clone(&resume),
+                    },
+                );
+            (reached, resume)
+        }
+
+        pub(crate) async fn after_snapshot(space: &str) {
+            let pause = AFTER_SNAPSHOT
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(space);
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+    }
+
+    pub(crate) mod community_parity_test_hooks {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Pause {
+            reached: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+            read_connection_autocommit: Arc<AtomicBool>,
+        }
+
+        static AFTER_SNAPSHOT: OnceLock<std::sync::Mutex<HashMap<(String, String), Pause>>> =
+            OnceLock::new();
+
+        pub(crate) fn pause_after_snapshot(
+            consumer: &str,
+            relevant_spaces_digest: &str,
+        ) -> (
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+            Arc<AtomicBool>,
+        ) {
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let read_connection_autocommit = Arc::new(AtomicBool::new(false));
+            AFTER_SNAPSHOT
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(
+                    (consumer.to_owned(), relevant_spaces_digest.to_owned()),
+                    Pause {
+                        reached: Arc::clone(&reached),
+                        resume: Arc::clone(&resume),
+                        read_connection_autocommit: Arc::clone(&read_connection_autocommit),
+                    },
+                );
+            (reached, resume, read_connection_autocommit)
+        }
+
+        pub(crate) async fn after_snapshot(
+            consumer: &str,
+            relevant_spaces_digest: &str,
+            autocommit: bool,
+        ) {
+            let pause = AFTER_SNAPSHOT
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(&(consumer.to_owned(), relevant_spaces_digest.to_owned()));
+            if let Some(pause) = pause {
+                pause
+                    .read_connection_autocommit
+                    .store(autocommit, Ordering::Release);
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+    }
+
     // ── compute_page_delta_summary tests ─────────────────────────────────────
 
     #[test]
@@ -43016,7 +49150,7 @@ pub(crate) mod tests {
         );
         let memory_db = MemoryDB {
             _db: db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
@@ -43026,12 +49160,453 @@ pub(crate) mod tests {
             // when the BGE tokenizer isn't in the resolved cache.
             chunker: build_chunker(std::path::Path::new(".nonexistent")),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
         memory_db
             .run_migrations(&crate::events::NoopEmitter)
             .await
             .unwrap();
         (memory_db, dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_m4_finalize_rolls_back_and_restores_lease_connection_and_runtime() {
+        const SPACE: &str = "m4-cancel-space";
+        const ROOT: &str = "m4-cancel-root";
+        const NODE_COUNT: usize = 32;
+
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO provenance_roots
+                    (root_id, identity_version, identity_digest, root_kind,
+                     independence_group_id, status, created_at)
+                 VALUES (?1, 1, 'm4-cancel-digest', 'generated',
+                         'm4-cancel-group', 'active', 1712707200)",
+                libsql::params![ROOT],
+            )
+            .await
+            .unwrap();
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                    libsql::params![format!("m4-cancel-node-{node:02}"), SPACE],
+                )
+                .await
+                .unwrap();
+            }
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO edges
+                        (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                         grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                             1, ?4, ?5, 1712707200)",
+                    libsql::params![
+                        format!("m4-cancel-edge-{node:02}"),
+                        format!("m4-cancel-node-{node:02}"),
+                        format!("m4-cancel-node-{:02}", (node + 1) % NODE_COUNT),
+                        ROOT,
+                        SPACE
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let first = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("first M4 cancellation fixture publication");
+        assert!(matches!(
+            first,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if receipt.compute_mode
+                    == (crate::community_grouping::CommunityGroupingComputeMode::Full {
+                        reason: crate::community_grouping::CommunityGroupingFullReason::FirstPublication,
+                    })
+        ));
+
+        let (published_before, members_before, input_generation) = {
+            let conn = db.conn.lock().await;
+            let mut state = conn
+                .query(
+                    "SELECT published_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let published = state
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<Option<i64>>(0)
+                .unwrap()
+                .unwrap();
+            drop(state);
+            let mut member_rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM community_members WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let members = member_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap();
+            drop(member_rows);
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-cancel-chord', 'm4-cancel-node-00', 'entity',
+                         'm4-cancel-node-03', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut generation_rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let generation = generation_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap();
+            (published, members, generation)
+        };
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            input_generation,
+            BTreeSet::from([
+                "m4-cancel-node-00".to_owned(),
+                "m4-cancel-node-03".to_owned(),
+            ]),
+        )]);
+
+        let (reached, _resume) = community_grouping_test_hooks::pause_after_member_delete(SPACE);
+        let operation = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move { db.run_next_community_grouping_cycle().await })
+        };
+        reached.notified().await;
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let conn = db.conn.lock().await;
+                let mut lease_rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM grouping_leases
+                         WHERE phase = 'community' AND space = ?1",
+                        libsql::params![SPACE],
+                    )
+                    .await
+                    .unwrap();
+                let leases = lease_rows
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<i64>(0)
+                    .unwrap();
+                drop(lease_rows);
+                drop(conn);
+                if leases == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attempt drop must release its durable lease");
+
+        let (published_after, dirty_after, members_after) = {
+            let conn = db.conn.lock().await;
+            let mut state = conn
+                .query(
+                    "SELECT published_generation, dirty FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let state = state.next().await.unwrap().unwrap();
+            let published = state.get::<Option<i64>>(0).unwrap().unwrap();
+            let dirty = state.get::<i64>(1).unwrap();
+            let mut member_rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM community_members WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let members = member_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap();
+            (published, dirty, members)
+        };
+        assert_eq!(published_after, published_before);
+        assert_eq!(dirty_after, 1);
+        assert_eq!(members_after, members_before);
+        assert_eq!(db.get_memory_count().await.unwrap(), 0);
+
+        let retry = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("retry cancelled M4 publication");
+        assert!(matches!(
+            retry,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if matches!(
+                    receipt.compute_mode,
+                    crate::community_grouping::CommunityGroupingComputeMode::Incremental {
+                        optimized_nodes
+                    } if optimized_nodes > 0 && optimized_nodes < NODE_COUNT
+                )
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn older_m4_cycle_cannot_overwrite_newer_published_runtime() {
+        const SPACE: &str = "m4-overlap-space";
+        const ROOT: &str = "m4-overlap-root";
+        const NODE_COUNT: usize = 32;
+
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO provenance_roots
+                    (root_id, identity_version, identity_digest, root_kind,
+                     independence_group_id, status, created_at)
+                 VALUES (?1, 1, 'm4-overlap-digest', 'generated',
+                         'm4-overlap-group', 'active', 1712707200)",
+                libsql::params![ROOT],
+            )
+            .await
+            .unwrap();
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                    libsql::params![format!("m4-overlap-node-{node:02}"), SPACE],
+                )
+                .await
+                .unwrap();
+            }
+            for node in 0..NODE_COUNT {
+                conn.execute(
+                    "INSERT INTO edges
+                        (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                         grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion',
+                             1, ?4, ?5, 1712707200)",
+                    libsql::params![
+                        format!("m4-overlap-ring-{node:02}"),
+                        format!("m4-overlap-node-{node:02}"),
+                        format!("m4-overlap-node-{:02}", (node + 1) % NODE_COUNT),
+                        ROOT,
+                        SPACE
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let first = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("publish initial M4 overlap runtime");
+        let initial_generation = match first {
+            crate::community_grouping::CommunityGroupingOutcome::Published(receipt) => {
+                receipt.published_generation
+            }
+            crate::community_grouping::CommunityGroupingOutcome::Held(receipt) => {
+                panic!("initial M4 overlap publication unexpectedly held: {receipt:?}")
+            }
+            crate::community_grouping::CommunityGroupingOutcome::Stale(receipt) => {
+                panic!("initial M4 overlap publication went stale: {receipt:?}")
+            }
+        };
+
+        let generation_g = {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-overlap-g', 'm4-overlap-node-00', 'entity',
+                         'm4-overlap-node-03', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        };
+        assert!(generation_g > initial_generation);
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            generation_g,
+            BTreeSet::from([
+                "m4-overlap-node-00".to_owned(),
+                "m4-overlap-node-03".to_owned(),
+            ]),
+        )]);
+
+        let (reached, resume) = community_grouping_test_hooks::pause_after_runtime_take(SPACE);
+        let older_cycle = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move { db.run_next_community_grouping_cycle().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("generation G must pause after taking the shared runtime");
+
+        let generation_g1 = {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-overlap-g1', 'm4-overlap-node-01', 'entity',
+                         'm4-overlap-node-05', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        };
+        assert!(generation_g1 > generation_g);
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            generation_g1,
+            BTreeSet::from([
+                "m4-overlap-node-01".to_owned(),
+                "m4-overlap-node-05".to_owned(),
+            ]),
+        )]);
+
+        let newer = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("generation G+1 must publish while G is paused");
+        assert!(matches!(
+            newer,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if receipt.published_generation == generation_g1
+                    && receipt.compute_mode
+                        == (crate::community_grouping::CommunityGroupingComputeMode::Full {
+                            reason: crate::community_grouping::CommunityGroupingFullReason::RuntimeStateMissing,
+                        })
+        ));
+
+        resume.notify_one();
+        assert!(
+            older_cycle.await.unwrap().is_err(),
+            "generation G must lose its superseded lease"
+        );
+        assert_eq!(
+            db.community_grouping_runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .published_generation(SPACE),
+            Some(generation_g1),
+            "the unwinding generation G guard must not replace the published G+1 runtime"
+        );
+
+        let generation_g2 = {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES ('m4-overlap-g2', 'm4-overlap-node-02', 'entity',
+                         'm4-overlap-node-07', 'entity', 'relates', 'assertion',
+                         1, ?1, ?2, 1712707200)",
+                libsql::params![ROOT, SPACE],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT grouping_generation FROM space_graph_state WHERE space = ?1",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        };
+        db.record_community_dirty_nodes(vec![(
+            SPACE.to_owned(),
+            generation_g2,
+            BTreeSet::from([
+                "m4-overlap-node-02".to_owned(),
+                "m4-overlap-node-07".to_owned(),
+            ]),
+        )]);
+        let next = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("generation G+2 must retain the warm G+1 runtime");
+        assert!(matches!(
+            next,
+            crate::community_grouping::CommunityGroupingOutcome::Published(ref receipt)
+                if matches!(
+                    receipt.compute_mode,
+                    crate::community_grouping::CommunityGroupingComputeMode::Incremental {
+                        optimized_nodes
+                    } if optimized_nodes > 0 && optimized_nodes < NODE_COUNT
+                )
+        ));
     }
 
     /// Helper: build a minimal RawDocument for testing.
@@ -43227,6 +49802,3944 @@ pub(crate) mod tests {
         let _db2 = MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_95_replays_after_partial_ddl_without_losing_existing_identity_rows() {
+        let dir = tempdir().unwrap();
+        let embedder = shared_embedder();
+        let db = MemoryDB::new_with_shared_embedder(
+            dir.path(),
+            Arc::new(crate::events::NoopEmitter),
+            Arc::clone(&embedder),
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let raw_db = libsql::Builder::new_local(
+            dir.path()
+                .join("origin_memory.db")
+                .to_str()
+                .expect("migration replay path"),
+        )
+        .build()
+        .await
+        .unwrap();
+        let raw = raw_db.connect().unwrap();
+        raw.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE IF EXISTS community_members;
+             DROP TABLE IF EXISTS grouping_leases;
+             DROP TABLE IF EXISTS space_graph_state;
+             DROP TABLE IF EXISTS communities;
+             CREATE TABLE communities (
+                 community_id TEXT PRIMARY KEY,
+                 space TEXT NOT NULL,
+                 display_name TEXT,
+                 algo_version TEXT NOT NULL,
+                 projection_version TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 retired_at INTEGER
+             );
+             INSERT INTO communities (
+                 community_id, space, display_name, algo_version,
+                 projection_version, created_at, updated_at, retired_at
+             ) VALUES (
+                 'partial-community', 'partial-space', NULL, 'leiden-m4-v1',
+                 'grounded-relates-v1', 1712707200, 1712707200, NULL
+             );
+             CREATE TABLE space_graph_state (
+                 space TEXT PRIMARY KEY,
+                 graph_generation INTEGER NOT NULL DEFAULT 0,
+                 published_generation INTEGER,
+                 dirty INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO space_graph_state (
+                 space, graph_generation, published_generation, dirty
+             ) VALUES ('partial-space', 7, 6, 1);
+             PRAGMA user_version=94;",
+        )
+        .await
+        .unwrap();
+        drop(raw);
+        drop(raw_db);
+
+        let reopened = MemoryDB::new_with_shared_embedder(
+            dir.path(),
+            Arc::new(crate::events::NoopEmitter),
+            embedder,
+        )
+        .await
+        .expect("migration 95 must replay after interrupted partial DDL");
+        let conn = reopened.conn.lock().await;
+        let mut version_rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        assert_eq!(
+            version_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            i64::from(SCHEMA_VERSION)
+        );
+        drop(version_rows);
+        for table in [
+            "communities",
+            "community_members",
+            "space_graph_state",
+            "grouping_leases",
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "migration replay must restore {table}"
+            );
+        }
+        let mut identity_rows = conn
+            .query(
+                "SELECT algo_version, projection_version FROM communities \
+                 WHERE community_id='partial-community'",
+                (),
+            )
+            .await
+            .unwrap();
+        let identity = identity_rows.next().await.unwrap().unwrap();
+        assert_eq!(identity.get::<String>(0).unwrap(), "leiden-m4-v1");
+        assert_eq!(identity.get::<String>(1).unwrap(), "grounded-relates-v1");
+        drop(identity_rows);
+        let mut state_rows = conn
+            .query(
+                "SELECT graph_generation, grouping_generation, published_generation, dirty \
+                 FROM space_graph_state WHERE space='partial-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let state = state_rows.next().await.unwrap().unwrap();
+        assert_eq!(state.get::<i64>(0).unwrap(), 7);
+        assert_eq!(
+            state.get::<i64>(1).unwrap(),
+            8,
+            "partial migration replay must advance the broader generation past graph-only state"
+        );
+        assert_eq!(state.get::<i64>(2).unwrap(), 6);
+        assert_eq!(state.get::<i64>(3).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_95_repairs_stamped_schema_and_bootstraps_existing_grounded_spaces() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDB::new_with_shared_embedder(
+            dir.path(),
+            Arc::new(crate::events::NoopEmitter),
+            shared_embedder(),
+        )
+        .await
+        .unwrap();
+        let conn = db.conn.lock().await;
+        let embedding = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        conn.execute(
+            "INSERT INTO entities (
+                 id, name, entity_type, space, created_at, updated_at, embedding
+             ) VALUES
+                 ('m95-bootstrap-left', 'Left', 'concept', ?1, 1, 1, vector32(?2)),
+                 ('m95-bootstrap-right', 'Right', 'concept', ?1, 1, 1, vector32(?2))",
+            libsql::params!["m95-bootstrap-space", embedding],
+        )
+        .await
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO provenance_roots (
+                 root_id, identity_version, identity_digest, root_kind,
+                 independence_group_id, status, created_at
+             ) VALUES (
+                 'm95-bootstrap-root', 1, 'm95-bootstrap-digest', 'generated',
+                 'm95-bootstrap-group', 'active', 1
+             );
+             INSERT INTO edges (
+                 edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                 lineage, grounded, root_id, space, created_at
+             ) VALUES (
+                 'm95-bootstrap-edge', 'm95-bootstrap-left', 'entity',
+                 'm95-bootstrap-right', 'entity', 'relates', 'assertion', 1,
+                 'm95-bootstrap-root', 'm95-bootstrap-space', 1
+             );
+             DROP TABLE community_members;
+             DROP TABLE grouping_leases;
+             DROP TABLE space_graph_state;
+             DROP TABLE communities;
+             CREATE TABLE space_graph_state (
+                 space TEXT PRIMARY KEY,
+                 graph_generation INTEGER NOT NULL DEFAULT 0,
+                 published_generation INTEGER,
+                 dirty INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO space_graph_state (
+                 space, graph_generation, published_generation, dirty
+             ) VALUES ('m95-clean-space', 9, 9, 0);
+             PRAGMA user_version=95;",
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("startup repair must run even when user_version is already 95");
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT graph_generation, grouping_generation, published_generation, dirty \
+                 FROM space_graph_state WHERE space='m95-bootstrap-space'",
+                (),
+            )
+            .await
+            .expect("query bootstrapped M4 state");
+        let state = rows
+            .next()
+            .await
+            .expect("read bootstrapped M4 state")
+            .expect("pre-existing grounded space must be queued");
+        assert_eq!(state.get::<i64>(0).unwrap(), 1);
+        assert_eq!(state.get::<i64>(1).unwrap(), 1);
+        assert_eq!(state.get::<Option<i64>>(2).unwrap(), None);
+        assert_eq!(state.get::<i64>(3).unwrap(), 1);
+        drop(rows);
+
+        let mut rows = conn
+            .query(
+                "SELECT graph_generation, grouping_generation, published_generation, dirty \
+                 FROM space_graph_state WHERE space='m95-clean-space'",
+                (),
+            )
+            .await
+            .expect("query conservatively invalidated clean M4 state");
+        let state = rows
+            .next()
+            .await
+            .expect("read conservatively invalidated clean M4 state")
+            .expect("existing state row must survive repair");
+        assert_eq!(state.get::<i64>(0).unwrap(), 9);
+        assert_eq!(
+            state.get::<i64>(1).unwrap(),
+            10,
+            "a newly repaired grouping generation must outrun the old clean publication"
+        );
+        assert_eq!(state.get::<Option<i64>>(2).unwrap(), Some(9));
+        assert_eq!(
+            state.get::<i64>(3).unwrap(),
+            1,
+            "old graph-only cleanliness cannot prove the broader grouping snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_95_complete_shape_does_not_repeat_grounded_bootstrap_scan() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        let embedding = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        conn.execute(
+            "INSERT INTO entities (
+                 id, name, entity_type, space, created_at, updated_at, embedding
+             ) VALUES
+                 ('m95-late-left', 'Left', 'concept', ?1, 1, 1, vector32(?2)),
+                 ('m95-late-right', 'Right', 'concept', ?1, 1, 1, vector32(?2))",
+            libsql::params!["m95-late-direct-space", embedding],
+        )
+        .await
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO provenance_roots (
+                 root_id, identity_version, identity_digest, root_kind,
+                 independence_group_id, status, created_at
+             ) VALUES (
+                 'm95-late-root', 1, 'm95-late-digest', 'generated',
+                 'm95-late-group', 'active', 1
+             );
+             INSERT INTO edges (
+                 edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                 lineage, grounded, root_id, space, created_at
+             ) VALUES (
+                 'm95-late-edge', 'm95-late-left', 'entity',
+                 'm95-late-right', 'entity', 'relates', 'assertion', 1,
+                 'm95-late-root', 'm95-late-direct-space', 1
+             );",
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "DELETE FROM space_graph_state WHERE space='m95-late-direct-space'",
+            (),
+        )
+        .await
+        .unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM space_graph_state WHERE space='m95-late-direct-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "fixture removes trigger-created state to isolate complete-shape startup scanning"
+        );
+        drop(rows);
+        drop(conn);
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("a complete M95 shape needs no repair");
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM space_graph_state WHERE space='m95-late-direct-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "complete M95 startup must not rescan all grounded edges"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_96_bootstraps_cutover_control_plane_and_first_entity_space() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+
+        let mut version_rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let version = version_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(version, 96, "M4 cutover control plane requires schema 96");
+        drop(version_rows);
+
+        for table in [
+            "page_community_assignments",
+            "page_community_route_inputs",
+            "community_route_space_inputs",
+            "community_reader_cutover",
+            "community_parity_input_state",
+            "community_reader_current_input",
+            "community_reader_watermark",
+            "community_reader_space_proof",
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "migration 96 must create {table}"
+            );
+        }
+
+        conn.execute(
+            "INSERT INTO entities
+                (id, name, entity_type, space, created_at, updated_at)
+             VALUES ('m96-first-entity', 'First', 'concept',
+                     'm96-entity-only-space', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT graph_generation, grouping_generation, published_generation, dirty
+                   FROM space_graph_state WHERE space='m96-entity-only-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let state = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("first entity must create a grouping state row");
+        assert_eq!(state.get::<i64>(0).unwrap(), 0);
+        assert_eq!(state.get::<i64>(1).unwrap(), 1);
+        assert_eq!(state.get::<Option<i64>>(2).unwrap(), None);
+        assert_eq!(state.get::<i64>(3).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_96_repairs_stamped_partial_cutover_ddl() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "DROP TABLE community_reader_watermark;
+                 DROP TRIGGER m4_page_community_page_invalidate;
+                 PRAGMA user_version=96;",
+            )
+            .await
+            .unwrap();
+        }
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("stamped partial M96 DDL must repair on startup");
+
+        let conn = db.conn.lock().await;
+        for (kind, name) in [
+            ("table", "community_reader_watermark"),
+            ("trigger", "m4_page_community_page_invalidate"),
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                    libsql::params![kind, name],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "startup repair must restore missing {kind} {name}"
+            );
+        }
+    }
+
+    /// A fresh database must get the contract-version column from M96 itself,
+    /// and a staged M96 file carrying the pre-column watermark must fail LOUD
+    /// naming the exact missing signature rather than silently serving a
+    /// watermark the gate can no longer evaluate. `CREATE TABLE IF NOT EXISTS`
+    /// cannot add a column, so silent tolerance here would mean a durable read
+    /// proved under a contract nobody recorded.
+    #[tokio::test]
+    async fn migration_96_requires_the_contract_version_column_on_the_watermark() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM pragma_table_info('community_reader_watermark')
+                      WHERE name='consumer_contract_version'",
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1,
+                "a fresh M96 database must carry the contract-version column"
+            );
+            drop(rows);
+            conn.execute_batch(
+                "DROP TABLE community_reader_watermark;
+                 CREATE TABLE community_reader_watermark (
+                     consumer TEXT PRIMARY KEY,
+                     proven_input_generation INTEGER NOT NULL,
+                     relevant_spaces_digest TEXT NOT NULL,
+                     relevant_space_count INTEGER NOT NULL,
+                     source_coverage_delta_count INTEGER NOT NULL,
+                     output_delta_count INTEGER NOT NULL,
+                     unexplained_drift_count INTEGER NOT NULL,
+                     checked_at INTEGER NOT NULL,
+                     report_json TEXT NOT NULL
+                 );",
+            )
+            .await
+            .unwrap();
+        }
+
+        let error = db
+            .community_cutover_needs_repair()
+            .await
+            .expect_err("a pre-column watermark must not be accepted as current");
+
+        assert!(
+            format!("{error}").contains("consumer_contract_version"),
+            "the failure must name the missing signature, got: {error}"
+        );
+    }
+
+    /// Repair recovery deliberately skips migrations and the startup trigger
+    /// inventory, then exposes the approved apply endpoint -- so a database
+    /// written by an earlier build of this same schema version, carrying 96
+    /// without the parity guards, would be opened with the effect guard's
+    /// arithmetic unprotected. `user_version` alone cannot see that. Refusing
+    /// is correct here rather than repairing: the repair contract does not
+    /// mutate schema outside the approved manifest.
+    #[tokio::test]
+    async fn repair_open_refuses_a_current_version_database_without_the_parity_guards() {
+        let (db, dir) = test_db().await;
+        for (name, _) in PARITY_GUARD_TRIGGERS {
+            db.conn
+                .lock()
+                .await
+                .execute_batch(&format!("DROP TRIGGER {name};"))
+                .await
+                .unwrap();
+        }
+        drop(db);
+
+        let error = MemoryDB::open_for_repair(dir.path())
+            .await
+            .err()
+            .expect("an unguarded database must not be opened for repair");
+
+        assert!(
+            format!("{error}").contains("repair_database_parity_guard_missing"),
+            "the refusal must name the guard gap, got: {error}"
+        );
+    }
+
+    /// A guard that keeps its name and its RAISE text but loses its predicate
+    /// enforces nothing. Name or message-substring validation would call that
+    /// healthy, so the check compares whole normalized DDL.
+    #[tokio::test]
+    async fn parity_guard_validation_rejects_a_hollowed_out_guard() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "DROP TRIGGER m4_parity_input_state_unit_bump;
+             CREATE TRIGGER m4_parity_input_state_unit_bump
+             BEFORE UPDATE ON community_parity_input_state
+             WHEN 0=1
+             BEGIN
+               SELECT RAISE(ABORT, 'community_parity_input_state generation must advance by at most 1 per write');
+             END;",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            parity_guard_shape_drift(&conn).await.unwrap(),
+            Some("m4_parity_input_state_unit_bump"),
+            "an inert guard with the right name and message must be detected"
+        );
+    }
+
+    /// Positive control over the parity counter's conservation invariant.
+    ///
+    /// The repair effect guard subtracts the measured generation delta from
+    /// `total_changes()`, which is sound only while a unit of compensation
+    /// costs a row write. Guarding one write shape is not enough: a review
+    /// found that `INSERT OR REPLACE` replaces rather than updates, so an
+    /// `UPDATE`-only invariant never fired and the replacement bought two
+    /// units of compensation for one row change. Textual similarity between
+    /// guards is not proof of behavioural equivalence, so this walks every
+    /// SQL shape that can reach the row and asserts the invariant that
+    /// actually matters -- the generation may never advance by more than the
+    /// number of row changes the statement paid for.
+    #[tokio::test]
+    async fn parity_generation_never_outruns_the_row_changes_it_costs() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+
+        // Every way a writer can move the singleton, legal or not.
+        let shapes = [
+            ("update +2", "UPDATE community_parity_input_state SET generation=generation+2 WHERE singleton=1"),
+            ("update jump", "UPDATE community_parity_input_state SET generation=generation+9000 WHERE singleton=1"),
+            ("insert or replace", "INSERT OR REPLACE INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) SELECT 1, generation+2, relevant_spaces_digest FROM community_parity_input_state WHERE singleton=1"),
+            ("bare replace", "REPLACE INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) SELECT 1, generation+5, relevant_spaces_digest FROM community_parity_input_state WHERE singleton=1"),
+            ("upsert do update", "INSERT INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) VALUES (1,0,'') ON CONFLICT(singleton) DO UPDATE SET generation=generation+3"),
+        ];
+
+        for (label, sql) in shapes {
+            let before_changes = conn.total_changes();
+            let before_generation: i64 = conn
+                .query(
+                    "SELECT generation FROM community_parity_input_state WHERE singleton=1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+
+            // A rejected write is the strongest outcome; a permitted one still
+            // has to pay its way. Either is acceptable, laundering is not.
+            let _ = conn.execute(sql, ()).await;
+
+            let after_generation: i64 = conn
+                .query(
+                    "SELECT COALESCE((SELECT generation FROM community_parity_input_state
+                                       WHERE singleton=1), ?1)",
+                    libsql::params![before_generation],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            let generation_delta = after_generation - before_generation;
+            let change_delta = (conn.total_changes() - before_changes) as i64;
+
+            assert!(
+                generation_delta <= change_delta,
+                "{label}: generation advanced {generation_delta} while paying only \
+                 {change_delta} row changes -- that surplus can hide an escaped write"
+            );
+        }
+
+        // DELETE gets its own arm: folding it into the loop above let the test
+        // stay green with the singleton actually deleted, because the loop
+        // substitutes the prior generation when the row disappears. Assert the
+        // rejection and the survival of the row directly.
+        let deleted = conn
+            .execute(
+                "DELETE FROM community_parity_input_state WHERE singleton=1",
+                (),
+            )
+            .await;
+        assert!(
+            deleted.is_err(),
+            "deleting the parity singleton must be rejected"
+        );
+        let survivors: i64 = conn
+            .query("SELECT COUNT(*) FROM community_parity_input_state", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(survivors, 1, "the parity singleton must survive a DELETE");
+
+        // And the full DELETE-then-INSERT route, which is the bypass the
+        // no-delete guard exists for.
+        let round_trip = conn
+            .execute_batch(
+                "DELETE FROM community_parity_input_state WHERE singleton=1;
+                 INSERT INTO community_parity_input_state
+                     (singleton, generation, relevant_spaces_digest)
+                 VALUES (1, 9000, '');",
+            )
+            .await;
+        assert!(
+            round_trip.is_err(),
+            "delete-then-insert must not reseat the counter"
+        );
+    }
+
+    /// Mutation caught: treating a stamped local-only M96 database as current
+    /// leaves per-space receipts trusted and never installs the global
+    /// generation/watermark/proof model.
+    #[tokio::test]
+    async fn migration_96_converges_local_only_parity_shape_and_invalidates_old_proof() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "DROP TABLE community_reader_space_proof;
+                 DROP TABLE community_reader_watermark;
+                 DROP TABLE community_reader_current_input;
+                 DROP TABLE community_parity_input_state;
+                 CREATE TABLE community_reader_parity (
+                     consumer TEXT NOT NULL,
+                     space TEXT NOT NULL,
+                     proven_published_generation INTEGER NOT NULL,
+                     unexplained_drift_count INTEGER NOT NULL,
+                     checked_at INTEGER NOT NULL,
+                     report_json TEXT,
+                     PRIMARY KEY(consumer, space)
+                 );
+                 INSERT INTO community_reader_parity
+                     (consumer, space, proven_published_generation,
+                      unexplained_drift_count, checked_at, report_json)
+                 VALUES ('summary_buckets', 'old-local-space', 9, 0, 1, '{}');
+                 PRAGMA user_version=96;",
+            )
+            .await
+            .unwrap();
+        }
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("startup repair must converge the old local-only M96 shape");
+        let conn = db.conn.lock().await;
+        let mut old_rows = conn
+            .query(
+                "SELECT 1 FROM sqlite_master
+                  WHERE type='table' AND name='community_reader_parity'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            old_rows.next().await.unwrap().is_none(),
+            "the local-only parity table must be retired"
+        );
+        drop(old_rows);
+        for table in [
+            "community_parity_input_state",
+            "community_reader_current_input",
+            "community_reader_watermark",
+            "community_reader_space_proof",
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "normalized startup repair must install {table}"
+            );
+        }
+        let mut proof_rows = conn
+            .query(
+                "SELECT
+                    (SELECT COUNT(*) FROM community_reader_current_input),
+                    (SELECT COUNT(*) FROM community_reader_watermark),
+                    (SELECT COUNT(*) FROM community_reader_space_proof)",
+                (),
+            )
+            .await
+            .unwrap();
+        let proof_counts = proof_rows.next().await.unwrap().unwrap();
+        assert_eq!(proof_counts.get::<i64>(0).unwrap(), 0);
+        assert_eq!(proof_counts.get::<i64>(1).unwrap(), 0);
+        assert_eq!(proof_counts.get::<i64>(2).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_96_upgrades_the_exact_pre_generation_assignment_shape() {
+        use crate::community_routing::PageCommunityRouteDecision;
+
+        const SPACE: &str = "m96-pre-generation-space";
+        const COMMUNITY_ID: &str = "m96-pre-generation-community";
+        const OTHER_COMMUNITY_ID: &str = "m96-pre-generation-community-other";
+        const THIRD_COMMUNITY_ID: &str = "m96-pre-generation-community-third";
+        const PAGE_ID: &str = "m96-pre-generation-page";
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+                libsql::params![COMMUNITY_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pages
+                    (id, title, content, source_memory_ids, version, status,
+                     created_at, last_compiled, last_modified, space, workspace, kind)
+                 VALUES (?1, 'Pre-generation', '', '[]', 1, 'active',
+                         'now', 'now', 'now', ?2, ?2, 'concept')",
+                libsql::params![PAGE_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+                 VALUES (?1, 8, 8, 8, 0)
+                 ON CONFLICT(space) DO UPDATE SET
+                    graph_generation=8, grouping_generation=8,
+                    published_generation=8, dirty=0",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 8, '', 'algo', 'projection', 1)",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db
+            .publish_page_community_route(
+                PAGE_ID,
+                SPACE,
+                1,
+                0,
+                0,
+                8,
+                &PageCommunityRouteDecision::Assigned {
+                    community_id: COMMUNITY_ID.to_string(),
+                    score: 0.75,
+                },
+            )
+            .await
+            .unwrap());
+        {
+            let conn = db.conn.lock().await;
+            for community_id in [OTHER_COMMUNITY_ID, THIRD_COMMUNITY_ID] {
+                conn.execute(
+                    "INSERT INTO communities
+                        (community_id, space, display_name, algo_version, projection_version,
+                         created_at, updated_at, retired_at)
+                     VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+                    libsql::params![community_id, SPACE],
+                )
+                .await
+                .unwrap();
+            }
+            for index in 1..=5 {
+                let entity_id = format!("m96-pre-generation-entity-{index}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 1, 1)",
+                    libsql::params![entity_id.clone(), SPACE],
+                )
+                .await
+                .unwrap();
+                if index <= 4 {
+                    let community_id = match index {
+                        1 | 2 => COMMUNITY_ID,
+                        3 => OTHER_COMMUNITY_ID,
+                        _ => THIRD_COMMUNITY_ID,
+                    };
+                    conn.execute(
+                        "INSERT INTO community_members
+                            (space, node_id, node_kind, community_id,
+                             published_generation, attachment)
+                         VALUES (?1, ?2, 'entity', ?3, 8, 'core')",
+                        libsql::params![SPACE, entity_id.clone(), community_id],
+                    )
+                    .await
+                    .unwrap();
+                }
+                if index == 1 {
+                    conn.execute(
+                        "UPDATE pages SET entity_id=?1 WHERE id=?2",
+                        libsql::params![entity_id, PAGE_ID],
+                    )
+                    .await
+                    .unwrap();
+                    continue;
+                }
+                let memory_id = format!("m96-pre-generation-memory-{index}");
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index,
+                         last_modified, chunk_type, space, entity_id)
+                     VALUES (?1, 'Route source', 'memory', ?1, 'Route source',
+                             0, 1, 'text', ?2, ?3)",
+                    libsql::params![memory_id.clone(), SPACE, entity_id],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO edges
+                        (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                         lineage, grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'page', ?3, 'memory', 'cites',
+                             'evidence', 0, NULL, ?4, 1)",
+                    libsql::params![
+                        format!("m96-pre-generation-edge-{index}"),
+                        PAGE_ID,
+                        memory_id,
+                        SPACE
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=8, grouping_generation=8,
+                        published_generation=8, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE page_community_assignments
+                     DROP COLUMN routing_space_generation;
+                 ALTER TABLE page_community_assignments
+                     DROP COLUMN routing_input_generation;
+                 PRAGMA user_version=96;",
+            )
+            .await
+            .unwrap();
+        }
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("the exact staged M96 assignment shape must gain the routing generation");
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT name
+                   FROM pragma_table_info('page_community_assignments')
+                  WHERE name IN ('routing_input_generation', 'routing_space_generation')
+                  ORDER BY name",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            columns,
+            vec!["routing_input_generation", "routing_space_generation"],
+            "startup repair must add both routing generation columns"
+        );
+        drop(rows);
+        conn.execute(
+            "UPDATE space_graph_state
+                SET graph_generation=8, grouping_generation=8,
+                    published_generation=8, dirty=0
+              WHERE space=?1",
+            libsql::params![SPACE],
+        )
+        .await
+        .unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*)
+                   FROM page_community_assignments a
+                   JOIN community_route_space_inputs s ON s.space=a.space
+                  WHERE a.page_id=?1
+                    AND a.routing_space_generation<>s.generation",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() == 1,
+            "an unproven pre-generation assignment must become stale on upgrade"
+        );
+        drop(rows);
+        let mut rows = conn
+            .query(
+                "SELECT p.status, i.space, s.dirty,
+                        s.grouping_generation, s.published_generation,
+                        i.generation, ri.generation
+                   FROM pages p
+                   JOIN page_community_route_inputs i ON i.page_id=p.id
+                   JOIN community_route_space_inputs ri ON ri.space=p.space
+                   JOIN space_graph_state s ON s.space=p.space
+                  WHERE p.id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        let route_state = rows.next().await.unwrap().unwrap();
+        assert_eq!(route_state.get::<String>(0).unwrap(), "active");
+        assert_eq!(route_state.get::<String>(1).unwrap(), SPACE);
+        assert_eq!(route_state.get::<i64>(2).unwrap(), 0);
+        assert_eq!(
+            route_state.get::<i64>(3).unwrap(),
+            route_state.get::<i64>(4).unwrap()
+        );
+        drop(rows);
+        drop(conn);
+        assert!(
+            db.refresh_next_stale_page_community_routes()
+                .await
+                .unwrap()
+                .is_some(),
+            "the stale selector must queue the upgraded assignment for recomputation"
+        );
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT state, community_id, score,
+                        routing_input_generation, routing_space_generation
+                   FROM page_community_assignments
+                  WHERE page_id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("the upgraded assignment must be replaced by a published route decision");
+        assert_eq!(
+            row.get::<String>(0).unwrap(),
+            "dropped",
+            "a migration-sentinel prior must not hold a current candidate in the hysteresis band"
+        );
+        assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
+        assert!((row.get::<f64>(2).unwrap() - 0.4).abs() < f64::EPSILON);
+        assert!(row.get::<i64>(3).unwrap() >= 0);
+        assert!(row.get::<i64>(4).unwrap() >= 0);
+    }
+
+    #[tokio::test]
+    async fn migration_96_repairs_malformed_cutover_triggers_and_indexes() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "DROP TRIGGER m4_page_community_page_invalidate;
+                 CREATE TRIGGER m4_page_community_page_invalidate
+                 AFTER UPDATE ON pages BEGIN SELECT 1; END;
+                 DROP INDEX idx_page_community_assignments_community;
+                 CREATE INDEX idx_page_community_assignments_community
+                     ON page_community_assignments(space);
+                 PRAGMA user_version=96;",
+            )
+            .await
+            .unwrap();
+        }
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("recomputable M96 trigger/index shapes must repair");
+
+        let conn = db.conn.lock().await;
+        let mut trigger_rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger'
+                    AND name='m4_page_community_page_invalidate'",
+                (),
+            )
+            .await
+            .unwrap();
+        let trigger_sql = trigger_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        assert!(trigger_sql.contains("source_revision"));
+        assert!(trigger_sql.contains("UPDATE page_community_route_inputs"));
+        drop(trigger_rows);
+
+        let mut index_rows = conn
+            .query(
+                "SELECT name
+                   FROM pragma_index_info('idx_page_community_assignments_community')
+                  ORDER BY seqno",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut columns = Vec::new();
+        while let Some(row) = index_rows.next().await.unwrap() {
+            columns.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(columns, vec!["community_id"]);
+    }
+
+    #[tokio::test]
+    async fn migration_96_fails_loudly_on_a_malformed_cutover_table() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "DROP TABLE community_reader_cutover;
+                 CREATE TABLE community_reader_cutover (
+                     consumer TEXT PRIMARY KEY
+                 );
+                 PRAGMA user_version=96;",
+            )
+            .await
+            .unwrap();
+        }
+
+        let error = db
+            .run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect_err("a malformed durable cutover table must fail loudly");
+        assert!(
+            error
+                .to_string()
+                .contains("malformed community cutover table community_reader_cutover"),
+            "unexpected startup error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_grounded_space_holds_and_keeps_all_community_consumers_on_legacy() {
+        const SPACE: &str = "m96-held-community-space";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            for suffix in ["a", "b", "c"] {
+                let entity_id = format!("m96-held-entity-{suffix}");
+                let source_id = format!("m96-held-memory-{suffix}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, community_id, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 7, 1, 1)",
+                    libsql::params![entity_id.clone(), SPACE],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index, last_modified,
+                         chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                     VALUES (?1, ?1, 'memory', ?1, ?1, 0, 1, 'text', ?2,
+                             vector32(?3), ?4, 0, 'hide')",
+                    libsql::params![source_id, SPACE, vector.clone(), entity_id],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let outcome = db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .expect("empty-grounded space must have queued viability work");
+        assert!(matches!(
+            outcome,
+            crate::community_grouping::CommunityGroupingOutcome::Held(ref receipt)
+                if receipt.member_count == 0 && receipt.projected_edge_count == 0
+        ));
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT published_generation, dirty,
+                        (SELECT COUNT(*) FROM community_members WHERE space=?1),
+                        (SELECT COUNT(*) FROM community_publication_receipts WHERE space=?1)
+                   FROM space_graph_state WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        let state = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            state.get::<Option<i64>>(0).unwrap(),
+            None,
+            "a fresh held space must not acquire a published generation"
+        );
+        assert_eq!(state.get::<i64>(1).unwrap(), 1, "a held space stays dirty");
+        assert_eq!(
+            state.get::<i64>(2).unwrap(),
+            0,
+            "a held space publishes no members"
+        );
+        assert_eq!(
+            state.get::<i64>(3).unwrap(),
+            0,
+            "a held space writes no publication receipt"
+        );
+        drop(rows);
+        drop(conn);
+
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "relevant held space must keep {consumer} on global legacy fallback"
+            );
+        }
+
+        let buckets = db.load_summary_buckets().await.unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].0, "7");
+        assert_eq!(buckets[0].1.len(), 3);
+
+        let conn = db.conn.lock().await;
+        let sql = format!(
+            "SELECT m.source_id FROM memories m
+              WHERE {}
+              ORDER BY m.source_id",
+            crate::derived_artifact_state::summary_eligible_predicate("m")
+        );
+        let mut rows = conn.query(&sql, ()).await.unwrap();
+        let mut eligible = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            eligible.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            eligible,
+            vec![
+                "m96-held-memory-a",
+                "m96-held-memory-b",
+                "m96-held-memory-c",
+            ],
+            "summary eligibility must also read legacy assignments while the space is held"
+        );
+    }
+
+    #[test]
+    fn community_reader_gate_sql_fails_closed_for_unknown_consumers() {
+        assert_eq!(community_reader_durable_gate_sql("bogus_consumer"), "0=1");
+        assert_eq!(community_reader_durable_gate_sql(""), "0=1");
+    }
+
+    /// The gate must compare the consumer-behaviour contract a proof was taken
+    /// under, or a tuning knob can be changed across a restart with no DB
+    /// mutation and the cached proof stays "current" while the predicate it
+    /// proved has silently changed underneath it.
+    #[test]
+    fn community_reader_gate_sql_pins_the_consumer_contract_version() {
+        let contract = community_consumer_contract_version();
+        assert_eq!(
+            contract,
+            format!(
+                "min_members={}",
+                crate::refinery::summary::min_bucket_members()
+            ),
+            "the contract token must track the threshold the predicate actually reads"
+        );
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let sql = community_reader_durable_gate_sql(consumer);
+            assert!(
+                sql.contains(&format!("watermark.consumer_contract_version='{contract}'")),
+                "gate for {consumer} does not pin the contract version"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn community_reader_cutover_fails_closed_when_a_legacy_input_space_lacks_state() {
+        const SPACE: &str = "m96-legacy-only-space";
+        const CONSUMER: &str = "summary_buckets";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO entities
+                    (id, name, entity_type, space, community_id, created_at, updated_at)
+                 VALUES ('m96-legacy-owner', 'Owner', 'concept', ?1, 7, 1, 1)",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories
+                    (id, content, source, source_id, title, chunk_index, last_modified,
+                     chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                 VALUES ('m96-legacy-memory', 'body', 'memory', 'm96-legacy-memory',
+                         'Legacy', 0, 1, 'text', ?1, vector32(?2),
+                         'm96-legacy-owner', 0, 'hide')",
+                libsql::params![SPACE, vector],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "DELETE FROM space_graph_state WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        db.set_community_reader_cutover(CONSUMER, true)
+            .await
+            .unwrap();
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::community_reader_uses_durable(&conn, CONSUMER).await,
+            "a relevant legacy-only space with no grouping state must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn community_reader_reconciliation_flips_equivalent_consumers_and_is_reversible() {
+        const SPACE: &str = "m96-parity-space";
+        const DURABLE_ID: &str = "m96-durable-community";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+                libsql::params![DURABLE_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            for suffix in ["a", "b", "c"] {
+                let entity_id = format!("m96-parity-entity-{suffix}");
+                let source_id = format!("m96-parity-memory-{suffix}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, community_id, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 7, 1, 1)",
+                    libsql::params![entity_id.clone(), SPACE],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index, last_modified,
+                         chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                     VALUES (?1, ?1, 'memory', ?1, ?1, 0, 1, 'text', ?2,
+                             vector32(?3), ?4, 0, 'hide')",
+                    libsql::params![source_id, SPACE, vector.clone(), entity_id.clone()],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO community_members
+                        (space, node_id, node_kind, community_id,
+                         published_generation, attachment)
+                     VALUES (?1, ?2, 'entity', ?3, 20, 'core')",
+                    libsql::params![SPACE, entity_id, DURABLE_ID],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=20, grouping_generation=20,
+                        published_generation=20, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let membership_digest =
+                community_membership_digest(["a", "b", "c"].into_iter().map(|suffix| {
+                    (
+                        format!("m96-parity-entity-{suffix}"),
+                        DURABLE_ID.to_string(),
+                        "core".to_string(),
+                    )
+                }));
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    membership_digest,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let receipt = db
+                .reconcile_community_reader_parity(consumer)
+                .await
+                .unwrap();
+            assert!(receipt.ready);
+            assert_eq!(receipt.unexplained_drift_count, 0);
+            assert_eq!(receipt.explained_structural_delta_count, 0);
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+            let conn = db.conn.lock().await;
+            assert!(MemoryDB::community_reader_uses_durable(&conn, consumer).await);
+        }
+
+        let durable_buckets = db.load_summary_buckets().await.unwrap();
+        assert_eq!(durable_buckets.len(), 1);
+        assert_eq!(durable_buckets[0].0, DURABLE_ID);
+        {
+            let conn = db.conn.lock().await;
+            let sql = format!(
+                "SELECT m.source_id FROM memories m
+                  WHERE m.source='memory' AND ({})
+                  ORDER BY m.source_id",
+                crate::derived_artifact_state::summary_eligible_predicate("m")
+            );
+            let mut rows = conn.query(&sql, ()).await.unwrap();
+            let mut eligible = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                eligible.push(row.get::<String>(0).unwrap());
+            }
+            assert_eq!(
+                eligible,
+                vec![
+                    "m96-parity-memory-a",
+                    "m96-parity-memory-b",
+                    "m96-parity-memory-c",
+                ]
+            );
+        }
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE entities SET community_id=8
+                  WHERE id='m96-parity-entity-c'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "legacy assignment changes must invalidate {consumer}"
+            );
+        }
+        assert!(db.reconcile_pending_community_readers().await.unwrap() >= 2);
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "the production phase hook must refresh {consumer}"
+            );
+        }
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET pending_revision=1
+                  WHERE source_id='m96-parity-memory-c'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "memory lifecycle changes must invalidate {consumer}"
+            );
+        }
+        assert!(db.reconcile_pending_community_readers().await.unwrap() >= 2);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "UPDATE entities SET community_id=7
+                  WHERE id='m96-parity-entity-c';
+                 UPDATE memories SET pending_revision=0
+                  WHERE source_id='m96-parity-memory-c';",
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db.reconcile_pending_community_readers().await.unwrap() >= 2);
+
+        db.set_community_reader_cutover(COMMUNITY_SUMMARY_BUCKETS_CONSUMER, false)
+            .await
+            .unwrap();
+        let legacy_buckets = db.load_summary_buckets().await.unwrap();
+        assert_eq!(legacy_buckets.len(), 1);
+        assert_eq!(legacy_buckets[0].0, "7");
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES ('m96-corrupt-community', ?1, NULL, 'algo', 'projection',
+                         1, 1, NULL)",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "UPDATE community_members
+                    SET community_id='m96-corrupt-community'
+                  WHERE space=?1 AND node_id='m96-parity-entity-c'",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+        }
+        assert!(
+            db.reconcile_pending_community_readers().await.unwrap() >= 2,
+            "the production hook must detect same-generation membership drift"
+        );
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT unexplained_drift_count
+                       FROM community_reader_watermark
+                      WHERE consumer=?1",
+                    libsql::params![consumer],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1
+            );
+            drop(rows);
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "same-coverage membership corruption must fail closed for {consumer}"
+            );
+        }
+    }
+
+    /// Mutation caught: restoring the old per-space parity loop makes the
+    /// cross-space legacy group look locally identical and silently reports
+    /// zero partition/eligibility delta.
+    #[tokio::test]
+    async fn community_reader_parity_is_a_true_global_differential() {
+        const SPACE_A: &str = "m96-global-parity-a";
+        const SPACE_B: &str = "m96-global-parity-b";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            for (space, community_id) in [
+                (SPACE_A, "m96-global-durable-a"),
+                (SPACE_B, "m96-global-durable-b"),
+            ] {
+                conn.execute(
+                    "INSERT INTO communities
+                        (community_id, space, display_name, algo_version, projection_version,
+                         created_at, updated_at, retired_at)
+                     VALUES (?1, ?2, NULL, ?3, ?4, 1, 1, NULL)",
+                    libsql::params![
+                        community_id,
+                        space,
+                        crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                        crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            for (suffix, space, community_id) in [
+                ("a", SPACE_A, "m96-global-durable-a"),
+                ("b", SPACE_A, "m96-global-durable-a"),
+                ("c", SPACE_B, "m96-global-durable-b"),
+            ] {
+                let entity_id = format!("m96-global-entity-{suffix}");
+                let source_id = format!("m96-global-memory-{suffix}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, community_id, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 7, 1, 1)",
+                    libsql::params![entity_id.clone(), space],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index, last_modified,
+                         chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                     VALUES (?1, ?1, 'memory', ?1, ?1, 0, 1, 'text', ?2,
+                             vector32(?3), ?4, 0, 'hide')",
+                    libsql::params![source_id, space, vector.clone(), entity_id.clone()],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO community_members
+                        (space, node_id, node_kind, community_id,
+                         published_generation, attachment)
+                     VALUES (?1, ?2, 'entity', ?3, 20, 'core')",
+                    libsql::params![space, entity_id, community_id],
+                )
+                .await
+                .unwrap();
+            }
+            for (space, members) in [(SPACE_A, vec!["a", "b"]), (SPACE_B, vec!["c"])] {
+                conn.execute(
+                    "UPDATE space_graph_state
+                        SET graph_generation=20, grouping_generation=20,
+                            published_generation=20, dirty=0
+                      WHERE space=?1",
+                    libsql::params![space],
+                )
+                .await
+                .unwrap();
+                let membership_digest =
+                    community_membership_digest(members.into_iter().map(|suffix| {
+                        (
+                            format!("m96-global-entity-{suffix}"),
+                            format!(
+                                "m96-global-durable-{}",
+                                if space == SPACE_A { "a" } else { "b" }
+                            ),
+                            "core".to_string(),
+                        )
+                    }));
+                conn.execute(
+                    "INSERT INTO community_publication_receipts
+                        (space, published_generation, membership_digest,
+                         algo_version, projection_version, published_at)
+                     VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                    libsql::params![
+                        space,
+                        membership_digest,
+                        crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                        crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let legacy_buckets = db.load_summary_buckets().await.unwrap();
+        assert_eq!(
+            legacy_buckets
+                .iter()
+                .map(|(_, members)| members
+                    .iter()
+                    .map(|member| member.source_id.as_str())
+                    .collect::<BTreeSet<_>>())
+                .collect::<Vec<_>>(),
+            vec![BTreeSet::from([
+                "m96-global-memory-a",
+                "m96-global-memory-b",
+                "m96-global-memory-c",
+            ])],
+            "the actual legacy consumer groups globally across spaces"
+        );
+
+        let bucket_receipt = db
+            .reconcile_community_reader_parity(COMMUNITY_SUMMARY_BUCKETS_CONSUMER)
+            .await
+            .unwrap();
+        assert_eq!(bucket_receipt.unexplained_drift_count, 0);
+        assert!(
+            bucket_receipt.explained_structural_delta_count > 0,
+            "equal global source coverage with a 1-to-2 partition split must be recorded"
+        );
+
+        let eligibility_receipt = db
+            .reconcile_community_reader_parity(COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER)
+            .await
+            .unwrap();
+        assert_eq!(eligibility_receipt.unexplained_drift_count, 0);
+        assert!(
+            eligibility_receipt.explained_structural_delta_count > 0,
+            "legacy 3-member eligibility versus durable 2+1 must be recorded"
+        );
+    }
+
+    async fn assert_reader_gate_falls_back_for_corruption(label: &str, mutation: &str) {
+        const SPACE: &str = "m96-independent-corruption-space";
+        const COMMUNITY_ID: &str = "m96-independent-corruption-community";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(&format!(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES ('{COMMUNITY_ID}', '{SPACE}', NULL,
+                         '{}', '{}', 1, 1, NULL);
+                 INSERT INTO entities
+                    (id, name, entity_type, space, community_id, created_at, updated_at)
+                 VALUES ('m96-independent-corruption-entity', 'entity', 'concept',
+                         '{SPACE}', 7, 1, 1);",
+                crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+            ))
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories
+                    (id, content, source, source_id, title, chunk_index, last_modified,
+                     chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                 VALUES ('m96-independent-corruption-memory', 'body', 'memory',
+                         'm96-independent-corruption-memory', 'title', 0, 1, 'text', ?1,
+                         vector32(?2), 'm96-independent-corruption-entity', 0, 'hide')",
+                libsql::params![SPACE, vector],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, 'm96-independent-corruption-entity', 'entity', ?2, 20, 'core')",
+                libsql::params![SPACE, COMMUNITY_ID],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=20, grouping_generation=20,
+                        published_generation=20, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let digest = community_membership_digest([(
+                "m96-independent-corruption-entity".to_string(),
+                COMMUNITY_ID.to_string(),
+                "core".to_string(),
+            )]);
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    digest,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            assert!(
+                db.reconcile_community_reader_parity(consumer)
+                    .await
+                    .unwrap()
+                    .ready,
+                "precondition: {label} fixture must reconcile"
+            );
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "precondition: {consumer} proof must be usable before {label}"
+            );
+        }
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(mutation).await.unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "{label} must immediately force {consumer} to legacy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_grouping_generation_mismatch() {
+        assert_reader_gate_falls_back_for_corruption(
+            "grouping-generation mismatch",
+            "UPDATE space_graph_state SET grouping_generation=21
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_receipt_digest_change() {
+        assert_reader_gate_falls_back_for_corruption(
+            "receipt digest change",
+            "UPDATE community_publication_receipts SET membership_digest='corrupt'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_receipt_algorithm_change() {
+        assert_reader_gate_falls_back_for_corruption(
+            "receipt algorithm change",
+            "UPDATE community_publication_receipts SET algo_version='corrupt'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_receipt_projection_change() {
+        assert_reader_gate_falls_back_for_corruption(
+            "receipt projection change",
+            "UPDATE community_publication_receipts SET projection_version='corrupt'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_member_mutation() {
+        assert_reader_gate_falls_back_for_corruption(
+            "member mutation",
+            "UPDATE community_members SET attachment='isolated'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_live_community_retirement() {
+        assert_reader_gate_falls_back_for_corruption(
+            "live community retirement",
+            "UPDATE communities SET retired_at=2
+              WHERE community_id='m96-independent-corruption-community'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_community_space_mutation() {
+        assert_reader_gate_falls_back_for_corruption(
+            "community space mutation",
+            "UPDATE communities SET space='m96-independent-corruption-other'
+              WHERE community_id='m96-independent-corruption-community'",
+        )
+        .await;
+    }
+
+    /// Mutation caught: removing the publication-receipt terms from the
+    /// centralized reader gate leaves a cached proof usable after its receipt
+    /// is deleted.
+    #[tokio::test]
+    async fn community_reader_gate_fails_closed_after_publication_receipt_delete() {
+        const SPACE: &str = "m96-receipt-delete-space";
+        const COMMUNITY_ID: &str = "m96-receipt-delete-community";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4, 1, 1, NULL)",
+                libsql::params![
+                    COMMUNITY_ID,
+                    SPACE,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+            for suffix in ["a", "b", "c"] {
+                let entity_id = format!("m96-receipt-delete-entity-{suffix}");
+                let source_id = format!("m96-receipt-delete-memory-{suffix}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, community_id, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 7, 1, 1)",
+                    libsql::params![entity_id.clone(), SPACE],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index, last_modified,
+                         chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                     VALUES (?1, ?1, 'memory', ?1, ?1, 0, 1, 'text', ?2,
+                             vector32(?3), ?4, 0, 'hide')",
+                    libsql::params![source_id, SPACE, vector.clone(), entity_id.clone()],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO community_members
+                        (space, node_id, node_kind, community_id,
+                         published_generation, attachment)
+                     VALUES (?1, ?2, 'entity', ?3, 20, 'core')",
+                    libsql::params![SPACE, entity_id, COMMUNITY_ID],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=20, grouping_generation=20,
+                        published_generation=20, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let membership_digest =
+                community_membership_digest(["a", "b", "c"].into_iter().map(|suffix| {
+                    (
+                        format!("m96-receipt-delete-entity-{suffix}"),
+                        COMMUNITY_ID.to_string(),
+                        "core".to_string(),
+                    )
+                }));
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    membership_digest,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            assert!(
+                db.reconcile_community_reader_parity(consumer)
+                    .await
+                    .unwrap()
+                    .ready
+            );
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+            let conn = db.conn.lock().await;
+            assert!(MemoryDB::community_reader_uses_durable(&conn, consumer).await);
+        }
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM community_publication_receipts WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "receipt deletion must immediately force {consumer} to legacy"
+            );
+        }
+
+        let membership_digest =
+            community_membership_digest(["a", "b", "c"].into_iter().map(|suffix| {
+                (
+                    format!("m96-receipt-delete-entity-{suffix}"),
+                    COMMUNITY_ID.to_string(),
+                    "core".to_string(),
+                )
+            }));
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    membership_digest.clone(),
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let corruptions = [
+            (
+                "grouping generation",
+                "UPDATE space_graph_state SET grouping_generation=21 \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                "UPDATE space_graph_state SET grouping_generation=20 \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+            ),
+            (
+                "receipt digest",
+                "UPDATE community_publication_receipts SET membership_digest='corrupt' \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                format!(
+                    "UPDATE community_publication_receipts SET membership_digest='{membership_digest}' \
+                     WHERE space='m96-receipt-delete-space'"
+                ),
+            ),
+            (
+                "receipt algorithm",
+                "UPDATE community_publication_receipts SET algo_version='corrupt' \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                format!(
+                    "UPDATE community_publication_receipts SET algo_version='{}' \
+                     WHERE space='m96-receipt-delete-space'",
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION
+                ),
+            ),
+            (
+                "receipt projection",
+                "UPDATE community_publication_receipts SET projection_version='corrupt' \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                format!(
+                    "UPDATE community_publication_receipts SET projection_version='{}' \
+                     WHERE space='m96-receipt-delete-space'",
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ),
+            ),
+            (
+                "member mutation",
+                "UPDATE community_members SET attachment='isolated' \
+                 WHERE space='m96-receipt-delete-space' \
+                   AND node_id='m96-receipt-delete-entity-c'"
+                    .to_string(),
+                "UPDATE community_members SET attachment='core' \
+                 WHERE space='m96-receipt-delete-space' \
+                   AND node_id='m96-receipt-delete-entity-c'"
+                    .to_string(),
+            ),
+            (
+                "live community retirement",
+                "UPDATE communities SET retired_at=2 \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+                "UPDATE communities SET retired_at=NULL \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+            ),
+            (
+                "community space mutation",
+                "UPDATE communities SET space='m96-receipt-delete-other' \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+                "UPDATE communities SET space='m96-receipt-delete-space' \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+            ),
+        ];
+        for (label, mutate, restore) in corruptions {
+            for consumer in [
+                COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+                COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+            ] {
+                assert!(
+                    db.reconcile_community_reader_parity(consumer)
+                        .await
+                        .unwrap()
+                        .ready,
+                    "baseline proof for {label} must be usable"
+                );
+            }
+            {
+                let conn = db.conn.lock().await;
+                conn.execute_batch(&mutate).await.unwrap();
+            }
+            for consumer in [
+                COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+                COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+            ] {
+                let conn = db.conn.lock().await;
+                assert!(
+                    !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                    "{label} must immediately force {consumer} to legacy"
+                );
+            }
+            {
+                let conn = db.conn.lock().await;
+                conn.execute_batch(&restore).await.unwrap();
+            }
+        }
+    }
+
+    /// Mutations caught: taking the parity snapshot through the canonical
+    /// mutex, leaving the read transaction open during Rust computation, or
+    /// publishing proof without a generation-CAS after the sole relevant
+    /// candidate disappears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn community_reader_parity_snapshot_releases_mutex_and_stale_cas_writes_nothing() {
+        use std::sync::atomic::Ordering;
+
+        const SPACE: &str = "m96-parity-snapshot-space";
+        const COMMUNITY_ID: &str = "m96-parity-snapshot-community";
+        const CONSUMER: &str = COMMUNITY_SUMMARY_BUCKETS_CONSUMER;
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4, 1, 1, NULL)",
+                libsql::params![
+                    COMMUNITY_ID,
+                    SPACE,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entities
+                    (id, name, entity_type, space, community_id, created_at, updated_at)
+                 VALUES ('m96-parity-snapshot-entity', 'entity', 'concept', ?1, 7, 1, 1)",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories
+                    (id, content, source, source_id, title, chunk_index, last_modified,
+                     chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                 VALUES ('m96-parity-snapshot-memory', 'body', 'memory',
+                         'm96-parity-snapshot-memory', 'title', 0, 1, 'text', ?1,
+                         vector32(?2), 'm96-parity-snapshot-entity', 0, 'hide')",
+                libsql::params![SPACE, vector],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, 'm96-parity-snapshot-entity', 'entity', ?2, 20, 'core')",
+                libsql::params![SPACE, COMMUNITY_ID],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=20, grouping_generation=20,
+                        published_generation=20, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let membership_digest = community_membership_digest([(
+                "m96-parity-snapshot-entity".to_string(),
+                COMMUNITY_ID.to_string(),
+                "core".to_string(),
+            )]);
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    membership_digest,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        db.set_community_reader_cutover(CONSUMER, true)
+            .await
+            .unwrap();
+
+        let relevant_spaces_digest = community_relevant_spaces_digest([SPACE.to_string()]);
+        let (reached, resume, read_connection_autocommit) =
+            community_parity_test_hooks::pause_after_snapshot(CONSUMER, &relevant_spaces_digest);
+        let worker_db = Arc::clone(&db);
+        let worker =
+            tokio::spawn(
+                async move { worker_db.reconcile_community_reader_parity(CONSUMER).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("reconciliation must expose a post-snapshot, pre-compute boundary");
+        assert!(
+            db.conn.try_lock().is_ok(),
+            "canonical connection mutex must be free after the read snapshot"
+        );
+        assert!(
+            read_connection_autocommit.load(Ordering::Acquire),
+            "the read-only snapshot connection must be back in autocommit before Rust compute"
+        );
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM memories WHERE source_id='m96-parity-snapshot-memory'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        resume.notify_one();
+        let receipt = worker.await.unwrap().unwrap();
+        assert!(
+            !receipt.ready,
+            "a stale snapshot whose sole relevant space disappeared must return pending"
+        );
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::community_reader_uses_durable(&conn, CONSUMER).await,
+            "stale reconciliation must write no usable global or per-space proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_community_route_publish_cas_rejects_stale_page_or_generation() {
+        use crate::community_routing::PageCommunityRouteDecision;
+
+        const SPACE: &str = "m96-route-space";
+        const COMMUNITY_ID: &str = "m96-route-community";
+        const PAGE_ID: &str = "m96-route-page";
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+                libsql::params![COMMUNITY_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pages
+                    (id, title, content, source_memory_ids, version, status,
+                     created_at, last_compiled, last_modified, space, workspace, kind)
+                 VALUES (?1, 'Route', 'Route', '[]', 3, 'active',
+                         'now', 'now', 'now', ?2, ?2, 'concept')",
+                libsql::params![PAGE_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+                 VALUES (?1, 8, 8, 8, 0)
+                 ON CONFLICT(space) DO UPDATE SET
+                    graph_generation=8, grouping_generation=8,
+                    published_generation=8, dirty=0",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(db
+            .publish_page_community_route(
+                PAGE_ID,
+                SPACE,
+                3,
+                0,
+                0,
+                8,
+                &PageCommunityRouteDecision::Assigned {
+                    community_id: COMMUNITY_ID.to_string(),
+                    score: 0.75,
+                },
+            )
+            .await
+            .unwrap());
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET version=4 WHERE id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db
+            .publish_page_community_route(
+                PAGE_ID,
+                SPACE,
+                4,
+                1,
+                0,
+                8,
+                &PageCommunityRouteDecision::Held {
+                    community_id: COMMUNITY_ID.to_string(),
+                    score: 0.40,
+                },
+            )
+            .await
+            .unwrap());
+        assert!(
+            !db.publish_page_community_route(
+                PAGE_ID,
+                SPACE,
+                3,
+                0,
+                0,
+                8,
+                &PageCommunityRouteDecision::Dropped { score: 0.0 },
+            )
+            .await
+            .unwrap(),
+            "a stale page snapshot must not overwrite the current assignment"
+        );
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT community_id, state, page_version, community_published_generation
+                   FROM page_community_assignments WHERE page_id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), COMMUNITY_ID);
+        assert_eq!(row.get::<String>(1).unwrap(), "held");
+        assert_eq!(row.get::<i64>(2).unwrap(), 4);
+        assert_eq!(row.get::<i64>(3).unwrap(), 8);
+        drop(rows);
+        drop(conn);
+        assert_eq!(
+            db.reconcile_community_consistency()
+                .await
+                .unwrap()
+                .violation_count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_community_cycle_retries_new_or_refreshed_page_routes() {
+        const SPACE: &str = "m96-route-retry-space";
+        const COMMUNITY_ID: &str = "m96-route-retry-community";
+        const ENTITY_ID: &str = "m96-route-retry-entity";
+        const SECOND_ENTITY_ID: &str = "m96-route-retry-entity-2";
+        const MEMORY_ID: &str = "m96-route-retry-memory";
+        const PAGE_ID: &str = "m96-route-retry-page";
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+                libsql::params![COMMUNITY_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            for entity_id in [ENTITY_ID, SECOND_ENTITY_ID] {
+                conn.execute(
+                    "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, ?2, 'entity', ?3, 8, 'core')",
+                    libsql::params![SPACE, entity_id, COMMUNITY_ID],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+                 VALUES (?1, 8, 8, 8, 0)
+                 ON CONFLICT(space) DO UPDATE SET
+                    graph_generation=8, grouping_generation=8,
+                    published_generation=8, dirty=0",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories
+                    (id, content, source, source_id, title, chunk_index,
+                     last_modified, chunk_type, space, entity_id)
+                 VALUES (?1, 'Route source', 'memory', ?1, 'Route source',
+                         0, 1, 'text', ?2, ?3)",
+                libsql::params![MEMORY_ID, SPACE, SECOND_ENTITY_ID],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pages
+                    (id, title, content, entity_id, source_memory_ids, version, status,
+                     created_at, last_compiled, last_modified, space, workspace, kind)
+                 VALUES (?1, 'Retry', 'Retry', ?2, '[]', 1, 'active',
+                         'now', 'now', 'now', ?3, ?3, 'concept')",
+                libsql::params![PAGE_ID, ENTITY_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                     lineage, grounded, root_id, space, created_at)
+                 VALUES ('m96-route-retry-cite', ?1, 'page', ?2, 'memory',
+                         'cites', 'evidence', 0, NULL, ?3, 1)",
+                libsql::params![PAGE_ID, MEMORY_ID, SPACE],
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.run_next_community_grouping_cycle()
+                .await
+                .unwrap()
+                .is_none(),
+            "clean community state should not republish membership"
+        );
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT state, page_version
+                       FROM page_community_assignments WHERE page_id=?1",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            let row = rows
+                .next()
+                .await
+                .unwrap()
+                .expect("new page must be routed in the clean community phase");
+            assert_eq!(row.get::<String>(0).unwrap(), "assigned");
+            assert_eq!(row.get::<i64>(1).unwrap(), 1);
+        }
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET version=2 WHERE id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .is_none());
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT page_version
+                   FROM page_community_assignments WHERE page_id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .expect("refreshed page must be re-routed")
+                .get::<i64>(0)
+                .unwrap(),
+            2
+        );
+        drop(rows);
+        drop(conn);
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages
+                    SET source_revision=source_revision + 1
+                  WHERE id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*)
+                       FROM page_community_assignments a
+                       JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                      WHERE a.page_id=?1
+                        AND a.routing_input_generation<i.generation",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1,
+                "a source refresh must stale the persisted route without blacking it out"
+            );
+        }
+        assert!(db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .is_none());
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET entity_id=?1 WHERE id=?2",
+                libsql::params![ENTITY_ID, MEMORY_ID],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*)
+                       FROM page_community_assignments a
+                       JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                      WHERE a.page_id=?1
+                        AND a.routing_input_generation<i.generation",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1,
+                "a memory ownership change must stale native-edge routes"
+            );
+        }
+        assert!(db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .is_none());
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE edges
+                    SET valid_until=2
+                  WHERE edge_id='m96-route-retry-cite'",
+                (),
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*)
+                       FROM page_community_assignments a
+                       JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                      WHERE a.page_id=?1
+                        AND a.routing_input_generation<i.generation",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1,
+                "a native routing-edge change must stale the persisted route"
+            );
+        }
+        assert!(db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .is_none());
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET entity_id=NULL WHERE id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*)
+                       FROM page_community_assignments a
+                       JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                      WHERE a.page_id=?1
+                        AND a.routing_input_generation<i.generation",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1,
+                "a direct page ownership change must stale the persisted route"
+            );
+        }
+        assert!(db
+            .run_next_community_grouping_cycle()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    async fn seed_clean_route_fixture(
+        db: &MemoryDB,
+        space: &str,
+        community_id: &str,
+        entity_id: &str,
+        page_id: &str,
+    ) {
+        let mut embedding = vec![0.0f32; 768];
+        embedding[0] = 1.0;
+        let embedding = MemoryDB::vec_to_sql(&embedding);
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entities
+                (id, name, entity_type, space, created_at, updated_at, embedding)
+             VALUES (?1, 'Route owner', 'concept', ?2, 1, 1, vector32(?3))",
+            libsql::params![entity_id, space, embedding.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO communities
+                (community_id, space, display_name, algo_version, projection_version,
+                 created_at, updated_at, retired_at)
+             VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+            libsql::params![community_id, space],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO community_members
+                (space, node_id, node_kind, community_id,
+                 published_generation, attachment)
+             VALUES (?1, ?2, 'entity', ?3, 8, 'core')",
+            libsql::params![space, entity_id, community_id],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO space_graph_state
+                (space, graph_generation, grouping_generation, published_generation, dirty)
+             VALUES (?1, 8, 8, 8, 0)
+             ON CONFLICT(space) DO UPDATE SET
+                graph_generation=8, grouping_generation=8,
+                published_generation=8, dirty=0",
+            libsql::params![space],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages
+                (id, title, content, source_memory_ids, version, status,
+                 embedding, created_at, last_compiled, last_modified, space, workspace, kind)
+             VALUES (?1, 'Entity shadow', '', '[]', 1, 'active',
+                     vector32(?2), 'now', 'now', 'now', ?3, ?3, 'entity')",
+            libsql::params![format!("{page_id}-shadow"), embedding.clone(), space],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+             VALUES (?1, ?2, 'now')",
+            libsql::params![entity_id, format!("{page_id}-shadow")],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages
+                (id, title, content, source_memory_ids, version, status,
+                 embedding, created_at, last_compiled, last_modified, space, workspace, kind)
+             VALUES (?1, 'Route target', '', '[]', 1, 'active',
+                     vector32(?2), 'now', 'now', 'now', ?3, ?3, 'concept')",
+            libsql::params![page_id, embedding, space],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn entity_shadow_centroid_routes_and_invalidates_entity_poor_pages() {
+        const SPACE: &str = "m96-real-shadow-route-space";
+        const COMMUNITY_ID: &str = "m96-real-shadow-route-community";
+        const PAGE_ID: &str = "m96-real-shadow-route-page";
+        let (db, _dir) = test_db().await;
+        let entity_id = db
+            .store_entity(
+                "Centroid owner",
+                "concept",
+                Some(SPACE),
+                Some("test"),
+                Some(1.0),
+            )
+            .await
+            .unwrap();
+
+        let mut aligned = vec![0.0f32; 768];
+        aligned[0] = 1.0;
+        let aligned_sql = MemoryDB::vec_to_sql(&aligned);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE entities SET embedding=vector32(?1) WHERE id=?2",
+                libsql::params![aligned_sql.clone(), entity_id.clone()],
+            )
+            .await
+            .unwrap();
+            MemoryDB::update_entity_shadow_page(&conn, &entity_id, "now")
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+                libsql::params![COMMUNITY_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, ?2, 'entity', ?3, 8, 'core')",
+                libsql::params![SPACE, entity_id.clone(), COMMUNITY_ID],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+                 VALUES (?1, 8, 8, 8, 0)
+                 ON CONFLICT(space) DO UPDATE SET
+                    graph_generation=8, grouping_generation=8,
+                    published_generation=8, dirty=0",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pages
+                    (id, title, content, source_memory_ids, version, status,
+                     embedding, created_at, last_compiled, last_modified, space, workspace, kind)
+                 VALUES (?1, 'Entity-poor route', '', '[]', 1, 'active',
+                         vector32(?2), 'now', 'now', 'now', ?3, ?3, 'concept')",
+                libsql::params![PAGE_ID, aligned_sql, SPACE],
+            )
+            .await
+            .unwrap();
+        }
+
+        db.refresh_page_community_routes(SPACE, 8).await.unwrap();
+        let original_input_generation = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT state, community_id, routing_space_generation
+                       FROM page_community_assignments WHERE page_id=?1",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "assigned");
+            assert_eq!(row.get::<String>(1).unwrap(), COMMUNITY_ID);
+            row.get::<i64>(2).unwrap()
+        };
+
+        let mut opposed = vec![0.0f32; 768];
+        opposed[0] = -1.0;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages
+                    SET embedding=vector32(?1)
+                  WHERE id=(SELECT page_id FROM entity_page_map WHERE entity_id=?2)",
+                libsql::params![MemoryDB::vec_to_sql(&opposed), entity_id.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        db.refresh_page_community_routes(SPACE, 8).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT state, routing_space_generation
+                   FROM page_community_assignments WHERE page_id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "dropped");
+        assert!(
+            row.get::<i64>(1).unwrap() > original_input_generation,
+            "a canonical entity-shadow embedding change must advance the dependent space epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_publish_rejects_snapshot_invalidated_before_publish() {
+        const SPACE: &str = "m96-route-input-race-space";
+        const COMMUNITY_ID: &str = "m96-route-input-race-community";
+        const ENTITY_ID: &str = "m96-route-input-race-entity";
+        const PAGE_ID: &str = "m96-route-input-race-page";
+        let (db, _dir) = test_db().await;
+        seed_clean_route_fixture(&db, SPACE, COMMUNITY_ID, ENTITY_ID, PAGE_ID).await;
+        db.refresh_page_community_routes(SPACE, 8).await.unwrap();
+
+        let db = Arc::new(db);
+        let (reached, resume) = community_routing_test_hooks::pause_after_snapshot(SPACE);
+        let worker_db = Arc::clone(&db);
+        let worker = tokio::spawn(async move {
+            worker_db
+                .refresh_page_community_routes(SPACE, 8)
+                .await
+                .unwrap()
+        });
+        reached.notified().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE pages SET source_revision=source_revision + 1 WHERE id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        }
+        resume.notify_one();
+        let receipt = worker.await.unwrap();
+        assert!(
+            receipt.stale_writes >= 1,
+            "a scorer using a stale routing-input snapshot must fail its publish CAS"
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT a.routing_input_generation, i.generation
+                       FROM page_community_assignments a
+                       JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                      WHERE a.page_id=?1",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            let row = rows
+                .next()
+                .await
+                .unwrap()
+                .expect("the prior assignment must survive invalidation until reroute");
+            assert!(
+                row.get::<i64>(0).unwrap() < row.get::<i64>(1).unwrap(),
+                "the stale selector must be able to observe the routing-input mismatch"
+            );
+        }
+
+        assert!(db
+            .refresh_next_stale_page_community_routes()
+            .await
+            .unwrap()
+            .is_some());
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT a.routing_input_generation, i.generation
+                   FROM page_community_assignments a
+                   JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                  WHERE a.page_id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap());
+    }
+
+    #[tokio::test]
+    async fn space_generation_retry_refreshes_all_active_page_routes() {
+        const SPACE: &str = "m96-global-route-retry-space";
+        const COMMUNITY_ID: &str = "m96-global-route-retry-community";
+        const ENTITY_ID: &str = "m96-global-route-retry-entity";
+        const PAGE_A: &str = "m96-global-route-retry-page-a";
+        const PAGE_B: &str = "m96-global-route-retry-page-b";
+        let (db, _dir) = test_db().await;
+        seed_clean_route_fixture(&db, SPACE, COMMUNITY_ID, ENTITY_ID, PAGE_A).await;
+        {
+            let mut embedding = vec![0.0f32; 768];
+            embedding[0] = 1.0;
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO pages
+                    (id, title, content, source_memory_ids, version, status,
+                     embedding, created_at, last_compiled, last_modified, space, workspace, kind)
+                 VALUES (?1, 'Second route target', '', '[]', 1, 'active',
+                         vector32(?2), 'now', 'now', 'now', ?3, ?3, 'concept')",
+                libsql::params![PAGE_B, MemoryDB::vec_to_sql(&embedding), SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        let initial = db.refresh_page_community_routes(SPACE, 8).await.unwrap();
+        assert_eq!(initial.pages_considered, 3);
+        assert_eq!(initial.assignments_published, 3);
+        let scope = ReadScope::Space(SPACE.to_string());
+        let current = db
+            .list_community_page_assignments(&scope, None, 50)
+            .await
+            .unwrap();
+        assert!(current
+            .page_assignments
+            .iter()
+            .any(|assignment| assignment.page_id == PAGE_A));
+        assert!(current
+            .page_assignments
+            .iter()
+            .any(|assignment| assignment.page_id == PAGE_B));
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE community_route_space_inputs
+                    SET generation=generation + 1
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        let stale = db
+            .list_community_page_assignments(&scope, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            stale
+                .page_assignments
+                .iter()
+                .all(|assignment| assignment.page_id != PAGE_A && assignment.page_id != PAGE_B),
+            "a space-wide route generation bump must hide every old assignment"
+        );
+
+        let receipt = db
+            .refresh_next_stale_page_community_routes()
+            .await
+            .unwrap()
+            .expect("the space-wide generation bump must queue a clean retry");
+        assert_eq!(
+            receipt.pages_considered, 3,
+            "one global retry must snapshot every active routed page in the space"
+        );
+        assert_eq!(receipt.assignments_published, 3);
+        assert_eq!(receipt.stale_writes, 0);
+
+        let refreshed = db
+            .list_community_page_assignments(&scope, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            refreshed
+                .page_assignments
+                .iter()
+                .any(|assignment| assignment.page_id == PAGE_A),
+            "the first named assignment must be current and public after the global retry"
+        );
+        assert!(
+            refreshed
+                .page_assignments
+                .iter()
+                .any(|assignment| assignment.page_id == PAGE_B),
+            "the second named assignment must be current and public after the global retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_route_retry_refreshes_only_the_selected_page() {
+        const SPACE: &str = "m96-targeted-route-retry-space";
+        const COMMUNITY_ID: &str = "m96-targeted-route-retry-community";
+        const ENTITY_ID: &str = "m96-targeted-route-retry-entity";
+        const PAGE_A: &str = "m96-targeted-route-retry-page-a";
+        const PAGE_B: &str = "m96-targeted-route-retry-page-b";
+        const PAGE_B_UPDATED_AT: i64 = 1_234_567_890;
+        let (db, _dir) = test_db().await;
+        seed_clean_route_fixture(&db, SPACE, COMMUNITY_ID, ENTITY_ID, PAGE_A).await;
+        {
+            let mut embedding = vec![0.0f32; 768];
+            embedding[0] = 1.0;
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO pages
+                    (id, title, content, source_memory_ids, version, status,
+                     embedding, created_at, last_compiled, last_modified, space, workspace, kind)
+                 VALUES (?1, 'Second route target', '', '[]', 1, 'active',
+                         vector32(?2), 'now', 'now', 'now', ?3, ?3, 'concept')",
+                libsql::params![PAGE_B, MemoryDB::vec_to_sql(&embedding), SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        db.refresh_page_community_routes(SPACE, 8).await.unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE page_community_assignments
+                    SET updated_at=?1
+                  WHERE page_id=?2",
+                libsql::params![PAGE_B_UPDATED_AT, PAGE_B],
+            )
+            .await
+            .unwrap();
+        }
+        let page_b_before = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT page_id, space, community_id, state, score, page_version,
+                            routing_input_generation, routing_space_generation,
+                            community_published_generation, route_version, updated_at
+                       FROM page_community_assignments
+                      WHERE page_id=?1",
+                    libsql::params![PAGE_B],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            (
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+                row.get::<String>(3).unwrap(),
+                row.get::<f64>(4).unwrap(),
+                row.get::<i64>(5).unwrap(),
+                row.get::<i64>(6).unwrap(),
+                row.get::<i64>(7).unwrap(),
+                row.get::<i64>(8).unwrap(),
+                row.get::<String>(9).unwrap(),
+                row.get::<i64>(10).unwrap(),
+            )
+        };
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE page_community_route_inputs
+                    SET generation=generation + 1
+                  WHERE page_id=?1",
+                libsql::params![PAGE_A],
+            )
+            .await
+            .unwrap();
+        }
+
+        let receipt = db
+            .refresh_next_stale_page_community_routes()
+            .await
+            .unwrap()
+            .expect("the page-local generation bump must queue one clean retry");
+        assert_eq!(
+            receipt.pages_considered, 1,
+            "a clean retry must snapshot and score only its selected stale page"
+        );
+        assert_eq!(receipt.assignments_published, 1);
+        assert_eq!(receipt.stale_writes, 0);
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT a.routing_input_generation, i.generation
+                   FROM page_community_assignments a
+                   JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                  WHERE a.page_id=?1",
+                libsql::params![PAGE_A],
+            )
+            .await
+            .unwrap();
+        let page_a = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            page_a.get::<i64>(0).unwrap(),
+            page_a.get::<i64>(1).unwrap(),
+            "the selected page must publish against its current local generation"
+        );
+        drop(rows);
+        let mut rows = conn
+            .query(
+                "SELECT page_id, space, community_id, state, score, page_version,
+                        routing_input_generation, routing_space_generation,
+                        community_published_generation, route_version, updated_at
+                   FROM page_community_assignments
+                  WHERE page_id=?1",
+                libsql::params![PAGE_B],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let page_b_after = (
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<Option<String>>(2).unwrap(),
+            row.get::<String>(3).unwrap(),
+            row.get::<f64>(4).unwrap(),
+            row.get::<i64>(5).unwrap(),
+            row.get::<i64>(6).unwrap(),
+            row.get::<i64>(7).unwrap(),
+            row.get::<i64>(8).unwrap(),
+            row.get::<String>(9).unwrap(),
+            row.get::<i64>(10).unwrap(),
+        );
+        assert_eq!(
+            page_b_after, page_b_before,
+            "an unrelated current assignment row must remain byte-for-byte unchanged"
+        );
+        assert_eq!(page_b_after.10, PAGE_B_UPDATED_AT);
+    }
+
+    #[tokio::test]
+    async fn public_page_assignment_reader_hides_obsolete_route_versions() {
+        const SPACE: &str = "m96-route-version-reader-space";
+        const COMMUNITY_ID: &str = "m96-route-version-reader-community";
+        const ENTITY_ID: &str = "m96-route-version-reader-entity";
+        const PAGE_ID: &str = "m96-route-version-reader-page";
+        let (db, _dir) = test_db().await;
+        seed_clean_route_fixture(&db, SPACE, COMMUNITY_ID, ENTITY_ID, PAGE_ID).await;
+        db.refresh_page_community_routes(SPACE, 8).await.unwrap();
+        let scope = ReadScope::Space(SPACE.to_string());
+
+        let current = db
+            .list_community_page_assignments(&scope, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            current
+                .page_assignments
+                .iter()
+                .any(|assignment| assignment.page_id == PAGE_ID),
+            "a current route-version assignment must be public"
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE page_community_assignments
+                    SET route_version='obsolete-route-version'
+                  WHERE page_id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        }
+        let obsolete = db
+            .list_community_page_assignments(&scope, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            obsolete
+                .page_assignments
+                .iter()
+                .all(|assignment| assignment.page_id != PAGE_ID),
+            "an obsolete route-version assignment must not be public"
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE page_community_assignments
+                    SET route_version=?1
+                  WHERE page_id=?2",
+                libsql::params![crate::community_routing::COMMUNITY_ROUTE_VERSION, PAGE_ID],
+            )
+            .await
+            .unwrap();
+        }
+        let restored = db
+            .list_community_page_assignments(&scope, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .page_assignments
+                .iter()
+                .any(|assignment| assignment.page_id == PAGE_ID),
+            "restoring the current route version must make the assignment public again"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_memory_write_preserves_page_community_assignments() {
+        const SPACE: &str = "m96-unrelated-memory-space";
+        const COMMUNITY_ID: &str = "m96-unrelated-memory-community";
+        const ENTITY_ID: &str = "m96-unrelated-memory-entity";
+        const PAGE_ID: &str = "m96-unrelated-memory-page";
+        let (db, _dir) = test_db().await;
+        seed_clean_route_fixture(&db, SPACE, COMMUNITY_ID, ENTITY_ID, PAGE_ID).await;
+        db.refresh_page_community_routes(SPACE, 8).await.unwrap();
+
+        let before = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT a.routing_input_generation, i.generation
+                       FROM page_community_assignments a
+                       JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                      WHERE a.page_id=?1",
+                    libsql::params![PAGE_ID],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+        };
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO memories
+                    (id, content, source, source_id, title, chunk_index,
+                     last_modified, chunk_type, space)
+                 VALUES ('m96-unrelated-memory', 'Unrelated', 'memory',
+                         'm96-unrelated-memory', 'Unrelated', 0, 1, 'text', ?1)",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT a.routing_input_generation, i.generation
+                   FROM page_community_assignments a
+                   JOIN page_community_route_inputs i ON i.page_id=a.page_id
+                  WHERE a.page_id=?1",
+                libsql::params![PAGE_ID],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("an unrelated memory must not black out an existing route");
+        assert_eq!(
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_membership_replacement_does_not_fan_out_page_generations() {
+        const SPACE: &str = "m96-member-epoch-space";
+        const COMMUNITY_ID: &str = "m96-member-epoch-community";
+        const ENTITY_ID: &str = "m96-member-epoch-entity";
+        const PAGE_ID: &str = "m96-member-epoch-page";
+        let (db, _dir) = test_db().await;
+        seed_clean_route_fixture(&db, SPACE, COMMUNITY_ID, ENTITY_ID, PAGE_ID).await;
+
+        let before = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT
+                        (SELECT SUM(generation) FROM page_community_route_inputs
+                          WHERE space=?1),
+                        (SELECT generation FROM community_route_space_inputs
+                          WHERE space=?1)",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+        };
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE space_graph_state SET dirty=1 WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            for node_id in ["m96-batch-member-a", "m96-batch-member-b"] {
+                conn.execute(
+                    "INSERT INTO community_members
+                        (space, node_id, node_kind, community_id,
+                         published_generation, attachment)
+                     VALUES (?1, ?2, 'entity', ?3, 8, 'core')",
+                    libsql::params![SPACE, node_id, COMMUNITY_ID],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "DELETE FROM community_members
+                  WHERE space=?1 AND node_id LIKE 'm96-batch-member-%'",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+
+        let during_dirty = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT
+                        (SELECT SUM(generation) FROM page_community_route_inputs
+                          WHERE space=?1),
+                        (SELECT generation FROM community_route_space_inputs
+                          WHERE space=?1)",
+                    libsql::params![SPACE],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+        };
+        assert_eq!(
+            during_dirty, before,
+            "row-level publication writes must not fan out to route rows or the space epoch"
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE space_graph_state SET dirty=0 WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, 'm96-direct-member', 'entity', ?2, 8, 'core')",
+                libsql::params![SPACE, COMMUNITY_ID],
+            )
+            .await
+            .unwrap();
+        }
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT
+                    (SELECT SUM(generation) FROM page_community_route_inputs
+                      WHERE space=?1),
+                    (SELECT generation FROM community_route_space_inputs
+                      WHERE space=?1)",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            before.0,
+            "a global membership invalidation must remain O(1)"
+        );
+        assert_eq!(
+            row.get::<i64>(1).unwrap(),
+            before.1 + 1,
+            "a direct same-generation membership change must advance the space epoch once"
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_and_confirmation_do_not_invalidate_entity_shadow_routes() {
+        const SPACE: &str = "m96-entity-metadata-route-space";
+        let (db, _dir) = test_db().await;
+        let entity_id = db
+            .store_entity(
+                "Metadata owner",
+                "concept",
+                Some(SPACE),
+                Some("test"),
+                Some(1.0),
+            )
+            .await
+            .unwrap();
+        let before = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT i.generation, s.generation
+                       FROM entity_page_map m
+                       JOIN page_community_route_inputs i ON i.page_id=m.page_id
+                       JOIN community_route_space_inputs s ON s.space=i.space
+                      WHERE m.entity_id=?1",
+                    libsql::params![entity_id.clone()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+        };
+
+        db.add_entity_alias("Metadata alias", &entity_id, "test")
+            .await
+            .unwrap();
+        db.confirm_entity(&entity_id, true).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT i.generation, s.generation
+                   FROM entity_page_map m
+                   JOIN page_community_route_inputs i ON i.page_id=m.page_id
+                   JOIN community_route_space_inputs s ON s.space=i.space
+                  WHERE m.entity_id=?1",
+                libsql::params![entity_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()),
+            before,
+            "metadata-only shadow synchronization must not stale page or space routing epochs"
+        );
+    }
+
+    #[tokio::test]
+    async fn community_rename_accept_is_generation_guarded_and_absent_from_legacy_queue() {
+        const SPACE: &str = "m96-proposal-space";
+        const COMMUNITY_ID: &str = "m96-proposal-community";
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, 'algo', 'projection', 1, 1, NULL)",
+                libsql::params![COMMUNITY_ID, SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+                 VALUES (?1, 8, 8, 8, 0)
+                 ON CONFLICT(space) DO UPDATE SET
+                    graph_generation=8, grouping_generation=8,
+                    published_generation=8, dirty=0",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let payload = serde_json::json!({
+                "action": "community_rename",
+                "space": SPACE,
+                "source_generation": 8,
+                "subject_id": COMMUNITY_ID,
+                "proposed_display_name": "Durable Name",
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO refinement_queue
+                    (id, action, source_ids, payload, confidence, status)
+                 VALUES ('m96-rename', 'community_rename', ?1, ?2, 1.0, 'awaiting_review')",
+                libsql::params![serde_json::json!([COMMUNITY_ID]).to_string(), payload],
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.get_pending_refinements().await.unwrap().is_empty(),
+            "community actions must not leak through the frozen legacy queue"
+        );
+        let proposals = db
+            .list_community_proposals(&crate::read_scope::ReadScope::Global, 10)
+            .await
+            .unwrap();
+        assert_eq!(proposals.proposals.len(), 1);
+
+        let accepted = db.accept_community_proposal("m96-rename").await.unwrap();
+        assert!(accepted.display_name_updated);
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT display_name FROM communities WHERE community_id=?1",
+                    libsql::params![COMMUNITY_ID],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<String>(0)
+                    .unwrap(),
+                "Durable Name"
+            );
+        }
+
+        {
+            let conn = db.conn.lock().await;
+            let payload = serde_json::json!({
+                "action": "community_rename",
+                "space": SPACE,
+                "source_generation": 8,
+                "subject_id": COMMUNITY_ID,
+                "proposed_display_name": "Stale Name",
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO refinement_queue
+                    (id, action, source_ids, payload, confidence, status)
+                 VALUES ('m96-stale-rename', 'community_rename', ?1, ?2, 1.0, 'awaiting_review')",
+                libsql::params![serde_json::json!([COMMUNITY_ID]).to_string(), payload],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET grouping_generation=9, published_generation=9
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db
+            .accept_community_proposal("m96-stale-rename")
+            .await
+            .is_err());
+        assert!(
+            db.reject_community_proposal("m96-stale-rename")
+                .await
+                .is_err(),
+            "a stale community proposal must not be terminally rejected"
+        );
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT c.display_name, q.status
+                   FROM communities c
+                   JOIN refinement_queue q ON q.id='m96-stale-rename'
+                  WHERE c.community_id=?1",
+                libsql::params![COMMUNITY_ID],
+            )
+            .await
+            .unwrap();
+        let stale = rows.next().await.unwrap().unwrap();
+        assert_eq!(stale.get::<String>(0).unwrap(), "Durable Name");
+        assert_eq!(stale.get::<String>(1).unwrap(), "awaiting_review");
+        drop(rows);
+        conn.execute(
+            "INSERT INTO refinement_queue
+                (id, action, source_ids, payload, confidence, status)
+             VALUES ('m96-mismatched-action', 'community_split', ?1, ?2,
+                     1.0, 'awaiting_review')",
+            libsql::params![
+                serde_json::json!([COMMUNITY_ID]).to_string(),
+                serde_json::json!({
+                    "action": "community_rename",
+                    "space": SPACE,
+                    "source_generation": 9,
+                    "subject_id": COMMUNITY_ID,
+                    "proposed_display_name": "Must Not Apply",
+                })
+                .to_string()
+            ],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        assert!(db
+            .list_community_proposals(&crate::read_scope::ReadScope::Global, 20)
+            .await
+            .is_err());
+        assert!(db
+            .accept_community_proposal("m96-mismatched-action")
+            .await
+            .is_err());
+        assert!(
+            db.reject_community_proposal("m96-mismatched-action")
+                .await
+                .is_err(),
+            "an action/payload mismatch must not be terminally rejected"
+        );
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT status FROM refinement_queue
+                  WHERE id='m96-mismatched-action'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "awaiting_review"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalizing_a_split_queues_review_without_overwriting_curated_names() {
+        use crate::community_grouping::{
+            CommunityGroupingComputeMode, CommunityGroupingComputed, CommunityGroupingFullReason,
+            CommunityGroupingOutcome, ComputedCommunityMember,
+        };
+        use wenlan_types::{CommunityProposalAction, CommunityProposalPayload};
+
+        const SPACE: &str = "m96-finalize-split-space";
+        const OLD_COMMUNITY: &str = "m96-old-community";
+        const NEW_COMMUNITY: &str = "m96-new-community";
+        const CURATED_NAME: &str = "Curated Name";
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, ?3, 'leiden-m4-v1', 'grounded-relates-v1',
+                         1, 1, NULL)",
+                libsql::params![OLD_COMMUNITY, SPACE, CURATED_NAME],
+            )
+            .await
+            .unwrap();
+            for node_id in ["m96-split-node-a", "m96-split-node-b"] {
+                conn.execute(
+                    "INSERT INTO community_members
+                        (space, node_id, node_kind, community_id,
+                         published_generation, attachment)
+                     VALUES (?1, ?2, 'entity', ?3, 1, 'core')",
+                    libsql::params![SPACE, node_id, OLD_COMMUNITY],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO space_graph_state
+                    (space, graph_generation, grouping_generation, published_generation, dirty)
+                 VALUES (?1, 2, 2, 1, 1)
+                 ON CONFLICT(space) DO UPDATE SET
+                    graph_generation=2, grouping_generation=2,
+                    published_generation=1, dirty=1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+
+        let attempt = db.prepare_community_grouping(SPACE).await.unwrap();
+        let outcome = db
+            .finalize_community_grouping(
+                attempt,
+                CommunityGroupingComputed {
+                    members: vec![
+                        ComputedCommunityMember {
+                            node_id: "m96-split-node-a".to_string(),
+                            community_id: OLD_COMMUNITY.to_string(),
+                            attachment: "core",
+                        },
+                        ComputedCommunityMember {
+                            node_id: "m96-split-node-b".to_string(),
+                            community_id: NEW_COMMUNITY.to_string(),
+                            attachment: "core",
+                        },
+                    ],
+                    held_below_floor: false,
+                    projected_edge_count: 0,
+                    compute_mode: CommunityGroupingComputeMode::Full {
+                        reason: CommunityGroupingFullReason::RuntimeStateMissing,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CommunityGroupingOutcome::Published(_)));
+
+        assert!(
+            db.get_pending_refinements().await.unwrap().is_empty(),
+            "split events must not leak through the frozen legacy queue"
+        );
+        let proposals = db
+            .list_community_proposals(&crate::read_scope::ReadScope::Global, 10)
+            .await
+            .unwrap();
+        assert_eq!(proposals.proposals.len(), 1);
+        assert_eq!(
+            proposals.proposals[0].action,
+            CommunityProposalAction::CommunitySplit
+        );
+        match &proposals.proposals[0].payload {
+            CommunityProposalPayload::CommunitySplit {
+                space,
+                source_generation,
+                subject_id,
+                old_community_ids,
+                new_community_ids,
+                proposed_display_name,
+            } => {
+                assert_eq!(space, SPACE);
+                assert_eq!(*source_generation, 2);
+                assert_eq!(subject_id, OLD_COMMUNITY);
+                assert_eq!(old_community_ids, &[OLD_COMMUNITY.to_string()]);
+                assert_eq!(
+                    new_community_ids,
+                    &[NEW_COMMUNITY.to_string(), OLD_COMMUNITY.to_string()]
+                );
+                assert_eq!(proposed_display_name, &None);
+            }
+            other => panic!("expected split payload, got {other:?}"),
+        }
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT display_name FROM communities WHERE community_id=?1",
+                libsql::params![OLD_COMMUNITY],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            CURATED_NAME,
+            "publication must preserve a user-curated display name"
+        );
+    }
+
+    #[tokio::test]
+    async fn community_consistency_detects_a_missing_connected_participant() {
+        use crate::community_grouping::{
+            run_community_grouping_cycle, CommunityGroupingOutcome, CommunityGroupingRuntime,
+        };
+
+        const SPACE: &str = "m96-consistency-coverage";
+        const ROOT_ID: &str = "m96-consistency-root";
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO provenance_roots
+                    (root_id, identity_version, identity_digest, root_kind,
+                     independence_group_id, status, created_at)
+                 VALUES (?1, 1, ?1, 'generated', ?1, 'active', 1)",
+                libsql::params![ROOT_ID],
+            )
+            .await
+            .unwrap();
+            for node in 0..10 {
+                let entity_id = format!("m96-consistency-node-{node:02}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 1, 1)",
+                    libsql::params![entity_id, SPACE],
+                )
+                .await
+                .unwrap();
+            }
+            for node in 0..10 {
+                conn.execute(
+                    "INSERT INTO edges
+                        (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                         lineage, grounded, root_id, space, created_at)
+                     VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates',
+                             'assertion', 1, ?4, ?5, 1)",
+                    libsql::params![
+                        format!("m96-consistency-edge-{node:02}"),
+                        format!("m96-consistency-node-{node:02}"),
+                        format!("m96-consistency-node-{:02}", (node + 1) % 10),
+                        ROOT_ID,
+                        SPACE
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let mut runtime = CommunityGroupingRuntime::default();
+        assert!(matches!(
+            run_community_grouping_cycle(&db, &mut runtime, SPACE)
+                .await
+                .unwrap(),
+            CommunityGroupingOutcome::Published(_)
+        ));
+        assert_eq!(
+            db.reconcile_community_consistency().await.unwrap(),
+            CommunityConsistencyReport {
+                missing_expected_members: 0,
+                unexpected_members: 0,
+                orphan_members: 0,
+                retired_community_members: 0,
+                member_generation_mismatches: 0,
+                publication_generation_mismatches: 0,
+                invalid_page_assignments: 0,
+            }
+        );
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM community_members
+                  WHERE space=?1 AND node_id='m96-consistency-node-09'",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        let report = db.reconcile_community_consistency().await.unwrap();
+        assert_eq!(report.missing_expected_members, 1);
+        assert_eq!(report.unexpected_members, 0);
+        assert_eq!(report.violation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn community_member_fence_rejects_a_cross_space_community_id() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO communities
+                (community_id, space, display_name, algo_version, projection_version,
+                 created_at, updated_at, retired_at)
+             VALUES ('m96-community-space-b', 'space-b', NULL,
+                     'algo', 'projection', 1, 1, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        let result = conn
+            .execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES ('space-a', 'm96-cross-space-node', 'entity',
+                         'm96-community-space-b', 1, 'core')",
+                (),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "membership publication must reject a community owned by another space"
+        );
+    }
+
+    #[tokio::test]
+    async fn community_consistency_counts_a_stored_cross_space_membership() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS m4_community_member_insert_fence;
+                 INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES ('m96-community-space-b', 'space-b', NULL,
+                         'algo', 'projection', 1, 1, NULL);
+                 INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES ('space-a', 'm96-cross-space-node', 'entity',
+                         'm96-community-space-b', 1, 'core');",
+            )
+            .await
+            .unwrap();
+        }
+
+        let report = db.reconcile_community_consistency().await.unwrap();
+        assert_eq!(
+            report.orphan_members, 1,
+            "a globally valid community id is still orphaned from a different space"
+        );
+    }
+
+    #[tokio::test]
+    async fn m4_hot_reads_use_the_authored_partial_and_membership_indexes() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        for (sql, expected_index) in [
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT edge_id FROM edges
+                  WHERE space='work' AND edge_type='relates'
+                    AND grounded=1 AND valid_until IS NULL
+                    AND src_kind='entity' AND dst_kind='entity'
+                    AND lineage='assertion' AND edge_id>''
+                  ORDER BY edge_id LIMIT 512",
+                "idx_edges_active_grounded_space_type",
+            ),
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT node_id FROM community_members
+                  WHERE community_id='community'
+                  ORDER BY node_id",
+                "idx_community_members_community",
+            ),
+        ] {
+            let mut rows = conn.query(sql, ()).await.unwrap();
+            let mut details = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                details.push(row.get::<String>(3).unwrap());
+            }
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "expected {expected_index}, got {details:?}"
+            );
+            assert!(
+                details.iter().all(|detail| !detail.contains("SCAN edges")),
+                "grounded hot path must not full-scan edges: {details:?}"
+            );
+        }
     }
 
     // ==================== upsert_documents ====================
@@ -43504,6 +54017,304 @@ pub(crate) mod tests {
             memories_after_retry[0].content,
             "Replacement content must not partially overwrite the original."
         );
+    }
+
+    async fn seed_conflicting_replacement_spaces(
+        db: &MemoryDB,
+        source_id: &str,
+    ) -> Vec<(String, String, Option<String>, i64)> {
+        let original =
+            "Original evidence must remain byte-for-byte available when replacement space inheritance is ambiguous. "
+                .repeat(200);
+        db.upsert_documents(vec![make_doc(
+            "memory",
+            source_id,
+            "Original document",
+            &original,
+        )])
+        .await
+        .unwrap();
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories
+                 SET space = CASE WHEN chunk_index = 0 THEN 'alpha-space' ELSE 'zeta-space' END
+                 WHERE source = 'memory' AND source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .unwrap();
+        }
+
+        let inventory = replacement_inventory(db, source_id).await;
+        assert!(
+            inventory.len() > 1,
+            "fixture must cover replacement of multiple chunks"
+        );
+        assert!(
+            inventory
+                .iter()
+                .any(|(_, _, space, _)| space.as_deref() == Some("alpha-space"))
+                && inventory
+                    .iter()
+                    .any(|(_, _, space, _)| space.as_deref() == Some("zeta-space")),
+            "fixture must contain conflicting non-NULL spaces"
+        );
+        inventory
+    }
+
+    async fn replacement_inventory(
+        db: &MemoryDB,
+        source_id: &str,
+    ) -> Vec<(String, String, Option<String>, i64)> {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, space, version
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY id",
+                libsql::params![source_id],
+            )
+            .await
+            .unwrap();
+        let mut inventory = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            inventory.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+                row.get(3).unwrap(),
+            ));
+        }
+        inventory
+    }
+
+    #[tokio::test]
+    async fn omitted_replacement_space_rejects_conflicting_existing_spaces_without_mutation() {
+        let (db, _dir) = test_db().await;
+        let source_id = "ambiguous-replacement-space";
+        let old_inventory = seed_conflicting_replacement_spaces(&db, source_id).await;
+
+        let replacement = make_doc(
+            "memory",
+            source_id,
+            "Replacement document",
+            "Replacement content must be rejected before the old chunks are mutated.",
+        );
+        assert!(replacement.space.is_none());
+        let error = db.upsert_documents(vec![replacement]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("ambiguous replacement space"),
+            "expected an ambiguity error, got {error}"
+        );
+        assert_eq!(
+            replacement_inventory(&db, source_id).await,
+            old_inventory,
+            "an ambiguous omitted-space replacement must preserve every old row exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_replacement_space_heals_conflicting_existing_spaces() {
+        let (db, _dir) = test_db().await;
+        let source_id = "explicit-heals-ambiguous-space";
+        seed_conflicting_replacement_spaces(&db, source_id).await;
+
+        let mut replacement = make_doc(
+            "memory",
+            source_id,
+            "Replacement document",
+            "An explicit incoming space remains authoritative.",
+        );
+        replacement.space = Some("healed-space".to_string());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let inventory = replacement_inventory(&db, source_id).await;
+        assert!(!inventory.is_empty());
+        assert!(
+            inventory.iter().all(
+                |(_, _, space, version)| space.as_deref() == Some("healed-space") && *version == 2
+            ),
+            "the explicit replacement must heal every new chunk into its authoritative space"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_new_episode_inherits_the_parent_assigned_space() {
+        let (db, _dir) = test_db().await;
+        let initial = make_doc(
+            "memory",
+            "episode-space-transition",
+            "Initial document",
+            "The initial document generation has enough words for an episode but keeps it disabled.",
+        );
+        db.upsert_documents_with_derived_channels_for_test(vec![initial], false, false)
+            .await
+            .unwrap();
+        db.update_memory_space("episode-space-transition", "m4-live")
+            .await
+            .unwrap();
+
+        let replacement = make_doc(
+            "memory",
+            "episode-space-transition",
+            "Replacement document",
+            "transitionepisodetoken appears in this replacement generation with enough words to create a new episode.",
+        );
+        assert!(replacement.space.is_none());
+        db.upsert_documents_with_derived_channels_for_test(vec![replacement], true, false)
+            .await
+            .unwrap();
+
+        let (parent_space, episode_space) = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT source, space FROM memories
+                     WHERE source_id = 'episode-space-transition'
+                     ORDER BY source",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut parent_space = None;
+            let mut episode_space = None;
+            while let Some(row) = rows.next().await.unwrap() {
+                let source: String = row.get(0).unwrap();
+                let space: String = row.get(1).unwrap();
+                match source.as_str() {
+                    "memory" => parent_space = Some(space),
+                    "episode" => episode_space = Some(space),
+                    _ => {}
+                }
+            }
+            (parent_space, episode_space)
+        };
+        assert_eq!(parent_space.as_deref(), Some("m4-live"));
+        assert_eq!(
+            episode_space, parent_space,
+            "a newly derived episode must inherit its replacement parent's effective space"
+        );
+
+        let in_scope = db
+            .search_episodes_scoped(
+                "transitionepisodetoken",
+                10,
+                &ReadScope::Space("m4-live".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            in_scope
+                .iter()
+                .any(|hit| hit.source_id == "episode-space-transition"),
+            "the new episode must be retrievable in the parent's assigned space"
+        );
+        let wrong_scope = db
+            .search_episodes_scoped(
+                "transitionepisodetoken",
+                10,
+                &ReadScope::Space("other-space".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_scope
+                .iter()
+                .all(|hit| hit.source_id != "episode-space-transition"),
+            "the new episode must not leak into another space"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_supersession_uses_the_inherited_space() {
+        let (db, _dir) = test_db().await;
+        let mut target = make_memory_doc(
+            "supersession-target",
+            "The original scoped preference remains confirmed until replaced.",
+            "preference",
+            "m4-live",
+            "test",
+        );
+        target.confirmed = Some(true);
+        db.upsert_documents(vec![target]).await.unwrap();
+
+        let initial_superseder = make_doc(
+            "memory",
+            "supersession-replacement",
+            "Initial superseder",
+            "The initial superseder generation does not yet replace the target.",
+        );
+        db.upsert_documents(vec![initial_superseder]).await.unwrap();
+        db.update_memory_space("supersession-replacement", "m4-live")
+            .await
+            .unwrap();
+
+        let mut replacement = make_doc(
+            "memory",
+            "supersession-replacement",
+            "Replacement superseder",
+            "The replacement generation now supersedes the original scoped preference.",
+        );
+        replacement.supersedes = Some("supersession-target".to_string());
+        assert!(replacement.space.is_none());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT confirmed FROM memories
+                 WHERE source = 'memory'
+                   AND source_id = 'supersession-target'
+                   AND space = 'm4-live'",
+                (),
+            )
+            .await
+            .unwrap();
+        let confirmed: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            confirmed, 0,
+            "an omitted-space replacement must suppress its target in the inherited scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_replacement_space_overrides_the_inherited_space() {
+        let (db, _dir) = test_db().await;
+        let initial = make_doc(
+            "memory",
+            "explicit-replacement-space",
+            "Initial document",
+            "Initial content before an explicit replacement space is supplied.",
+        );
+        db.upsert_documents(vec![initial]).await.unwrap();
+        db.update_memory_space("explicit-replacement-space", "m4-live")
+            .await
+            .unwrap();
+
+        let mut replacement = make_doc(
+            "memory",
+            "explicit-replacement-space",
+            "Replacement document",
+            "Replacement content with an explicitly authoritative space.",
+        );
+        replacement.space = Some("explicit-space".to_string());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT space FROM memories
+                 WHERE source = 'memory' AND source_id = 'explicit-replacement-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(space, "explicit-space");
+        assert!(rows.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -74298,6 +85109,29 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn community_leiden_enabled_is_explicit_opt_in() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !community_leiden_enabled_value(value),
+                "{value:?} must preserve the legacy-only community phase"
+            );
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), Some(" TRUE ")] {
+            assert!(
+                community_leiden_enabled_value(value),
+                "{value:?} must enable the M4 write-only shadow"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn migration_68_adds_citations_column_null_for_legacy() {
         let (db, _dir) = test_db().await;
@@ -74837,6 +85671,34 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
+        // A database claiming the current schema version must actually carry
+        // the parity counter and its integrity guards -- `open_for_repair`
+        // refuses one that does not, because that path skips migrations and
+        // then exposes the approved apply endpoint. Stamping the version
+        // without them would make this fixture a shape no real database of
+        // that version has.
+        if schema_version == SCHEMA_VERSION {
+            connection
+                .execute_batch(PARITY_INPUT_STATE_TABLE_DDL)
+                .await
+                .unwrap();
+            for (_, canonical) in PARITY_GUARD_TRIGGERS {
+                connection
+                    .execute_batch(&format!("{canonical};"))
+                    .await
+                    .unwrap();
+            }
+            // Seeded after the guards, so the fixture also proves the seed the
+            // real migration writes is one the guards accept.
+            connection
+                .execute_batch(
+                    "INSERT INTO community_parity_input_state
+                         (singleton, generation, relevant_spaces_digest)
+                     VALUES (1, 0, '');",
+                )
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -74847,6 +85709,7 @@ pub(crate) mod tests {
             conn.execute_batch(
                 "DROP TABLE entity_type_vocabulary;
                  DROP TABLE vocab_heal_ledger;
+                 DROP TRIGGER m4_page_community_page_invalidate;
                  ALTER TABLE pages DROP COLUMN source_revision;
                  PRAGMA user_version = 72;",
             )
@@ -74942,6 +85805,7 @@ pub(crate) mod tests {
             conn.execute_batch(
                 "DROP TABLE entity_type_vocabulary;
                  DROP TABLE vocab_heal_ledger;
+                 DROP TRIGGER m4_page_community_page_invalidate;
                  ALTER TABLE pages DROP COLUMN source_revision;",
             )
             .await
@@ -75069,7 +85933,7 @@ pub(crate) mod tests {
         );
         let db = MemoryDB {
             _db: raw_db,
-            conn: tokio::sync::Mutex::new(conn),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
             entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
@@ -75077,6 +85941,10 @@ pub(crate) mod tests {
             embedder: None,
             chunker: ChunkingEngine::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+            community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+            community_grouping_runtime: std::sync::Mutex::new(
+                crate::community_grouping::CommunityGroupingRuntime::default(),
+            ),
         };
 
         db.run_migrations(&crate::events::NoopEmitter)
@@ -75158,6 +86026,7 @@ pub(crate) mod tests {
             conn.execute_batch(
                 "DROP TABLE entity_type_vocabulary;
                  DROP TABLE vocab_heal_ledger;
+                 DROP TRIGGER m4_page_community_page_invalidate;
                  ALTER TABLE pages DROP COLUMN source_revision;
                  INSERT INTO refinement_queue
                      (id,action,source_ids,payload,status,created_at)
@@ -75389,7 +86258,12 @@ pub(crate) mod tests {
         drop(rows);
         drop(connection);
 
-        assert_eq!(tables, vec!["repair_open_probe"]);
+        // Exactly what the fixture wrote, in name order -- repair recovery
+        // opens what it finds and bootstraps nothing.
+        assert_eq!(
+            tables,
+            vec!["community_parity_input_state", "repair_open_probe"]
+        );
         assert!(db
             .generate_embeddings(&["must stay unloaded".to_string()])
             .is_err());
@@ -80220,6 +91094,218 @@ pub(crate) mod tests {
             .unwrap();
         let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(n, 1, "the live db row must survive a rejected self-backup");
+    }
+
+    /// M4 Gate 1.4 mutex-hold receipt at the authored §6.5 corpus scale.
+    /// Seeds 100k memories, 5k pages, and the three-space grounded projection,
+    /// then times 20 indexed subgraph reads while keeping projection and
+    /// partitioning structurally outside the connection guard.
+    #[tokio::test]
+    #[ignore]
+    async fn m4_grounded_projection_select_mutex_receipt() {
+        use crate::community_partition::{
+            full_partition, project_grounded_relates, PartitionConfig, ProjectionConfig,
+            ProjectionInputEdge,
+        };
+        use std::time::{Duration, Instant};
+
+        const MEMORIES: usize = 100_000;
+        const PAGES: usize = 5_000;
+        const SPACES: usize = 3;
+        const CLUSTERS_PER_SPACE: usize = 8;
+        const NODES_PER_CLUSTER: usize = 256;
+        const FIRINGS: usize = 20;
+
+        let (db, _dir) = test_db().await;
+        let seed_started = Instant::now();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            for i in 0..MEMORIES {
+                conn.execute(
+                    "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                        last_modified, chunk_type, source_agent, space, confidence, confirmed, \
+                        memory_type, pending_revision) \
+                     VALUES (?1, 'c', 'memory', ?1, 't', 0, 1712707200, 'text', NULL, ?2, \
+                        1.0, 0, 'fact', 0)",
+                    libsql::params![format!("m4_mem_{i}"), format!("space-{}", i % SPACES)],
+                )
+                .await
+                .unwrap();
+            }
+            for page in 0..PAGES {
+                let space = format!("space-{}", page % SPACES);
+                conn.execute(
+                    "INSERT INTO pages (id, title, content, created_at, last_compiled, \
+                        last_modified, space, workspace) \
+                     VALUES (?1, 't', 'c', '2024-01-01T00:00:00Z', \
+                        '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', ?2, ?2)",
+                    libsql::params![format!("m4_page_{page}"), space],
+                )
+                .await
+                .unwrap();
+            }
+            for space in 0..SPACES {
+                conn.execute(
+                    "INSERT INTO provenance_roots (root_id, identity_version, identity_digest, \
+                        root_kind, independence_group_id, status, created_at) \
+                     VALUES (?1, 1, ?2, 'generated', ?3, 'active', 1712707200)",
+                    libsql::params![
+                        format!("m4-root-{space}"),
+                        format!("m4-root-digest-{space}"),
+                        format!("m4-space-{space}")
+                    ],
+                )
+                .await
+                .unwrap();
+                for cluster in 0..CLUSTERS_PER_SPACE {
+                    for node in 0..NODES_PER_CLUSTER {
+                        let entity_id =
+                            format!("space-{space}-cluster-{cluster:02}-node-{node:03}");
+                        conn.execute(
+                            "INSERT INTO entities (id, name, entity_type, space, created_at, updated_at) \
+                             VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
+                            libsql::params![entity_id, format!("space-{space}")],
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+
+                let mut edge_index = 0usize;
+                for cluster in 0..CLUSTERS_PER_SPACE {
+                    for node in 0..NODES_PER_CLUSTER {
+                        for offset in 1..=3 {
+                            conn.execute(
+                                "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, \
+                                    edge_type, lineage, grounded, root_id, space, created_at) \
+                                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', \
+                                    1, ?4, ?5, 1712707200)",
+                                libsql::params![
+                                    format!("m4-space-{space}-edge-{edge_index:06}"),
+                                    format!("space-{space}-cluster-{cluster:02}-node-{node:03}"),
+                                    format!(
+                                        "space-{space}-cluster-{cluster:02}-node-{:03}",
+                                        (node + offset) % NODES_PER_CLUSTER
+                                    ),
+                                    format!("m4-root-{space}"),
+                                    format!("space-{space}")
+                                ],
+                            )
+                            .await
+                            .unwrap();
+                            edge_index += 1;
+                        }
+                    }
+                    if cluster + 1 < CLUSTERS_PER_SPACE {
+                        conn.execute(
+                            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, \
+                                edge_type, lineage, grounded, root_id, space, created_at) \
+                             VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', \
+                                1, ?4, ?5, 1712707200)",
+                            libsql::params![
+                                format!("m4-space-{space}-edge-{edge_index:06}"),
+                                format!("space-{space}-cluster-{cluster:02}-node-000"),
+                                format!("space-{space}-cluster-{:02}-node-000", cluster + 1),
+                                format!("m4-root-{space}"),
+                                format!("space-{space}")
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                        edge_index += 1;
+                    }
+                }
+                assert_eq!(edge_index, 6_151);
+            }
+            conn.execute("COMMIT", ()).await.unwrap();
+            conn.execute("ANALYZE edges", ()).await.unwrap();
+        }
+        let seed_secs = seed_started.elapsed().as_secs_f64();
+
+        {
+            let conn = db.conn.lock().await;
+            let mut plan = conn
+                .query(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE space = ?1 AND edge_type = 'relates' \
+                       AND valid_until IS NULL AND grounded = 1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity'",
+                    libsql::params!["space-0"],
+                )
+                .await
+                .unwrap();
+            let mut details = Vec::new();
+            while let Some(row) = plan.next().await.unwrap() {
+                details.push(row.get::<String>(3).unwrap());
+            }
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_edges_active_grounded_space_type")),
+                "Gate 1.4 SELECT must use the partial active-grounded index: {details:?}"
+            );
+        }
+
+        let mut holds = Vec::with_capacity(FIRINGS);
+        let mut last_projection = Vec::new();
+        for firing in 0..FIRINGS {
+            let space = format!("space-{}", firing % SPACES);
+            let hold_started = Instant::now();
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT edge_id, src_id, dst_id FROM edges \
+                     WHERE space = ?1 AND edge_type = 'relates' \
+                       AND valid_until IS NULL AND grounded = 1 \
+                       AND src_kind = 'entity' AND dst_kind = 'entity'",
+                    libsql::params![space],
+                )
+                .await
+                .unwrap();
+            let mut projection = Vec::with_capacity(6_151);
+            while let Some(row) = rows.next().await.unwrap() {
+                projection.push(ProjectionInputEdge::new(
+                    row.get::<String>(0).unwrap(),
+                    row.get::<String>(1).unwrap(),
+                    row.get::<String>(2).unwrap(),
+                ));
+            }
+            drop(rows);
+            drop(conn);
+            holds.push(hold_started.elapsed());
+            assert_eq!(projection.len(), 6_151);
+            last_projection = projection;
+        }
+
+        // Structural bite for the gate-stage path: projection and partition
+        // begin only after the connection guard above has been dropped.
+        let graph = project_grounded_relates(&last_projection, ProjectionConfig::default());
+        let partition =
+            full_partition(&graph, PartitionConfig::default()).expect("outside-lock partition");
+        assert_eq!(partition.membership().len(), 2_048);
+
+        holds.sort_unstable();
+        let p95 = holds[(holds.len() * 95).div_ceil(100) - 1];
+        let max = *holds.last().unwrap();
+        assert!(
+            p95 <= Duration::from_millis(500),
+            "Gate 1.4 mutex p95 {p95:?} exceeds 500ms"
+        );
+        assert!(
+            max <= Duration::from_secs(2),
+            "Gate 1.4 hard fail: mutex max {max:?} exceeds 2s"
+        );
+        eprintln!(
+            "[m4_db_gate_receipt] memories={MEMORIES} pages={PAGES} spaces={SPACES} \
+             edges={} participants={} firings={FIRINGS} seed_secs={seed_secs:.3} \
+             mutex_p95_ms={:.3} mutex_max_ms={:.3}",
+            SPACES * 6_151,
+            SPACES * CLUSTERS_PER_SPACE * NODES_PER_CLUSTER,
+            p95.as_secs_f64() * 1_000.0,
+            max.as_secs_f64() * 1_000.0,
+        );
     }
 
     /// §6.5-scale acceptance (100k memories / 5k pages). Manual-only (needs

@@ -72,6 +72,10 @@ env_logger = "0.11"
 # eval modules are not feature-gated, so their deps are regular deps.
 tiktoken-rs = "0.6"
 futures = { workspace = true }
+# M4 gate-stage candidate: exact-pinned and sequential-only so a fixed seed plus
+# stable node indexing can make the partition byte-deterministic. Persistence
+# remains blocked until the authored Gate 1 and Gate 2 harnesses pass.
+leiden-rs = { version = "=0.8.1", default-features = false }
 # Unicode NFC normalization for provenance-root content canonicalization
 # (Q6-locked recipe: NFC + line-ending + whitespace, nothing semantic).
 # Already present transitively (text-splitter -> ... -> unicode-normalization
