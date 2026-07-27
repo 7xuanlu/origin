@@ -43,8 +43,13 @@ If `space` is empty, print:
 
     Resolved space: none (unscoped)
 
-Unknown spaces are not auto-created. Register a new space first with
-`wenlan spaces add <space>`, or omit `space` to store uncategorized.
+Unknown spaces are not auto-created. Register one through the resolved CLI
+binary, or omit `space` to store uncategorized:
+
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" spaces add <space>
+```
 
 ## How to invoke
 
@@ -88,8 +93,13 @@ omit `entity`.
 
 - cwd inside a repo → repo name (e.g. `~/Repos/wenlan/...` → `"wenlan"`).
 - Outside any repo → most recent topic from the conversation, or omit.
-- Pass `space` only when scope is known; if uncertain, run `list_spaces`
-  later (post-PR-C) or omit.
+- Pass `space` only when scope is known. If uncertain, omit it or inspect the
+  registered spaces first:
+
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" spaces list
+```
 
 ### Multiple entities or relations
 

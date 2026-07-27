@@ -838,9 +838,6 @@ pub struct GetPageSourcesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ListSpacesParams {}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AcceptRevisionRequest {
     /// The source_id of the memory whose pending revision should be accepted.
     pub target_source_id: String,
@@ -915,90 +912,6 @@ fn tool_error(e: WenlanError, verb: &str) -> CallToolResult {
         ),
     };
     CallToolResult::error(vec![Content::text(msg)])
-}
-
-fn format_doctor_message(status: &serde_json::Value) -> String {
-    let mode = status
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let setup_completed = status
-        .get("setup_completed")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let anthropic_key_configured = status
-        .get("anthropic_key_configured")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let local_model_selected = status.get("local_model_selected").and_then(|v| v.as_str());
-    let local_model_loaded = status.get("local_model_loaded").and_then(|v| v.as_str());
-    let local_model_cached = status
-        .get("local_model_cached")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let mode_label = match mode {
-        "basic-memory" => "Local Memory",
-        "local-model" => "On-device Model",
-        "anthropic-key" => "Anthropic Key",
-        other => other,
-    };
-    let local_model_line = match local_model_selected {
-        Some(id) => {
-            let cache_status = if local_model_cached {
-                "downloaded"
-            } else {
-                "not downloaded"
-            };
-            let loaded_status = if Some(id) == local_model_loaded {
-                ", loaded"
-            } else {
-                ""
-            };
-            format!("{id} ({cache_status}{loaded_status})")
-        }
-        None => "not selected".to_string(),
-    };
-    let refinement_line = if anthropic_key_configured || local_model_loaded.is_some() {
-        "enabled (richer extraction and page synthesis are active)"
-    } else if setup_completed {
-        "off (local memory stores, searches, and recalls now. Choose an on-device model or Anthropic key for richer extraction.)"
-    } else {
-        "not configured"
-    };
-
-    let mut msg = format!(
-        "Wenlan daemon: running\n\
-         Setup: {}\n\
-         Mode: {mode_label}\n\
-         Anthropic key: {}\n\
-         On-device model: {local_model_line}\n\
-         Distill cycles: {refinement_line}",
-        if setup_completed {
-            "completed"
-        } else {
-            "not completed"
-        },
-        if anthropic_key_configured {
-            "configured"
-        } else {
-            "not configured"
-        }
-    );
-
-    if !setup_completed {
-        msg.push_str(
-            "\n\nRun `wenlan setup` to choose Local Memory, On-device Model, or Anthropic Key.",
-        );
-    } else if !anthropic_key_configured && local_model_loaded.is_none() {
-        msg.push_str(
-            "\n\nLocal memory works now: capture, recall, and context are available. \
-             To enable richer extraction and distill cycles, run `wenlan models install` \
-             or `wenlan keys set anthropic`.",
-        );
-    }
-
-    msg
 }
 
 /// Call a daemon HTTP method and short-circuit on transport error.
@@ -1154,24 +1067,6 @@ impl WenlanMcpServer {
         } else {
             Ok(CallToolResult::success(vec![Content::text(context)]))
         }
-    }
-
-    pub async fn doctor_impl(&self) -> Result<CallToolResult, McpError> {
-        let status: serde_json::Value = match self.client.get("/api/setup/status").await {
-            Ok(r) => r,
-            Err(WenlanError::Api { status: 404, .. }) => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "Wenlan daemon is running, but it does not expose /api/setup/status. \
-                     Update Wenlan, then run `wenlan doctor`."
-                        .to_string(),
-                )]));
-            }
-            Err(e) => return Ok(tool_error(e, "status check")),
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(
-            format_doctor_message(&status),
-        )]))
     }
 
     fn remove_submitted_agent_work(
@@ -1734,20 +1629,6 @@ impl WenlanMcpServer {
         ))]))
     }
 
-    pub async fn list_spaces_impl(
-        &self,
-        _params: ListSpacesParams,
-    ) -> Result<CallToolResult, McpError> {
-        let resp: Vec<Space> = try_call!(self.client.get("/api/spaces"), "list_spaces");
-        let pretty = serde_json::to_string_pretty(&resp)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{} spaces\n{}",
-            resp.len(),
-            pretty
-        ))]))
-    }
-
     pub async fn accept_revision_impl(
         &self,
         req: AcceptRevisionRequest,
@@ -1893,14 +1774,6 @@ impl WenlanMcpServer {
         Parameters(params): Parameters<ContextParams>,
     ) -> Result<CallToolResult, McpError> {
         self.context_impl(params).await
-    }
-
-    #[tool(
-        description = "Diagnose the local Wenlan runtime. This is not part of the memory loop. Use only when Wenlan tools fail, when onboarding a new MCP client, or when the user asks why setup, extraction, or distill cycles are off. Reports daemon reachability, setup mode, Local Memory, On-device Model, Anthropic key state, and on-device model state.",
-        annotations(title = "Doctor", read_only_hint = true, open_world_hint = false)
-    )]
-    async fn doctor(&self) -> Result<CallToolResult, McpError> {
-        self.doctor_impl().await
     }
 
     #[tool(
@@ -2142,17 +2015,6 @@ impl WenlanMcpServer {
         Parameters(params): Parameters<GetPageSourcesParams>,
     ) -> Result<CallToolResult, McpError> {
         self.get_page_sources_impl(&params.page_id).await
-    }
-
-    #[tool(
-        description = "List all spaces in this Wenlan instance. Use when the user asks 'what spaces exist', 'list my topics', or to discover space names before passing one as a filter to search_memory / list_nurture. Returns each space's name, description, memory_count, entity_count, and timestamps.",
-        annotations(title = "List spaces", read_only_hint = true, open_world_hint = false)
-    )]
-    async fn list_spaces(
-        &self,
-        Parameters(params): Parameters<ListSpacesParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.list_spaces_impl(params).await
     }
 
     #[tool(
@@ -3511,61 +3373,6 @@ mod tests {
     }
 
     #[test]
-    fn doctor_local_memory_message_sets_expectations() {
-        let msg = format_doctor_message(&serde_json::json!({
-            "setup_completed": true,
-            "mode": "basic-memory",
-            "anthropic_key_configured": false,
-            "local_model_selected": null,
-            "local_model_loaded": null,
-            "local_model_cached": false
-        }));
-
-        assert!(msg.contains("Mode: Local Memory"));
-        assert!(msg.contains("On-device model: not selected"));
-        assert!(msg.contains("Distill cycles: off"));
-        assert!(msg.contains("Local memory works now: capture, recall, and context are available"));
-        assert!(msg.contains("wenlan models install"));
-        assert!(msg.contains("wenlan keys set anthropic"));
-    }
-
-    #[test]
-    fn doctor_on_device_model_message_shows_loaded_model() {
-        let msg = format_doctor_message(&serde_json::json!({
-            "setup_completed": true,
-            "mode": "local-model",
-            "anthropic_key_configured": false,
-            "local_model_selected": "qwen3-1.7b",
-            "local_model_loaded": "qwen3-1.7b",
-            "local_model_cached": true
-        }));
-
-        assert!(msg.contains("Mode: On-device Model"), "{msg}");
-        assert!(
-            msg.contains("On-device model: qwen3-1.7b (downloaded, loaded)"),
-            "{msg}"
-        );
-        assert!(msg.contains("Distill cycles: enabled"), "{msg}");
-        assert!(!msg.contains("Local memory works now"));
-    }
-
-    #[test]
-    fn doctor_unconfigured_message_names_three_setup_paths() {
-        let msg = format_doctor_message(&serde_json::json!({
-            "setup_completed": false,
-            "mode": "unknown",
-            "anthropic_key_configured": false,
-            "local_model_selected": null,
-            "local_model_loaded": null,
-            "local_model_cached": false
-        }));
-
-        assert!(msg.contains("Setup: not completed"));
-        assert!(msg.contains("Run `wenlan setup`"));
-        assert!(msg.contains("Local Memory, On-device Model, or Anthropic Key"));
-    }
-
-    #[test]
     fn search_memory_request_serialization_excludes_entity() {
         let req = SearchMemoryRequest {
             query: "test".into(),
@@ -4593,24 +4400,6 @@ mod tests {
     }
 
     #[test]
-    fn doctor_description_mentions_setup_mode() {
-        let descriptions = tool_descriptions();
-        let status = descriptions.get("doctor").expect("doctor tool exists");
-        assert!(
-            status.contains("Local Memory"),
-            "doctor description must mention setup modes, got: {status}"
-        );
-        assert!(
-            status.contains("On-device Model"),
-            "doctor description must mention on-device setup, got: {status}"
-        );
-        assert!(
-            status.contains("not part of the memory loop"),
-            "doctor description must frame itself as diagnostic-only, got: {status}"
-        );
-    }
-
-    #[test]
     fn recall_memory_type_param_lists_two_level_filter() {
         let params_schema = serde_json::to_string(&schemars::schema_for!(RecallParams))
             .expect("RecallParams schema serializes");
@@ -4800,7 +4589,7 @@ mod tests {
     #[test]
     fn new_crud_tools_are_registered() {
         let descriptions = tool_descriptions();
-        for name in ["create_page", "update_page", "delete_page", "list_spaces"] {
+        for name in ["create_page", "update_page", "delete_page"] {
             assert!(
                 descriptions.contains_key(name),
                 "tool `{name}` must be registered, got: {:?}",
@@ -5133,7 +4922,6 @@ mod tests {
             "delete_page",
             "dismiss_revision",
             "distill",
-            "doctor",
             "forget",
             "get_lint_agent_work_page",
             "get_lint_repair_plan_entries",
@@ -5141,7 +4929,6 @@ mod tests {
             "lint",
             "list_pending",
             "list_pending_revisions",
-            "list_spaces",
             "prepare_lint_repair",
             "prepare_lint_repair_plan",
             "recall",

@@ -4,7 +4,7 @@ description: >
   Frictionless Wenlan setup for Codex. Detects a missing local runtime, installs
   or repairs it, and verifies the plugin to MCP to local runtime round-trip. Run
   when the user says "set up wenlan", "is wenlan working", or "fix wenlan".
-allowed-tools: ["Bash", "mcp__wenlan__doctor", "mcp__wenlan__context"]
+allowed-tools: ["Bash", "mcp__wenlan__context"]
 user-invocable: true
 ---
 
@@ -125,10 +125,11 @@ code.
 
 ### 5. Doctor
 
-Call the Wenlan MCP `doctor` tool.
+Run the Wenlan CLI doctor through the resolved binary path:
 
-```text
-doctor()
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" doctor
 ```
 
 Expected: local memory configured. Capture the mode string for the final report.
@@ -151,7 +152,7 @@ Print:
 ```text
 Wenlan ready.
   Runtime:  up on 127.0.0.1:7878
-  Mode:     <mode from doctor()>
+  Mode:     <mode from CLI doctor>
   MCP:      connected
   Data:     ~/.wenlan/
   Try:      /brief, /capture <thing>

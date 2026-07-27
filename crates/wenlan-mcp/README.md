@@ -13,7 +13,7 @@ wenlan connect codex              # or: claude-code, cursor, claude-desktop, vsc
 wenlan connect cursor --dry-run   # preview before editing JSON config
 ```
 
-MCP-only setup gives agents tools for capture, recall, context, doctor, and page distillation. It does not install Claude Code slash skills like `/brief`, `/handoff`, `/distill`, or `/setup`; use the Wenlan plugin for that workflow.
+MCP-only setup gives agents tools for capture, recall, context, and page distillation. It does not install Claude Code slash skills like `/brief`, `/handoff`, `/distill`, or `/setup`; use the Wenlan plugin for that workflow.
 
 If you only need the raw MCP connector config, add this to your MCP client:
 
@@ -66,9 +66,8 @@ wenlan-mcp --origin-url http://127.0.0.1:7879
 | `list_pending` | List unconfirmed memories waiting for review. |
 | `confirm_memory` | Confirm a pending memory by `source_id`. |
 | `forget` | Delete a memory by ID. Destructive. |
-| `doctor` | Diagnose daemon reachability, setup mode, API key state, and on-device model state. |
-
-`doctor` mirrors `wenlan doctor`. It is diagnostic only and is not part of the memory loop.
+Runtime diagnostics live in the CLI: `wenlan doctor`. They are not part of the
+MCP memory loop.
 
 ## Setup Modes
 
