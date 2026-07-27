@@ -82655,7 +82655,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let retry_id = db
-            .create_relation(
+            .create_relation_with_span(
                 &e1,
                 &e2,
                 "works_at",
@@ -82663,6 +82663,10 @@ pub(crate) mod tests {
                 Some(0.9),
                 None,
                 Some("mem_b"),
+                Some(content_b),
+                Some(content_b),
+                Some("model-b"),
+                Some("prompt-b"),
             )
             .await
             .unwrap();
@@ -82705,6 +82709,14 @@ pub(crate) mod tests {
 
         assert_eq!(relation_source, "mem_a");
         assert_eq!(edge_source, "mem_a");
+        assert_eq!(payload["span"]["quote"], serde_json::json!(content_a));
+        assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+        assert_eq!(
+            payload["span"]["char_end"],
+            serde_json::json!(content_a.chars().count())
+        );
+        assert_eq!(payload["model_version"], serde_json::json!("model-a"));
+        assert_eq!(payload["prompt_version"], serde_json::json!("prompt-a"));
         assert_eq!(
             relation_source, edge_source,
             "relation and extraction edge provenance must agree after retry"
