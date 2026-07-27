@@ -93,6 +93,30 @@ assert_rejects "codex curate missing refinement reject permission" \
     perl -0pi -e 's/, "mcp__wenlan__reject_refinement"//' \
     "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
 
+assert_rejects "claude curate missing existing capture permission" \
+    perl -0pi -e 's/, "mcp__plugin_wenlan_wenlan__capture"//' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate missing existing list permission" \
+    perl -0pi -e 's/, "mcp__wenlan__list_pending"//' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate added unintended mutation permission" \
+    perl -0pi -e 's/"Bash",/"Bash", "mcp__plugin_wenlan_wenlan__delete_page",/' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate added unintended mutation permission" \
+    perl -0pi -e 's/"Bash",/"Bash", "mcp__wenlan__delete_page",/' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate lint repair review route drift" \
+    perl -0pi -e 's/A generic accept does not apply\s+`lint_repair_review`; route that action through `\/lint repair` instead\./A generic accept applies `lint_repair_review` directly./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate lint repair review route drift" \
+    perl -0pi -e 's/Do not generically accept `lint_repair_review`;\s+route it through `\/lint repair`\./Accept `lint_repair_review` directly./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
 assert_rejects "setup autocomplete drift" \
     perl -0pi -e 's/user-invocable: true/user-invocable: false/' \
     "$TMPDIR_TEST/root/plugin-codex/skills/setup/SKILL.md"

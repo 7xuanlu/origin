@@ -484,17 +484,36 @@ def validate_skill_surface(
                 allowed_tools = json.loads(frontmatter.get("allowed-tools", ""))
             except json.JSONDecodeError:
                 fail(f"{rel(root, skill_path)} allowed-tools must be a JSON array")
-            required_tools = {
+            expected_allowed_tools = {
+                "Bash",
+                f"{expected_prefix}list_pending",
+                f"{expected_prefix}confirm_memory",
+                f"{expected_prefix}forget",
+                f"{expected_prefix}capture",
+                f"{expected_prefix}recall",
                 f"{expected_prefix}list_refinements",
                 f"{expected_prefix}accept_refinement",
                 f"{expected_prefix}reject_refinement",
             }
-            if not isinstance(allowed_tools, list) or not required_tools.issubset(allowed_tools):
+            if surface == "claude":
+                expected_allowed_tools.add("AskUserQuestion")
+            if (
+                not isinstance(allowed_tools, list)
+                or len(allowed_tools) != len(expected_allowed_tools)
+                or set(allowed_tools) != expected_allowed_tools
+            ):
                 fail(
-                    f"{rel(root, skill_path)} allowed-tools must include "
-                    f"{sorted(required_tools)!r}"
+                    f"{rel(root, skill_path)} allowed-tools must be exactly "
+                    f"{sorted(expected_allowed_tools)!r}"
                 )
             normalized_text = " ".join(text.split())
+            lint_repair_guardrail = (
+                "A generic accept does not apply `lint_repair_review`; route that "
+                "action through `/lint repair` instead."
+                if surface == "claude"
+                else "Do not generically accept `lint_repair_review`; route it "
+                "through `/lint repair`."
+            )
             guardrails = [
                 (
                     "Use `/curate refinements` only when the user explicitly asks "
@@ -512,6 +531,7 @@ def validate_skill_surface(
                 "Skip or cancel is a no-op.",
                 "Re-list after every mutation batch.",
                 "`vocab_promote`",
+                lint_repair_guardrail,
             ]
             for guardrail in guardrails:
                 if guardrail not in normalized_text:
