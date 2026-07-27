@@ -11,15 +11,16 @@
 use rmcp::model::{CallToolResult, RawContent};
 use wenlan_mcp::client::WenlanClient;
 use wenlan_mcp::tools::{
-    CaptureParams, ContextParams, ListPendingImportsParams, ListPendingParams,
-    ListRejectionsParams, RecallParams, TransportMode, WenlanMcpServer,
+    CaptureParams, ContextParams, CreateRelationParams, ListPendingImportsParams,
+    ListPendingParams, ListRejectionsParams, RecallParams, TransportMode, WenlanMcpServer,
 };
 use wenlan_types::import::PendingImport;
-use wenlan_types::memory::RejectionRecord;
 use wenlan_types::memory::{IndexedFileInfo, SearchResult};
+use wenlan_types::memory::{MemoryItem, RejectionRecord};
 use wenlan_types::responses::{
-    ChatContextResponse, DeleteResponse, KnowledgeContext, ListMemoriesResponse, ProfileContext,
-    SearchMemoryResponse, StoreMemoryResponse, TierTokenEstimates,
+    ChatContextResponse, CreateRelationResponse, DeleteResponse, KnowledgeContext,
+    ListMemoriesResponse, MemoryDetailResponse, ProfileContext, SearchMemoryResponse,
+    StoreMemoryResponse, TierTokenEstimates,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -102,6 +103,38 @@ fn sample_search_result() -> SearchResult {
     }
 }
 
+fn sample_memory(source_id: &str) -> MemoryItem {
+    MemoryItem {
+        source_id: source_id.into(),
+        title: "Explicit relation".into(),
+        content: "Alice works on Wenlan.".into(),
+        summary: None,
+        memory_type: Some("fact".into()),
+        space: None,
+        source_agent: Some("test-agent".into()),
+        confidence: Some(1.0),
+        confirmed: false,
+        stability: None,
+        pinned: false,
+        supersedes: None,
+        last_modified: 0,
+        chunk_count: 1,
+        entity_id: None,
+        quality: None,
+        is_recap: false,
+        enrichment_status: String::new(),
+        supersede_mode: String::new(),
+        structured_fields: None,
+        retrieval_cue: None,
+        access_count: 0,
+        source_text: None,
+        version: 1,
+        changelog: None,
+        pending_revision: false,
+        merged_from: None,
+    }
+}
+
 #[tokio::test]
 async fn t1_remember_roundtrip() {
     let (mock, client) = setup().await;
@@ -140,11 +173,111 @@ async fn t1_remember_roundtrip() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t1");
+    assert_eq!(text, "Stored mem_t1\nsource_memory_id: mem_t1");
 
     let body = captured_body(&mock).await;
     assert_eq!(body["content"], serde_json::json!("anything"));
     assert_eq!(body["source_agent"], serde_json::json!("test-agent"));
+}
+
+#[tokio::test]
+async fn create_relation_rejects_blank_source_before_network() {
+    let (mock, client) = setup().await;
+    let server = make_server(client);
+
+    let result = server
+        .create_relation_impl(CreateRelationParams {
+            from_entity_id: "ent_alice".into(),
+            to_entity_id: "ent_wenlan".into(),
+            relation_type: "works_on".into(),
+            source_memory_id: "   ".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_error.unwrap_or(false));
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "blank source must reject before any HTTP request"
+    );
+}
+
+#[tokio::test]
+async fn create_relation_missing_source_preflight_prevents_post() {
+    let (mock, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/memory/mem_missing/detail"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    let server = make_server(client);
+
+    let result = server
+        .create_relation_impl(CreateRelationParams {
+            from_entity_id: "ent_alice".into(),
+            to_entity_id: "ent_wenlan".into(),
+            relation_type: "works_on".into(),
+            source_memory_id: "mem_missing".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_error.unwrap_or(false));
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "missing source must stop after preflight"
+    );
+    assert_eq!(received[0].method.as_str(), "GET");
+}
+
+#[tokio::test]
+async fn create_relation_successful_preflight_maps_source_into_post() {
+    let (mock, client) = setup().await;
+    let source_id = "mem source/1";
+    Mock::given(method("GET"))
+        .and(path("/api/memory/mem%20source%2F1/detail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(MemoryDetailResponse {
+                memory: Some(sample_memory(source_id)),
+            }),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/memory/relations"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(CreateRelationResponse {
+                id: "rel_1".into(),
+                warnings: Vec::new(),
+            }),
+        )
+        .mount(&mock)
+        .await;
+    let server = make_server(client);
+
+    let result = server
+        .create_relation_impl(CreateRelationParams {
+            from_entity_id: "ent_alice".into(),
+            to_entity_id: "ent_wenlan".into(),
+            relation_type: "works_on".into(),
+            source_memory_id: source_id.into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.is_error.unwrap_or(false));
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        2,
+        "preflight GET must precede relation POST"
+    );
+    assert_eq!(received[0].method.as_str(), "GET");
+    assert_eq!(received[1].method.as_str(), "POST");
+    let post_body: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+    assert_eq!(post_body["source_memory_id"], source_id);
 }
 
 #[tokio::test]
@@ -242,7 +375,7 @@ async fn t3_structured_fields_schema_is_object() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t3");
+    assert_eq!(text, "Stored mem_t3\nsource_memory_id: mem_t3");
 
     let body = captured_body(&mock).await;
     assert_eq!(
@@ -363,7 +496,7 @@ async fn t5_memory_type_hint_preserved_without_forcing_domain() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t5");
+    assert_eq!(text, "Stored mem_t5\nsource_memory_id: mem_t5");
 
     let body = captured_body(&mock).await;
     assert_eq!(body["memory_type"], serde_json::json!("fact"));
@@ -587,7 +720,7 @@ async fn t10_remember_request_does_not_contain_user_id() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t10");
+    assert_eq!(text, "Stored mem_t10\nsource_memory_id: mem_t10");
 
     let body = captured_body(&mock).await;
     let obj = body.as_object().expect("body is an object");
@@ -640,7 +773,7 @@ async fn t11_extraction_method_none_not_in_text() {
         !text.contains("extraction_method"),
         "extraction_method label leaked into text: {text}"
     );
-    assert_eq!(text, "Stored mem_t11");
+    assert_eq!(text, "Stored mem_t11\nsource_memory_id: mem_t11");
 }
 
 /// Regression test: context_impl must succeed even when the daemon returns
@@ -741,7 +874,7 @@ async fn t12_forward_compat_response_missing_extraction_method() {
         .expect("capture_impl failed against pre-D9 response");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t12");
+    assert_eq!(text, "Stored mem_t12\nsource_memory_id: mem_t12");
 
     let parsed: StoreMemoryResponse = serde_json::from_value(raw_json).unwrap();
     assert_eq!(parsed.extraction_method, "unknown");

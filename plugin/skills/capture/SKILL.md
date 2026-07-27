@@ -105,10 +105,10 @@ W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
 
 Ordinary captures stop after `capture`: pass the single most important named
 anchor through `capture.entity` and let daemon enrichment handle routine
-extraction. Do not call `create_entity` for every capture, and never infer a
+extraction. Do not call `create_entity` for ordinary captures. Never infer a
 relation the user did not state.
 
-Use the explicit KG tools only when the user directly states a durable relation:
+Use the explicit KG tools only when the user explicitly states a durable relation:
 
 1. Call `create_entity` for both named endpoints first and collect their stable
    ids. This is idempotent and may return an existing id.

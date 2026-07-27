@@ -84,10 +84,10 @@ Use the exact name. If there is no named anchor, omit `entity`.
 
 Pass the single most important named anchor through `capture.entity`. Ordinary
 captures stop there; daemon enrichment handles routine extraction. Do not call
-`mcp__wenlan__create_entity` for every capture, and never infer a relation the
+`mcp__wenlan__create_entity` for ordinary captures. Never infer a relation the
 user did not state.
 
-Only when the user explicitly states a durable relation:
+Use the explicit KG tools only when the user explicitly states a durable relation:
 
 1. Call `mcp__wenlan__create_entity` for both named endpoints first and collect
    their stable ids. The call is idempotent and may return an existing id.

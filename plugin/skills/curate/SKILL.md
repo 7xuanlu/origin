@@ -6,9 +6,9 @@ description: >
   `/brief` for revisions; that handles the daily flow. Use `/curate` only for
   explicit deep-walk audits after bulk imports, or to walk the full queue rather
   than the top 3 shown in /brief.
-  Invoked as `/curate captures` or `/curate revisions`.
-argument-hint: "captures | revisions"
-allowed-tools: ["Bash", "AskUserQuestion", "mcp__plugin_wenlan_wenlan__list_pending", "mcp__plugin_wenlan_wenlan__confirm_memory", "mcp__plugin_wenlan_wenlan__forget", "mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall"]
+  Invoked as `/curate captures`, `/curate revisions`, or `/curate refinements`.
+argument-hint: "captures | revisions | refinements"
+allowed-tools: ["Bash", "AskUserQuestion", "mcp__plugin_wenlan_wenlan__list_pending", "mcp__plugin_wenlan_wenlan__confirm_memory", "mcp__plugin_wenlan_wenlan__forget", "mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__list_refinements", "mcp__plugin_wenlan_wenlan__accept_refinement", "mcp__plugin_wenlan_wenlan__reject_refinement"]
 ---
 
 # /curate
@@ -121,12 +121,39 @@ lists every unconfirmed memory (pass `space` only if the user named one, e.g.
 - *Other (typed text)* → edit: `capture(content=<text>, supersedes=<source_id>)`,
   then `forget(memory_id=<source_id>)`.
 
+## `/curate refinements` (explicit proposal audit, MCP)
+
+Use `/curate refinements` only when the user explicitly asks to inspect or
+review the daemon proposal/refinement queue. Never poll the refinement queue
+ambiently.
+
+List first with
+`mcp__plugin_wenlan_wenlan__list_refinements(limit=50)` and show at most four
+items. Include each proposal id, action, confidence, and bounded payload
+summary. The action set includes `vocab_promote`, so vocabulary promotion
+candidates stay discoverable.
+
+Perform no mutation until the user gives an unambiguous item-level accept or
+reject decision. Use native cards with one question per proposal:
+
+- **Accept** → `mcp__plugin_wenlan_wenlan__accept_refinement(id="<proposal-id>")`
+  (also pass `space` when accepting `cross_space_discovery`).
+- **Reject** → `mcp__plugin_wenlan_wenlan__reject_refinement(id="<proposal-id>")`.
+- **Skip** → nothing.
+
+Skip or cancel is a no-op. A generic accept does not apply
+`lint_repair_review`; route that action through `/lint repair` instead. Apply
+only the explicit item decisions, then re-list. Re-list after every mutation
+batch.
+
 ## When to use
 
 - After a bulk import (ChatGPT, Obsidian dump) when you want to audit every
   auto-classification before sealing.
 - When `/brief` shows ">3 pending revisions" and you want to clear the full
   queue, not just the top 3.
+- When the user explicitly asks to inspect or review daemon refinement
+  proposals.
 
 ## When NOT to use
 

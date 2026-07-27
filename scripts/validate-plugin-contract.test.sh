@@ -61,6 +61,38 @@ assert_rejects "missing curate ambiguity guardrail" \
     perl -0pi -e 's/Ambiguous replies do not mutate/Ambiguous replies are clarified/' \
     "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
 
+assert_rejects "claude curate refinements explicit-only drift" \
+    perl -0pi -e 's/Use `\/curate refinements` only when the user explicitly asks to inspect or\s+review the daemon proposal\/refinement queue\./Inspect refinements whenever useful./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate refinements explicit-only drift" \
+    perl -0pi -e 's/Use `\/curate refinements` only when the user explicitly asks to inspect or\s+review the daemon proposal\/refinement queue\./Inspect refinements whenever useful./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate refinements mutation gate drift" \
+    perl -0pi -e 's/Perform no mutation until the user gives an unambiguous item-level accept or\s+reject decision\./Apply likely decisions immediately./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate refinements mutation gate drift" \
+    perl -0pi -e 's/Perform no mutation until the user gives an unambiguous item-level accept or\s+reject decision\./Apply likely decisions immediately./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate refinements skip drift" \
+    perl -0pi -e 's/Skip or cancel is a no-op\./Skip accepts the proposal./' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate refinements skip drift" \
+    perl -0pi -e 's/Skip or cancel is a no-op\./Skip accepts the proposal./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
+assert_rejects "claude curate missing refinement accept permission" \
+    perl -0pi -e 's/, "mcp__plugin_wenlan_wenlan__accept_refinement"//' \
+    "$TMPDIR_TEST/root/plugin/skills/curate/SKILL.md"
+
+assert_rejects "codex curate missing refinement reject permission" \
+    perl -0pi -e 's/, "mcp__wenlan__reject_refinement"//' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/curate/SKILL.md"
+
 assert_rejects "setup autocomplete drift" \
     perl -0pi -e 's/user-invocable: true/user-invocable: false/' \
     "$TMPDIR_TEST/root/plugin-codex/skills/setup/SKILL.md"
@@ -119,6 +151,30 @@ assert_rejects "claude capture relation order drift" \
 
 assert_rejects "codex capture relation order drift" \
     perl -0pi -e 's/for both named endpoints first/for both named endpoints after capture/' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
+
+assert_rejects "claude capture explicit-relation policy drift" \
+    perl -0pi -e 's/only when the user explicitly states a durable relation/whenever a relation seems useful/' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture explicit-relation policy drift" \
+    perl -0pi -e 's/only when the user explicitly states a durable relation/whenever a relation seems useful/' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
+
+assert_rejects "claude capture ordinary entity policy drift" \
+    perl -0pi -e 's/Do not call\s+`create_entity` for ordinary captures\./Call `create_entity` for ordinary captures./' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture ordinary entity policy drift" \
+    perl -0pi -e 's/Do not call\s+`mcp__wenlan__create_entity` for ordinary captures\./Call `mcp__wenlan__create_entity` for ordinary captures./' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
+
+assert_rejects "claude capture inference policy drift" \
+    perl -0pi -e 's/Never infer a\s+relation the\s+user did not state\./Infer likely relations./' \
+    "$TMPDIR_TEST/root/plugin/skills/capture/SKILL.md"
+
+assert_rejects "codex capture inference policy drift" \
+    perl -0pi -e 's/Never infer a\s+relation the\s+user did not state\./Infer likely relations./' \
     "$TMPDIR_TEST/root/plugin-codex/skills/capture/SKILL.md"
 
 assert_rejects "claude lint counterevidence authorization drift" \

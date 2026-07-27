@@ -2278,23 +2278,26 @@ pub async fn create_relation_with_span(
         )));
     }
 
-    // Idempotency: if an identical (from, to, type) triple already exists,
-    // return its id immediately — no log, no refinery enqueue.
-    if let Ok(existing) = db
-        .list_relations_between(&req.from_entity, &req.to_entity)
-        .await
-    {
-        if let Some((existing_id, _)) = existing.into_iter().find(|(_, t)| t == rt) {
-            return Ok(WriteResult {
-                id: existing_id,
-                attached_to: None,
-                warnings: vec![],
-                wrote: false,
-                revision_card_id: None,
-                gated: false,
-                outcome: WriteOutcome::Unchanged,
-                acknowledged: false,
-            });
+    // Source-less retries can return immediately. A source-backed retry must
+    // reach the DB upsert so an existing unbacked triple gains provenance and
+    // the canonical edge dual-write runs.
+    if req.source_memory_id.is_none() {
+        if let Ok(existing) = db
+            .list_relations_between(&req.from_entity, &req.to_entity)
+            .await
+        {
+            if let Some((existing_id, _)) = existing.into_iter().find(|(_, t)| t == rt) {
+                return Ok(WriteResult {
+                    id: existing_id,
+                    attached_to: None,
+                    warnings: vec![],
+                    wrote: false,
+                    revision_card_id: None,
+                    gated: false,
+                    outcome: WriteOutcome::Unchanged,
+                    acknowledged: false,
+                });
+            }
         }
     }
 
@@ -4342,6 +4345,105 @@ mod tests {
         assert!(
             second.warnings.is_empty(),
             "idempotent resolve should have no warnings"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_unbacked_relation_becomes_source_backed() {
+        let (db, _dir) = test_db().await;
+        let alice = db
+            .store_entity("Alice", "person", None, Some("test"), None)
+            .await
+            .unwrap();
+        let wenlan = db
+            .store_entity("Wenlan", "project", None, Some("test"), None)
+            .await
+            .unwrap();
+
+        let first = create_relation(
+            &db,
+            CreateRelationRequest {
+                from_entity: alice.clone(),
+                to_entity: wenlan.clone(),
+                relation_type: "works_on".to_string(),
+                source_agent: Some("test".to_string()),
+                confidence: None,
+                explanation: None,
+                source_memory_id: None,
+                span: None,
+                model_version: None,
+                prompt_version: None,
+            },
+            "test-agent",
+        )
+        .await
+        .unwrap();
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM edges
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![alice.clone(), wenlan.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let second = create_relation(
+            &db,
+            CreateRelationRequest {
+                from_entity: alice.clone(),
+                to_entity: wenlan.clone(),
+                relation_type: "works_on".to_string(),
+                source_agent: Some("test".to_string()),
+                confidence: None,
+                explanation: None,
+                source_memory_id: Some("mem_explicit_relation".to_string()),
+                span: None,
+                model_version: None,
+                prompt_version: None,
+            },
+            "test-agent",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.id, first.id, "upsert must preserve the relation id");
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_memory_id FROM relations WHERE id = ?1",
+                libsql::params![first.id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("relation row");
+        let source_memory_id: Option<String> = row.get(0).unwrap();
+        assert_eq!(
+            source_memory_id.as_deref(),
+            Some("mem_explicit_relation"),
+            "the source-backed retry must attach provenance to the existing triple"
+        );
+        drop(rows);
+        let mut edge_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM edges
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![alice, wenlan],
+            )
+            .await
+            .unwrap();
+        let edge_count = edge_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            edge_count, 1,
+            "the source-backed retry must restore the canonical edge dual-write"
         );
     }
 

@@ -2739,6 +2739,7 @@ END;
 pub struct MemoryDB {
     pub(crate) _db: libsql::Database,
     pub(crate) conn: tokio::sync::Mutex<libsql::Connection>,
+    entity_resolution_lock: tokio::sync::Mutex<()>,
     pub(crate) lint_freshness: Arc<crate::lint::snapshot::LintFreshnessClock>,
     page_projection_tracker: Arc<crate::page_projection_tracker::PageProjectionTracker>,
     pub(crate) derived_artifact_state: Arc<crate::derived_artifact_state::DerivedArtifactState>,
@@ -2854,6 +2855,7 @@ impl MemoryDB {
         Ok(Self {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3049,6 +3051,7 @@ impl MemoryDB {
         let instance = Self {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3128,6 +3131,7 @@ impl MemoryDB {
         let instance = Self {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -23322,6 +23326,7 @@ impl MemoryDB {
         source_agent: Option<&str>,
         confidence: Option<f32>,
     ) -> Result<(String, bool), WenlanError> {
+        let _resolution_guard = self.entity_resolution_lock.lock().await;
         let name_lower = name.to_lowercase();
 
         // Step 1: alias lookup (exact, case-insensitive).
@@ -43019,6 +43024,7 @@ pub(crate) mod tests {
         let memory_db = MemoryDB {
             _db: db,
             conn: tokio::sync::Mutex::new(conn),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -47458,6 +47464,84 @@ pub(crate) mod tests {
 
         assert!(!created, "alias match must resolve, not create");
         assert_eq!(id, existing_id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_or_create_entity_converges_on_one_identity() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        // Hold the connection until both tasks are queued at the first lookup.
+        // Tokio's fair mutex then alternates the old multi-lock cascade,
+        // deterministically exposing the resolve-then-create race.
+        let conn_guard = db.conn.lock().await;
+
+        let spawn_resolve = |db: Arc<MemoryDB>, barrier: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                db.resolve_or_create_entity(
+                    "Concurrent Canonical Entity",
+                    "concept",
+                    None,
+                    Some("test"),
+                    None,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        let first = spawn_resolve(Arc::clone(&db), Arc::clone(&barrier));
+        let second = spawn_resolve(Arc::clone(&db), Arc::clone(&barrier));
+        barrier.wait().await;
+        tokio::task::yield_now().await;
+        drop(conn_guard);
+
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.0, second.0, "both callers must receive one id");
+        assert_eq!(
+            usize::from(first.1) + usize::from(second.1),
+            1,
+            "exactly one caller must report created=true"
+        );
+
+        let conn = db.conn.lock().await;
+        let mut entity_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM entities WHERE name = ?1",
+                libsql::params!["Concurrent Canonical Entity"],
+            )
+            .await
+            .unwrap();
+        let entity_count = entity_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        drop(entity_rows);
+        let mut shadow_rows = conn
+            .query(
+                "SELECT COUNT(*)
+                 FROM entity_page_map m
+                 JOIN entities e ON e.id = m.entity_id
+                 JOIN pages p ON p.id = m.page_id
+                 WHERE e.name = ?1 AND p.kind = 'entity' AND p.status = 'active'",
+                libsql::params!["Concurrent Canonical Entity"],
+            )
+            .await
+            .unwrap();
+        let shadow_count = shadow_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(entity_count, 1, "one canonical entity row");
+        assert_eq!(shadow_count, 1, "one live shadow identity");
     }
 
     /// Differential oracle (discipline floor): both real callers must mint
@@ -74993,6 +75077,7 @@ pub(crate) mod tests {
         let db = MemoryDB {
             _db: raw_db,
             conn: tokio::sync::Mutex::new(conn),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),

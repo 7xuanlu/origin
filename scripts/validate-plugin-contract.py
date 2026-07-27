@@ -147,6 +147,17 @@ def validate_capture_relation_flow(
             f"{rel(root, skill_path)} must resolve entities, capture the linked "
             "memory, then create the relation"
         )
+    policies = [
+        "only when the user explicitly states a durable relation",
+        f"Do not call `{tool('create_entity')}` for ordinary captures.",
+        "Never infer a relation the user did not state.",
+    ]
+    for policy in policies:
+        if policy not in normalized_text:
+            fail(
+                f"{rel(root, skill_path)} must contain relation policy "
+                f"{policy!r}"
+            )
 
 
 def fail(message: str) -> None:
@@ -463,6 +474,51 @@ def validate_skill_surface(
                 expected_prefix,
                 text,
             )
+        if name == "curate":
+            require_equal(
+                f"{rel(root, skill_path)} argument-hint",
+                frontmatter.get("argument-hint"),
+                "captures | revisions | refinements",
+            )
+            try:
+                allowed_tools = json.loads(frontmatter.get("allowed-tools", ""))
+            except json.JSONDecodeError:
+                fail(f"{rel(root, skill_path)} allowed-tools must be a JSON array")
+            required_tools = {
+                f"{expected_prefix}list_refinements",
+                f"{expected_prefix}accept_refinement",
+                f"{expected_prefix}reject_refinement",
+            }
+            if not isinstance(allowed_tools, list) or not required_tools.issubset(allowed_tools):
+                fail(
+                    f"{rel(root, skill_path)} allowed-tools must include "
+                    f"{sorted(required_tools)!r}"
+                )
+            normalized_text = " ".join(text.split())
+            guardrails = [
+                (
+                    "Use `/curate refinements` only when the user explicitly asks "
+                    "to inspect or review the daemon proposal/refinement queue."
+                ),
+                "Never poll the refinement queue ambiently.",
+                (
+                    f"List first with `{expected_prefix}list_refinements(limit=50)` "
+                    "and show at most four items."
+                ),
+                (
+                    "Perform no mutation until the user gives an unambiguous "
+                    "item-level accept or reject decision."
+                ),
+                "Skip or cancel is a no-op.",
+                "Re-list after every mutation batch.",
+                "`vocab_promote`",
+            ]
+            for guardrail in guardrails:
+                if guardrail not in normalized_text:
+                    fail(
+                        f"{rel(root, skill_path)} must contain refinement guardrail "
+                        f"{guardrail!r}"
+                    )
         if name == "lint":
             require_equal(
                 f"{rel(root, skill_path)} argument-hint",

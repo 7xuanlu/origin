@@ -776,6 +776,35 @@ pub struct ConfirmMemoryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListRefinementsParams {
+    #[schemars(
+        description = "Optional action filter. One of: entity_merge, relation_conflict, detect_contradiction, suggest_entity, dedup_merge, page_merge, cross_space_discovery, page_keep_or_archive, lint_repair_review, vocab_promote."
+    )]
+    #[serde(default)]
+    pub action: Option<String>,
+    #[schemars(description = "Max number of proposals to return. Default 500, max 500.")]
+    #[serde(default, deserialize_with = "deserialize_optional_usize_lenient")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RejectRefinementParams {
+    #[schemars(description = "The review proposal id to dismiss.")]
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AcceptRefinementParams {
+    #[schemars(description = "The review proposal id (e.g. \"merge_abc123_def456\").")]
+    pub id: String,
+    #[schemars(
+        description = "Selected destination space for cross_space_discovery cards. Omit for ordinary accept actions."
+    )]
+    #[serde(default)]
+    pub space: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateEntityParams {
     #[schemars(
         description = "Canonical entity name (e.g. 'Alice', 'Wenlan', 'PostgreSQL'). Use the exact, full name; the daemon resolves an existing canonical entity idempotently when present."
@@ -913,7 +942,10 @@ pub struct ListPendingRevisionsParams {
 // ===== Internal Implementations =====
 
 fn format_capture_success(resp: &StoreMemoryResponse) -> String {
-    let mut msg = format!("Stored {}", resp.source_id);
+    let mut msg = format!(
+        "Stored {}\nsource_memory_id: {}",
+        resp.source_id, resp.source_id
+    );
     if !resp.warnings.is_empty() {
         msg.push_str("\nWarnings:");
         for warning in &resp.warnings {
@@ -1607,10 +1639,111 @@ impl WenlanMcpServer {
         )]))
     }
 
+    pub async fn list_refinements_impl(
+        &self,
+        params: ListRefinementsParams,
+    ) -> Result<CallToolResult, McpError> {
+        let mut path = String::from("/api/refinery/queue");
+        let mut query = Vec::new();
+        if let Some(action) = params.action.as_deref() {
+            query.push(format!("action={}", url_encode_simple(action)));
+        }
+        if let Some(limit) = params.limit {
+            query.push(format!("limit={limit}"));
+        }
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(&query.join("&"));
+        }
+
+        let resp: ListRefinementsResponse = try_call!(self.client.get(&path), "list_refinements");
+        let pretty = serde_json::to_string_pretty(&resp.proposals)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} pending review proposals\n{}",
+            resp.proposals.len(),
+            pretty
+        ))]))
+    }
+
+    pub async fn reject_refinement_impl(
+        &self,
+        params: RejectRefinementParams,
+    ) -> Result<CallToolResult, McpError> {
+        if self.transport == TransportMode::Http {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Review proposal operations are not available over remote connections. \
+                 Use local MCP on the machine running Wenlan to reject proposals."
+                    .to_string(),
+            )]));
+        }
+        let path = format!(
+            "/api/refinery/queue/{}/reject",
+            url_encode_simple(&params.id)
+        );
+        let resp: RejectRefinementResponse = try_call!(
+            self.client.post(&path, &serde_json::json!({})),
+            "reject_refinement"
+        );
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Review proposal {} dismissed.",
+            resp.id
+        ))]))
+    }
+
+    pub async fn accept_refinement_impl(
+        &self,
+        params: AcceptRefinementParams,
+    ) -> Result<CallToolResult, McpError> {
+        if self.transport == TransportMode::Http {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Review proposal operations are not available over remote connections. \
+                 Use local MCP on the machine running Wenlan to accept proposals."
+                    .to_string(),
+            )]));
+        }
+        let path = format!(
+            "/api/refinery/queue/{}/accept",
+            url_encode_simple(&params.id)
+        );
+        let request = match params.space {
+            Some(space) => {
+                wenlan_types::requests::AcceptRefinementRequest::PickSpace { space, notes: None }
+            }
+            None => wenlan_types::requests::AcceptRefinementRequest::Accept { notes: None },
+        };
+        let resp: AcceptRefinementResponse =
+            try_call!(self.client.post(&path, &request), "accept_refinement");
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Review proposal {} accepted (action={}).",
+            resp.id, resp.action_applied
+        ))]))
+    }
+
     pub async fn create_relation_impl(
         &self,
         params: CreateRelationParams,
     ) -> Result<CallToolResult, McpError> {
+        if params.source_memory_id.trim().is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "source_memory_id must not be blank; pass the id returned by capture.".to_string(),
+            )]));
+        }
+        let detail_path = format!(
+            "/api/memory/{}/detail",
+            url_encode_simple(&params.source_memory_id)
+        );
+        let source: wenlan_types::responses::MemoryDetailResponse = try_call!(
+            self.client.get(&detail_path),
+            "create_relation source preflight"
+        );
+        if source.memory.is_none() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Source memory {} is missing or not visible; relation was not created.",
+                params.source_memory_id
+            ))]));
+        }
+
         let req = CreateRelationRequest {
             from_entity: params.from_entity_id,
             to_entity: params.to_entity_id,
@@ -2169,6 +2302,56 @@ impl WenlanMcpServer {
     }
 
     #[tool(
+        description = "List pending daemon refinement proposals only when the user explicitly asks to inspect or review the proposal/refinement queue; never poll this queue ambiently. Returns typed actions and payloads, including vocab_promote. Filter by action and bound the result with limit. Pair with accept_refinement or reject_refinement only after an unambiguous item-level user decision.",
+        annotations(
+            title = "List refinement proposals",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_refinements(
+        &self,
+        Parameters(params): Parameters<ListRefinementsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.list_refinements_impl(params).await
+    }
+
+    #[tool(
+        description = "Accept one listed refinement proposal by id only after the user gives an unambiguous item-level accept decision. For cross_space_discovery, pass the selected destination space. Not available over remote HTTP MCP transport (local stdio only).",
+        annotations(
+            title = "Accept refinement proposal",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn accept_refinement(
+        &self,
+        Parameters(params): Parameters<AcceptRefinementParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.accept_refinement_impl(params).await
+    }
+
+    #[tool(
+        description = "Reject one listed refinement proposal by id only after the user gives an unambiguous item-level reject decision. Skip or cancel is a no-op. Not available over remote HTTP MCP transport (local stdio only).",
+        annotations(
+            title = "Reject refinement proposal",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reject_refinement(
+        &self,
+        Parameters(params): Parameters<RejectRefinementParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_refinement_impl(params).await
+    }
+
+    #[tool(
         description = "Resolve a durable named entity idempotently. Use only as a support step when the user explicitly establishes a durable named entity, or when resolved ids are needed for a relation the user explicitly stated. Do not call create_entity for every ordinary capture; capture already handles its primary entity and daemon enrichment handles routine extraction.",
         annotations(
             title = "Resolve entity",
@@ -2412,6 +2595,8 @@ const LOCAL_ONLY_TOOL_NAMES: &[&str] = &[
     "forget",
     "confirm_memory",
     "delete_page",
+    "accept_refinement",
+    "reject_refinement",
 ];
 
 impl WenlanMcpServer {
@@ -2758,6 +2943,8 @@ mod tests {
             "forget",
             "confirm_memory",
             "delete_page",
+            "accept_refinement",
+            "reject_refinement",
         ] {
             assert!(stdio.iter().any(|candidate| candidate == name));
             assert!(!http.iter().any(|candidate| candidate == name));
@@ -3648,7 +3835,7 @@ mod tests {
             hint: String::new(),
         };
         let msg = format_capture_success(&resp);
-        assert_eq!(msg, "Stored mem_abc");
+        assert_eq!(msg, "Stored mem_abc\nsource_memory_id: mem_abc");
         assert!(!msg.contains("chunks"));
         assert!(!msg.contains("quality"));
         assert!(!msg.contains("entity"));
@@ -4889,6 +5076,100 @@ mod tests {
         assert!(!relation.contains("Created"));
     }
 
+    // ===== Refinement queue guards =====
+
+    #[tokio::test]
+    async fn test_reject_refinement_blocked_on_http_transport() {
+        let server = make_server(TransportMode::Http, "agent", None);
+        let result = server
+            .reject_refinement_impl(RejectRefinementParams {
+                id: "merge_abc_def".into(),
+            })
+            .await
+            .unwrap();
+        let rmcp::model::RawContent::Text(text) = &result.content[0].raw else {
+            panic!("expected text content");
+        };
+        assert!(text.text.contains("not available over remote connections"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_refinement_allowed_on_stdio_transport() {
+        let server = make_server(TransportMode::Stdio, "agent", None);
+        let result = server
+            .reject_refinement_impl(RejectRefinementParams {
+                id: "merge_abc_def".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_error.unwrap_or(false),
+            "should fail with connection error, not transport block"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_refinement_blocked_on_http_transport() {
+        let server = make_server(TransportMode::Http, "agent", None);
+        let result = server
+            .accept_refinement_impl(AcceptRefinementParams {
+                id: "merge_abc_def".into(),
+                space: None,
+            })
+            .await
+            .unwrap();
+        let rmcp::model::RawContent::Text(text) = &result.content[0].raw else {
+            panic!("expected text content");
+        };
+        assert!(text.text.contains("not available over remote connections"));
+    }
+
+    #[tokio::test]
+    async fn test_accept_refinement_allowed_on_stdio_transport() {
+        let server = make_server(TransportMode::Stdio, "agent", None);
+        let result = server
+            .accept_refinement_impl(AcceptRefinementParams {
+                id: "merge_abc_def".into(),
+                space: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_error.unwrap_or(false),
+            "should fail with connection error, not transport block"
+        );
+    }
+
+    #[test]
+    fn list_refinements_description_mentions_vocab_promote() {
+        let descriptions = tool_descriptions();
+        let list = descriptions
+            .get("list_refinements")
+            .expect("list_refinements tool exists");
+        assert!(
+            list.contains("vocab_promote"),
+            "list_refinements description must enumerate vocab_promote, got: {list}"
+        );
+    }
+
+    #[test]
+    fn accept_refinement_response_typed_deserialize() {
+        let raw = r#"{"id":"ref_xyz","action_applied":"entity_merge"}"#;
+        let parsed: AcceptRefinementResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.id, "ref_xyz");
+        assert_eq!(parsed.action_applied, "entity_merge");
+    }
+
+    #[test]
+    fn accept_refinement_response_rejects_extra_envelope() {
+        let wrong = r#"{"data":{"id":"ref_xyz","action_applied":"entity_merge"}}"#;
+        let result: Result<AcceptRefinementResponse, _> = serde_json::from_str(wrong);
+        assert!(
+            result.is_err(),
+            "envelope-wrapped response must fail typed deserialize"
+        );
+    }
+
     // ===== Page CRUD =====
 
     #[test]
@@ -5375,10 +5656,11 @@ mod tests {
         );
     }
 
-    /// The 26 tools in the final 2026-07 Phase A MCP surface.
+    /// The 29 tools in the final 2026-07 Phase A MCP surface.
     /// Deleting or adding a tool must edit this list deliberately.
     fn expected_tool_surface() -> Vec<&'static str> {
         vec![
+            "accept_refinement",
             "accept_revision",
             "apply_lint_repair",
             "capture",
@@ -5399,10 +5681,12 @@ mod tests {
             "list_pending",
             "list_pending_imports",
             "list_pending_revisions",
+            "list_refinements",
             "list_rejections",
             "prepare_lint_repair",
             "prepare_lint_repair_plan",
             "recall",
+            "reject_refinement",
             "verify_lint_repair",
             "write_page",
         ]
