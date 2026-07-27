@@ -116,6 +116,28 @@ pub async fn test_app_no_gate() -> (AppRouter, tempfile::TempDir, Arc<MemoryDB>)
     (router, dir, db_arc)
 }
 
+/// Build a quality-gate-disabled test app with an isolated Page projection root.
+#[allow(dead_code)]
+pub async fn test_app_no_gate_with_page_root() -> (AppRouter, tempfile::TempDir, Arc<MemoryDB>) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .unwrap();
+    let db_arc = Arc::new(db);
+    let gate_cfg = wenlan_core::tuning::GateConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let state = ServerState {
+        db: Some(db_arc.clone()),
+        quality_gate: QualityGate::new(gate_cfg),
+        ..ServerState::default()
+    }
+    .with_page_root(dir.path().join("pages"));
+    let router = build_router(Arc::new(RwLock::new(state)));
+    (router, dir, db_arc)
+}
+
 /// Count `agent_activity` rows matching both `action` and `agent_name`.
 /// Used by curation mutate HTTP tests to verify activity logging without
 /// requiring direct access to the private `conn` field.

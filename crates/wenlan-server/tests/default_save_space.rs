@@ -288,7 +288,7 @@ async fn create_entity_reports_existing_owner_without_moving() {
 
 #[tokio::test]
 async fn create_page_rejects_conflicting_aliases_and_mirrors_default() {
-    let (router, _tmp, db) = common::test_app_no_gate().await;
+    let (router, tmp, db) = common::test_app_no_gate_with_page_root().await;
     let work = db.create_space("work", None, false).await.unwrap();
     db.create_space("personal", None, false).await.unwrap();
     db.set_default_space(&work.id).await.unwrap();
@@ -333,4 +333,11 @@ async fn create_page_rejects_conflicting_aliases_and_mirrors_default() {
         .unwrap();
     assert_eq!(page.space.as_deref(), Some("work"));
     assert_eq!(page.workspace.as_deref(), Some("work"));
+
+    let page_files = std::fs::read_dir(tmp.path().join("pages"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
+        .count();
+    assert_eq!(page_files, 1, "page projection must stay inside TempDir");
 }

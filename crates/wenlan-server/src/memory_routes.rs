@@ -2142,12 +2142,13 @@ pub async fn handle_create_page(
     Json(mut req): Json<CreateConceptRequest>,
 ) -> Result<Json<CreatePageResponse>, ServerError> {
     let agent = extract_agent_name(&headers, None);
-    let (db, page_min_cluster_size, page_match_threshold) = {
+    let (db, page_root, page_min_cluster_size, page_match_threshold) = {
         let s = state.read().await;
         (
             s.db.as_ref()
                 .cloned()
                 .ok_or(ServerError::DbNotInitialized)?,
+            s.lint_config.page_root().map(std::path::Path::to_path_buf),
             s.tuning.distillation.page_min_cluster_size,
             s.tuning.distillation.page_match_threshold,
         )
@@ -2163,12 +2164,11 @@ pub async fn handle_create_page(
         None => WriteSpaceTarget::Uncategorized,
     };
     req.workspace = resolved.space_name.clone();
-    let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
     let result = wenlan_core::post_write::create_page_with_tuning(
         &db,
         req,
         &agent,
-        Some(knowledge_path.as_path()),
+        page_root.as_deref(),
         page_min_cluster_size,
         page_match_threshold,
     )
