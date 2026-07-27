@@ -776,22 +776,28 @@ pub struct ConfirmMemoryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CreatePageParams {
+pub struct WritePageParams {
     #[schemars(
-        description = "Short noun phrase that names the page (e.g. 'Wenlan daemon architecture')."
+        description = "Omit to create a new page. Pass an existing page id (e.g. 'page_abc', from the `stale_pages` block in distill output) to refresh that page in place."
     )]
-    pub title: String,
+    pub page_id: Option<String>,
+    #[schemars(
+        description = "Short noun phrase that names the page (e.g. 'Wenlan daemon architecture'). Required when creating; ignored on refresh."
+    )]
+    pub title: Option<String>,
     #[schemars(
         description = "Markdown body — 3-7 paragraphs of wiki prose with [[wikilinks]]. Do not cite source ids inline; pass them in source_memory_ids and the daemon attaches provenance automatically."
     )]
     pub content: String,
-    #[schemars(description = "Optional one-sentence summary — the durable claim.")]
+    #[schemars(
+        description = "Optional one-sentence summary — the durable claim. On refresh: omit to keep the existing summary; pass empty string to clear it."
+    )]
     pub summary: Option<String>,
     #[schemars(
-        description = "Optional entity_id (e.g. 'ent_abc') to anchor the page to a knowledge-graph entity."
+        description = "Optional entity_id (e.g. 'ent_abc') to anchor the page to a knowledge-graph entity. Create only."
     )]
     pub entity_id: Option<String>,
-    #[schemars(description = "Topic scope (e.g. 'origin', 'work'). Optional.")]
+    #[schemars(description = "Topic scope (e.g. 'origin', 'work'). Optional. Create only.")]
     #[serde(default, alias = "domain")]
     pub space: Option<String>,
     #[schemars(
@@ -807,26 +813,6 @@ pub struct DeletePageParams {
         description = "Page id (e.g. 'page_abc' or legacy 'concept_abc'). Get it from distill output."
     )]
     pub page_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct UpdatePageParams {
-    #[schemars(
-        description = "Page id (e.g. 'page_abc' or legacy 'concept_abc'). Get it from the `stale_pages` block in distill output."
-    )]
-    pub page_id: String,
-    #[schemars(
-        description = "Refreshed markdown body — same wiki-prose style as create_page. Replaces the existing content."
-    )]
-    pub content: String,
-    #[schemars(
-        description = "Full source_memory_ids list for the refreshed page — typically the stale page's existing list (carry through from distill output)."
-    )]
-    pub source_memory_ids: Vec<String>,
-    #[schemars(
-        description = "Optional one-sentence summary. Omit to keep the existing summary; pass empty string to clear it."
-    )]
-    pub summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1533,57 +1519,65 @@ impl WenlanMcpServer {
         }
     }
 
-    pub async fn create_page_impl(
+    pub async fn write_page_impl(
         &self,
-        params: CreatePageParams,
+        params: WritePageParams,
     ) -> Result<CallToolResult, McpError> {
-        let space_arg = effective_space(&params.space);
-        let req = CreateConceptRequest {
-            title: params.title,
-            content: params.content,
-            summary: params.summary,
-            entity_id: params.entity_id,
-            space: space_arg,
-            source_memory_ids: params.source_memory_ids,
-            creation_kind: None,
-            workspace: None,
-        };
-        let resp: CreatePageResponse =
-            try_call!(self.client.post("/api/pages", &req), "create_page");
-        let mut text = format!("Created page {}", resp.id);
-        for w in &resp.warnings {
-            text.push_str(&format!("\nwarning: {w}"));
+        match params.page_id {
+            Some(page_id) => {
+                if params.source_memory_ids.is_empty() {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "source_memory_ids is required when refreshing — carry through \
+                         the stale page's existing list from distill output"
+                            .to_string(),
+                    )]));
+                }
+                if self.transport == TransportMode::Http {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Update operations are not available over remote connections. \
+                         Use local MCP on the machine running Wenlan to update pages."
+                            .to_string(),
+                    )]));
+                }
+                let req = wenlan_types::requests::RefreshPageRequest {
+                    content: params.content,
+                    source_memory_ids: params.source_memory_ids,
+                    summary: params.summary,
+                };
+                let path = format!("/api/pages/{page_id}");
+                // Typed end-to-end: a wire-shape drift on the daemon side fails at
+                // deserialize instead of silently returning the no-op "Refreshed"
+                // line. Same discipline as the other typed page responses.
+                let resp: wenlan_types::responses::PageWriteResponse =
+                    try_call!(self.client.put(&path, &req), "write_page");
+                // Ownership gate (spec §5.2): a human-owned page is never overwritten
+                // in place; the daemon stages a revision card. Surface that so the
+                // caller does not believe the prose was rewritten.
+                let msg = format_update_page_response(&page_id, resp);
+                Ok(CallToolResult::success(vec![Content::text(msg)]))
+            }
+            None => {
+                let Some(title) = params.title else {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "title is required when creating a page (no page_id given)".to_string(),
+                    )]));
+                };
+                let req = CreateConceptRequest {
+                    title,
+                    content: params.content,
+                    summary: params.summary,
+                    entity_id: params.entity_id,
+                    space: effective_space(&params.space),
+                    source_memory_ids: params.source_memory_ids,
+                    creation_kind: None,
+                    workspace: None,
+                };
+                let resp: CreatePageResponse =
+                    try_call!(self.client.post("/api/pages", &req), "write_page");
+                let text = format_create_page_response(resp);
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
         }
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
-    pub async fn update_page_impl(
-        &self,
-        params: UpdatePageParams,
-    ) -> Result<CallToolResult, McpError> {
-        if self.transport == TransportMode::Http {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "Update operations are not available over remote connections. \
-                 Use local MCP on the machine running Wenlan to update pages."
-                    .to_string(),
-            )]));
-        }
-        let req = wenlan_types::requests::RefreshPageRequest {
-            content: params.content,
-            source_memory_ids: params.source_memory_ids,
-            summary: params.summary,
-        };
-        let path = format!("/api/pages/{}", params.page_id);
-        // Typed end-to-end: a wire-shape drift on the daemon side fails at
-        // deserialize instead of silently returning the no-op "Refreshed"
-        // line. Same discipline as the other typed page responses.
-        let resp: wenlan_types::responses::PageWriteResponse =
-            try_call!(self.client.put(&path, &req), "update_page");
-        // Ownership gate (spec §5.2): a human-owned page is never overwritten in
-        // place; the daemon stages a revision card. Surface that so the caller
-        // does not believe the prose was rewritten.
-        let msg = format_update_page_response(&params.page_id, resp);
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     pub async fn delete_page_impl(&self, page_id: &str) -> Result<CallToolResult, McpError> {
@@ -1707,6 +1701,17 @@ fn format_update_page_response(
     } else {
         format!("Refreshed page {page_id}")
     }
+}
+
+fn format_create_page_response(resp: CreatePageResponse) -> String {
+    let mut text = match resp.attached_to {
+        Some(page_id) => format!("Attached to existing page {page_id}"),
+        None => format!("Created page {}", resp.id),
+    };
+    for warning in resp.warnings {
+        text.push_str(&format!("\nwarning: {warning}"));
+    }
+    text
 }
 
 // ===== Tool Registrations =====
@@ -1950,37 +1955,20 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Create a distilled wiki page from a memory cluster. The /distill flow uses this to post agent-synthesized pages back to the daemon. Provide a markdown body with [[wikilinks]]. Do not cite source ids inline; pass them in source_memory_ids and the daemon attaches provenance automatically. The daemon writes both the DB row and the on-disk .origin/pages/<slug>.md projection atomically.",
+        description = "Create or refresh a distilled wiki page. Omit page_id to create a new page (title required); the daemon writes the DB row and the on-disk .origin/pages/<slug>.md projection atomically. Pass page_id (from the `stale_pages` block in distill output) to refresh that page in place — replaces content + source_memory_ids + optional summary, clears stale_reason, preserves page_id and created_at, bumps version monotonically so external [[wikilinks]] keep working. Never delete_page + recreate to refresh: that churns ids and loses version history. Refresh is not available over remote HTTP MCP transport (local stdio only).",
         annotations(
-            title = "Create page",
+            title = "Write page",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = false
         )
     )]
-    async fn create_page(
+    async fn write_page(
         &self,
-        Parameters(params): Parameters<CreatePageParams>,
+        Parameters(params): Parameters<WritePageParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.create_page_impl(params).await
-    }
-
-    #[tool(
-        description = "Refresh a stale page in place. Replaces content + source_memory_ids + optional summary, clears the daemon's stale_reason in the same call. Preserves page_id, created_at, and bumps version monotonically — external [[wikilinks]] keep working. Use this on entries in the /distill response's `stale_pages` block instead of delete_page + create_page (which churned ids and lost version history). Not available over remote HTTP MCP transport (local stdio only).",
-        annotations(
-            title = "Refresh page",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn update_page(
-        &self,
-        Parameters(params): Parameters<UpdatePageParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.update_page_impl(params).await
+        self.write_page_impl(params).await
     }
 
     #[tool(
@@ -3840,15 +3828,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_page_blocked_on_http_transport() {
+    async fn test_write_page_refresh_blocked_on_http_transport() {
         let server = make_server(TransportMode::Http, "agent", None);
-        let params = UpdatePageParams {
-            page_id: "page_x".into(),
+        let params = WritePageParams {
+            page_id: Some("page_x".into()),
+            title: None,
             content: "body".into(),
             source_memory_ids: vec!["mem_a".into()],
             summary: None,
+            entity_id: None,
+            space: None,
         };
-        let result = server.update_page_impl(params).await.unwrap();
+        let result = server.write_page_impl(params).await.unwrap();
         let content = &result.content[0];
         match content.raw {
             rmcp::model::RawContent::Text(ref tc) => {
@@ -3859,23 +3850,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_page_allowed_on_stdio_transport() {
+    async fn test_write_page_refresh_allowed_on_stdio_transport() {
         let server = make_server(TransportMode::Stdio, "agent", None);
-        let params = UpdatePageParams {
-            page_id: "page_x".into(),
+        let params = WritePageParams {
+            page_id: Some("page_x".into()),
+            title: None,
             content: "body".into(),
             source_memory_ids: vec!["mem_a".into()],
             summary: None,
+            entity_id: None,
+            space: None,
         };
-        let result = server.update_page_impl(params).await.unwrap();
+        let result = server.write_page_impl(params).await.unwrap();
         assert!(
             result.is_error.unwrap_or(false),
             "should fail with connection error, not transport block"
         );
     }
 
+    #[test]
+    fn create_page_reports_attached_to_existing_page_truthfully() {
+        let text = format_create_page_response(CreatePageResponse {
+            id: "page_existing".into(),
+            attached_to: Some("page_existing".into()),
+            warnings: Vec::new(),
+        });
+
+        assert!(
+            text.starts_with("Attached to existing page page_existing"),
+            "attached response must not claim a new page was created: {text}"
+        );
+        assert!(
+            !text.contains("Created page"),
+            "attached response must distinguish reuse from creation: {text}"
+        );
+    }
+
     #[tokio::test]
-    async fn test_update_page_surfaces_gated_revision_card_fields() {
+    async fn write_page_refresh_rejects_empty_sources_before_network() {
+        let server = make_server(TransportMode::Stdio, "agent", None);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.write_page_impl(WritePageParams {
+                page_id: Some("page_x".into()),
+                title: None,
+                content: "body".into(),
+                source_memory_ids: Vec::new(),
+                summary: None,
+                entity_id: None,
+                space: None,
+            }),
+        )
+        .await
+        .expect("empty-source guard must return before any daemon retry")
+        .unwrap();
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(text) => &text.text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(
+            result.is_error.unwrap_or(false) && text.contains("source_memory_ids is required"),
+            "empty refresh sources must fail locally before any daemon call: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_page_refresh_surfaces_gated_revision_card_fields() {
         let text = format_update_page_response(
             "page_x",
             wenlan_types::responses::PageWriteResponse {
@@ -3886,11 +3926,11 @@ mod tests {
         );
         assert!(
             text.contains("gated: true"),
-            "gated field missing from update_page response: {text}"
+            "gated field missing from write_page refresh response: {text}"
         );
         assert!(
             text.contains("revision_card_id: mem_page_card_1"),
-            "revision_card_id missing from update_page response: {text}"
+            "revision_card_id missing from write_page refresh response: {text}"
         );
     }
 
@@ -4420,72 +4460,25 @@ mod tests {
     // ===== Page CRUD =====
 
     #[test]
-    fn test_create_page_params_minimal() {
-        let json = r#"{"title": "Wenlan daemon", "content": "Body text."}"#;
-        let params: CreatePageParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.title, "Wenlan daemon");
-        assert_eq!(params.content, "Body text.");
-        assert!(params.summary.is_none());
-        assert!(params.entity_id.is_none());
-        assert!(params.space.is_none());
-        assert!(params.source_memory_ids.is_empty());
-    }
+    fn write_page_params_accept_create_and_refresh_shapes() {
+        let create: WritePageParams = serde_json::from_value(serde_json::json!({
+            "title": "T",
+            "content": "body"
+        }))
+        .unwrap();
+        assert!(create.page_id.is_none());
+        assert_eq!(create.title.as_deref(), Some("T"));
+        assert!(create.source_memory_ids.is_empty());
 
-    #[test]
-    fn test_create_page_params_full() {
-        let json = r##"{
-            "title": "Wenlan daemon",
-            "content": "Markdown body with [[wikilinks]].",
-            "summary": "The headless HTTP daemon at the heart of Wenlan.",
-            "entity_id": "ent_origin",
-            "space": "origin",
-            "source_memory_ids": ["mem_1", "mem_2"]
-        }"##;
-        let params: CreatePageParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.title, "Wenlan daemon");
-        assert_eq!(
-            params.summary.as_deref(),
-            Some("The headless HTTP daemon at the heart of Wenlan.")
-        );
-        assert_eq!(params.entity_id.as_deref(), Some("ent_origin"));
-        assert_eq!(params.space.as_deref(), Some("origin"));
-        assert_eq!(params.source_memory_ids, vec!["mem_1", "mem_2"]);
-    }
-
-    #[test]
-    fn test_create_page_params_missing_required_fails() {
-        let json = r#"{"title": "Only title"}"#;
-        let result = serde_json::from_str::<CreatePageParams>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_page_request_body_shape() {
-        let params = CreatePageParams {
-            title: "Page".into(),
-            content: "Body".into(),
-            summary: Some("S".into()),
-            entity_id: Some("ent_1".into()),
-            space: Some("origin".into()),
-            source_memory_ids: vec!["mem_1".into()],
-        };
-        let req = CreateConceptRequest {
-            title: params.title,
-            content: params.content,
-            summary: params.summary,
-            entity_id: params.entity_id,
-            space: params.space,
-            source_memory_ids: params.source_memory_ids,
-            creation_kind: None,
-            workspace: None,
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["title"], "Page");
-        assert_eq!(json["content"], "Body");
-        assert_eq!(json["summary"], "S");
-        assert_eq!(json["entity_id"], "ent_1");
-        assert_eq!(json["space"], "origin");
-        assert_eq!(json["source_memory_ids"], serde_json::json!(["mem_1"]));
+        let refresh: WritePageParams = serde_json::from_value(serde_json::json!({
+            "page_id": "page_abc",
+            "content": "body",
+            "source_memory_ids": ["mem_1"]
+        }))
+        .unwrap();
+        assert_eq!(refresh.page_id.as_deref(), Some("page_abc"));
+        assert!(refresh.title.is_none());
+        assert_eq!(refresh.source_memory_ids, vec!["mem_1"]);
     }
 
     // --- DeletePageParams ---
@@ -4528,68 +4521,12 @@ mod tests {
         );
     }
 
-    // --- UpdatePageParams ---
-
-    #[test]
-    fn test_update_page_params_minimal() {
-        let json =
-            r#"{"page_id": "page_abc", "content": "fresh body", "source_memory_ids": ["mem_1"]}"#;
-        let params: UpdatePageParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.page_id, "page_abc");
-        assert_eq!(params.content, "fresh body");
-        assert_eq!(params.source_memory_ids, vec!["mem_1"]);
-        assert!(params.summary.is_none());
-    }
-
-    #[test]
-    fn test_update_page_params_with_summary() {
-        let json = r#"{
-            "page_id": "page_abc",
-            "content": "body",
-            "source_memory_ids": ["mem_1", "mem_2"],
-            "summary": "Refreshed claim."
-        }"#;
-        let params: UpdatePageParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.summary.as_deref(), Some("Refreshed claim."));
-        assert_eq!(params.source_memory_ids.len(), 2);
-    }
-
-    #[test]
-    fn test_update_page_params_missing_required_fails() {
-        // Missing source_memory_ids is a hard fail — refresh without sources
-        // would orphan the page from its provenance trail.
-        let json = r#"{"page_id": "page_abc", "content": "body"}"#;
-        let result = serde_json::from_str::<UpdatePageParams>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_update_page_request_body_shape() {
-        let params = UpdatePageParams {
-            page_id: "page_abc".into(),
-            content: "Body".into(),
-            source_memory_ids: vec!["mem_1".into()],
-            summary: Some("S".into()),
-        };
-        let req = wenlan_types::requests::RefreshPageRequest {
-            content: params.content,
-            source_memory_ids: params.source_memory_ids,
-            summary: params.summary,
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["content"], "Body");
-        assert_eq!(json["source_memory_ids"], serde_json::json!(["mem_1"]));
-        assert_eq!(json["summary"], "S");
-        // page_id stays in the URL, never the body.
-        assert!(json.get("page_id").is_none());
-    }
-
     // --- Tool registration ---
 
     #[test]
     fn new_crud_tools_are_registered() {
         let descriptions = tool_descriptions();
-        for name in ["create_page", "update_page", "delete_page"] {
+        for name in ["write_page", "delete_page"] {
             assert!(
                 descriptions.contains_key(name),
                 "tool `{name}` must be registered, got: {:?}",
@@ -4623,9 +4560,9 @@ mod tests {
     }
 
     #[test]
-    fn create_page_schema_documents_traceability() {
-        let schema = serde_json::to_string(&schemars::schema_for!(CreatePageParams))
-            .expect("CreatePageParams schema serializes");
+    fn write_page_schema_documents_traceability() {
+        let schema = serde_json::to_string(&schemars::schema_for!(WritePageParams))
+            .expect("WritePageParams schema serializes");
         assert!(
             schema.contains("traceability"),
             "schema must spell out why source_memory_ids matter"
@@ -4918,7 +4855,6 @@ mod tests {
             "capture",
             "confirm_memory",
             "context",
-            "create_page",
             "delete_page",
             "dismiss_revision",
             "distill",
@@ -4932,8 +4868,8 @@ mod tests {
             "prepare_lint_repair",
             "prepare_lint_repair_plan",
             "recall",
-            "update_page",
             "verify_lint_repair",
+            "write_page",
         ]
     }
 
