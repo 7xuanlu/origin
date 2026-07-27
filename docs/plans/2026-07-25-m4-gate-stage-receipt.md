@@ -321,10 +321,87 @@ surviving database is not independent proof of the pre-restart read. State remai
 `5/5/5`, `dirty=0`, with five communities, 10 members, and zero leases. The second process
 then completed a final formal shutdown, and port `7879` was free.
 
+### Post-main integration live rerun
+
+The full signed live contract was rerun on 2026-07-27 at clean exact HEAD
+`f367ae7485ba97c7fd18e05b50af728fdf212fdd`, after the latest `main` was integrated into
+the local branch and the document-enrichment retry repair was committed locally. Neither
+is yet published by PR #395. The exact `target/debug/wenlan-server` had SHA-256
+`363959550a215612da999d6035c4111045de8eb1c2611f3312fa51884e668626`, size
+`155468528`, schema version `95`, and health version `0.15.0+gf367ae74`. The passing
+isolated roots were:
+
+- data: `/private/tmp/wenlan-m4-pr1-data-f367ae74-v2`;
+- source: `/private/tmp/wenlan-m4-pr1-source-f367ae74-v2`;
+- evidence: `/private/tmp/wenlan-m4-pr1-live-f367ae74-v2`.
+
+The signed document timeline was reproduced before any graph fixture write:
+
+1. Fresh public source admission produced one version `1` `folder` memory in `unfiled`
+   with hash
+   `71f401ddd10f69f2d6d0ba2390c22395bd0c367a2d84234d3bcbdeb620d641a3`;
+   the queue drained `done` at `attempt_count=0`.
+2. The public official document-to-space assignment alone produced version `2` in
+   `m4-live`, preserving the same hash and `folder` inventory.
+3. A semantic source replacement, submitted through the public source-sync endpoint,
+   produced version `3` while preserving `m4-live` and `folder`; its final hash was
+   `1113696816ca1d41f732d9be97051035bfd3b484fe4a3e92fca3f115d9647db2`,
+   and the queue again drained `done` at `attempt_count=0`.
+
+There was no provider failure or retry in the passing run, so this live leg did not
+dynamically exercise a same-hash retry. Repeated automatic same-hash source syncs while
+each queue item was active did not create another semantic generation. The signed
+pre-fixture snapshot had zero entities, zero relations, and zero `relates` edges.
+
+The public fixture then created exactly 10 `m4-live` entities and five relations, each
+linked to the exact full folder `memories.source_id`
+`directory-wenlan-m4-pr1-source-f367ae74-v2::/private/tmp/wenlan-m4-pr1-source-f367ae74-v2/grounded-community-source.md`.
+Before grounding, the five assertion edges were all active and ungrounded across 10
+distinct endpoints, with cursor `0`. Production ambient admission recorded five genuine
+`EdgeGroundingPromote selected=true` completions:
+
+| Completion | `llm_calls` | `panicked` |
+|---|---:|---|
+| `2026-07-27T11:47:41.752513Z` | 1 | false |
+| `2026-07-27T11:50:13.695776Z` | 1 | false |
+| `2026-07-27T11:52:45.718929Z` | 1 | false |
+| `2026-07-27T11:55:17.699825Z` | 1 | false |
+| `2026-07-27T11:57:49.647778Z` | 1 | false |
+
+All five assertion edges ended grounded across 10 endpoints and shared active
+`document_ingest` root `8aed80a5-eb24-493d-be1a-1a7e0f907943`. Every payload recorded
+model id/version `qwen3-4b`, prompt `m3g-entailment-v3`, path `entailment-only`, and
+entailment score `1.0`. The durable cursor was `5`, with `stuck_rowid=null` and
+`failures=0`. The source remained version `3`, `m4-live`, `folder`, at the final hash,
+with all five evidence sentences present. The M3g process then shut down formally and
+port `7879` was free.
+
+On the same database, the M4 pre-state was `5/5/NULL`, `dirty=1`, with zero communities,
+members, and grouping leases. Public `POST /api/steep` returned 15 phases with zero
+errors; `community_detection` processed `15` items in `3 ms`. The post-state was
+`5/5/5`, `dirty=0`, with five active communities, 10 distinct members arranged as five
+pairs, and zero orphan members or grouping leases. Every persisted row used generation
+`5`, algorithm `leiden-m4-v1`, and projection `grounded-relates-v1`.
+
+Unlike the earlier live receipt, this rerun persisted both sorted logical-row outputs:
+`55-logical-rows-pre-restart.txt` and `62-logical-rows-post-restart.txt`. An actual second
+M4 process returned health `0.15.0+gf367ae74` before any mutating request; the two files
+were byte-identical and each had SHA-256
+`c3b29ff5544fe2cb23b6d4257681c5ae3dece634ff4be8e251bdbb6f3716529b`.
+Restarted state remained `5/5/5`, `dirty=0`, with five communities, 10 members, and zero
+leases. The second process completed a formal shutdown and port `7879` was free.
+
+One earlier isolated verifier-negative run is preserved under the corresponding `-v1`
+roots. Its public fixture mistakenly supplied `memories.id` instead of the required full
+folder `memories.source_id`; ambient M3g therefore made a zero-LLM external-origin skip
+and advanced cursor `0→5` without grounding. That database was formally shut down,
+proved port-free, and abandoned without direct database correction or reuse. It is not
+part of the positive result above.
+
 ### Open publication step
 
-The local branch is 11 commits ahead of `origin/main`. Its only commits after the current
-remote candidate `a5d985bc` are `b7c22ce6` and `597760ac`; the ambiguity repair and this
-receipt remain uncommitted. Updating PR #395 waits for explicit user approval; no receipt
-statement should be read as saying that the repairs or their test results are already
-published or covered by remote CI.
+The local branch is 15 commits ahead of `origin/main`. Its first-parent commits after the
+remote PR candidate `a5d985bc` are exactly `b7c22ce6`, `597760ac`, `7727c72b`,
+`d0d070b7` (merge latest `main`), and `f367ae74`. This receipt remains uncommitted. None
+of those local updates or the live evidence above are yet in remote PR #395 or covered
+by remote CI. Pushing them waits for explicit user approval.
