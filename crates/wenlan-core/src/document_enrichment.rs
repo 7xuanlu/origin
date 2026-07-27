@@ -1134,6 +1134,118 @@ mod tests {
         assert_eq!(queued.last_completed_chunk, -1);
     }
 
+    #[tokio::test]
+    async fn changed_hash_replacement_preserves_assigned_space_and_invalidates_projection() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let source_id = format!("folder-notes::{file_path}");
+        let initial_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&initial_hash))
+            .await
+            .unwrap();
+        let initial_entry = db.claim_next_pending().await.unwrap().expect("claim v1");
+        run_document_enrichment(&db, &initial_entry, None, None, &PromptRegistry::default()).await;
+
+        db.update_memory_space(&source_id, "m4-live").await.unwrap();
+        let from = db
+            .create_entity("M4 source", "concept", Some("m4-live"))
+            .await
+            .unwrap();
+        let to = db
+            .create_entity("M4 target", "concept", Some("m4-live"))
+            .await
+            .unwrap();
+        db.create_relation(
+            &from,
+            &to,
+            "related_to",
+            Some("document_enrichment"),
+            Some(0.9),
+            None,
+            Some(&source_id),
+        )
+        .await
+        .unwrap();
+        let edge_id = crate::provenance::compute_edge_id(
+            "relates",
+            "entity",
+            &from,
+            "entity",
+            &to,
+            "related_to",
+        );
+        assert_eq!(
+            db.edge_snapshot_for_test(&edge_id).await.unwrap()["valid_until"],
+            serde_json::Value::Null,
+            "fixture must begin with an active source-owned edge"
+        );
+
+        std::fs::write(
+            &path,
+            "The third semantic generation replaces the folder document body. ".repeat(80),
+        )
+        .unwrap();
+        let replacement_hash = file_hash(&path);
+        assert_ne!(replacement_hash, initial_hash);
+        db.enqueue_document("folder-notes", &file_path, Some(&replacement_hash))
+            .await
+            .unwrap();
+        let replacement_entry = db.claim_next_pending().await.unwrap().expect("claim v3");
+        run_document_enrichment(
+            &db,
+            &replacement_entry,
+            None,
+            None,
+            &PromptRegistry::default(),
+        )
+        .await;
+
+        let stored = db
+            .get_memories_by_source_id("memory", &source_id)
+            .await
+            .unwrap();
+        assert!(!stored.is_empty());
+        let (stored_spaces, stored_versions) = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT space, version FROM memories
+                     WHERE source = 'memory' AND source_id = ?1
+                     ORDER BY chunk_index",
+                    libsql::params![source_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let mut spaces = Vec::new();
+            let mut versions = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                spaces.push(row.get::<String>(0).unwrap());
+                versions.push(row.get::<i64>(1).unwrap());
+            }
+            (spaces, versions)
+        };
+        assert!(
+            stored_spaces.iter().all(|space| space == "m4-live"),
+            "replacement without an explicit space must preserve the assigned space"
+        );
+        assert!(
+            stored_versions.iter().all(|version| *version == 3),
+            "v1 ingest + v2 assignment + replacement must produce v3"
+        );
+        assert!(
+            db.list_relations_between(&from, &to)
+                .await
+                .unwrap()
+                .is_empty(),
+            "semantic replacement must delete the old source-owned relation"
+        );
+        assert!(
+            db.edge_snapshot_for_test(&edge_id).await.unwrap()["valid_until"].is_number(),
+            "semantic replacement must soft-invalidate the old source-owned edge"
+        );
+    }
+
     // ── integration: kill after 2 chunks (drop), then resume from checkpoint ──
 
     #[tokio::test]

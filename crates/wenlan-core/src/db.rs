@@ -16931,11 +16931,12 @@ impl MemoryDB {
             // under the same write transaction as delete + insert. Fresh
             // sources begin at v1; semantic replacements advance old + 1.
             let mut replacement_versions: HashMap<(String, String), i64> = HashMap::new();
+            let mut replacement_spaces: HashMap<(String, String), String> = HashMap::new();
             let mut changed_page_sources: HashSet<String> = HashSet::new();
             for (source, source_id) in &source_ids_to_delete {
                 let mut rows = conn
                     .query(
-                        "SELECT MAX(version) FROM memories
+                        "SELECT MAX(version), MAX(space) FROM memories
                          WHERE source = ?1 AND source_id = ?2",
                         libsql::params![source.clone(), source_id.clone()],
                     )
@@ -16943,21 +16944,43 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("read replacement version: {e}"))
                     })?;
-                let old_version = rows
-                    .next()
-                    .await
-                    .map_err(|e| {
-                        WenlanError::VectorDb(format!("read replacement version row: {e}"))
-                    })?
-                    .and_then(|row| row.get::<Option<i64>>(0).ok().flatten());
+                let (old_version, old_space) = match rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("read replacement version row: {e}"))
+                })? {
+                    Some(row) => (
+                        row.get::<Option<i64>>(0).ok().flatten(),
+                        row.get::<Option<String>>(1).ok().flatten(),
+                    ),
+                    None => (None, None),
+                };
                 if old_version.is_some() && source != "episode" {
                     changed_page_sources.insert(source_id.clone());
+                }
+                if let Some(old_space) = old_space {
+                    replacement_spaces
+                        .insert((source.clone(), source_id.clone()), old_space);
                 }
                 replacement_versions.insert(
                     (source.clone(), source_id.clone()),
                     old_version.map_or(1, |version| version.saturating_add(1)),
                 );
             }
+            let effective_memory_spaces: HashMap<String, String> = docs
+                .iter()
+                .filter(|doc| doc.source == "memory")
+                .map(|doc| {
+                    let space = doc
+                        .space
+                        .clone()
+                        .or_else(|| {
+                            replacement_spaces
+                                .get(&("memory".to_string(), doc.source_id.clone()))
+                                .cloned()
+                        })
+                        .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
+                    (doc.source_id.clone(), space)
+                })
+                .collect();
             let replaced_sources: Vec<(String, String)> = source_ids_to_delete
                 .iter()
                 .filter(|(source, _)| source != "episode")
@@ -17032,14 +17055,22 @@ impl MemoryDB {
                     .memory_type
                     .map(|s| s.into())
                     .unwrap_or(libsql::Value::Null);
-                // M3 PR-1 stage e: `space` is NOT NULL as of migration 91 --
-                // an unset doc.space folds to the reserved sentinel here
-                // rather than landing NULL. Covers both source='memory' rows
-                // and their co-written source='episode' rows (both flow
-                // through this one loop; see `memory_rows.extend(episode_rows)`
-                // above).
+                // An explicit replacement space is authoritative. When omitted,
+                // inherit the source-wide assignment read inside this replacement
+                // transaction; only a fresh unscoped source folds to the sentinel.
                 let space_val: libsql::Value = row
                     .space
+                    .or_else(|| match row.source.as_str() {
+                        "memory" | "episode" => {
+                            effective_memory_spaces.get(&row.source_id).cloned()
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        replacement_spaces
+                            .get(&(row.source.clone(), row.source_id.clone()))
+                            .cloned()
+                    })
                     .unwrap_or_else(|| UNFILED_SPACE_ID.to_string())
                     .into();
                 let source_agent_val: libsql::Value = row
@@ -17201,14 +17232,10 @@ impl MemoryDB {
             for doc in &docs {
                 if let Some(ref superseded_id) = doc.supersedes {
                     if !doc.pending_revision {
-                        // M3 PR-1 stage e: `space` is NOT NULL as of migration
-                        // 85 -- match the same fold the row insert above
-                        // applies (an unset doc.space lands as the sentinel,
-                        // never NULL), so this comparison still matches the
-                        // superseded row.
-                        let superseder_space = doc
-                            .space
-                            .clone()
+                        let superseder_space = effective_memory_spaces
+                            .get(&doc.source_id)
+                            .cloned()
+                            .or_else(|| doc.space.clone())
                             .unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
                         conn.execute(
                             "UPDATE memories SET confirmed = 0
@@ -46133,6 +46160,182 @@ pub(crate) mod tests {
             memories_after_retry[0].content,
             "Replacement content must not partially overwrite the original."
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_new_episode_inherits_the_parent_assigned_space() {
+        let (db, _dir) = test_db().await;
+        let initial = make_doc(
+            "memory",
+            "episode-space-transition",
+            "Initial document",
+            "The initial document generation has enough words for an episode but keeps it disabled.",
+        );
+        db.upsert_documents_with_derived_channels_for_test(vec![initial], false, false)
+            .await
+            .unwrap();
+        db.update_memory_space("episode-space-transition", "m4-live")
+            .await
+            .unwrap();
+
+        let replacement = make_doc(
+            "memory",
+            "episode-space-transition",
+            "Replacement document",
+            "transitionepisodetoken appears in this replacement generation with enough words to create a new episode.",
+        );
+        assert!(replacement.space.is_none());
+        db.upsert_documents_with_derived_channels_for_test(vec![replacement], true, false)
+            .await
+            .unwrap();
+
+        let (parent_space, episode_space) = {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT source, space FROM memories
+                     WHERE source_id = 'episode-space-transition'
+                     ORDER BY source",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut parent_space = None;
+            let mut episode_space = None;
+            while let Some(row) = rows.next().await.unwrap() {
+                let source: String = row.get(0).unwrap();
+                let space: String = row.get(1).unwrap();
+                match source.as_str() {
+                    "memory" => parent_space = Some(space),
+                    "episode" => episode_space = Some(space),
+                    _ => {}
+                }
+            }
+            (parent_space, episode_space)
+        };
+        assert_eq!(parent_space.as_deref(), Some("m4-live"));
+        assert_eq!(
+            episode_space, parent_space,
+            "a newly derived episode must inherit its replacement parent's effective space"
+        );
+
+        let in_scope = db
+            .search_episodes_scoped(
+                "transitionepisodetoken",
+                10,
+                &ReadScope::Space("m4-live".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            in_scope
+                .iter()
+                .any(|hit| hit.source_id == "episode-space-transition"),
+            "the new episode must be retrievable in the parent's assigned space"
+        );
+        let wrong_scope = db
+            .search_episodes_scoped(
+                "transitionepisodetoken",
+                10,
+                &ReadScope::Space("other-space".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_scope
+                .iter()
+                .all(|hit| hit.source_id != "episode-space-transition"),
+            "the new episode must not leak into another space"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_supersession_uses_the_inherited_space() {
+        let (db, _dir) = test_db().await;
+        let mut target = make_memory_doc(
+            "supersession-target",
+            "The original scoped preference remains confirmed until replaced.",
+            "preference",
+            "m4-live",
+            "test",
+        );
+        target.confirmed = Some(true);
+        db.upsert_documents(vec![target]).await.unwrap();
+
+        let initial_superseder = make_doc(
+            "memory",
+            "supersession-replacement",
+            "Initial superseder",
+            "The initial superseder generation does not yet replace the target.",
+        );
+        db.upsert_documents(vec![initial_superseder]).await.unwrap();
+        db.update_memory_space("supersession-replacement", "m4-live")
+            .await
+            .unwrap();
+
+        let mut replacement = make_doc(
+            "memory",
+            "supersession-replacement",
+            "Replacement superseder",
+            "The replacement generation now supersedes the original scoped preference.",
+        );
+        replacement.supersedes = Some("supersession-target".to_string());
+        assert!(replacement.space.is_none());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT confirmed FROM memories
+                 WHERE source = 'memory'
+                   AND source_id = 'supersession-target'
+                   AND space = 'm4-live'",
+                (),
+            )
+            .await
+            .unwrap();
+        let confirmed: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            confirmed, 0,
+            "an omitted-space replacement must suppress its target in the inherited scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_replacement_space_overrides_the_inherited_space() {
+        let (db, _dir) = test_db().await;
+        let initial = make_doc(
+            "memory",
+            "explicit-replacement-space",
+            "Initial document",
+            "Initial content before an explicit replacement space is supplied.",
+        );
+        db.upsert_documents(vec![initial]).await.unwrap();
+        db.update_memory_space("explicit-replacement-space", "m4-live")
+            .await
+            .unwrap();
+
+        let mut replacement = make_doc(
+            "memory",
+            "explicit-replacement-space",
+            "Replacement document",
+            "Replacement content with an explicitly authoritative space.",
+        );
+        replacement.space = Some("explicit-space".to_string());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT space FROM memories
+                 WHERE source = 'memory' AND source_id = 'explicit-replacement-space'",
+                (),
+            )
+            .await
+            .unwrap();
+        let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(space, "explicit-space");
+        assert!(rows.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
