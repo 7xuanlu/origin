@@ -1,18 +1,28 @@
-# M4 gate-stage receipt — Gate 1 + Gate 2.1–2.3
+# M4 gate-stage receipt — Gate 1 + Gate 2
 
 **Date:** 2026-07-26
 **Branch:** `kg-m4-communities-shadow`
 **Stage-0 base commit:** `430ee7d2`
-**Verdict:** Gate 1 is
+**Closed:** 2026-07-27 on local live-tested candidate `597760ac`, with the subsequent
+ambiguity repair still uncommitted.
+**Verdict:** `PASS — Gate 1.1–1.5 and Gate 2.1–2.4 MET`.
+**Publication boundary:** the live-tested candidate and subsequent ambiguity repair are
+local-only. PR #395 remains at remote `a5d985bc`; the two repair commits and current
+uncommitted changes are not included in that PR or its CI.
+
+The provisional history below is preserved as recorded. Its pending Gate 1.4 and Gate 2.4
+language is superseded by the 2026-07-27 live-closure addendum.
+
+**Prior provisional verdict (2026-07-26):** Gate 1 was
 `PROVISIONAL PASS — 1.1–1.3 and 1.5 MET; 1.4 SELECT preflight MET, real job pending PR-1`.
-Gate 2 is
+Gate 2 was
 `PROVISIONAL PASS — 2.1–2.3 MET, 2.4 pending PR-1`.
 
-Gate 1.4 keeps its authored cumulative mutex and transaction-structure bars. Gate 2.4 keeps
+Gate 1.4 kept its authored cumulative mutex and transaction-structure bars. Gate 2.4 kept
 its authored `≤ 1 cycle` common / `≤ 2 cycles` worst-case bar. Per the sequencing rulings
-in `2026-07-25-m4-gate-criteria.md`, the first PR-1 persistence commit must be the RED
+in `2026-07-25-m4-gate-criteria.md`, the first PR-1 persistence commit had to be the RED
 integration test against the real lease + generation-CAS job and published
-`community_members` snapshot. Neither gate is final until that test is GREEN.
+`community_members` snapshot. Neither gate was final until that test was GREEN.
 
 ## Candidate and corpus
 
@@ -166,3 +176,155 @@ The production composer is now implemented. The post-review closure run produced
 
 Gate 1.3 remains a partition-only RSS receipt. The production composer reports elapsed time
 and row counts, but PR-1 does not measure or claim whole-snapshot composer peak RSS.
+
+## 2026-07-27 live-closure addendum
+
+### Repaired local candidate
+
+- Worktree: `/private/tmp/wenlan-m4-pr1-live-a5d985bc`
+- Branch: `kg-m4-communities-shadow`
+- Live-test baseline, clean before this receipt-only edit:
+  `597760ac8cf6bc60b6a064617f566e5a50dda344`
+- `target/debug/wenlan-server` SHA-256:
+  `d7d9ac5505039fd609b92972ee9184c49c2a1d211701bd962c90f344e2302203`
+- Repair `b7c22ce6932f06577e33dcab24a54c1a8deb5ac7` holds undersized spaces
+  without publishing an invalid snapshot and advances the durable selection cursor so a
+  held space cannot starve a later viable space.
+- Repair `597760ac8cf6bc60b6a064617f566e5a50dda344` preserves a document's
+  effective space across semantic replacement.
+- The subsequent uncommitted repair rejects an omitted-space replacement when the exact
+  existing `(source, source_id)` rows disagree on space or contain any NULL space. The
+  rejection occurs before page marking, projection invalidation, child deletion, or memory
+  deletion; an explicit incoming space remains authoritative and can heal the old ambiguity.
+
+The first positive live attempt exposed a real product bug rather than proving closure:
+document replacement omitted the assigned space, reset the source to `unfiled`, and
+invalidated the grounded projection. The daemon was formally shut down before repair.
+The RED-first replacement repair proves that an explicit replacement space wins, a fresh
+source with no space still lands in `unfiled`, derived episodes inherit the parent's
+effective space, and supersession uses that same effective space.
+
+An earlier independent review of the document-space repair through `597760ac` returned
+`APPROVE`. That review preceded the later full unpublished-delta review, which found the
+mixed-space replacement ambiguity. After the local fix, the independent full
+unpublished-delta closure review returned `APPROVE`: all prior findings were resolved and
+it found no new findings.
+Fresh verification after the uncommitted ambiguity repair reported:
+
+- focused conflicting-space regressions: `2 passed`;
+- focused `replacement_` run: `15 passed`;
+- first core library run: `3,079 passed; 1 failed; 33 ignored`, with the already-observed
+  transient libSQL fixture failure
+  `online_backup integrity: SQLite failure: bad parameter or other API misuse` in
+  `reconcile_detects_map_row_whose_page_is_not_live`;
+- immediate isolated rerun of that test: `1 passed`;
+- fresh full core library rerun: `3,080 passed; 0 failed; 33 ignored`;
+- M4 gate target: `20 passed; 4 skipped`;
+- Clippy with `-D warnings`, formatting, and diff whitespace checks: green.
+
+### Isolated live contract
+
+- Data root: `/private/tmp/wenlan-m4-pr1-data-597760ac-v3`
+- Watched source:
+  `/private/tmp/wenlan-m4-pr1-source-597760ac-v3`
+- Bind: `127.0.0.1:7879`
+- Common environment: `WENLAN_LLM_DEVICE=auto`; entity sweep, document reconciliation,
+  and citation backfill disabled; no synthetic idle or admission overrides.
+- M3g leg: edge-grounding promotion enabled and Leiden grouping disabled.
+- M4 leg: edge-grounding promotion disabled and Leiden grouping enabled.
+- Routing config: `everyday_source=on_device`, `synthesis_source=on_device`,
+  `on_device_model=qwen3-4b`.
+- Health/version: `0.15.0+g597760ac`.
+- Runtime: Metal on Apple M2 Pro with `gpu_layers=99`.
+
+The M3g leg proves isolated production ambient admission for edge-grounding promotion. The
+M4 leg proves production publication through the public `POST /api/steep` surface. Neither
+leg proves default-on contention or fairness under a competing production workload.
+
+### Positive M3g grounding leg
+
+The source memory was
+`directory-wenlan-m4-pr1-source-597760ac-v3::/private/tmp/wenlan-m4-pr1-source-597760ac-v3/grounded-community-source.md`.
+Its final stored state was version `3`, space `m4-live`, source agent `folder`, and content
+hash `1113696816ca1d41f732d9be97051035bfd3b484fe4a3e92fca3f115d9647db2`.
+The document queue was `done` with `attempt_count=0`, and all five source evidence
+sentences remained present.
+
+Before grounding, the public fixture had 10 `m4-live` entities, five relations with rowids
+`1..5` while the grounding cursor was `0`, five active ungrounded assertion edges, and 10
+distinct endpoints. Production ambient admission then recorded five genuine
+`EdgeGroundingPromote selected=true` completions:
+
+| Completion | `llm_calls` | `panicked` |
+|---|---:|---|
+| `2026-07-27T07:27:38.569175Z` | 1 | false |
+| `2026-07-27T07:30:10.428486Z` | 1 | false |
+| `2026-07-27T07:32:42.627356Z` | 1 | false |
+| `2026-07-27T07:35:14.567510Z` | 1 | false |
+| `2026-07-27T07:37:46.475322Z` | 1 | false |
+
+The final projection had five active assertion edges, all five grounded, across 10 distinct
+endpoints. All shared root `2b9b2e2f-e374-4df6-8202-258889ecfe43`, whose state was active
+`document_ingest`. Every grounding payload recorded model id/version `qwen3-4b`, prompt
+`m3g-entailment-v3`, and entailment score `1.0`. The durable cursor was `5`, with
+`stuck_rowid=null` and `failures=0`. The leg ended with a formal shutdown.
+
+### Positive M4 publication and restart leg
+
+On the same database, the pre-state was:
+
+```text
+graph_generation=5
+grouping_generation=5
+published_generation=NULL
+dirty=1
+communities=0
+members=0
+leases=0
+```
+
+`POST /api/steep` returned a `community_detection` phase with
+`items_processed=15`, `duration_ms=2`, and `error=null`; the full steep returned 15 phases
+and zero errors. The persisted post-state was graph/grouping/published generation
+`5/5/5`, `dirty=0`, five active communities, and 10 distinct members arranged as five
+pairs. Every row was generation `5`, algorithm `leiden-m4-v1`, projection
+`grounded-relates-v1`; orphan members and leases were both zero. The sorted logical-row
+SHA-256 was
+`4c5367b3c7e08e6a02cac520c6464d002382c19f1a69c9570497f895fba5575c`.
+
+The canonical pipeline used for each live read was:
+
+```sh
+sqlite3 /private/tmp/wenlan-m4-pr1-data-597760ac-v3/memorydb/origin_memory.db \
+  "SELECT row FROM (
+     SELECT 'C|'||space||'|'||community_id||'|'||coalesce(display_name,'')||'|'||
+            algo_version||'|'||projection_version||'|'||
+            CASE WHEN retired_at IS NULL THEN 'active' ELSE 'retired' END AS row
+       FROM communities
+     UNION ALL
+     SELECT 'M|'||space||'|'||node_id||'|'||node_kind||'|'||community_id||'|'||
+            published_generation||'|'||attachment AS row
+       FROM community_members
+     UNION ALL
+     SELECT 'S|'||space||'|'||graph_generation||'|'||grouping_generation||'|'||
+            coalesce(published_generation,'NULL')||'|'||dirty AS row
+       FROM space_graph_state
+   ) ORDER BY row;" |
+  shasum -a 256
+```
+
+After formal shutdown, an actual second M4 process restarted against the same environment
+and database. Before any mutating request, health was again `0.15.0+g597760ac`. During the
+two live reads, the operator observed the pipeline above return the same hash before and
+after restart; the receipt does not persist both raw command outputs, so replaying the
+surviving database is not independent proof of the pre-restart read. State remained
+`5/5/5`, `dirty=0`, with five communities, 10 members, and zero leases. The second process
+then completed a final formal shutdown, and port `7879` was free.
+
+### Open publication step
+
+The local branch is 11 commits ahead of `origin/main`. Its only commits after the current
+remote candidate `a5d985bc` are `b7c22ce6` and `597760ac`; the ambiguity repair and this
+receipt remain uncommitted. Updating PR #395 waits for explicit user approval; no receipt
+statement should be read as saying that the repairs or their test results are already
+published or covered by remote CI.

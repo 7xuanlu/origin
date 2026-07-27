@@ -16932,11 +16932,19 @@ impl MemoryDB {
             // sources begin at v1; semantic replacements advance old + 1.
             let mut replacement_versions: HashMap<(String, String), i64> = HashMap::new();
             let mut replacement_spaces: HashMap<(String, String), String> = HashMap::new();
+            let explicit_replacement_spaces: HashSet<(String, String)> = docs
+                .iter()
+                .filter(|doc| doc.space.is_some())
+                .map(|doc| (doc.source.clone(), doc.source_id.clone()))
+                .collect();
+            let mut ambiguous_replacement_spaces: HashSet<(String, String)> = HashSet::new();
             let mut changed_page_sources: HashSet<String> = HashSet::new();
             for (source, source_id) in &source_ids_to_delete {
                 let mut rows = conn
                     .query(
-                        "SELECT MAX(version), MAX(space) FROM memories
+                        "SELECT MAX(version), COUNT(*), COUNT(space),
+                                COUNT(DISTINCT space), MIN(space)
+                         FROM memories
                          WHERE source = ?1 AND source_id = ?2",
                         libsql::params![source.clone(), source_id.clone()],
                     )
@@ -16944,21 +16952,46 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("read replacement version: {e}"))
                     })?;
-                let (old_version, old_space) = match rows.next().await.map_err(|e| {
+                let row = rows.next().await.map_err(|e| {
                     WenlanError::VectorDb(format!("read replacement version row: {e}"))
-                })? {
-                    Some(row) => (
-                        row.get::<Option<i64>>(0).ok().flatten(),
-                        row.get::<Option<String>>(1).ok().flatten(),
-                    ),
-                    None => (None, None),
-                };
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb(
+                        "read replacement version row: aggregate returned no row".to_string(),
+                    )
+                })?;
+                let old_version = row.get::<Option<i64>>(0).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement version: {e}"))
+                })?;
+                let total = row.get::<i64>(1).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement row count: {e}"))
+                })?;
+                let non_null_spaces = row.get::<i64>(2).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement non-NULL space count: {e}"))
+                })?;
+                let distinct_spaces = row.get::<i64>(3).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement distinct space count: {e}"))
+                })?;
+                let old_space = row.get::<Option<String>>(4).map_err(|e| {
+                    WenlanError::VectorDb(format!("decode replacement space: {e}"))
+                })?;
                 if old_version.is_some() && source != "episode" {
                     changed_page_sources.insert(source_id.clone());
                 }
-                if let Some(old_space) = old_space {
-                    replacement_spaces
-                        .insert((source.clone(), source_id.clone()), old_space);
+                if total > 0 {
+                    if non_null_spaces == total && distinct_spaces == 1 {
+                        let old_space = old_space.ok_or_else(|| {
+                            WenlanError::VectorDb(format!(
+                                "decode replacement space: aggregate for {source}/{source_id} \
+                                 reported one non-NULL space without a value"
+                            ))
+                        })?;
+                        replacement_spaces
+                            .insert((source.clone(), source_id.clone()), old_space);
+                    } else {
+                        ambiguous_replacement_spaces
+                            .insert((source.clone(), source_id.clone()));
+                    }
                 }
                 replacement_versions.insert(
                     (source.clone(), source_id.clone()),
@@ -16981,6 +17014,22 @@ impl MemoryDB {
                     (doc.source_id.clone(), space)
                 })
                 .collect();
+            for (source, source_id) in &ambiguous_replacement_spaces {
+                let derived_episode_has_parent_space = source == "episode"
+                    && docs
+                        .iter()
+                        .any(|doc| doc.source == "memory" && doc.source_id == *source_id)
+                    && effective_memory_spaces.contains_key(source_id);
+                if !explicit_replacement_spaces
+                    .contains(&(source.clone(), source_id.clone()))
+                    && !derived_episode_has_parent_space
+                {
+                    return Err(WenlanError::Conflict(format!(
+                        "ambiguous replacement space for {source}/{source_id}: \
+                         omitted space cannot inherit from conflicting or NULL existing rows"
+                    )));
+                }
+            }
             let replaced_sources: Vec<(String, String)> = source_ids_to_delete
                 .iter()
                 .filter(|(source, _)| source != "episode")
@@ -46159,6 +46208,128 @@ pub(crate) mod tests {
         assert_eq!(
             memories_after_retry[0].content,
             "Replacement content must not partially overwrite the original."
+        );
+    }
+
+    async fn seed_conflicting_replacement_spaces(
+        db: &MemoryDB,
+        source_id: &str,
+    ) -> Vec<(String, String, Option<String>, i64)> {
+        let original =
+            "Original evidence must remain byte-for-byte available when replacement space inheritance is ambiguous. "
+                .repeat(200);
+        db.upsert_documents(vec![make_doc(
+            "memory",
+            source_id,
+            "Original document",
+            &original,
+        )])
+        .await
+        .unwrap();
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE memories
+                 SET space = CASE WHEN chunk_index = 0 THEN 'alpha-space' ELSE 'zeta-space' END
+                 WHERE source = 'memory' AND source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .unwrap();
+        }
+
+        let inventory = replacement_inventory(db, source_id).await;
+        assert!(
+            inventory.len() > 1,
+            "fixture must cover replacement of multiple chunks"
+        );
+        assert!(
+            inventory
+                .iter()
+                .any(|(_, _, space, _)| space.as_deref() == Some("alpha-space"))
+                && inventory
+                    .iter()
+                    .any(|(_, _, space, _)| space.as_deref() == Some("zeta-space")),
+            "fixture must contain conflicting non-NULL spaces"
+        );
+        inventory
+    }
+
+    async fn replacement_inventory(
+        db: &MemoryDB,
+        source_id: &str,
+    ) -> Vec<(String, String, Option<String>, i64)> {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, space, version
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY id",
+                libsql::params![source_id],
+            )
+            .await
+            .unwrap();
+        let mut inventory = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            inventory.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+                row.get(3).unwrap(),
+            ));
+        }
+        inventory
+    }
+
+    #[tokio::test]
+    async fn omitted_replacement_space_rejects_conflicting_existing_spaces_without_mutation() {
+        let (db, _dir) = test_db().await;
+        let source_id = "ambiguous-replacement-space";
+        let old_inventory = seed_conflicting_replacement_spaces(&db, source_id).await;
+
+        let replacement = make_doc(
+            "memory",
+            source_id,
+            "Replacement document",
+            "Replacement content must be rejected before the old chunks are mutated.",
+        );
+        assert!(replacement.space.is_none());
+        let error = db.upsert_documents(vec![replacement]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("ambiguous replacement space"),
+            "expected an ambiguity error, got {error}"
+        );
+        assert_eq!(
+            replacement_inventory(&db, source_id).await,
+            old_inventory,
+            "an ambiguous omitted-space replacement must preserve every old row exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_replacement_space_heals_conflicting_existing_spaces() {
+        let (db, _dir) = test_db().await;
+        let source_id = "explicit-heals-ambiguous-space";
+        seed_conflicting_replacement_spaces(&db, source_id).await;
+
+        let mut replacement = make_doc(
+            "memory",
+            source_id,
+            "Replacement document",
+            "An explicit incoming space remains authoritative.",
+        );
+        replacement.space = Some("healed-space".to_string());
+        db.upsert_documents(vec![replacement]).await.unwrap();
+
+        let inventory = replacement_inventory(&db, source_id).await;
+        assert!(!inventory.is_empty());
+        assert!(
+            inventory.iter().all(
+                |(_, _, space, version)| space.as_deref() == Some("healed-space") && *version == 2
+            ),
+            "the explicit replacement must heal every new chunk into its authoritative space"
         );
     }
 
