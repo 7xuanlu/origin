@@ -4,7 +4,7 @@ description: >
   List or open distilled Wenlan pages from Codex by delegating to the local
   `wenlan pages` CLI. Invoked as /pages [query].
 argument-hint: "[query]"
-allowed-tools: ["Bash"]
+allowed-tools: ["Bash", "mcp__wenlan__get_page_revisions"]
 user-invocable: true
 ---
 
@@ -81,6 +81,25 @@ fi
 Print the newest topics exactly as the CLI returns them. The CLI caps the list
 by default and prints `--limit 0` when the user wants all topics. Tell the user
 to run `/pages <query>` to open one.
+
+## Explicit changelog lookup
+
+Only when the user explicitly asks for a page's changelog or version history,
+resolve its stable id without reading the page body. Resolve the page ID first
+with `wenlan pages "<query-or-filename>" --resolve-id`.
+
+```bash
+"$W" pages "<query-or-filename>" --resolve-id
+```
+
+If several pages match, ask the user to narrow by filename and rerun the
+resolver. Then call:
+
+```text
+mcp__wenlan__get_page_revisions(page_id="<page-id>")
+```
+
+Do not fetch changelogs during ordinary `/pages` list/open flows.
 
 ## When not to use
 

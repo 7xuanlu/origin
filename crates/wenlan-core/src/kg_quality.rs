@@ -1190,9 +1190,8 @@ mod tests {
             assert_eq!(smid, "mem_123", "source_memory_id should be mem_123");
         }
 
-        // Upsert with lower confidence and source_memory_id "mem_456"
-        // The ON CONFLICT clause uses COALESCE(EXCLUDED.source_memory_id, source_memory_id),
-        // meaning a non-null new source_memory_id always overwrites, regardless of confidence.
+        // Upsert with lower confidence and source_memory_id "mem_456".
+        // Relation provenance is fill-only: the first non-null source remains.
         db.create_relation(
             &e1,
             &e2,
@@ -1205,10 +1204,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Per the actual SQL: source_memory_id = COALESCE(EXCLUDED.source_memory_id, source_memory_id)
-        // A non-null EXCLUDED.source_memory_id always wins, so this should be "mem_456".
-        // (The test spec expected "mem_123" to remain, but the implementation always updates
-        // source_memory_id when the new value is non-null, independent of confidence.)
         {
             let conn = db.conn.lock().await;
             let mut rows = conn
@@ -1226,10 +1221,9 @@ mod tests {
                 (conf - 0.8).abs() < 1e-6,
                 "confidence should remain 0.8 after lower-confidence upsert, got {conf}"
             );
-            // source_memory_id per COALESCE behavior: "mem_456" overwrites because it's non-null
             assert_eq!(
-                smid, "mem_456",
-                "source_memory_id should be mem_456 (COALESCE always takes non-null new value)"
+                smid, "mem_123",
+                "source_memory_id should preserve the first non-null source"
             );
         }
 
@@ -1246,7 +1240,7 @@ mod tests {
         .await
         .unwrap();
 
-        // After higher-confidence update, source_memory_id should be "mem_789"
+        // Higher confidence updates the score, but not existing provenance.
         {
             let conn = db.conn.lock().await;
             let mut rows = conn
@@ -1264,8 +1258,8 @@ mod tests {
                 "confidence should be 0.95 after higher-confidence upsert, got {conf}"
             );
             assert_eq!(
-                smid, "mem_789",
-                "source_memory_id should be mem_789 after higher-confidence upsert"
+                smid, "mem_123",
+                "source_memory_id should remain mem_123 after higher-confidence upsert"
             );
         }
     }

@@ -2758,6 +2758,7 @@ END;
 pub struct MemoryDB {
     pub(crate) _db: libsql::Database,
     pub(crate) conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
+    entity_resolution_lock: tokio::sync::Mutex<()>,
     pub(crate) lint_freshness: Arc<crate::lint::snapshot::LintFreshnessClock>,
     page_projection_tracker: Arc<crate::page_projection_tracker::PageProjectionTracker>,
     pub(crate) derived_artifact_state: Arc<crate::derived_artifact_state::DerivedArtifactState>,
@@ -2877,6 +2878,7 @@ impl MemoryDB {
         Ok(Self {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3076,6 +3078,7 @@ impl MemoryDB {
         let instance = Self {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -3159,6 +3162,7 @@ impl MemoryDB {
         let instance = Self {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -12403,30 +12407,23 @@ impl MemoryDB {
         )
     }
 
-    /// Test-only: re-assert the same (from,to,type) triple from a DIFFERENT
-    /// source memory via the REAL `create_relation` upsert, so the §C2
-    /// linkage-move race test can simulate a same-triple re-assert landing DURING
-    /// entailment. The ON CONFLICT COALESCE moves `source_memory_id` to
-    /// `new_source_id` while keeping the SAME `relations.id` — the flip's
-    /// `source_memory_id` term must then reject the stale verdict.
+    /// Test-only: move an existing relation to a different source while keeping
+    /// the same relation id, so the §C2 linkage guard can exercise a concurrent
+    /// provenance migration independently of create-retry semantics.
     #[cfg(test)]
-    pub(crate) async fn reassert_relation_from_other_source_for_test(
+    pub(crate) async fn move_relation_linkage_for_test(
         &self,
         old_source_id: &str,
         new_source_id: &str,
     ) {
-        let (_id, from, to, rt) = self.relation_triple_for_test(old_source_id).await;
-        self.create_relation(
-            &from,
-            &to,
-            &rt,
-            Some("post_ingest"),
-            Some(0.99),
-            None,
-            Some(new_source_id),
+        let (id, _, _, _) = self.relation_triple_for_test(old_source_id).await;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE relations SET source_memory_id = ?1 WHERE id = ?2",
+            libsql::params![new_source_id, id],
         )
         .await
-        .expect("test re-assert relation from other source");
+        .expect("test move relation linkage");
     }
 
     /// Test-only: supersede-then-reactivate the relation for `source_id` via the
@@ -24977,6 +24974,7 @@ impl MemoryDB {
         source_agent: Option<&str>,
         confidence: Option<f32>,
     ) -> Result<(String, bool), WenlanError> {
+        let _resolution_guard = self.entity_resolution_lock.lock().await;
         let name_lower = name.to_lowercase();
 
         // Step 1: alias lookup (exact, case-insensitive).
@@ -26244,7 +26242,7 @@ impl MemoryDB {
                      explanation = CASE
                          WHEN EXCLUDED.confidence IS NOT NULL AND (confidence IS NULL OR EXCLUDED.confidence > confidence)
                          THEN COALESCE(EXCLUDED.explanation, explanation) ELSE explanation END,
-                     source_memory_id = COALESCE(EXCLUDED.source_memory_id, source_memory_id)",
+                     source_memory_id = COALESCE(source_memory_id, EXCLUDED.source_memory_id)",
                 libsql::params![
                     id.clone(),
                     from_entity.to_string(),
@@ -44971,6 +44969,7 @@ pub(crate) mod tests {
         let memory_db = MemoryDB {
             _db: db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -50460,6 +50459,84 @@ pub(crate) mod tests {
 
         assert!(!created, "alias match must resolve, not create");
         assert_eq!(id, existing_id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_or_create_entity_converges_on_one_identity() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        // Hold the connection until both tasks are queued at the first lookup.
+        // Tokio's fair mutex then alternates the old multi-lock cascade,
+        // deterministically exposing the resolve-then-create race.
+        let conn_guard = db.conn.lock().await;
+
+        let spawn_resolve = |db: Arc<MemoryDB>, barrier: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                db.resolve_or_create_entity(
+                    "Concurrent Canonical Entity",
+                    "concept",
+                    None,
+                    Some("test"),
+                    None,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        let first = spawn_resolve(Arc::clone(&db), Arc::clone(&barrier));
+        let second = spawn_resolve(Arc::clone(&db), Arc::clone(&barrier));
+        barrier.wait().await;
+        tokio::task::yield_now().await;
+        drop(conn_guard);
+
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.0, second.0, "both callers must receive one id");
+        assert_eq!(
+            usize::from(first.1) + usize::from(second.1),
+            1,
+            "exactly one caller must report created=true"
+        );
+
+        let conn = db.conn.lock().await;
+        let mut entity_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM entities WHERE name = ?1",
+                libsql::params!["Concurrent Canonical Entity"],
+            )
+            .await
+            .unwrap();
+        let entity_count = entity_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        drop(entity_rows);
+        let mut shadow_rows = conn
+            .query(
+                "SELECT COUNT(*)
+                 FROM entity_page_map m
+                 JOIN entities e ON e.id = m.entity_id
+                 JOIN pages p ON p.id = m.page_id
+                 WHERE e.name = ?1 AND p.kind = 'entity' AND p.status = 'active'",
+                libsql::params!["Concurrent Canonical Entity"],
+            )
+            .await
+            .unwrap();
+        let shadow_count = shadow_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(entity_count, 1, "one canonical entity row");
+        assert_eq!(shadow_count, 1, "one live shadow identity");
     }
 
     /// Differential oracle (discipline floor): both real callers must mint
@@ -78018,6 +78095,7 @@ pub(crate) mod tests {
         let db = MemoryDB {
             _db: raw_db,
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            entity_resolution_lock: tokio::sync::Mutex::new(()),
             lint_freshness,
             page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
             derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
@@ -85782,6 +85860,107 @@ pub(crate) mod tests {
         assert_eq!(
             payload["prompt_version"],
             serde_json::json!(crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_backed_relation_retry_preserves_original_relation_and_edge_provenance() {
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .create_entity("Alice", "person", Some("space_a"))
+            .await
+            .unwrap();
+        let e2 = db
+            .create_entity("Acme", "org", Some("space_a"))
+            .await
+            .unwrap();
+        let content_a = "Alice works at Acme.";
+        let content_b = "Acme employs Alice.";
+        seed_memory_with_source_id_and_space(&db, "mem_a", content_a, "space_a").await;
+        seed_memory_with_source_id_and_space(&db, "mem_b", content_b, "space_a").await;
+
+        let first_id = db
+            .create_relation_with_span(
+                &e1,
+                &e2,
+                "works_at",
+                Some("extractor"),
+                Some(0.8),
+                None,
+                Some("mem_a"),
+                Some(content_a),
+                Some(content_a),
+                Some("model-a"),
+                Some("prompt-a"),
+            )
+            .await
+            .unwrap();
+        let retry_id = db
+            .create_relation_with_span(
+                &e1,
+                &e2,
+                "works_at",
+                Some("extractor"),
+                Some(0.9),
+                None,
+                Some("mem_b"),
+                Some(content_b),
+                Some(content_b),
+                Some("model-b"),
+                Some("prompt-b"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_id, first_id, "retry must converge on one relation");
+
+        let conn = db.conn.lock().await;
+        let mut relation_rows = conn
+            .query(
+                "SELECT source_memory_id FROM relations WHERE id = ?1",
+                libsql::params![first_id],
+            )
+            .await
+            .unwrap();
+        let relation_source: String = relation_rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relation row")
+            .get(0)
+            .unwrap();
+        drop(relation_rows);
+
+        let mut edge_rows = conn
+            .query(
+                "SELECT payload FROM edges
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![e1, e2],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = edge_rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect("extraction edge payload");
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        let edge_source = payload["source_memory_id"].as_str().unwrap();
+
+        assert_eq!(relation_source, "mem_a");
+        assert_eq!(edge_source, "mem_a");
+        assert_eq!(payload["span"]["quote"], serde_json::json!(content_a));
+        assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+        assert_eq!(
+            payload["span"]["char_end"],
+            serde_json::json!(content_a.chars().count())
+        );
+        assert_eq!(payload["model_version"], serde_json::json!("model-a"));
+        assert_eq!(payload["prompt_version"], serde_json::json!("prompt-a"));
+        assert_eq!(
+            relation_source, edge_source,
+            "relation and extraction edge provenance must agree after retry"
         );
     }
 

@@ -61,7 +61,7 @@ LINT_SHARED_GUARDRAILS = [
     "Do not compare General and Deep Page digests across profiles because their Page scan coverage intentionally differs.",
     "Lead repair output with exactly one compact typed-count funnel",
     "Never substitute check, family, or candidate counts for occurrence counts",
-    "no CLI or HTTP fallback",
+    "CLI fallback: `wenlan lint --profile deep --agent-assist`",
     "global",
     "uncategorized",
     "Plain `/lint`, `/lint deep`, the lint MCP tool, and `/api/lint` are fully read-only",
@@ -97,13 +97,70 @@ LINT_SHARED_GUARDRAILS = [
     "Never call `apply_lint_repair` in the same turn as `prepare_lint_repair_plan`",
     "applied_unverified",
     "Match every line byte-for-byte",
-    "no CLI or HTTP fallback",
+    "the MCP repair-manifest tools have no CLI equivalent yet",
+]
+PAGES_SHARED_GUARDRAILS = [
+    'Resolve the page ID first with `wenlan pages "<query-or-filename>" --resolve-id`.',
 ]
 ENRICHMENT_CONSENT_GUARDRAILS = [
     "wenlan enrichment status",
     "wenlan enrichment configure --everyday <source> --synthesis <source>",
     "wenlan enrichment disable",
 ]
+
+
+def validate_capture_relation_flow(
+    root: Path,
+    surface: str,
+    skill_path: Path,
+    expected_prefix: str,
+    text: str,
+) -> None:
+    def tool(name: str) -> str:
+        return name if surface == "claude" else f"{expected_prefix}{name}"
+
+    steps = [
+        (
+            f"1. Call `{tool('create_entity')}` for both named endpoints first "
+            "and collect their stable ids."
+        ),
+        (
+            f"2. Call `{tool('capture')}` with the complete relation statement "
+            "and pass the primary entity name as `entity` so the memory resolves "
+            "and links to it."
+        ),
+        (
+            f"3. Call `{tool('create_relation')}` with `from_entity_id`, "
+            "`to_entity_id`, `relation_type`, and the capture result's required "
+            "`source_memory_id`."
+        ),
+    ]
+    normalized_text = " ".join(text.split())
+    positions = []
+    for step in steps:
+        position = normalized_text.find(step)
+        if position < 0:
+            fail(
+                f"{rel(root, skill_path)} must contain ordered relation step "
+                f"{step!r}"
+            )
+        positions.append(position)
+    if positions != sorted(positions):
+        fail(
+            f"{rel(root, skill_path)} must resolve entities, capture the linked "
+            "memory, then create the relation"
+        )
+    policies = [
+        "only when the user explicitly states a durable relation",
+        f"Do not call `{tool('create_entity')}` for ordinary captures.",
+        "Never infer a relation the user did not state.",
+    ]
+    for policy in policies:
+        if policy not in normalized_text:
+            fail(
+                f"{rel(root, skill_path)} must contain relation policy "
+                f"{policy!r}"
+            )
 
 
 def fail(message: str) -> None:
@@ -412,6 +469,79 @@ def validate_skill_surface(
             fail(f"{rel(root, skill_path)} contains unexpected MCP tools: {wrong_tools}")
         if mcp_tools and not any(token.startswith(expected_prefix) for token in mcp_tools):
             fail(f"{rel(root, skill_path)} must use MCP prefix {expected_prefix!r}")
+        if name == "capture":
+            validate_capture_relation_flow(
+                root,
+                surface,
+                skill_path,
+                expected_prefix,
+                text,
+            )
+        if name == "curate":
+            require_equal(
+                f"{rel(root, skill_path)} argument-hint",
+                frontmatter.get("argument-hint"),
+                "captures | revisions | refinements",
+            )
+            try:
+                allowed_tools = json.loads(frontmatter.get("allowed-tools", ""))
+            except json.JSONDecodeError:
+                fail(f"{rel(root, skill_path)} allowed-tools must be a JSON array")
+            expected_allowed_tools = {
+                "Bash",
+                f"{expected_prefix}list_pending",
+                f"{expected_prefix}confirm_memory",
+                f"{expected_prefix}forget",
+                f"{expected_prefix}capture",
+                f"{expected_prefix}recall",
+                f"{expected_prefix}list_refinements",
+                f"{expected_prefix}accept_refinement",
+                f"{expected_prefix}reject_refinement",
+            }
+            if surface == "claude":
+                expected_allowed_tools.add("AskUserQuestion")
+            if (
+                not isinstance(allowed_tools, list)
+                or len(allowed_tools) != len(expected_allowed_tools)
+                or set(allowed_tools) != expected_allowed_tools
+            ):
+                fail(
+                    f"{rel(root, skill_path)} allowed-tools must be exactly "
+                    f"{sorted(expected_allowed_tools)!r}"
+                )
+            normalized_text = " ".join(text.split())
+            lint_repair_guardrail = (
+                "A generic accept does not apply `lint_repair_review`; route that "
+                "action through `/lint repair` instead."
+                if surface == "claude"
+                else "Do not generically accept `lint_repair_review`; route it "
+                "through `/lint repair`."
+            )
+            guardrails = [
+                (
+                    "Use `/curate refinements` only when the user explicitly asks "
+                    "to inspect or review the daemon proposal/refinement queue."
+                ),
+                "Never poll the refinement queue ambiently.",
+                (
+                    f"List first with `{expected_prefix}list_refinements(limit=50)` "
+                    "and show at most four items."
+                ),
+                (
+                    "Perform no mutation until the user gives an unambiguous "
+                    "item-level accept or reject decision."
+                ),
+                "Skip or cancel is a no-op.",
+                "Re-list after every mutation batch.",
+                "`vocab_promote`",
+                lint_repair_guardrail,
+            ]
+            for guardrail in guardrails:
+                if guardrail not in normalized_text:
+                    fail(
+                        f"{rel(root, skill_path)} must contain refinement guardrail "
+                        f"{guardrail!r}"
+                    )
         if name == "lint":
             require_equal(
                 f"{rel(root, skill_path)} argument-hint",
@@ -462,6 +592,11 @@ def validate_skill_surface(
             )
             if resolver not in text:
                 fail(f"{rel(root, skill_path)} must use {resolver}")
+        if name == "pages":
+            normalized_text = " ".join(text.split())
+            for needle in PAGES_SHARED_GUARDRAILS:
+                if needle not in normalized_text:
+                    fail(f"{rel(root, skill_path)} must contain guardrail {needle!r}")
         if name == "help" and "/lint [deep|repair] [scope]" not in text:
             fail(f"{rel(root, skill_path)} must advertise the unified lint grammar")
         if name in {"help", "setup"}:

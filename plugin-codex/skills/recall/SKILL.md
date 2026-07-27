@@ -4,7 +4,7 @@ description: >
   Search Wenlan's local memory from Codex by query. Targeted lookup, not
   session orientation. Invoked as /recall <query>.
 argument-hint: "<query>"
-allowed-tools: ["Bash", "mcp__wenlan__recall"]
+allowed-tools: ["Bash", "mcp__wenlan__recall", "mcp__wenlan__get_memory_revisions"]
 user-invocable: true
 ---
 
@@ -91,6 +91,15 @@ Render revision context only when it matters:
 
 Skip that tag line when the memory is a fresh v1 with no merge or pending
 revision fields.
+
+Only when the user explicitly asks for one memory's history or evolution, or
+whether a correction was recorded, call:
+
+```text
+mcp__wenlan__get_memory_revisions(memory_id="<source_id>")
+```
+
+Do not fetch revision chains for ordinary recall results.
 
 ## When to use
 

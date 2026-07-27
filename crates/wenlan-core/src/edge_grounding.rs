@@ -881,9 +881,9 @@ mod tests {
         SupersedeEdge,
         /// Concurrent source edit: rewrite the source memory's chunk-0 content.
         EditSource,
-        /// Same-triple re-assert from a DIFFERENT source: the ON CONFLICT upsert
-        /// moves `source_memory_id` while the `relations.id` stays fixed. The
-        /// linkage guard's `source_memory_id` term must reject the stale verdict.
+        /// Concurrent provenance migration to a different source while the
+        /// `relations.id` stays fixed. The linkage guard's `source_memory_id`
+        /// term must reject the stale verdict.
         MoveLinkage { new_source_id: String },
         /// Supersede-then-reactivate: delete + re-add the relation, minting a
         /// FRESH `relations.id` while the edge is reactivated active. The linkage
@@ -921,10 +921,7 @@ mod tests {
                 }
                 StaleMutation::MoveLinkage { new_source_id } => {
                     self.db
-                        .reassert_relation_from_other_source_for_test(
-                            &self.source_id,
-                            new_source_id,
-                        )
+                        .move_relation_linkage_for_test(&self.source_id, new_source_id)
                         .await;
                 }
                 StaleMutation::SupersedeReactivate => {
@@ -1652,7 +1649,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_evidence_linkage_move_during_entailment_grounds_nothing() {
-        // §C2 linkage-move race: a same-triple re-assert from a DIFFERENT source
+        // §C2 linkage-move race: a provenance migration to a DIFFERENT source
         // memory lands DURING entailment. The content-addressed edge_id is
         // triple-only, so it is unchanged and source A's content is unchanged —
         // only the relation's `source_memory_id` moved to B. The flip's linkage

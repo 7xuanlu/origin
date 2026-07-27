@@ -21,6 +21,7 @@ use crate::output::{print_json, OutputFormat};
 pub struct PageEntry {
     pub path: PathBuf,
     pub title: String,
+    pub page_id: Option<String>,
     pub modified: SystemTime,
 }
 
@@ -34,7 +35,7 @@ pub enum QueryMatch<'a> {
 /// Pull the frontmatter `title:` (quotes stripped); fall back to the filename
 /// stem. Only the leading `--- ... ---` block is scanned, so a `title:` line in
 /// the body can't be mistaken for the page title.
-fn extract_title(content: &str, fallback_stem: &str) -> String {
+fn extract_frontmatter_value(content: &str, key: &str) -> Option<String> {
     let mut in_fm = false;
     for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -48,14 +49,18 @@ fn extract_title(content: &str, fallback_stem: &str) -> String {
         if in_fm && trimmed == "---" {
             break; // end of frontmatter
         }
-        if let Some(rest) = trimmed.strip_prefix("title:") {
-            let t = rest.trim().trim_matches('"').trim();
-            if !t.is_empty() {
-                return t.to_string();
+        if let Some(rest) = trimmed.strip_prefix(key) {
+            let value = rest.trim().trim_matches('"').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
             }
         }
     }
-    fallback_stem.to_string()
+    None
+}
+
+fn extract_title(content: &str, fallback_stem: &str) -> String {
+    extract_frontmatter_value(content, "title:").unwrap_or_else(|| fallback_stem.to_string())
 }
 
 /// Newest-first by mtime.
@@ -66,6 +71,21 @@ fn sort_newest_first(pages: &mut [PageEntry]) {
 /// Case-insensitive substring match against title OR filename stem.
 fn match_query<'a>(pages: &'a [PageEntry], query: &str) -> QueryMatch<'a> {
     let q = query.to_lowercase();
+    let exact_filename_hits: Vec<&PageEntry> = pages
+        .iter()
+        .filter(|p| {
+            p.path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.to_lowercase() == q)
+        })
+        .collect();
+    match exact_filename_hits.len() {
+        1 => return QueryMatch::One(exact_filename_hits[0]),
+        2.. => return QueryMatch::Many(exact_filename_hits),
+        _ => {}
+    }
+
     let hits: Vec<&PageEntry> = pages
         .iter()
         .filter(|p| {
@@ -104,6 +124,7 @@ fn read_pages(dir: &Path) -> Vec<PageEntry> {
             .unwrap_or("")
             .to_string();
         let title = extract_title(&content, &stem);
+        let page_id = extract_frontmatter_value(&content, "origin_id:");
         let modified = e
             .metadata()
             .and_then(|m| m.modified())
@@ -111,6 +132,7 @@ fn read_pages(dir: &Path) -> Vec<PageEntry> {
         entries.push(PageEntry {
             path,
             title,
+            page_id,
             modified,
         });
     }
@@ -152,7 +174,13 @@ fn collapse_by_title(pages: &[PageEntry]) -> Vec<(String, usize)> {
         .collect()
 }
 
-pub fn run(format: OutputFormat, quiet: bool, query: Option<String>, limit: usize) -> Result<()> {
+pub fn run(
+    format: OutputFormat,
+    quiet: bool,
+    query: Option<String>,
+    limit: usize,
+    resolve_id: bool,
+) -> Result<()> {
     // An empty/whitespace query (e.g. a skill passing "" for no-arg) means "list".
     let query = query.filter(|q| !q.trim().is_empty());
     let dir = wenlan_core::config::load_config().knowledge_path_or_default();
@@ -196,6 +224,18 @@ pub fn run(format: OutputFormat, quiet: bool, query: Option<String>, limit: usiz
                 eprintln!("run `wenlan pages` to list, or `/distill {q}` to synthesize one");
             }
             QueryMatch::One(p) => {
+                if resolve_id {
+                    let page_id = p.page_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "page projection {} has no origin_id frontmatter",
+                            p.path.display()
+                        )
+                    })?;
+                    if !quiet {
+                        println!("{page_id}");
+                    }
+                    return Ok(());
+                }
                 let launched = open_in_editor(&p.path);
                 if !quiet {
                     if launched {
@@ -289,6 +329,7 @@ mod tests {
         PageEntry {
             path: PathBuf::from(file),
             title: title.into(),
+            page_id: None,
             modified: UNIX_EPOCH + Duration::from_secs(secs),
         }
     }
@@ -351,6 +392,18 @@ mod tests {
         match match_query(&pages, "2026-03") {
             QueryMatch::One(p) => assert_eq!(p.title, "Some Title"),
             _ => panic!("expected one (stem match)"),
+        }
+    }
+
+    #[test]
+    fn exact_filename_stem_wins_over_broader_substring_matches() {
+        let pages = vec![
+            mk("Atlas", "atlas.md", 1),
+            mk("Atlas Notes", "atlas-notes.md", 2),
+        ];
+        match match_query(&pages, "atlas") {
+            QueryMatch::One(p) => assert_eq!(p.path, PathBuf::from("atlas.md")),
+            _ => panic!("expected the exact filename stem"),
         }
     }
 

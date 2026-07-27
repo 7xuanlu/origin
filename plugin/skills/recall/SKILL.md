@@ -5,7 +5,7 @@ description: >
   Invoked as `/recall <query>`. Use when the user asks "do you
   remember", "what do you know about", "look up".
 argument-hint: "<query>"
-allowed-tools: ["mcp__plugin_wenlan_wenlan__recall"]
+allowed-tools: ["mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__get_memory_revisions"]
 ---
 
 # /recall
@@ -92,6 +92,11 @@ ones that directly answer the question; demote ones that just share
 keywords.
 
 Show the user the top 3-5 reranked hits. Surface the rest only if asked.
+
+If the user explicitly asks how one returned memory changed, for its full
+history, or whether a correction was recorded, call
+`get_memory_revisions(memory_id="<source_id>")`. Do not fetch revision chains
+for ordinary recall results.
 
 ### Phase 4 — render revision context (per result)
 
