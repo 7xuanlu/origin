@@ -2400,20 +2400,25 @@ fn strip_space_from_tool_schema(mut tool: Tool) -> Tool {
     tool
 }
 
-const LINT_REPAIR_TOOL_NAMES: &[&str] = &[
+/// Tools whose every lane hard-rejects over remote HTTP transport; hidden
+/// from tools/list there so remote clients don't pay for error-only tools.
+const LOCAL_ONLY_TOOL_NAMES: &[&str] = &[
     "get_lint_agent_work_page",
     "prepare_lint_repair_plan",
     "get_lint_repair_plan_entries",
     "prepare_lint_repair",
     "apply_lint_repair",
     "verify_lint_repair",
+    "forget",
+    "confirm_memory",
+    "delete_page",
 ];
 
 impl WenlanMcpServer {
     fn visible_tools(&self) -> Vec<Tool> {
         let mut tools = Self::tool_router().list_all();
         if self.transport == TransportMode::Http {
-            tools.retain(|tool| !LINT_REPAIR_TOOL_NAMES.contains(&tool.name.as_ref()));
+            tools.retain(|tool| !LOCAL_ONLY_TOOL_NAMES.contains(&tool.name.as_ref()));
         }
         tools
     }
@@ -2724,12 +2729,20 @@ mod tests {
     }
 
     #[test]
-    fn lint_repair_tools_are_visible_only_over_stdio() {
-        let stdio = make_server(TransportMode::Stdio, "agent", None)
+    fn fully_local_tools_are_visible_only_over_stdio() {
+        let mut stdio = make_server(TransportMode::Stdio, "agent", None)
             .visible_tools()
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
+        stdio.sort();
+        let mut expected = expected_tool_surface()
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(stdio, expected, "stdio must retain the full locked surface");
+
         let http = make_server(TransportMode::Http, "agent", None)
             .visible_tools()
             .into_iter()
@@ -2742,6 +2755,9 @@ mod tests {
             "prepare_lint_repair",
             "apply_lint_repair",
             "verify_lint_repair",
+            "forget",
+            "confirm_memory",
+            "delete_page",
         ] {
             assert!(stdio.iter().any(|candidate| candidate == name));
             assert!(!http.iter().any(|candidate| candidate == name));
