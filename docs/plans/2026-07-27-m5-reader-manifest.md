@@ -21,9 +21,8 @@ Verified surface on the merge base (`5ba8a3b4`):
 | HTTP `(method, path, handler)` triples in `router.rs` | 155 | paren-balanced parse of `.route("…", …)` |
 | in `repair_routes.rs` | 5 | `repair_routes.rs:24-36` |
 | in `lint_routes.rs` | 2 | missed by the first pass |
-| in `routes.rs` | 1 | missed by the first pass |
-| **total** | **163** | every file under `crates/wenlan-server/src` |
-| distinct `(method, path)` pairs | 161 | 2 duplicates, below |
+| **total** | **162** | every file, `#[cfg(test)]` modules stripped |
+| distinct `(method, path)` pairs | 160 | 2 duplicates, below |
 | MCP tools | 29 | `#[tool(` in `wenlan-mcp/src/tools.rs` |
 | CLI subcommands | 19 top-level | `Commands` enum, `wenlan-cli/src/main.rs:29` |
 
@@ -34,9 +33,10 @@ an overlapping registration — but the inventory's set-equality check must key 
 `(builder, method, path)` or it will report a phantom drift.
 
 These counts come from a paren-balanced parse across **every** file in the
-crate. The first pass used a single-line regex over two hand-picked files and
-reported 151; both mistakes are recorded in the inventory because the parser is
-now part of the contract.
+crate, with `#[cfg(test)]` modules stripped. Three counts preceded this one —
+151 (hand-picked file list, single-line regex), then 163 (both fixed, but
+counting a route registered inside a test module). All three are recorded in the
+inventory, because the parser is now part of the contract.
 
 `router.rs` is not the whole route table — `/api/repairs/*` registers in its own
 module. But it composes through the **same** wrapper, and that wrapper is the
@@ -177,14 +177,11 @@ the merge base: all 163 registered `(method, path, handler)` triples, all 29
 class, an adapter, and the evidence the classification rests on. That file is
 the artifact this section used to only promise.
 
-The first generated version claimed 151 triples and was wrong twice over: it
-scanned a hand-picked file list (`router.rs`, `repair_routes.rs`) and missed
-`lint_routes.rs` and `routes.rs`, and its single-line regex truncated chained
-method routers that span lines. Twelve registrations were hidden. **Enumerate by
-pattern over the whole crate, never over a hand-picked file list** — this is the
-third incomplete enumeration in this program from that same mistake.
+Three earlier counts were wrong — 151, then 163 — from a hand-picked file list,
+a single-line regex, and a route registered inside a `#[cfg(test)]` module.
+**Enumerate by pattern over the whole crate, and strip test modules.**
 
-Generating it also surfaced four things a reviewed prose list did not:
+Generating it also surfaced five things a reviewed prose list did not:
 
 - `label` is a page title by another name — `PageLinkOutbound`,
   `PageLinkInbound`, `OrphanLink`, `PageMapNode` all carry one, and a scan keyed
@@ -197,7 +194,12 @@ Generating it also surfaced four things a reviewed prose list did not:
 - **response scanning is blind to effects.** `POST /api/pages/export` returns
   only `ExportStats` and writes full page prose into the user's Obsidian vault.
   The most consequential page reader in the product exposes nothing through its
-  response, so `page_bearing` needs an effects test alongside the response test.
+  response, so `page_bearing` needs an effects test alongside the response test;
+- **and blind to the error arm.** 158 of 162 handlers return
+  `Result<_, ServerError>`, and every `ServerError` variant carries a free-form
+  `String` (`error.rs:11`). D4's stale-base conflict is precisely where an
+  implementer writes `current version: <title>`. A fourth test and a sentinel
+  cover it.
 
 ### `explicit` is a property of the call, not the route
 
@@ -237,14 +239,59 @@ per-route intent judgment that a UI change can silently falsify. It also removes
 the entire class of "the app started polling an explicit route" regressions,
 which nothing in the previous design would have caught.
 
-### The explicit grant covers the named page only
+### The marker binds to the pages the call names
 
-A per-call marker authorizes provisional content **for the page the human
-named**, not for every page whose text rides along in the payload.
+A per-call marker is not a blanket header. It **binds to the page IDs the call
+names**, which makes spraying it on every request structurally meaningless on
+routes that name no page. That is the cheap structural defence; the marker is
+otherwise cooperative-tier (below).
+
+Embedded other-page content follows the automatic rule.
 `PageLinkOutbound.label`, `PageLinkInbound.label`, `OrphanLink.label`, and
-`PageMapNode.label` all carry *other* pages' titles, and none of them carry
-per-item truth axes. Embedded other-page content therefore follows the automatic
-rule unless the payload is extended to carry axes per item.
+`PageMapNode.label` all carry *other* pages' titles with no per-item axes, so a
+grant for page A never covers page B's title riding along in A's payload.
+
+### Collections may list provisional entries; only prose is named-page-only
+
+Named-page-only, applied to collections, produces a dead end: post-migration
+every page is `provisional` (artifact 2 §4), lists and search exclude
+provisional, and **a human cannot name a page they cannot see**. The review loop
+this rung exists to feed would have no entry point — the same curation-death
+failure artifact 6 §2a names for human prose. It also contradicts G6, which
+requires "M5-aware explicit browse returns all four with both axes" for every
+manifest row, unsatisfiable for collection rows under a named-page-only rule.
+
+The line that resolves both:
+
+| Call | Provisional pages |
+|---|---|
+| marker-bearing **collection** (list, search, recent, orphan-links) | **entries visible** — title + both axes per item, no prose |
+| marker-bearing **named-page** fetch | full prose, both axes |
+| any call without the marker | excluded entirely |
+| embedded other-page labels inside either | excluded — they carry no axes |
+
+Discovery is restored without weakening the prose rule: a provisional page can
+be *found* and its state seen, and reading it is still a deliberate act. Per-item
+axes are what make this safe — an entry that appears without its state is the
+unearned trust this rung exists to prevent, which is why the carve-out is
+conditional on rendering them.
+
+### The marker is cooperative-tier, not a capability
+
+Stated once so it is not re-litigated: the intent marker is **not** a D7
+presence capability. Artifact 5 §1 already puts hostile-same-user out of scope,
+and a client willing to forge the marker can equally lie about its contract
+version — both sit in the same trust tier, so nonce-consuming machinery buys
+nothing against the conceded attacker.
+
+The risk that is real is the **cooperative agent**: nothing inherently stops an
+MCP tool from transmitting the marker, at which point an agent self-serves
+provisional prose into its own context and D3's first sentence fails with
+nothing going RED. That is why `marker_eligible` is a per-surface column in the
+inventory — MCP tools, internal readers, and non-interactive CLI subcommands are
+`no`, enforced by a test on each surface. The server cannot distinguish a forged
+marker from a real one, and saying so plainly is the honest statement of what
+cooperative-tier means.
 
 The two-table prose enumeration that used to sit here was deleted, not moved: it
 was a second copy of the inventory's Class column, which is precisely the
@@ -339,4 +386,9 @@ Every unmarked row is an executable test that goes RED under its weakening.
 | classify an opaque route `page_bearing = no` | inventory §teeth check 4 |
 | scan response fields with word-boundary instead of substring matching | inventory — `delta_summary` must still be found |
 | drop `label` from the prose-field pattern | inventory — `PageLinkOutbound.label` must still be found |
-| force opaque routes to `automatic` | §4 — `GET /api/pages/{id}` must stay explicit |
+| strip the per-call marker check | §7 case 2 — a declared client's unmarked poll must not see provisional |
+| treat the marker as a blanket header | §4 — a marker naming no page grants nothing |
+| let an MCP tool transmit the marker | inventory §marker_eligible per-surface test |
+| exclude provisional entries from a marker-bearing collection call | §4 collection carve-out; G6 explicit-browse bullet |
+| list a provisional entry without its axes | §4 — per-item axes are the carve-out's precondition |
+| let page prose reach an error body | inventory §teeth check 8 sentinel |

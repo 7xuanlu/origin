@@ -124,6 +124,18 @@ half is an app-side change in `7xuanlu/wenlan-app` and no PR in this document
 owns it.** It must be scheduled with a named owner before PR-C is scoped, or the
 gate sits permanently red with nobody accountable for the number.
 
+### Second app-side dependency: marker wiring
+
+The same applies to the per-call intent marker (artifact 4 §4). Only the app can
+testify that a request came from a human gesture, and the distinction is drawn
+*inside a component* — a gesture-triggered fetch and a 10-second poll can sit in
+the same file, as `SpaceList.tsx:76` shows. No server-side change can supply
+that signal.
+
+Both app-side items are blocking dependencies of this gate and of D3 activation,
+and both currently have no owner. They are listed here rather than in artifact 4
+because this is the document that decides when the cutover may proceed.
+
 ## 4. PR-C — the fenced cutover ceremony
 
 Filesystem projection and SQLite truth state are **not** one atomic store. The
