@@ -30,7 +30,8 @@ watermark, ONE central fail-closed gate), reused deliberately because it worked.
 ## 2. PR-A — schema, shadow, no behavior change
 
 Adds: logical claims, immutable revisions + predecessor chains, page-version
-membership/anchors, exact-page-version derivation-completion markers, the
+membership/anchors, exact-page-version derivation-completion markers carrying
+`extractor_version` (artifact 9 §4), the
 five-part entailment cache, page truth state with version-bound review evidence,
 durable jobs/leases/receipts, the one-shot nonce table, and the widened edge
 kinds/types + indexes (artifact 3).

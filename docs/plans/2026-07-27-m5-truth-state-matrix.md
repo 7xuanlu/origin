@@ -22,7 +22,11 @@ A page version is `supported` only when **every** condition holds. Any failure,
 of any kind, yields `provisional`.
 
 1. An exact-page-version `claim_derivation_complete` marker exists, and its
-   recorded page-version digest equals the current page-version digest.
+   recorded page-version digest equals the current page-version digest **and**
+   its recorded `extractor_version` equals the current one. The digest alone is
+   not sufficient: identical page text under a changed extractor yields a
+   different claim set, so a digest-only check would accept an inventory that
+   no longer describes the page (artifact 9 §4).
 2. That marker's membership inventory is **nonempty**.
 3. Every active claim revision in the inventory has at least one `supports` edge
    that is simultaneously: active, above threshold, and produced by a
@@ -51,6 +55,7 @@ A genuinely empty page (no prose, nothing to claim) is therefore permanently
 |---|---|
 | no derivation marker | never derived |
 | marker digest ≠ current page digest | derived against different text |
+| marker `extractor_version` ≠ current | same text, different claim cuts |
 | marker present, inventory empty | vacuous-truth guard (§1) |
 | partial derivation | incomplete evidence |
 | support edge missing for any revision | incomplete evidence |
@@ -200,6 +205,7 @@ Each weakening must turn at least one listed row RED:
 | let prose edit preserve `HR` | row 8 |
 | publish partial derivation results | row 6 |
 | skip the digest equality check | row 7 |
+| check the digest but not `extractor_version` | §1 condition 1 — same page text, bumped extractor, marker must be rejected |
 | infer `SS` from legacy `review_status` | row 16 |
 | infer `HR` from `user_edited` or authored status | row 16 |
 | treat `supported` as monotonic (never fall back) | rows 13, 14, 15 |
