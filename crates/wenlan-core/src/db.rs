@@ -20,6 +20,7 @@ use std::sync::Arc;
 #[cfg(test)]
 static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+mod claim_identity;
 mod count;
 mod entity_page_adapter;
 mod page_drafts;
@@ -27,6 +28,8 @@ pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
 
+#[cfg(test)]
+mod claim_identity_test;
 #[cfg(test)]
 mod entity_page_adapter_test;
 #[cfg(test)]
