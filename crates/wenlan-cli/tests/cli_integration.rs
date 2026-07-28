@@ -457,6 +457,7 @@ fn each_subcommand_has_help() {
         "status",
         "search",
         "recall",
+        "brief",
         "capture",
         "memories",
         "agents",
