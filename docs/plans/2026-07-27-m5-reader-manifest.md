@@ -173,16 +173,16 @@ exists to prevent. §4 explains why intent cannot be a route property.
 
 **The manifest is `2026-07-27-m5-reader-manifest-inventory.md`**, generated from
 the merge base: all 162 registered `(method, path, handler)` triples, all 29
-`#[tool(` declarations, all 19 `Commands` variants, and all **76 internal
-page-prose call sites**, each with `page_bearing`, a class, a marker shape, an
+`#[tool(` declarations, all 19 `Commands` variants, and the internal
+page-prose readers, each with `page_bearing`, a class, a marker shape, an
 adapter, and the evidence the classification rests on. That file is the artifact
 this section used to only promise.
 
-The internal readers were the last thing in it still written as categories —
-"RRF page channel", "refinery / briefing builders" — with the enumeration
-deferred to PR-B. They are now enumerated, and the categories turned out to name
-the wrong modules: the readers that carry page prose live in `db.rs` (46 of 76),
-`repair.rs`, `post_write.rs`, `lint/`, and `maintenance/`.
+The internal readers are **not enumerated in prose here or there**. They come
+from `scripts/m5-reader-sweep.py`, which is the predicate; the inventory carries
+its output and the count is whatever it prints. Four hand-written drafts of that
+set were wrong in four different ways, which is the whole argument for making it
+a script.
 
 Three earlier counts were wrong — 151, then 163 — from a hand-picked file list,
 a single-line regex, and a route registered inside a `#[cfg(test)]` module.
@@ -202,11 +202,16 @@ Generating it also surfaced five things a reviewed prose list did not:
   only `ExportStats` and writes full page prose into the user's Obsidian vault.
   The most consequential page reader in the product exposes nothing through its
   response, so `page_bearing` needs an effects test alongside the response test;
-- **and blind to the error arm.** 158 of 162 handlers return
-  `Result<_, ServerError>`, and every `ServerError` variant carries a free-form
-  `String` (`error.rs:11`). D4's stale-base conflict is precisely where an
-  implementer writes `current version: <title>`. A fourth test and a sentinel
-  cover it.
+- **and blind to the error arm** — though this one is *not* a `page_bearing`
+  test, and a draft that made it one contradicted its own table. 158 of 162
+  handlers return `Result<_, ServerError>` and every variant carries a free-form
+  `String` (`error.rs:11`), so the rule would classify 158 routes page-bearing
+  while the table says 77. D4's stale-base conflict is precisely where an
+  implementer writes `current version: <title>`. The leak is real; the axis was
+  wrong. It is now **one cross-cutting invariant at the error-serialization
+  seam** — no `ServerError` body may carry a provisional page's title or prose —
+  enforced once, covering routes added later, and far less to maintain than 158
+  classifications.
 
 ### `explicit` is a property of the call, not the route
 
@@ -272,10 +277,16 @@ The line that resolves both:
 
 | Call | Provisional pages |
 |---|---|
-| marker-bearing **collection** (list, search, recent, orphan-links) | **entries visible** — title + both axes per item, no prose |
+| marker-bearing **collection** (list, search, recent) | **entries visible** — page ID + title + both axes per item, no prose |
 | marker-bearing **named-page** fetch | full prose, both axes |
 | any call without the marker | excluded entirely |
 | embedded other-page labels inside either | excluded — they carry no axes |
+
+`/api/pages/orphan-links` is deliberately **not** in that first row. Its items
+are `OrphanLink { label, count }` (`wenlan-types/src/responses.rs:1128`) — no
+page identity, no axes — and the carve-out is conditional on rendering both.
+A route qualifies for `collection` only if its item type can carry a page
+identity and both axes.
 
 Discovery is restored without weakening the prose rule: a provisional page can
 be *found* and its state seen, and reading it is still a deliberate act. Per-item
