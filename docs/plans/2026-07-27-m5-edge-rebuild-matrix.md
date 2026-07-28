@@ -109,6 +109,14 @@ same reason.
 - The attesting root's `root_kind` must be `human_capture` or
   `human_edit_delta`. A `generated` root can never attest.
 
+**Verified gap.** Neither human root kind is minted anywhere in production. The
+`CHECK` permits them (`db.rs:8898`) and the only minter in the tree is
+`acquire_provenance_root("document_ingest", …)` (`edge_grounding.rs:537`); the
+human kinds otherwise appear only in a `provenance.rs` unit test. So attestation
+has **no valid source root today**. PR-A must deliver the human-root minter —
+see artifact 6 §2a, which needs the same minter for the human-prose evidence
+path. One missing component blocks both.
+
 Immutable `attests` payload carries: viewed page version, revision digest,
 caller/operation identity, protocol version, nonce digest, verification time.
 It **never** carries the HMAC, raw capability, or install secret (D7).

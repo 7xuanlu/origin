@@ -65,6 +65,66 @@ exact digests means an invalidated anchor cannot silently hit cache.
 `scored_at`. `threshold_at_write` is recorded so a later threshold change is
 detectable per row rather than silently reinterpreting stored scores.
 
+## 2a. Support-candidate sourcing — including human-authored prose
+
+`supports` targets memory spans (artifact 3 §2). That raises the question the
+rest of this spec depends on: **where does evidence for a human-written
+sentence come from?**
+
+If the answer were "nowhere," one human-added sentence would make its page
+permanently `provisional` — `supported` requires *every* claim supported
+(artifact 2 §1) — and automatic readers exclude at page granularity (artifact
+4). Users would learn that editing their own wiki removes it from their agent's
+context, which trains people to stop curating. For a curation product that is
+fatal, and no amount of `human_reviewed` rescues it, because that axis
+deliberately does not feed `support_status`.
+
+### The path, from D4
+
+Human saves mint a grounded `human_edit_delta` root, computed against the exact
+immutable `page_history` snapshot and carrying `operation_id`. That delta — the
+exact text the human wrote — is stored span-addressably and becomes the
+evidence a claim derived from human prose is judged against. D4's rule for
+`observation` applies: it counts as **one independence group** and supports
+another claim **only after exact-delta entailment**.
+
+This is not circular. Entailment against the human's own text checks that the
+derived claim does not **overreach** what the human actually wrote. A claim that
+faithfully restates the sentence is supported — correctly, since
+`support_status` means "every claim traces to evidence," not "every claim is
+independently verified." A claim that generalizes, strengthens a quantifier, or
+drops a hedge fails, which is exactly the N1/N8 class in artifact 1 §7.
+
+Because a human-authored claim rests on exactly one independence group, it can
+never accumulate independent corroboration from its own page. That is intended
+and must not be worked around by counting the same delta twice.
+
+### Verified gap — PR-A must build this
+
+`provenance_roots.root_kind` permits `human_capture` and `human_edit_delta`
+(`db.rs:8898`), but **nothing mints either**. The only production minter is
+`acquire_provenance_root("document_ingest", …)` (`edge_grounding.rs:537`); the
+two human kinds appear elsewhere only inside a `provenance.rs` unit test.
+
+Two Stage 0 contracts therefore depend on code that does not exist:
+
+1. this section's human-prose evidence path;
+2. artifact 3 §5, which requires an attesting root to be `human_capture` or
+   `human_edit_delta`.
+
+PR-A must deliver the human-root minter and the span-addressable delta store.
+Neither is optional, and neither can be deferred to PR-B: without them,
+attestation has no valid source root and every human-edited page is
+permanently unsupported.
+
+### Shadow-phase metric (required)
+
+During the PR-A shadow phase, report supported-fraction **by page class** —
+distilled, human-edited, human-authored — never as one aggregate. An aggregate
+dominated by distilled pages would hide a human-authored class sitting at zero,
+which is precisely the failure this section exists to catch. That number gates
+PR-C (artifact 7 §4a).
+
 ## 3. Threshold
 
 One threshold per `(model_id, model_version, prompt_version)`. There is no
@@ -75,6 +135,33 @@ inherited by M5.
 A claim revision is supported only when at least one active support edge scores
 **at or above** the threshold for *its own* key triple. Below-threshold, absent,
 and unparseable all mean `provisional` (artifact 2 §1).
+
+### Model-version eligibility is ROLLING, not instant
+
+Artifact 2 row 14 demotes a page when its supporting model version becomes
+ineligible. If a judge upgrade made the old version ineligible *immediately*,
+the entire corpus would flip `provisional` in one step — the migration cliff
+recurring at every model bump, with no readiness fence, a mass quarantine of the
+projection directory (artifact 7 §4), and a decode-bound re-derivation storm.
+
+Eligibility is therefore a durable per-version state with a drain:
+
+| State | Meaning |
+|---|---|
+| `active` | new judgments use this version |
+| `draining` | no new judgments; **existing scores remain eligible** |
+| `retired` | scores no longer count; affected pages demote |
+
+An upgrade moves the old version `active → draining` and the new one to
+`active`. Re-derivation proceeds under the new version at the normal drain rate.
+The old version moves to `retired` only when no page still depends on it, or
+when it is retired **deliberately** — a judge found to be wrong should demote
+its corpus immediately, and that path stays available as an explicit operator
+action rather than an accident of upgrading.
+
+Per-version thresholds (above) are what make this coherent: scores from the two
+versions are never compared, they are simply each valid under their own
+threshold while their version is `active` or `draining`.
 
 ## 4. Retry and lease
 
@@ -183,3 +270,9 @@ supported.
 | let a non-pinned backend judge | §1 refusal test |
 | accept the benchmark with a mean instead of p99 | §7 method test |
 | set production constants without benchmark evidence | §7 STOP rule — review gate |
+| leave human-authored prose with no evidence path | §2a — human-edited page must reach `supported` |
+| let a human delta support a claim that overreaches it | §2a exact-delta test, N1/N8 class |
+| count one human delta as two independence groups | §2a test |
+| retire a model version instantly on upgrade | §3 rolling-eligibility test |
+| demote pages while the old version is `draining` | §3 test |
+| report supported-fraction as one aggregate | §2a metric test |

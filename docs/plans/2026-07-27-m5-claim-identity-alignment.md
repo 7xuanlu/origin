@@ -172,6 +172,26 @@ N1 and N8 are the corpus's teeth: both survive any similarity threshold loose
 enough to be useful, which is exactly why identity here is digest equality and
 never similarity.
 
+## 7a. Scope note — build this exactly as small as the corpus
+
+Alignment carries less weight than its length here suggests, and implementing it
+as though it carried more would be the wrong reading.
+
+Support survival across edits is mostly the **entailment cache's** doing:
+identical claim text plus identical span digest is a cache hit regardless of
+which `claim_id` the revision belongs to (artifact 6 §2). And the
+"edited, unambiguous" case re-derives support anyway.
+
+What alignment actually buys is narrower and still worth having:
+
+1. per-claim **attestation** persistence across unrelated edits (P6, P7);
+2. **non-sharing** of trust between duplicate claims (N2);
+3. an audit lineage of what superseded what (§6).
+
+Implement exactly what §7's corpus exercises. Any alignment machinery that no
+case in that corpus distinguishes is speculative surface and does not belong —
+if a new heuristic seems needed, the corpus gains a case first.
+
 ## 8. Mutation checks
 
 The oracle is only worth what it catches, so each of these deliberate weakenings

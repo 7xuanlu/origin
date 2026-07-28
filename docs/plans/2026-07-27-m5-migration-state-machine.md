@@ -89,6 +89,28 @@ Readiness is durable and monotone **only while its inputs hold**. A new page or
 a retracted support edge lowers it. Treating readiness as a latch would let a
 cutover proceed on a number that was true an hour ago.
 
+**Readiness proves coverage, not health.** Condition 1 counts "provisional with
+an explicit reason" as a derivation outcome, so 100% readiness is fully
+compatible with a corpus that is 90% permanently unsupported. Readiness would
+read green while cutover emptied the user's automatic context. That is why §4a
+exists.
+
+## 4a. PR-C entry gate — a human looks at the numbers
+
+Readiness = 100% is necessary and **not sufficient**. Before the ceremony runs,
+a human reviews the shadow-phase supported-fraction **by page class** —
+distilled, human-edited, human-authored (artifact 6 §2a) — and explicitly
+approves the cutover.
+
+This gate is not automatable, and that is the point. Every other check in this
+document asks "is the machinery consistent?" This one asks "does the product
+survive the switch?" A corpus where human-authored pages sit near zero supported
+is a signal to fix the evidence path first, not to flip the fence and discover
+it in production.
+
+Aggregate supported-fraction does **not** satisfy this gate. An aggregate
+dominated by distilled pages hides exactly the class most likely to be broken.
+
 ## 4. PR-C — the fenced cutover ceremony
 
 Filesystem projection and SQLite truth state are **not** one atomic store. The
@@ -184,3 +206,6 @@ Each is a separate test:
 | open a v97 database with a pre-M5 binary | §2 downgrade test |
 | accept a backup without a restore drill | §2 — release checklist |
 | ship `committed` with no reverse path | §6 reverse-cutover test |
+| treat readiness = 100% as sufficient for cutover | §4a gate |
+| satisfy §4a with an aggregate supported-fraction | §4a |
+| ship PR-A without the human-root minter | artifact 6 §2a / artifact 3 §5 |

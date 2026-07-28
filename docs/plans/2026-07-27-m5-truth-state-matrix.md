@@ -121,6 +121,34 @@ Rows 13–15 also establish that `supported` is **not monotonic**. It is a
 statement about currently-valid evidence, so it can be lost without the page
 changing at all.
 
+### Who drives demotion
+
+`support_status` is **stored**, not computed on read — evaluating §1 per page on
+every read would not meet the budgets in artifact 6. Stored state with
+event-driven invalidation needs a named owner, or rows 13–15 are aspirations
+that no component performs.
+
+| Event | Trigger | Finds affected pages via |
+|---|---|---|
+| support edge retracted / invalidated | the write that retracts it, same transaction | `idx_edges_supports_rev` (artifact 3 §6) |
+| model version → `retired` | the eligibility transition (artifact 6 §3) | entailment cache `(model_id, model_version)` index |
+| threshold raised | the threshold change | same index |
+| anchor invalidated | the document write that invalidates it | anchor → claim revision |
+
+Rules:
+
+- Demotion is **synchronous with its trigger**, in the same transaction. An
+  asynchronous sweep would leave a window in which a page reads `supported` on
+  evidence that is already gone — the exact false-trust this rung forbids.
+- Promotion is asynchronous (it needs model work); demotion never is. The
+  asymmetry is deliberate: losing trust must be immediate, gaining it may wait.
+- A bulk trigger (version retirement, threshold change) demotes through the same
+  path, batched, and is bounded by the same budgets. It never bypasses the
+  per-page write.
+- A **startup reconciler** re-evaluates §1 for any page whose stored status
+  cannot be proven consistent with current evidence — the durable backstop for a
+  crash between a retraction and its demotion.
+
 ## 4. Migration from legacy fields
 
 Pre-M5 pages migrate to `support_status=provisional`, `human_reviewed=false`,
@@ -169,3 +197,6 @@ Each weakening must turn at least one listed row RED:
 | infer `HR` from `user_edited` or authored status | row 16 |
 | treat `supported` as monotonic (never fall back) | rows 13, 14, 15 |
 | accept a review action without version+digest | row 10 |
+| demote asynchronously instead of in the trigger's transaction | §3 "who drives demotion" — crash-window test |
+| leave a retraction with no demotion path | rows 13–15 owner test |
+| skip the startup reconciler | crash-between-retraction-and-demotion test |
