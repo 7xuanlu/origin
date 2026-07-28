@@ -2397,6 +2397,102 @@ fn community_relevant_spaces_digest(spaces: impl IntoIterator<Item = String>) ->
     hex::encode(digest.finalize())
 }
 
+/// The parity-counter integrity guards, written once so the installer and every
+/// validator read the same text and cannot drift apart.
+///
+/// The repair effect guard proves write scope by differencing `total_changes()`
+/// and subtracting the measured generation delta, which is exact only while a
+/// unit of compensation costs a row write. These three guards make that true
+/// across the table's whole DML surface:
+///
+/// * `unit_bump` — an UPDATE advancing the counter by more than one would buy
+///   compensation without paying a row change, letting an escaped write hide
+///   under the subtraction. The only legal shapes are the triggers' `+1` and
+///   reconciliation's digest-only CAS, which leaves the generation untouched.
+/// * `seed_only_insert` — `INSERT OR REPLACE` resolves its conflict by
+///   *replacing* the row, so `unit_bump` never fires, while the replacement
+///   costs one row change and can carry the generation arbitrarily far forward.
+///   The only legitimate insert is the seed, always at generation 0. (A replace
+///   carrying 0 moves the counter backwards, which yields negative compensation
+///   and so makes an escape easier to see, besides invalidating every proof.)
+/// * `no_delete` — DELETE+INSERT is the same bypass by a longer route. Note it
+///   does NOT fire for `INSERT OR REPLACE` unless `recursive_triggers` is on,
+///   which Wenlan never enables; `seed_only_insert` is what closes that route.
+pub(crate) const PARITY_GUARD_TRIGGERS: [(&str, &str); 3] = [
+    (
+        "m4_parity_input_state_unit_bump",
+        "CREATE TRIGGER m4_parity_input_state_unit_bump
+         BEFORE UPDATE ON community_parity_input_state
+         WHEN NEW.generation <> OLD.generation
+          AND NEW.generation <> OLD.generation + 1
+         BEGIN
+           SELECT RAISE(ABORT, 'community_parity_input_state generation must advance by at most 1 per write');
+         END",
+    ),
+    (
+        "m4_parity_input_state_seed_only_insert",
+        "CREATE TRIGGER m4_parity_input_state_seed_only_insert
+         BEFORE INSERT ON community_parity_input_state
+         WHEN NEW.generation <> 0
+         BEGIN
+           SELECT RAISE(ABORT, 'community_parity_input_state may only be inserted at generation 0');
+         END",
+    ),
+    (
+        "m4_parity_input_state_no_delete",
+        "CREATE TRIGGER m4_parity_input_state_no_delete
+         BEFORE DELETE ON community_parity_input_state
+         BEGIN
+           SELECT RAISE(ABORT, 'community_parity_input_state singleton must not be deleted');
+         END",
+    ),
+];
+
+/// Whitespace- and case-insensitive form for comparing stored DDL against its
+/// canonical text.
+fn normalized_ddl(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Name of the first parity guard whose installed shape differs from its
+/// canonical definition, or `None` when all three are intact.
+///
+/// Compares whole normalized DDL rather than a name or a message substring: a
+/// trigger keeping its name and RAISE text but flipping its WHEN predicate,
+/// timing, or target table would otherwise read as healthy while enforcing
+/// nothing.
+pub(crate) async fn parity_guard_shape_drift(
+    conn: &libsql::Connection,
+) -> Result<Option<&'static str>, WenlanError> {
+    for (name, canonical) in PARITY_GUARD_TRIGGERS {
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 LIMIT 1",
+                libsql::params![name],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("inspect parity guard {name}: {error}"))
+            })?;
+        let installed = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("read parity guard {name}: {error}")))?
+            .and_then(|row| row.get::<String>(0).ok());
+        if installed
+            .as_deref()
+            .map(normalized_ddl)
+            .is_none_or(|found| found != normalized_ddl(canonical))
+        {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 /// The consumer-behaviour contract a proof was taken under. The global input
 /// generation only advances on DB mutations, so a proof stays "current" across
 /// a restart that changes a tuning knob the consumer predicate actually reads.
@@ -3012,6 +3108,20 @@ impl MemoryDB {
         if user_version != i64::from(SCHEMA_VERSION) {
             return Err(WenlanError::Validation(
                 "repair_database_schema_mismatch".to_string(),
+            ));
+        }
+
+        // A matching user_version is not proof the parity guards are installed:
+        // a database written by an earlier build of this schema version carries
+        // 96 without them. This path deliberately skips migrations and the
+        // startup trigger inventory, then exposes the approved apply endpoint,
+        // so opening an unguarded database here is exactly where the repair
+        // effect guard could be laundered. Refuse rather than repair -- the
+        // repair contract does not mutate schema outside the approved manifest.
+        if let Some(missing) = parity_guard_shape_drift(&conn).await? {
+            log::error!("[repair] refusing to open: parity guard {missing} missing or altered");
+            return Err(WenlanError::Validation(
+                "repair_database_parity_guard_missing".to_string(),
             ));
         }
 
@@ -11527,59 +11637,22 @@ impl MemoryDB {
              END;
              CREATE TRIGGER m4_parity_input_state_update AFTER UPDATE ON space_graph_state BEGIN
                UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
-             END;
-
-             -- The repair effect guard proves write scope by differencing
-             -- total_changes() and subtracting the measured generation delta,
-             -- which is only exact while every bump costs one row write. A
-             -- single UPDATE advancing the counter by more than 1 would buy
-             -- compensation without paying a row change, letting an escaped
-             -- write hide under the subtraction. Enforcing at-most-unit
-             -- advance makes the compensation conservation-preserving: the
-             -- only legal shapes are the triggers' +1 and reconciliation's
-             -- digest-only CAS, which leaves the generation untouched.
-             DROP TRIGGER IF EXISTS m4_parity_input_state_unit_bump;
-             CREATE TRIGGER m4_parity_input_state_unit_bump
-             BEFORE UPDATE ON community_parity_input_state
-             WHEN NEW.generation <> OLD.generation
-              AND NEW.generation <> OLD.generation + 1
-             BEGIN
-               SELECT RAISE(ABORT, 'community_parity_input_state generation must advance by at most 1 per write');
-             END;
-
-             -- UPDATE is not the only way to move the counter. `INSERT OR
-             -- REPLACE` resolves its conflict by replacing the row rather than
-             -- updating it, so the guard above never fires, and the replacement
-             -- costs one row change while carrying the generation arbitrarily
-             -- far forward -- the same laundering by another route. The only
-             -- legitimate insert is the seed directly below, which is always
-             -- generation 0, so anything else is rejected. (A replace that
-             -- carries generation 0 moves the counter backwards, which yields
-             -- negative compensation and so makes an escape easier to see, not
-             -- harder, besides invalidating every proof.)
-             DROP TRIGGER IF EXISTS m4_parity_input_state_seed_only_insert;
-             CREATE TRIGGER m4_parity_input_state_seed_only_insert
-             BEFORE INSERT ON community_parity_input_state
-             WHEN NEW.generation <> 0
-             BEGIN
-               SELECT RAISE(ABORT, 'community_parity_input_state may only be inserted at generation 0');
-             END;
-
-             -- DELETE+INSERT is the same bypass by a longer route, and nothing
-             -- in production ever deletes the singleton. Note this does NOT
-             -- fire for `INSERT OR REPLACE` unless recursive_triggers is on --
-             -- the seed-only insert guard above is what closes that route.
-             DROP TRIGGER IF EXISTS m4_parity_input_state_no_delete;
-             CREATE TRIGGER m4_parity_input_state_no_delete
-             BEFORE DELETE ON community_parity_input_state
-             BEGIN
-               SELECT RAISE(ABORT, 'community_parity_input_state singleton must not be deleted');
              END;",
         )
         .await
         .map_err(|error| {
             WenlanError::VectorDb(format!("install global community parity model: {error}"))
         })?;
+
+        // Installed from the same canonical text the validators compare
+        // against, so installer/validator drift is not expressible.
+        for (name, canonical) in PARITY_GUARD_TRIGGERS {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}; {canonical};"))
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("install parity guard {name}: {error}"))
+                })?;
+        }
         conn.execute_batch(
             "DROP TRIGGER IF EXISTS m4_community_parity_entity_update;
              DROP TRIGGER IF EXISTS m4_community_parity_memory_insert;
@@ -12219,44 +12292,12 @@ impl MemoryDB {
 
         // The integrity guards never bump the counter -- they forbid the write
         // shapes that would let a bump be laundered past the repair effect
-        // guard -- so they carry their own markers rather than the bump
-        // substring above. Without this loop a missing or malformed guard is
-        // undetectable, which would leave the arithmetic silently unprotected.
-        for (trigger, marker) in [
-            ("m4_parity_input_state_unit_bump", "at most 1 per write"),
-            (
-                "m4_parity_input_state_seed_only_insert",
-                "only be inserted at generation 0",
-            ),
-            ("m4_parity_input_state_no_delete", "must not be deleted"),
-        ] {
-            let mut rows = conn
-                .query(
-                    "SELECT sql FROM sqlite_master
-                      WHERE type='trigger' AND name=?1 LIMIT 1",
-                    libsql::params![trigger],
-                )
-                .await
-                .map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "inspect community parity integrity guard {trigger}: {error}"
-                    ))
-                })?;
-            let sql = rows
-                .next()
-                .await
-                .map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "read community parity integrity guard {trigger}: {error}"
-                    ))
-                })?
-                .and_then(|row| row.get::<String>(0).ok());
-            if !sql
-                .as_deref()
-                .is_some_and(|value| value.to_ascii_lowercase().contains(marker))
-            {
-                return Ok(true);
-            }
+        // guard -- so the substring check above cannot see them. Whole-shape
+        // comparison, because a guard keeping its name and RAISE text while
+        // losing its WHEN predicate, timing, or target table would enforce
+        // nothing and still read as healthy.
+        if parity_guard_shape_drift(&conn).await?.is_some() {
+            return Ok(true);
         }
         Ok(false)
     }
@@ -50198,6 +50239,63 @@ pub(crate) mod tests {
         );
     }
 
+    /// Repair recovery deliberately skips migrations and the startup trigger
+    /// inventory, then exposes the approved apply endpoint -- so a database
+    /// written by an earlier build of this same schema version, carrying 96
+    /// without the parity guards, would be opened with the effect guard's
+    /// arithmetic unprotected. `user_version` alone cannot see that. Refusing
+    /// is correct here rather than repairing: the repair contract does not
+    /// mutate schema outside the approved manifest.
+    #[tokio::test]
+    async fn repair_open_refuses_a_current_version_database_without_the_parity_guards() {
+        let (db, dir) = test_db().await;
+        for (name, _) in PARITY_GUARD_TRIGGERS {
+            db.conn
+                .lock()
+                .await
+                .execute_batch(&format!("DROP TRIGGER {name};"))
+                .await
+                .unwrap();
+        }
+        drop(db);
+
+        let error = MemoryDB::open_for_repair(dir.path())
+            .await
+            .err()
+            .expect("an unguarded database must not be opened for repair");
+
+        assert!(
+            format!("{error}").contains("repair_database_parity_guard_missing"),
+            "the refusal must name the guard gap, got: {error}"
+        );
+    }
+
+    /// A guard that keeps its name and its RAISE text but loses its predicate
+    /// enforces nothing. Name or message-substring validation would call that
+    /// healthy, so the check compares whole normalized DDL.
+    #[tokio::test]
+    async fn parity_guard_validation_rejects_a_hollowed_out_guard() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "DROP TRIGGER m4_parity_input_state_unit_bump;
+             CREATE TRIGGER m4_parity_input_state_unit_bump
+             BEFORE UPDATE ON community_parity_input_state
+             WHEN 0=1
+             BEGIN
+               SELECT RAISE(ABORT, 'community_parity_input_state generation must advance by at most 1 per write');
+             END;",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            parity_guard_shape_drift(&conn).await.unwrap(),
+            Some("m4_parity_input_state_unit_bump"),
+            "an inert guard with the right name and message must be detected"
+        );
+    }
+
     /// Positive control over the parity counter's conservation invariant.
     ///
     /// The repair effect guard subtracts the measured generation delta from
@@ -50222,7 +50320,6 @@ pub(crate) mod tests {
             ("insert or replace", "INSERT OR REPLACE INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) SELECT 1, generation+2, relevant_spaces_digest FROM community_parity_input_state WHERE singleton=1"),
             ("bare replace", "REPLACE INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) SELECT 1, generation+5, relevant_spaces_digest FROM community_parity_input_state WHERE singleton=1"),
             ("upsert do update", "INSERT INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) VALUES (1,0,'') ON CONFLICT(singleton) DO UPDATE SET generation=generation+3"),
-            ("delete then insert", "DELETE FROM community_parity_input_state WHERE singleton=1"),
         ];
 
         for (label, sql) in shapes {
@@ -50268,6 +50365,47 @@ pub(crate) mod tests {
                  {change_delta} row changes -- that surplus can hide an escaped write"
             );
         }
+
+        // DELETE gets its own arm: folding it into the loop above let the test
+        // stay green with the singleton actually deleted, because the loop
+        // substitutes the prior generation when the row disappears. Assert the
+        // rejection and the survival of the row directly.
+        let deleted = conn
+            .execute(
+                "DELETE FROM community_parity_input_state WHERE singleton=1",
+                (),
+            )
+            .await;
+        assert!(
+            deleted.is_err(),
+            "deleting the parity singleton must be rejected"
+        );
+        let survivors: i64 = conn
+            .query("SELECT COUNT(*) FROM community_parity_input_state", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(survivors, 1, "the parity singleton must survive a DELETE");
+
+        // And the full DELETE-then-INSERT route, which is the bypass the
+        // no-delete guard exists for.
+        let round_trip = conn
+            .execute_batch(
+                "DELETE FROM community_parity_input_state WHERE singleton=1;
+                 INSERT INTO community_parity_input_state
+                     (singleton, generation, relevant_spaces_digest)
+                 VALUES (1, 9000, '');",
+            )
+            .await;
+        assert!(
+            round_trip.is_err(),
+            "delete-then-insert must not reseat the counter"
+        );
     }
 
     /// Mutation caught: treating a stamped local-only M96 database as current
