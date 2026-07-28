@@ -24,7 +24,7 @@ correct and stay:
   (`edge_grounding.rs:100` states this invariant explicitly).
 
 M3g also refuses to judge under a non-pinned backend
-(`skipped_non_on_device`, `edge_grounding.rs:171`) because a cloud model would
+(`skipped_non_on_device`, `edge_grounding.rs:175`) because a cloud model would
 score a fixed threshold differently. M5 keeps that refusal.
 
 ## 2. The M3g cache key is NOT reused
@@ -32,7 +32,7 @@ score a fixed threshold differently. M5 keeps that refusal.
 Verified: M3g's version tag is
 
 ```rust
-// edge_grounding.rs:154
+// edge_grounding.rs:155, in grounding_version_tag (:154)
 format!("{EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION}|{model_id}")
 ```
 

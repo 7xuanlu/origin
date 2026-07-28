@@ -62,24 +62,33 @@ and one derived check, mirroring the existing `scope_contract_violation()`.
 
 `truth_class` must **not** be derived from membership in
 `sensitive_read_routes()`. Verified: `NON_SENSITIVE_PATHS`
-(`route_registry.rs:190`) contains paths that are page-bearing readers under D3:
+(`route_registry.rs:190`) contains paths that are page-bearing readers under D3.
+Found by inspection, **non-exhaustive**:
 
 | Path in `NON_SENSITIVE_PATHS` | D3 class |
 |---|---|
 | `/ws/updates` | automatic |
 | `/api/steep` | automatic |
 | `/api/distill`, `/api/distill/{page_id}` | automatic |
-| `/api/lint`, `/api/repairs/*` | automatic |
+| `/api/lint`, `/api/repairs/*` (5 routes) | automatic |
 | `/api/knowledge/path` | automatic |
-| `/api/pages/{id}/map/*` (mutating variants) | explicit |
+| `/api/debug/pipeline` | automatic |
+| `/api/communities/proposals/{id}/accept`, `/reject` | automatic |
+| `/api/pages/{id}/map/*` (5 routes) | explicit |
+| `/api/pages/{id}/archive`, `/api/memory/{id}/update-page` | explicit |
 
 Those are opted out of *scope-sensitivity* classification, which is a different
 question from *truth exposure*. A page-bearing route can be scope-insensitive
 and still leak provisional prose. So M5's truth classification must be **total
 over every registered path**, including the opt-out lists, with its own
-fail-closed assert in `TrackedRouter::route`. Reusing the existing membership
-test would silently exempt every path in the table above — seven page-bearing
-readers, including the push channel.
+fail-closed assert in `TrackedRouter::route`.
+
+**The table above is deliberately not the contract.** An earlier draft of this
+document asserted a specific count, and re-reading `NON_SENSITIVE_PATHS`
+immediately found more. That is the argument for total coverage in one
+observation: any hand-enumeration of page-bearing readers is wrong on the day
+it is written, so PR-B classifies **every** registered path and lets the assert
+find what a human list misses. Treat this table as motivation, never as the set.
 
 ### MCP, CLI, projection, internal: no registry exists
 
@@ -220,7 +229,8 @@ which is the precedent this follows deliberately.
 
 | Weakening | Must fail |
 |---|---|
-| derive `truth_class` from `sensitive_read_routes()` membership | §2 opt-out test — `/ws/updates` and six others go unclassified |
+| derive `truth_class` from `sensitive_read_routes()` membership | §2 opt-out test — `/ws/updates` and every other opt-out path goes unclassified |
+| replace total coverage with a hand-enumerated page-bearing list | §2 — add a page-bearing route to `NON_SENSITIVE_PATHS`, assert must fire |
 | build a second source-scanning manifest beside `TrackedRouter` | §1 — review gate, duplicate seam |
 | allow an unclassified registered path | `TrackedRouter::route` assert |
 | allow a table entry with no registered path | `finish()` drift assert |
