@@ -7,6 +7,13 @@ the set.
 **Generated from the merge base (`5ba8a3b4`), not hand-written.** Every row
 traces to a `.route()` call, a `#[tool(` declaration, or a `Commands` variant.
 
+**Amended for PR #399.** The three `/api/spaces/default` routes landed on `main`
+after this file was generated, so the original 162 was correct at `5ba8a3b4` and
+stale by the time PR-B cut its branch. They were not found by re-reading this
+file -- `TrackedRouter`'s coverage assert failed the first time it ran, which is
+the whole point of keeping the enforcement in the router rather than in a
+second scan. Current count: 165.
+
 ## Three wrong counts before this one
 
 Recorded because the corrections are the only reason to trust the fourth:
@@ -17,7 +24,7 @@ Recorded because the corrections are the only reason to trust the fourth:
 | 163 | fixed both of those, then counted a route registered **inside a `#[cfg(test)]` block** in `routes.rs` — its handler was an inline closure, which is why the adapter cell read `move` |
 | **162** | current: paren-balanced parse, every file, test modules stripped |
 
-155 in `router.rs`, 5 in `repair_routes.rs`,
+158 in `router.rs`, 5 in `repair_routes.rs`,
 2 in `lint_routes.rs`. `routes.rs` contributes none.
 
 Two rules follow, and both are now part of the contract:
@@ -193,9 +200,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 162 registered `(method, path, handler)` triples
+## HTTP — all 165 registered `(method, path, handler)` triples
 
-77 page-bearing, 85 not.
+79 page-bearing, 86 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -347,6 +354,9 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `POST` | `/api/sources/{id}/sync` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/spaces` | main | yes | automatic | `none` | `handle_list_spaces` | Space.description |
 | `POST` | `/api/spaces` | main | yes | automatic | `none` | `handle_create_space` | Space.description |
+| `DELETE` | `/api/spaces/default` | main | no | not_applicable | `none` | — | no prose fields |
+| `GET` | `/api/spaces/default` | main | yes | automatic | `none` | `handle_get_default_space` | Space.description |
+| `PUT` | `/api/spaces/default` | main | yes | automatic | `none` | `handle_set_default_space` | Space.description |
 | `POST` | `/api/spaces/reorder` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/spaces/{from}/move-to/{to}` | main | yes | automatic | `none` | `handle_move_space` | opaque response type — fail-closed |
 | `DELETE` | `/api/spaces/{name}` | main | yes | automatic | `none` | `handle_delete_space` | opaque response type — fail-closed |
@@ -742,8 +752,8 @@ adds a test that:
 
    | Count | Value | What it counts |
    |---|---|---|
-   | call-site triples | **162** | rows in this table: 155 `router.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
-   | runtime builder triples | **166** | `(builder, method, path)` pairs actually installed: 160 `main` + 6 `repair` |
+   | call-site triples | **165** | rows in this table: 158 `router.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
+   | runtime builder triples | **169** | `(builder, method, path)` pairs actually installed: 163 `main` + 6 `repair` |
 
    The +4 is two call sites that each land in **both** builders:
    `lint_routes::register` (2 triples) and `repair_routes::register_execution`

@@ -11,6 +11,7 @@ use crate::{
     security, source_routes, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use wenlan_core::truth_manifest::Builder;
 
 /// Build the shared application router with all routes.
 pub fn build_router(state: SharedState) -> AppRouter {
@@ -42,7 +43,7 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .allow_methods(Any)
         .allow_headers(Any);
 
-    repair_routes::register(lint_routes::register(TrackedRouter::new()))
+    repair_routes::register(lint_routes::register(TrackedRouter::new(Builder::Main)))
         // General
         .route("/api/health", get(routes::handle_health))
         .route("/api/status", get(routes::handle_status))
@@ -594,7 +595,7 @@ pub fn build_repair_router(state: SharedState) -> AppRouter {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    repair_routes::register_execution(lint_routes::register(TrackedRouter::new()))
+    repair_routes::register_execution(lint_routes::register(TrackedRouter::new(Builder::Repair)))
         .route("/api/health", get(routes::handle_health))
         .route("/api/status", get(routes::handle_status))
         .finish_restricted()

@@ -76,6 +76,7 @@ pub mod synthesis;
 pub mod tags;
 pub(crate) mod temporal_query;
 pub mod topic_match;
+pub mod truth_manifest;
 pub mod tuning;
 pub mod vocab;
 
