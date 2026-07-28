@@ -43,6 +43,10 @@ mod lint_endpoint_test;
 #[path = "repair_endpoint_test.rs"]
 mod repair_endpoint_test;
 
+#[cfg(test)]
+#[path = "truth_error_seam_test.rs"]
+mod truth_error_seam_test;
+
 /// Shared mutex for tests that mutate the process-wide `WENLAN_DATA_DIR` env
 /// var. Rust tests run in parallel by default, so any test that swaps this env
 /// var must hold this single crate-level lock for the full guard lifetime.

@@ -33,6 +33,10 @@ type ProjectionStateMode = bool;
 /// `write_page` calls for the same page never pick the same temp filename.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[path = "projection_invariant_test.rs"]
+mod projection_invariant_test;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct KnowledgeState {
     #[serde(default = "default_schema_v2")]
@@ -465,6 +469,61 @@ impl KnowledgeWriter {
 
             Ok(())
         })
+    }
+
+    /// `projection_directory_invariant` — the enforcement address the M5 reader
+    /// manifest records for `wenlan pages` (binding spec section 5).
+    ///
+    /// `wenlan pages` reads Markdown straight off this directory
+    /// (`crates/wenlan-cli/src/commands/pages.rs`), so neither frontmatter nor
+    /// wire negotiation can reach it: what the directory *contains* is the whole
+    /// enforcement. After the cutover it holds supported pages only, and this
+    /// pass is what makes that true — it removes the file of every page the
+    /// automatic reader may not see.
+    ///
+    /// Removal, not a write-time skip, is the load-bearing half. Migration 99
+    /// backfills every pre-existing page to `provisional`, so the moment the
+    /// cutover advances, the directory is already full of files no later write
+    /// would ever touch; a writer that merely declined to project new
+    /// provisional pages would leave every one of them readable. That is
+    /// exactly the weakening section 9 names.
+    ///
+    /// Inert at cutover generation 0 by construction rather than by a branch of
+    /// its own: `page_visibility` short-circuits every page to `Full` there, so
+    /// the pass finds nothing to remove and PR-B changes no behavior.
+    ///
+    /// ponytail: `remove_page` reloads and rewrites `state.json` per page, so a
+    /// cutover that evicts a whole corpus is O(n²) in state bytes. It runs once,
+    /// off the request path, and reusing the removal seam keeps the stub
+    /// manifest correct for free — bulk it only if a real corpus complains.
+    pub async fn enforce_projection_directory_invariant(
+        &self,
+        database: &crate::db::MemoryDB,
+        guard: &crate::page_projection_tracker::PageProjectionWriteGuard,
+    ) -> Result<usize, WenlanError> {
+        self.validate_guard(guard)?;
+        // The projection's own record of who lives here, not the DB's active
+        // page list: a file whose page row is already gone still has to go.
+        let projected: Vec<String> = self.load_state().pages.into_keys().collect();
+        if projected.is_empty() {
+            return Ok(0);
+        }
+        // `Automatic` is the only honest grant for a directory: the reader is a
+        // filesystem, it declares no contract and carries no human gesture.
+        let visible = database
+            .page_visibility(&crate::truth_contract::TruthGrant::Automatic, &projected)
+            .await?;
+        let mut removed = 0;
+        for page_id in &projected {
+            // A missing verdict is not permission. `page_visibility` is total
+            // over its input, so this only fires if that ever stops being true.
+            if visible.get(page_id) == Some(&crate::truth_contract::Visibility::Full) {
+                continue;
+            }
+            self.remove_page(guard, page_id)?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     fn validate_guard(
@@ -3332,6 +3391,16 @@ impl KnowledgeProjectionWrite {
 
     pub fn reconcile(&self, pages: &[Page]) -> Result<ReconcileStats, WenlanError> {
         self.writer.reconcile(&self.guard, pages)
+    }
+
+    /// See [`KnowledgeWriter::enforce_projection_directory_invariant`].
+    pub async fn enforce_projection_directory_invariant(
+        &self,
+        database: &crate::db::MemoryDB,
+    ) -> Result<usize, WenlanError> {
+        self.writer
+            .enforce_projection_directory_invariant(database, &self.guard)
+            .await
     }
 }
 

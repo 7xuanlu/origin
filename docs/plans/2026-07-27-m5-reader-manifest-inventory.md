@@ -90,7 +90,9 @@ the pattern.
 
 ### Recorded demotions
 
-Exactly one, and it is the only row where `no` overrides an opaque return type:
+Thirty-five. One of them — `GET /ws/updates` — is the only row where `no`
+overrides an opaque return type; the other thirty-four are transparent handlers
+traced to their data source.
 
 - **`GET /ws/updates`.** The handler returns a bare `Response` (the upgrade), so
   test 2 flags it. But the messages it can carry are a closed enum:
@@ -102,6 +104,141 @@ Exactly one, and it is the only row where `no` overrides an opaque return type:
 An earlier draft made this route the headline example of a page-bearing reader
 nobody had noticed. That was wrong, and the correction is why demotions cite a
 type rather than an intuition.
+
+#### Source-traced demotions (2026-07-28)
+
+The scan of section "How `page_bearing` was determined" matched on response
+*field names*, so a route returning any `title`/`content`/`summary` field was
+marked `yes` regardless of where those bytes came from. The thirty-four rows
+below were each traced from handler to the SQL or core function it actually
+reads. Every one reads `memories`, `entities`, `spaces`, `agent_connections`,
+or another non-page table, and none composes a helper that touches `pages`.
+Each bullet cites the data-source line, not the response type.
+
+A cross-cutting check backs the memory-table rows: no production code path
+writes page prose into `memories`. A scan of every SQL literal that both names
+a page table and writes `memories` found only test fixtures
+(`lint/semantic_test.rs`, `lint/deep_test.rs`,
+`lint/pages/diagnostic_scale_test.rs`), and a scan for Rust functions
+containing both a page read and a memory write found only `#[cfg(test)]`
+functions in `db.rs` plus `wenlan-server/src/main.rs:1037 run_daemon` (startup
+orchestration, not a route handler). `sources/page_watcher.rs` writes only back
+to `pages`. That scan is name-based, not LSP-resolved, so it is corroboration
+for the per-row traces rather than a substitute for them.
+
+- **`GET /api/activities`.** `list_agent_activity_scoped` (`db.rs:40951`) and
+  `list_agent_activity` (`db.rs:40857`) read `agent_activity`; the only title
+  source is `SELECT DISTINCT title FROM memories` (`db.rs:41049`,
+  `db.rs:40922`).
+- **`GET /api/agents`.** `list_agents` (`db.rs:34274`) selects `FROM
+  agent_connections`. No join, no page read.
+- **`GET /api/agents/{name}`.** `get_agent` (`db.rs:34252`) selects `FROM
+  agent_connections WHERE name = ?1`.
+- **`PUT /api/agents/{name}`.** `update_agent` (`db.rs:34295`) writes
+  `agent_connections`, then the handler re-reads through `get_agent`
+  (`db.rs:34252`).
+- **`GET /api/briefing`.** `generate_briefing_scoped` (`briefing.rs:181`) /
+  `generate_briefing` (`briefing.rs:156`) assemble via
+  `assemble_briefing` (`briefing.rs:88`) over
+  `get_recent_memories_for_briefing[_scoped]` (`db.rs:36834`, `db.rs:36873`)
+  and `get_briefing_stats[_scoped]` (`db.rs:36722`, `db.rs:36656`) — all `FROM
+  memories`.
+- **`GET /api/chunks/{source_id}`.** `get_chunks_scoped` (`db.rs:27287`) selects
+  `FROM memories`.
+- **`GET /api/config`.** `load_config` (`config.rs:180`) is a
+  `std::fs::read_to_string` of `config.json` — no DB at all. The
+  `skip_title_patterns` field that the field-name scan matched is a list of
+  capture-skip window-title globs (`config.rs:30`, `config.rs:49`), not page
+  titles.
+- **`PUT /api/config`.** Same file-backed source; the handler returns
+  `config_to_response(&cfg)` (`config_routes.rs:15`, `config_routes.rs:116`).
+- **`GET /api/decisions`.** `list_memories_scoped` (`db.rs:28498`) reads
+  `memories` joined to `enrichment_steps`.
+- **`GET /api/home-stats`.** `get_home_stats_scoped` (`db.rs:33631`) /
+  `get_home_stats` (`db.rs:33276`) aggregate `memories` and `access_log`.
+- **`GET /api/indexed-files`.** `list_indexed_files_scoped` (`db.rs:27061`) runs
+  one aggregate `FROM memories`, and sets `content: String::new()`
+  (`db.rs:27109`).
+- **`GET /api/memory/by-ids`.** `get_memories_by_source_ids_scoped`
+  (`db.rs:28822`) reads `memories` + `enrichment_steps`.
+- **`POST /api/memory/list`.** `list_filtered_confirmed_scoped` (`db.rs:29220`)
+  selects `FROM memories` (SQL at `db.rs:29292`-`db.rs:29306`).
+- **`GET /api/memory/nurture`.** `get_nurture_cards_scoped` (`db.rs:35061`)
+  reads `memories` + `enrichment_steps`.
+- **`GET /api/memory/pending-revision/{source_id}`.**
+  `get_pending_revision_for_scoped` (`db.rs:35448`) selects `FROM memories`.
+- **`GET /api/memory/pending-revisions`.** `list_pending_revisions_scoped`
+  (`db.rs:35589`) selects `FROM memories`.
+- **`GET /api/memory/pinned`.** `list_pinned_memories_scoped` (`db.rs:33092`)
+  delegates to `list_memories_scoped` (`db.rs:28498`).
+- **`GET /api/memory/recent`.** `list_recent_memories_scoped` (`db.rs:40319`)
+  reads `memories` + `enrichment_steps` plus `pending_review_memory_ids`
+  (`db.rs:37058`, `FROM refinement_queue`), and emits `ActivityKind::Memory`
+  only.
+- **`GET /api/memory/rejections`.** `handle_get_rejections`
+  (`memory_routes.rs:1934`) calls `get_rejections` (`db.rs:41112`), which
+  selects `FROM rejected_memories`.
+- **`GET /api/memory/unconfirmed`.** `list_unconfirmed_memories_scoped`
+  (`db.rs:40479`) selects `FROM memories` and emits `ActivityKind::Memory` only.
+- **`GET /api/memory/{id}/detail`.** `get_memory_detail_scoped` (`db.rs:28811`)
+  delegates to `get_memories_by_source_ids_scoped` (`db.rs:28822`).
+- **`GET /api/memory/{id}/revisions`.** `walk_supersede_chain_scoped`
+  (`db.rs:48680`) is a recursive CTE `FROM memories`.
+- **`GET /api/memory/{id}/versions`.** `get_version_chain_scoped`
+  (`db.rs:33928`) selects `FROM memories`.
+- **`GET /api/memory/{source_id}/enrichment-status`.**
+  `get_enrichment_status_scoped` (`db.rs:32439`) composes `get_enrichment_steps`
+  (`db.rs:32611`) and `get_enrichment_summary` (`db.rs:32640`), both over
+  `enrichment_steps`.
+- **`GET /api/profile/narrative`.** Served from `get_cached_narrative`
+  (`db.rs:36575`, `FROM narrative_cache`) or generated by `generate_narrative`
+  (`narrative.rs:122`) over `get_memories_for_narrative` (`db.rs:36514`).
+- **`POST /api/profile/narrative/regenerate`.** Same path, forced regeneration
+  (`memory_routes.rs:3273`).
+- **`GET /api/snapshots`.** `get_recent_snapshots` (`db.rs:36328`) selects `FROM
+  session_snapshots`.
+- **`GET /api/snapshots/{id}/captures`.** `get_captures_for_snapshot_scoped`
+  (`db.rs:36138`) joins `capture_refs` to `memories`.
+- **`GET /api/snapshots/{id}/captures-with-content`.**
+  `get_snapshot_captures_with_content_scoped` (`db.rs:36277`) composes
+  `db.rs:36138`, `db.rs:27061`, and `get_snapshot_capture_content`
+  (`db.rs:36236`, `FROM memories`).
+- **`GET /api/spaces`.** `list_spaces` (`db.rs:19226`) selects `FROM spaces`
+  with COUNT subqueries over `memories` and `entities`.
+- **`POST /api/spaces`.** `create_space` (`db.rs:19317`) reads only `SELECT
+  MAX(sort_order) FROM spaces` before inserting.
+- **`GET /api/spaces/default`.** `get_default_space` (`space_context.rs:73`)
+  resolves through `get_space_by_id` (`space_context.rs:35`), a `spaces` read.
+- **`PUT /api/spaces/default`.** `set_default_space` (`space_context.rs:106`)
+  returns `get_space_by_id` (`space_context.rs:35`).
+- **`PUT /api/spaces/{name}`.** `update_space` (`db.rs:19374`) does touch
+  `pages`, but its only page statement (`db.rs:19428`-`db.rs:19446`) is a
+  scope-rename cascade that writes space/workspace/version/last_modified and
+  selects nothing back; the response is `get_space(new_name)` (`db.rs:19265`).
+
+#### Corrected evidence on kept rows (2026-07-28)
+
+Two rows kept `page_bearing = yes` — the right verdict — while citing evidence
+that does not carry it. A row whose evidence names the wrong field looks
+demotable the moment that field is refactored away, so the cell is load-bearing
+even when the verdict does not move.
+
+- **`GET /api/memory/entities/{entity_id}`**, was `Observation.content`, now
+  `Entity.name = pages.title (M3)`. An observation is a knowledge-graph string,
+  not page prose, so it never justified the verdict. What does: under the M3
+  entity reader cutover, `get_entity_detail_scoped`
+  (`db/scoped_entities.rs:116`) selects `p.title` from `pages` through
+  `entity_page_map` and returns it as the entity's `name`. The page class it
+  reads is `kind = 'entity'` — precisely the class `select_visible_pages`
+  excludes, so the shared visibility helper never sees this path. The cutover is
+  per-consumer and default-OFF (`set_entity_reader_cutover`), so the disclosure
+  is conditional; the manifest records the strongest reason, not the current
+  default.
+- **`POST /api/repairs/apply`**, now `RepairTarget.label_key`. The receipt
+  flattens to `RepairTarget::PageLink { source_page_id, label_key, scope }`
+  (`wenlan-types/src/repair.rs:1701`), and a wikilink label is a page title
+  under another name. A scan over response *types* cannot see this; only
+  following the flatten does.
 
 ## Class is always `automatic`; `explicit` is per-call
 
@@ -202,35 +339,35 @@ load-bearing: the shape gate holds even when this one is bypassed.
 
 ## HTTP — all 165 registered `(method, path, handler)` triples
 
-79 page-bearing, 86 not.
+45 page-bearing, 120 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
-| `GET` | `/api/activities` | main | yes | automatic | `none` | `handle_list_activities` | AgentActivityRow.memory_titles |
-| `GET` | `/api/agents` | main | yes | automatic | `none` | `handle_list_agents` | AgentResponse.description |
+| `GET` | `/api/activities` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/agents` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `DELETE` | `/api/agents/{name}` | main | yes | automatic | `none` | `handle_delete_agent` | opaque response type — fail-closed |
-| `GET` | `/api/agents/{name}` | main | yes | automatic | `none` | `handle_get_agent` | AgentResponse.description |
-| `PUT` | `/api/agents/{name}` | main | yes | automatic | `none` | `handle_update_agent` | AgentResponse.description |
-| `GET` | `/api/briefing` | main | yes | automatic | `none` | `handle_get_briefing` | BriefingResponse.content |
+| `GET` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `PUT` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/briefing` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `GET` | `/api/capture-stats` | main | yes | automatic | `none` | `handle_capture_stats` | opaque response type — fail-closed |
 | `POST` | `/api/chunks/delete-bulk` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/chunks/time-range` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/chunks/{id}/update` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/chunks/{source_id}` | main | yes | automatic | `none` | `handle_get_chunks` | MemoryDetail.content, MemoryDetail.summary, MemoryDetail.title |
+| `GET` | `/api/chunks/{source_id}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `GET` | `/api/communities` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/communities/members` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/communities/page-assignments` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/communities/proposals` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/communities/proposals/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/communities/proposals/{id}/reject` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/config` | main | yes | automatic | `none` | `handle_get_config` | ConfigResponse.skip_title_patterns |
-| `PUT` | `/api/config` | main | yes | automatic | `none` | `handle_update_config` | ConfigResponse.skip_title_patterns |
+| `GET` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `PUT` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `GET` | `/api/config/routing` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/config/skip-apps` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/config/skip-apps` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/context` | main | yes | automatic | `none` | `handle_context` | ChatContextResponse.context, KnowledgeContext.graph_context, Searc |
 | `GET` | `/api/debug/pipeline` | main | yes | automatic | `none` | `handle_pipeline_status` | opaque response type — fail-closed |
-| `GET` | `/api/decisions` | main | yes | automatic | `none` | `handle_list_decisions` | MemoryItem.content, MemoryItem.source_text, MemoryItem.summary, Me |
+| `GET` | `/api/decisions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `GET` | `/api/decisions/domains` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/distill` | main | yes | automatic | `none` | `handle_distill` | opaque response type — fail-closed |
 | `POST` | `/api/distill/{page_id}` | main | yes | automatic | `none` | `handle_redistill` | opaque response type — fail-closed |
@@ -239,11 +376,11 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `DELETE` | `/api/documents/{source}/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/health` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/health` | repair | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/home-stats` | main | yes | automatic | `none` | `handle_get_home_stats` | TopMemory.content |
+| `GET` | `/api/home-stats` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/import/chat-export` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/import/memories` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/import/state` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/indexed-files` | main | yes | automatic | `none` | `handle_list_indexed_files` | IndexedFileInfo.content, IndexedFileInfo.summary, IndexedFileInfo. |
+| `GET` | `/api/indexed-files` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/ingest/memory` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/ingest/text` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/ingest/webpage` | main | no | not_applicable | `none` | — | no prose fields |
@@ -253,48 +390,48 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/lint` | main + repair | yes | automatic | `none` | `handle_lint` | LintAgentRecord.excerpt, LintAgentRecord.source_excerpt, LintCheck |
 | `POST` | `/api/lint` | main + repair | yes | automatic | `none` | `handle_lint_submission` | LintAgentRecord.excerpt, LintAgentRecord.source_excerpt, LintCheck |
 | `POST` | `/api/llm/test` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/by-ids` | main | yes | automatic | `none` | `handle_get_memories_by_ids` | MemoryItem.content, MemoryItem.source_text, MemoryItem.summary, Me |
+| `GET` | `/api/memory/by-ids` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/memory/confirm/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/contradiction/{source_id}/dismiss` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/delete/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/entities` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/entities/list` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/entities/search` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/entities/{entity_id}` | main | yes | automatic | `none` | `handle_get_entity_detail` | Observation.content |
+| `GET` | `/api/memory/entities/{entity_id}` | main | yes | automatic | `none` | `handle_get_entity_detail` | Entity.name = pages.title (M3) |
 | `POST` | `/api/memory/entities/{entity_id}/observations` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/entities/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/entities/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/memory/entity-suggestions` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/link-entity` | main | yes | automatic | `none` | `handle_link_entity` | opaque response type — fail-closed |
-| `POST` | `/api/memory/list` | main | yes | automatic | `none` | `handle_list_memories` | IndexedFileInfo.content, IndexedFileInfo.summary, IndexedFileInfo. |
-| `GET` | `/api/memory/nurture` | main | yes | automatic | `none` | `handle_get_nurture_cards` | MemoryItem.content, MemoryItem.source_text, MemoryItem.summary, Me |
+| `POST` | `/api/memory/list` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/nurture` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/memory/observations` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/observations/{id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/observations/{id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/observations/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/pending-revision/{source_id}` | main | yes | automatic | `none` | `handle_get_pending_revision` | PendingRevision.content |
-| `GET` | `/api/memory/pending-revisions` | main | yes | automatic | `none` | `handle_list_pending_revisions` | PendingRevisionItem.revision_content |
-| `GET` | `/api/memory/pinned` | main | yes | automatic | `none` | `handle_list_pinned_memories` | MemoryItem.content, MemoryItem.source_text, MemoryItem.summary, Me |
-| `GET` | `/api/memory/recent` | main | yes | automatic | `none` | `handle_recent_memories` | RecentActivityItem.snippet, RecentActivityItem.title |
+| `GET` | `/api/memory/pending-revision/{source_id}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/pending-revisions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/pinned` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/recent` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/memory/reclassify/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/rejections` | main | yes | automatic | `none` | `handle_get_rejections` | RejectionRecord.content |
+| `GET` | `/api/memory/rejections` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/memory/relations` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/revision/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/revision/{id}/dismiss` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/search` | main | yes | automatic | `none` | `handle_search_memory` | SearchResult.content, SearchResult.content_hash, SearchResult.last |
 | `GET` | `/api/memory/stats` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/store` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/unconfirmed` | main | yes | automatic | `none` | `handle_list_unconfirmed_memories` | RecentActivityItem.snippet, RecentActivityItem.title |
+| `GET` | `/api/memory/unconfirmed` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/memory/{id}/correct` | main | yes | automatic | `none` | `handle_correct_memory` | opaque response type — fail-closed |
-| `GET` | `/api/memory/{id}/detail` | main | yes | automatic | `none` | `handle_get_memory_detail` | MemoryItem.content, MemoryItem.source_text, MemoryItem.summary, Me |
+| `GET` | `/api/memory/{id}/detail` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/memory/{id}/pin` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/{id}/revisions` | main | yes | automatic | `none` | `handle_get_memory_revisions` | MemoryRevisionEntry.content_preview, MemoryRevisionEntry.delta_sum |
+| `GET` | `/api/memory/{id}/revisions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `PUT` | `/api/memory/{id}/stability` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/{id}/unpin` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/{id}/update` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/{id}/update-page` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/{id}/versions` | main | yes | automatic | `none` | `handle_get_version_chain` | MemoryVersionItem.content, MemoryVersionItem.title |
-| `GET` | `/api/memory/{source_id}/enrichment-status` | main | yes | automatic | `none` | `handle_get_enrichment_status` | EnrichmentStatusResponse.summary |
+| `GET` | `/api/memory/{id}/versions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/{source_id}/enrichment-status` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `GET` | `/api/on-device-model` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/on-device-model/download` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/onboarding/milestones` | main | no | not_applicable | `none` | — | no prose fields |
@@ -328,8 +465,8 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/ping` | main | yes | automatic | `none` | `handle_ping` | opaque response type — fail-closed |
 | `GET` | `/api/profile` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/profile` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/profile/narrative` | main | yes | automatic | `none` | `handle_get_profile_narrative` | NarrativeResponse.content |
-| `POST` | `/api/profile/narrative/regenerate` | main | yes | automatic | `none` | `handle_regenerate_narrative` | NarrativeResponse.content |
+| `GET` | `/api/profile/narrative` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `POST` | `/api/profile/narrative/regenerate` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `GET` | `/api/refinery/queue` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/refinery/queue/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/refinery/queue/{id}/reject` | main | no | not_applicable | `none` | — | no prose fields |
@@ -344,23 +481,23 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `PUT` | `/api/setup/anthropic-key` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/setup/status` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/shutdown` | main | yes | automatic | `none` | `handle_shutdown` | opaque response type — fail-closed |
-| `GET` | `/api/snapshots` | main | yes | automatic | `none` | `handle_list_snapshots` | SessionSnapshot.summary |
-| `GET` | `/api/snapshots/{id}/captures` | main | yes | automatic | `none` | `handle_get_snapshot_captures` | SnapshotCapture.window_title |
-| `GET` | `/api/snapshots/{id}/captures-with-content` | main | yes | automatic | `none` | `handle_get_snapshot_captures_with_content` | SnapshotCaptureWithContent.content, SnapshotCaptureWithContent.sum |
+| `GET` | `/api/snapshots` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/snapshots/{id}/captures` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/snapshots/{id}/captures-with-content` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/snapshots/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/sources` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/sources` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/sources/{id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/sources/{id}/sync` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/spaces` | main | yes | automatic | `none` | `handle_list_spaces` | Space.description |
-| `POST` | `/api/spaces` | main | yes | automatic | `none` | `handle_create_space` | Space.description |
+| `GET` | `/api/spaces` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `POST` | `/api/spaces` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `DELETE` | `/api/spaces/default` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/spaces/default` | main | yes | automatic | `none` | `handle_get_default_space` | Space.description |
-| `PUT` | `/api/spaces/default` | main | yes | automatic | `none` | `handle_set_default_space` | Space.description |
+| `GET` | `/api/spaces/default` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `PUT` | `/api/spaces/default` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/spaces/reorder` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/spaces/{from}/move-to/{to}` | main | yes | automatic | `none` | `handle_move_space` | opaque response type — fail-closed |
 | `DELETE` | `/api/spaces/{name}` | main | yes | automatic | `none` | `handle_delete_space` | opaque response type — fail-closed |
-| `PUT` | `/api/spaces/{name}` | main | yes | automatic | `none` | `handle_update_space` | Space.description |
+| `PUT` | `/api/spaces/{name}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
 | `POST` | `/api/spaces/{name}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/spaces/{name}/pin` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/spaces/{name}/star` | main | yes | automatic | `none` | `handle_toggle_space_starred` | opaque response type — fail-closed |
@@ -438,7 +575,7 @@ the projection-directory reader.
 | `wenlan connect` | yes | automatic | `none` | subcommand renderer |
 | `wenlan search` | yes | automatic | `none` | subcommand renderer |
 | `wenlan recall` | yes | automatic | `none` | subcommand renderer |
-| `wenlan pages` | yes | automatic | **`collection` + `named_page`** | subcommand renderer |
+| `wenlan pages` | yes | automatic | **`collection` + `named_page`** | enforce_projection_directory_invariant |
 | `wenlan sources` | yes | automatic | `none` | subcommand renderer |
 | `wenlan capture` | yes | automatic | `none` | subcommand renderer |
 | `wenlan memories` | yes | automatic | `none` | subcommand renderer |
@@ -809,3 +946,19 @@ adds a test that:
 
 Checks 2 and 3 are the positive controls: 2 keeps the row set live, 3 keeps the
 evidence live. Without both, this file is a snapshot that rots.
+
+#### Known non-HTTP disclosure surfaces (out of scope for check 14)
+
+Check 14's invariant is scoped to the HTTP **error response body**. Three
+success-path sites put a page title somewhere durable that is not an error body,
+found while auditing the seam and deliberately left alone:
+
+| site | what it writes | why out of scope |
+|---|---|---|
+| `core/post_write.rs:2918` (`create_page_impl`) | `title={req.title}` into `log_agent_activity`'s `detail` | activity-log row, `Ok` path only |
+| `core/post_write.rs:3086` (`stage_page_revision_card`) | `format!("Revision: {}", page.title)` into a staged `RawDocument` | staged row, `Gated` success path only |
+| `core/export/obsidian.rs:44` | `log::warn!` naming a page that failed to export | process log, never reaches the wire |
+
+None is reachable through an error response, so none can be driven by a caller
+holding no truth grant. If the truth contract later extends to durable
+side-channels, these are the known starting set.

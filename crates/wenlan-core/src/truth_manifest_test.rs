@@ -232,7 +232,7 @@ fn manifest_counts_match_the_spec() {
         .iter()
         .filter(|r| r.page_bearing == PageBearing::Yes)
         .count();
-    assert_eq!(bearing, 79, "page-bearing HTTP routes");
+    assert_eq!(bearing, 45, "page-bearing HTTP routes");
 }
 
 /// No runtime identity may be registered twice. `(method, path)` alone collides
