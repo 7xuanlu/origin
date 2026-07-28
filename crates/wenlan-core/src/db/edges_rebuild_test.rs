@@ -73,14 +73,18 @@ async fn every_index_on_edges_is_recorded_for_the_rebuild() {
         schema_objects("index").await,
         [
             "idx_edges_active_grounded_space_type",
+            "idx_edges_attests_fwd",
+            "idx_edges_attests_rev",
             "idx_edges_dst",
             "idx_edges_operation",
             "idx_edges_root",
             "idx_edges_src",
             "idx_edges_superseded",
+            "idx_edges_supports_fwd",
+            "idx_edges_supports_rev",
         ],
-        "the edges rebuild must restore every one of these, plus the four \
-         partial support/attest indexes it adds (artifact 3 §6)"
+        "six pre-M5 indexes the rebuild replays, plus the four partial \
+         support/attest indexes it adds (artifact 3 §6)"
     );
 }
 
@@ -170,6 +174,244 @@ async fn capture_skips_the_implicit_primary_key_index() {
         captured.is_empty(),
         "the PK's implicit index has no CREATE statement to replay: {captured:?}"
     );
+}
+
+/// Re-run migration 97 over the current database, the way `migration_58_idempotent`
+/// re-runs 58: rewind `user_version` one step and drive the real dispatch, so
+/// the test exercises the shipped ordering rather than a hand-assembled copy of
+/// it.
+async fn rerun_migration_97(db: &MemoryDB) {
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 96", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 97 must be re-runnable");
+    let conn = db.conn.lock().await;
+    let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(version, 97, "the rebuild must stamp the version it earned");
+}
+
+/// Weakening: assume the standard SQLite table-rebuild ordering just works
+/// here, because it works on a table nothing else references.
+///
+/// It does not. `m4_page_community_memory_insert_invalidate` (`db.rs:11162`)
+/// and its delete twin (`db.rs:11180`) are triggers **on `memories`** whose
+/// bodies read `FROM edges e`. They are not attached to `edges`, so
+/// `DROP TABLE edges` does not take them — they survive, naming a table that
+/// no longer exists. Since SQLite 3.25 `ALTER TABLE edges_new RENAME TO edges`
+/// reparses every trigger in the schema to rewrite references to the renamed
+/// object, that reparse resolves table names, and it trips over them:
+///
+/// ```text
+/// error in trigger m4_page_community_memory_insert_invalidate:
+///   no such table: main.edges
+/// ```
+///
+/// That is measured, not predicted — it is what this test reported before
+/// `rename_into_place` suppressed the reparse. Removing the suppression turns
+/// it red again.
+#[tokio::test]
+async fn the_rebuild_survives_the_window_where_edges_does_not_exist() {
+    let (db, _temp) = test_db().await;
+    let before = {
+        let conn = db.conn.lock().await;
+        schema_names(&conn, "trigger").await
+    };
+
+    rerun_migration_97(&db).await;
+
+    let conn = db.conn.lock().await;
+    assert_eq!(
+        schema_names(&conn, "trigger").await,
+        before,
+        "every trigger on edges must come back"
+    );
+
+    // The surviving triggers on `memories` must still resolve `edges`. A
+    // reparse that quietly repointed them elsewhere would leave this insert
+    // working and the invalidation dead, so the assertion is that the trigger
+    // body runs at all.
+    conn.execute(
+        "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                              last_modified, chunk_type, space)
+         VALUES ('m-fence', 'body', 'memory', 'm-fence', 't', 0, 0, 'text', 'unfiled')",
+        (),
+    )
+    .await
+    .expect("m4 memories triggers must still find edges");
+}
+
+/// Weakening: verify the rebuild by row count alone.
+///
+/// A count survives a column-order mistake in the copy; the row contents do
+/// not. Seeded with `lineage='legacy'`, which the space fence skips by design,
+/// so the fixture needs no page or memory endpoints to exist.
+#[tokio::test]
+async fn the_rebuild_preserves_every_row_unchanged() {
+    let (db, _temp) = test_db().await;
+    let before = {
+        let conn = db.conn.lock().await;
+        for (id, weight) in [("e1", "0.5"), ("e2", "NULL")] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                        lineage, grounded, space, weight, payload, created_at)
+                     VALUES ('{id}', 'p1', 'page', 'm1', 'memory', 'cites', 'legacy', 0,
+                             'unfiled', {weight}, '{{\"k\":1}}', 7)"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        dump_edges(&conn).await
+    };
+    assert_eq!(before.len(), 2, "fixture seeded");
+
+    rerun_migration_97(&db).await;
+
+    let conn = db.conn.lock().await;
+    assert_eq!(
+        dump_edges(&conn).await,
+        before,
+        "rows must survive verbatim"
+    );
+}
+
+/// Weakening: widen the CHECK enumerations and call the fail-open lane closed.
+///
+/// Artifact 3 §4 is explicit that it is not: both fence triggers carry
+/// `WHEN NEW.lineage != 'legacy'`, so a `claim_revision → memory` row written
+/// as legacy skips the fence body entirely and lands in the trusted support set
+/// with only writer discipline in the way. A CHECK has no lineage exemption,
+/// which is why the rebuild is the one chance to add one.
+#[tokio::test]
+async fn a_legacy_lineage_claim_revision_edge_is_refused_by_the_check() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+
+    let refused = conn
+        .execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, space, created_at)
+             VALUES ('bypass', 'cr1', 'claim_revision', 'm1', 'memory', 'supports',
+                     'legacy', 1, 'unfiled', 0)",
+            (),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a legacy-lineage claim_revision edge bypasses the fence, so storage must refuse it"
+    );
+}
+
+/// Weakening: accept any attestation whose columns are individually legal.
+///
+/// Artifact 3 §5 requires `attests.root_id` to equal `src_id`. Without it an
+/// attestation could claim one root's authority while pointing at another's
+/// identity — the two roots are both real, both permitted, and nothing else in
+/// the row is wrong.
+#[tokio::test]
+async fn an_attestation_may_not_name_a_root_other_than_its_source() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+    for root in ["r-src", "r-other"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
+                                               root_kind, independence_group_id, created_at)
+                 VALUES ('{root}', 1, '{root}', 'human_capture', 'g', 0)"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let refused = conn
+        .execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, root_id, space, created_at)
+             VALUES ('a1', 'r-src', 'root', 'cr1', 'claim_revision', 'attests',
+                     'assertion', 0, 'r-other', 'unfiled', 0)",
+            (),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "attests.root_id must equal src_id (artifact 3 §5)"
+    );
+}
+
+/// Weakening: let a human attestation set `grounded=1`.
+///
+/// Artifact 3 §3: human presence is provenance, not grounding. A human
+/// clicking approve does not make an ungrounded claim grounded — that is
+/// exactly the D2 axis collapse this rung exists to forbid.
+#[tokio::test]
+async fn an_attestation_may_not_assert_grounding() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
+                                       root_kind, independence_group_id, created_at)
+         VALUES ('r1', 1, 'r1', 'human_capture', 'g', 0)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let refused = conn
+        .execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, root_id, space, created_at)
+             VALUES ('a1', 'r1', 'root', 'cr1', 'claim_revision', 'attests',
+                     'assertion', 1, 'r1', 'unfiled', 0)",
+            (),
+        )
+        .await;
+    assert!(refused.is_err(), "attestation is never grounding");
+}
+
+async fn schema_names(conn: &libsql::Connection, kind: &str) -> Vec<String> {
+    let mut rows = conn
+        .query(
+            "SELECT name FROM sqlite_master
+             WHERE type = ?1 AND tbl_name = 'edges' AND sql IS NOT NULL
+             ORDER BY name",
+            libsql::params![kind],
+        )
+        .await
+        .unwrap();
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        names.push(row.get::<String>(0).unwrap());
+    }
+    names
+}
+
+async fn dump_edges(conn: &libsql::Connection) -> Vec<String> {
+    let mut rows = conn
+        .query(
+            "SELECT edge_id || '|' || src_id || '|' || src_kind || '|' || dst_id || '|'
+                 || dst_kind || '|' || edge_type || '|' || lineage || '|' || grounded || '|'
+                 || coalesce(root_id,'~') || '|' || space || '|' || coalesce(weight,'~') || '|'
+                 || coalesce(payload,'~') || '|' || coalesce(provenance,'~') || '|'
+                 || coalesce(operation_id,'~') || '|' || created_at || '|'
+                 || coalesce(superseded_by,'~') || '|' || coalesce(valid_until,'~')
+               FROM edges ORDER BY edge_id",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut dumped = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        dumped.push(row.get::<String>(0).unwrap());
+    }
+    dumped
 }
 
 /// Weakening: swallow a replay failure. That leaves a widened table with part

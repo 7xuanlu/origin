@@ -297,6 +297,55 @@ rebuild. It runs as a guarded, replay-safe, row-for-row migration.
    larger than an earlier draft of this step claimed.
 7. Stamp `user_version` last.
 
+### The rename aborts — the textbook procedure does not work on this schema
+
+Steps 3–6 above are SQLite's own documented table-rebuild procedure. Run
+verbatim against this schema, **step 6 fails**:
+
+```
+ALTER TABLE edges_new RENAME TO edges
+  -> error in trigger m4_page_community_memory_insert_invalidate:
+     no such table: main.edges
+```
+
+Measured, not predicted (`db/edges_rebuild_test.rs`,
+`the_rebuild_survives_the_window_where_edges_does_not_exist`).
+
+The cause is a second instance of the §7 defect, one level out. The census
+above enumerates objects attached **to** `edges`. Two triggers *reference*
+`edges` without being attached to it: `m4_page_community_memory_insert_invalidate`
+(`db.rs:11162`) and its delete twin (`db.rs:11180`) sit on **`memories`** and
+read `FROM edges e` in their bodies. `DROP TABLE edges` does not take them —
+they survive, naming a table that no longer exists. Since SQLite 3.25 a rename
+reparses every trigger and view in the schema in order to rewrite references to
+the renamed object, that reparse resolves table names, and it trips over them.
+
+**Fix: `PRAGMA legacy_alter_table = ON` around the rename only.** It is the
+documented request for pre-3.25 behavior — rename the entry, rewrite nothing.
+Nothing references `edges_new`, since it was created moments earlier in the
+same transaction, so there is no reference for the reparse to fix and
+suppressing it costs nothing. The pragma is connection state, not transaction
+state, so it is restored on the failure path too.
+
+Two alternatives were considered and rejected:
+
+- **Drop and recreate the two `memories` triggers.** Works, and it is a
+  hand-maintained list of everything that happens to mention `edges` today —
+  the same defect the attached-object census exists to remove. The next trigger
+  that references `edges` would break the migration again, and only on a
+  machine that ran it.
+- **Rename the old table out of the way first** (`edges` → `edges_old`, then
+  create the new `edges`). Actively unsafe. The reparse is not just an
+  obstacle, it *rewrites bodies*: this would silently repoint both `memories`
+  triggers at `edges_old` and leave them there after the new table took the
+  name. Same silent-invalidation-death failure shape as dropping the six M4
+  triggers, arrived at from the opposite direction.
+
+The lesson generalizes past this rung: **"what is attached to X" and "what
+refers to X" are different sets, and a table rebuild has to answer both.** The
+census closes the first. The pragma closes the second without needing to
+enumerate it.
+
 ### Recreate the whole set, and diff it — do not trust this list
 
 An earlier draft of step 6 read "recreate triggers (space fence, both twins)".

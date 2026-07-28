@@ -29,10 +29,6 @@ impl MemoryDB {
     // instead of leaving a permanent suppression behind.
     // Gated on `not(test)`: with `--all-targets` the test module below is a
     // caller, so the lint does not fire and a bare `expect` would itself fail.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired into migration 97 with the edges rebuild")
-    )]
     pub(super) async fn ensure_claim_identity_tables(
         tx: &libsql::Transaction,
     ) -> Result<(), WenlanError> {

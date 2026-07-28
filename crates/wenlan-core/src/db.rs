@@ -585,7 +585,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 96;
+pub const SCHEMA_VERSION: u32 = 97;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8492,6 +8492,17 @@ impl MemoryDB {
             if version < 96 {
                 self.migrate_96_community_cutover(version).await?;
             }
+
+            // Migration 97 (M5 PR-A): durable claim identity, plus the
+            // `edges` widening that gives support and attestation edges
+            // somewhere to live. One migration, because the claim tables and
+            // the widened `edges` are not independently useful -- and because
+            // the extended space fence resolves a `claim_revision` endpoint
+            // through `claim_revisions`, so the tables must exist before the
+            // rebuilt fence is created. See migrate_97_claim_identity.
+            if version < 97 {
+                self.migrate_97_claim_identity(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11726,6 +11737,69 @@ impl MemoryDB {
             .map_err(|error| WenlanError::VectorDb(format!("m96 bump: {error}")))?;
         log::info!(
             "[migration] Migration 96 applied: M4 routing and per-consumer cutover control plane"
+        );
+        Ok(())
+    }
+
+    /// Migration 97 (M5 PR-A): claim identity tables + the `edges` widening.
+    ///
+    /// Ordering is the M4 lesson applied. Every piece of DDL commits before
+    /// `user_version` is stamped, so an interrupted upgrade leaves the old
+    /// version and never a widened-but-unfenced `edges`
+    /// (`docs/plans/2026-07-27-m5-edge-rebuild-matrix.md` §7).
+    ///
+    /// `PRAGMA foreign_keys` is suspended around the whole thing because
+    /// `edges.superseded_by` self-references `edges`: the drop is illegal with
+    /// enforcement on. `foreign_key_check` runs before the commit, so the
+    /// suspension cannot hide a reference the rebuild broke.
+    async fn migrate_97_claim_identity(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(97, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA foreign_keys = OFF", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m97 fk off: {error}")))?;
+
+        let result = async {
+            let tx = conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m97 begin: {error}")))?;
+            Self::ensure_claim_identity_tables(&tx).await?;
+            Self::rebuild_edges_widened(&tx).await?;
+
+            let mut violations = tx
+                .query("PRAGMA foreign_key_check", ())
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m97 fk check: {error}")))?;
+            let violation = violations
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m97 fk check read: {error}")))?;
+            if violation.is_some() {
+                return Err(WenlanError::VectorDb(
+                    "m97 rebuild left a dangling foreign-key reference".into(),
+                ));
+            }
+            drop(violations);
+
+            tx.commit()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m97 commit: {error}")))
+        }
+        .await;
+
+        conn.execute("PRAGMA foreign_keys = ON", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m97 fk on: {error}")))?;
+        result?;
+
+        conn.execute("PRAGMA user_version = 97", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m97 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 97 applied: M5 claim identity tables + widened edges \
+             (claim_revision/root endpoints, attests type, extended space fence)"
         );
         Ok(())
     }
@@ -50134,7 +50208,14 @@ pub(crate) mod tests {
             .unwrap()
             .get::<i64>(0)
             .unwrap();
-        assert_eq!(version, 96, "M4 cutover control plane requires schema 96");
+        // `>=`, not `==`: this test's precondition is that migration 96 has
+        // run, not that 96 is the newest migration there is. Pinning equality
+        // made it fail the moment 97 landed, which said nothing about the M4
+        // control plane it exists to check.
+        assert!(
+            version >= 96,
+            "M4 cutover control plane requires schema 96 or later, found {version}"
+        );
         drop(version_rows);
 
         for table in [
