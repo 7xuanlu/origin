@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **draft frozen for Fable design review; implementation has not started**
+Status: **Fable gate 1 approved after required document fixes; R0 may start**
 
 ## Authority and change control
 
@@ -48,10 +48,10 @@ Measured on the baseline above:
 | `db/claim_identity.rs` | 946 production lines |
 | `db/edges_rebuild.rs` | 556 production lines |
 | M5 external DB tests | 2,219 lines across two files |
-| server route registrations | 156 `.route(` occurrences |
+| server `.route(` text occurrences in Rust source | 156; size signal, not the 162-route census |
 | `memory_routes.rs` public handlers | 95 |
 | MCP tool declarations | 29 |
-| public request/response wire types | 129 |
+| public request/response wire declarations | 129 matching `^pub (struct|enum|type) ` in `requests.rs` + `responses.rs` |
 | root + core `AGENTS.md` | 71,679 bytes |
 
 M5 established the preferred DB seam: child modules contain inherent
@@ -117,6 +117,13 @@ The first move may produce one large external test file. Domain-by-domain test
 splitting is a later mechanical series; combining both transformations would
 make missing tests harder to detect.
 
+The external file must remain invisible to the reader census. Either name it
+with the existing `_test.rs` / `_tests.rs` suffix that
+`scripts/m5-reader-sweep.py` excludes, or extend the generator first so a
+`#[cfg(test)]` module declared through `#[path]` is excluded and mutation-test
+that exact shape. A natural but unsafe `db/tests.rs` move is forbidden while
+the current filename filter is authoritative.
+
 ### D4 — connection encapsulation is the last DB step
 
 Do not make `MemoryDB::conn` private at the start. First introduce or move the
@@ -128,6 +135,12 @@ During the refactor:
 - the existing external set must decrease monotonically;
 - final target: no direct connection access outside the DB implementation
   boundary, except explicitly justified test support.
+
+R0 makes this executable with a tracked external-access allowlist keyed by
+source file and occurrence count. The allowlist may shrink but a new file or an
+increased count fails the same `drift_guard` library-test layer used by the
+other source contracts. Existing test-support entries remain explicit rather
+than disappearing through a broad test exemption.
 
 ### D5 — M5 surfaces are protected until their cutover sequence clears
 
@@ -142,8 +155,15 @@ change, do not structurally move:
 - reader addresses consumed by the M5 manifest;
 - the canonical page-write seam needed by the exact-base save path.
 
-R0 may strengthen the reader inventory because that reduces risk without moving
-production behavior. R1 and later wait at this gate if PR-B/PR-C remain active.
+While PR-B/PR-C remain active, only R0 and R1 may proceed:
+
+- R0 strengthens the interim inventory under the ownership handoff defined in
+  its scope;
+- R1 is allowed only because it moves the trailing test module, preserves every
+  production reader address, and obeys D3's generator-exclusion constraint.
+
+R2 through R7 remain blocked until PR-B/PR-C merge or the M5 owner explicitly
+coordinates a narrower exception. R8 remains last by design.
 
 ### D6 — executable change maps precede broad movement
 
@@ -189,7 +209,7 @@ Agent effect:
 - contract tests can bind a vertical slice instead of a monolithic router.
 
 This waits behind the M5 reader-adapter work because both touch the same
-surfaces.
+surfaces; it is part of the explicit R2-through-R7 block in D5.
 
 ### 3. `post_write` internal phases
 
@@ -237,21 +257,38 @@ Scope:
 
 - explain and reconcile `191` generated vs `190` committed;
 - regenerate the inventory from the merge baseline;
-- add set-equality and partition checks suitable for CI;
+- add a `drift_guard` library test, executed by the existing
+  `cargo test --workspace --lib` PR path, that invokes the generator's check
+  mode and enforces current-tree set equality plus the depth/exposure
+  partition;
+- add the external direct-connection ratchet required by D4;
+- correct the stale `run_migrations` size comment in the generator while this
+  script is already in scope;
 - keep production behavior unchanged.
+
+Ownership handoff: R0 owns the interim name-resolved
+`m5-reader-sweep.py`/inventory gate. M5 PR-B owns the LSP-resolved successor
+already promised by the M5 manifest. Only one owner edits these artifacts at a
+time; PR-B must replace or extend the interim gate rather than install a second
+competing census.
 
 Required evidence:
 
 - generator self-test;
 - generated/current set equality;
-- deliberate add/remove mutation makes the guard fail;
-- Opus reviews the predicate and the positive control.
+- the gate is exercised through `cargo test --workspace --lib` on every
+  applicable PR, not only by a manual Python invocation;
+- deliberate add/remove reader mutations make the census guard fail;
+- deliberate new/increased external `.conn.lock()` mutations make the
+  connection ratchet fail;
+- Opus reviews both predicates and their positive controls.
 
 ### R1 — externalize the main `db.rs` test module
 
 Scope:
 
 - move only the main test-module body;
+- use a filename that satisfies D3's census-exclusion rule;
 - preserve `crate::db::tests::*`;
 - preserve all test names and ignored-test entrypoints;
 - no production movement.
@@ -331,6 +368,14 @@ Fable reviews system shape only:
 Expected verdict: `APPROVE`, `APPROVE-WITH-FIXES`, or `BLOCK`. All fixes land in
 this document. Implementation starts only after the design verdict is clear.
 
+Gate result, 2026-07-28: **APPROVE-WITH-FIXES → APPROVE after five required
+document corrections.** Fable required an explicit D5 concurrency rule, an R1
+reader-census exclusion rule, a named CI execution layer for R0, an R0/PR-B
+artifact-ownership handoff, and an executable direct-connection ratchet. Those
+corrections are now incorporated above. Fable explicitly classified them as
+clarifications within the frozen intent and said no second full review was
+needed before R0.
+
 ### Intermediate PRs — Opus, not Fable
 
 Every PR receives a focused Opus opinion or diff review against:
@@ -376,8 +421,9 @@ Reviewers and auditors do not edit the implementation while reviewing it.
 The refactor is complete only when:
 
 - R0's current-tree inventories pass by set equality;
-- `db.rs` is a facade/orchestrator rather than the home of unrelated domain
-  implementations and the giant inline test corpus;
+- `db.rs` contains no giant inline test module, no unrelated domain
+  implementation bodies, and only ordered dispatch rather than inline bodies
+  for migrations covered by R2;
 - movement PRs have no intentional SQL, API, transaction, or behavior change;
 - no new external direct DB connection access was introduced and the accepted
   end-state boundary is enforced;
@@ -387,9 +433,19 @@ The refactor is complete only when:
   affected higher-layer tests pass after the final edit;
 - Fable gate 2 approves the whole result.
 
-LSP responsiveness is recorded before and after as an agent-impact measure. It
-is supporting evidence, not the sole correctness gate, because language-server
-timeouts also depend on tooling and machine state.
+Agent impact is recorded before and after on the same machine with the same
+tool versions:
+
+- document-symbol enumeration for `db.rs`;
+- child-module `MemoryDB` definition navigation;
+- whole-workspace `MemoryDB` reference lookup, including timeout/result and
+  wall time;
+- the number of source files and functions an agent must inspect for one
+  representative bounded DB change and one representative vertical API change.
+
+These probes are supporting evidence, not correctness gates, because
+language-server latency also depends on tooling and machine state. The
+structural facade definition and executable contracts above remain the gates.
 
 ## Decision-change log
 
@@ -401,3 +457,16 @@ timeouts also depend on tooling and machine state.
 - M5 PR-B/PR-C surfaces protected before broad movement.
 - Review policy locked: Fable at frozen design and final system acceptance only;
   Opus for intermediate PR opinions and diff reviews.
+
+### 2026-07-28 — Fable gate 1 corrections
+
+- Clarified that R0 and R1 may proceed during active M5 PR-B/PR-C work while
+  R2 through R7 remain blocked.
+- Bound the R1 test-file move to the reader generator's exclusion contract.
+- Named `drift_guard` plus `cargo test --workspace --lib` as R0's PR execution
+  layer.
+- Assigned interim name-resolved census ownership to R0 and the LSP-resolved
+  successor to M5 PR-B, with one writer at a time.
+- Added an executable, shrink-only direct-connection access ratchet to R0.
+- Relabeled two snapshot metrics with their exact textual predicates and added
+  concrete before/after agent-impact probes.
