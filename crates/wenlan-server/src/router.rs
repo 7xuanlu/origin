@@ -6,9 +6,9 @@ pub use crate::route_registry::AppRouter;
 use crate::route_registry::{delete, get, patch, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
-    config_routes, import_routes, ingest_routes, knowledge_routes, lint_routes, memory_routes,
-    onboarding_routes, page_map_routes, refinery_routes, repair_routes, routes, security,
-    source_routes, websocket,
+    community_routes, config_routes, import_routes, ingest_routes, knowledge_routes, lint_routes,
+    memory_routes, onboarding_routes, page_map_routes, refinery_routes, repair_routes, routes,
+    security, source_routes, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -65,6 +65,30 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
             get(memory_routes::handle_list_unconfirmed_memories),
         )
         .route("/api/pages/recent", get(routes::handle_recent_pages))
+        .route(
+            "/api/communities",
+            get(community_routes::handle_list_communities),
+        )
+        .route(
+            "/api/communities/members",
+            get(community_routes::handle_list_community_members),
+        )
+        .route(
+            "/api/communities/page-assignments",
+            get(community_routes::handle_list_community_page_assignments),
+        )
+        .route(
+            "/api/communities/proposals",
+            get(community_routes::handle_list_community_proposals),
+        )
+        .route(
+            "/api/communities/proposals/{id}/accept",
+            post(community_routes::handle_accept_community_proposal),
+        )
+        .route(
+            "/api/communities/proposals/{id}/reject",
+            post(community_routes::handle_reject_community_proposal),
+        )
         .route("/api/steep", post(routes::handle_steep))
         .route("/api/distill", post(routes::handle_distill))
         .route("/api/distill/{page_id}", post(routes::handle_redistill))

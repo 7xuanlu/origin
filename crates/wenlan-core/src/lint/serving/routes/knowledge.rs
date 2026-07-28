@@ -4,7 +4,9 @@ use super::{
     Method::*,
     ScopeBinding::*,
     SelectionGate::{NotApplicable as NoGate, SingleId404},
-    SelectorPrecedence::{BodyThenHeader, HeaderOnly, NotApplicable as NoSelector},
+    SelectorPrecedence::{
+        BodyThenHeader, HeaderOnly, NotApplicable as NoSelector, QueryThenHeader,
+    },
     SensitiveReadRoute,
 };
 
@@ -26,4 +28,8 @@ pub(super) const ROUTES: &[SensitiveReadRoute] = &[
     row!(Get,"/api/knowledge/recent-relations","relation_list",HeaderOnly,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
     row!(Get,"/api/knowledge/count","knowledge_count",NoSelector,UnauthenticatedLocal,Global,NoGate,NotApplicable,AggregateOnly),
     row!(Get,"/api/onboarding/milestones","onboarding_state",NoSelector,UnauthenticatedLocal,Global,NoGate,NotApplicable,GlobalRead),
+    row!(Get,"/api/communities","community_list",QueryThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
+    row!(Get,"/api/communities/members","community_members",QueryThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
+    row!(Get,"/api/communities/page-assignments","community_page_assignments",QueryThenHeader,UnauthenticatedLocal,PageWorkspace,NoGate,Rejected,Forbidden),
+    row!(Get,"/api/communities/proposals","community_proposals",QueryThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
 ];
