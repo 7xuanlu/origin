@@ -34,6 +34,30 @@ copy_fixture
 python3 "$VALIDATOR" --root "$TMPDIR_TEST/root"
 echo "PASS valid plugin contract"
 
+assert_rejects "brief context adapter regression" \
+    perl -0pi -e 's/mcp__wenlan__brief/mcp__wenlan__context/g' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/brief/SKILL.md"
+
+assert_rejects "brief mandatory session-start regression" \
+    perl -0pi -e 's/It is not a mandatory\s+every-session boot step\./Call FIRST at session start./g' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/brief/SKILL.md"
+
+assert_rejects "brief Markdown authority regression" \
+    perl -0pi -e 's/must\s+never be read as product state/must cat ~\/.wenlan\/sessions\/_status\/<project>.md/gi' \
+    "$TMPDIR_TEST/root/plugin/skills/brief/SKILL.md"
+
+assert_rejects "handoff missing Brief read" \
+    perl -0pi -e 's/This read is mandatory before any Brief delta is authored\./Compose deltas from conversation./g' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/handoff/SKILL.md"
+
+assert_rejects "handoff auto-demotion regression" \
+    perl -0pi -e 's/Never auto-demote an untouched Active item\./Auto-demote untouched Active items./g' \
+    "$TMPDIR_TEST/root/plugin/skills/handoff/SKILL.md"
+
+assert_rejects "handoff direct status rewrite regression" \
+    perl -0pi -e 's/Never read, edit, or overwrite that receipt as\s+authority\./Overwrite `~\/.wenlan\/sessions\/_status\/<project>.md`./g' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/handoff/SKILL.md"
+
 python3 - "$TMPDIR_TEST/root/plugin-codex/.mcp.json" <<'PY'
 import json
 import sys

@@ -4,7 +4,7 @@ description: >
   Frictionless Wenlan setup for Codex. Detects a missing local runtime, installs
   or repairs it, and verifies the plugin to MCP to local runtime round-trip. Run
   when the user says "set up wenlan", "is wenlan working", or "fix wenlan".
-allowed-tools: ["Bash", "mcp__wenlan__context"]
+allowed-tools: ["Bash", "mcp__wenlan__brief"]
 user-invocable: true
 ---
 
@@ -136,10 +136,10 @@ Expected: local memory configured. Capture the mode string for the final report.
 
 ### 6. MCP round-trip
 
-Call the Wenlan MCP `context` tool with a small limit.
+Call the Wenlan MCP `brief` tool as a read-only round-trip.
 
 ```text
-context(limit=3)
+brief()
 ```
 
 If it fails, report: "wenlan-mcp did not respond through Codex. Start a new

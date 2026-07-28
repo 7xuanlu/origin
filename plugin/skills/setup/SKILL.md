@@ -5,7 +5,7 @@ description: >
   configures local memory, and verifies the full plugin -> MCP -> local runtime
   round-trip. Run after `/plugin install wenlan@7xuanlu-wenlan`, or any time the user
   says "set up wenlan", "is wenlan working", "fix wenlan".
-allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__context"]
+allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__brief"]
 ---
 
 # /setup
@@ -136,10 +136,10 @@ Expected: local memory configured. Capture the mode string for the final report.
 
 ### 6. MCP round-trip
 
-Call the Wenlan MCP `context` tool.
+Call the Wenlan MCP `brief` tool as a read-only round-trip.
 
 ```text
-context()
+brief()
 ```
 
 Pass: continue. Fail: MCP is not wired. Tell the user:

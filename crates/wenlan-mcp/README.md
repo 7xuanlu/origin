@@ -13,7 +13,7 @@ wenlan connect codex              # or: claude-code, cursor, claude-desktop, vsc
 wenlan connect cursor --dry-run   # preview before editing JSON config
 ```
 
-MCP-only setup gives agents tools for capture, recall, context, and page distillation. It does not install Claude Code slash skills like `/brief`, `/handoff`, `/distill`, or `/setup`; use the Wenlan plugin for that workflow.
+MCP-only setup gives agents tools for capture, recall, a Space-owned Brief, and page distillation. It does not install Claude Code slash skills like `/brief`, `/handoff`, `/distill`, or `/setup`; use the Wenlan plugin for that workflow.
 
 If you only need the raw MCP connector config, add this to your MCP client:
 
@@ -62,7 +62,7 @@ out the primary memory loop and the unique refinement-review queue.
 
 | Tool | Purpose |
 | --- | --- |
-| `context` | Load session context. Use at session start or major topic shifts. |
+| `brief` | Read the current Space Brief; an optional topic appends separately labeled same-Space context. |
 | `capture` | Save one durable memory and return its explicit `source_memory_id`. |
 | `recall` | Search memories and pages by natural-language query. |
 | `distill` | Trigger page distillation for new clusters or a specific `page_id`. |
