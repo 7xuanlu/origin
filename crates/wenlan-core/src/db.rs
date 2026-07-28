@@ -2448,6 +2448,20 @@ pub(crate) const PARITY_GUARD_TRIGGERS: [(&str, &str); 3] = [
     ),
 ];
 
+/// Canonical DDL for the parity counter table, shared with the repair-open
+/// fixture. `PARITY_GUARD_TRIGGERS` already binds the guards to one source;
+/// this binds the table they guard, so a hand-copied shape in a test cannot
+/// drift from the installer. A single added column would otherwise leave the
+/// copy stale while the generation-only guards still installed cleanly against
+/// it -- a silent false PASS.
+pub(crate) const PARITY_INPUT_STATE_TABLE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS community_parity_input_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    generation INTEGER NOT NULL,
+    relevant_spaces_digest TEXT NOT NULL
+);
+";
+
 /// Whitespace- and case-insensitive form for comparing stored DDL against its
 /// canonical text.
 ///
@@ -3131,10 +3145,12 @@ impl MemoryDB {
         // Refusing does leave an operator no way out if their repair manifest is
         // already applied-but-unverified, since startup then forces this path.
         // That is acceptable only because the unguarded shape is unreachable in
-        // the field: no released build has ever written schema 96, so the state
-        // exists only in development trees, where rebuilding the database is the
-        // recovery. Should 96 ever ship without the guards, this must become a
-        // narrow guard-only bootstrap instead.
+        // the field: no released build has written schema 96 *without* these
+        // guards, and migration 96 commits the guards before it stamps the
+        // version, so an interrupted upgrade leaves <=95, never an unguarded 96.
+        // The state therefore exists only in development trees, where rebuilding
+        // the database is the recovery. Should a build ever ship 96 without the
+        // guards, this must become a narrow guard-only bootstrap instead.
         if let Some(missing) = parity_guard_shape_drift(&conn).await? {
             log::error!("[repair] refusing to open: parity guard {missing} missing or altered");
             return Err(WenlanError::Validation(
@@ -11542,13 +11558,14 @@ impl MemoryDB {
             WenlanError::VectorDb(format!("install community cutover input triggers: {error}"))
         })?;
 
+        conn.execute_batch(PARITY_INPUT_STATE_TABLE_DDL)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("install community parity input state: {error}"))
+            })?;
+
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS community_parity_input_state (
-                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                 generation INTEGER NOT NULL,
-                 relevant_spaces_digest TEXT NOT NULL
-             );
-             INSERT OR IGNORE INTO community_parity_input_state
+            "INSERT OR IGNORE INTO community_parity_input_state
                  (singleton, generation, relevant_spaces_digest)
              VALUES (1, 0, '');
 
@@ -85662,13 +85679,7 @@ pub(crate) mod tests {
         // that version has.
         if schema_version == SCHEMA_VERSION {
             connection
-                .execute_batch(
-                    "CREATE TABLE community_parity_input_state (
-                         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                         generation INTEGER NOT NULL,
-                         relevant_spaces_digest TEXT NOT NULL
-                     );",
-                )
+                .execute_batch(PARITY_INPUT_STATE_TABLE_DDL)
                 .await
                 .unwrap();
             for (_, canonical) in PARITY_GUARD_TRIGGERS {
