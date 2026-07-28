@@ -1007,6 +1007,16 @@ jobs:
           echo "    Linux background on/off round-trip PASS"
       - name: E2E folder ingest over HTTP (Linux)
         run: bash scripts/smoke-folder-ingest.sh
+      # Surface smokes ride the non-PR backstop only: each boots its own
+      # daemon (~3-4 min like folder-ingest above), and the ordinary PR lane
+      # holds the sub-20-minute budget from #393. /prove runs them locally
+      # when a PR actually touches the CLI/MCP surface.
+      - name: E2E CLI surface smoke (Linux)
+        if: github.event_name != 'pull_request'
+        run: bash scripts/smoke-cli.sh
+      - name: E2E MCP stdio surface smoke (Linux)
+        if: github.event_name != 'pull_request'
+        run: bash scripts/smoke-mcp.sh
 
   # Build-only preflight for every shipped release target. Native/build/package
   # diffs prove their release profile before merge; main/manual runs and the
