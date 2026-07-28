@@ -330,6 +330,37 @@ Required evidence:
 - formatting and Clippy at the repository-standard layer;
 - Opus diff review focused on lost fixtures, visibility, and cfg boundaries.
 
+Execution record, 2026-07-28:
+
+- RED: the new `drift_guard::db_main_tests_live_outside_db_rs` contract failed
+  on the inline body, missing external declaration, and missing external file;
+  its positive control also rejects the census-visible `db/tests.rs` shape.
+- GREEN: the body now lives at `db/main_tests.rs`, while `db.rs` declares it
+  through `#[path]`; `crate::db::tests::*`, shared hooks, and `test_db` retain
+  their original module path and visibility.
+- GREEN: compiler-discovered before/after inventories are byte-identical:
+  `3,232` total `wenlan-core` library tests, `950` under `db::tests::*`,
+  `33` ignored tests overall, and `6` ignored `db::tests::*` entrypoints.
+- GREEN: focused `db::tests::*` execution passed `944`, ignored `6`, failed
+  `0`; rust-analyzer reported no errors in the three changed Rust files and an
+  external `crate::db::tests::test_db` definition lookup resolved to the new
+  file.
+- GREEN: the reader-census check stayed at `192` rows, partition
+  `55 / 50 / 87`, with `22` exposure paths.
+- NOTE: rustfmt's module-level outdent collapsed `93` physical lines after the
+  byte-exact body extraction; compiler-discovered test-name equality is the
+  semantic movement proof rather than raw line-count equality.
+- REVIEW: Opus/xhigh returned `APPROVE` with no material findings and confirmed
+  preserved names, ignored entrypoints, cfg scope, census exclusion, and zero
+  production movement. A permanent `950 / 6` count lock was not added: the
+  before/after compiler inventory is the R1 movement gate, while a static count
+  would also reject legitimate future test additions.
+- GREEN: repository-standard `cargo fmt --all --check` and workspace
+  all-targets Clippy with `-D warnings` passed. Final
+  `cargo test --workspace --lib` passed: CLI `31 / 31`; core `3,199` passed,
+  `33` ignored; MCP `177 / 177`; server `311` passed, `2` ignored; types
+  `180 / 180`.
+
 ### R2 — migration dispatcher and historical migration modules
 
 Scope:

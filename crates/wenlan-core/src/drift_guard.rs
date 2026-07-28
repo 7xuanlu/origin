@@ -5598,6 +5598,79 @@ fn m5_reader_inventory_matches_current_tree() {
     );
 }
 
+// ── R1: keep the giant DB test module external and census-invisible ──
+
+const DB_TEST_MODULE_PATH: &str = "db/main_tests.rs";
+
+fn db_test_module_layout_violations(
+    db_source: &str,
+    external_path: &str,
+    external_exists: bool,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let declaration = format!("#[cfg(test)]\n#[path = \"{external_path}\"]\npub(crate) mod tests;");
+    if db_source.matches(&declaration).count() != 1 {
+        violations.push(format!(
+            "db.rs must declare its test module exactly once through {external_path:?}"
+        ));
+    }
+    if regex::Regex::new(r"(?m)^\s*pub\(crate\)\s+mod\s+tests\s*\{")
+        .unwrap()
+        .is_match(db_source)
+    {
+        violations.push("db.rs still contains an inline pub(crate) mod tests body".into());
+    }
+    if !external_path.ends_with("_test.rs") && !external_path.ends_with("_tests.rs") {
+        violations.push(format!(
+            "{external_path} is visible to scripts/m5-reader-sweep.py; use an _test.rs or _tests.rs suffix"
+        ));
+    }
+    if !external_exists {
+        violations.push(format!(
+            "external DB test module is missing: {external_path}"
+        ));
+    }
+    violations
+}
+
+#[test]
+fn db_main_tests_live_outside_db_rs() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let external = Path::new("crates/wenlan-core/src").join(DB_TEST_MODULE_PATH);
+    let violations = db_test_module_layout_violations(
+        &db_source,
+        DB_TEST_MODULE_PATH,
+        root.join(external).is_file(),
+    );
+
+    assert!(
+        violations.is_empty(),
+        "R1 DB test-module layout drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn db_test_module_layout_guard_rejects_inline_and_census_visible_shapes() {
+    let violations = db_test_module_layout_violations(
+        "#[cfg(test)]\npub(crate) mod tests {\n    #[test]\n    fn still_inline() {}\n}\n",
+        "db/tests.rs",
+        false,
+    );
+    assert_eq!(
+        violations,
+        vec![
+            "db.rs must declare its test module exactly once through \"db/tests.rs\"",
+            "db.rs still contains an inline pub(crate) mod tests body",
+            "db/tests.rs is visible to scripts/m5-reader-sweep.py; use an _test.rs or _tests.rs suffix",
+            "external DB test module is missing: db/tests.rs",
+        ],
+        "the guard must reject the pre-R1 inline shape and the natural but census-visible filename"
+    );
+}
+
 // ── R0: shrink-only direct DB connection access ──
 
 const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
