@@ -172,10 +172,17 @@ exists to prevent. §4 explains why intent cannot be a route property.
 ## 4. Classification — the enumeration lives in the inventory file
 
 **The manifest is `2026-07-27-m5-reader-manifest-inventory.md`**, generated from
-the merge base: all 163 registered `(method, path, handler)` triples, all 29
-`#[tool(` declarations, all 19 `Commands` variants, each with `page_bearing`, a
-class, an adapter, and the evidence the classification rests on. That file is
-the artifact this section used to only promise.
+the merge base: all 162 registered `(method, path, handler)` triples, all 29
+`#[tool(` declarations, all 19 `Commands` variants, and all **76 internal
+page-prose call sites**, each with `page_bearing`, a class, a marker shape, an
+adapter, and the evidence the classification rests on. That file is the artifact
+this section used to only promise.
+
+The internal readers were the last thing in it still written as categories —
+"RRF page channel", "refinery / briefing builders" — with the enumeration
+deferred to PR-B. They are now enumerated, and the categories turned out to name
+the wrong modules: the readers that carry page prose live in `db.rs` (46 of 76),
+`repair.rs`, `post_write.rs`, `lint/`, and `maintenance/`.
 
 Three earlier counts were wrong — 151, then 163 — from a hand-picked file list,
 a single-line regex, and a route registered inside a `#[cfg(test)]` module.
@@ -276,22 +283,39 @@ axes are what make this safe — an entry that appears without its state is the
 unearned trust this rung exists to prevent, which is why the carve-out is
 conditional on rendering them.
 
-### The marker is cooperative-tier, not a capability
+### Two gates: shape is hard, authenticity is cooperative
 
-Stated once so it is not re-litigated: the intent marker is **not** a D7
+Stated once so it is not re-litigated. The intent marker is **not** a D7
 presence capability. Artifact 5 §1 already puts hostile-same-user out of scope,
 and a client willing to forge the marker can equally lie about its contract
 version — both sit in the same trust tier, so nonce-consuming machinery buys
 nothing against the conceded attacker.
 
-The risk that is real is the **cooperative agent**: nothing inherently stops an
-MCP tool from transmitting the marker, at which point an agent self-serves
-provisional prose into its own context and D3's first sentence fails with
-nothing going RED. That is why `marker_eligible` is a per-surface column in the
-inventory — MCP tools, internal readers, and non-interactive CLI subcommands are
-`no`, enforced by a test on each surface. The server cannot distinguish a forged
-marker from a real one, and saying so plainly is the honest statement of what
-cooperative-tier means.
+An earlier draft stopped there and made eligibility a boolean "enforced
+client-side by a test on each surface," which is another way of saying the
+server does not enforce it. Every page-bearing route ended up eligible,
+including `POST /api/context` and both exports — the shapes D3 excludes
+unconditionally. That does not close the mixed-caller hole; it relocates it.
+
+Splitting the concern makes one half hard:
+
+| Gate | Question | Enforcement |
+|---|---|---|
+| **route shape** | may a marker do anything here, and what? | **server-side, no client cooperation.** `none` **refuses** the request. |
+| **marker authenticity** | did a human actually gesture? | cooperative-tier; the daemon cannot tell forged from real |
+
+`marker_shape` is therefore a three-valued per-route column in the inventory —
+`none` (152 routes), `collection` (5), `named_page` (5) — fail-closed by
+construction, so a route added tomorrow is `none` until someone deliberately
+gives it a shape. The risk that is real is the **cooperative agent**: nothing
+inherently stops an MCP tool from transmitting the marker. Under the boolean
+that agent could self-serve provisional prose into its own automatic context.
+Under the shape gate it cannot: `/api/context`, `/api/search`, and the exports
+refuse the marker regardless of caller. The residual exposure is bounded to a
+page the caller named by ID, returned with both axes attached.
+
+Per-surface transmission (MCP, internal readers, non-interactive CLI: never)
+remains the soft gate, tested per surface. It is no longer load-bearing.
 
 The two-table prose enumeration that used to sit here was deleted, not moved: it
 was a second copy of the inventory's Class column, which is precisely the
@@ -376,7 +400,7 @@ Every unmarked row is an executable test that goes RED under its weakening.
 | leave an MCP tool or CLI subcommand uncovered | §2 per-surface coverage test |
 | default ambiguous readers to `explicit` | §3 classification test |
 | treat an unknown contract version as supported | §6 test |
-| let an explicit path skip negotiation | §7 explicit case 1 |
+| let a marked call skip negotiation | §7 per-call case 1 |
 | remove any single adapter's filter | that entry's own §7 test goes RED |
 | leave provisional files in the legacy projection directory | §5 invariant test |
 | omit `/ws/updates` from the manifest | §2.3 |
@@ -388,7 +412,9 @@ Every unmarked row is an executable test that goes RED under its weakening.
 | drop `label` from the prose-field pattern | inventory — `PageLinkOutbound.label` must still be found |
 | strip the per-call marker check | §7 case 2 — a declared client's unmarked poll must not see provisional |
 | treat the marker as a blanket header | §4 — a marker naming no page grants nothing |
-| let an MCP tool transmit the marker | inventory §marker_eligible per-surface test |
+| let an MCP tool transmit the marker | inventory teeth 9 — per-surface test |
+| give a new route a marker shape by default | inventory teeth 7 — fail-closed allowlist |
+| ignore a marker on a `none` route instead of refusing | inventory teeth 8 — `/api/context`, `/api/search`, both exports |
 | exclude provisional entries from a marker-bearing collection call | §4 collection carve-out; G6 explicit-browse bullet |
 | list a provisional entry without its axes | §4 — per-item axes are the carve-out's precondition |
 | let page prose reach an error body | inventory §teeth check 8 sentinel |

@@ -73,15 +73,36 @@ combinations, because a widened CHECK alone would newly permit nonsense like
 migrated production-shaped database before the guard is enabled. Any tuple the
 census finds and this table omits is a defect in this table.
 
-### Legacy `supports`
+### Legacy `supports` — the type is reserved, never written
 
-`supports` already exists as an edge type. Pre-M5 `supports` rows are
-`page`/`memory`-shaped and are **not** claim supports. They keep
-`lineage='legacy'` or their existing lineage and are excluded from every M5
-support query by the `src_kind='claim_revision'` predicate. M5 never reads a
-`supports` edge whose source is not a claim revision. This is the one place
-where reusing an existing type name could silently widen trust, so the
-discriminator is the source kind, never the type alone.
+An earlier draft of this section said pre-M5 `supports` rows are
+`page`/`memory`-shaped and survive the rebuild with `lineage='legacy'`. That
+claim was never verified, and it is **false**. It also contradicted the
+completeness rule above: it described a surviving tuple absent from the allowed
+table, so the guard would have rejected rows the migration promised to keep.
+
+The verified fact: the literal `'supports'` occurs **exactly once in the whole
+tree** — the `edge_type` CHECK constraint (`db.rs:8916`). No `dual_write_edge`
+call site, no backfill, and no `.sql` file emits it. The type was reserved in
+the constraint and never used.
+
+Two consequences:
+
+- the allowed-tuple table is complete as written; `supports` appears there only
+  in its M5 form, `claim_revision → memory`;
+- PR-A's assignment guard rejects any `supports` row whose `src_kind` is not
+  `claim_revision`, and that rejection is **not** expected to fire on migration,
+  because the census should find zero pre-M5 `supports` rows.
+
+If the §2 census (`SELECT DISTINCT edge_type, src_kind, dst_kind, lineage FROM
+edges`) does find a `supports` row on a real database, that is a **discovery
+that invalidates this section**, not a row to wave through: the migration halts
+and this table is widened deliberately. Fail-closed, because a `supports` edge
+of unknown provenance is exactly the shape M5 reads as truth.
+
+M5 support queries additionally predicate on `src_kind='claim_revision'`, so
+even a row that somehow existed could not be read as a claim support. Type name
+alone never grants trust; the source kind is the discriminator.
 
 ### Writer exclusivity (D8)
 
@@ -320,7 +341,8 @@ guards in M4.
 | allow a `generated` root to attest | §5 test |
 | let `supports` set `grounded=1` from an ungrounded memory | §3 test |
 | let the D8 finalizer write `attests` | writer-exclusivity test |
-| treat legacy `supports` rows as claim supports | §2 discriminator test |
+| treat a non-`claim_revision` `supports` row as a claim support | §2 discriminator test — insert one directly (no writer emits them), assert every M5 support query excludes it |
+| let the migration continue after the census finds a pre-M5 `supports` row | §2 — census halt, not a silent widen |
 | skip the row-count or checksum verify | §7.5 **with fault injection** — drop and alter a row mid-copy; a clean corpus stays green either way, so the oracle must corrupt something |
 | stamp `user_version` before recreating triggers | §7 ordering test |
 | resume from cursor without re-verifying the prefix | §7 resumability test |
