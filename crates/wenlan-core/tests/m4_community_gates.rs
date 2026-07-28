@@ -1376,6 +1376,152 @@ async fn m4_pr2_routing_consistency_and_index_scale_receipt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "M4 PR-2 graded 100k-memory / 5k-page global parity reconciliation receipt"]
+async fn m4_pr2_global_parity_reconcile_scale_receipt() {
+    const RUNS: usize = 20;
+    const CONSUMER: &str = "summary_buckets";
+
+    let dir = tempfile::tempdir().expect("M4 parity scale tempdir");
+    let db = Arc::new(
+        MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+            .await
+            .expect("open M4 parity scale database"),
+    );
+    let observer_db = libsql::Builder::new_local(dir.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("open independent M4 parity scale observer");
+    let observer = observer_db
+        .connect()
+        .expect("connect M4 parity scale observer");
+    seed_m4_graded_corpus(&observer).await;
+
+    let mut runtime = CommunityGroupingRuntime::default();
+    for index in 0..3 {
+        let space = format!("space-{index}");
+        assert!(
+            matches!(
+                run_community_grouping_cycle(&db, &mut runtime, &space)
+                    .await
+                    .expect("publish M4 parity scale community snapshot"),
+                CommunityGroupingOutcome::Published(_)
+            ),
+            "graded parity corpus must publish every space"
+        );
+    }
+
+    observer
+        .execute(
+            "UPDATE entities
+                SET community_id=1
+              WHERE id IN (SELECT node_id FROM community_members)",
+            (),
+        )
+        .await
+        .expect("seed scale legacy community coverage");
+    observer
+        .execute(
+            "UPDATE memories
+                SET embedding=vector32(?1)
+              WHERE entity_id IS NOT NULL",
+            libsql::params![m4_unit_embedding(0)],
+        )
+        .await
+        .expect("seed scale parity candidate embeddings");
+
+    let mut memory_rows = observer
+        .query("SELECT COUNT(*) FROM memories", ())
+        .await
+        .expect("count parity scale memories");
+    let memory_count = memory_rows
+        .next()
+        .await
+        .expect("read parity scale memory count")
+        .expect("parity scale memory count row")
+        .get::<i64>(0)
+        .expect("decode parity scale memory count");
+    drop(memory_rows);
+    let mut page_rows = observer
+        .query("SELECT COUNT(*) FROM pages", ())
+        .await
+        .expect("count parity scale pages");
+    let page_count = page_rows
+        .next()
+        .await
+        .expect("read parity scale page count")
+        .expect("parity scale page count row")
+        .get::<i64>(0)
+        .expect("decode parity scale page count");
+    drop(page_rows);
+    assert_eq!((memory_count, page_count), (100_000, 5_000));
+
+    let mut mutex_holds = Vec::with_capacity(RUNS);
+    let mut reconcile_elapsed = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let receipt = db
+            .reconcile_community_reader_parity(CONSUMER)
+            .await
+            .expect("reconcile global community-reader parity at scale");
+        assert!(
+            receipt.ready,
+            "graded parity corpus must retain equal global source coverage: {receipt:?}"
+        );
+        assert_eq!(receipt.spaces_checked, 3);
+        mutex_holds.push(receipt.canonical_mutex_hold);
+        reconcile_elapsed.push(receipt.reconcile_elapsed);
+    }
+    let mutex_p95 = duration_p95(&mutex_holds);
+    let mutex_max = mutex_holds.iter().copied().max().expect("mutex receipts");
+    assert!(
+        mutex_p95 <= Duration::from_millis(500),
+        "global parity canonical-mutex p95 {mutex_p95:?} exceeds 500 ms"
+    );
+    assert!(
+        mutex_max < Duration::from_secs(2),
+        "global parity canonical-mutex max {mutex_max:?} reaches the 2 s hard fail"
+    );
+
+    let total_p50 = duration_percentile(&reconcile_elapsed, 50);
+    let total_p95 = duration_p95(&reconcile_elapsed);
+    let total_max = reconcile_elapsed
+        .iter()
+        .copied()
+        .max()
+        .expect("reconcile receipts");
+    let mut checkpoint_rows = observer
+        .query("PRAGMA wal_checkpoint(PASSIVE)", ())
+        .await
+        .expect("checkpoint parity scale WAL");
+    let checkpoint = checkpoint_rows
+        .next()
+        .await
+        .expect("read parity scale checkpoint")
+        .expect("parity scale checkpoint row");
+    let wal_busy = checkpoint
+        .get::<i64>(0)
+        .expect("decode parity scale WAL busy");
+    let wal_frames = checkpoint
+        .get::<i64>(1)
+        .expect("decode parity scale WAL frames");
+    let checkpointed_frames = checkpoint
+        .get::<i64>(2)
+        .expect("decode parity scale checkpointed frames");
+
+    println!(
+        "[m4_pr2_global_parity_scale] memories={memory_count} pages={page_count} runs={RUNS} \
+         canonical_mutex_p95_ms={:.3} canonical_mutex_max_ms={:.3} \
+         reconcile_p50_ms={:.3} reconcile_p95_ms={:.3} reconcile_max_ms={:.3} \
+         wal_busy={wal_busy} wal_frames={wal_frames} \
+         checkpointed_frames={checkpointed_frames}",
+        mutex_p95.as_secs_f64() * 1_000.0,
+        mutex_max.as_secs_f64() * 1_000.0,
+        total_p50.as_secs_f64() * 1_000.0,
+        total_p95.as_secs_f64() * 1_000.0,
+        total_max.as_secs_f64() * 1_000.0,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
     const SPACE: &str = "m4-isolated-space";
     const ROOT: &str = "m4-isolated-root";
@@ -3878,9 +4024,15 @@ fn community_count(membership: &[usize]) -> usize {
 }
 
 fn duration_p95(values: &[Duration]) -> Duration {
+    duration_percentile(values, 95)
+}
+
+fn duration_percentile(values: &[Duration], percentile: usize) -> Duration {
+    assert!(!values.is_empty());
+    assert!((1..=100).contains(&percentile));
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
-    sorted[(sorted.len() * 95).div_ceil(100) - 1]
+    sorted[(sorted.len() * percentile).div_ceil(100) - 1]
 }
 
 fn f64_p95(values: &[f64]) -> f64 {

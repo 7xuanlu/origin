@@ -239,6 +239,7 @@ where
         if &before_target_receipt != expected_receipt {
             return Err(WenlanError::Conflict("repair_target_stale".to_string()));
         }
+        let parity_before = crate::repair::parity_input_generation_on_connection(&conn).await?;
         let non_target_before = crate::repair::effect_guard_receipt(conn.total_changes());
         let affected = conn
             .execute(
@@ -260,9 +261,14 @@ where
                 "repair_target_write_unproven".to_string(),
             ));
         }
+        let parity_bump = crate::repair::parity_input_generation_on_connection(&conn)
+            .await?
+            .checked_sub(parity_before)
+            .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_underflow".to_string()))?;
         let normalized_total_changes = conn
             .total_changes()
             .checked_sub(target_rows)
+            .and_then(|changes| changes.checked_sub(parity_bump))
             .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_underflow".to_string()))?;
         let non_target_after = crate::repair::effect_guard_receipt(normalized_total_changes);
         if non_target_after != non_target_before {
@@ -420,6 +426,7 @@ where
         if &before_target_receipt != manifest.expected_state().canonical_receipt() {
             return Err(WenlanError::Conflict("repair_target_stale".to_string()));
         }
+        let parity_before = crate::repair::parity_input_generation_on_connection(&conn).await?;
         let non_target_before = crate::repair::effect_guard_receipt(conn.total_changes());
         let mut inserted = 0_u64;
         for entity_id in entity_ids {
@@ -493,9 +500,14 @@ where
             ));
         }
         let allowed_changes = inserted.saturating_add(updated);
+        let parity_bump = crate::repair::parity_input_generation_on_connection(&conn)
+            .await?
+            .checked_sub(parity_before)
+            .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_underflow".to_string()))?;
         let normalized_total_changes = conn
             .total_changes()
             .checked_sub(allowed_changes)
+            .and_then(|changes| changes.checked_sub(parity_bump))
             .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_underflow".to_string()))?;
         let non_target_after = crate::repair::effect_guard_receipt(normalized_total_changes);
         if non_target_after != non_target_before {
@@ -997,6 +1009,7 @@ where
             } else {
                 None
             };
+        let parity_before = crate::repair::parity_input_generation_on_connection(&conn).await?;
         let non_target_before = crate::repair::effect_guard_receipt(conn.total_changes());
         let affected = match (manifest.target(), manifest.writer(), manifest.mutation()) {
             (
@@ -1273,9 +1286,14 @@ where
         let allowed_changes = affected
             .checked_add(allowed_derived_changes)
             .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_overflow".to_string()))?;
+        let parity_bump = crate::repair::parity_input_generation_on_connection(&conn)
+            .await?
+            .checked_sub(parity_before)
+            .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_underflow".to_string()))?;
         let normalized_total_changes = conn
             .total_changes()
             .checked_sub(allowed_changes)
+            .and_then(|changes| changes.checked_sub(parity_bump))
             .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_underflow".to_string()))?;
         let non_target_after = crate::repair::effect_guard_receipt(normalized_total_changes);
         if non_target_after != non_target_before {

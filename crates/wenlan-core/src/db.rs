@@ -2384,6 +2384,77 @@ pub struct RefinementProposal {
 pub(crate) const COMMUNITY_SUMMARY_BUCKETS_CONSUMER: &str = "summary_buckets";
 pub(crate) const COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER: &str = "summary_eligibility";
 
+fn community_relevant_spaces_digest(spaces: impl IntoIterator<Item = String>) -> String {
+    let mut spaces = spaces.into_iter().collect::<Vec<_>>();
+    spaces.sort();
+    spaces.dedup();
+    let mut digest = Sha256::new();
+    for space in spaces {
+        let bytes = space.as_bytes();
+        digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(bytes);
+    }
+    hex::encode(digest.finalize())
+}
+
+/// The one fail-closed durable-reader invariant used by the direct reader,
+/// summary eligibility SQL, and pending-reconcile detection. The expensive
+/// membership digest is reconciliation-time work: reads compare only cached
+/// digest/generation tokens whose complete mutation triggers advance the
+/// global input generation.
+pub(crate) fn community_reader_durable_gate_sql(consumer: &str) -> String {
+    if !matches!(
+        consumer,
+        COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+    ) {
+        // Fail closed rather than interpolate an unvetted string into SQL.
+        return "0=1".to_string();
+    }
+    format!(
+        "EXISTS (
+             SELECT 1
+               FROM community_reader_cutover cutover
+               JOIN community_parity_input_state input ON input.singleton=1
+               JOIN community_reader_current_input current_input
+                 ON current_input.consumer=cutover.consumer
+                AND current_input.input_generation=input.generation
+               JOIN community_reader_watermark watermark
+                 ON watermark.consumer=cutover.consumer
+                AND watermark.proven_input_generation=input.generation
+                AND watermark.relevant_spaces_digest=current_input.relevant_spaces_digest
+              WHERE cutover.consumer='{consumer}'
+                AND cutover.enabled=1
+                AND watermark.unexplained_drift_count=0
+                AND watermark.relevant_space_count=(
+                    SELECT COUNT(*) FROM community_reader_space_proof proof
+                     WHERE proof.consumer='{consumer}'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM community_reader_space_proof proof
+                      LEFT JOIN space_graph_state state ON state.space=proof.space
+                      LEFT JOIN community_publication_receipts receipt
+                        ON receipt.space=proof.space
+                       AND receipt.published_generation=proof.proven_published_generation
+                     WHERE proof.consumer='{consumer}'
+                       AND (
+                            state.space IS NULL
+                         OR state.dirty<>0
+                         OR state.published_generation IS NULL
+                         OR state.grouping_generation<>state.published_generation
+                         OR state.published_generation<>proof.proven_published_generation
+                         OR receipt.space IS NULL
+                         OR receipt.membership_digest<>proof.proven_membership_digest
+                         OR receipt.algo_version<>'{algorithm}'
+                         OR receipt.projection_version<>'{projection}'
+                       )
+                )
+        )",
+        algorithm = crate::community_grouping::COMMUNITY_ALGO_VERSION,
+        projection = crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+    )
+}
+
 fn community_membership_digest(
     members: impl IntoIterator<Item = (String, String, String)>,
 ) -> String {
@@ -2407,6 +2478,8 @@ pub struct CommunityReaderParityReceipt {
     pub spaces_checked: usize,
     pub unexplained_drift_count: usize,
     pub explained_structural_delta_count: usize,
+    pub canonical_mutex_hold: std::time::Duration,
+    pub reconcile_elapsed: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10657,6 +10730,32 @@ impl MemoryDB {
 
     async fn ensure_community_cutover_tables(conn: &libsql::Connection) -> Result<(), WenlanError> {
         conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m4_parity_input_entity_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_update;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!(
+                "disable global community parity triggers for repair: {error}"
+            ))
+        })?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS page_community_assignments (
                 page_id TEXT PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
                 space TEXT NOT NULL,
@@ -10992,7 +11091,6 @@ impl MemoryDB {
             CREATE TRIGGER m4_community_member_insert_invalidate
             AFTER INSERT ON community_members
             BEGIN
-              DELETE FROM community_reader_parity WHERE space = NEW.space;
               UPDATE community_route_space_inputs
                  SET generation=generation + 1
                WHERE space=NEW.space
@@ -11005,7 +11103,6 @@ impl MemoryDB {
             CREATE TRIGGER m4_community_member_delete_invalidate
             AFTER DELETE ON community_members
             BEGIN
-              DELETE FROM community_reader_parity WHERE space = OLD.space;
               UPDATE community_route_space_inputs
                  SET generation=generation + 1
                WHERE space=OLD.space
@@ -11018,8 +11115,6 @@ impl MemoryDB {
             CREATE TRIGGER m4_community_member_update_invalidate
             AFTER UPDATE ON community_members
             BEGIN
-              DELETE FROM community_reader_parity
-               WHERE space = OLD.space OR space = NEW.space;
               UPDATE community_route_space_inputs
                  SET generation=generation + 1
                WHERE (space=OLD.space OR space=NEW.space)
@@ -11208,7 +11303,6 @@ impl MemoryDB {
                ON CONFLICT(space) DO UPDATE SET
                     grouping_generation = grouping_generation + 1,
                     dirty = 1;
-               DELETE FROM community_reader_parity WHERE space = NEW.space;
              END;
 
              CREATE TRIGGER m4_grouping_entity_delete
@@ -11218,7 +11312,6 @@ impl MemoryDB {
                UPDATE space_graph_state
                   SET grouping_generation = grouping_generation + 1, dirty = 1
                 WHERE space = OLD.space;
-               DELETE FROM community_reader_parity WHERE space = OLD.space;
              END;
 
              CREATE TRIGGER m4_grouping_entity_update
@@ -11230,11 +11323,6 @@ impl MemoryDB {
                 WHERE space = OLD.space
                   AND OLD.space IS NOT NULL
                   AND OLD.space IS NOT NEW.space;
-               DELETE FROM community_reader_parity
-                WHERE space = OLD.space
-                  AND OLD.space IS NOT NULL
-                  AND OLD.space IS NOT NEW.space;
-
                INSERT INTO space_graph_state
                     (space, graph_generation, grouping_generation, published_generation, dirty)
                SELECT NEW.space, 0, 1, NULL, 1
@@ -11246,13 +11334,6 @@ impl MemoryDB {
                ON CONFLICT(space) DO UPDATE SET
                     grouping_generation = grouping_generation + 1,
                     dirty = 1;
-               DELETE FROM community_reader_parity
-                WHERE space = NEW.space
-                  AND NEW.space IS NOT NULL
-                  AND (
-                         OLD.space IS NOT NEW.space
-                      OR OLD.embedding IS NOT NEW.embedding
-                  );
              END;
 
              DROP TRIGGER IF EXISTS m4_community_parity_entity_update;
@@ -11316,6 +11397,135 @@ impl MemoryDB {
             WenlanError::VectorDb(format!("install community cutover input triggers: {error}"))
         })?;
 
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS community_parity_input_state (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                 generation INTEGER NOT NULL,
+                 relevant_spaces_digest TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO community_parity_input_state
+                 (singleton, generation, relevant_spaces_digest)
+             VALUES (1, 0, '');
+
+             CREATE TABLE IF NOT EXISTS community_reader_current_input (
+                 consumer TEXT PRIMARY KEY,
+                 input_generation INTEGER NOT NULL,
+                 relevant_spaces_digest TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS community_reader_watermark (
+                 consumer TEXT PRIMARY KEY,
+                 proven_input_generation INTEGER NOT NULL,
+                 relevant_spaces_digest TEXT NOT NULL,
+                 relevant_space_count INTEGER NOT NULL,
+                 source_coverage_delta_count INTEGER NOT NULL,
+                 output_delta_count INTEGER NOT NULL,
+                 unexplained_drift_count INTEGER NOT NULL,
+                 checked_at INTEGER NOT NULL,
+                 report_json TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS community_reader_space_proof (
+                 consumer TEXT NOT NULL,
+                 space TEXT NOT NULL,
+                 proven_published_generation INTEGER NOT NULL,
+                 proven_membership_digest TEXT NOT NULL,
+                 PRIMARY KEY(consumer, space)
+             );
+
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_memory_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_member_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_community_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_receipt_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_state_update;
+
+             CREATE TRIGGER m4_parity_input_entity_insert AFTER INSERT ON entities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_entity_delete AFTER DELETE ON entities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_entity_update AFTER UPDATE ON entities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_memory_insert AFTER INSERT ON memories BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_memory_delete AFTER DELETE ON memories BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_memory_update AFTER UPDATE ON memories BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_member_insert AFTER INSERT ON community_members BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_member_delete AFTER DELETE ON community_members BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_member_update AFTER UPDATE ON community_members BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_community_insert AFTER INSERT ON communities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_community_delete AFTER DELETE ON communities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_community_update AFTER UPDATE ON communities BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_receipt_insert
+             AFTER INSERT ON community_publication_receipts BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_receipt_delete
+             AFTER DELETE ON community_publication_receipts BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_receipt_update
+             AFTER UPDATE ON community_publication_receipts BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_state_insert AFTER INSERT ON space_graph_state BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_state_delete AFTER DELETE ON space_graph_state BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+             CREATE TRIGGER m4_parity_input_state_update AFTER UPDATE ON space_graph_state BEGIN
+               UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("install global community parity model: {error}"))
+        })?;
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m4_community_parity_entity_update;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_insert;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_delete;
+             DROP TRIGGER IF EXISTS m4_community_parity_memory_update;
+             DROP TABLE IF EXISTS community_reader_parity;",
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("retire local-only community parity model: {error}"))
+        })?;
+
         Ok(())
     }
 
@@ -11359,7 +11569,22 @@ impl MemoryDB {
             .map_err(|error| {
                 WenlanError::VectorDb(format!("M4 cutover startup repair reset indexes: {error}"))
             })?;
-            Self::ensure_community_cutover_tables(&tx).await
+            Self::ensure_community_cutover_tables(&tx).await?;
+            tx.execute_batch(
+                "DELETE FROM community_reader_current_input;
+                 DELETE FROM community_reader_watermark;
+                 DELETE FROM community_reader_space_proof;
+                 UPDATE community_parity_input_state
+                    SET generation=generation+1, relevant_spaces_digest=''
+                  WHERE singleton=1;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "M4 cutover startup repair invalidate old proofs: {error}"
+                ))
+            })?;
+            Ok(())
         }
         .await;
         match result {
@@ -11482,7 +11707,7 @@ impl MemoryDB {
     }
 
     async fn community_cutover_needs_repair(&self) -> Result<bool, WenlanError> {
-        const REQUIRED_TABLES: [(&str, &[&str]); 6] = [
+        const REQUIRED_TABLES: [(&str, &[&str]); 9] = [
             (
                 "page_community_assignments",
                 &[
@@ -11525,18 +11750,6 @@ impl MemoryDB {
                 ],
             ),
             (
-                "community_reader_parity",
-                &[
-                    "consumer text not null",
-                    "space text not null",
-                    "proven_published_generation integer not null",
-                    "unexplained_drift_count integer not null",
-                    "checked_at integer not null",
-                    "report_json text",
-                    "primary key(consumer, space)",
-                ],
-            ),
-            (
                 "community_publication_receipts",
                 &[
                     "space text primary key",
@@ -11545,6 +11758,46 @@ impl MemoryDB {
                     "algo_version text not null",
                     "projection_version text not null",
                     "published_at integer not null",
+                ],
+            ),
+            (
+                "community_parity_input_state",
+                &[
+                    "singleton integer primary key check(singleton=1)",
+                    "generation integer not null",
+                    "relevant_spaces_digest text not null",
+                ],
+            ),
+            (
+                "community_reader_current_input",
+                &[
+                    "consumer text primary key",
+                    "input_generation integer not null",
+                    "relevant_spaces_digest text not null",
+                ],
+            ),
+            (
+                "community_reader_watermark",
+                &[
+                    "consumer text primary key",
+                    "proven_input_generation integer not null",
+                    "relevant_spaces_digest text not null",
+                    "relevant_space_count integer not null",
+                    "source_coverage_delta_count integer not null",
+                    "output_delta_count integer not null",
+                    "unexplained_drift_count integer not null",
+                    "checked_at integer not null",
+                    "report_json text not null",
+                ],
+            ),
+            (
+                "community_reader_space_proof",
+                &[
+                    "consumer text not null",
+                    "space text not null",
+                    "proven_published_generation integer not null",
+                    "proven_membership_digest text not null",
+                    "primary key(consumer, space)",
                 ],
             ),
         ];
@@ -11562,7 +11815,7 @@ impl MemoryDB {
                 "on page_community_route_inputs(space)",
             ),
         ];
-        const REQUIRED_TRIGGERS: [(&str, &[&str]); 23] = [
+        const REQUIRED_TRIGGERS: [(&str, &[&str]); 19] = [
             (
                 "m4_page_community_insert_fence",
                 &[
@@ -11697,7 +11950,6 @@ impl MemoryDB {
                 "m4_community_member_insert_invalidate",
                 &[
                     "after insert on community_members",
-                    "delete from community_reader_parity where space = new.space",
                     "update community_route_space_inputs",
                     "where space=new.space",
                     "s.dirty=0",
@@ -11707,7 +11959,6 @@ impl MemoryDB {
                 "m4_community_member_delete_invalidate",
                 &[
                     "after delete on community_members",
-                    "delete from community_reader_parity where space = old.space",
                     "update community_route_space_inputs",
                     "where space=old.space",
                     "s.dirty=0",
@@ -11717,27 +11968,10 @@ impl MemoryDB {
                 "m4_community_member_update_invalidate",
                 &[
                     "after update on community_members",
-                    "delete from community_reader_parity",
                     "update community_route_space_inputs",
                     "where (space=old.space or space=new.space)",
                     "s.dirty=0",
                 ],
-            ),
-            (
-                "m4_community_parity_entity_update",
-                &["delete from community_reader_parity"],
-            ),
-            (
-                "m4_community_parity_memory_insert",
-                &["delete from community_reader_parity"],
-            ),
-            (
-                "m4_community_parity_memory_delete",
-                &["delete from community_reader_parity"],
-            ),
-            (
-                "m4_community_parity_memory_update",
-                &["delete from community_reader_parity"],
             ),
         ];
 
@@ -11867,9 +12101,24 @@ impl MemoryDB {
         }
 
         for trigger in [
-            "m4_grouping_entity_insert",
-            "m4_grouping_entity_delete",
-            "m4_grouping_entity_update",
+            "m4_parity_input_entity_insert",
+            "m4_parity_input_entity_delete",
+            "m4_parity_input_entity_update",
+            "m4_parity_input_memory_insert",
+            "m4_parity_input_memory_delete",
+            "m4_parity_input_memory_update",
+            "m4_parity_input_member_insert",
+            "m4_parity_input_member_delete",
+            "m4_parity_input_member_update",
+            "m4_parity_input_community_insert",
+            "m4_parity_input_community_delete",
+            "m4_parity_input_community_update",
+            "m4_parity_input_receipt_insert",
+            "m4_parity_input_receipt_delete",
+            "m4_parity_input_receipt_update",
+            "m4_parity_input_state_insert",
+            "m4_parity_input_state_delete",
+            "m4_parity_input_state_update",
         ] {
             let mut rows = conn
                 .query(
@@ -11880,7 +12129,7 @@ impl MemoryDB {
                 .await
                 .map_err(|error| {
                     WenlanError::VectorDb(format!(
-                        "inspect community parity invalidation trigger {trigger}: {error}"
+                        "inspect global community parity trigger {trigger}: {error}"
                     ))
                 })?;
             let sql = rows
@@ -11888,14 +12137,14 @@ impl MemoryDB {
                 .await
                 .map_err(|error| {
                     WenlanError::VectorDb(format!(
-                        "read community parity invalidation trigger {trigger}: {error}"
+                        "read global community parity trigger {trigger}: {error}"
                     ))
                 })?
                 .and_then(|row| row.get::<String>(0).ok());
             if !sql.as_deref().is_some_and(|value| {
                 value
                     .to_ascii_lowercase()
-                    .contains("community_reader_parity")
+                    .contains("update community_parity_input_state")
             }) {
                 return Ok(true);
             }
@@ -13504,17 +13753,6 @@ impl MemoryDB {
                         "finalize publication receipt: {error}"
                     ))
                 })?;
-                tx.execute(
-                    "DELETE FROM community_reader_parity WHERE space=?1",
-                    libsql::params![attempt.space.clone()],
-                )
-                .await
-                .map_err(|error| {
-                    CommunityGroupingError::Database(format!(
-                        "finalize invalidate reader parity: {error}"
-                    ))
-                })?;
-
                 for event in &identity_events {
                     let mut source_ids = event.old_community_ids.clone();
                     source_ids.extend(event.new_community_ids.iter().cloned());
@@ -14032,153 +14270,18 @@ impl MemoryDB {
     /// published generation. Missing, corrupt, stale, or disabled state keeps
     /// the reader on the legacy fallback.
     async fn community_reader_uses_durable(conn: &libsql::Connection, consumer: &str) -> bool {
-        let enabled = async {
-            let mut rows = conn
-                .query(
-                    "SELECT enabled
-                       FROM community_reader_cutover
-                      WHERE consumer=?1",
-                    libsql::params![consumer],
-                )
-                .await?;
+        if !Self::is_known_community_reader(consumer) {
+            return false;
+        }
+        let sql = format!("SELECT {}", community_reader_durable_gate_sql(consumer));
+        let result = async {
+            let mut rows = conn.query(&sql, ()).await?;
             Ok::<_, libsql::Error>(
                 rows.next().await?.and_then(|row| row.get::<i64>(0).ok()) == Some(1),
             )
         }
         .await;
-        if !matches!(enabled, Ok(true)) {
-            return false;
-        }
-
-        let violations = async {
-            let mut rows = conn
-                .query(
-                    "WITH candidates AS (
-                         SELECT m.source_id, m.space, m.entity_id
-                           FROM memories m
-                          WHERE m.source = 'memory'
-                            AND m.chunk_index = 0
-                            AND (
-                                ?1 <> 'summary_buckets'
-                                OR (
-                                    COALESCE(m.pending_revision, 0) = 0
-                                    AND NOT EXISTS (
-                                        SELECT 1 FROM memories superseder
-                                         WHERE superseder.supersedes = m.source_id
-                                           AND COALESCE(superseder.pending_revision, 0) = 0
-                                           AND superseder.source = 'memory'
-                                    )
-                                )
-                            )
-                            AND m.is_recap = 0
-                            AND m.supersede_mode <> 'archive'
-                            AND m.source_id NOT LIKE 'merged_%'
-                            AND m.source_id NOT LIKE 'recap_%'
-                            AND m.embedding IS NOT NULL
-                     ),
-                     relevant(space) AS (
-                         SELECT DISTINCT m.space
-                           FROM candidates m
-                           JOIN entities e ON e.id = m.entity_id
-                          WHERE e.community_id IS NOT NULL
-                         UNION
-                         SELECT DISTINCT cm.space
-                           FROM community_members cm
-                           JOIN candidates m
-                             ON m.entity_id = cm.node_id AND m.space = cm.space
-                     )
-                     SELECT COUNT(*)
-                       FROM relevant r
-                       LEFT JOIN space_graph_state s ON s.space = r.space
-                       LEFT JOIN community_reader_parity p
-                         ON p.consumer = ?1 AND p.space = r.space
-                      WHERE s.space IS NULL
-                         OR s.dirty <> 0
-                         OR s.published_generation IS NULL
-                         OR p.space IS NULL
-                         OR p.unexplained_drift_count <> 0
-                         OR p.proven_published_generation <> s.published_generation",
-                    libsql::params![consumer],
-                )
-                .await?;
-            let row = rows.next().await?.ok_or(libsql::Error::Misuse(
-                "community cutover gate returned no count row".to_string(),
-            ))?;
-            row.get::<i64>(0)
-        }
-        .await;
-
-        matches!(violations, Ok(0))
-    }
-
-    async fn load_community_reader_groups(
-        conn: &libsql::Connection,
-        space: &str,
-        durable: bool,
-        consumer: &str,
-    ) -> Result<Vec<Vec<String>>, libsql::Error> {
-        let lifecycle = if consumer == COMMUNITY_SUMMARY_BUCKETS_CONSUMER {
-            "AND COALESCE(m.pending_revision, 0) = 0
-             AND NOT EXISTS (
-                 SELECT 1 FROM memories superseder
-                  WHERE superseder.supersedes = m.source_id
-                    AND COALESCE(superseder.pending_revision, 0) = 0
-                    AND superseder.source = 'memory'
-             )"
-        } else {
-            ""
-        };
-        let sql = if durable {
-            format!(
-                "SELECT m.source_id, cm.community_id
-               FROM memories m
-               JOIN community_members cm
-                 ON cm.node_id = m.entity_id AND cm.space = m.space
-               JOIN space_graph_state s
-                 ON s.space = cm.space
-                AND cm.published_generation = s.published_generation
-               JOIN communities c
-                 ON c.community_id = cm.community_id
-                AND c.space = cm.space
-                AND c.retired_at IS NULL
-              WHERE m.space = ?1
-                AND m.source = 'memory' AND m.chunk_index = 0
-                {lifecycle}
-                AND m.is_recap = 0
-                AND m.supersede_mode <> 'archive'
-                AND m.source_id NOT LIKE 'merged_%'
-                AND m.source_id NOT LIKE 'recap_%'
-                AND m.embedding IS NOT NULL
-              ORDER BY cm.community_id, m.source_id"
-            )
-        } else {
-            format!(
-                "SELECT m.source_id, CAST(e.community_id AS TEXT)
-               FROM memories m
-               JOIN entities e ON e.id = m.entity_id
-              WHERE m.space = ?1
-                AND m.source = 'memory' AND m.chunk_index = 0
-                {lifecycle}
-                AND m.is_recap = 0
-                AND m.supersede_mode <> 'archive'
-                AND m.source_id NOT LIKE 'merged_%'
-                AND m.source_id NOT LIKE 'recap_%'
-                AND m.embedding IS NOT NULL
-                AND e.community_id IS NOT NULL
-              ORDER BY e.community_id, m.source_id"
-            )
-        };
-        let mut rows = conn.query(&sql, libsql::params![space]).await?;
-        let mut groups = BTreeMap::<String, Vec<String>>::new();
-        while let Some(row) = rows.next().await? {
-            groups
-                .entry(row.get::<String>(1)?)
-                .or_default()
-                .push(row.get::<String>(0)?);
-        }
-        let mut normalized = groups.into_values().collect::<Vec<_>>();
-        normalized.sort();
-        Ok(normalized)
+        matches!(result, Ok(true))
     }
 
     async fn community_reader_parity_needs_reconcile(
@@ -14186,59 +14289,15 @@ impl MemoryDB {
         consumer: &str,
     ) -> Result<bool, WenlanError> {
         let conn = self.conn.lock().await;
+        let gate = community_reader_durable_gate_sql(consumer);
+        let sql = format!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM community_reader_cutover
+                  WHERE consumer=?1 AND enabled=1
+             ) AND NOT ({gate})"
+        );
         let mut rows = conn
-            .query(
-                "WITH candidates AS (
-                     SELECT m.source_id, m.space, m.entity_id
-                       FROM memories m
-                      WHERE m.source='memory' AND m.chunk_index=0
-                        AND (
-                            ?1 <> 'summary_buckets'
-                            OR (
-                                COALESCE(m.pending_revision, 0)=0
-                                AND NOT EXISTS (
-                                    SELECT 1 FROM memories superseder
-                                     WHERE superseder.supersedes=m.source_id
-                                       AND COALESCE(superseder.pending_revision, 0)=0
-                                       AND superseder.source='memory'
-                                )
-                            )
-                        )
-                        AND m.is_recap=0
-                        AND m.supersede_mode<>'archive'
-                        AND m.source_id NOT LIKE 'merged_%'
-                        AND m.source_id NOT LIKE 'recap_%'
-                        AND m.embedding IS NOT NULL
-                 ),
-                 relevant(space) AS (
-                     SELECT DISTINCT m.space
-                       FROM candidates m
-                       JOIN entities e ON e.id=m.entity_id
-                      WHERE e.community_id IS NOT NULL
-                     UNION
-                     SELECT DISTINCT cm.space
-                       FROM community_members cm
-                       JOIN candidates m
-                         ON m.entity_id=cm.node_id AND m.space=cm.space
-                 )
-                 SELECT EXISTS (
-                     SELECT 1
-                       FROM community_reader_cutover cutover
-                      WHERE cutover.consumer=?1 AND cutover.enabled=1
-                 ) AND EXISTS (
-                     SELECT 1
-                       FROM relevant r
-                       LEFT JOIN space_graph_state s ON s.space=r.space
-                       LEFT JOIN community_reader_parity p
-                         ON p.consumer=?1 AND p.space=r.space
-                      WHERE s.space IS NULL
-                         OR s.dirty<>0
-                         OR s.published_generation IS NULL
-                         OR p.space IS NULL
-                         OR p.proven_published_generation<>s.published_generation
-                 )",
-                libsql::params![consumer],
-            )
+            .query(&sql, libsql::params![consumer])
             .await
             .map_err(|error| {
                 WenlanError::VectorDb(format!(
@@ -14288,321 +14347,552 @@ impl MemoryDB {
         &self,
         consumer: &str,
     ) -> Result<CommunityReaderParityReceipt, WenlanError> {
+        let reconcile_started = std::time::Instant::now();
         if !Self::is_known_community_reader(consumer) {
             return Err(WenlanError::Validation(format!(
                 "unknown community reader consumer: {consumer}"
             )));
         }
-        let conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        #[derive(Debug)]
+        struct CandidateSnapshot {
+            source_id: String,
+            space: String,
+            legacy_community_id: Option<String>,
+            raw_durable_community_id: Option<String>,
+            current_durable_community_id: Option<String>,
+        }
+        #[derive(Debug)]
+        struct SpaceSnapshot {
+            space: String,
+            published_generation: Option<i64>,
+            stored_digest: Option<String>,
+            algorithm: Option<String>,
+            projection: Option<String>,
+            members: Vec<(String, String, String)>,
+        }
+
+        let snapshot_conn = self
+            ._db
+            .connect()
+            .map_err(|error| WenlanError::VectorDb(format!("community parity connect: {error}")))?;
+        snapshot_conn
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON; BEGIN;")
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("community parity begin: {error}")))?;
-        let result: Result<CommunityReaderParityReceipt, WenlanError> = async {
-            let mut space_rows = tx
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity snapshot begin: {error}"))
+            })?;
+        let snapshot_result: Result<
+            (i64, Vec<CandidateSnapshot>, Vec<SpaceSnapshot>),
+            WenlanError,
+        > = async {
+            let mut generation_rows = snapshot_conn
                 .query(
-                    "WITH candidates AS (
-                         SELECT m.source_id, m.space, m.entity_id
+                    "SELECT generation FROM community_parity_input_state WHERE singleton=1",
+                    (),
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity generation: {error}"))
+                })?;
+            let input_generation = generation_rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity generation row: {error}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb("community parity input generation missing".to_string())
+                })?
+                .get::<i64>(0)
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity generation decode: {error}"))
+                })?;
+            drop(generation_rows);
+
+            let mut candidate_rows = snapshot_conn
+                .query(
+                    "SELECT m.source_id, m.space, CAST(e.community_id AS TEXT),
+                                raw_member.community_id,
+                                CASE WHEN current_community.community_id IS NOT NULL
+                                     THEN raw_member.community_id END
                            FROM memories m
-                          WHERE m.source = 'memory'
-                            AND m.chunk_index = 0
+                           LEFT JOIN entities e ON e.id=m.entity_id
+                           LEFT JOIN community_members raw_member
+                             ON raw_member.node_id=m.entity_id
+                            AND raw_member.space=m.space
+                           LEFT JOIN space_graph_state current_state
+                             ON current_state.space=raw_member.space
+                            AND current_state.dirty=0
+                            AND current_state.published_generation IS NOT NULL
+                            AND current_state.grouping_generation=current_state.published_generation
+                            AND raw_member.published_generation=current_state.published_generation
+                           LEFT JOIN communities current_community
+                             ON current_community.community_id=raw_member.community_id
+                            AND current_community.space=raw_member.space
+                            AND current_community.retired_at IS NULL
+                          WHERE m.source='memory' AND m.chunk_index=0
                             AND (
-                                ?1 <> 'summary_buckets'
+                                ?1<>'summary_buckets'
                                 OR (
-                                    COALESCE(m.pending_revision, 0) = 0
+                                    COALESCE(m.pending_revision,0)=0
                                     AND NOT EXISTS (
                                         SELECT 1 FROM memories superseder
-                                         WHERE superseder.supersedes = m.source_id
-                                           AND COALESCE(superseder.pending_revision, 0) = 0
-                                           AND superseder.source = 'memory'
+                                         WHERE superseder.supersedes=m.source_id
+                                           AND COALESCE(superseder.pending_revision,0)=0
+                                           AND superseder.source='memory'
                                     )
                                 )
                             )
-                            AND m.is_recap = 0
-                            AND m.supersede_mode <> 'archive'
+                            AND m.is_recap=0
+                            AND m.supersede_mode<>'archive'
                             AND m.source_id NOT LIKE 'merged_%'
                             AND m.source_id NOT LIKE 'recap_%'
                             AND m.embedding IS NOT NULL
-                     )
-                     SELECT DISTINCT space FROM (
-                         SELECT m.space AS space
-                           FROM candidates m
-                           JOIN entities e ON e.id = m.entity_id
-                          WHERE e.community_id IS NOT NULL
-                         UNION
-                         SELECT cm.space AS space
-                           FROM community_members cm
-                           JOIN candidates m
-                             ON m.entity_id = cm.node_id AND m.space = cm.space
-                     )
-                     ORDER BY space",
+                          ORDER BY m.source_id",
                     libsql::params![consumer],
                 )
                 .await
                 .map_err(|error| {
-                    WenlanError::VectorDb(format!("community parity relevant spaces: {error}"))
+                    WenlanError::VectorDb(format!("community parity candidates: {error}"))
                 })?;
-            let mut spaces = Vec::new();
-            while let Some(row) = space_rows.next().await.map_err(|error| {
-                WenlanError::VectorDb(format!("community parity space row: {error}"))
+            let mut candidates = Vec::new();
+            let mut relevant_spaces = BTreeSet::new();
+            while let Some(row) = candidate_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("community parity candidate row: {error}"))
             })? {
-                spaces.push(row.get::<String>(0).map_err(|error| {
-                    WenlanError::VectorDb(format!("community parity space decode: {error}"))
-                })?);
+                let candidate = CandidateSnapshot {
+                    source_id: row.get::<String>(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("community parity source decode: {error}"))
+                    })?,
+                    space: row.get::<String>(1).map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "community parity candidate space decode: {error}"
+                        ))
+                    })?,
+                    legacy_community_id: row.get::<String>(2).ok(),
+                    raw_durable_community_id: row.get::<String>(3).ok(),
+                    current_durable_community_id: row.get::<String>(4).ok(),
+                };
+                if candidate.legacy_community_id.is_some()
+                    || candidate.raw_durable_community_id.is_some()
+                {
+                    relevant_spaces.insert(candidate.space.clone());
+                }
+                candidates.push(candidate);
             }
-            drop(space_rows);
+            drop(candidate_rows);
 
-            tx.execute(
-                "DELETE FROM community_reader_parity WHERE consumer=?1",
-                libsql::params![consumer],
-            )
-            .await
-            .map_err(|error| WenlanError::VectorDb(format!("community parity reset: {error}")))?;
-
-            let mut unexplained_total = 0usize;
-            let mut explained_total = 0usize;
-            let mut ready = true;
-            for space in &spaces {
-                let mut state_rows = tx
+            let mut spaces = Vec::new();
+            for space in relevant_spaces {
+                let mut state_rows = snapshot_conn
                     .query(
-                        "SELECT published_generation
-                           FROM space_graph_state
-                          WHERE space=?1 AND dirty=0
-                            AND published_generation IS NOT NULL
-                            AND published_generation=grouping_generation",
+                        "SELECT state.published_generation,
+                                    receipt.membership_digest,
+                                    receipt.algo_version,
+                                    receipt.projection_version
+                               FROM space_graph_state state
+                               LEFT JOIN community_publication_receipts receipt
+                                 ON receipt.space=state.space
+                                AND receipt.published_generation=state.published_generation
+                              WHERE state.space=?1
+                                AND state.dirty=0
+                                AND state.published_generation IS NOT NULL
+                                AND state.grouping_generation=state.published_generation",
                         libsql::params![space.clone()],
                     )
                     .await
                     .map_err(|error| {
-                        WenlanError::VectorDb(format!("community parity state: {error}"))
+                        WenlanError::VectorDb(format!(
+                            "community parity publication snapshot: {error}"
+                        ))
                     })?;
-                let published_generation = state_rows
+                let state = state_rows
                     .next()
                     .await
                     .map_err(|error| {
-                        WenlanError::VectorDb(format!("community parity state row: {error}"))
-                    })?
-                    .and_then(|row| row.get::<i64>(0).ok());
-                drop(state_rows);
-                let Some(published_generation) = published_generation else {
-                    ready = false;
-                    continue;
-                };
-
-                let mut receipt_rows = tx
-                    .query(
-                        "SELECT membership_digest, algo_version, projection_version
-                           FROM community_publication_receipts
-                          WHERE space=?1 AND published_generation=?2",
-                        libsql::params![space.clone(), published_generation],
-                    )
-                    .await
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!("community publication receipt: {error}"))
-                    })?;
-                let stored_receipt = receipt_rows
-                    .next()
-                    .await
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!("community publication receipt row: {error}"))
+                        WenlanError::VectorDb(format!("community parity publication row: {error}"))
                     })?
                     .map(|row| {
-                        Ok::<_, WenlanError>((
+                        (
+                            row.get::<i64>(0).ok(),
+                            row.get::<String>(1).ok(),
+                            row.get::<String>(2).ok(),
+                            row.get::<String>(3).ok(),
+                        )
+                    })
+                    .unwrap_or((None, None, None, None));
+                drop(state_rows);
+                let mut members = Vec::new();
+                if let Some(published_generation) = state.0 {
+                    let mut member_rows = snapshot_conn
+                        .query(
+                            "SELECT node_id, community_id, attachment
+                                   FROM community_members
+                                  WHERE space=?1 AND published_generation=?2
+                                  ORDER BY node_id",
+                            libsql::params![space.clone(), published_generation],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "community parity membership snapshot: {error}"
+                            ))
+                        })?;
+                    while let Some(row) = member_rows.next().await.map_err(|error| {
+                        WenlanError::VectorDb(format!("community parity membership row: {error}"))
+                    })? {
+                        members.push((
                             row.get::<String>(0).map_err(|error| {
                                 WenlanError::VectorDb(format!(
-                                    "community membership digest decode: {error}"
+                                    "community parity member decode: {error}"
                                 ))
                             })?,
                             row.get::<String>(1).map_err(|error| {
                                 WenlanError::VectorDb(format!(
-                                    "community receipt algorithm decode: {error}"
+                                    "community parity member community decode: {error}"
                                 ))
                             })?,
                             row.get::<String>(2).map_err(|error| {
                                 WenlanError::VectorDb(format!(
-                                    "community receipt projection decode: {error}"
+                                    "community parity attachment decode: {error}"
                                 ))
                             })?,
-                        ))
-                    })
-                    .transpose()?;
-                drop(receipt_rows);
-
-                let mut member_rows = tx
-                    .query(
-                        "SELECT node_id, community_id, attachment
-                           FROM community_members
-                          WHERE space=?1 AND published_generation=?2
-                          ORDER BY node_id",
-                        libsql::params![space.clone(), published_generation],
-                    )
-                    .await
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!("community receipt membership read: {error}"))
-                    })?;
-                let mut current_members = Vec::new();
-                while let Some(row) = member_rows.next().await.map_err(|error| {
-                    WenlanError::VectorDb(format!("community receipt membership row: {error}"))
-                })? {
-                    current_members.push((
-                        row.get::<String>(0).map_err(|error| {
-                            WenlanError::VectorDb(format!("community receipt node decode: {error}"))
-                        })?,
-                        row.get::<String>(1).map_err(|error| {
-                            WenlanError::VectorDb(format!(
-                                "community receipt community decode: {error}"
-                            ))
-                        })?,
-                        row.get::<String>(2).map_err(|error| {
-                            WenlanError::VectorDb(format!(
-                                "community receipt attachment decode: {error}"
-                            ))
-                        })?,
-                    ));
+                        ));
+                    }
                 }
-                drop(member_rows);
-                let current_membership_digest = community_membership_digest(current_members);
-                let receipt_valid = stored_receipt.as_ref().is_some_and(
-                    |(stored_digest, algorithm, projection)| {
-                        stored_digest == &current_membership_digest
-                            && algorithm == crate::community_grouping::COMMUNITY_ALGO_VERSION
-                            && projection == crate::community_grouping::COMMUNITY_PROJECTION_VERSION
-                    },
-                );
-                if !receipt_valid {
-                    unexplained_total += 1;
-                    ready = false;
-                    let report = serde_json::json!({
-                        "consumer": consumer,
-                        "space": space,
-                        "receipt_valid": false,
-                        "stored_receipt": stored_receipt,
-                        "current_membership_digest": current_membership_digest,
-                        "explained_structural_delta_count": 0,
-                        "unexplained_drift_count": 1,
-                    })
-                    .to_string();
-                    tx.execute(
-                        "INSERT INTO community_reader_parity
-                            (consumer, space, proven_published_generation,
-                             unexplained_drift_count, checked_at, report_json)
-                         VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-                        libsql::params![
-                            consumer,
-                            space.clone(),
-                            published_generation,
-                            chrono::Utc::now().timestamp(),
-                            report
-                        ],
-                    )
-                    .await
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!(
-                            "invalid community receipt parity row: {error}"
-                        ))
-                    })?;
-                    continue;
-                }
+                spaces.push(SpaceSnapshot {
+                    space,
+                    published_generation: state.0,
+                    stored_digest: state.1,
+                    algorithm: state.2,
+                    projection: state.3,
+                    members,
+                });
+            }
+            Ok((input_generation, candidates, spaces))
+        }
+        .await;
+        let (input_generation, candidates, space_snapshots) = match snapshot_result {
+            Ok(snapshot) => {
+                snapshot_conn.execute("COMMIT", ()).await.map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity snapshot commit: {error}"))
+                })?;
+                snapshot
+            }
+            Err(error) => {
+                let _ = snapshot_conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        let read_connection_autocommit = snapshot_conn
+            .execute_batch("BEGIN; ROLLBACK;")
+            .await
+            .is_ok();
+        drop(snapshot_conn);
+        let relevant_spaces = space_snapshots
+            .iter()
+            .map(|space| space.space.clone())
+            .collect::<Vec<_>>();
+        let relevant_spaces_digest =
+            community_relevant_spaces_digest(relevant_spaces.iter().cloned());
+        #[cfg(test)]
+        tests::community_parity_test_hooks::after_snapshot(
+            consumer,
+            &relevant_spaces_digest,
+            read_connection_autocommit,
+        )
+        .await;
 
-                let legacy = Self::load_community_reader_groups(&tx, space, false, consumer)
-                    .await
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!("community parity legacy read: {error}"))
-                    })?;
-                let durable = Self::load_community_reader_groups(&tx, space, true, consumer)
-                    .await
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!("community parity durable read: {error}"))
-                    })?;
+        let mut legacy_groups = BTreeMap::<String, Vec<String>>::new();
+        let mut durable_groups = BTreeMap::<(String, String), Vec<String>>::new();
+        for candidate in candidates {
+            if let Some(community_id) = candidate.legacy_community_id {
+                legacy_groups
+                    .entry(community_id)
+                    .or_default()
+                    .push(candidate.source_id.clone());
+            }
+            if let Some(community_id) = candidate.current_durable_community_id {
+                durable_groups
+                    .entry((candidate.space, community_id))
+                    .or_default()
+                    .push(candidate.source_id);
+            }
+        }
+        let mut legacy = legacy_groups.into_values().collect::<Vec<_>>();
+        let mut durable = durable_groups.into_values().collect::<Vec<_>>();
+        for group in legacy.iter_mut().chain(durable.iter_mut()) {
+            group.sort();
+        }
+        legacy.sort();
+        durable.sort();
+        let legacy_sources = legacy.iter().flatten().cloned().collect::<BTreeSet<_>>();
+        let durable_sources = durable.iter().flatten().cloned().collect::<BTreeSet<_>>();
+        let source_coverage_delta = legacy_sources
+            .symmetric_difference(&durable_sources)
+            .count();
+        let output_delta = if consumer == COMMUNITY_SUMMARY_BUCKETS_CONSUMER {
+            let legacy_partitions = legacy.iter().cloned().collect::<BTreeSet<_>>();
+            let durable_partitions = durable.iter().cloned().collect::<BTreeSet<_>>();
+            legacy_partitions
+                .symmetric_difference(&durable_partitions)
+                .count()
+        } else {
+            let minimum = crate::refinery::summary::min_bucket_members();
+            let legacy_eligible = legacy
+                .iter()
+                .filter(|group| group.len() >= minimum)
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let durable_eligible = durable
+                .iter()
+                .filter(|group| group.len() >= minimum)
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            legacy_eligible
+                .symmetric_difference(&durable_eligible)
+                .count()
+        };
 
-                let legacy_sources = legacy.iter().flatten().cloned().collect::<BTreeSet<_>>();
-                let durable_sources = durable.iter().flatten().cloned().collect::<BTreeSet<_>>();
-                let source_coverage_delta = legacy_sources
-                    .symmetric_difference(&durable_sources)
-                    .count();
-                let legacy_partitions = legacy.iter().cloned().collect::<BTreeSet<_>>();
-                let durable_partitions = durable.iter().cloned().collect::<BTreeSet<_>>();
-                let partition_delta = legacy_partitions
-                    .symmetric_difference(&durable_partitions)
-                    .count();
-                let (unexplained, explained) = if source_coverage_delta > 0 {
-                    (source_coverage_delta, 0usize)
-                } else if legacy == durable {
-                    (0usize, 0usize)
-                } else if consumer == COMMUNITY_SUMMARY_BUCKETS_CONSUMER {
-                    (0, partition_delta.max(1))
-                } else {
-                    let minimum = crate::refinery::summary::min_bucket_members();
-                    let legacy_eligible = legacy
-                        .iter()
-                        .filter(|group| group.len() >= minimum)
-                        .flatten()
-                        .cloned()
-                        .collect::<BTreeSet<_>>();
-                    let durable_eligible = durable
-                        .iter()
-                        .filter(|group| group.len() >= minimum)
-                        .flatten()
-                        .cloned()
-                        .collect::<BTreeSet<_>>();
-                    let eligibility_delta = legacy_eligible
-                        .symmetric_difference(&durable_eligible)
-                        .count();
-                    (0, eligibility_delta.max(partition_delta).max(1))
-                };
-                unexplained_total += unexplained;
-                explained_total += explained;
-                let report = serde_json::json!({
-                    "consumer": consumer,
-                    "space": space,
-                    "legacy_groups": legacy,
-                    "durable_groups": durable,
-                    "receipt_valid": true,
-                    "membership_digest": current_membership_digest,
-                    "source_coverage_delta_count": source_coverage_delta,
-                    "partition_delta_count": partition_delta,
-                    "explained_structural_delta_count": explained,
-                    "unexplained_drift_count": unexplained,
-                })
-                .to_string();
-                tx.execute(
-                    "INSERT INTO community_reader_parity
-                        (consumer, space, proven_published_generation,
-                         unexplained_drift_count, checked_at, report_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let mut valid_space_proofs = Vec::new();
+        let mut invalid_publication_proofs = 0usize;
+        for snapshot in space_snapshots {
+            let current_digest = community_membership_digest(snapshot.members);
+            let valid = snapshot.published_generation.is_some()
+                && snapshot.stored_digest.as_deref() == Some(current_digest.as_str())
+                && snapshot.algorithm.as_deref()
+                    == Some(crate::community_grouping::COMMUNITY_ALGO_VERSION)
+                && snapshot.projection.as_deref()
+                    == Some(crate::community_grouping::COMMUNITY_PROJECTION_VERSION);
+            if valid {
+                valid_space_proofs.push((
+                    snapshot.space,
+                    snapshot.published_generation.unwrap_or_default(),
+                    current_digest,
+                ));
+            } else {
+                invalid_publication_proofs += 1;
+            }
+        }
+        let unexplained_total = source_coverage_delta + invalid_publication_proofs;
+        let explained_total = if source_coverage_delta == 0 {
+            output_delta
+        } else {
+            0
+        };
+        let report = serde_json::json!({
+            "consumer": consumer,
+            "input_generation": input_generation,
+            "relevant_spaces": relevant_spaces,
+            "relevant_spaces_digest": relevant_spaces_digest,
+            "legacy_groups": legacy,
+            "durable_groups": durable,
+            "source_coverage_delta_count": source_coverage_delta,
+            "output_delta_count": output_delta,
+            "invalid_publication_proof_count": invalid_publication_proofs,
+            "explained_structural_delta_count": explained_total,
+            "unexplained_drift_count": unexplained_total,
+        })
+        .to_string();
+
+        let conn = self.conn.lock().await;
+        let canonical_mutex_started = std::time::Instant::now();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity finalize begin: {error}"))
+            })?;
+        let mut generation_rows = tx
+            .query(
+                "SELECT generation FROM community_parity_input_state WHERE singleton=1",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity finalize generation: {error}"))
+            })?;
+        let current_generation = generation_rows
+            .next()
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity finalize generation row: {error}"))
+            })?
+            .and_then(|row| row.get::<i64>(0).ok());
+        drop(generation_rows);
+        if current_generation != Some(input_generation) {
+            tx.rollback().await.map_err(|error| {
+                WenlanError::VectorDb(format!("community parity stale rollback: {error}"))
+            })?;
+            return Ok(CommunityReaderParityReceipt {
+                consumer: consumer.to_owned(),
+                ready: false,
+                spaces_checked: relevant_spaces.len(),
+                unexplained_drift_count: 0,
+                explained_structural_delta_count: 0,
+                canonical_mutex_hold: canonical_mutex_started.elapsed(),
+                reconcile_elapsed: reconcile_started.elapsed(),
+            });
+        }
+        for (space, published_generation, membership_digest) in &valid_space_proofs {
+            let mut proof_rows = tx
+                .query(
+                    "SELECT COUNT(*)
+                       FROM space_graph_state state
+                       JOIN community_publication_receipts receipt
+                         ON receipt.space=state.space
+                        AND receipt.published_generation=state.published_generation
+                      WHERE state.space=?1
+                        AND state.dirty=0
+                        AND state.grouping_generation=?2
+                        AND state.published_generation=?2
+                        AND receipt.membership_digest=?3
+                        AND receipt.algo_version=?4
+                        AND receipt.projection_version=?5",
                     libsql::params![
-                        consumer,
                         space.clone(),
-                        published_generation,
-                        i64::try_from(unexplained).unwrap_or(i64::MAX),
-                        chrono::Utc::now().timestamp(),
-                        report
+                        *published_generation,
+                        membership_digest.clone(),
+                        crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                        crate::community_grouping::COMMUNITY_PROJECTION_VERSION
                     ],
                 )
                 .await
                 .map_err(|error| {
-                    WenlanError::VectorDb(format!("community parity receipt: {error}"))
+                    WenlanError::VectorDb(format!("community parity finalize proof CAS: {error}"))
                 })?;
+            let matches = proof_rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity finalize proof row: {error}"))
+                })?
+                .and_then(|row| row.get::<i64>(0).ok())
+                == Some(1);
+            drop(proof_rows);
+            if !matches {
+                tx.rollback().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("community parity proof-CAS rollback: {error}"))
+                })?;
+                return Ok(CommunityReaderParityReceipt {
+                    consumer: consumer.to_owned(),
+                    ready: false,
+                    spaces_checked: relevant_spaces.len(),
+                    unexplained_drift_count: 0,
+                    explained_structural_delta_count: 0,
+                    canonical_mutex_hold: canonical_mutex_started.elapsed(),
+                    reconcile_elapsed: reconcile_started.elapsed(),
+                });
             }
-            ready &= unexplained_total == 0;
-            Ok(CommunityReaderParityReceipt {
+        }
+        let matched = tx
+            .execute(
+                "UPDATE community_parity_input_state
+                    SET relevant_spaces_digest=?2
+                  WHERE singleton=1 AND generation=?1",
+                libsql::params![input_generation, relevant_spaces_digest.clone()],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity digest CAS: {error}"))
+            })?;
+        if matched == 0 {
+            tx.rollback().await.map_err(|error| {
+                WenlanError::VectorDb(format!("community parity digest-CAS rollback: {error}"))
+            })?;
+            return Ok(CommunityReaderParityReceipt {
                 consumer: consumer.to_owned(),
-                ready,
-                spaces_checked: spaces.len(),
-                unexplained_drift_count: unexplained_total,
-                explained_structural_delta_count: explained_total,
-            })
+                ready: false,
+                spaces_checked: relevant_spaces.len(),
+                unexplained_drift_count: 0,
+                explained_structural_delta_count: 0,
+                canonical_mutex_hold: canonical_mutex_started.elapsed(),
+                reconcile_elapsed: reconcile_started.elapsed(),
+            });
         }
-        .await;
-        match result {
-            Ok(receipt) => {
-                tx.commit().await.map_err(|error| {
-                    WenlanError::VectorDb(format!("community parity commit: {error}"))
-                })?;
-                Ok(receipt)
-            }
-            Err(error) => Err(error),
+        tx.execute(
+            "INSERT INTO community_reader_current_input
+                (consumer, input_generation, relevant_spaces_digest)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(consumer) DO UPDATE SET
+                input_generation=excluded.input_generation,
+                relevant_spaces_digest=excluded.relevant_spaces_digest",
+            libsql::params![consumer, input_generation, relevant_spaces_digest.clone()],
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("community parity current input: {error}"))
+        })?;
+        tx.execute(
+            "DELETE FROM community_reader_space_proof WHERE consumer=?1",
+            libsql::params![consumer],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("community parity proof reset: {error}")))?;
+        for (space, published_generation, membership_digest) in &valid_space_proofs {
+            tx.execute(
+                "INSERT INTO community_reader_space_proof
+                    (consumer, space, proven_published_generation, proven_membership_digest)
+                 VALUES (?1, ?2, ?3, ?4)",
+                libsql::params![
+                    consumer,
+                    space.clone(),
+                    *published_generation,
+                    membership_digest.clone()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("community parity space proof: {error}"))
+            })?;
         }
+        tx.execute(
+            "INSERT INTO community_reader_watermark
+                (consumer, proven_input_generation, relevant_spaces_digest,
+                 relevant_space_count, source_coverage_delta_count, output_delta_count,
+                 unexplained_drift_count, checked_at, report_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(consumer) DO UPDATE SET
+                proven_input_generation=excluded.proven_input_generation,
+                relevant_spaces_digest=excluded.relevant_spaces_digest,
+                relevant_space_count=excluded.relevant_space_count,
+                source_coverage_delta_count=excluded.source_coverage_delta_count,
+                output_delta_count=excluded.output_delta_count,
+                unexplained_drift_count=excluded.unexplained_drift_count,
+                checked_at=excluded.checked_at,
+                report_json=excluded.report_json",
+            libsql::params![
+                consumer,
+                input_generation,
+                relevant_spaces_digest,
+                i64::try_from(relevant_spaces.len()).unwrap_or(i64::MAX),
+                i64::try_from(source_coverage_delta).unwrap_or(i64::MAX),
+                i64::try_from(output_delta).unwrap_or(i64::MAX),
+                i64::try_from(unexplained_total).unwrap_or(i64::MAX),
+                chrono::Utc::now().timestamp(),
+                report
+            ],
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("community parity global watermark: {error}"))
+        })?;
+        tx.commit().await.map_err(|error| {
+            WenlanError::VectorDb(format!("community parity finalize commit: {error}"))
+        })?;
+        let canonical_mutex_hold = canonical_mutex_started.elapsed();
+        Ok(CommunityReaderParityReceipt {
+            consumer: consumer.to_owned(),
+            ready: unexplained_total == 0,
+            spaces_checked: relevant_spaces.len(),
+            unexplained_drift_count: unexplained_total,
+            explained_structural_delta_count: explained_total,
+            canonical_mutex_hold,
+            reconcile_elapsed: reconcile_started.elapsed(),
+        })
     }
 
     /// Retry one clean space containing a stale route. Space-wide generation,
@@ -48333,6 +48623,65 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) mod community_parity_test_hooks {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Pause {
+            reached: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+            read_connection_autocommit: Arc<AtomicBool>,
+        }
+
+        static AFTER_SNAPSHOT: OnceLock<std::sync::Mutex<HashMap<(String, String), Pause>>> =
+            OnceLock::new();
+
+        pub(crate) fn pause_after_snapshot(
+            consumer: &str,
+            relevant_spaces_digest: &str,
+        ) -> (
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+            Arc<AtomicBool>,
+        ) {
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let read_connection_autocommit = Arc::new(AtomicBool::new(false));
+            AFTER_SNAPSHOT
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(
+                    (consumer.to_owned(), relevant_spaces_digest.to_owned()),
+                    Pause {
+                        reached: Arc::clone(&reached),
+                        resume: Arc::clone(&resume),
+                        read_connection_autocommit: Arc::clone(&read_connection_autocommit),
+                    },
+                );
+            (reached, resume, read_connection_autocommit)
+        }
+
+        pub(crate) async fn after_snapshot(
+            consumer: &str,
+            relevant_spaces_digest: &str,
+            autocommit: bool,
+        ) {
+            let pause = AFTER_SNAPSHOT
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(&(consumer.to_owned(), relevant_spaces_digest.to_owned()));
+            if let Some(pause) = pause {
+                pause
+                    .read_connection_autocommit
+                    .store(autocommit, Ordering::Release);
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+    }
+
     // ── compute_page_delta_summary tests ─────────────────────────────────────
 
     #[test]
@@ -49600,7 +49949,10 @@ pub(crate) mod tests {
             "page_community_route_inputs",
             "community_route_space_inputs",
             "community_reader_cutover",
-            "community_reader_parity",
+            "community_parity_input_state",
+            "community_reader_current_input",
+            "community_reader_watermark",
+            "community_reader_space_proof",
         ] {
             let mut rows = conn
                 .query(
@@ -49649,7 +50001,7 @@ pub(crate) mod tests {
         {
             let conn = db.conn.lock().await;
             conn.execute_batch(
-                "DROP TABLE community_reader_parity;
+                "DROP TABLE community_reader_watermark;
                  DROP TRIGGER m4_page_community_page_invalidate;
                  PRAGMA user_version=96;",
             )
@@ -49663,7 +50015,7 @@ pub(crate) mod tests {
 
         let conn = db.conn.lock().await;
         for (kind, name) in [
-            ("table", "community_reader_parity"),
+            ("table", "community_reader_watermark"),
             ("trigger", "m4_page_community_page_invalidate"),
         ] {
             let mut rows = conn
@@ -49678,6 +50030,89 @@ pub(crate) mod tests {
                 "startup repair must restore missing {kind} {name}"
             );
         }
+    }
+
+    /// Mutation caught: treating a stamped local-only M96 database as current
+    /// leaves per-space receipts trusted and never installs the global
+    /// generation/watermark/proof model.
+    #[tokio::test]
+    async fn migration_96_converges_local_only_parity_shape_and_invalidates_old_proof() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "DROP TABLE community_reader_space_proof;
+                 DROP TABLE community_reader_watermark;
+                 DROP TABLE community_reader_current_input;
+                 DROP TABLE community_parity_input_state;
+                 CREATE TABLE community_reader_parity (
+                     consumer TEXT NOT NULL,
+                     space TEXT NOT NULL,
+                     proven_published_generation INTEGER NOT NULL,
+                     unexplained_drift_count INTEGER NOT NULL,
+                     checked_at INTEGER NOT NULL,
+                     report_json TEXT,
+                     PRIMARY KEY(consumer, space)
+                 );
+                 INSERT INTO community_reader_parity
+                     (consumer, space, proven_published_generation,
+                      unexplained_drift_count, checked_at, report_json)
+                 VALUES ('summary_buckets', 'old-local-space', 9, 0, 1, '{}');
+                 PRAGMA user_version=96;",
+            )
+            .await
+            .unwrap();
+        }
+
+        db.run_migrations(&crate::events::NoopEmitter)
+            .await
+            .expect("startup repair must converge the old local-only M96 shape");
+        let conn = db.conn.lock().await;
+        let mut old_rows = conn
+            .query(
+                "SELECT 1 FROM sqlite_master
+                  WHERE type='table' AND name='community_reader_parity'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            old_rows.next().await.unwrap().is_none(),
+            "the local-only parity table must be retired"
+        );
+        drop(old_rows);
+        for table in [
+            "community_parity_input_state",
+            "community_reader_current_input",
+            "community_reader_watermark",
+            "community_reader_space_proof",
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "normalized startup repair must install {table}"
+            );
+        }
+        let mut proof_rows = conn
+            .query(
+                "SELECT
+                    (SELECT COUNT(*) FROM community_reader_current_input),
+                    (SELECT COUNT(*) FROM community_reader_watermark),
+                    (SELECT COUNT(*) FROM community_reader_space_proof)",
+                (),
+            )
+            .await
+            .unwrap();
+        let proof_counts = proof_rows.next().await.unwrap().unwrap();
+        assert_eq!(proof_counts.get::<i64>(0).unwrap(), 0);
+        assert_eq!(proof_counts.get::<i64>(1).unwrap(), 0);
+        assert_eq!(proof_counts.get::<i64>(2).unwrap(), 0);
     }
 
     #[tokio::test]
@@ -50152,6 +50587,12 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn community_reader_gate_sql_fails_closed_for_unknown_consumers() {
+        assert_eq!(community_reader_durable_gate_sql("bogus_consumer"), "0=1");
+        assert_eq!(community_reader_durable_gate_sql(""), "0=1");
+    }
+
     #[tokio::test]
     async fn community_reader_cutover_fails_closed_when_a_legacy_input_space_lacks_state() {
         const SPACE: &str = "m96-legacy-only-space";
@@ -50435,9 +50876,9 @@ pub(crate) mod tests {
             let mut rows = conn
                 .query(
                     "SELECT unexplained_drift_count
-                       FROM community_reader_parity
-                      WHERE consumer=?1 AND space=?2",
-                    libsql::params![consumer, SPACE],
+                       FROM community_reader_watermark
+                      WHERE consumer=?1",
+                    libsql::params![consumer],
                 )
                 .await
                 .unwrap();
@@ -50451,6 +50892,712 @@ pub(crate) mod tests {
                 "same-coverage membership corruption must fail closed for {consumer}"
             );
         }
+    }
+
+    /// Mutation caught: restoring the old per-space parity loop makes the
+    /// cross-space legacy group look locally identical and silently reports
+    /// zero partition/eligibility delta.
+    #[tokio::test]
+    async fn community_reader_parity_is_a_true_global_differential() {
+        const SPACE_A: &str = "m96-global-parity-a";
+        const SPACE_B: &str = "m96-global-parity-b";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            for (space, community_id) in [
+                (SPACE_A, "m96-global-durable-a"),
+                (SPACE_B, "m96-global-durable-b"),
+            ] {
+                conn.execute(
+                    "INSERT INTO communities
+                        (community_id, space, display_name, algo_version, projection_version,
+                         created_at, updated_at, retired_at)
+                     VALUES (?1, ?2, NULL, ?3, ?4, 1, 1, NULL)",
+                    libsql::params![
+                        community_id,
+                        space,
+                        crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                        crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            for (suffix, space, community_id) in [
+                ("a", SPACE_A, "m96-global-durable-a"),
+                ("b", SPACE_A, "m96-global-durable-a"),
+                ("c", SPACE_B, "m96-global-durable-b"),
+            ] {
+                let entity_id = format!("m96-global-entity-{suffix}");
+                let source_id = format!("m96-global-memory-{suffix}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, community_id, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 7, 1, 1)",
+                    libsql::params![entity_id.clone(), space],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index, last_modified,
+                         chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                     VALUES (?1, ?1, 'memory', ?1, ?1, 0, 1, 'text', ?2,
+                             vector32(?3), ?4, 0, 'hide')",
+                    libsql::params![source_id, space, vector.clone(), entity_id.clone()],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO community_members
+                        (space, node_id, node_kind, community_id,
+                         published_generation, attachment)
+                     VALUES (?1, ?2, 'entity', ?3, 20, 'core')",
+                    libsql::params![space, entity_id, community_id],
+                )
+                .await
+                .unwrap();
+            }
+            for (space, members) in [(SPACE_A, vec!["a", "b"]), (SPACE_B, vec!["c"])] {
+                conn.execute(
+                    "UPDATE space_graph_state
+                        SET graph_generation=20, grouping_generation=20,
+                            published_generation=20, dirty=0
+                      WHERE space=?1",
+                    libsql::params![space],
+                )
+                .await
+                .unwrap();
+                let membership_digest =
+                    community_membership_digest(members.into_iter().map(|suffix| {
+                        (
+                            format!("m96-global-entity-{suffix}"),
+                            format!(
+                                "m96-global-durable-{}",
+                                if space == SPACE_A { "a" } else { "b" }
+                            ),
+                            "core".to_string(),
+                        )
+                    }));
+                conn.execute(
+                    "INSERT INTO community_publication_receipts
+                        (space, published_generation, membership_digest,
+                         algo_version, projection_version, published_at)
+                     VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                    libsql::params![
+                        space,
+                        membership_digest,
+                        crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                        crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let legacy_buckets = db.load_summary_buckets().await.unwrap();
+        assert_eq!(
+            legacy_buckets
+                .iter()
+                .map(|(_, members)| members
+                    .iter()
+                    .map(|member| member.source_id.as_str())
+                    .collect::<BTreeSet<_>>())
+                .collect::<Vec<_>>(),
+            vec![BTreeSet::from([
+                "m96-global-memory-a",
+                "m96-global-memory-b",
+                "m96-global-memory-c",
+            ])],
+            "the actual legacy consumer groups globally across spaces"
+        );
+
+        let bucket_receipt = db
+            .reconcile_community_reader_parity(COMMUNITY_SUMMARY_BUCKETS_CONSUMER)
+            .await
+            .unwrap();
+        assert_eq!(bucket_receipt.unexplained_drift_count, 0);
+        assert!(
+            bucket_receipt.explained_structural_delta_count > 0,
+            "equal global source coverage with a 1-to-2 partition split must be recorded"
+        );
+
+        let eligibility_receipt = db
+            .reconcile_community_reader_parity(COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER)
+            .await
+            .unwrap();
+        assert_eq!(eligibility_receipt.unexplained_drift_count, 0);
+        assert!(
+            eligibility_receipt.explained_structural_delta_count > 0,
+            "legacy 3-member eligibility versus durable 2+1 must be recorded"
+        );
+    }
+
+    async fn assert_reader_gate_falls_back_for_corruption(label: &str, mutation: &str) {
+        const SPACE: &str = "m96-independent-corruption-space";
+        const COMMUNITY_ID: &str = "m96-independent-corruption-community";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(&format!(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES ('{COMMUNITY_ID}', '{SPACE}', NULL,
+                         '{}', '{}', 1, 1, NULL);
+                 INSERT INTO entities
+                    (id, name, entity_type, space, community_id, created_at, updated_at)
+                 VALUES ('m96-independent-corruption-entity', 'entity', 'concept',
+                         '{SPACE}', 7, 1, 1);",
+                crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+            ))
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories
+                    (id, content, source, source_id, title, chunk_index, last_modified,
+                     chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                 VALUES ('m96-independent-corruption-memory', 'body', 'memory',
+                         'm96-independent-corruption-memory', 'title', 0, 1, 'text', ?1,
+                         vector32(?2), 'm96-independent-corruption-entity', 0, 'hide')",
+                libsql::params![SPACE, vector],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, 'm96-independent-corruption-entity', 'entity', ?2, 20, 'core')",
+                libsql::params![SPACE, COMMUNITY_ID],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=20, grouping_generation=20,
+                        published_generation=20, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let digest = community_membership_digest([(
+                "m96-independent-corruption-entity".to_string(),
+                COMMUNITY_ID.to_string(),
+                "core".to_string(),
+            )]);
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    digest,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            assert!(
+                db.reconcile_community_reader_parity(consumer)
+                    .await
+                    .unwrap()
+                    .ready,
+                "precondition: {label} fixture must reconcile"
+            );
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+            let conn = db.conn.lock().await;
+            assert!(
+                MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "precondition: {consumer} proof must be usable before {label}"
+            );
+        }
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(mutation).await.unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "{label} must immediately force {consumer} to legacy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_grouping_generation_mismatch() {
+        assert_reader_gate_falls_back_for_corruption(
+            "grouping-generation mismatch",
+            "UPDATE space_graph_state SET grouping_generation=21
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_receipt_digest_change() {
+        assert_reader_gate_falls_back_for_corruption(
+            "receipt digest change",
+            "UPDATE community_publication_receipts SET membership_digest='corrupt'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_receipt_algorithm_change() {
+        assert_reader_gate_falls_back_for_corruption(
+            "receipt algorithm change",
+            "UPDATE community_publication_receipts SET algo_version='corrupt'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_receipt_projection_change() {
+        assert_reader_gate_falls_back_for_corruption(
+            "receipt projection change",
+            "UPDATE community_publication_receipts SET projection_version='corrupt'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_member_mutation() {
+        assert_reader_gate_falls_back_for_corruption(
+            "member mutation",
+            "UPDATE community_members SET attachment='isolated'
+              WHERE space='m96-independent-corruption-space'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_live_community_retirement() {
+        assert_reader_gate_falls_back_for_corruption(
+            "live community retirement",
+            "UPDATE communities SET retired_at=2
+              WHERE community_id='m96-independent-corruption-community'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn community_reader_gate_rejects_community_space_mutation() {
+        assert_reader_gate_falls_back_for_corruption(
+            "community space mutation",
+            "UPDATE communities SET space='m96-independent-corruption-other'
+              WHERE community_id='m96-independent-corruption-community'",
+        )
+        .await;
+    }
+
+    /// Mutation caught: removing the publication-receipt terms from the
+    /// centralized reader gate leaves a cached proof usable after its receipt
+    /// is deleted.
+    #[tokio::test]
+    async fn community_reader_gate_fails_closed_after_publication_receipt_delete() {
+        const SPACE: &str = "m96-receipt-delete-space";
+        const COMMUNITY_ID: &str = "m96-receipt-delete-community";
+        let (db, _dir) = test_db().await;
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4, 1, 1, NULL)",
+                libsql::params![
+                    COMMUNITY_ID,
+                    SPACE,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+            for suffix in ["a", "b", "c"] {
+                let entity_id = format!("m96-receipt-delete-entity-{suffix}");
+                let source_id = format!("m96-receipt-delete-memory-{suffix}");
+                conn.execute(
+                    "INSERT INTO entities
+                        (id, name, entity_type, space, community_id, created_at, updated_at)
+                     VALUES (?1, ?1, 'concept', ?2, 7, 1, 1)",
+                    libsql::params![entity_id.clone(), SPACE],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, content, source, source_id, title, chunk_index, last_modified,
+                         chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                     VALUES (?1, ?1, 'memory', ?1, ?1, 0, 1, 'text', ?2,
+                             vector32(?3), ?4, 0, 'hide')",
+                    libsql::params![source_id, SPACE, vector.clone(), entity_id.clone()],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO community_members
+                        (space, node_id, node_kind, community_id,
+                         published_generation, attachment)
+                     VALUES (?1, ?2, 'entity', ?3, 20, 'core')",
+                    libsql::params![SPACE, entity_id, COMMUNITY_ID],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=20, grouping_generation=20,
+                        published_generation=20, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let membership_digest =
+                community_membership_digest(["a", "b", "c"].into_iter().map(|suffix| {
+                    (
+                        format!("m96-receipt-delete-entity-{suffix}"),
+                        COMMUNITY_ID.to_string(),
+                        "core".to_string(),
+                    )
+                }));
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    membership_digest,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            assert!(
+                db.reconcile_community_reader_parity(consumer)
+                    .await
+                    .unwrap()
+                    .ready
+            );
+            db.set_community_reader_cutover(consumer, true)
+                .await
+                .unwrap();
+            let conn = db.conn.lock().await;
+            assert!(MemoryDB::community_reader_uses_durable(&conn, consumer).await);
+        }
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM community_publication_receipts WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+        }
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let conn = db.conn.lock().await;
+            assert!(
+                !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                "receipt deletion must immediately force {consumer} to legacy"
+            );
+        }
+
+        let membership_digest =
+            community_membership_digest(["a", "b", "c"].into_iter().map(|suffix| {
+                (
+                    format!("m96-receipt-delete-entity-{suffix}"),
+                    COMMUNITY_ID.to_string(),
+                    "core".to_string(),
+                )
+            }));
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    membership_digest.clone(),
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let corruptions = [
+            (
+                "grouping generation",
+                "UPDATE space_graph_state SET grouping_generation=21 \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                "UPDATE space_graph_state SET grouping_generation=20 \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+            ),
+            (
+                "receipt digest",
+                "UPDATE community_publication_receipts SET membership_digest='corrupt' \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                format!(
+                    "UPDATE community_publication_receipts SET membership_digest='{membership_digest}' \
+                     WHERE space='m96-receipt-delete-space'"
+                ),
+            ),
+            (
+                "receipt algorithm",
+                "UPDATE community_publication_receipts SET algo_version='corrupt' \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                format!(
+                    "UPDATE community_publication_receipts SET algo_version='{}' \
+                     WHERE space='m96-receipt-delete-space'",
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION
+                ),
+            ),
+            (
+                "receipt projection",
+                "UPDATE community_publication_receipts SET projection_version='corrupt' \
+                 WHERE space='m96-receipt-delete-space'"
+                    .to_string(),
+                format!(
+                    "UPDATE community_publication_receipts SET projection_version='{}' \
+                     WHERE space='m96-receipt-delete-space'",
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ),
+            ),
+            (
+                "member mutation",
+                "UPDATE community_members SET attachment='isolated' \
+                 WHERE space='m96-receipt-delete-space' \
+                   AND node_id='m96-receipt-delete-entity-c'"
+                    .to_string(),
+                "UPDATE community_members SET attachment='core' \
+                 WHERE space='m96-receipt-delete-space' \
+                   AND node_id='m96-receipt-delete-entity-c'"
+                    .to_string(),
+            ),
+            (
+                "live community retirement",
+                "UPDATE communities SET retired_at=2 \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+                "UPDATE communities SET retired_at=NULL \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+            ),
+            (
+                "community space mutation",
+                "UPDATE communities SET space='m96-receipt-delete-other' \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+                "UPDATE communities SET space='m96-receipt-delete-space' \
+                 WHERE community_id='m96-receipt-delete-community'"
+                    .to_string(),
+            ),
+        ];
+        for (label, mutate, restore) in corruptions {
+            for consumer in [
+                COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+                COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+            ] {
+                assert!(
+                    db.reconcile_community_reader_parity(consumer)
+                        .await
+                        .unwrap()
+                        .ready,
+                    "baseline proof for {label} must be usable"
+                );
+            }
+            {
+                let conn = db.conn.lock().await;
+                conn.execute_batch(&mutate).await.unwrap();
+            }
+            for consumer in [
+                COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+                COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+            ] {
+                let conn = db.conn.lock().await;
+                assert!(
+                    !MemoryDB::community_reader_uses_durable(&conn, consumer).await,
+                    "{label} must immediately force {consumer} to legacy"
+                );
+            }
+            {
+                let conn = db.conn.lock().await;
+                conn.execute_batch(&restore).await.unwrap();
+            }
+        }
+    }
+
+    /// Mutations caught: taking the parity snapshot through the canonical
+    /// mutex, leaving the read transaction open during Rust computation, or
+    /// publishing proof without a generation-CAS after the sole relevant
+    /// candidate disappears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn community_reader_parity_snapshot_releases_mutex_and_stale_cas_writes_nothing() {
+        use std::sync::atomic::Ordering;
+
+        const SPACE: &str = "m96-parity-snapshot-space";
+        const COMMUNITY_ID: &str = "m96-parity-snapshot-community";
+        const CONSUMER: &str = COMMUNITY_SUMMARY_BUCKETS_CONSUMER;
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let vector = MemoryDB::vec_to_sql(&vec![0.0f32; EMBEDDING_DIM]);
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO communities
+                    (community_id, space, display_name, algo_version, projection_version,
+                     created_at, updated_at, retired_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4, 1, 1, NULL)",
+                libsql::params![
+                    COMMUNITY_ID,
+                    SPACE,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entities
+                    (id, name, entity_type, space, community_id, created_at, updated_at)
+                 VALUES ('m96-parity-snapshot-entity', 'entity', 'concept', ?1, 7, 1, 1)",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories
+                    (id, content, source, source_id, title, chunk_index, last_modified,
+                     chunk_type, space, embedding, entity_id, is_recap, supersede_mode)
+                 VALUES ('m96-parity-snapshot-memory', 'body', 'memory',
+                         'm96-parity-snapshot-memory', 'title', 0, 1, 'text', ?1,
+                         vector32(?2), 'm96-parity-snapshot-entity', 0, 'hide')",
+                libsql::params![SPACE, vector],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, 'm96-parity-snapshot-entity', 'entity', ?2, 20, 'core')",
+                libsql::params![SPACE, COMMUNITY_ID],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "UPDATE space_graph_state
+                    SET graph_generation=20, grouping_generation=20,
+                        published_generation=20, dirty=0
+                  WHERE space=?1",
+                libsql::params![SPACE],
+            )
+            .await
+            .unwrap();
+            let membership_digest = community_membership_digest([(
+                "m96-parity-snapshot-entity".to_string(),
+                COMMUNITY_ID.to_string(),
+                "core".to_string(),
+            )]);
+            conn.execute(
+                "INSERT INTO community_publication_receipts
+                    (space, published_generation, membership_digest,
+                     algo_version, projection_version, published_at)
+                 VALUES (?1, 20, ?2, ?3, ?4, 1)",
+                libsql::params![
+                    SPACE,
+                    membership_digest,
+                    crate::community_grouping::COMMUNITY_ALGO_VERSION,
+                    crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        db.set_community_reader_cutover(CONSUMER, true)
+            .await
+            .unwrap();
+
+        let relevant_spaces_digest = community_relevant_spaces_digest([SPACE.to_string()]);
+        let (reached, resume, read_connection_autocommit) =
+            community_parity_test_hooks::pause_after_snapshot(CONSUMER, &relevant_spaces_digest);
+        let worker_db = Arc::clone(&db);
+        let worker =
+            tokio::spawn(
+                async move { worker_db.reconcile_community_reader_parity(CONSUMER).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("reconciliation must expose a post-snapshot, pre-compute boundary");
+        assert!(
+            db.conn.try_lock().is_ok(),
+            "canonical connection mutex must be free after the read snapshot"
+        );
+        assert!(
+            read_connection_autocommit.load(Ordering::Acquire),
+            "the read-only snapshot connection must be back in autocommit before Rust compute"
+        );
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "DELETE FROM memories WHERE source_id='m96-parity-snapshot-memory'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        resume.notify_one();
+        let receipt = worker.await.unwrap().unwrap();
+        assert!(
+            !receipt.ready,
+            "a stale snapshot whose sole relevant space disappeared must return pending"
+        );
+        let conn = db.conn.lock().await;
+        assert!(
+            !MemoryDB::community_reader_uses_durable(&conn, CONSUMER).await,
+            "stale reconciliation must write no usable global or per-space proof"
+        );
     }
 
     #[tokio::test]

@@ -5621,6 +5621,32 @@ pub(crate) fn effect_guard_receipt(normalized_total_changes: u64) -> RepairDiges
     repair_digest(&bytes)
 }
 
+/// The M4 parity triggers bump `community_parity_input_state.generation` once
+/// per changed row on their watched tables, and `total_changes()` counts those
+/// bookkeeping rows. Guarded writes subtract the measured generation delta so
+/// designed invalidation bumps don't read as an effect escape; a real escaped
+/// content write still leaves its own row count behind.
+pub(crate) async fn parity_input_generation_on_connection(
+    connection: &libsql::Connection,
+) -> Result<u64, WenlanError> {
+    let mut rows = connection
+        .query(
+            "SELECT generation FROM community_parity_input_state WHERE singleton=1",
+            (),
+        )
+        .await
+        .map_err(database_error)?;
+    let generation = rows
+        .next()
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| WenlanError::VectorDb("repair parity generation missing".to_string()))?
+        .get::<i64>(0)
+        .map_err(database_error)?;
+    u64::try_from(generation)
+        .map_err(|_| WenlanError::VectorDb("repair parity generation negative".to_string()))
+}
+
 fn validate_selected_finding(request: &PrepareRepairRequest) -> Result<(), WenlanError> {
     let Some(selected_finding) = request.selected_finding() else {
         return Err(WenlanError::Validation(

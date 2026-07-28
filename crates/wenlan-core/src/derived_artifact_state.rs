@@ -6,48 +6,8 @@ mod sweep;
 
 pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     let minimum = crate::refinery::summary::min_bucket_members();
-    let durable_gate = format!(
-        "EXISTS (
-             SELECT 1 FROM community_reader_cutover cutover
-              WHERE cutover.consumer='{consumer}' AND cutover.enabled=1
-         )
-         AND NOT EXISTS (
-             WITH candidates AS (
-                 SELECT candidate.source_id, candidate.space, candidate.entity_id
-                  FROM memories candidate
-                  WHERE candidate.source='memory' AND candidate.chunk_index=0
-                    AND candidate.is_recap=0
-                    AND candidate.supersede_mode<>'archive'
-                    AND candidate.source_id NOT LIKE 'merged_%'
-                    AND candidate.source_id NOT LIKE 'recap_%'
-                    AND candidate.embedding IS NOT NULL
-             ),
-             relevant(space) AS (
-                 SELECT DISTINCT candidate.space
-                   FROM candidates candidate
-                   JOIN entities legacy_entity
-                     ON legacy_entity.id=candidate.entity_id
-                  WHERE legacy_entity.community_id IS NOT NULL
-                 UNION
-                 SELECT DISTINCT durable_member.space
-                   FROM community_members durable_member
-                   JOIN candidates candidate
-                     ON candidate.entity_id=durable_member.node_id
-                    AND candidate.space=durable_member.space
-             )
-             SELECT 1
-               FROM relevant
-               LEFT JOIN space_graph_state state ON state.space=relevant.space
-               LEFT JOIN community_reader_parity parity
-                 ON parity.consumer='{consumer}' AND parity.space=relevant.space
-              WHERE state.space IS NULL
-                 OR state.dirty<>0
-                 OR state.published_generation IS NULL
-                 OR parity.space IS NULL
-                 OR parity.unexplained_drift_count<>0
-                 OR parity.proven_published_generation<>state.published_generation
-         )",
-        consumer = crate::db::COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+    let durable_gate = crate::db::community_reader_durable_gate_sql(
+        crate::db::COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
     );
     let legacy = format!(
         "{alias}.entity_id IN (
