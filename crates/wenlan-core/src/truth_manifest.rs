@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! M5 reader manifest -- the executable enumeration of every registered reader.
 //!
 //! Generated from `docs/plans/2026-07-27-m5-reader-manifest-inventory.md`, which

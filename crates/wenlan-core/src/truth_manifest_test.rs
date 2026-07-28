@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Teeth for the M5 reader manifest.
 //!
 //! The source-side positive control is deliberately **not** here. A test that
