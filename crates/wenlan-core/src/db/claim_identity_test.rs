@@ -355,3 +355,330 @@ async fn the_backfill_checks_coverage_rather_than_assuming_it() {
     let uncovered: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(uncovered, 0, "every page carries a truth row");
 }
+
+// ===== The human-root minter (artifact 3 §5, artifact 6 §2a) =====
+
+const BASE_PROSE: &str = "Kestrels hunt by hovering.\nThey favour rough grassland.";
+
+/// Seed a page that already carries prose, and return its exact base digest.
+/// `insert_page` writes the matching immutable `page_history` row, so the base
+/// the minter checks against is the real one rather than a hand-built fixture.
+async fn page_with_prose(db: &MemoryDB, id: &str) -> String {
+    db.insert_page(
+        id,
+        id,
+        None,
+        BASE_PROSE,
+        None,
+        None,
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    crate::provenance::revision_content_digest(BASE_PROSE)
+}
+
+async fn root_kind_of(db: &MemoryDB, root_id: &str) -> String {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT root_kind FROM provenance_roots WHERE root_id = ?1",
+            libsql::params![root_id],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+async fn human_delta_root_count(db: &MemoryDB) -> i64 {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT count(*) FROM provenance_roots WHERE root_kind = 'human_edit_delta'",
+            (),
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+/// The happy path, and the shape artifact 3 §4a's "human-delta destination"
+/// requires: the delta is reachable as a `memory` whose span can be cited, and
+/// its root carries the human kind that §5 demands of an attesting root.
+///
+/// Weakening guarded: minting the root without storing the delta, or storing it
+/// under any other root kind.
+#[tokio::test]
+async fn an_exact_base_save_mints_a_human_root_and_a_span_addressable_memory() {
+    let (db, _temp) = db_with_substrate().await;
+    let digest = page_with_prose(&db, "hp1").await;
+
+    let minted = db
+        .mint_human_edit_delta(
+            "hp1",
+            1,
+            &digest,
+            &format!("{BASE_PROSE}\nThey nest in old crow nests."),
+        )
+        .await
+        .unwrap()
+        .expect("an exact-base save that adds prose mints a delta");
+
+    assert_eq!(
+        minted.delta_text, "They nest in old crow nests.",
+        "the delta is the added prose, not the whole page"
+    );
+    assert_eq!(
+        root_kind_of(&db, &minted.root_id).await,
+        "human_edit_delta",
+        "the root must carry the kind §5 accepts from an attesting root"
+    );
+
+    // Addressable the way an edge addresses a memory: by source_id, which is
+    // what the rebuilt space fence resolves on.
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT content FROM memories WHERE source_id = ?1",
+            libsql::params![minted.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    let stored: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        stored, minted.delta_text,
+        "the delta must be stored verbatim, or its spans address nothing"
+    );
+}
+
+/// D4's stale row: "conflict, nothing written". Not a partial write, not a
+/// warning — nothing.
+///
+/// Weakening guarded: comparing the base loosely (canonically, by version
+/// alone, or not at all), which would attribute another writer's text to the
+/// human as new prose.
+#[tokio::test]
+async fn a_stale_base_mints_nothing() {
+    let (db, _temp) = db_with_substrate().await;
+    page_with_prose(&db, "hp2").await;
+
+    let error = db
+        .mint_human_edit_delta(
+            "hp2",
+            1,
+            &crate::provenance::revision_content_digest("some other text entirely"),
+            &format!("{BASE_PROSE}\nThey nest in old crow nests."),
+        )
+        .await
+        .expect_err("a stale base is a conflict");
+    assert!(
+        format!("{error}").contains("human_delta_base_stale"),
+        "the conflict must name itself: {error}"
+    );
+    assert_eq!(
+        human_delta_root_count(&db).await,
+        0,
+        "a stale base writes nothing at all"
+    );
+}
+
+/// Whitespace tolerance is the specific loosening that must not creep in. A
+/// reflow changes every line boundary, so a canonical comparison here would let
+/// the reflowed text be attributed to the human.
+#[tokio::test]
+async fn a_whitespace_only_difference_is_still_a_stale_base() {
+    let (db, _temp) = db_with_substrate().await;
+    page_with_prose(&db, "hp3").await;
+
+    // Word spacing, which canonicalization collapses. A blank-line change would
+    // NOT work here: canonicalization preserves blank lines, so the precondition
+    // below would be false and the test would prove nothing.
+    let reflowed = BASE_PROSE.replace(' ', "  ");
+    assert_eq!(
+        crate::provenance::canonical_content_digest(&reflowed),
+        crate::provenance::canonical_content_digest(BASE_PROSE),
+        "precondition: canonical digests DO converge here, which is why the \
+         exact digest has to be the one that binds"
+    );
+
+    let error = db
+        .mint_human_edit_delta(
+            "hp3",
+            1,
+            &crate::provenance::revision_content_digest(&reflowed),
+            &format!("{BASE_PROSE}\nAdded."),
+        )
+        .await
+        .expect_err("an inexact base is stale even when it canonicalizes the same");
+    assert!(
+        format!("{error}").contains("human_delta_base_stale"),
+        "{error}"
+    );
+}
+
+/// A base version that never existed cannot be verified, so it cannot mint.
+#[tokio::test]
+async fn an_unknown_base_version_mints_nothing() {
+    let (db, _temp) = db_with_substrate().await;
+    let digest = page_with_prose(&db, "hp4").await;
+
+    let error = db
+        .mint_human_edit_delta("hp4", 99, &digest, "anything")
+        .await
+        .expect_err("there is no version 99 to have been written against");
+    assert!(
+        format!("{error}").contains("human_delta_base_unknown"),
+        "{error}"
+    );
+    assert_eq!(human_delta_root_count(&db).await, 0);
+}
+
+/// A save that adds no prose has no evidence to ground. That is an ordinary
+/// edit, not a conflict — refusing it would make deleting a sentence fail.
+#[tokio::test]
+async fn a_save_that_adds_no_prose_mints_no_delta() {
+    let (db, _temp) = db_with_substrate().await;
+    let digest = page_with_prose(&db, "hp5").await;
+
+    let minted = db
+        .mint_human_edit_delta("hp5", 1, &digest, "Kestrels hunt by hovering.")
+        .await
+        .unwrap();
+    assert!(minted.is_none(), "a deletion mints nothing");
+    assert_eq!(human_delta_root_count(&db).await, 0);
+}
+
+/// The same prose saved twice is one piece of evidence, not two. Roots are
+/// content-addressed and the memory ids derive from the root, so a retry
+/// converges instead of duplicating the delta.
+///
+/// Weakening guarded: a random root or memory id, which would let one sentence
+/// be counted repeatedly.
+#[tokio::test]
+async fn the_same_delta_twice_converges_on_one_root_and_one_memory() {
+    let (db, _temp) = db_with_substrate().await;
+    let digest = page_with_prose(&db, "hp6").await;
+    let saved = format!("{BASE_PROSE}\nThey nest in old crow nests.");
+
+    let first = db
+        .mint_human_edit_delta("hp6", 1, &digest, &saved)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = db
+        .mint_human_edit_delta("hp6", 1, &digest, &saved)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.root_id, second.root_id, "one root for one text");
+    assert_eq!(first.memory_source_id, second.memory_source_id);
+    assert_eq!(human_delta_root_count(&db).await, 1);
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT count(*) FROM memories WHERE source_id = ?1",
+            libsql::params![first.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    let copies: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(copies, 1, "one memory for one delta");
+}
+
+/// Artifact 6 §2a: a human can never corroborate themselves. Two unrelated
+/// deltas, on two different pages, must land in ONE independence group — one
+/// person is one source, whatever they write and wherever they write it.
+///
+/// Weakening guarded: giving each delta its own group (per-save, per-page, or a
+/// fresh uuid), which would let a user manufacture independent support for a
+/// claim by restating it.
+#[tokio::test]
+async fn every_human_delta_shares_one_independence_group() {
+    let (db, _temp) = db_with_substrate().await;
+    let d1 = page_with_prose(&db, "hp7").await;
+    let d2 = page_with_prose(&db, "hp8").await;
+
+    let a = db
+        .mint_human_edit_delta(
+            "hp7",
+            1,
+            &d1,
+            &format!("{BASE_PROSE}\nThey nest in old crow nests."),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let b = db
+        .mint_human_edit_delta(
+            "hp8",
+            1,
+            &d2,
+            &format!("{BASE_PROSE}\nRainfall in March determines the vole population."),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(a.root_id, b.root_id, "precondition: two distinct roots");
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT count(DISTINCT independence_group_id) FROM provenance_roots
+              WHERE root_kind = 'human_edit_delta'",
+            (),
+        )
+        .await
+        .unwrap();
+    let groups: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        groups, 1,
+        "one human is one source; distinct groups would inflate independent support"
+    );
+}
+
+/// The delta memory must inherit the page's space. The rebuilt space fence
+/// compares a support edge's claim-side space against its memory-side space, so
+/// a delta filed anywhere else is unciteable — and unciteable in the worst way,
+/// refused at edge-write time rather than here.
+#[tokio::test]
+async fn the_delta_memory_takes_the_page_space_so_the_fence_admits_it() {
+    let (db, _temp) = db_with_substrate().await;
+    db.insert_page(
+        "hp9",
+        "hp9",
+        None,
+        BASE_PROSE,
+        None,
+        Some("birds"),
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+
+    let minted = db
+        .mint_human_edit_delta(
+            "hp9",
+            1,
+            &crate::provenance::revision_content_digest(BASE_PROSE),
+            &format!("{BASE_PROSE}\nThey nest in old crow nests."),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT (SELECT space FROM pages WHERE id='hp9')
+                  = (SELECT space FROM memories WHERE source_id = ?1)",
+            libsql::params![minted.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    let same: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(same, 1, "delta memory space must equal the page space");
+}
