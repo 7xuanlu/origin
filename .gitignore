@@ -48,6 +48,13 @@ crates/*/.fastembed_cache
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
+# Skills are tracked selectively: verification skills ship with the repo,
+# personal/local skills stay local.
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/prove/
+!.claude/skills/run-wenlan/
+!.claude/skills/verify/
 .mcp.json
 
 # Coverage reports
