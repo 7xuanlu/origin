@@ -83,6 +83,9 @@ pub async fn handle_read_brief(
         }));
     };
 
+    let legacy_context_limit = request
+        .legacy_context_limit
+        .unwrap_or(RELATED_CONTEXT_LIMIT);
     let recall_db = Arc::clone(&db);
     let recall_space = space.clone();
     let related_context = related_context_if_requested(request.topic.as_deref(), move |query| {
@@ -91,7 +94,7 @@ pub async fn handle_read_brief(
             recall_db
                 .search_memory(
                     &query,
-                    RELATED_CONTEXT_LIMIT,
+                    legacy_context_limit,
                     None,
                     &scope,
                     None,
@@ -119,14 +122,16 @@ pub async fn handle_update_brief(
     State(state): State<SharedState>,
     Json(request): Json<BriefUpdateRequest>,
 ) -> Result<Json<BriefUpdateReceipt>, ServerError> {
-    let (db, status_root) = {
+    let (db, status_root, projection_lock) = {
         let state = state.read().await;
         (
             state.db.clone().ok_or(ServerError::DbNotInitialized)?,
             state.brief_status_root.clone(),
+            Arc::clone(&state.brief_projection_lock),
         )
     };
     let mut receipt = db.apply_brief_update(&request).await?;
+    let _projection_guard = projection_lock.lock().await;
 
     match (
         status_root,

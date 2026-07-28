@@ -62,6 +62,10 @@ pub struct BriefReadRequest {
     pub topic: Option<String>,
     #[serde(default, alias = "domain")]
     pub space: Option<String>,
+    // Internal compatibility marker: never serialized on the Brief wire.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub legacy_context_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

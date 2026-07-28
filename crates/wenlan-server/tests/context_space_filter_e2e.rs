@@ -126,6 +126,40 @@ async fn context_with_topic_keeps_brief_and_adds_only_same_space_results() {
 }
 
 #[tokio::test]
+async fn context_with_topic_preserves_the_legacy_result_limit() {
+    let (app, _temp, db) = common::test_app().await;
+    db.apply_brief_update(&add_request("work", "create-limit", "keep the brief"))
+        .await
+        .unwrap();
+    for index in 0..3 {
+        db.upsert_documents(vec![RawDocument {
+            source: "memory".into(),
+            source_id: format!("limit-result-{index}"),
+            title: format!("limit result {index}"),
+            content: format!("legacy limit marker shared-query result {index}"),
+            last_modified: index + 1,
+            confirmed: Some(true),
+            space: Some("work".into()),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+    }
+
+    let response = call_context(
+        app,
+        serde_json::json!({
+            "space": "work",
+            "query": "legacy limit marker shared-query",
+            "max_chunks": 0
+        }),
+    )
+    .await;
+
+    assert!(response.knowledge.relevant_memories.is_empty());
+}
+
+#[tokio::test]
 async fn context_without_a_resolved_space_returns_a_legacy_explanation_without_writing() {
     let (app, _temp, db) = common::test_app().await;
 

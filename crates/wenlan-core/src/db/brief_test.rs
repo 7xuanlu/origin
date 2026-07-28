@@ -14,6 +14,7 @@ async fn brief_migration_creates_fk_backed_tables() {
         conn.execute_batch(
             "DROP TABLE brief_items;
              DROP TABLE briefs;
+             DROP TABLE brief_legacy_imports;
              PRAGMA user_version=99;",
         )
         .await
@@ -22,7 +23,7 @@ async fn brief_migration_creates_fk_backed_tables() {
     db.migrate_100_brief(99).await.unwrap();
     let conn = db.conn.lock().await;
 
-    for table in ["briefs", "brief_items"] {
+    for table in ["briefs", "brief_items", "brief_legacy_imports"] {
         let mut rows = conn
             .query(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
@@ -310,6 +311,67 @@ async fn brief_stale_item_conflict_does_not_block_unrelated_mutation() {
     assert_eq!(brief.active[0].text, "newer first");
     assert_eq!(brief.backlog.len(), 1);
     assert_eq!(brief.backlog[0].id, second);
+}
+
+#[tokio::test]
+async fn brief_same_request_can_apply_multiple_deltas_from_one_item_snapshot() {
+    let (db, _temp) = test_db().await;
+    let created = db
+        .apply_brief_update(&update_request(
+            "snapshot",
+            "create-item",
+            vec![add("draft release", BriefItemState::Active)],
+        ))
+        .await
+        .unwrap();
+    let item_id = created.applied[0].item_id.clone().unwrap();
+
+    let receipt = db
+        .apply_brief_update(&update_request(
+            "snapshot",
+            "compose-deltas",
+            vec![
+                BriefMutation::Edit {
+                    item_id: item_id.clone(),
+                    expected_version: 1,
+                    text: "ship release".into(),
+                },
+                BriefMutation::Move {
+                    item_id: item_id.clone(),
+                    expected_version: 1,
+                    state: BriefItemState::Backlog,
+                },
+                BriefMutation::SetGate {
+                    item_id: item_id.clone(),
+                    expected_version: 1,
+                    gate: Some("CI passes".into()),
+                },
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.applied.len(), 3);
+    assert!(receipt.conflicts.is_empty());
+    assert_eq!(
+        receipt
+            .applied
+            .iter()
+            .map(|entry| entry.version)
+            .collect::<Vec<_>>(),
+        vec![Some(2), Some(3), Some(4)]
+    );
+
+    let brief = db
+        .get_brief_by_space_name("snapshot")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(brief.active.is_empty());
+    assert_eq!(brief.backlog[0].id, item_id);
+    assert_eq!(brief.backlog[0].text, "ship release");
+    assert_eq!(brief.backlog[0].gate.as_deref(), Some("CI passes"));
+    assert_eq!(brief.backlog[0].version, 4);
 }
 
 #[tokio::test]

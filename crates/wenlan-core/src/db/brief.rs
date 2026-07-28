@@ -2,6 +2,7 @@
 
 use super::MemoryDB;
 use crate::error::WenlanError;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyBriefItem {
@@ -33,6 +34,12 @@ CREATE TABLE IF NOT EXISTS brief_items (
 
 CREATE INDEX IF NOT EXISTS idx_brief_items_space_state
     ON brief_items(space_id, state, added_at, id);
+
+CREATE TABLE IF NOT EXISTS brief_legacy_imports (
+    source_key TEXT PRIMARY KEY,
+    space_name TEXT NOT NULL,
+    imported_at INTEGER NOT NULL
+);
 ";
 
 impl MemoryDB {
@@ -180,6 +187,22 @@ fn item_conflict(
             wenlan_types::BriefConflictReason::ItemNotFound
         },
         current_version,
+    }
+}
+
+fn item_matches_snapshot(
+    snapshot: &HashMap<String, Option<i64>>,
+    mutation_index: usize,
+    item_id: &str,
+    expected_version: i64,
+    conflicts: &mut Vec<wenlan_types::BriefMutationConflict>,
+) -> bool {
+    let current_version = snapshot.get(item_id).copied().flatten();
+    if current_version == Some(expected_version) {
+        true
+    } else {
+        conflicts.push(item_conflict(mutation_index, item_id, current_version));
+        false
     }
 }
 
@@ -413,6 +436,20 @@ impl MemoryDB {
             }
         }
 
+        // All deltas for one item compare against the same pre-request version.
+        // The immediate transaction excludes concurrent writers; later deltas in this
+        // request may therefore build on earlier ones without self-conflicting.
+        let mut item_snapshot_versions = HashMap::new();
+        for mutation in &request.mutations {
+            let Some(item_id) = mutation.item_id() else {
+                continue;
+            };
+            if !item_snapshot_versions.contains_key(item_id) {
+                let version = current_item_version(&tx, &space_id, item_id).await?;
+                item_snapshot_versions.insert(item_id.to_string(), version);
+            }
+        }
+
         for (mutation_index, mutation) in request.mutations.iter().enumerate() {
             match mutation {
                 wenlan_types::BriefMutation::Add {
@@ -455,18 +492,21 @@ impl MemoryDB {
                     expected_version,
                     text,
                 } => {
+                    if !item_matches_snapshot(
+                        &item_snapshot_versions,
+                        mutation_index,
+                        item_id,
+                        *expected_version,
+                        &mut conflicts,
+                    ) {
+                        continue;
+                    }
                     let updated = tx
                         .execute(
                             "UPDATE brief_items
                                 SET text=?1, version=version+1, updated_at=?2
-                              WHERE space_id=?3 AND id=?4 AND version=?5",
-                            libsql::params![
-                                text.trim(),
-                                now,
-                                space_id.as_str(),
-                                item_id.as_str(),
-                                *expected_version
-                            ],
+                              WHERE space_id=?3 AND id=?4",
+                            libsql::params![text.trim(), now, space_id.as_str(), item_id.as_str()],
                         )
                         .await
                         .map_err(|error| {
@@ -477,7 +517,7 @@ impl MemoryDB {
                             mutation_index: Some(mutation_index),
                             kind: mutation.kind(),
                             item_id: Some(item_id.clone()),
-                            version: Some(expected_version + 1),
+                            version: current_item_version(&tx, &space_id, item_id).await?,
                         });
                         changed = true;
                     } else {
@@ -493,17 +533,25 @@ impl MemoryDB {
                     expected_version,
                     state,
                 } => {
+                    if !item_matches_snapshot(
+                        &item_snapshot_versions,
+                        mutation_index,
+                        item_id,
+                        *expected_version,
+                        &mut conflicts,
+                    ) {
+                        continue;
+                    }
                     let updated = tx
                         .execute(
                             "UPDATE brief_items
                                 SET state=?1, version=version+1, updated_at=?2
-                              WHERE space_id=?3 AND id=?4 AND version=?5",
+                              WHERE space_id=?3 AND id=?4",
                             libsql::params![
                                 state.as_str(),
                                 now,
                                 space_id.as_str(),
-                                item_id.as_str(),
-                                *expected_version
+                                item_id.as_str()
                             ],
                         )
                         .await
@@ -515,7 +563,7 @@ impl MemoryDB {
                             mutation_index: Some(mutation_index),
                             kind: mutation.kind(),
                             item_id: Some(item_id.clone()),
-                            version: Some(expected_version + 1),
+                            version: current_item_version(&tx, &space_id, item_id).await?,
                         });
                         changed = true;
                     } else {
@@ -531,6 +579,15 @@ impl MemoryDB {
                     expected_version,
                     gate,
                 } => {
+                    if !item_matches_snapshot(
+                        &item_snapshot_versions,
+                        mutation_index,
+                        item_id,
+                        *expected_version,
+                        &mut conflicts,
+                    ) {
+                        continue;
+                    }
                     let gate = gate
                         .as_deref()
                         .map(str::trim)
@@ -539,14 +596,8 @@ impl MemoryDB {
                         .execute(
                             "UPDATE brief_items
                                 SET gate=?1, version=version+1, updated_at=?2
-                              WHERE space_id=?3 AND id=?4 AND version=?5",
-                            libsql::params![
-                                gate,
-                                now,
-                                space_id.as_str(),
-                                item_id.as_str(),
-                                *expected_version
-                            ],
+                              WHERE space_id=?3 AND id=?4",
+                            libsql::params![gate, now, space_id.as_str(), item_id.as_str()],
                         )
                         .await
                         .map_err(|error| {
@@ -557,7 +608,7 @@ impl MemoryDB {
                             mutation_index: Some(mutation_index),
                             kind: mutation.kind(),
                             item_id: Some(item_id.clone()),
-                            version: Some(expected_version + 1),
+                            version: current_item_version(&tx, &space_id, item_id).await?,
                         });
                         changed = true;
                     } else {
@@ -572,11 +623,20 @@ impl MemoryDB {
                     item_id,
                     expected_version,
                 } => {
+                    if !item_matches_snapshot(
+                        &item_snapshot_versions,
+                        mutation_index,
+                        item_id,
+                        *expected_version,
+                        &mut conflicts,
+                    ) {
+                        continue;
+                    }
                     let deleted = tx
                         .execute(
                             "DELETE FROM brief_items
-                              WHERE space_id=?1 AND id=?2 AND version=?3",
-                            libsql::params![space_id.as_str(), item_id.as_str(), *expected_version],
+                              WHERE space_id=?1 AND id=?2",
+                            libsql::params![space_id.as_str(), item_id.as_str()],
                         )
                         .await
                         .map_err(|error| {
@@ -669,12 +729,19 @@ impl MemoryDB {
 impl MemoryDB {
     pub async fn import_legacy_brief(
         &self,
+        source_key: &str,
         space_name: &str,
         last_session_summary: &str,
         last_handoff_at: Option<i64>,
         items: &[LegacyBriefItem],
     ) -> Result<bool, WenlanError> {
+        let source_key = source_key.trim();
         let space_name = space_name.trim();
+        if source_key.is_empty() {
+            return Err(WenlanError::Validation(
+                "legacy Brief import requires a non-empty source key".into(),
+            ));
+        }
         if space_name.is_empty() {
             return Err(WenlanError::Validation(
                 "legacy Brief import requires a non-empty space".into(),
@@ -695,6 +762,30 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("legacy Brief import begin: {error}"))
             })?;
         let now = chrono::Utc::now().timestamp();
+
+        let already_imported = {
+            let mut rows = tx
+                .query(
+                    "SELECT 1 FROM brief_legacy_imports WHERE source_key=?1",
+                    libsql::params![source_key],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("legacy Brief marker lookup: {error}"))
+                })?;
+            rows.next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("legacy Brief marker row: {error}"))
+                })?
+                .is_some()
+        };
+        if already_imported {
+            tx.commit().await.map_err(|error| {
+                WenlanError::VectorDb(format!("legacy Brief marker skip commit: {error}"))
+            })?;
+            return Ok(false);
+        }
 
         let space_id = {
             let existing = {
@@ -754,6 +845,14 @@ impl MemoryDB {
                 .is_some()
         };
         if brief_exists {
+            tx.execute(
+                "INSERT INTO brief_legacy_imports (source_key, space_name, imported_at) VALUES (?1, ?2, ?3)",
+                libsql::params![source_key, space_name, now],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("legacy Brief marker insert: {error}"))
+            })?;
             tx.commit().await.map_err(|error| {
                 WenlanError::VectorDb(format!("legacy Brief skip commit: {error}"))
             })?;
@@ -798,6 +897,15 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("legacy Brief item insert: {error}")))?;
         }
+
+        tx.execute(
+            "INSERT INTO brief_legacy_imports (source_key, space_name, imported_at) VALUES (?1, ?2, ?3)",
+            libsql::params![source_key, space_name, now],
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("legacy Brief marker insert: {error}"))
+        })?;
 
         tx.commit()
             .await

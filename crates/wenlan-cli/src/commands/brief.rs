@@ -67,6 +67,7 @@ pub async fn run(
                 .brief(&BriefReadRequest {
                     topic: args.topic,
                     space: None,
+                    legacy_context_limit: None,
                 })
                 .await?;
             if !quiet {

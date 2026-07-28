@@ -8,7 +8,7 @@ use crate::reflection_debounce::ReflectionDebouncer;
 use crate::scheduler::WriteSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use wenlan_core::access_tracker::AccessTracker;
 use wenlan_core::db::MemoryDB;
 use wenlan_core::lint::observation::{LintRunObserver, NoopLintRunObserver};
@@ -79,6 +79,9 @@ pub struct ServerState {
     /// One-way, human-readable projection of the daemon-owned Space Brief.
     /// `None` disables projection without affecting the authoritative DB state.
     pub brief_status_root: Option<PathBuf>,
+    // Serializes the read-and-replace receipt projection so a stale handler
+    // cannot overwrite a newer committed Brief projection.
+    pub brief_projection_lock: Arc<Mutex<()>>,
     /// On-device LLM provider (Qwen via llama-cpp).
     pub llm: Option<Arc<dyn LlmProvider>>,
     /// Registry id of the currently-loaded on-device model (e.g. "qwen3-4b").
@@ -155,6 +158,7 @@ impl Default for ServerState {
             shutdown: ShutdownHandle::default(),
             db: None,
             brief_status_root: None,
+            brief_projection_lock: Arc::new(Mutex::new(())),
             llm: None,
             loaded_on_device_model: None,
             startup_model_load_reserved: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -1143,6 +1143,7 @@ impl WenlanMcpServer {
         let request = wenlan_types::BriefReadRequest {
             topic: params.topic,
             space: effective_space(&params.space),
+            legacy_context_limit: None,
         };
         let response: wenlan_types::BriefReadResponse =
             try_call!(self.client.post("/api/brief", &request), "brief load");
@@ -5883,6 +5884,16 @@ mod tests {
             "verify_lint_repair",
             "write_page",
         ]
+    }
+
+    #[test]
+    fn legacy_context_is_registered_but_not_visible() {
+        let raw = WenlanMcpServer::tool_router().list_all();
+        assert!(raw.iter().any(|tool| tool.name == "context"));
+        assert!(make_server(TransportMode::Stdio, "agent", None)
+            .visible_tools()
+            .iter()
+            .all(|tool| tool.name != "context"));
     }
 
     #[test]

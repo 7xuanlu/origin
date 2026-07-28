@@ -212,12 +212,17 @@ def validate_session_brief_flow(
     else:
         required = [
             "Read the Brief before composing deltas",
-            "This read is mandatory before any Brief delta is authored.",
+            "This read is mandatory before any Brief delta is authored for a registered Space.",
             "brief update --file",
             "Never fuzzy-match",
             "Never auto-demote",
             "one-way human receipt",
             "Never read, edit, or overwrite that receipt as authority.",
+            "cwd-repo-new",
+            "For `cwd-repo-new`, prove the Space is absent with `spaces show` before composing deltas.",
+            "Outside a Git repository, do not derive a new Space from the directory basename.",
+            "Apply the Brief update before Space-scoped captures when this fallback is new.",
+            "Every delta for one existing item uses the same version from the pre-handoff Brief snapshot.",
         ]
         retired_handoff = [
             "status_json=",

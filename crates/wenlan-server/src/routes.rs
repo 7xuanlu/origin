@@ -303,6 +303,7 @@ pub async fn handle_context(
     let request = wenlan_types::BriefReadRequest {
         topic,
         space: req.space,
+        legacy_context_limit: Some(req.max_chunks),
     };
     let Json(brief_response) = crate::brief_routes::handle_read_brief(
         State(state),
