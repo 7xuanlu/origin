@@ -105,16 +105,24 @@ async fn assert_response_has_no_sentinel(response: Response<Body>, label: &str) 
     );
 }
 
-/// The minimum the plan asks for: a 404 on a page id that was never seeded.
-/// Doesn't name the real page, but pins the generic not-found shape clean.
+/// The minimum the plan asks for: a 404 on a page id nothing was stored under.
+///
+/// The sentinel page is seeded first and left live, so `SENTINEL_TITLE` and
+/// `SENTINEL_PROSE` genuinely exist in this process and the assertion has
+/// something to find. Without that the test could not fail no matter what the
+/// 404 arm echoed. The bogus id is the real one with a suffix, so a prefix or
+/// `LIKE`-shaped lookup that resolved the wrong row would surface here too.
 #[tokio::test]
 async fn a_404_on_a_nonexistent_page_id_carries_no_sentinel() {
     let (state, _db, _tmp) = db_state().await;
+    let seeded = seed_sentinel_page(&state).await;
+    let missing = format!("{seeded}-zzq-does-not-exist");
+
     let response = send(
         &state,
         Request::builder()
             .method("GET")
-            .uri("/api/pages/zzq-does-not-exist")
+            .uri(format!("/api/pages/{missing}"))
             .body(Body::empty())
             .unwrap(),
     )
@@ -123,22 +131,30 @@ async fn a_404_on_a_nonexistent_page_id_carries_no_sentinel() {
     assert_response_has_no_sentinel(response, "GET /api/pages/{bogus}").await;
 }
 
-/// The other minimum the plan asks for: a malformed-JSON body on a page route
-/// that names the real, still-live sentinel page by id. Axum's own JSON
-/// rejection runs before `handle_export_page` ever touches the DB, so this
-/// mainly pins that the rejection formatter doesn't echo anything it shouldn't.
+/// The payload-echo channel named in this module's header ("a serde error
+/// quoting the payload").
+///
+/// Axum's `Json` rejection fires before `handle_export_page` runs, so no
+/// DB-layer regression is reachable through this route -- the request body
+/// carries the sentinel instead, which is what gives the assertion a way to go
+/// RED. Today `JsonSyntaxError` reports a line and column and nothing else; a
+/// rejection formatter that started quoting the offending input would fail
+/// here.
 #[tokio::test]
-async fn malformed_json_on_a_named_page_route_carries_no_sentinel() {
+async fn a_json_rejection_does_not_echo_the_payload() {
     let (state, _db, _tmp) = db_state().await;
     let id = seed_sentinel_page(&state).await;
 
+    // Valid JSON up to the missing closing brace, so the parse gets far enough
+    // to have the sentinel in hand before it fails.
+    let malformed = format!(r#"{{"vault_path": "{SENTINEL_TITLE}", "note": "{SENTINEL_PROSE}""#);
     let response = send(
         &state,
         Request::builder()
             .method("POST")
             .uri(format!("/api/pages/{id}/export"))
             .header("Content-Type", "application/json")
-            .body(Body::from("{not valid json"))
+            .body(Body::from(malformed))
             .unwrap(),
     )
     .await;

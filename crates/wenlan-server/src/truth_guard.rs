@@ -151,6 +151,17 @@ pub async fn guard(
         {
             tracing::error!("[truth] marker audit write failed for {method_str} {path}: {error}");
         }
+    } else {
+        // Same failure, different cause: no row was written, so the compensating
+        // control for the conceded enumerate-then-fetch walk is not there for
+        // this call. Silence here would be the exact shape the comment above
+        // rules out. Latent -- no known window serves requests before `db` is
+        // set -- which is why the request is still allowed to proceed.
+        tracing::error!(
+            "[truth] no database open; the marker audit row for {method_str} {path} from \
+             {caller} (outcome {}, pages {named_pages:?}) was not written",
+            MarkerOutcome::of(&decision).as_str(),
+        );
     }
 
     match decision {

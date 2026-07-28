@@ -244,3 +244,97 @@ async fn an_unknown_outcome_string_is_refused_by_the_schema() {
         .await;
     assert!(result.is_err(), "the outcome CHECK constraint is missing");
 }
+
+// ---- the cutover setter has no production caller -------------------------
+
+/// Every `.rs` file under every crate's `src/` in this workspace.
+fn workspace_sources() -> Vec<(std::path::PathBuf, String)> {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/");
+    let mut stack: Vec<std::path::PathBuf> = std::fs::read_dir(crates_dir)
+        .expect("read crates/")
+        .flatten()
+        .map(|entry| entry.path().join("src"))
+        .filter(|path| path.is_dir())
+        .collect();
+    assert!(
+        !stack.is_empty(),
+        "found no crate sources under {}",
+        crates_dir.display()
+    );
+
+    let mut out = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let body = std::fs::read_to_string(&path).expect("read source");
+                out.push((path, body));
+            }
+        }
+    }
+    out
+}
+
+/// The structural half of the docstring on `set_truth_cutover_generation`.
+///
+/// Advancing that integer past 0 is what turns
+/// `enforce_projection_directory_invariant` from an inert pass into a mass
+/// delete over the user's Markdown vault, so PR-B ships it with zero production
+/// callers on purpose. The docstring says nothing there should be read as
+/// permission to flip it; a docstring is prose. This is the guarantee.
+///
+/// Scanning source rather than behavior, and scanning every crate rather than
+/// the ones we expect to be clean, mirrors
+/// `truth_contract_test.rs` "inventory teeth 9": the failure worth catching is
+/// the call site added next week, not the ones already known.
+///
+/// Test callers are excused by FILE, not by `#[cfg(test)]` region: every test
+/// module in this workspace lives in a `*_test.rs` pulled in under
+/// `#[cfg(test)] #[path = "..."] mod tests;`, and a scan that instead tried to
+/// recognize test regions inside a source file would have to decide where one
+/// ends. Getting that wrong fails OPEN -- an early `#[cfg(test)]` in a long
+/// file would hide every call site below it, which is the whole point of the
+/// test evaporating silently. So the rule is coarse and fails CLOSED: a call
+/// from an inline `#[cfg(test)] mod tests { ... }` is reported, and the fix is
+/// to move it to the `*_test.rs` file the rest of the crate uses.
+#[test]
+fn the_cutover_setter_has_no_production_caller() {
+    const SETTER: &str = "set_truth_cutover_generation";
+    let declaration = format!("fn {SETTER}");
+
+    let mut callers = Vec::new();
+    for (path, body) in workspace_sources() {
+        let is_test_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("_test.rs"));
+        if is_test_file {
+            continue;
+        }
+        for (offset, line) in body.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // The declaration itself is not a call, and neither is prose.
+            if !line.contains(SETTER) || trimmed.starts_with("//") || trimmed.contains(&declaration)
+            {
+                continue;
+            }
+            callers.push(format!("{}:{}", path.display(), offset + 1));
+        }
+    }
+
+    assert!(
+        callers.is_empty(),
+        "{SETTER} has a caller outside a `*_test.rs` file: {callers:?}. Advancing \
+         the cutover generation makes the projection pass delete every \
+         unsupported page's file out of the user's Markdown vault, so the setter \
+         is a test-only lever in PR-B. PR-C's two-phase fenced ceremony is the \
+         intended way to advance it -- if you are landing that ceremony, change \
+         this test deliberately to name the one allowed call site rather than \
+         deleting it. If this is a test caller, move it into the crate's \
+         `*_test.rs` module, which is where every other one lives."
+    );
+}

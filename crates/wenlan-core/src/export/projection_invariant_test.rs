@@ -180,3 +180,49 @@ async fn a_second_pass_removes_nothing_more() {
     assert_eq!(removed, 0);
     assert_eq!(readable_pages(root.path()), ["p1"]);
 }
+
+/// One page that cannot be removed must not save the others.
+///
+/// `remove_page` refuses a projection target that is not a regular file
+/// (`knowledge.rs`, the `page_projection_target_invalid` arm), so replacing
+/// `p2.md` with a directory of the same name is a portable way to make exactly
+/// one eviction fail. `p3` sorts after `p2`, so if the pass still aborted on the
+/// first error, `p3.md` would survive -- readable by `wenlan pages`, which is
+/// the whole failure this guards.
+#[tokio::test]
+async fn a_page_that_cannot_be_evicted_does_not_shelter_the_next_one() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    // Turn p2's projection target into a directory: same name, not a file.
+    let blocked = root.path().join("p2.md");
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+
+    let error = projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .expect_err("a failed eviction must be reported, not swallowed");
+
+    assert!(
+        !root.path().join("p3.md").exists(),
+        "p3 sorts after the page that failed; aborting the pass there would leave \
+         it readable by `wenlan pages`"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("p2"),
+        "the failure has to name the page still on disk -- got: {message}"
+    );
+    assert!(
+        blocked.is_dir(),
+        "the obstruction itself is left alone -- the pass removes files, not whatever \
+         happens to occupy the name"
+    );
+    assert!(
+        root.path().join("p1.md").is_file(),
+        "the supported page is untouched"
+    );
+}

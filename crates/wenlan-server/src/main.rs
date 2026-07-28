@@ -1539,7 +1539,10 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                         Ok(removed) => tracing::info!(
                             "[truth] projection invariant evicted {removed} unsupported page(s)"
                         ),
-                        Err(e) => tracing::warn!("[truth] projection invariant pass failed: {e}"),
+                        // `error!`, not `warn!`: the pass now runs to completion
+                        // and only returns `Err` when a file it was supposed to
+                        // evict is still on disk and still readable.
+                        Err(e) => tracing::error!("[truth] projection invariant pass failed: {e}"),
                     }
                 }
                 Err(e) => tracing::warn!("[reconcile] list_pages failed: {e}"),

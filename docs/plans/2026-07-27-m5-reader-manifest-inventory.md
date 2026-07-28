@@ -109,27 +109,46 @@ type rather than an intuition.
 
 The scan of section "How `page_bearing` was determined" matched on response
 *field names*, so a route returning any `title`/`content`/`summary` field was
-marked `yes` regardless of where those bytes came from. The thirty-four rows
-below were each traced from handler to the SQL or core function it actually
-reads. Every one reads `memories`, `entities`, `spaces`, `agent_connections`,
-or another non-page table, and none composes a helper that touches `pages`.
-Each bullet cites the data-source line, not the response type.
+marked `yes` regardless of where those bytes came from. Thirty-four rows were
+demoted here on 2026-07-28; pre-merge review then returned two of them to
+page-bearing (see "Demotions reversed" below), leaving **32**. Each remaining
+bullet was traced from handler to the SQL or core function it actually reads,
+and cites the data-source line rather than the response type.
 
-A cross-cutting check backs the memory-table rows: no production code path
-writes page prose into `memories`. A scan of every SQL literal that both names
-a page table and writes `memories` found only test fixtures
-(`lint/semantic_test.rs`, `lint/deep_test.rs`,
-`lint/pages/diagnostic_scale_test.rs`), and a scan for Rust functions
-containing both a page read and a memory write found only `#[cfg(test)]`
-functions in `db.rs` plus `wenlan-server/src/main.rs:1037 run_daemon` (startup
-orchestration, not a route handler). `sources/page_watcher.rs` writes only back
-to `pages`. That scan is name-based, not LSP-resolved, so it is corroboration
-for the per-row traces rather than a substitute for them.
+**RETRACTED 2026-07-28 — the original cross-cutting claim was false.** An
+earlier revision of this section asserted that "no production code path writes
+page prose into `memories`," backed by a name-based SQL scan. Pre-merge review
+disproved it by reading the code: `stage_page_revision_card`
+(`post_write.rs:3090`) builds `RawDocument { title: "Revision: {page.title}",
+content: <full new page body>, pending_revision: true }` and upserts it into
+`memories` (`post_write.rs:3123`, `:3141`). The scan missed it because the
+function names no page table in a SQL literal — it copies prose through a Rust
+struct. **A name-based scan cannot establish provenance, and no future revision
+of this document should reinstate that claim on scan evidence.**
 
-- **`GET /api/activities`.** `list_agent_activity_scoped` (`db.rs:40951`) and
-  `list_agent_activity` (`db.rs:40857`) read `agent_activity`; the only title
-  source is `SELECT DISTINCT title FROM memories` (`db.rs:41049`,
-  `db.rs:40922`).
+What actually holds up the memories-backed demotions is narrower and has to be
+checked per row: the revision card is written with `pending_revision = 1`, and
+the ordinary memory readers filter it out. `list_memories_scoped`
+(`db.rs:28545`) and `get_memories_by_source_ids_scoped` (`db.rs:28834`) both
+carry `AND pending_revision = 0`; the two pending-revision readers require
+`EXISTS (SELECT 1 FROM memories target WHERE target.source_id =
+revision.supersedes …)` (`db.rs:35595`, `db.rs:35454`), which a `page_…` id
+does not satisfy. So a demotion is sound only where the reader carries that
+filter — **the question is the provenance of the bytes, not the name of the
+table.**
+
+`GET /api/chunks/{source_id}` is where that distinction bit: `get_chunks_scoped`
+(`db.rs:27287`) conditions on `source_id` and `source IN ('memory','file')` with
+no `pending_revision` filter, so given a revision-card id it returns the page
+title and full body. It is now page-bearing.
+
+Audit status, stated honestly: 8 of the 34 demotions were re-checked under the
+provenance question and 2 were wrong (`/api/activities`, `/api/chunks/{source_id}`,
+both now promoted). **The remaining 26 were reasoned from the source-table
+question and have not been re-checked under the provenance question.** They are
+not known wrong; they are known under-audited, and that is a follow-up this
+document should keep visible until it is closed.
+
 - **`GET /api/agents`.** `list_agents` (`db.rs:34274`) selects `FROM
   agent_connections`. No join, no page read.
 - **`GET /api/agents/{name}`.** `get_agent` (`db.rs:34252`) selects `FROM
@@ -143,8 +162,6 @@ for the per-row traces rather than a substitute for them.
   `get_recent_memories_for_briefing[_scoped]` (`db.rs:36834`, `db.rs:36873`)
   and `get_briefing_stats[_scoped]` (`db.rs:36722`, `db.rs:36656`) — all `FROM
   memories`.
-- **`GET /api/chunks/{source_id}`.** `get_chunks_scoped` (`db.rs:27287`) selects
-  `FROM memories`.
 - **`GET /api/config`.** `load_config` (`config.rs:180`) is a
   `std::fs::read_to_string` of `config.json` — no DB at all. The
   `skip_title_patterns` field that the field-name scan matched is a list of
@@ -215,6 +232,32 @@ for the per-row traces rather than a substitute for them.
   `pages`, but its only page statement (`db.rs:19428`-`db.rs:19446`) is a
   scope-rename cascade that writes space/workspace/version/last_modified and
   selects nothing back; the response is `get_space(new_name)` (`db.rs:19265`).
+
+#### Demotions reversed (2026-07-28, pre-merge review)
+
+Two rows demoted above were wrong and are now page-bearing. Both were missed
+the same way: the demotion asked which table the handler reads, when the
+question that decides disclosure is where the bytes in that table came from.
+
+- **`GET /api/activities` → `yes`.** `agent_activity.detail` carries page
+  titles verbatim, written at three sites — `post_write.rs:2078`
+  (`write_document_source_page_impl`), `:2163` (`replace_source_page_impl`),
+  and `:2918` (`create_page_impl`) — each as
+  `format!("title={title}, sources={}", …)` into `log_agent_activity`. The
+  column is selected straight back out (`db.rs:40866`, `:40967`), lands in
+  `AgentActivityRow.detail` (`db.rs:40905`, `:41016`), and is returned by
+  `handle_list_activities` (`server/memory_routes.rs:2626`). The original
+  demotion cited "the only title source is `SELECT DISTINCT title FROM
+  memories`" — true of the `memory_titles` field, but it overlooked the
+  `detail` column selected by that same statement.
+- **`GET /api/chunks/{source_id}` → `yes`.** See the retraction above:
+  `get_chunks_scoped` (`db.rs:27287`) has no `pending_revision` filter, so a
+  revision-card id returns the staged page title and full body.
+
+Both were found by reading, not by driving a live daemon. The cheapest
+confirmation at the wire, if wanted: create a page with a sentinel title, then
+`GET /api/activities` and grep the body for it; and capture a
+`revision_card_id` from a gated page write, then `GET /api/chunks/{that_id}`.
 
 #### Corrected evidence on kept rows (2026-07-28)
 
@@ -339,35 +382,35 @@ load-bearing: the shape gate holds even when this one is bypassed.
 
 ## HTTP — all 165 registered `(method, path, handler)` triples
 
-45 page-bearing, 120 not.
+47 page-bearing, 118 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
-| `GET` | `/api/activities` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/agents` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/activities` | main | yes | automatic | `none` | `handle_list_activities` | AgentActivityRow.detail = title={page.title} |
+| `GET` | `/api/agents` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `DELETE` | `/api/agents/{name}` | main | yes | automatic | `none` | `handle_delete_agent` | opaque response type — fail-closed |
-| `GET` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `PUT` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/briefing` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `PUT` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/briefing` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/capture-stats` | main | yes | automatic | `none` | `handle_capture_stats` | opaque response type — fail-closed |
 | `POST` | `/api/chunks/delete-bulk` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/chunks/time-range` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/chunks/{id}/update` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/chunks/{source_id}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/chunks/{source_id}` | main | yes | automatic | `none` | `handle_get_chunks` | MemoryDetail.title/content via revision card |
 | `GET` | `/api/communities` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/communities/members` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/communities/page-assignments` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/communities/proposals` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/communities/proposals/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/communities/proposals/{id}/reject` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `PUT` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `PUT` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/config/routing` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/config/skip-apps` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/config/skip-apps` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/context` | main | yes | automatic | `none` | `handle_context` | ChatContextResponse.context, KnowledgeContext.graph_context, Searc |
 | `GET` | `/api/debug/pipeline` | main | yes | automatic | `none` | `handle_pipeline_status` | opaque response type — fail-closed |
-| `GET` | `/api/decisions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/decisions` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/decisions/domains` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/distill` | main | yes | automatic | `none` | `handle_distill` | opaque response type — fail-closed |
 | `POST` | `/api/distill/{page_id}` | main | yes | automatic | `none` | `handle_redistill` | opaque response type — fail-closed |
@@ -376,11 +419,11 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `DELETE` | `/api/documents/{source}/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/health` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/health` | repair | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/home-stats` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/home-stats` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/import/chat-export` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/import/memories` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/import/state` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/indexed-files` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/indexed-files` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/ingest/memory` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/ingest/text` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/ingest/webpage` | main | no | not_applicable | `none` | — | no prose fields |
@@ -390,7 +433,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/lint` | main + repair | yes | automatic | `none` | `handle_lint` | LintAgentRecord.excerpt, LintAgentRecord.source_excerpt, LintCheck |
 | `POST` | `/api/lint` | main + repair | yes | automatic | `none` | `handle_lint_submission` | LintAgentRecord.excerpt, LintAgentRecord.source_excerpt, LintCheck |
 | `POST` | `/api/llm/test` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/by-ids` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/by-ids` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/memory/confirm/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/contradiction/{source_id}/dismiss` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/delete/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
@@ -403,35 +446,35 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `DELETE` | `/api/memory/entities/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/memory/entity-suggestions` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/link-entity` | main | yes | automatic | `none` | `handle_link_entity` | opaque response type — fail-closed |
-| `POST` | `/api/memory/list` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/memory/nurture` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `POST` | `/api/memory/list` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/memory/nurture` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/memory/observations` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/observations/{id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/observations/{id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/observations/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/pending-revision/{source_id}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/memory/pending-revisions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/memory/pinned` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/memory/recent` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/pending-revision/{source_id}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/memory/pending-revisions` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/memory/pinned` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/memory/recent` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/memory/reclassify/{source_id}` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/rejections` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/rejections` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/memory/relations` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/revision/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/revision/{id}/dismiss` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/search` | main | yes | automatic | `none` | `handle_search_memory` | SearchResult.content, SearchResult.content_hash, SearchResult.last |
 | `GET` | `/api/memory/stats` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/store` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/unconfirmed` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/unconfirmed` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/memory/{id}/correct` | main | yes | automatic | `none` | `handle_correct_memory` | opaque response type — fail-closed |
-| `GET` | `/api/memory/{id}/detail` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/{id}/detail` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/memory/{id}/pin` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/{id}/revisions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/{id}/revisions` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `PUT` | `/api/memory/{id}/stability` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/{id}/unpin` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/{id}/update` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/{id}/update-page` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/{id}/versions` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/memory/{source_id}/enrichment-status` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/memory/{id}/versions` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/memory/{source_id}/enrichment-status` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/on-device-model` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/on-device-model/download` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/onboarding/milestones` | main | no | not_applicable | `none` | — | no prose fields |
@@ -465,8 +508,8 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/ping` | main | yes | automatic | `none` | `handle_ping` | opaque response type — fail-closed |
 | `GET` | `/api/profile` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/profile` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/profile/narrative` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `POST` | `/api/profile/narrative/regenerate` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/profile/narrative` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `POST` | `/api/profile/narrative/regenerate` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/refinery/queue` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/refinery/queue/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/refinery/queue/{id}/reject` | main | no | not_applicable | `none` | — | no prose fields |
@@ -481,23 +524,23 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `PUT` | `/api/setup/anthropic-key` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/setup/status` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/shutdown` | main | yes | automatic | `none` | `handle_shutdown` | opaque response type — fail-closed |
-| `GET` | `/api/snapshots` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/snapshots/{id}/captures` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `GET` | `/api/snapshots/{id}/captures-with-content` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/snapshots` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/snapshots/{id}/captures` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/snapshots/{id}/captures-with-content` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/snapshots/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/sources` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/sources` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/sources/{id}` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/sources/{id}/sync` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/spaces` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `POST` | `/api/spaces` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/spaces` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `POST` | `/api/spaces` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `DELETE` | `/api/spaces/default` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/spaces/default` | main | no | not_applicable | `none` | — | DEMOTED, see below |
-| `PUT` | `/api/spaces/default` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/api/spaces/default` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `PUT` | `/api/spaces/default` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/spaces/reorder` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/spaces/{from}/move-to/{to}` | main | yes | automatic | `none` | `handle_move_space` | opaque response type — fail-closed |
 | `DELETE` | `/api/spaces/{name}` | main | yes | automatic | `none` | `handle_delete_space` | opaque response type — fail-closed |
-| `PUT` | `/api/spaces/{name}` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `PUT` | `/api/spaces/{name}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `POST` | `/api/spaces/{name}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/spaces/{name}/pin` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/spaces/{name}/star` | main | yes | automatic | `none` | `handle_toggle_space_starred` | opaque response type — fail-closed |
@@ -507,7 +550,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/suggest-tags` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/tags` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/tags/{name}` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/ws/updates` | main | no | not_applicable | `none` | — | DEMOTED, see below |
+| `GET` | `/ws/updates` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 
 ## MCP — all 29 `#[tool(` declarations
 

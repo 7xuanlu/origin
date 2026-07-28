@@ -504,24 +504,55 @@ impl KnowledgeWriter {
         self.validate_guard(guard)?;
         // The projection's own record of who lives here, not the DB's active
         // page list: a file whose page row is already gone still has to go.
-        let projected: Vec<String> = self.load_state().pages.into_keys().collect();
+        let mut projected: Vec<String> = self.load_state().pages.into_keys().collect();
         if projected.is_empty() {
             return Ok(0);
         }
+        // `HashMap` keys come out in whatever order the hasher felt like. The
+        // pass no longer stops at the first failure, so order does not decide
+        // who survives any more -- but it does decide what the failure report
+        // says, and a receipt for a disclosure boundary has to read the same
+        // way twice.
+        projected.sort();
         // `Automatic` is the only honest grant for a directory: the reader is a
         // filesystem, it declares no contract and carries no human gesture.
         let visible = database
             .page_visibility(&crate::truth_contract::TruthGrant::Automatic, &projected)
             .await?;
         let mut removed = 0;
+        let mut stuck: Vec<&str> = Vec::new();
         for page_id in &projected {
             // A missing verdict is not permission. `page_visibility` is total
             // over its input, so this only fires if that ever stops being true.
             if visible.get(page_id) == Some(&crate::truth_contract::Visibility::Full) {
                 continue;
             }
-            self.remove_page(guard, page_id)?;
-            removed += 1;
+            match self.remove_page(guard, page_id) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    // Do not abort. This is a disclosure boundary, and the cost
+                    // of stopping is that every page after this one keeps a
+                    // file `wenlan pages` can read -- so maximum removal beats
+                    // a clean exit. `remove_page` skips its state save on the
+                    // failing path, so the page stays in `state.json` and the
+                    // next pass retries it.
+                    log::error!(
+                        "[truth] projection invariant could not evict page {page_id}, its file \
+                         is still readable by `wenlan pages`: {error}"
+                    );
+                    stuck.push(page_id);
+                }
+            }
+        }
+        if !stuck.is_empty() {
+            // Loud at the caller too, not only in the per-page log lines: the
+            // count is what a health check can act on.
+            return Err(WenlanError::Conflict(format!(
+                "projection invariant evicted {removed} page(s) but {} could not be removed and \
+                 remain readable on disk: {}",
+                stuck.len(),
+                stuck.join(", ")
+            )));
         }
         Ok(removed)
     }
