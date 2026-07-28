@@ -72,6 +72,11 @@ def collect_covers(paths):
 
 
 def run(plan_path, test_paths):
+    missing = [p for p in test_paths if not os.path.exists(p)]
+    if missing:
+        print(f"error: test path(s) do not exist: {', '.join(missing)}",
+              file=sys.stderr)
+        return 2
     try:
         behaviors = parse_behaviors(plan_path)
     except OSError as e:
@@ -83,6 +88,11 @@ def run(plan_path, test_paths):
     if not behaviors:
         print(f"error: '## Behaviors' section in {plan_path} defines no "
               f"'- B<n>:' items", file=sys.stderr)
+        return 2
+    dupes = sorted({b for b in behaviors if behaviors.count(b) > 1})
+    if dupes:
+        print(f"error: duplicate behavior id(s) in {plan_path}: "
+              f"{', '.join(dupes)}", file=sys.stderr)
         return 2
 
     covers = collect_covers(test_paths)
@@ -164,10 +174,20 @@ def self_test():
         if run(os.path.join(td, "no-such-plan.md"), [td]) != 2:
             failures.append("missing plan file should return 2")
 
+        # 9. nonexistent test path -> usage error, not a silent skip
+        write("## Behaviors\n- B1: x\n", "// covers: B1\nfn a(){}\n")
+        if run(plan, [td, os.path.join(td, "no-such-dir")]) != 2:
+            failures.append("nonexistent test path should return 2")
+
+        # 10. duplicate behavior ids -> usage error
+        write("## Behaviors\n- B1: x\n- B1: y\n", "// covers: B1\nfn a(){}\n")
+        if run(plan, [td]) != 2:
+            failures.append("duplicate behavior ids should return 2")
+
     if failures:
         print("SELF-TEST FAILED:\n  " + "\n  ".join(failures))
         return 1
-    print("self-test: 8/8 cases correct")
+    print("self-test: 10/10 cases correct")
     return 0
 
 

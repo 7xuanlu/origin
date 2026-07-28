@@ -40,6 +40,9 @@ fail() {
 echo "==> Building wenlan-server + wenlan-mcp"
 (cd "$ROOT" && cargo build -p wenlan-server -p wenlan-mcp)
 
+# Without lsof a failed port check reads as "port free" — fail loud instead.
+command -v lsof >/dev/null 2>&1 || fail "lsof is required (port check + cleanup)"
+
 if lsof -ti ":${PORT}" >/dev/null 2>&1; then
     fail "port ${PORT} already in use; set PORT= to another free port"
 fi
@@ -52,7 +55,7 @@ DAEMON_PID=$!
 echo "==> Waiting for /api/health"
 healthy=""
 for i in $(seq 1 120); do
-    if curl -sf "$HOST/api/health" >/dev/null 2>&1; then
+    if curl -sf --max-time 2 "$HOST/api/health" >/dev/null 2>&1; then
         echo "    healthy after ${i}s"
         healthy=1
         break
@@ -74,29 +77,39 @@ SENTINEL = "walrus-observatory-5507"
 proc = subprocess.Popen(
     [os.environ["MCP_BIN"], "--origin-url", os.environ["MCP_URL"],
      "--agent-name", "smoke-mcp"],
-    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 )
 
 def send(obj):
-    proc.stdin.write(json.dumps(obj) + "\n")
+    proc.stdin.write((json.dumps(obj) + "\n").encode())
     proc.stdin.flush()
 
+buf = b""
+
 def recv(want_id, timeout=60):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], 1)
-        if not ready:
-            continue
-        line = proc.stdout.readline()
-        if not line:
-            raise SystemExit("wenlan-mcp closed stdout")
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if msg.get("id") == want_id:
-            return msg
-    raise SystemExit(f"timeout waiting for response id={want_id}")
+    # Frame by hand: select() + buffered readline() can hang on a partial
+    # frame or strand a second frame already sitting in Python's buffer
+    # while select() waits on the drained fd.
+    global buf
+    deadline = time.monotonic() + timeout
+    while True:
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == want_id:
+                return msg
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SystemExit(f"timeout waiting for response id={want_id}")
+        ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 1))
+        if ready:
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                raise SystemExit("wenlan-mcp closed stdout")
+            buf += chunk
 
 def expect_ok(msg, what):
     if "error" in msg:
@@ -125,12 +138,16 @@ send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
 expect_ok(recv(3), "capture")
 print("    capture ok")
 
+# One monotonic window for the whole poll — per-retry timeouts would let
+# the advertised 60s stretch to 30 minutes against a hung daemon.
 found = False
-for _ in range(30):
+poll_deadline = time.monotonic() + 60
+while time.monotonic() < poll_deadline:
     send({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
         "name": "recall",
         "arguments": {"query": "walrus observatory sentinel"}}})
-    result = expect_ok(recv(4), "recall")
+    result = expect_ok(
+        recv(4, timeout=max(1, poll_deadline - time.monotonic())), "recall")
     if SENTINEL in json.dumps(result):
         found = True
         break

@@ -40,6 +40,9 @@ fail() {
 echo "==> Building wenlan-server + wenlan"
 (cd "$ROOT" && cargo build -p wenlan-server -p wenlan)
 
+# Without lsof a failed port check reads as "port free" — fail loud instead.
+command -v lsof >/dev/null 2>&1 || fail "lsof is required (port check + cleanup)"
+
 if lsof -ti ":${PORT}" >/dev/null 2>&1; then
     fail "port ${PORT} already in use; set PORT= to another free port"
 fi
@@ -53,7 +56,7 @@ DAEMON_PID=$!
 echo "==> Waiting for /api/health"
 healthy=""
 for i in $(seq 1 120); do
-    if curl -sf "$HOST/api/health" >/dev/null 2>&1; then
+    if curl -sf --max-time 2 "$HOST/api/health" >/dev/null 2>&1; then
         echo "    healthy after ${i}s"
         healthy=1
         break
