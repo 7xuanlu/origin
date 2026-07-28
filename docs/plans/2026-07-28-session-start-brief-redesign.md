@@ -1,7 +1,7 @@
 # Session-start brief redesign
 
-**Status:** Proposed product contract  
-**Scope:** Wenlan daemon, MCP, CLI/plugin skills, and legacy status migration  
+**Status:** Approved product contract
+**Scope:** Wenlan daemon, MCP, CLI/plugin skills, and legacy status migration
 **Explicitly out of scope:** wenlan-app UI
 
 ## Summary
@@ -221,8 +221,8 @@ Import is idempotent and must never overwrite an existing stored Brief.
 
 - daemon storage and read/write routes
 - shared request/response contracts
-- MCP `brief` read surface and a Brief update surface
-  used by handoff
+- MCP `brief` read surface and a daemon-backed CLI update surface used by
+  handoff
 - CLI/plugin skill migration for Claude and Codex
 - legacy `context` adapter and caller migration
 - one-time status Markdown importer
