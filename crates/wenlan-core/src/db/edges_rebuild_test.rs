@@ -176,11 +176,17 @@ async fn capture_skips_the_implicit_primary_key_index() {
     );
 }
 
-/// Re-run migration 97 over the current database, the way `migration_58_idempotent`
-/// re-runs 58: rewind `user_version` one step and drive the real dispatch, so
-/// the test exercises the shipped ordering rather than a hand-assembled copy of
-/// it.
-async fn rerun_migration_97(db: &MemoryDB) {
+/// Rewind `user_version` to 96 and drive the real migration dispatch, the way
+/// `migration_58_idempotent` does, so the test exercises the shipped ordering
+/// rather than a hand-assembled copy of it. 97 is the rebuild; whatever follows
+/// it runs too, which is the point — the rebuild has to leave a substrate the
+/// rest of the chain can still migrate.
+///
+/// The end state is asserted against `SCHEMA_VERSION`, never a literal. An
+/// earlier draft of this helper pinned 97 and went red the moment 98 landed,
+/// which is the same rot this commit's sibling fix removed from
+/// `migration_96_bootstraps_cutover_control_plane_and_first_entity_space`.
+async fn rerun_migrations_from_96(db: &MemoryDB) {
     {
         let conn = db.conn.lock().await;
         conn.execute("PRAGMA user_version = 96", ()).await.unwrap();
@@ -191,7 +197,11 @@ async fn rerun_migration_97(db: &MemoryDB) {
     let conn = db.conn.lock().await;
     let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
     let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-    assert_eq!(version, 97, "the rebuild must stamp the version it earned");
+    assert_eq!(
+        version,
+        i64::from(crate::db::SCHEMA_VERSION),
+        "the chain must run to completion, not stall inside the rebuild"
+    );
 }
 
 /// Weakening: assume the standard SQLite table-rebuild ordering just works
@@ -221,7 +231,7 @@ async fn the_rebuild_survives_the_window_where_edges_does_not_exist() {
         schema_names(&conn, "trigger").await
     };
 
-    rerun_migration_97(&db).await;
+    rerun_migrations_from_96(&db).await;
 
     let conn = db.conn.lock().await;
     assert_eq!(
@@ -271,7 +281,7 @@ async fn the_rebuild_preserves_every_row_unchanged() {
     };
     assert_eq!(before.len(), 2, "fixture seeded");
 
-    rerun_migration_97(&db).await;
+    rerun_migrations_from_96(&db).await;
 
     let conn = db.conn.lock().await;
     assert_eq!(

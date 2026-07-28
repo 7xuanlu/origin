@@ -585,7 +585,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 97;
+pub const SCHEMA_VERSION: u32 = 98;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8503,6 +8503,15 @@ impl MemoryDB {
             if version < 97 {
                 self.migrate_97_claim_identity(version).await?;
             }
+
+            // Migration 98 (M5 PR-A): give every pre-existing page a truth
+            // row, unconditionally `provisional` and unreviewed. Separate from
+            // 97 because 97 is schema and this is data: a backfill that has to
+            // be re-runnable should not be entangled with a table rebuild that
+            // must not be. See backfill_page_truth_state.
+            if version < 98 {
+                self.migrate_98_page_truth_backfill(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11800,6 +11809,35 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 97 applied: M5 claim identity tables + widened edges \
              (claim_revision/root endpoints, attests type, extended space fence)"
+        );
+        Ok(())
+    }
+
+    /// Migration 98 (M5 PR-A): fail-closed page truth-state backfill.
+    ///
+    /// Every page becomes `provisional` and unreviewed. Nothing is read from a
+    /// legacy field and turned into a truth claim — see
+    /// `backfill_page_truth_state` for why that is the whole point rather than
+    /// a conservative default.
+    async fn migrate_98_page_truth_backfill(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(98, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m98 begin: {error}")))?;
+        let filled = Self::backfill_page_truth_state(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m98 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 98", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m98 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 98 applied: {filled} page(s) backfilled to provisional, \
+             unreviewed truth state"
         );
         Ok(())
     }

@@ -240,4 +240,76 @@ impl MemoryDB {
         .map_err(|error| WenlanError::VectorDb(format!("m97 claim-identity DDL: {error}")))?;
         Ok(())
     }
+
+    /// Give every existing page a truth row, `provisional` and unreviewed.
+    ///
+    /// **Nothing is inferred.** Not from `citations`, not from a page having
+    /// been distilled, not from any legacy field that reads like approval. A
+    /// page's support status means "the D8 finalizer evaluated this exact
+    /// version and found supporting evidence", and that has never run for any
+    /// row here, so the only honest value is `provisional`. `human_reviewed`
+    /// is stricter still: it means a specific human approved a specific text,
+    /// and no such record exists to migrate from. Inventing either would put
+    /// the two axes this rung exists to separate back on the same footing —
+    /// and it would do so silently, since a wrongly-`supported` page looks
+    /// exactly like a correctly-`supported` one.
+    ///
+    /// **Resumable by construction, with no cursor.** `WHERE NOT EXISTS` makes
+    /// the statement fill precisely the gap that remains, so an interrupted run
+    /// resumes by being run again. A cursor would be strictly weaker: it can go
+    /// stale or be written wrong, whereas "which pages lack a row" is derived
+    /// from the data every time.
+    ///
+    /// It also means the backfill never touches a row that already exists.
+    /// At migration time there can be none — `page_truth_state` was created one
+    /// migration earlier — so that only matters on a re-run, where clobbering a
+    /// real evaluation with `provisional` would be a regression, not a repair.
+    ///
+    /// The post-condition is coverage, checked rather than assumed: if any page
+    /// still lacks a row when the statement finishes, the migration fails
+    /// rather than reporting success over a partial backfill.
+    pub(super) async fn backfill_page_truth_state(
+        tx: &libsql::Transaction,
+    ) -> Result<u64, WenlanError> {
+        let now = chrono::Utc::now().timestamp();
+        let filled = tx
+            .execute(
+                "INSERT INTO page_truth_state
+                     (page_id, page_version, support_status, provisional_reason,
+                      human_reviewed, updated_at)
+                 SELECT p.id, p.version, 'provisional',
+                        'never evaluated: predates claim derivation', 0, ?1
+                   FROM pages p
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM page_truth_state t WHERE t.page_id = p.id
+                  )",
+                libsql::params![now],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m98 backfill truth state: {error}")))?;
+
+        let mut rows = tx
+            .query(
+                "SELECT count(*) FROM pages p
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM page_truth_state t WHERE t.page_id = p.id
+                  )",
+                (),
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m98 coverage check: {error}")))?;
+        let uncovered: i64 = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m98 coverage read: {error}")))?
+            .ok_or_else(|| WenlanError::VectorDb("m98 coverage returned no row".into()))?
+            .get(0)
+            .map_err(|error| WenlanError::VectorDb(format!("m98 coverage decode: {error}")))?;
+        if uncovered != 0 {
+            return Err(WenlanError::VectorDb(format!(
+                "m98 backfill left {uncovered} page(s) with no truth row"
+            )));
+        }
+        Ok(filled)
+    }
 }

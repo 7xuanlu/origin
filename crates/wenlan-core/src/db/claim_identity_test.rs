@@ -223,3 +223,135 @@ async fn derivation_jobs_dedupe_per_page_version() {
         .await;
     assert!(dup.is_err(), "same page+version must not queue twice");
 }
+
+/// Weakening: migrate a page's existing state into `support_status` because
+/// something about it looks vetted.
+///
+/// Nothing about a pre-M5 page carries the claim `support_status` makes. It
+/// says the D8 finalizer evaluated this exact version and found supporting
+/// evidence, and that has never run. A page with citations, a page distilled
+/// from many sources, a page a human once edited — none of those are that.
+#[tokio::test]
+async fn the_backfill_infers_nothing_and_covers_every_page() {
+    let (db, _temp) = db_with_substrate().await;
+    let conn = db.conn.lock().await;
+    // Dress p1 up as something a lenient migration might read as approved.
+    conn.execute(
+        "UPDATE pages SET citations = '[{\"n\":1,\"source_id\":\"m1\"}]' WHERE id = 'p1'",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    let filled = MemoryDB::backfill_page_truth_state(&tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(filled, 2, "both seeded pages must be covered");
+
+    let mut rows = conn
+        .query(
+            "SELECT page_id, support_status, human_reviewed, reviewed_page_version
+               FROM page_truth_state ORDER BY page_id",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        seen.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<i64>(2).unwrap(),
+            row.get::<Option<i64>>(3).unwrap(),
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("p1".to_string(), "provisional".to_string(), 0, None),
+            ("p2".to_string(), "provisional".to_string(), 0, None),
+        ],
+        "citations are not evidence of evaluation, and nothing is a human review"
+    );
+}
+
+/// Weakening: make the backfill an unconditional INSERT OR REPLACE, so a
+/// re-run is "safe".
+///
+/// It would be the opposite. The backfill has to be re-runnable — that is how
+/// it resumes — and a re-run that overwrites is a re-run that resets a real
+/// evaluation to `provisional` and drops a human review. Only the gap gets
+/// filled.
+#[tokio::test]
+async fn the_backfill_never_overwrites_an_existing_evaluation() {
+    let (db, _temp) = db_with_substrate().await;
+    let conn = db.conn.lock().await;
+    {
+        let tx = conn.transaction().await.unwrap();
+        MemoryDB::backfill_page_truth_state(&tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    conn.execute(
+        "UPDATE page_truth_state
+            SET support_status='supported', human_reviewed=1,
+                reviewed_page_version=1, reviewed_page_digest='d'
+          WHERE page_id='p1'",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    let filled = MemoryDB::backfill_page_truth_state(&tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(filled, 0, "no gap left to fill");
+
+    let mut rows = conn
+        .query(
+            "SELECT support_status, human_reviewed FROM page_truth_state WHERE page_id='p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "supported");
+    assert_eq!(row.get::<i64>(1).unwrap(), 1, "a human review must survive");
+}
+
+/// Weakening: trust that the INSERT covered everything and report success.
+///
+/// Coverage is the migration's whole postcondition, so it is read back from
+/// the data rather than inferred from the statement not erroring. A page added
+/// between the INSERT and the check would fail here — correctly, since it has
+/// no truth row.
+#[tokio::test]
+async fn the_backfill_checks_coverage_rather_than_assuming_it() {
+    let (db, _temp) = db_with_substrate().await;
+    db.insert_page(
+        "p3",
+        "p3",
+        None,
+        "",
+        None,
+        None,
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let conn = db.conn.lock().await;
+    let tx = conn.transaction().await.unwrap();
+    MemoryDB::backfill_page_truth_state(&tx).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut rows = conn
+        .query(
+            "SELECT count(*) FROM pages p
+              WHERE NOT EXISTS (SELECT 1 FROM page_truth_state t WHERE t.page_id = p.id)",
+            (),
+        )
+        .await
+        .unwrap();
+    let uncovered: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(uncovered, 0, "every page carries a truth row");
+}
