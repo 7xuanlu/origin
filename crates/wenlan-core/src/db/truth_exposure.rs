@@ -264,6 +264,19 @@ impl MemoryDB {
     /// PR-B calls this only from tests. PR-C owns the production advance, which
     /// is a two-phase fenced ceremony this setter is merely the last step of --
     /// so nothing here should be read as permission to flip it.
+    ///
+    /// # Advancing this alone is destructive, not protective
+    ///
+    /// As of PR-B the ONLY production consumer of [`Self::page_visibility`] is
+    /// the projection-directory invariant in `export::knowledge`, which DELETES
+    /// the `.md` file of every page the verdict hides. No HTTP adapter reads the
+    /// grant the guard resolves -- `select_visible_pages` filters on scope,
+    /// trust tier and `kind`, and never consults truth state at all.
+    ///
+    /// So the destructive half of this contract is wired and the protective half
+    /// is not. Advancing the generation today would evict pages from the user's
+    /// vault while every page route kept serving them. PR-C must land the
+    /// adapters BEFORE the ceremony, not alongside it.
     pub async fn set_truth_cutover_generation(&self, generation: i64) -> Result<(), WenlanError> {
         self.set_app_metadata(TRUTH_CUTOVER_GENERATION_KEY, &generation.to_string())
             .await

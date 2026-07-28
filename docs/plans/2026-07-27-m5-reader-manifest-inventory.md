@@ -1005,3 +1005,84 @@ found while auditing the seam and deliberately left alone:
 None is reachable through an error response, so none can be driven by a caller
 holding no truth grant. If the truth contract later extends to durable
 side-channels, these are the known starting set.
+
+Read "out of scope" narrowly: it means *not an error body*, not *not a
+disclosure*. The first two rows were later found to be HTTP-reachable by other
+routes — that is what promoted `/api/activities` and `/api/chunks/{source_id}`
+to page-bearing. Being absent from the error seam says nothing about the read
+side.
+
+##### Background re-distillation sends page titles to the configured LLM
+##### provider (found by cross-model review, 2026-07-28)
+
+A fourth surface, and the only one that leaves the machine. It is not an HTTP
+route, so the manifest does not cover it and neither gate sits in its path:
+
+```
+scheduler.rs:2494  run_periodic_steep_phase_with_api   (timer, no request)
+  -> refinery/mod.rs:1583  get_stale_page_after("source_updated", ...)
+       selects stale/active pages directly, no truth predicate
+  -> synthesis/distill.rs:1309  build_page_compile_user_prompt(db, &page.title, ..)
+       -> :85  list_relevant_active_page_titles(...)   other titles, as a hint
+  -> llm.generate(..)   provider from refinery/mod.rs:326 resolve_synthesis,
+                        which may be the Anthropic slot or an external endpoint
+```
+
+So post-cutover a background timer can hand an unsupported page's title — plus
+a hint list of other active titles — to a remote provider, with no HTTP
+middleware and no `page_visibility` anywhere in the path. Failure logging in
+`synthesis/distill.rs` names the titles too.
+
+Inert today only because nothing is hidden at generation 0. PR-C must decide
+whether re-distillation of an unsupported page is permitted at all; if it is,
+the permit has to be consumed inside the refinery, not at the HTTP edge, since
+there is no request to attach a grant to.
+
+## What PR-C must own before the ceremony (cross-model review, 2026-07-28)
+
+A read-only Codex (gpt-5.6-sol, xhigh) review of the PR-B branch returned
+**BLOCK** — not on PR-B's safety, which is inert at generation 0, but on the
+claim that advancing the generation activates the contract. It does not. Every
+item below was verified at source before being recorded here.
+
+### The asymmetry, stated plainly
+
+The destructive half of this contract is wired and the protective half is not.
+`page_visibility` has exactly one production caller — the projection invariant,
+which deletes `.md` files. No HTTP adapter reads the grant the guard resolves;
+`select_visible_pages` filters scope, trust tier and `kind`, never truth state.
+Advancing the generation today would evict pages from the user's vault while
+`/api/pages`, `/api/pages/{id}`, `/api/pages/search` and both export routes kept
+serving them. Adapters land BEFORE the ceremony, not with it. The warning now
+also sits on `set_truth_cutover_generation` itself, where the trigger is.
+
+### Prerequisites
+
+| # | what | where |
+|---|---|---|
+| 1 | Adapters that consume the resolved grant, so hiding actually hides | `memory_routes.rs:1983`, `:2003`, `:2120`, `:2243`, `:2284` |
+| 2 | Stop trusting `state.json` as the page enumeration | `export/knowledge.rs:573`, `:630` |
+| 3 | Both a removal pass and a write-time skip | `post_write.rs:2852` (carried from the Opus review) |
+| 4 | Decide whether a failed invariant may serve traffic | `main.rs:1534`, `:1548` |
+| 5 | Flip the audit write to fail-closed for grants | `truth_guard.rs:152` |
+| 6 | Rule on re-distillation of unsupported pages | previous section |
+| 7 | A tooth on the projection pass's wiring | deleting the `main.rs` call leaves tests green |
+| 8 | Re-audit the 26 demotions never checked for provenance | this document |
+
+On #2: `load_state` returns `KnowledgeState::default()` on any read error
+(`knowledge.rs:573`) and `parse_state` falls back to `unwrap_or_default()` on
+malformed JSON (`:630`). Either yields an empty page map, so the invariant
+returns `Ok(0)` and reports success while every `.md` file stays on disk — and
+`wenlan pages` enumerates that directory independently of `state.json`. Since
+state saves truncate before writing, a crash mid-save is a realistic way to
+reach it.
+
+### Generation 0 is inert in effect, not in every observable
+
+Worth stating because the branch was described as changing nothing. The guard
+does not consult the generation, so from this branch onward a request carrying
+`x-wenlan-reader-intent` gets an audit row, and can get a 403 on a
+`MarkerShape::None` route — headers that were ignored before. Migration 101 also
+creates its table and advances `user_version` on first start. No caller that
+does not send the new headers sees any change, which is the property that
+matters, but "nothing changes" was too strong.

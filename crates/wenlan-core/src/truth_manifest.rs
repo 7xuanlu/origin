@@ -136,7 +136,7 @@ pub struct CliReader {
 
 /// All 165 registered `(method, path, handler)` triples.
 ///
-/// 45 page-bearing, 120 not. Expands to 169 `(builder, method, path)`
+/// 47 page-bearing, 118 not. Expands to 169 `(builder, method, path)`
 /// runtime entries: 163 in `main`, 6 in `repair`.
 #[rustfmt::skip]
 pub const HTTP_READERS: &[HttpReader] = &[

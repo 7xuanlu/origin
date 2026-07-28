@@ -137,6 +137,17 @@ pub async fn guard(
     // fails must not take the request with it, but it must be loud, because a
     // silently absent audit row is the compensating control quietly not being
     // there.
+    //
+    // Best-effort is a generation-0 choice and PR-C must revisit it. While
+    // `page_visibility` answers `Full` for everything, a lost row records the
+    // absence of a restriction that is not in force, so availability wins.
+    // Once the generation advances the row IS the control for the conceded
+    // composition, and a grant issued without one should refuse instead.
+    //
+    // `caller` is whatever the request put in `x-agent-name`. It is unverified,
+    // same cooperative tier as the marker itself: a caller that forges the
+    // marker can attribute the walk to someone else. The row proves a marked
+    // call happened, not who made it.
     let db = { guard_state.state.read().await.db.clone() };
     if let Some(db) = db {
         if let Err(error) = db
