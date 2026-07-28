@@ -20,6 +20,7 @@ use std::sync::Arc;
 #[cfg(test)]
 static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+mod brief;
 mod claim_identity;
 mod count;
 mod edges_rebuild;
@@ -29,6 +30,8 @@ pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
 
+#[cfg(test)]
+mod brief_test;
 #[cfg(test)]
 mod claim_identity_test;
 #[cfg(test)]
@@ -585,7 +588,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 99;
+pub const SCHEMA_VERSION: u32 = 100;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8534,6 +8537,12 @@ impl MemoryDB {
             // must not be. See backfill_page_truth_state.
             if version < 99 {
                 self.migrate_99_page_truth_backfill(version).await?;
+            }
+
+            // Migration 100: daemon-authoritative Brief state, keyed by the
+            // stable Space id so renames preserve current work.
+            if version < 100 {
+                self.migrate_100_brief(version).await?;
             }
         }
 

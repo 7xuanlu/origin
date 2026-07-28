@@ -6,6 +6,7 @@
 //! limited to serde and serde_json -- no heavy runtime deps.
 
 pub mod brand;
+pub mod brief;
 pub mod briefing;
 pub mod communities;
 pub mod entities;
@@ -28,6 +29,7 @@ pub mod system_info;
 pub mod working_memory;
 
 // Re-export commonly used types at crate root for convenience.
+pub use brief::*;
 pub use briefing::{BriefingResponse, ContradictionItem};
 pub use communities::{
     CommunityListResponse, CommunityMember, CommunityMemberCursor, CommunityMembersResponse,
