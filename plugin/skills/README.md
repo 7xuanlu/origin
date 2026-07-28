@@ -45,12 +45,12 @@ ordered chain below. Higher layers override lower ones:
 
 | Layer | Mechanism | Example |
 |---|---|---|
-| 1 | `space:X` inline arg | `/capture space:health "slept 5hrs"` |
-| 2 | `WENLAN_SPACE` env var | `WENLAN_SPACE=career claude` |
-| 3 | `~/.wenlan/spaces.toml` cwd-prefix mapping (longest prefix wins; ties go to first-defined) | see `plugin/examples/spaces.toml` |
-| 4 | cwd git-repo basename | `~/Repos/wenlan/...` → `wenlan` |
-| 5 | conversation topic | (rarely used directly) |
-| 6 | none | omit the space |
+| 1 | `WENLAN_SPACE` strict process pin | `WENLAN_SPACE=career claude` |
+| 2 | `space:X` inline arg | `/capture space:health "slept 5hrs"` |
+| 3 | `WENLAN_DEFAULT_SPACE` overridable process context | `WENLAN_DEFAULT_SPACE=career claude` |
+| 4 | `~/.wenlan/spaces.toml` cwd-prefix mapping (longest prefix wins; ties go to first-defined) | see `plugin/examples/spaces.toml` |
+| 5 | registered cwd git-repo basename | `~/Repos/wenlan/...` → `wenlan`, only if that Space exists |
+| 6 | none | omit client context; daemon Default decides new writes |
 
 To pin a session to a specific bucket regardless of cwd, set
 `WENLAN_SPACE` before invoking Claude Code. To pin by working directory
@@ -63,8 +63,10 @@ line so the user can confirm the active bucket:
 
     Resolved space: <name> (from <layer>)
 
-If the resolver reports no space, the skill omits the space parameter
-instead of falling back to `personal`.
+If the resolver reports no space, the skill omits the space parameter. The
+daemon then applies its Default save space to new writes; reads remain All
+Spaces. The tool's returned receipt is authoritative if it differs from the
+client's proposed context.
 
 ## Links
 

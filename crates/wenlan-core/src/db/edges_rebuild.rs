@@ -349,15 +349,15 @@ impl MemoryDB {
         let mut rows = tx
             .query("PRAGMA table_info(edges)", ())
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m97 column census: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m98 column census: {error}")))?;
         let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m97 column census read: {error}")))?
+            .map_err(|error| WenlanError::VectorDb(format!("m98 column census read: {error}")))?
         {
             live.insert(row.get(1).map_err(|error| {
-                WenlanError::VectorDb(format!("m97 column census decode: {error}"))
+                WenlanError::VectorDb(format!("m98 column census decode: {error}"))
             })?);
         }
         let declared: std::collections::BTreeSet<String> = EDGE_COLUMNS
@@ -368,7 +368,7 @@ impl MemoryDB {
             let unlisted: Vec<&str> = live.difference(&declared).map(String::as_str).collect();
             let phantom: Vec<&str> = declared.difference(&live).map(String::as_str).collect();
             return Err(WenlanError::VectorDb(format!(
-                "m97 EDGE_COLUMNS is stale: columns on the table but not in the list \
+                "m98 EDGE_COLUMNS is stale: columns on the table but not in the list \
                  (these would be SILENTLY DROPPED by the rebuild): {unlisted:?}; columns in \
                  the list but not on the table: {phantom:?}"
             )));
@@ -390,7 +390,7 @@ impl MemoryDB {
 
         tx.execute(EDGES_WIDENED_DDL, ())
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m97 create edges_new: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m98 create edges_new: {error}")))?;
 
         tx.execute(
             &format!(
@@ -400,7 +400,7 @@ impl MemoryDB {
             (),
         )
         .await
-        .map_err(|error| WenlanError::VectorDb(format!("m97 copy edges: {error}")))?;
+        .map_err(|error| WenlanError::VectorDb(format!("m98 copy edges: {error}")))?;
 
         Self::assert_copy_is_faithful(tx).await?;
 
@@ -409,7 +409,7 @@ impl MemoryDB {
         // connection ever observes that window (artifact 3 §8).
         tx.execute("DROP TABLE edges", ())
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m97 drop edges: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m98 drop edges: {error}")))?;
         Self::rename_into_place(tx).await?;
 
         Self::replay_attached_objects(tx, &captured).await?;
@@ -432,18 +432,18 @@ impl MemoryDB {
              BEGIN{FENCE_BODY}END;"
         ))
         .await
-        .map_err(|error| WenlanError::VectorDb(format!("m97 widen space fence: {error}")))?;
+        .map_err(|error| WenlanError::VectorDb(format!("m98 widen space fence: {error}")))?;
 
         for (name, statement) in M5_INDEXES {
             tx.execute(statement, ()).await.map_err(|error| {
-                WenlanError::VectorDb(format!("m97 create M5 index {name}: {error}"))
+                WenlanError::VectorDb(format!("m98 create M5 index {name}: {error}"))
             })?;
             expected.insert(name.to_string());
         }
 
         for (name, statement) in M5_TRIGGERS {
             tx.execute(statement, ()).await.map_err(|error| {
-                WenlanError::VectorDb(format!("m97 create M5 trigger {name}: {error}"))
+                WenlanError::VectorDb(format!("m98 create M5 trigger {name}: {error}"))
             })?;
             expected.insert(name.to_string());
         }
@@ -454,7 +454,7 @@ impl MemoryDB {
             .collect();
         if actual != expected {
             return Err(WenlanError::VectorDb(format!(
-                "m97 attached-object set changed across the rebuild: expected {expected:?}, \
+                "m98 attached-object set changed across the rebuild: expected {expected:?}, \
                  found {actual:?}"
             )));
         }
@@ -497,7 +497,7 @@ impl MemoryDB {
         tx.execute("PRAGMA legacy_alter_table = ON", ())
             .await
             .map_err(|error| {
-                WenlanError::VectorDb(format!("m97 legacy_alter_table on: {error}"))
+                WenlanError::VectorDb(format!("m98 legacy_alter_table on: {error}"))
             })?;
         let renamed = tx
             .execute("ALTER TABLE edges_new RENAME TO edges", ())
@@ -505,9 +505,9 @@ impl MemoryDB {
         tx.execute("PRAGMA legacy_alter_table = OFF", ())
             .await
             .map_err(|error| {
-                WenlanError::VectorDb(format!("m97 legacy_alter_table off: {error}"))
+                WenlanError::VectorDb(format!("m98 legacy_alter_table off: {error}"))
             })?;
-        renamed.map_err(|error| WenlanError::VectorDb(format!("m97 rename edges_new: {error}")))?;
+        renamed.map_err(|error| WenlanError::VectorDb(format!("m98 rename edges_new: {error}")))?;
         Ok(())
     }
 
@@ -536,18 +536,18 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|error| {
-                    WenlanError::VectorDb(format!("m97 verify {from} minus {to}: {error}"))
+                    WenlanError::VectorDb(format!("m98 verify {from} minus {to}: {error}"))
                 })?;
             let missing: i64 = rows
                 .next()
                 .await
-                .map_err(|error| WenlanError::VectorDb(format!("m97 verify read: {error}")))?
-                .ok_or_else(|| WenlanError::VectorDb("m97 verify returned no row".into()))?
+                .map_err(|error| WenlanError::VectorDb(format!("m98 verify read: {error}")))?
+                .ok_or_else(|| WenlanError::VectorDb("m98 verify returned no row".into()))?
                 .get(0)
-                .map_err(|error| WenlanError::VectorDb(format!("m97 verify decode: {error}")))?;
+                .map_err(|error| WenlanError::VectorDb(format!("m98 verify decode: {error}")))?;
             if missing != 0 {
                 return Err(WenlanError::VectorDb(format!(
-                    "m97 edges copy is not faithful: {missing} row(s) in {from} absent from {to}"
+                    "m98 edges copy is not faithful: {missing} row(s) in {from} absent from {to}"
                 )));
             }
         }

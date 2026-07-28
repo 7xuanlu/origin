@@ -35,9 +35,8 @@ where
     }
 }
 
-/// Return the effective space for a tool call: when locked, always the
-/// locked value (warns if model attempted to override); otherwise the
-/// non-empty inbound value passed by the model.
+/// Return the effective space for a tool call: strict process pin, then an
+/// explicit non-empty tool argument, then the overridable process fallback.
 pub fn effective_space(inbound: &Option<String>) -> Option<String> {
     if let Some(locked) = crate::lock_state::locked_space() {
         if let Some(passed) = inbound.as_ref() {
@@ -50,12 +49,15 @@ pub fn effective_space(inbound: &Option<String>) -> Option<String> {
             }
         }
         Some(locked)
+    } else if let Some(explicit) = inbound
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    {
+        Some(explicit)
     } else {
-        inbound
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+        crate::lock_state::default_space()
     }
 }
 
@@ -946,6 +948,12 @@ fn format_capture_success(resp: &StoreMemoryResponse) -> String {
         "Stored {}\nsource_memory_id: {}",
         resp.source_id, resp.source_id
     );
+    append_write_receipt(
+        &mut msg,
+        resp.space.as_deref(),
+        resp.space_source,
+        resp.write_outcome,
+    );
     if !resp.warnings.is_empty() {
         msg.push_str("\nWarnings:");
         for warning in &resp.warnings {
@@ -1061,7 +1069,7 @@ impl WenlanMcpServer {
         let req = StoreMemoryRequest {
             content: params.content,
             memory_type: params.memory_type,
-            space: space_arg,
+            space: (space_arg).into(),
             source_agent,
             title: None,
             confidence: params.confidence,
@@ -1626,7 +1634,7 @@ impl WenlanMcpServer {
         let req = CreateEntityRequest {
             name: params.name,
             entity_type: params.entity_type,
-            space: effective_space(&params.space),
+            space: (effective_space(&params.space)).into(),
             source_agent: self.resolve_source_agent(None),
             confidence: params.confidence,
         };
@@ -1813,7 +1821,7 @@ impl WenlanMcpServer {
                     content: params.content,
                     summary: params.summary,
                     entity_id: params.entity_id,
-                    space: effective_space(&params.space),
+                    space: (effective_space(&params.space)).into(),
                     source_memory_ids: params.source_memory_ids,
                     creation_kind: None,
                     workspace: None,
@@ -2026,6 +2034,12 @@ fn format_create_page_response(resp: CreatePageResponse) -> String {
         Some(page_id) => format!("Attached to existing page {page_id}"),
         None => format!("Created page {}", resp.id),
     };
+    append_write_receipt(
+        &mut text,
+        resp.space.as_deref(),
+        resp.space_source,
+        resp.write_outcome,
+    );
     for warning in resp.warnings {
         text.push_str(&format!("\nwarning: {warning}"));
     }
@@ -2034,10 +2048,48 @@ fn format_create_page_response(resp: CreatePageResponse) -> String {
 
 fn format_entity_ready_response(resp: CreateEntityResponse) -> String {
     let mut text = format!("Entity {} ready", resp.id);
+    append_write_receipt(
+        &mut text,
+        resp.space.as_deref(),
+        resp.space_source,
+        resp.write_outcome,
+    );
     for warning in resp.warnings {
         text.push_str(&format!("\nwarning: {warning}"));
     }
     text
+}
+
+fn append_write_receipt(
+    text: &mut String,
+    space: Option<&str>,
+    source: Option<wenlan_types::WriteSpaceSource>,
+    outcome: Option<wenlan_types::WriteOutcome>,
+) {
+    if space.is_some() || source.is_some() || outcome.is_some() {
+        text.push_str("\nspace: ");
+        text.push_str(space.unwrap_or("Uncategorized"));
+    }
+    if let Some(source) = source {
+        text.push_str("\nspace_source: ");
+        text.push_str(match source {
+            wenlan_types::WriteSpaceSource::Request => "request",
+            wenlan_types::WriteSpaceSource::Header => "header",
+            wenlan_types::WriteSpaceSource::Default => "default",
+            wenlan_types::WriteSpaceSource::Uncategorized => "uncategorized",
+            wenlan_types::WriteSpaceSource::Existing => "existing",
+            wenlan_types::WriteSpaceSource::Unknown => "unknown",
+        });
+    }
+    if let Some(outcome) = outcome {
+        text.push_str("\nwrite_outcome: ");
+        text.push_str(match outcome {
+            wenlan_types::WriteOutcome::Created => "created",
+            wenlan_types::WriteOutcome::ResolvedExisting => "resolved_existing",
+            wenlan_types::WriteOutcome::AttachedExisting => "attached_existing",
+            wenlan_types::WriteOutcome::Unknown => "unknown",
+        });
+    }
 }
 
 fn format_relation_ready_response(resp: CreateRelationResponse) -> String {
@@ -3806,7 +3858,7 @@ mod tests {
         let req = StoreMemoryRequest {
             content: "test content".into(),
             memory_type: None,
-            space: None,
+            space: (None).into(),
             source_agent: Some("test-agent".into()),
             title: None,
             confidence: None,
@@ -3826,7 +3878,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_success_message_is_terse() {
+    fn capture_success_message_uses_persisted_receipt() {
         let resp = StoreMemoryResponse {
             source_id: "mem_abc".into(),
             chunks_created: 3,
@@ -3837,9 +3889,15 @@ mod tests {
             extraction_method: "llm".into(),
             enrichment: String::new(),
             hint: String::new(),
+            space: Some("work".into()),
+            space_source: Some(wenlan_types::WriteSpaceSource::Default),
+            write_outcome: Some(wenlan_types::WriteOutcome::Created),
         };
         let msg = format_capture_success(&resp);
-        assert_eq!(msg, "Stored mem_abc\nsource_memory_id: mem_abc");
+        assert_eq!(
+            msg,
+            "Stored mem_abc\nsource_memory_id: mem_abc\nspace: work\nspace_source: default\nwrite_outcome: created"
+        );
         assert!(!msg.contains("chunks"));
         assert!(!msg.contains("quality"));
         assert!(!msg.contains("entity"));
@@ -3857,6 +3915,9 @@ mod tests {
             extraction_method: "agent".into(),
             enrichment: String::new(),
             hint: String::new(),
+            space: None,
+            space_source: None,
+            write_outcome: None,
         };
         let msg = format_capture_success(&resp);
         assert!(msg.starts_with("Stored mem_abc"));
@@ -3876,6 +3937,9 @@ mod tests {
             extraction_method: "agent".into(),
             enrichment: String::new(),
             hint: String::new(),
+            space: None,
+            space_source: None,
+            write_outcome: None,
         };
         let out = format_capture_success(&resp);
         assert!(!out.contains("Triggered revisions"));
@@ -4017,7 +4081,7 @@ mod tests {
         let req = StoreMemoryRequest {
             content: "test".into(),
             memory_type: Some("decision".into()),
-            space: None,
+            space: (None).into(),
             source_agent: Some("claude".into()),
             title: None,
             confidence: Some(0.9),
@@ -4040,7 +4104,7 @@ mod tests {
         let req = StoreMemoryRequest {
             content: "hello".into(),
             memory_type: Some("fact".into()),
-            space: None,
+            space: (None).into(),
             source_agent: None,
             title: None,
             confidence: None,
@@ -4395,6 +4459,9 @@ mod tests {
             id: "page_existing".into(),
             attached_to: Some("page_existing".into()),
             warnings: Vec::new(),
+            space: Some("work".into()),
+            space_source: Some(wenlan_types::WriteSpaceSource::Existing),
+            write_outcome: Some(wenlan_types::WriteOutcome::AttachedExisting),
         });
 
         assert!(
@@ -4405,6 +4472,9 @@ mod tests {
             !text.contains("Created page"),
             "attached response must distinguish reuse from creation: {text}"
         );
+        assert!(text.contains("space: work"));
+        assert!(text.contains("space_source: existing"));
+        assert!(text.contains("write_outcome: attached_existing"));
     }
 
     #[tokio::test]
@@ -4537,7 +4607,7 @@ mod tests {
         let req = StoreMemoryRequest {
             content: params.content,
             memory_type: params.memory_type,
-            space: params.space,
+            space: (params.space).into(),
             source_agent,
             title: None,
             confidence: params.confidence,
@@ -4711,7 +4781,7 @@ mod tests {
         let req = StoreMemoryRequest {
             content: "test".into(),
             memory_type: Some("fact".into()),
-            space: None,
+            space: (None).into(),
             source_agent: None,
             title: None,
             confidence: None,
@@ -5067,10 +5137,15 @@ mod tests {
         let entity = format_entity_ready_response(CreateEntityResponse {
             id: "ent_alice".into(),
             warnings: vec!["resolved existing canonical entity".into()],
+            space: None,
+            space_source: Some(wenlan_types::WriteSpaceSource::Uncategorized),
+            write_outcome: Some(wenlan_types::WriteOutcome::ResolvedExisting),
         });
         assert!(entity.starts_with("Entity ent_alice ready"));
         assert!(!entity.contains("Created"));
         assert!(entity.contains("warning: resolved existing canonical entity"));
+        assert!(entity.contains("space: Uncategorized"));
+        assert!(entity.contains("write_outcome: resolved_existing"));
 
         let relation = format_relation_ready_response(CreateRelationResponse {
             id: "rel_alice_wenlan".into(),
@@ -5463,6 +5538,34 @@ mod tests {
     }
 
     #[test]
+    fn default_space_fills_an_omitted_argument() {
+        let _guard = crate::lock_state::ENV_LOCK.blocking_lock();
+        std::env::remove_var("WENLAN_SPACE");
+        std::env::set_var("WENLAN_DEFAULT_SPACE", "fallback");
+        crate::lock_state::init_from_env();
+
+        let resolved = effective_space(&None);
+        assert_eq!(resolved.as_deref(), Some("fallback"));
+
+        std::env::remove_var("WENLAN_DEFAULT_SPACE");
+        crate::lock_state::init_from_env();
+    }
+
+    #[test]
+    fn explicit_tool_space_beats_default_space() {
+        let _guard = crate::lock_state::ENV_LOCK.blocking_lock();
+        std::env::remove_var("WENLAN_SPACE");
+        std::env::set_var("WENLAN_DEFAULT_SPACE", "fallback");
+        crate::lock_state::init_from_env();
+
+        let resolved = effective_space(&Some("explicit".to_string()));
+        assert_eq!(resolved.as_deref(), Some("explicit"));
+
+        std::env::remove_var("WENLAN_DEFAULT_SPACE");
+        crate::lock_state::init_from_env();
+    }
+
+    #[test]
     fn unlocked_empty_inbound_yields_none() {
         let _guard = crate::lock_state::ENV_LOCK.blocking_lock();
         std::env::remove_var("WENLAN_SPACE");
@@ -5611,6 +5714,25 @@ mod tests {
             props.contains_key("space"),
             "space field must be present in capture schema when WENLAN_SPACE is not locked"
         );
+    }
+
+    #[test]
+    fn default_space_keeps_explicit_space_in_tool_schema() {
+        let _guard = crate::lock_state::ENV_LOCK.blocking_lock();
+        std::env::remove_var("WENLAN_SPACE");
+        std::env::set_var("WENLAN_DEFAULT_SPACE", "fallback");
+        crate::lock_state::init_from_env();
+
+        let tools = WenlanMcpServer::tool_router().list_all();
+        let capture = tools
+            .iter()
+            .find(|tool| tool.name == "capture")
+            .expect("capture tool registered");
+        let props = capture.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("space"));
+
+        std::env::remove_var("WENLAN_DEFAULT_SPACE");
+        crate::lock_state::init_from_env();
     }
 
     /// Collect `properties.<name>` entries whose schema is a bare boolean.

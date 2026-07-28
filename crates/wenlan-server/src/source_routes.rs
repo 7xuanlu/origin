@@ -1387,7 +1387,7 @@ mod tests {
                     content: "Source Page body survives an identical-content rename.".to_string(),
                     summary: None,
                     entity_id: None,
-                    space: None,
+                    space: None.into(),
                     source_memory_ids: orig_chunk_ids,
                     creation_kind: Some("source".to_string()),
                     workspace: None,

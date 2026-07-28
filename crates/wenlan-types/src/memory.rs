@@ -353,6 +353,8 @@ pub struct Space {
     pub description: Option<String>,
     pub suggested: bool,
     pub starred: bool,
+    #[serde(default)]
+    pub is_default: bool,
     pub sort_order: i64,
     pub memory_count: u64,
     pub entity_count: u64,

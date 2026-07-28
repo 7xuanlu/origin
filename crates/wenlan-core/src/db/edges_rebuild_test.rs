@@ -195,7 +195,7 @@ async fn rerun_migrations_from_96(db: &MemoryDB) {
     }
     db.run_migrations(&crate::events::NoopEmitter)
         .await
-        .expect("migration 97 must be re-runnable");
+        .expect("migration 98 must be re-runnable");
     let conn = db.conn.lock().await;
     let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
     let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
@@ -620,7 +620,7 @@ async fn an_update_may_not_repoint_an_attestation_at_a_machine_root() {
 /// very thing under test, which proves nothing when the two drift.
 ///
 /// So: build the widened shape the migration builds, and show the row bounces
-/// off it. Migration 97 wraps that in a transaction, which is what turns a
+/// off it. Migration 98 wraps that in a transaction, which is what turns a
 /// bounced row into a rolled-back migration.
 #[tokio::test]
 async fn a_pre_m5_supports_row_cannot_enter_the_widened_table() {
@@ -729,7 +729,7 @@ async fn the_copy_verifier_catches_a_corrupted_copy() {
 /// would still exist, still pass `integrity_check`, and still open — and would
 /// be worthless as a rollback target. So the drill asserts the M5 tables are
 /// ABSENT from it: `claims`, `claim_revisions`, and `entailment_cache` are
-/// created BY migration 97, so a restore point that contains them was taken too
+/// created BY migration 98, so a restore point that contains them was taken too
 /// late. That check cannot be satisfied by a backup of the post-rebuild state,
 /// which is exactly the failure a rollback plan must not have.
 ///
@@ -754,7 +754,7 @@ async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
         .join("pre_migration_97_backup.db");
     assert!(
         dest.exists(),
-        "migration 97 must leave a restore point at {}",
+        "migration 98 must leave a restore point at {}",
         dest.display()
     );
 
@@ -795,7 +795,7 @@ async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
         let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(
             present, 0,
-            "{table} is created BY migration 97, so a restore point holding it was \
+            "{table} is created BY migration 98, so a restore point holding it was \
              taken after the rebuild and rolls back to nothing"
         );
     }
@@ -814,7 +814,7 @@ async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
 /// pre-existing orphan in some unrelated table is a real historical
 /// possibility — and it would abort 97, roll back, and leave `user_version` at
 /// 96. The daemon would then fail on every subsequent boot with
-/// "m97 rebuild left a dangling foreign-key reference", blaming the rebuild for
+/// "m98 rebuild left a dangling foreign-key reference", blaming the rebuild for
 /// damage it did not cause, with no way forward short of hand-surgery on the
 /// user's database.
 ///

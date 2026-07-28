@@ -139,6 +139,7 @@ pub async fn handle_status(
         reranker_light: reranker_light_status,
         reranker_mode,
         on_device_inference,
+        capabilities: vec!["default_save_space".to_string()],
     }))
 }
 
@@ -1930,7 +1931,7 @@ mod redistill_contract_tests {
                 content: "original body".to_string(),
                 summary: None,
                 entity_id: None,
-                space: None,
+                space: (None).into(),
                 source_memory_ids: Vec::new(),
                 creation_kind: Some("authored".to_string()),
                 workspace: None,
@@ -2117,7 +2118,7 @@ mod context_page_selection_tests {
                 entity_id: None,
                 source_memory_ids: vec![source_id.to_string()],
                 creation_kind: Some("distilled".to_string()),
-                space: Some(space.to_string()),
+                space: (Some(space.to_string())).into(),
                 workspace: Some(space.to_string()),
             },
             "test",
@@ -2336,7 +2337,7 @@ mod search_supplemental_pages_tests {
                 entity_id: None,
                 source_memory_ids: vec![source_id.to_string()],
                 creation_kind: Some("distilled".to_string()),
-                space: Some(space.to_string()),
+                space: (Some(space.to_string())).into(),
                 workspace: Some(space.to_string()),
             },
             "test",

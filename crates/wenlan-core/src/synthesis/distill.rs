@@ -755,7 +755,7 @@ async fn distill_one_cluster_with_tuning(
                         content: content.clone(),
                         summary: summary.clone(),
                         entity_id: cluster.entity_id.clone(),
-                        space: cluster.space.clone(),
+                        space: (cluster.space.clone()).into(),
                         source_memory_ids: cluster.source_ids.clone(),
                         creation_kind: Some("distilled".to_string()),
                         workspace: cluster.space.clone(),

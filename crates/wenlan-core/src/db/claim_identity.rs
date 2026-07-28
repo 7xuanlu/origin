@@ -11,7 +11,7 @@
 //! `CHECK` constraint, so adding the `claim_revision`/`root` endpoint kinds and
 //! the `attests` edge type needs the guarded row-for-row table rebuild of
 //! `docs/plans/2026-07-27-m5-edge-rebuild-matrix.md` §7. Both run inside the
-//! one migration 97 transaction, tables first, because the rebuilt space fence
+//! one migration 98 transaction, tables first, because the rebuilt space fence
 //! resolves a `claim_revision` endpoint through `claim_revisions` — a
 //! half-stamped 97 is exactly the state the ordering invariant
 //! (`docs/plans/2026-07-27-m5-migration-state-machine.md` §7.1) forbids.
@@ -312,7 +312,7 @@ impl MemoryDB {
             );",
         )
         .await
-        .map_err(|error| WenlanError::VectorDb(format!("m97 claim-identity DDL: {error}")))?;
+        .map_err(|error| WenlanError::VectorDb(format!("m98 claim-identity DDL: {error}")))?;
         Ok(())
     }
 
@@ -361,7 +361,7 @@ impl MemoryDB {
                 libsql::params![now],
             )
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m98 backfill truth state: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m99 backfill truth state: {error}")))?;
 
         let mut rows = tx
             .query(
@@ -372,17 +372,17 @@ impl MemoryDB {
                 (),
             )
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m98 coverage check: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m99 coverage check: {error}")))?;
         let uncovered: i64 = rows
             .next()
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m98 coverage read: {error}")))?
-            .ok_or_else(|| WenlanError::VectorDb("m98 coverage returned no row".into()))?
+            .map_err(|error| WenlanError::VectorDb(format!("m99 coverage read: {error}")))?
+            .ok_or_else(|| WenlanError::VectorDb("m99 coverage returned no row".into()))?
             .get(0)
-            .map_err(|error| WenlanError::VectorDb(format!("m98 coverage decode: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m99 coverage decode: {error}")))?;
         if uncovered != 0 {
             return Err(WenlanError::VectorDb(format!(
-                "m98 backfill left {uncovered} page(s) with no truth row"
+                "m99 backfill left {uncovered} page(s) with no truth row"
             )));
         }
         Ok(filled)

@@ -3,6 +3,7 @@
 //!
 //! - When body omits `space`, the header value is used.
 //! - When body supplies `space`, the body wins regardless of the header.
+//! - An unregistered named header fails closed without mutating data.
 
 mod common;
 
@@ -167,8 +168,9 @@ async fn body_space_wins_over_header() {
 }
 
 #[tokio::test]
-async fn unregistered_header_space_is_not_stored_or_auto_created() {
+async fn unregistered_header_space_is_rejected_without_mutation() {
     let (router, _tmp, db) = common::test_app().await;
+    let content = "unregistered header space must fail without storing content";
 
     let req = Request::builder()
         .method("POST")
@@ -177,7 +179,7 @@ async fn unregistered_header_space_is_not_stored_or_auto_created() {
         .header("X-Origin-Space", "surprise-topic")
         .body(Body::from(
             serde_json::json!({
-                "content": "unregistered header space should stay uncategorized",
+                "content": content,
                 "memory_type": "fact"
             })
             .to_string(),
@@ -185,28 +187,25 @@ async fn unregistered_header_space_is_not_stored_or_auto_created() {
         .unwrap();
 
     let res = router.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK, "store must return 200");
-
-    let stored: StoreMemoryResponse = body_as_json(res).await;
-    let space = db
-        .get_memory_space(&stored.source_id)
-        .await
-        .expect("get_memory_space must not fail");
     assert_eq!(
-        space, None,
-        "unregistered resolved spaces must not be persisted to memories"
+        res.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "store must reject an unregistered header Space"
+    );
+    let error: serde_json::Value = body_as_json(res).await;
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("not registered")),
+        "{error}"
+    );
+    assert!(
+        !db.has_memory_content(content).await.unwrap(),
+        "a rejected header Space must not persist the memory"
     );
     assert!(
         db.get_space("surprise-topic").await.unwrap().is_none(),
-        "unregistered resolved spaces must not auto-create a spaces row"
-    );
-    assert!(
-        stored
-            .warnings
-            .iter()
-            .any(|w| w.contains("surprise-topic") && w.contains("not registered")),
-        "response should suggest registering the ignored space; warnings={:?}",
-        stored.warnings
+        "a rejected header Space must not auto-create a spaces row"
     );
 }
 
@@ -995,7 +994,7 @@ async fn create_entity_uses_header_when_body_omits_space() {
 }
 
 #[tokio::test]
-async fn create_entity_unregistered_header_space_is_not_stored_or_auto_created() {
+async fn create_entity_unregistered_header_space_is_rejected_without_mutation() {
     let (router, _tmp, db) = common::test_app().await;
 
     let req = Request::builder()
@@ -1015,22 +1014,26 @@ async fn create_entity_unregistered_header_space_is_not_stored_or_auto_created()
     let res = router.oneshot(req).await.unwrap();
     assert_eq!(
         res.status(),
-        StatusCode::OK,
-        "create_entity must return 200"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "create_entity must reject an unregistered header Space"
     );
-
-    let created: CreateEntityResponse = body_as_json(res).await;
-    let detail = db
-        .get_entity_detail(&created.id)
-        .await
-        .expect("get_entity_detail must not fail");
-    assert_eq!(
-        detail.entity.space, None,
-        "unregistered header spaces must not be persisted to entities"
+    let error: serde_json::Value = body_as_json(res).await;
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("not registered")),
+        "{error}"
+    );
+    assert!(
+        db.search_entities_by_name("test_ent_unregistered_header")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected header Space must not persist the entity"
     );
     assert!(
         db.get_space("surprise-entity").await.unwrap().is_none(),
-        "unregistered header spaces must not auto-create a spaces row"
+        "a rejected header Space must not auto-create a spaces row"
     );
 }
 
@@ -1120,7 +1123,7 @@ async fn create_page_uses_header_when_body_omits_space() {
 }
 
 #[tokio::test]
-async fn create_page_unregistered_header_space_is_not_stored_or_auto_created() {
+async fn create_page_unregistered_header_space_is_rejected_without_mutation() {
     let _env_lock = data_dir_lock().lock().await;
     let _config = WritableKnowledgeConfig::new();
     let (router, _tmp, db) = common::test_app_no_gate().await;
@@ -1175,27 +1178,23 @@ async fn create_page_unregistered_header_space_is_not_stored_or_auto_created() {
         .unwrap();
     assert_eq!(
         create_res.status(),
-        StatusCode::OK,
-        "create_page must return 200"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "create_page must reject an unregistered header Space"
     );
-
-    let created: CreatePageResponse = body_as_json(create_res).await;
-    let page = db
-        .get_page(&created.id)
-        .await
-        .expect("get_page must not fail")
-        .expect("page must exist after creation");
-    assert_eq!(
-        page.space, None,
-        "unregistered header spaces must not be copied into pages.space"
+    let error: serde_json::Value = body_as_json(create_res).await;
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("not registered")),
+        "{error}"
     );
-    assert_eq!(
-        page.workspace, None,
-        "unregistered header spaces must not be persisted to pages.workspace"
+    assert!(
+        db.list_pages("active", 100, 0).await.unwrap().is_empty(),
+        "a rejected header Space must not persist the page"
     );
     assert!(
         db.get_space("surprise-page").await.unwrap().is_none(),
-        "unregistered header spaces must not auto-create a spaces row"
+        "a rejected header Space must not auto-create a spaces row"
     );
 }
 

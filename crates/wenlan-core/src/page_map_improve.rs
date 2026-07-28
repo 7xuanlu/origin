@@ -475,7 +475,7 @@ mod tests {
                 entity_id: None,
                 source_memory_ids,
                 creation_kind: Some("distilled".to_string()),
-                space: Some("default".to_string()),
+                space: (Some("default".to_string())).into(),
                 workspace: Some("default".to_string()),
             },
             "test",

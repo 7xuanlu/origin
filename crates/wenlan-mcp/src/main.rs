@@ -104,9 +104,17 @@ async fn main() -> anyhow::Result<()> {
 
     wenlan_mcp::lock_state::init_from_env();
     if let Some(space) = wenlan_mcp::lock_state::locked_space() {
-        eprintln!("wenlan-mcp: WENLAN_SPACE lock active, space=\"{}\"", space);
+        eprintln!(
+            "wenlan-mcp: WENLAN_SPACE strict pin active, space=\"{}\"",
+            space
+        );
+    } else if let Some(space) = wenlan_mcp::lock_state::default_space() {
+        eprintln!(
+            "wenlan-mcp: WENLAN_DEFAULT_SPACE fallback active, space=\"{}\"",
+            space
+        );
     } else {
-        eprintln!("wenlan-mcp: WENLAN_SPACE lock inactive (no lock)");
+        eprintln!("wenlan-mcp: no process Space context");
     }
 
     match cli.command {
