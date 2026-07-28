@@ -17,7 +17,8 @@ Every one is durable, and no two are inferred from each other.
 | `claim_migration_state` | PR-A | same shape, own row |
 | truth-contract version | PR-B | integer, per client declaration |
 | readiness watermark | PR-B | 0–100%, durable |
-| **cutover generation** | PR-C | `off` → `preparing` → `committed` |
+| **cutover fence** | PR-C | `(epoch, phase)`; epoch monotonic, phase `off \| preparing \| committed` (§6) |
+| directory identities | PR-C | active / prepared / previous |
 | projection manifest digest | PR-C | over (page, version, content digest) |
 | projection watermark | PR-C | + pending-outbox count |
 | writer fence / cutover lease | PR-C | held / released |
@@ -170,12 +171,45 @@ now provisional, and the new one may be incomplete.
 | PR-A pre-`user_version` | drop new tables; old schema intact |
 | PR-A post-`user_version` | forward-only; restore from the §2 backup (drill-verified) |
 | PR-B | flip adapters off; no durable state changed |
-| PR-C `preparing` | restore previous directory, release lease, state → `off` |
-| PR-C `committed` | reverse cutover: rebuild the full directory, set generation `off`, under the same lease |
+| PR-C `preparing` | restore previous directory, release lease, phase → `off` at a **new epoch** |
+| PR-C `committed` | **forward-only.** Stop jobs, retain fail-closed filtering. Never re-expose provisional prose. |
 
-`committed` → `off` is a supported operation, not an emergency improvisation. It
-runs the same ceremony in reverse under the same fence, and it is exercised by a
-test rather than documented and hoped for.
+### `committed` never returns to `off`
+
+An earlier draft made `committed → off` a supported reverse cutover that
+rebuilt the *full* legacy directory. That directly violates the governing
+rollback contract, which says PR-C rollback must "stop jobs and retain
+fail-closed truth filtering. Never flip back to exposing provisional prose"
+(`2026-07-27-kg-m5-goal-prompt.md:629`).
+
+Rebuilding the full directory is exactly that flip: every provisional page's
+prose reappears at a path `wenlan pages` reads directly, with no wire
+negotiation able to stop it. The draft had reasoned that a reverse path is
+better than an improvisation — true in general, wrong here, because the
+"reverse" restores a state that is now known to be unsafe.
+
+What is permitted after `committed`:
+
+- **stop jobs** and keep serving supported-only, which is the fail-closed state;
+- **forward fix**, always preferred;
+- **selective snapshot restore**, allowed only when no later human edit depends
+  on the post-cutover state; otherwise replay the preserved human edits or stay
+  forward-only.
+
+The projection directory stays supported-only in every one of these.
+
+### The fence is an epoch, not a three-state enum
+
+`off → preparing → committed → off` would let a stale writer that captured `off`
+before the ceremony CAS successfully afterwards — a textbook ABA. The phase enum
+alone cannot distinguish "the `off` I read" from "a later `off`."
+
+The fence is therefore `(epoch, phase)` where **epoch is monotonically
+increasing** and every transition bumps it. A writer CASes the pair, so a stale
+`off` capture fails against a higher epoch even when the phase matches. The
+durable state additionally records the identities of the **active**,
+**prepared**, and **previous** directories, so recovery never has to infer which
+directory a given epoch meant.
 
 ## 7. Ordering invariants
 
@@ -191,6 +225,11 @@ Each is a separate test:
 
 ## 8. Mutation checks
 
+Rows marked **[gate]** are human review gates, not executable tests. They are
+listed because they must happen, but they are not teeth — a table that mixes the
+two lets a process promise stand in for a failing build. Every unmarked row is
+an executable test that goes RED under its weakening.
+
 | Weakening | Must fail |
 |---|---|
 | stamp `user_version` before guards commit | §7.1 |
@@ -204,8 +243,10 @@ Each is a separate test:
 | serve the legacy directory in an indeterminate state | §5 row 3 |
 | let a writer skip the cutover-generation CAS | §4.1 test |
 | open a v97 database with a pre-M5 binary | §2 downgrade test |
-| accept a backup without a restore drill | §2 — release checklist |
-| ship `committed` with no reverse path | §6 reverse-cutover test |
-| treat readiness = 100% as sufficient for cutover | §4a gate |
-| satisfy §4a with an aggregate supported-fraction | §4a |
+| accept a backup without a restore drill | **[gate]** §2 release checklist |
+| roll `committed` back to `off` by rebuilding the full directory | §6 — after a `committed→off` attempt, assert no provisional page's prose exists in the projection dir |
+| use a bare phase enum as the writer fence | §6 ABA test: stale `off` capture must fail against a higher epoch |
+| infer a directory identity from the epoch | §6 — recovery with two epochs mapped to the same directory name must refuse, not pick |
+| treat readiness = 100% as sufficient for cutover | §4a — ceremony must refuse to start without a recorded gate approval |
+| satisfy §4a with an aggregate supported-fraction | §4a — the recorded approval must carry per-class fractions |
 | ship PR-A without the human-root minter | artifact 6 §2a / artifact 3 §5 |

@@ -146,6 +146,11 @@ receipt, and no export.
 
 ## 8. Mutation checks
 
+Rows marked **[gate]** are human review gates, not executable tests. They are
+listed because they must happen, but they are not teeth — a table that mixes the
+two lets a process promise stand in for a failing build. Every unmarked row is
+an executable test that goes RED under its weakening.
+
 | Weakening | Must fail |
 |---|---|
 | pass the capability to frontend JS | T1 test |
@@ -160,4 +165,4 @@ receipt, and no export.
 | log or return the capability | §7 sentinel test |
 | let a machine job write `attests` | T10 / writer-exclusivity test |
 | degrade to trusting the caller when the secret is missing | §5 test |
-| describe this as hostile-same-user protection | §1 — doc review, not a unit test |
+| describe this as hostile-same-user protection | **[gate]** §1 scope statement |

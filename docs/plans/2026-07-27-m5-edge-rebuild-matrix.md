@@ -30,15 +30,30 @@ Added: endpoint kinds `claim_revision`, `root`; edge type `attests`.
 |---|---|---|---|---|---|---|
 | `mentions` | page | entity | assertion | inherit | optional | existing |
 | `relates` | entity | entity | assertion | inherit | optional | existing |
-| `cites` | page | external | synthesis | 0 | optional | existing |
+| `cites` | page | external | evidence \| legacy | 0 | optional | existing |
+| `cites` | page | **memory** | evidence \| legacy | inherit | optional | existing |
 | `links` | page | page | synthesis | 0 | optional | existing |
-| `supports` | **claim_revision** | **memory** | evidence | see §3 | required | D8 finalizer only |
-| `attests` | **root** | **claim_revision** | assertion | 0 | required, = src | UI-presence txn only |
+| `supports` | **claim_revision** | **memory** | **evidence** | see §3 | required | D8 finalizer only |
+| `attests` | **root** | **claim_revision** | **assertion** | 0 | required, = src | UI-presence txn only |
+
+`cites page→memory` is **live production behavior**, not a hypothetical: the
+backfill emits it (`db.rs:17937`) and both `dual_write_edge` call sites emit it
+with lineage `evidence`, or `legacy` on a cross-space downgrade
+(`db.rs:41004`, `db.rs:45178`). An earlier draft of this table listed only
+`cites page→external`, which would have made PR-A's assignment guard reject
+existing rows and break the row-for-row no-behavior-change contract. The guard
+is the dangerous half of "one edge store": it must be derived from what the
+tree actually writes, never from what the spec's prose enumerates.
 
 Every tuple not in this table is rejected. The CHECK constraints permit the
 column values; a separate writer-side assignment guard rejects unlisted
 combinations, because a widened CHECK alone would newly permit nonsense like
 `root → external` or `claim_revision → page`.
+
+**PR-A must verify the guard against a full census of live tuples**
+(`SELECT DISTINCT edge_type, src_kind, dst_kind, lineage FROM edges`) on a
+migrated production-shaped database before the guard is enabled. Any tuple the
+census finds and this table omits is a defect in this table.
 
 ### Legacy `supports`
 
@@ -77,10 +92,38 @@ endpoint's space with `CASE kind WHEN 'page' … WHEN 'memory' … WHEN 'entity'
 ELSE NULL END`, then aborts when the resolved value `IS NOT NEW.space`. Because
 `IS NOT` is null-safe, an unknown kind resolves to NULL and **always aborts**.
 
-Verified consequence: with the CHECK widened but the fence untouched, *every*
-`supports` and `attests` edge is rejected at insert. That is the correct default
-— fail-closed — and it means the fence extension is a deliberate, reviewable
-act rather than an oversight that silently permits cross-space edges.
+Verified consequence: with the CHECK widened but the fence untouched, every
+**non-legacy** `supports` and `attests` edge is rejected at insert.
+
+### The legacy-lineage bypass — a fail-open lane
+
+Both fence triggers are guarded by `WHEN NEW.lineage != 'legacy'`
+(`db.rs:8995`). A row with `lineage='legacy'` **skips the trigger body
+entirely** — no space check, no unknown-kind rejection. So "every new support
+edge aborts" is false as stated, and the gap is not theoretical:
+
+a `claim_revision → memory` row written with `lineage='legacy'` bypasses the
+SQL fence completely. If the M5 support indexes and queries discriminate only
+on `edge_type` and `src_kind` — as an earlier draft of §6 did — that row lands
+directly in the **trusted** support set, and the only thing standing between it
+and false `supported` is every writer being perfect. A fail-closed design must
+not rest on that.
+
+### The lineage tooth
+
+Lineage is therefore part of the M5 contract, not incidental metadata:
+
+- a claim support edge is **`lineage='evidence'`**, always;
+- an attestation edge is **`lineage='assertion'`**, always;
+- **every** M5 support/attestation query and index filters on lineage in
+  addition to `edge_type` and `src_kind` (§6);
+- a `claim_revision`- or `root`-endpoint row carrying `lineage='legacy'` is
+  invalid by construction. Since the SQL fence cannot see it, a **separate
+  CHECK constraint** on the rebuilt table enforces it — CHECKs, unlike these
+  triggers, have no lineage exemption.
+
+The CHECK is what makes this fail-closed at the storage layer rather than at
+the writer. The rebuild in §7 is the one chance to add it.
 
 Required extensions:
 
@@ -97,6 +140,54 @@ comment, an earlier WHEN clause disabled the whole trigger body and skipped the
 source check). The new exemption is written in the same narrow form for the
 same reason.
 
+## 4a. Support edges must bind the exact span and the exact verdict
+
+D2 requires a support edge "to an exact source span"
+(`2026-07-27-kg-m5-goal-prompt.md:88`). The `edges` table has **no span
+columns** (`db.rs:8910`) — only `src_id`/`dst_id`. A `claim_revision → memory`
+edge therefore names a *memory*, not a span within it, which is not what D2
+asks for and is not enough to prove later that the thing judged is the thing
+cited.
+
+Nothing in Stage 0 previously closed this: artifact 1 §3 defines anchors on
+*claim revisions*, and artifact 6 §2 puts `source_span_digest` in the
+*entailment cache key* — but no column bound the **edge** to either. Three
+independent records of "the evidence" with nothing forcing them to agree is the
+same drift pattern this program has hit repeatedly.
+
+The support edge's immutable payload therefore carries, and PR-A freezes:
+
+| Field | Binds |
+|---|---|
+| `source_version` | the exact memory version the span was read from |
+| `span_start`, `span_end` | offsets into that version |
+| `span_digest` | SHA-256 of the exact span bytes |
+| `model_id`, `model_version`, `prompt_version` | which judge produced this |
+| `score`, `threshold_at_write` | the verdict and the bar it cleared |
+
+Two invariants, both testable:
+
+1. **Same-evidence invariant.** `span_digest` on the edge equals the
+   `source_span_digest` component of the entailment-cache key that produced the
+   verdict, and equals the digest of the bytes at `[span_start, span_end)` in
+   `source_version`. If any pair disagrees, the edge is invalid and its claim is
+   `provisional`.
+2. **Same-verdict invariant.** The edge's `model_id`/`model_version`/
+   `prompt_version`/`score` are the ones the cache recorded. A support edge may
+   never be written from a verdict it cannot name.
+
+Anchor validity (artifact 1 §3) applies here unchanged: offsets alone are never
+trusted, so a span whose digest no longer matches invalidates the support edge
+rather than silently re-pointing it at whatever text now occupies those offsets.
+
+### The human-delta destination
+
+Artifact 6 §2a's human edit delta must be reachable as a `memory` destination
+with the same five span fields, because §2 permits no other destination kind for
+`supports`. PR-A stores the delta as a memory with a provenance root of kind
+`human_edit_delta`; the delta's span is then addressable exactly like any other
+evidence span. Without that, §2a has no representable edge.
+
 ## 5. Root rule
 
 `root_id` is required on `supports` and `attests`.
@@ -111,8 +202,10 @@ same reason.
 
 **Verified gap.** Neither human root kind is minted anywhere in production. The
 `CHECK` permits them (`db.rs:8898`) and the only minter in the tree is
-`acquire_provenance_root("document_ingest", …)` (`edge_grounding.rs:537`); the
-human kinds otherwise appear only in a `provenance.rs` unit test. So attestation
+`acquire_provenance_root("document_ingest", …)` (`edge_grounding.rs:537`).
+Of the two human kinds, only `human_capture` appears anywhere else at all, in a
+`provenance.rs:232` unit test; `human_edit_delta` exists **solely** as a CHECK
+literal. So attestation
 has **no valid source root today**. PR-A must deliver the human-root minter —
 see artifact 6 §2a, which needs the same minter for the human-prose evidence
 path. One missing component blocks both.
@@ -129,14 +222,19 @@ for the two hot traversals:
 
 | Index | Definition | Serves |
 |---|---|---|
-| `idx_edges_supports_fwd` | `(src_id, dst_id)` WHERE `edge_type='supports' AND src_kind='claim_revision' AND valid_until IS NULL` | is this revision supported? |
-| `idx_edges_supports_rev` | `(dst_id)` WHERE `edge_type='supports' AND src_kind='claim_revision' AND valid_until IS NULL` | what does this memory support? |
-| `idx_edges_attests_fwd` | `(dst_id)` WHERE `edge_type='attests' AND valid_until IS NULL` | who attested this revision? |
-| `idx_edges_attests_rev` | `(src_id, dst_id)` WHERE `edge_type='attests' AND valid_until IS NULL` | what has this root attested? |
+| `idx_edges_supports_fwd` | `(src_id, dst_id)` WHERE `edge_type='supports' AND src_kind='claim_revision' AND lineage='evidence' AND valid_until IS NULL` | is this revision supported? |
+| `idx_edges_supports_rev` | `(dst_id)` WHERE `edge_type='supports' AND src_kind='claim_revision' AND lineage='evidence' AND valid_until IS NULL` | what does this memory support? |
+| `idx_edges_attests_fwd` | `(dst_id)` WHERE `edge_type='attests' AND src_kind='root' AND lineage='assertion' AND valid_until IS NULL` | who attested this revision? |
+| `idx_edges_attests_rev` | `(src_id, dst_id)` WHERE `edge_type='attests' AND src_kind='root' AND lineage='assertion' AND valid_until IS NULL` | what has this root attested? |
 
-All four are active-only. Support-status evaluation (§1 of the truth-state
-matrix) runs per page version and must not degrade to a scan; the benchmark in
-artifact 6 measures it.
+All four are active-only, and all four carry the **lineage predicate** from §4.
+The index predicates and the query predicates must be written once and shared —
+an index that filters lineage while a query does not would still read the
+bypassed row via a scan, which defeats the tooth without failing any test that
+only inspects the index definition.
+
+Support-status evaluation (§1 of the truth-state matrix) runs per page version
+and must not degrade to a scan; the benchmark in artifact 6 measures it.
 
 ## 7. Rebuild
 
@@ -192,13 +290,19 @@ guards in M4.
 
 | Weakening | Must fail |
 |---|---|
-| widen CHECK without extending the fence | §4 test: `supports` insert must abort |
+| extend the fence to resolve an unknown kind as "no space" instead of aborting | §4: cross-space `supports` insert must abort |
+| write a `claim_revision` support edge with `lineage='legacy'` | §4 CHECK test — the SQL fence cannot catch this one |
+| drop the lineage predicate from a support index **or** its query | §6 — bypassed row must not enter the trusted set |
+| omit `cites page→memory` from the assignment guard | §2 live-tuple census |
+| omit span/verdict fields from the support payload | §4a same-evidence invariant |
+| let edge `span_digest` differ from the cache key's | §4a invariant 1 |
+| write a support edge whose verdict it cannot name | §4a invariant 2 |
 | exempt `root` on both sides instead of source-only | cross-space `attests` accepted |
 | allow `attests` where `root_id != src_id` | §5 test |
 | allow a `generated` root to attest | §5 test |
 | let `supports` set `grounded=1` from an ungrounded memory | §3 test |
 | let the D8 finalizer write `attests` | writer-exclusivity test |
 | treat legacy `supports` rows as claim supports | §2 discriminator test |
-| skip the row-count or checksum verify | §7.5 test on a seeded corpus |
+| skip the row-count or checksum verify | §7.5 **with fault injection** — drop and alter a row mid-copy; a clean corpus stays green either way, so the oracle must corrupt something |
 | stamp `user_version` before recreating triggers | §7 ordering test |
 | resume from cursor without re-verifying the prefix | §7 resumability test |

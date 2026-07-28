@@ -79,14 +79,42 @@ context, which trains people to stop curating. For a curation product that is
 fatal, and no amount of `human_reviewed` rescues it, because that axis
 deliberately does not feed `support_status`.
 
-### The path, from D4
+### The path, from D4 — with D4's actual preconditions
 
-Human saves mint a grounded `human_edit_delta` root, computed against the exact
-immutable `page_history` snapshot and carrying `operation_id`. That delta — the
-exact text the human wrote — is stored span-addressably and becomes the
-evidence a claim derived from human prose is judged against. D4's rule for
-`observation` applies: it counts as **one independence group** and supports
-another claim **only after exact-delta entailment**.
+**Only** a save that supplies a valid exact `base_version + base_content_digest`
+mints a grounded `human_edit_delta`, computed against the exact immutable
+`page_history` snapshot and carrying `operation_id`. Per D4
+(`2026-07-27-kg-m5-goal-prompt.md:197`):
+
+| Save shape | Result |
+|---|---|
+| valid exact base supplied | grounded `human_edit_delta` minted |
+| **stale** base supplied | **conflict, nothing written** — no delta |
+| base **omitted** | saves prose, mints **no** grounded delta |
+
+The omitted-base case is the one that matters here and the one an earlier draft
+of this section erased by saying "human saves mint grounded deltas" flatly. A
+no-base save produces prose with **no** evidence, so its claims are
+`provisional` and its page cannot reach `supported` until a based save or a
+derivation supplies evidence. That is correct, and it must be stated rather than
+papered over.
+
+D4 also constrains **which** assertion kinds may act as evidence
+(`2026-07-27-kg-m5-goal-prompt.md:190`):
+
+- **`observation`** — may support another claim, as **one independence group**,
+  only after exact-delta entailment. This is the only kind that does.
+- **`correction`** — requires the exact current target revision and digest; a
+  stale target conflicts. Cross-page consequences stage review; they never
+  silently rewrite another page.
+- **`preference`** — subject-bound, never generalized into factual structure.
+- **`speculation`** — retains modality; cannot support an unqualified factual
+  claim.
+- legacy/missing kind — NULL, unclassified, **non-voting**.
+
+So "human prose is evidence" is false in general and true only for an eligible
+`observation` delta from an exact-base save. Any broader reading would let a
+preference or a speculation support a factual claim, which D4 forbids outright.
 
 This is not circular. Entailment against the human's own text checks that the
 derived claim does not **overreach** what the human actually wrote. A claim that
@@ -163,6 +191,43 @@ Per-version thresholds (above) are what make this coherent: scores from the two
 versions are never compared, they are simply each valid under their own
 threshold while their version is `active` or `draining`.
 
+### Eligibility generation — how bulk demotion stays atomic
+
+Artifact 2 requires demotion in the trigger's own transaction. A retirement or
+threshold change affects an unbounded number of pages, so "synchronous **and**
+batched" is a contradiction: either one enormous transaction, or a window in
+which eligibility has changed while stored rows still read `supported`.
+
+Neither is acceptable, so bulk eligibility changes do **not** rewrite page rows
+to take effect. They bump a single durable **eligibility generation**:
+
+- the eligibility table holds `(model_id, model_version, prompt_version) →
+  {state, threshold, generation}`;
+- one monotonic generation counter covers all of it;
+- **every** support-status read joins through that table, so retiring a version
+  or raising a threshold changes what every affected page reports **at the
+  instant the generation commits** — one row written, no window;
+- stored `support_status` is then reconciled to match, batched and bounded,
+  purely as a materialization. Because reads already join eligibility, a page
+  whose stored value is momentarily stale still **reads** `provisional`.
+
+This is the M4 control-plane shape again — one global monotonic generation, one
+central gate — and it is why bulk changes need no unbounded transaction.
+Per-edge events (a retraction) stay synchronous as artifact 2 specifies; only
+the unbounded class routes through the generation.
+
+### The finalizer must CAS eligibility too
+
+D8's finalizer CASes `(page_version, dependency_generation,
+active_root_set_digest)`. None of those move when a model is retired or a
+threshold is raised, so a job that began under the old regime can finalize
+afterwards and **republish stale support** — a verdict from a retired judge
+written as fresh evidence.
+
+The finalizer therefore also captures and re-checks the **eligibility
+generation** before commit. A mismatch is a CAS miss: zero visible rows,
+requeue, re-judge under the current regime.
+
 ## 4. Retry and lease
 
 - Durable derivation jobs with leases. A lease has an owner, an expiry, and an
@@ -211,15 +276,32 @@ optimal; PR-A may lower them on evidence and may raise them only on evidence.
 
 ## 7. Benchmark
 
-**Corpus (frozen at Stage 0):** a representative synthetic corpus of
-**100k memories / 5k pages**, generated by a seeded, checked-in generator so any
-reviewer reproduces the same bytes. Page-size distribution matches the observed
-production distribution rather than a uniform average, because tail pages, not
-median pages, are what breach a budget.
+A corpus is "frozen" only if a reviewer can regenerate it byte-for-byte and
+check that they did. Naming a size and a property is not freezing. The following
+identifiers are the freeze, and PR-A creates each at these exact paths:
 
-Plus a hand-built **judge accuracy set**: labelled (claim, span, entails?)
-triples including the adversarial cases from artifact 1 §7 — negation (N1) and
-quantifier change (N8) — which a lenient judge will wrongly call supported.
+| Artifact | Path | Frozen by |
+|---|---|---|
+| generator | `crates/wenlan-core/src/eval/m5_bench_corpus.rs` | checked in |
+| seed | `M5_BENCH_SEED: u64 = 0x4d35_0001` | a constant, not a flag |
+| corpus digest | `crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256` | asserted by the bench before it runs |
+| size-distribution snapshot | `crates/wenlan-core/tests/fixtures/m5_page_size_dist.json` | derived once from a real corpus, checked in, cited by digest |
+| judge accuracy set | `crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl` | checked in, digest-asserted |
+
+**Corpus:** **100k memories / 5k pages**, produced by that generator under that
+seed. Page sizes are drawn from the snapshot above rather than a uniform
+average, because tail pages, not median pages, are what breach a budget. The
+snapshot is a checked-in file precisely so "observed production distribution"
+names something a reviewer can open — an undefined phrase would let any later
+run silently change the shape of the test.
+
+The bench recomputes the corpus digest at startup and **refuses to run** on a
+mismatch. A benchmark whose corpus can drift measures nothing across time.
+
+**Judge accuracy set:** labelled `(claim, span, entails?)` triples, including
+every adversarial case from artifact 1 §7 — negation (N1), quantifier change
+(N8), terminator change (N11), acronym case change (N12) — which a lenient judge
+will wrongly call supported.
 
 **Method:**
 
@@ -256,6 +338,11 @@ supported.
 
 ## 8. Mutation checks
 
+Rows marked **[gate]** are human review gates, not executable tests. They are
+listed because they must happen, but they are not teeth — a table that mixes the
+two lets a process promise stand in for a failing build. Every unmarked row is
+an executable test that goes RED under its weakening.
+
 | Weakening | Must fail |
 |---|---|
 | drop `model_version` from the cache key | cross-version hit test |
@@ -269,10 +356,16 @@ supported.
 | retry forever instead of parking | §4 cap test |
 | let a non-pinned backend judge | §1 refusal test |
 | accept the benchmark with a mean instead of p99 | §7 method test |
-| set production constants without benchmark evidence | §7 STOP rule — review gate |
-| leave human-authored prose with no evidence path | §2a — human-edited page must reach `supported` |
+| set production constants without benchmark evidence | **[gate]** §7 STOP rule |
+| leave human-authored prose with no evidence path | §2a — a page edited by an **exact-base save whose claims are eligible `observation`s** must be able to reach `supported` |
+| mint a grounded delta for a no-base or stale-base save | §2a save-shape table |
+| let `preference` or `speculation` support a factual claim | §2a kind table |
+| let an unclassified/legacy-kind claim vote | §2a kind table |
 | let a human delta support a claim that overreaches it | §2a exact-delta test, N1/N8 class |
 | count one human delta as two independence groups | §2a test |
 | retire a model version instantly on upgrade | §3 rolling-eligibility test |
 | demote pages while the old version is `draining` | §3 test |
+| let a support-status read skip the eligibility join | §3 — retire a version, page must read `provisional` immediately |
+| omit the eligibility generation from the finalizer CAS | §3 — retire mid-job, finalize must write zero rows |
+| rewrite page rows as the mechanism of bulk demotion | §3 — unbounded-transaction / stale-window test |
 | report supported-fraction as one aggregate | §2a metric test |

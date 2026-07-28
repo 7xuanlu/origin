@@ -35,8 +35,7 @@ underneath the approval.
 1. Unicode NFC normalization.
 2. Replacing every Unicode whitespace run with a single space (U+0020).
 3. Trimming leading and trailing whitespace.
-4. Removing a single trailing sentence terminator (`.`, `!`, `?`) if present.
-5. Case-folding with `str::to_lowercase`.
+4. Removing a single trailing period (`.`) if present.
 
 `canonical_text_digest` is the SHA-256 of the UTF-8 bytes of `canonical_text`.
 
@@ -45,6 +44,23 @@ It does **not** normalize punctuation inside the sentence, expand contractions,
 strip markdown emphasis, resolve pronouns, or reorder clauses, because each of
 those can change meaning. Two texts that differ after canonicalization are
 different claims, full stop.
+
+### What canonicalization must NOT absorb, and why
+
+Two transforms that look like reformatting are **excluded**, because each can
+change meaning while collapsing to one digest — and a collapsed digest reuses
+the *exact same revision*, carrying old support and attestation onto text a
+human never approved. That is the precise failure this rung exists to prevent,
+so the bar here is meaning-preservation, not tidiness.
+
+| Excluded | Why |
+|---|---|
+| stripping `?` or `!` | *"The alarm is armed?"* and *"The alarm is armed."* are a question and an assertion. Only one of them claims anything. |
+| case folding | case carries meaning: `US` vs `us`, `IT` vs `it`, `Apple` vs `apple`, and acronym-vs-word generally. |
+
+A trailing period is safe to strip because its presence or absence does not
+change what is asserted. `?` and `!` do. The asymmetry is deliberate and is the
+whole reason step 4 names one character rather than a class.
 
 **Non-goal:** canonicalization is not similarity. There is no edit-distance
 threshold anywhere in identity. See §5.
@@ -147,11 +163,10 @@ outcome; the test asserts identity, not similarity.
 | P1 | byte-identical text and anchors |
 | P2 | whitespace reflow (line wrap, double space) |
 | P3 | Unicode NFD → NFC normalization difference |
-| P4 | trailing period added |
-| P5 | case-only change (`Rust` → `rust`) |
-| P6 | claim moved from position 1 to position 4, nothing else changed |
-| P7 | surrounding claims edited, target claim untouched |
-| P8 | one of two anchors invalidated, the other still valid and uniquely matching |
+| P4 | trailing **period** added or removed |
+| P5 | claim moved from position 1 to position 4, nothing else changed |
+| P6 | surrounding claims edited, target claim untouched |
+| P7 | one of two anchors invalidated, the other still valid and uniquely matching |
 
 **Negative cases — identity MUST NOT be preserved:**
 
@@ -167,10 +182,18 @@ outcome; the test asserts identity, not similarity.
 | N8 | quantifier changed (`all` → `some`) |
 | N9 | claim deleted, then identical text reappears two versions later |
 | N10 | anchor digest mismatch with no valid alternate anchor |
+| N11 | terminator changed `.` → `?` (*"The alarm is armed."* → *"The alarm is armed?"*) |
+| N12 | case change that alters an acronym (`US policy` → `us policy`) |
 
-N1 and N8 are the corpus's teeth: both survive any similarity threshold loose
-enough to be useful, which is exactly why identity here is digest equality and
-never similarity.
+N1 and N8 are the corpus's teeth against similarity: both survive any threshold
+loose enough to be useful, which is why identity here is digest equality.
+
+N11 and N12 are the teeth against **over-normalization**, and they are the two
+cases most likely to be reintroduced by a future "let's also normalize…"
+change. Both must fail on identity *and* on the entailment cache (artifact 6
+§2), since the cache reuses `canonical_text_digest` — a canonicalization that
+collapses them would hand the cached verdict for one sentence to a different
+sentence.
 
 ## 7a. Scope note — build this exactly as small as the corpus
 
@@ -184,7 +207,8 @@ which `claim_id` the revision belongs to (artifact 6 §2). And the
 
 What alignment actually buys is narrower and still worth having:
 
-1. per-claim **attestation** persistence across unrelated edits (P6, P7);
+1. per-claim **attestation** persistence across reposition and unrelated edits
+   (P5, P6);
 2. **non-sharing** of trust between duplicate claims (N2);
 3. an audit lineage of what superseded what (§6).
 
@@ -199,12 +223,40 @@ must turn at least one listed case RED:
 
 | Weakening | Must fail |
 |---|---|
-| drop uniqueness condition 3 (`C→P` direction) | N2 |
-| drop uniqueness condition 2 (`P→C` direction) | N3 |
+| drop uniqueness condition 3 (`C→P`: one `p` matched by many `c`) | N2 duplicate, N3 split |
+| drop uniqueness condition 2 (`P→C`: one `c` matching many `p`) | N4 merge |
 | accept a match when text and anchor keys disagree | N6 |
 | drop `claim_kind` from condition 5 | N7 |
-| drop `claim_kind` from the revision hash | N7 |
+| drop `claim_kind` from the revision hash | **§8a**, not N7 |
 | trust anchor offsets without `span_digest` | N10 |
 | add any similarity-threshold fallback | N1, N8 |
-| make position part of identity | P6 |
+| make position part of identity | P5 |
 | allow retired IDs to be re-inherited | N9 |
+| strip `?`/`!` in canonicalization | N11 |
+| case-fold in canonicalization | N12 |
+
+Two of these need care, because the obvious oracle does not actually discriminate:
+
+- **Conditions 2 and 3 are directional.** Condition 3 (`c` matches exactly one
+  `p`) is what duplicates and splits violate; condition 2 (`p` matches exactly
+  one `c`) is what a merge violates. An earlier draft pointed the
+  condition-2 mutation at N3, which a condition-3 check already catches — so the
+  mutation would have passed. Each condition must be dropped **alone**, with the
+  other held, or neither oracle proves anything.
+
+### 8a. The `claim_kind`-in-hash oracle needs its own case
+
+Dropping `claim_kind` from the revision hash **does not** turn N7 red: condition
+5 rejects the alignment first, so `c` mints a fresh `claim_id`, and a fresh
+`claim_id` already changes the hash. The hash's `claim_kind` term is never
+exercised.
+
+The case that isolates it: **one logical claim whose kind changes while
+alignment is forced to succeed** — i.e. hold condition 5 disabled, then assert
+that the successor revision ID still differs from its predecessor's. With
+`claim_kind` in the hash it does; without, the two revisions collide and a
+support edge bound to the old revision silently describes the new kind.
+
+This is the general shape to watch for in every mutation table here: an oracle
+is worthless when an *earlier* guard already rejects the input. Each check must
+be the only thing standing between the input and the wrong answer.

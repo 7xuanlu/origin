@@ -18,10 +18,18 @@ Verified surface on the merge base (`5ba8a3b4`):
 
 | Surface | Count | Source |
 |---|---|---|
-| HTTP routes in `router.rs` | 139 | parsed `.route("…", method(handler))` |
-| HTTP routes in **other** server files | 5 | `repair_routes.rs:24-36` |
+| HTTP `(method, path, handler)` triples in `router.rs` | 146 | parsed `.route("…", method(handler))` |
+| HTTP triples in **other** server files | 5 | `repair_routes.rs:24-36` |
+| distinct `(method, path)` pairs | 149 | 2 duplicates, below |
+| distinct paths | 142 | 7 paths carry more than one method |
 | MCP tools | 29 | `#[tool(` in `wenlan-mcp/src/tools.rs` |
-| CLI subcommands | 18 top-level | `Commands` enum, `wenlan-cli/src/main.rs:31` |
+| CLI subcommands | 19 top-level | `Commands` enum, `wenlan-cli/src/main.rs:29` |
+
+The two duplicate `(method, path)` pairs are `GET /api/health` and
+`GET /api/status`, registered once in `build_router` (`router.rs:47`) and again
+in `build_repair_router` (`router.rs:592`). Two separate `Router` instances, not
+an overlapping registration — but the inventory's set-equality check must key on
+`(builder, method, path)` or it will report a phantom drift.
 
 `router.rs` is not the whole route table — `/api/repairs/*` registers in its own
 module. But it composes through the **same** wrapper, and that wrapper is the
@@ -67,15 +75,25 @@ Found by inspection, **non-exhaustive**:
 
 | Path in `NON_SENSITIVE_PATHS` | D3 class |
 |---|---|
-| `/ws/updates` | automatic |
 | `/api/steep` | automatic |
 | `/api/distill`, `/api/distill/{page_id}` | automatic |
 | `/api/lint`, `/api/repairs/*` (5 routes) | automatic |
-| `/api/knowledge/path` | automatic |
 | `/api/debug/pipeline` | automatic |
 | `/api/communities/proposals/{id}/accept`, `/reject` | automatic |
 | `/api/pages/{id}/map/*` (5 routes) | explicit |
 | `/api/pages/{id}/archive`, `/api/memory/{id}/update-page` | explicit |
+
+**Two paths an earlier draft wrongly listed here**, both corrected by reading
+the response types instead of reasoning from the route name:
+
+- `/ws/updates` is **not** page-bearing. `WsServerMessage` carries only
+  index progress (`files_indexed`/`files_total`), ingest completion
+  (`document_id`, `chunks`), and an error string (`websocket.rs:34`). The draft
+  called it "a reader nobody requested" and made it the headline example.
+- `/api/knowledge/path` returns a **filesystem path string**
+  (`knowledge_routes.rs:11`), not a graph traversal. Its exposure risk is the
+  projection directory it names, which §5's invariant owns — not a
+  page-response adapter.
 
 Those are opted out of *scope-sensitivity* classification, which is a different
 question from *truth exposure*. A page-bearing route can be scope-insensitive
@@ -83,12 +101,16 @@ and still leak provisional prose. So M5's truth classification must be **total
 over every registered path**, including the opt-out lists, with its own
 fail-closed assert in `TrackedRouter::route`.
 
-**The table above is deliberately not the contract.** An earlier draft of this
-document asserted a specific count, and re-reading `NON_SENSITIVE_PATHS`
-immediately found more. That is the argument for total coverage in one
-observation: any hand-enumeration of page-bearing readers is wrong on the day
-it is written, so PR-B classifies **every** registered path and lets the assert
-find what a human list misses. Treat this table as motivation, never as the set.
+**The table above is not the contract** —
+`2026-07-27-m5-reader-manifest-inventory.md` is. An earlier draft asserted a
+specific count; re-reading `NON_SENSITIVE_PATHS` found more, and reading the
+response types then removed two that did not belong. A hand-enumeration was
+wrong in **both directions** within one day of being written, which is why the
+inventory is generated and this table is kept only as the motivating example.
+
+Classifying a path requires reading its **response type**, not inferring from
+its name — and where the response type is `serde_json::Value`, even that is not
+enough (inventory, "the opaque routes").
 
 ### MCP, CLI, projection, internal: no registry exists
 
@@ -112,11 +134,17 @@ Each entry carries five fields. All five are required; none may be inferred.
 
 | Field | Values |
 |---|---|
+| `method` | `GET \| POST \| PUT \| DELETE \| PATCH`; `n/a` off-HTTP |
 | `path` | route / tool name / CLI command |
 | `surface` | `http \| mcp \| cli \| projection \| export \| internal` |
 | `page_bearing` | `yes \| no` |
 | `class` | `automatic \| explicit \| not_applicable` |
 | `adapter` | the exact enforcement call site |
+
+`method` is required because `TrackedRouter`'s authoritative identity is
+`(method, path)`, not path alone (`route_registry.rs:145`). Several paths carry
+both a read and a mutation — `GET` vs `DELETE /api/pages/{id}` — and keying the
+manifest on path would silently merge them into one classification.
 
 `page_bearing = no` entries still appear in the table. Marking something
 not-page-bearing is a claim that must be reviewed, and silence is not a claim.
@@ -132,46 +160,59 @@ Ambiguous readers classify **automatic**. Under-exposing a provisional page
 costs a user one click; over-exposing one attaches unearned trust to unverified
 prose, which is the failure this rung exists to prevent.
 
-## 4. Classification of the known page-bearing surface
+## 4. Classification — the enumeration lives in the inventory file
 
-Derived from the route table above. The executable test owns the authoritative
-copy; this section is the reviewed seed.
+**The manifest is `2026-07-27-m5-reader-manifest-inventory.md`**, generated from
+the merge base: all 151 registered `(method, path, handler)` triples, all 29
+`#[tool(` declarations, all 19 `Commands` variants, each with `page_bearing`, a
+class, an adapter, and the return-type evidence the classification rests on.
+That file is the artifact this section used to only promise.
 
-### Automatic — provisional excluded unconditionally
+Generating it surfaced three things a reviewed prose list did not:
 
-| Path | Why automatic |
+- `label` is a page title by another name — `PageLinkOutbound`,
+  `PageLinkInbound`, `OrphanLink`, `PageMapNode` all carry one, and a scan keyed
+  on `title` misses every one;
+- word-boundary matching misses `delta_summary`, because `_` is a word
+  character — so the field scan must match substrings;
+- **16 routes are statically opaque**, returning `serde_json::Value` or a bare
+  `Response`, and they include `GET /api/pages`, `POST /api/pages/search`, and
+  `GET /api/pages/{id}` — the three primary page readers.
+
+### The two axes are independent, including under opacity
+
+An opaque return type answers `page_bearing`, not `class`. A first pass at this
+section said "all 16 opaque routes classify automatic, fail-closed," which reads
+like caution and is wrong in a way worth naming: it conflates *not knowing
+whether prose is in the payload* with *not knowing whether a human named the
+page*. Only the first is unknown. `GET /api/pages/{id}` is explicit whatever its
+return type says, because reader intent is a property of the route, not the
+struct.
+
+Forcing those to automatic would have denied provisional content to M5-aware
+explicit browse clients — a functional regression dressed as a safety win. The
+rules are therefore separate:
+
+| Unknown | Fail-closed default | Because |
+|---|---|---|
+| is prose in the payload? | `page_bearing = yes` | an unguarded reader is unrecoverable |
+| did a human name the page? | read it off the route, as usual | opacity says nothing about intent |
+
+**No provisional content is exposed anywhere without a declared M5 contract**,
+so an opaque explicit route is not a hole: it degrades to automatic behavior for
+every caller that has not declared support (§6).
+
+### The classification rule
+
+| Reader intent | Class |
 |---|---|
-| `POST /api/context` | the canonical automatic context constructor |
-| `POST /api/search` | supplementation, no page named |
-| `POST /api/memory/search` | same |
-| `POST /api/pages/search` | machine-ranked, no page named |
-| `GET /api/briefing` | synthesized digest |
-| `GET /api/home-stats` | synthesized counts + surfaced pages |
-| `GET /api/decisions`, `/api/decisions/domains` | synthesis |
-| `GET /api/profile/narrative` | synthesis |
-| `GET /api/knowledge/path`, `/recent-relations` | graph traversal |
-| `GET /api/communities/*` | routing/graph voting inputs |
-| `GET /api/memory/nurture`, `/api/memory/entity-suggestions` | candidate generation |
-| `GET /api/refinery/queue` | candidate generation |
-| `POST /api/steep`, `POST /api/distill`, `POST /api/distill/{page_id}` | downstream synthesis inputs |
-| `POST /api/lint`, `/api/repairs/*` | maintenance readers |
-| MCP `context`, `recall`, `search_pages`, `list_pending`, `list_refinements`, `list_nurture`, `lint`, `distill`, `get_lint_agent_work_page`, `prepare_lint_repair*`, `verify_lint_repair` | agent-facing automatic reads |
-| `/ws/updates` | push payloads carry page fields |
-| internal: RRF page channel, graph voting, community routing, export builders, refinery, summary | not reachable by URL; still readers |
+| a human named the page, or asked to browse | **explicit** |
+| everything else, including every ambiguous case | **automatic** |
 
-`/ws/updates` is called out because a push channel is easy to forget: it is a
-reader that no one requested, which is the definition of automatic.
-
-### Explicit — provisional allowed only with a declared M5 contract
-
-| Path | Why explicit |
-|---|---|
-| `GET /api/pages/{id}` | a page was named |
-| `GET /api/pages/{id}/sources`, `/links`, `/revisions`, `/map*` | subresources of a named page |
-| `GET /api/pages`, `/api/pages/recent`, `/api/pages/recent-changes`, `/api/pages/orphan-links` | human browse surfaces |
-| `POST /api/pages/export`, `POST /api/pages/{id}/export` | human-initiated export |
-| MCP `get_page`, `get_page_sources`, `get_page_revisions`, `get_page_links`, `list_pages_recent` | agent acting on a named page |
-| CLI `wenlan pages …` | human at a terminal |
+Applied per row in the inventory. The two-table prose enumeration that used to
+sit here was deleted, not moved: it was a second copy of the inventory's Class
+column, which is precisely the hand-copied-canonical-thing pattern that produced
+the misses above. One source, one positive control.
 
 **Every** explicit path degrades to automatic behavior when the caller has not
 declared the M5 contract. There is no "explicit therefore safe" path.
@@ -227,17 +268,29 @@ which is the precedent this follows deliberately.
 
 ## 9. Mutation checks
 
+Rows marked **[gate]** are human review gates, not executable tests. They are
+listed here because they must happen, but they must not be counted as teeth — a
+table that mixes the two lets a process promise stand in for a failing build.
+Every unmarked row is an executable test that goes RED under its weakening.
+
 | Weakening | Must fail |
 |---|---|
 | derive `truth_class` from `sensitive_read_routes()` membership | §2 opt-out test — `/ws/updates` and every other opt-out path goes unclassified |
 | replace total coverage with a hand-enumerated page-bearing list | §2 — add a page-bearing route to `NON_SENSITIVE_PATHS`, assert must fire |
-| build a second source-scanning manifest beside `TrackedRouter` | §1 — review gate, duplicate seam |
+| build a second source-scanning manifest beside `TrackedRouter` | **[gate]** §1 duplicate seam |
 | allow an unclassified registered path | `TrackedRouter::route` assert |
 | allow a table entry with no registered path | `finish()` drift assert |
 | leave an MCP tool or CLI subcommand uncovered | §2 per-surface coverage test |
 | default ambiguous readers to `explicit` | §3 classification test |
 | treat an unknown contract version as supported | §6 test |
 | let an explicit path skip negotiation | §7 explicit case 1 |
-| replace per-entry mutation tests with one blanket test | §7 — remove one adapter, blanket test still passes |
+| remove any single adapter's filter | that entry's own §7 test goes RED |
 | leave provisional files in the legacy projection directory | §5 invariant test |
 | omit `/ws/updates` from the manifest | §2.3 |
+| add a route without an inventory row | inventory §teeth check 2 (set equality) |
+| delete an inventory row for a live route | inventory §teeth check 2 |
+| leave an inventory row with an empty class | inventory §teeth check 3 |
+| classify an opaque route `page_bearing = no` | inventory §teeth check 4 |
+| scan response fields with word-boundary instead of substring matching | inventory — `delta_summary` must still be found |
+| drop `label` from the prose-field pattern | inventory — `PageLinkOutbound.label` must still be found |
+| force opaque routes to `automatic` | §4 — `GET /api/pages/{id}` must stay explicit |

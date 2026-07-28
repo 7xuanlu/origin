@@ -146,8 +146,15 @@ Rules:
   path, batched, and is bounded by the same budgets. It never bypasses the
   per-page write.
 - A **startup reconciler** re-evaluates §1 for any page whose stored status
-  cannot be proven consistent with current evidence — the durable backstop for a
-  crash between a retraction and its demotion.
+  cannot be proven consistent with current evidence.
+
+The reconciler's justification is **not** "a crash between retraction and
+demotion" — if both are truly one transaction, that window does not exist, and
+an oracle written against it could never go RED. It exists for the cases the
+transaction genuinely does not cover: a bulk eligibility change materializing
+asynchronously (artifact 6 §3), an out-of-band write, a restored backup, and any
+future writer that forgets the demotion path. Its test seeds each of those
+inconsistencies directly rather than trying to interrupt an atomic commit.
 
 ## 4. Migration from legacy fields
 
@@ -197,6 +204,6 @@ Each weakening must turn at least one listed row RED:
 | infer `HR` from `user_edited` or authored status | row 16 |
 | treat `supported` as monotonic (never fall back) | rows 13, 14, 15 |
 | accept a review action without version+digest | row 10 |
-| demote asynchronously instead of in the trigger's transaction | §3 "who drives demotion" — crash-window test |
+| demote asynchronously instead of in the trigger's transaction | §3 — retract a support edge, then read the page in the same transaction: `SS` must already be `provisional` |
 | leave a retraction with no demotion path | rows 13–15 owner test |
-| skip the startup reconciler | crash-between-retraction-and-demotion test |
+| skip the startup reconciler | §3 — seed a page with `SS=supported` and no qualifying support edge, restart, assert demotion |
