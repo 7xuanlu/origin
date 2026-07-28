@@ -77,31 +77,6 @@ pub fn decide_page_community_route(
     PageCommunityRouteDecision::Dropped { score }
 }
 
-pub fn strongest_weighted_community<'a>(
-    votes: impl IntoIterator<Item = (&'a str, f64)>,
-) -> Option<(String, f64)> {
-    let mut totals = BTreeMap::<String, f64>::new();
-    let mut total_weight = 0.0;
-    for (community_id, weight) in votes {
-        if !weight.is_finite() || weight <= 0.0 {
-            continue;
-        }
-        *totals.entry(community_id.to_owned()).or_default() += weight;
-        total_weight += weight;
-    }
-    if total_weight <= 0.0 {
-        return None;
-    }
-    totals
-        .into_iter()
-        .map(|(community_id, weight)| (community_id, weight / total_weight))
-        .max_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| right.0.cmp(&left.0))
-        })
-}
-
 pub fn community_embedding_centroids(
     members: impl IntoIterator<Item = (String, String, Vec<f32>)>,
 ) -> BTreeMap<String, Vec<f32>> {
@@ -178,18 +153,6 @@ mod tests {
         assert_eq!(
             decide_page_community_route(Some("c-old"), Some(("c-new", 0.299_999))),
             PageCommunityRouteDecision::Dropped { score: 0.299_999 }
-        );
-    }
-
-    #[test]
-    fn weighted_votes_are_normalized_and_ties_are_deterministic() {
-        assert_eq!(
-            strongest_weighted_community([("c-b", 2.0), ("c-a", 2.0)]),
-            Some(("c-a".to_string(), 0.5))
-        );
-        assert_eq!(
-            strongest_weighted_community([("c-a", 3.0), ("c-b", 1.0)]),
-            Some(("c-a".to_string(), 0.75))
         );
     }
 }
