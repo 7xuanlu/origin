@@ -762,7 +762,16 @@ mod tests {
 
         child.kill().expect("kill process identity test child");
         child.wait().expect("reap process identity test child");
-        assert!(!identity.is_running(&mut system));
+        // Windows can keep a terminated process visible in the enumeration
+        // snapshot briefly after wait(); poll instead of racing one check.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while identity.is_running(&mut system) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child process still visible 10s after exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     #[test]
