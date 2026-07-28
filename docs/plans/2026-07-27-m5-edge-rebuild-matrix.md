@@ -81,10 +81,13 @@ claim was never verified, and it is **false**. It also contradicted the
 completeness rule above: it described a surviving tuple absent from the allowed
 table, so the guard would have rejected rows the migration promised to keep.
 
-The verified fact: the literal `'supports'` occurs **exactly once in the whole
-tree** — the `edge_type` CHECK constraint (`db.rs:8916`). No `dual_write_edge`
-call site, no backfill, and no `.sql` file emits it. The type was reserved in
-the constraint and never used.
+The verified fact: across **executable source** — every `.rs` and `.sql` file in
+the repository — the literal `'supports'` occurs exactly once, in the
+`edge_type` CHECK constraint (`db.rs:8916`). No `dual_write_edge` call site and
+no backfill emits it; every production writer emits `cites`, `relates`, or
+`links`. The type was reserved in the constraint and never used. (Tracked
+markdown, including this file, mentions the word; the claim is about code, and
+saying "the whole tree" overstated it.)
 
 Two consequences:
 

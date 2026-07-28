@@ -45,16 +45,29 @@ Four independent tests; **any** one yields `yes`.
    even when its response carries none. `POST /api/pages/export` and
    `POST /api/pages/{id}/export` return only `ExportStats` and write full page
    prose into the user's Obsidian vault.
-4. **The error arm.** 159 of 162 handlers return
+4. ~~**The error arm.**~~ **Withdrawn as a `page_bearing` test** — see below.
+   159 of 162 handlers return
    `Result<_, ServerError>`, and **every** `ServerError` variant carries a
-   free-form `String` (`error.rs:11`) — `Conflict`, `NotFound`,
-   `ValidationError`, `BadRequest`, and the rest. D4's stale-base save conflict
-   is exactly where an implementer helpfully writes `current version: <title>`.
+   free-form `String` (`error.rs:11`). D4's stale-base save conflict is exactly
+   where an implementer helpfully writes `current version: <title>`. That risk
+   is real; making it a per-route classification is what was wrong.
 
 Tests 1 and 2 inspect the Ok path only. Test 3 was added because the most
-consequential page reader in the product exposes nothing through its response,
-and test 4 because the second-most-likely leak is an error message. Neither is
-reachable by looking at a success type.
+consequential page reader in the product exposes nothing through its response.
+
+**Test 4 was wrong as stated, and the table did not obey it.** If a free-form
+`ServerError` arm made a route page-bearing, 159 of 162 routes would be
+page-bearing; the table says 77. `POST /api/import/memories` and the bulk-delete
+route return `Result<_, ServerError>` and are marked `no`. A rule the data
+contradicts is not a rule.
+
+The error arm is a **real leak and the wrong axis**. It is not a property of any
+individual route — it is one cross-cutting invariant with a single enforcement
+point at the error-serialization seam: no `ServerError` body may contain a
+provisional page's title or prose, enforced once, for every route including
+routes added later. That is both stronger than classifying 159 rows and far less
+to maintain. `page_bearing` returns to meaning what it says: does the **Ok**
+path, or a write effect, carry page prose.
 
 Two false-negative classes found in test 1 and fixed:
 
@@ -109,9 +122,19 @@ someone deliberately gives it a shape.
 
 | Shape | What the marker grants | Routes |
 |---|---|---|
-| `none` | nothing — **the request is refused**, not silently downgraded | everything not listed below (152 of 162) |
-| `collection` | provisional **entries**: title + both axes per item, never prose | `GET /api/pages`, `GET /api/pages/recent`, `GET /api/pages/recent-changes`, `POST /api/pages/search`, `GET /api/pages/orphan-links` |
+| `none` | nothing — **the request is refused**, not silently downgraded | everything not listed below (153 of 162) |
+| `collection` | provisional **entries**: page ID + title + both axes per item, never prose | `GET /api/pages`, `GET /api/pages/recent`, `GET /api/pages/recent-changes`, `POST /api/pages/search` |
 | `named_page` | full prose for the page named in the path, both axes | `GET /api/pages/{id}`, `.../links`, `.../map`, `.../revisions`, `.../sources` |
+
+`/api/pages/orphan-links` was on the `collection` list for one draft and does
+not belong there. Its items are `OrphanLink { label, count }`
+(`wenlan-types/src/responses.rs:1128`) — no page ID and no truth axes. The
+carve-out is **conditional** on rendering both axes per item; a shape that
+cannot carry them cannot receive the grant. An entry surfacing without its state
+is the unearned trust this rung exists to prevent, so the route is `none` and
+its labels stay excluded like any other embedded other-page title. The general
+rule: **a route qualifies for `collection` only if its item type can carry a
+page identity and both axes.**
 
 Refusing on `none` rather than ignoring is deliberate. An ignored marker is a
 wiring mistake that behaves correctly today and silently wrong after a refactor;
@@ -128,13 +151,34 @@ the concern and one half becomes hard:
 | **route shape** | may a marker do anything here, and what? | **server-side and hard.** No client cooperation. `none` refuses. |
 | **marker authenticity** | did a human actually gesture? | **cooperative-tier.** The daemon is loopback and unauthenticated (artifact 5 §1); it cannot tell a forged marker from a real one. |
 
-The first gate is what closes the hole. A cooperative agent that forges the
-marker *and* claims to be the app still cannot pull provisional prose out of
+The first gate closes the *bulk* path: a cooperative agent that forges the
+marker and claims to be the app still cannot pull provisional prose out of
 `/api/context`, `/api/search`, or an export, because those routes refuse the
-marker regardless of caller. The residual exposure is bounded to page-read
-routes, where the worst case is an agent seeing a page it named by ID with both
-axes attached — not automatic-context contamination. Under the boolean, the
-worst case was the whole context path.
+marker regardless of caller.
+
+**It does not bound total exposure, and an earlier draft claimed it did.** The
+two shapes compose: a forging agent calls a `collection` route to enumerate
+provisional page IDs, then calls `named_page` once per ID, and reconstructs the
+corpus a page at a time into its own prompt. "Bounded to a page the caller named
+by ID" is true per call and worthless in aggregate, because the caller can name
+every ID it just discovered.
+
+That composition is not a new hole, and this is the honest place to say so: it
+requires **forging the marker**, which artifact 5 §1 already concedes as out of
+scope (T11, hostile same-user). Nothing at cooperative tier can prevent it —
+the daemon has no signal that separates a forged marker from a real one, so any
+"prevention" claim here would be theatre.
+
+What the gates actually buy, stated without inflation:
+
+| Against | Effect |
+|---|---|
+| a careless integration (an MCP tool wired to send the marker) | **prevented** — per-surface rule, plus every automatic-context and export route refuses regardless |
+| an accidental bulk leak (one `/api/context` call returning provisional prose) | **prevented** — shape gate, no cooperation needed |
+| a deliberately forging agent enumerating then fetching | **not prevented.** Conceded at T11. Made *visible*: every marked call is recorded with caller identity, the page IDs it named, and a timestamp, so page-at-a-time extraction is an auditable pattern rather than an invisible one |
+
+Under the boolean column, the third row was invisible *and* the first two were
+unprotected. The gain is real; the bound is not.
 
 ### Per-surface transmission is the cooperative half
 
@@ -252,7 +296,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/pages` | main | yes | automatic | **`collection`** | `handle_list_pages` | opaque response type — fail-closed |
 | `POST` | `/api/pages` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/pages/export` | main | yes | automatic | `none` | `handle_export_pages` | EFFECT: writes page prose to the requested vault |
-| `GET` | `/api/pages/orphan-links` | main | yes | automatic | **`collection`** | `handle_list_orphan_links` | OrphanLink.label, OrphanLinksResponse.orphan_labels |
+| `GET` | `/api/pages/orphan-links` | main | yes | automatic | `none` | `handle_list_orphan_links` | OrphanLink.label, OrphanLinksResponse.orphan_labels |
 | `GET` | `/api/pages/recent` | main | yes | automatic | **`collection`** | `handle_recent_pages` | RecentActivityItem.snippet, RecentActivityItem.title |
 | `GET` | `/api/pages/recent-changes` | main | yes | automatic | **`collection`** | `handle_recent_page_changes` | PageChange.title |
 | `POST` | `/api/pages/search` | main | yes | automatic | **`collection`** | `handle_search_pages` | opaque response type — fail-closed |
@@ -282,11 +326,11 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/refinery/queue` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/refinery/queue/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/refinery/queue/{id}/reject` | main | no | not_applicable | `none` | — | no prose fields |
-| `POST` | `/api/repairs/apply` | repair | yes | automatic | `none` | `handle_apply` | RepairTarget.label_key |
+| `POST` | `/api/repairs/apply` | main + repair | yes | automatic | `none` | `handle_apply` | RepairTarget.label_key |
 | `POST` | `/api/repairs/plan` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/repairs/plan/entries` | main | yes | automatic | `none` | `handle_plan_entries` | RepairMutation.after_title, RepairMutation.before_title, RepairSys |
 | `POST` | `/api/repairs/prepare` | main | yes | automatic | `none` | `handle_prepare` | RepairMutation.after_title, RepairMutation.before_title, RepairTar |
-| `POST` | `/api/repairs/verify` | repair | no | not_applicable | `none` | — | no prose fields |
+| `POST` | `/api/repairs/verify` | main + repair | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/retrievals/recent` | main | yes | automatic | `none` | `handle_recent_retrievals` | RetrievalEvent.memory_snippets, RetrievalEvent.page_titles |
 | `POST` | `/api/search` | main | yes | automatic | `none` | `handle_search` | SearchResult.content, SearchResult.content_hash, SearchResult.last |
 | `DELETE` | `/api/setup/anthropic-key` | main | no | not_applicable | `none` | — | no prose fields |
@@ -403,162 +447,129 @@ Both rows are effect-based: neither returns page prose, and both write it. The
 internal helper readers are enumerated in full below rather than described as
 categories.
 
-## Internal readers — all 76 page-prose call sites
+## Internal readers — enumerated by a committed generator
 
-An earlier draft listed four categories here — "RRF page channel", "graph
-voting / community routing", "refinery, summary, briefing builders" — and
-deferred the enumeration to PR-B. That was the same defer-the-hard-half move the
-HTTP section already had to correct, and the governing requirement is explicit:
-"No single endpoint or shared helper is assumed to cover this set. Stage 0 must
-produce an executable manifest from actual callers"
-(`2026-07-27-kg-m5-goal-prompt.md:128`).
+An earlier draft listed four categories and deferred enumeration to PR-B. A
+later one enumerated 76 call sites. Both were wrong, in different ways, and the
+second failure is the instructive one.
 
-**Derivation.** Every `fn` in `wenlan-core`, `wenlan-server`, `wenlan-cli`, and
-`wenlan-mcp` whose body contains `FROM pages` / `JOIN pages` **and** a
-prose-column reference (`content`, `title`, `summary`, `excerpt`, `body`,
-`snippet`), with `#[cfg(test)]` blocks stripped by brace tracking. That yields
-**76** call sites.
+**The predicate lived in prose, so every implementation of it disagreed.** Three
+rounds produced 76, then a reviewer's 65 and 71, then 54 — not because the tree
+changed but because "a function that reads page prose" admits at least four
+readings. A count derived from an unpinned predicate is not a fact, and this
+file had been presenting one as a fact.
 
-A first pass reported 24. It stripped each file at its **first** `#[cfg(test)]`
-line rather than tracking the block's braces, which truncated `db.rs` — the file
-holding 46 of the 76 — near its top.
+The predicate is therefore **executable and checked in**:
+`scripts/m5-reader-sweep.py`. Its docstring is the specification; the number is
+whatever it prints. Two implementation defects it now documents in place:
 
-The 76 is cross-checked, not asserted once. Two test-strippers were written
-independently — one tracking braces character-by-character over the whole file,
-one tracking them line-by-line — and both return the same 76 rows and the same
-46-in-`db.rs` split. A single scan agreeing with itself proves nothing; two
-implementations of the tricky half agreeing is the differential control this
-file demands of everything else in it. Same failure family as the three wrong
-route counts: a scan that silently narrows its own input. The rule is now
-recorded with the others: **strip test modules by brace tracking, never by
-first-match truncation.**
+- **body delimitation.** Bodies were delimited by the next `fn` match, which
+  merged adjacent functions and let one function's SQL vote for its neighbour.
+  Bodies are now brace-matched.
+- **predicate scope.** The `pages` match and the prose-column match were tested
+  anywhere in the body, so `list_tags_scoped` (selects tags, merely checks page
+  existence, `db.rs:19900`) and `tally` (no page SQL at all, `db.rs:18199`)
+  counted. Both halves must now hold **inside the same string literal**.
 
-The four categories were not merely incomplete, they were the wrong shape. The
-scoped accessors in `scoped_pages.rs` are called only from `routes.rs` and
-tests; the readers that actually carry page prose through the product sit in
-`db.rs`, `repair.rs`, `post_write.rs`, `lint/`, and `maintenance/`, none of
-which the category list named.
+The earlier "differential cross-check" — two test-strippers agreeing on 76 — was
+worthless, and worth recording as a trap. Both implementations varied only the
+`#[cfg(test)]` stripping and shared the same broken body delimitation. **A
+differential oracle that varies the wrong dimension confirms the bug in
+stereo.** It is not evidence unless the varied dimension is the one that can be
+wrong.
 
-### Split by exposure
-
-`exposure` is machine-derived, not judged: a reader is an exposure path if it is
-called from **outside `wenlan-core`** — that is, from the server, the CLI, or
-the MCP crate, all of which terminate in a wire response.
+### Current output
 
 | | Count |
 |---|---|
-| exposure paths — reachable from a wire surface | **14** |
-| internal-only — no caller outside `wenlan-core` | **62** |
+| internal page-prose readers | **54** |
+| exposure paths — `pub` **and** called from outside `wenlan-core` | **10** |
+| internal-only | **44** |
+| name-ambiguous — caller edges unresolvable by a name scan | **3** |
 
-Internal-only is **not** a pass. It means no *current* caller crosses the
-boundary, which a single future `pub` re-export changes. PR-B asserts the
-partition itself: any internal-only row that gains an outside caller fails the
-test and must be given an adapter, so the classification cannot rot silently.
+`db.rs` holds 28 of them. The four categories the first draft named — "RRF page
+channel", "graph voting / community routing", "refinery / briefing builders" —
+match none of the modules that actually appear.
 
-Every row here is `marker_shape = none`. There is no caller to gesture.
+Every row is `marker_shape = none`. There is no caller to gesture.
 
-### The caller column is name-based, and two rows say so
+### Exposure is a starting classification, not a proof
 
-Callers are resolved by name match, which is a text property, not a semantic
-one. Two rows are module-private functions named `load`, and a name scan for
-`load(` matches every unrelated `load` in the workspace — the reported
-`config_routes.rs:434` caller is a false hit, not a real edge. Those rows are
-marked **name-ambiguous** rather than given a caller list that reads as
-evidence.
+Caller edges are resolved by **name**, which over-matches on generic names and
+under-matches through trait dispatch and re-exports. Rows whose function name is
+declared more than once in the tree are marked name-ambiguous and excluded from
+the exposure set rather than given a caller list that would read as evidence —
+the two `load` functions are `pub(super)` with core-parent callers only, and an
+earlier draft credited them with server callers that do not exist.
 
-This is the general limit, recorded so the next reader does not over-trust the
-column: **a name-keyed caller scan over-matches on generic names and
-under-matches through trait dispatch and re-exports.** PR-B resolves the caller
-edges with the language server, not `grep`, and the 14/62 partition is a
-starting classification to be confirmed there — not a proof. The *row set* is
-sound (it keys on SQL text inside a function body, which is unambiguous); only
-the caller edges carry this caveat.
+PR-B re-resolves every edge with the language server and re-runs this generator,
+asserting set equality on the rows and the partition. Until then the split is a
+classification to be confirmed, and internal-only is **not** a pass: it means no
+*current* caller crosses the boundary, which one `pub` re-export changes.
 
 ### Exposure paths (adapter required)
 
-| Address | Function | Callers outside core | Disposition |
+| Address | Function | Visibility | Caller outside core |
 |---|---|---|---|
-| `core/db.rs:16980` | `reconcile_entity_page_parity` | `server/scheduler.rs:2237` | **adapter required** |
-| `core/db.rs:19900` | `list_tags_scoped` | `server/memory_routes.rs:2556` | **adapter required** |
-| `core/db.rs:39619` | `list_recent_retrievals_scoped` | `server/routes.rs:1121` | **adapter required** |
-| `core/db.rs:43455` | `load_page_source_index` | `server/routes.rs:928` | **adapter required** |
-| `core/db.rs:44002` | `resolve_orphan_page_links` | `server/routes.rs:1001` | **adapter required** |
-| `core/db.rs:46287` | `list_stale_pages_scoped` | `server/routes.rs:970` | **adapter required** |
-| `core/db.rs:46327` | `find_stale_archived_pages` | `server/cmd_backfill.rs:49` | **adapter required** |
-| `core/db/scoped_entities.rs:12` | `list_entities_scoped` | `server/memory_routes.rs:1429` | **adapter required** |
-| `core/db/scoped_entities.rs:84` | `get_entity_detail_scoped` | `server/memory_routes.rs:1445` | **adapter required** |
-| `core/db/scoped_entities.rs:291` | `list_recent_relations_scoped` | `server/knowledge_routes.rs:67` | **adapter required** |
-| `core/db/scoped_entities.rs:615` | `search_entities_by_vector_scoped` | `server/memory_routes.rs:1480` | **adapter required** |
-| `core/db/scoped_pages.rs:376` | `list_recent_changes_scoped` | `server/routes.rs:1141` | **adapter required** |
-| `core/lint/pages/link_checks/orphans.rs:8` | `load` | **name-ambiguous** — see note | resolve with LSP, then adapt |
-| `core/lint/serving/query.rs:16` | `load` | **name-ambiguous** — see note | resolve with LSP, then adapt |
+| `core/db.rs:16980` | `reconcile_entity_page_parity` | `pub` | `server/scheduler.rs:2237` |
+| `core/db.rs:39619` | `list_recent_retrievals_scoped` | `pub` | `server/routes.rs:1121` |
+| `core/db.rs:43455` | `load_page_source_index` | `pub` | `server/routes.rs:928` |
+| `core/db.rs:46287` | `list_stale_pages_scoped` | `pub` | `server/routes.rs:970` |
+| `core/db.rs:46327` | `find_stale_archived_pages` | `pub` | `server/cmd_backfill.rs:49` |
+| `core/db/scoped_entities.rs:12` | `list_entities_scoped` | `pub` | `server/memory_routes.rs:1429` |
+| `core/db/scoped_entities.rs:84` | `get_entity_detail_scoped` | `pub` | `server/memory_routes.rs:1445` |
+| `core/db/scoped_entities.rs:291` | `list_recent_relations_scoped` | `pub` | `server/knowledge_routes.rs:67` |
+| `core/db/scoped_entities.rs:615` | `search_entities_by_vector_scoped` | `pub` | `server/memory_routes.rs:1480` |
+| `core/db/scoped_pages.rs:376` | `list_recent_changes_scoped` | `pub` | `server/routes.rs:1141` |
 
-### Internal-only (no caller outside `wenlan-core`)
+### Internal-only
 
-| Address | Function | Callers inside core | Disposition |
+| Address | Function | Visibility | Why internal-only |
 |---|---|---|---|
-| `core/db.rs:3520` | `run_migrations` | 3 | internal-only |
-| `core/db.rs:8813` | `assert_pages_scope_columns_backfilled` | 1 | internal-only |
-| `core/db.rs:8886` | `migrate_81_unified_edges` | 1 | internal-only |
-| `core/db.rs:9240` | `migrate_89_page_kind_fold` | 1 | internal-only |
-| `core/db.rs:16387` | `reconcile_community_consistency` | 0 | internal-only |
-| `core/db.rs:18199` | `tally` | 5 | internal-only |
-| `core/db.rs:25507` | `delete_by_source_id_in_transaction` | 5 | internal-only |
-| `core/db.rs:25989` | `rebind_source_id_inner` | 2 | internal-only |
-| `core/db.rs:26449` | `rebind_source_page_in_transaction` | 1 | internal-only |
-| `core/db.rs:29622` | `merge_entities` | 1 | internal-only |
-| `core/db.rs:34283` | `oldest_active_page` | 1 | internal-only |
-| `core/db.rs:39116` | `delete_non_head_memory_chunks` | 1 | internal-only |
-| `core/db.rs:39479` | `list_recent_retrievals` | 1 | internal-only |
-| `core/db.rs:39825` | `list_recent_changes` | 1 | internal-only |
-| `core/db.rs:40128` | `list_recent_pages_with_badges` | 1 | internal-only |
-| `core/db.rs:40927` | `insert_resolved_page_evidence` | 6 | internal-only |
-| `core/db.rs:41041` | `append_page_history` | 2 | internal-only |
-| `core/db.rs:41202` | `insert_page_with_kind_inner` | 2 | internal-only |
-| `core/db.rs:41445` | `replace_source_page_inner` | 2 | internal-only |
-| `core/db.rs:41739` | `get_page_inner` | 2 | internal-only |
-| `core/db.rs:41768` | `get_page_by_entity` | 1 | internal-only |
-| `core/db.rs:41843` | `list_pages_inner` | 2 | internal-only |
-| `core/db.rs:41876` | `list_pages_stale` | 0 | internal-only |
-| `core/db.rs:41921` | `list_pages_by_space` | 0 | internal-only |
-| `core/db.rs:42982` | `find_matching_page` | 0 | internal-only |
-| `core/db.rs:43039` | `find_matching_page_scoped` | 5 | internal-only |
-| `core/db.rs:43406` | `page_merge_row` | 2 | internal-only |
-| `core/db.rs:43582` | `list_active_page_titles_scoped` | 2 | internal-only |
-| `core/db.rs:43624` | `list_relevant_active_page_titles` | 1 | internal-only |
-| `core/db.rs:43688` | `find_active_page_id_by_title` | 2 | internal-only |
-| `core/db.rs:43723` | `find_unique_active_page_id_by_title_scoped` | 2 | internal-only |
-| `core/db.rs:44093` | `search_pages_inner` | 2 | internal-only |
-| `core/db.rs:44274` | `backfill_page_embeddings` | 1 | internal-only |
-| `core/db.rs:44946` | `get_pages_missing_citations` | 1 | internal-only |
-| `core/db.rs:45112` | `link_page_evidence` | 0 | internal-only |
-| `core/db.rs:45351` | `get_pages_for_memory` | 0 | internal-only |
-| `core/db.rs:45418` | `cleanup_orphaned_page_sources` | 1 | internal-only |
-| `core/db.rs:46250` | `get_stale_page_after` | 4 | internal-only |
-| `core/db.rs:46419` | `get_page_changelog` | 3 | internal-only |
-| `core/db/page_drafts.rs:476` | `delete_page_draft` | 0 | internal-only |
-| `core/db/scoped_pages.rs:90` | `search_pages_scoped_inner` | 2 | internal-only |
-| `core/db/scoped_pages.rs:457` | `list_pages_scoped_inner` | 2 | internal-only |
-| `core/db/scoped_pages.rs:588` | `get_page_scoped_inner` | 2 | internal-only |
-| `core/lint/deep.rs:221` | `page_duplicates` | 1 | internal-only |
-| `core/lint/deep.rs:299` | `page_body_result` | 1 | internal-only |
-| `core/lint/pages/db_checks.rs:233` | `load_rows` | 1 | internal-only |
-| `core/lint/semantic_candidates.rs:846` | `load_pages` | 3 | internal-only |
-| `core/maintenance.rs:557` | `scan_automatic_retro_stub_slice` | 1 | internal-only |
-| `core/maintenance/duplicates.rs:63` | `scan_near_duplicate_slice` | 1 | internal-only |
-| `core/maintenance/duplicates.rs:281` | `embedding_near_duplicate_pairs` | 1 | internal-only |
-| `core/post_write.rs:583` | `rename_page_title_cas_inner` | 1 | internal-only |
-| `core/post_write.rs:906` | `page_on_connection` | 2 | internal-only |
-| `core/post_write.rs:939` | `apply_deterministic_repair_cas` | 5 | internal-only |
-| `core/repair.rs:1387` | `prepare_rename_page_title` | 1 | internal-only |
-| `core/repair.rs:3930` | `capture_rename_page_row_on_snapshot` | 1 | internal-only |
-| `core/repair.rs:4159` | `validate_rename_page_title_collision_on_snapshot` | 1 | internal-only |
-| `core/repair.rs:4203` | `validate_rename_page_title_collision_on_connection` | 1 | internal-only |
-| `core/repair.rs:6145` | `projection_page_receipt_sql` | 2 | internal-only |
-| `core/repair_plan/deterministic.rs:96` | `resolve_duplicate_page_titles` | 1 | internal-only |
-| `core/repair_plan/deterministic.rs:270` | `renamed_page_title_still_actionable` | 1 | internal-only |
-| `core/repair_plan/deterministic.rs:420` | `resolve_source_pages` | 2 | internal-only |
-| `core/repair_plan/deterministic.rs:1147` | `resolve_orphan_links` | 2 | internal-only |
+| `core/db.rs:9240` | `migrate_89_page_kind_fold` | `private` | not `pub` |
+| `core/db.rs:26449` | `rebind_source_page_in_transaction` | `private` | not `pub` |
+| `core/db.rs:34283` | `oldest_active_page` | `pub` | no caller outside core |
+| `core/db.rs:39479` | `list_recent_retrievals` | `pub` | no caller outside core |
+| `core/db.rs:39825` | `list_recent_changes` | `pub` | no caller outside core |
+| `core/db.rs:40128` | `list_recent_pages_with_badges` | `pub` | no caller outside core |
+| `core/db.rs:41041` | `append_page_history` | `private` | not `pub` |
+| `core/db.rs:41202` | `insert_page_with_kind_inner` | `private` | not `pub` |
+| `core/db.rs:41739` | `get_page_inner` | `private` | not `pub` |
+| `core/db.rs:41768` | `get_page_by_entity` | `pub` | no caller outside core |
+| `core/db.rs:41843` | `list_pages_inner` | `private` | not `pub` |
+| `core/db.rs:41876` | `list_pages_stale` | `pub` | no caller outside core |
+| `core/db.rs:41921` | `list_pages_by_space` | `pub` | no caller outside core |
+| `core/db.rs:42982` | `find_matching_page` | `pub` | no caller outside core |
+| `core/db.rs:43039` | `find_matching_page_scoped` | `pub` | no caller outside core |
+| `core/db.rs:43406` | `page_merge_row` | `private` | not `pub` |
+| `core/db.rs:43582` | `list_active_page_titles_scoped` | `pub` | no caller outside core |
+| `core/db.rs:43624` | `list_relevant_active_page_titles` | `pub` | no caller outside core |
+| `core/db.rs:43688` | `find_active_page_id_by_title` | `pub` | no caller outside core |
+| `core/db.rs:43723` | `find_unique_active_page_id_by_title_scoped` | `pub` | no caller outside core |
+| `core/db.rs:44274` | `backfill_page_embeddings` | `pub` | no caller outside core |
+| `core/db.rs:45351` | `get_pages_for_memory` | `pub` | no caller outside core |
+| `core/db.rs:46250` | `get_stale_page_after` | `pub` | no caller outside core |
+| `core/lint/deep.rs:221` | `page_duplicates` | `private` | not `pub` |
+| `core/lint/deep.rs:299` | `page_body_result` | `private` | not `pub` |
+| `core/lint/pages/db_checks.rs:233` | `load_rows` | `private` | not `pub` |
+| `core/lint/pages/link_checks/orphans.rs:8` | `load` | `pub(super)` | name-ambiguous — caller edges unresolvable by name |
+| `core/lint/semantic_candidates.rs:846` | `load_pages` | `private` | name-ambiguous — caller edges unresolvable by name |
+| `core/lint/serving/query.rs:16` | `load` | `pub(super)` | name-ambiguous — caller edges unresolvable by name |
+| `core/maintenance.rs:557` | `scan_automatic_retro_stub_slice` | `private` | not `pub` |
+| `core/maintenance/duplicates.rs:63` | `scan_near_duplicate_slice` | `pub(super)` | not `pub` |
+| `core/maintenance/duplicates.rs:281` | `embedding_near_duplicate_pairs` | `private` | not `pub` |
+| `core/post_write.rs:583` | `rename_page_title_cas_inner` | `private` | not `pub` |
+| `core/post_write.rs:906` | `page_on_connection` | `pub(crate)` | not `pub` |
+| `core/post_write.rs:939` | `apply_deterministic_repair_cas` | `pub` | no caller outside core |
+| `core/repair.rs:1387` | `prepare_rename_page_title` | `private` | not `pub` |
+| `core/repair.rs:3930` | `capture_rename_page_row_on_snapshot` | `private` | not `pub` |
+| `core/repair.rs:4159` | `validate_rename_page_title_collision_on_snapshot` | `private` | not `pub` |
+| `core/repair.rs:4203` | `validate_rename_page_title_collision_on_connection` | `pub(crate)` | not `pub` |
+| `core/repair.rs:6145` | `projection_page_receipt_sql` | `private` | not `pub` |
+| `core/repair_plan/deterministic.rs:96` | `resolve_duplicate_page_titles` | `private` | not `pub` |
+| `core/repair_plan/deterministic.rs:270` | `renamed_page_title_still_actionable` | `private` | not `pub` |
+| `core/repair_plan/deterministic.rs:420` | `resolve_source_pages` | `private` | not `pub` |
+| `core/repair_plan/deterministic.rs:1147` | `resolve_orphan_links` | `private` | not `pub` |
 
 ## The teeth: this file is data, not documentation
 
@@ -578,15 +589,21 @@ adds a test that:
    | Count | Value | What it counts |
    |---|---|---|
    | call-site triples | **162** | rows in this table: 155 `router.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
-   | runtime builder triples | **164** | `(builder, method, path)` pairs actually installed |
+   | runtime builder triples | **166** | `(builder, method, path)` pairs actually installed: 160 `main` + 6 `repair` |
 
-   The +2 is `lint_routes::register`, one call site invoked from **both**
-   builders (`router.rs:45` and `router.rs:591`), so its 2 triples land twice.
+   The +4 is two call sites that each land in **both** builders:
+   `lint_routes::register` (2 triples) and `repair_routes::register_execution`
+   (2 triples). The second is easy to miss and was missed once:
+   `repair_routes::register` **wraps** `register_execution`
+   (`repair_routes.rs:25`), so `main` gets all five repair routes, not three,
+   while `build_repair_router` installs `apply`/`verify` again
+   (`router.rs:591`). An arithmetic that reads only the two `register*` call
+   sites in `router.rs` lands on 164 and is wrong.
+
    `/api/health` and `/api/status` do *not* inflate: each is two separate
    `.route()` call sites, one per builder region, so they are already two rows
    here. `build_router` delegates to `build_router_with_shutdown`
-   (`router.rs:24`), so those are one builder, not two — 158 in `main`, 6 in
-   `repair`;
+   (`router.rs:24`), so those are one builder, not two;
 3. re-runs the **prose-field scan** and asserts no row marked
    `page_bearing = no` resolves to a type matching the pattern. Without this the
    evidence column rots: a typed response that later gains a `title` field flips
@@ -605,16 +622,19 @@ adds a test that:
    `POST /api/search`, and both export routes are among the refusals;
 9. asserts no surface marked never-transmit (MCP, internal, non-interactive
    CLI) sends the marker;
-10. re-derives the **internal-reader** set by the same SQL-text rule (test
-    modules stripped by brace tracking) and asserts it equals the 76 rows —
-    the positive control that keeps `db.rs` growth from adding an unlisted
-    page reader;
-11. asserts the exposure partition: every row marked internal-only has **no**
-    caller outside `wenlan-core`, resolved with the language server rather than
-    a name scan. A row that gains an outside caller fails until it is moved to
+10. re-runs `scripts/m5-reader-sweep.py` and asserts its output equals the
+    internal-reader tables — the generator is the predicate, so this is a real
+    positive control rather than a second reading of prose;
+11. asserts the exposure partition with the **language server**, not a name
+    scan: every internal-only row is either not `pub` or has no caller outside
+    `wenlan-core`. A row that gains an outside caller fails until it is moved to
     the exposure table and given an adapter;
-12. sentinel test: seed a provisional page, drive every error path that names it,
-    and assert its title and prose appear in **no** error body.
+12. asserts every `collection`-shaped route's item type can carry a page
+    identity **and** both truth axes — the check that keeps
+    `OrphanLink { label, count }`-shaped payloads off the allowlist;
+13. sentinel test: seed a provisional page, drive every error path that names
+    it, and assert its title and prose appear in **no** error body. This is the
+    single error-seam invariant, not a per-route classification.
 
 Checks 2 and 3 are the positive controls: 2 keeps the row set live, 3 keeps the
 evidence live. Without both, this file is a snapshot that rots.

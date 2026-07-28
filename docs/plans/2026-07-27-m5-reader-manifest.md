@@ -305,14 +305,18 @@ Splitting the concern makes one half hard:
 | **marker authenticity** | did a human actually gesture? | cooperative-tier; the daemon cannot tell forged from real |
 
 `marker_shape` is therefore a three-valued per-route column in the inventory —
-`none` (152 routes), `collection` (5), `named_page` (5) — fail-closed by
+`none` (153 routes), `collection` (4), `named_page` (5) — fail-closed by
 construction, so a route added tomorrow is `none` until someone deliberately
-gives it a shape. The risk that is real is the **cooperative agent**: nothing
-inherently stops an MCP tool from transmitting the marker. Under the boolean
-that agent could self-serve provisional prose into its own automatic context.
-Under the shape gate it cannot: `/api/context`, `/api/search`, and the exports
-refuse the marker regardless of caller. The residual exposure is bounded to a
-page the caller named by ID, returned with both axes attached.
+gives it a shape.
+
+The gate stops the **careless** integration: an MCP tool wired to transmit the
+marker still gets nothing from `/api/context`, `/api/search`, or an export,
+because those refuse it regardless of caller. It does **not** bound total
+exposure, and a draft of this section wrongly claimed it did — `collection` and
+`named_page` compose, so a forging agent can enumerate provisional IDs and then
+fetch each one. That requires forging, which artifact 5 §1 concedes at T11; it
+is made auditable rather than prevented. The inventory states the full
+disposition.
 
 Per-surface transmission (MCP, internal readers, non-interactive CLI: never)
 remains the soft gate, tested per surface. It is no longer load-bearing.
@@ -401,6 +405,8 @@ Every unmarked row is an executable test that goes RED under its weakening.
 | default ambiguous readers to `explicit` | §3 classification test |
 | treat an unknown contract version as supported | §6 test |
 | let a marked call skip negotiation | §7 per-call case 1 |
+| grant `collection` to an item type that cannot carry both axes | inventory teeth 12 — `OrphanLink { label, count }` |
+| claim the shape gate bounds total exposure | §4 — `collection` + `named_page` compose |
 | remove any single adapter's filter | that entry's own §7 test goes RED |
 | leave provisional files in the legacy projection directory | §5 invariant test |
 | omit `/ws/updates` from the manifest | §2.3 |
