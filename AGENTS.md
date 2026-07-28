@@ -295,6 +295,7 @@ All post-store enrichment goes through the ONE canonical path (`wenlan_core::ing
 **Other:**
 - **Metal/ggml on macOS Tahoe 26.x**: `ggml_metal_init` may fail even though native Metal works. The daemon auto-degrades and continues without LLM. Not a code bug. Check for competing GPU processes: `pgrep -la wenlan`.
 - **Dev and prod share data by default**: Both use port 7878 and the platform data directory (on macOS, `~/Library/Application Support/wenlan/`). For isolated testing, override explicitly: `WENLAN_PORT=7879 WENLAN_DATA_DIR=/tmp/origin-test cargo run -p wenlan-server`.
+- **Isolation has THREE axes, not two — `WENLAN_DATA_DIR` does not cover the page vault.** The projection directory comes from the `knowledge_path` config field, which `Config::knowledge_path_or_default()` (`crates/wenlan-core/src/config.rs:147`) resolves to `~/.wenlan/pages` when unset — it reads nothing from `WENLAN_DATA_DIR`. A fresh isolated data dir therefore has no override, so an "isolated" daemon that creates or exports pages writes real `.md` files into the user's live vault. Before starting an isolated daemon that will touch pages, seed its data dir with a `config.json` carrying `{"knowledge_path": "<scratch>/pages"}`, then confirm via `GET /api/knowledge/path` that the daemon reports the scratch path. Fingerprint the real vault before and after if the run is at all destructive.
 
 ### Worktree cleanup after squash-merge
 
