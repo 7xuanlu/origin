@@ -8,7 +8,7 @@ use crate::state::SharedState;
 use crate::{
     community_routes, config_routes, import_routes, ingest_routes, knowledge_routes, lint_routes,
     memory_routes, onboarding_routes, page_map_routes, refinery_routes, repair_routes, routes,
-    security, source_routes, websocket,
+    security, source_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -573,6 +573,16 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         // WebSocket
         .route("/ws/updates", get(websocket::handle_ws_upgrade))
         .finish()
+        // Innermost of the three, and `route_layer` rather than `layer`: it
+        // resolves the route's marker shape from `MatchedPath`, which only
+        // exists after routing.
+        .route_layer(axum::middleware::from_fn_with_state(
+            truth_guard::TruthGuardState {
+                state: state.clone(),
+                builder: Builder::Main,
+            },
+            truth_guard::guard,
+        ))
         .layer(cors)
         // Outermost: reject cross-origin browser traffic before CORS/handlers.
         .layer(axum::middleware::from_fn(security::guard_local_only))
@@ -599,6 +609,13 @@ pub fn build_repair_router(state: SharedState) -> AppRouter {
         .route("/api/health", get(routes::handle_health))
         .route("/api/status", get(routes::handle_status))
         .finish_restricted()
+        .route_layer(axum::middleware::from_fn_with_state(
+            truth_guard::TruthGuardState {
+                state: state.clone(),
+                builder: Builder::Repair,
+            },
+            truth_guard::guard,
+        ))
         .layer(cors)
         .layer(axum::middleware::from_fn(security::guard_local_only))
         .with_state(state)

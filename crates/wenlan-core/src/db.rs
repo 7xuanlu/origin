@@ -28,6 +28,9 @@ mod page_drafts;
 pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
+mod truth_exposure;
+
+pub use truth_exposure::{TruthMarkerAudit, TRUTH_CUTOVER_GENERATION_KEY};
 
 #[cfg(test)]
 mod claim_edge_lifecycle_test;
@@ -587,7 +590,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 100;
+pub const SCHEMA_VERSION: u32 = 101;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8546,6 +8549,15 @@ impl MemoryDB {
             if version < 100 {
                 self.migrate_100_claim_edge_lifecycle(version).await?;
             }
+
+            // Migration 101 (M5 PR-B): the marker audit log. Nothing writes to
+            // it until a call carries the intent marker, and nothing does that
+            // yet — but the table has to exist before the first one can, and a
+            // compensating control that appears at the same moment as the thing
+            // it compensates for has a window where it does not.
+            if version < 101 {
+                self.migrate_101_truth_exposure(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11959,6 +11971,29 @@ impl MemoryDB {
             "[migration] Migration 100 applied: claim-edge lifecycle triggers \
              (page move/delete, memory move) + root_kind immutability"
         );
+        Ok(())
+    }
+
+    /// Migration 101 (M5 PR-B): the truth-marker audit log.
+    ///
+    /// Additive `IF NOT EXISTS` DDL, same shape as 100 and for the same reason.
+    /// The cutover generation needs no DDL — it is an `app_metadata` key, absent
+    /// until someone sets it, and absent reads as off.
+    async fn migrate_101_truth_exposure(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 begin: {error}")))?;
+        Self::ensure_truth_exposure_tables(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 101", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 bump: {error}")))?;
+        log::info!("[migration] Migration 101 applied: truth-marker audit log");
         Ok(())
     }
 

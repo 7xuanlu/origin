@@ -32,6 +32,7 @@ pub mod sensitive_read_routes;
 pub mod source_routes;
 pub mod space_header;
 pub mod state;
+pub mod truth_guard;
 pub mod websocket;
 
 #[cfg(test)]

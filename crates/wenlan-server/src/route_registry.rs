@@ -252,6 +252,25 @@ where
         }
     }
 
+    /// Like [`Self::layer`], but only for requests that matched a route.
+    ///
+    /// The M5 truth guard needs this rather than `layer`: it looks the route up
+    /// in the manifest by `MatchedPath`, which only exists once routing has
+    /// happened, and a request that matched nothing has no marker shape to
+    /// enforce -- it is a 404 either way.
+    pub(crate) fn route_layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: Service<Request> + Clone + Send + Sync + 'static,
+        <L::Service as Service<Request>>::Response: IntoResponse + 'static,
+        <L::Service as Service<Request>>::Error: Into<Infallible> + 'static,
+        <L::Service as Service<Request>>::Future: Send + 'static,
+    {
+        Self {
+            inner: self.inner.route_layer(layer),
+        }
+    }
+
     pub(crate) fn with_state(self, state: S) -> AppRouter {
         AppRouter::new(self.inner.with_state(state))
     }
