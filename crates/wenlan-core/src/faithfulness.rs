@@ -8,11 +8,38 @@ const STOPWORDS: &[&str] = &[
     "then", "they", "them", "your", "yours",
 ];
 
-/// Split a page body into sentences. Uses regex on terminal punctuation
-/// followed by whitespace. Final sentence may not have trailing whitespace.
-pub fn split_sentences(body: &str) -> Vec<&str> {
+/// Byte spans of `body`'s sentences, in order. Splits on terminal punctuation
+/// followed by whitespace; the final span may have no trailing whitespace.
+///
+/// This is the ONE definition of the sentence boundary — a `drift_guard` tooth
+/// fails the build on a second copy, because the boundary decides where one
+/// claim ends and the next begins, and M5 claim identity is content-addressed
+/// over that text.
+///
+/// Empty spans are **retained**. A caller that maps recorded byte offsets onto
+/// span indices (`citations::process_citation_output`, attributing citation
+/// markers to sentences) needs indices aligned with the raw scan.
+/// `split_sentences` drops them at its own layer instead.
+pub fn sentence_spans(body: &str) -> Vec<(usize, usize)> {
     let re = regex::Regex::new(r"(?m)[.!?]+\s+").expect("static regex");
-    re.split(body).filter(|s| !s.trim().is_empty()).collect()
+    let mut spans = Vec::new();
+    let mut prev = 0;
+    for m in re.find_iter(body) {
+        spans.push((prev, m.start()));
+        prev = m.end();
+    }
+    spans.push((prev, body.len()));
+    spans
+}
+
+/// Split a page body into sentences, dropping blank ones. Boundaries come from
+/// [`sentence_spans`]; this is the offset-free view for scoring callers.
+pub fn split_sentences(body: &str) -> Vec<&str> {
+    sentence_spans(body)
+        .into_iter()
+        .map(|(start, end)| &body[start..end])
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 /// Extract content-bearing tokens from a sentence: lowercase, length >= 4,
@@ -59,6 +86,32 @@ mod tests {
     fn split_sentences_basic_punctuation() {
         let s = split_sentences("First sentence. Second sentence! Third question? Final.");
         assert_eq!(s.len(), 4);
+    }
+
+    #[test]
+    fn sentence_spans_cover_the_body_and_match_split_sentences() {
+        let body = "First sentence. Second sentence! Third question? Final.";
+        let spans = sentence_spans(body);
+        assert_eq!(spans.first().expect("nonempty").0, 0);
+        assert_eq!(spans.last().expect("nonempty").1, body.len());
+        let via_spans: Vec<&str> = spans
+            .iter()
+            .map(|&(s, e)| &body[s..e])
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        assert_eq!(via_spans, split_sentences(body));
+    }
+
+    #[test]
+    fn sentence_spans_retains_the_empty_spans_split_sentences_drops() {
+        // Two adjacent delimiter matches leave an empty span between them.
+        // `citations::process_citation_output` attributes each citation marker
+        // by resolving its byte offset to a span INDEX, so dropping the empty
+        // one here would shift every later sentence's attribution by one.
+        let body = "A. . B";
+        let spans = sentence_spans(body);
+        assert_eq!(spans, vec![(0, 1), (3, 3), (5, 6)]);
+        assert_eq!(split_sentences(body), vec!["A", "B"]);
     }
 
     #[test]

@@ -165,8 +165,9 @@ fn strip_out_of_range(body: &str, num_sources: usize, stripped: &mut usize) -> S
 /// citation records in body order, and aggregate stats.
 ///
 /// Sentence boundaries are computed on a marker-free "bare" copy of the
-/// body: `split_sentences` requires the terminal punctuation to be directly
-/// followed by whitespace, but a marker sits between them (`"claim.[1] Next"`).
+/// body: `faithfulness::sentence_spans` requires the terminal punctuation to
+/// be directly followed by whitespace, but a marker sits between them
+/// (`"claim.[1] Next"`).
 /// Removing the marker restores that adjacency (`"claim. Next"`) while each
 /// marker's removal position (recorded before it is dropped) still tells us
 /// which sentence it belonged to.
@@ -191,16 +192,11 @@ pub fn process_citation_output(
     }
     bare_body.push_str(&clean_body[last_end..]);
 
-    // Sentence spans over the bare body, using the same delimiter
-    // `faithfulness::split_sentences` splits on.
-    let delim_re = regex::Regex::new(r"(?m)[.!?]+\s+").expect("static regex");
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut prev = 0;
-    for m in delim_re.find_iter(&bare_body) {
-        spans.push((prev, m.start()));
-        prev = m.end();
-    }
-    spans.push((prev, bare_body.len()));
+    // Sentence spans over the bare body. The boundary rule lives in
+    // `faithfulness::sentence_spans` and only there — this path needs the
+    // offsets (to attribute each marker to its sentence), which is why it
+    // takes the span form rather than `split_sentences`.
+    let spans = crate::faithfulness::sentence_spans(&bare_body);
 
     // Paragraph spans (blank-line delimited) for the fallback scope: small
     // on-device models attach markers to a paragraph's closing elaboration

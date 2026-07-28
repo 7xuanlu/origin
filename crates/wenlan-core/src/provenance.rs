@@ -76,6 +76,26 @@ pub fn canonical_content_digest(raw_content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// SHA-256 over the **exact bytes** of a page revision's content -- the
+/// `base_content_digest` a human save binds itself to (D4; presence threat
+/// model §3 "base/revision digests: exact viewed content", T6).
+///
+/// Deliberately NOT [`canonical_content_digest`]. The two answer different
+/// questions and must not be swapped:
+///
+/// - canonical asks *"is this the same content?"* and is whitespace-tolerant on
+///   purpose, so a reformatted mirror converges on one identity;
+/// - this asks *"is this the exact text the human was looking at?"* and must be
+///   whitespace-INtolerant, because the human-edit delta is computed by
+///   comparing lines. A reflow that canonical would forgive changes every line
+///   boundary, so forgiving it would attribute the reflowed text to the human
+///   as new prose.
+pub fn revision_content_digest(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Root digest = `hash(identity_version, root_kind, canonical_content_digest)`
 /// (Q6, spec §1). Source-instance identity is excluded, so two
 /// byte-identical imports converge on one root via `INSERT ... ON CONFLICT
