@@ -693,6 +693,59 @@ fn text_embedding_initializer_guard_detects_a_direct_call() {
     assert_eq!(sites.len(), 1, "positive control must detect direct init");
 }
 
+fn sentence_delimiter_sites(path: &str, source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || !trimmed.contains(r"[.!?]+\s+") {
+                return None;
+            }
+            Some(format!("{path}:{trimmed}"))
+        })
+        .collect()
+}
+
+/// The sentence-boundary rule decides where one claim ends and the next
+/// begins, so a second copy silently forks the claim corpus: two call sites
+/// that agree today drift apart on the next abbreviation fix, and "sentence
+/// n" stops meaning the same prose in the two paths. M5 claim identity is
+/// content-addressed over that text, so the fork is not cosmetic — it mints
+/// divergent revisions for the same page. See
+/// `docs/plans/2026-07-27-m5-claim-extractor-spec.md` §1.
+#[test]
+fn the_sentence_delimiter_rule_has_exactly_one_definition() {
+    let root = repo_root();
+    let mut sites = Vec::new();
+    for path in git_ls_files(&root, "*.rs").into_iter().filter(|path| {
+        path.starts_with("crates/")
+            && path.contains("/src/")
+            && path != "crates/wenlan-core/src/drift_guard.rs"
+    }) {
+        let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
+        sites.extend(sentence_delimiter_sites(&path, &source));
+    }
+    assert_eq!(
+        sites,
+        [concat!(
+            "crates/wenlan-core/src/faithfulness.rs:",
+            r#"let re = regex::Regex::new(r"(?m)[.!?]+\s+").expect("static regex");"#
+        )],
+        "the sentence-boundary rule must live in exactly one place \
+         (faithfulness::sentence_spans); callers needing offsets call it \
+         rather than re-deriving the split: {sites:?}"
+    );
+}
+
+#[test]
+fn sentence_delimiter_guard_detects_a_second_copy() {
+    let sites = sentence_delimiter_sites(
+        "crates/wenlan-core/src/somewhere_else.rs",
+        "    let delim = regex::Regex::new(r\"(?m)[.!?]+\\s+\").unwrap();",
+    );
+    assert_eq!(sites.len(), 1, "positive control must detect a second copy");
+}
+
 #[test]
 fn clippy_syntax_guard_forbids_direct_text_embedding_initializers() {
     let config =
