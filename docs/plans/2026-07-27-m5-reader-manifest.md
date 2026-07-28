@@ -18,10 +18,12 @@ Verified surface on the merge base (`5ba8a3b4`):
 
 | Surface | Count | Source |
 |---|---|---|
-| HTTP `(method, path, handler)` triples in `router.rs` | 146 | parsed `.route("…", method(handler))` |
-| HTTP triples in **other** server files | 5 | `repair_routes.rs:24-36` |
-| distinct `(method, path)` pairs | 149 | 2 duplicates, below |
-| distinct paths | 142 | 7 paths carry more than one method |
+| HTTP `(method, path, handler)` triples in `router.rs` | 155 | paren-balanced parse of `.route("…", …)` |
+| in `repair_routes.rs` | 5 | `repair_routes.rs:24-36` |
+| in `lint_routes.rs` | 2 | missed by the first pass |
+| in `routes.rs` | 1 | missed by the first pass |
+| **total** | **163** | every file under `crates/wenlan-server/src` |
+| distinct `(method, path)` pairs | 161 | 2 duplicates, below |
 | MCP tools | 29 | `#[tool(` in `wenlan-mcp/src/tools.rs` |
 | CLI subcommands | 19 top-level | `Commands` enum, `wenlan-cli/src/main.rs:29` |
 
@@ -30,6 +32,11 @@ The two duplicate `(method, path)` pairs are `GET /api/health` and
 in `build_repair_router` (`router.rs:592`). Two separate `Router` instances, not
 an overlapping registration — but the inventory's set-equality check must key on
 `(builder, method, path)` or it will report a phantom drift.
+
+These counts come from a paren-balanced parse across **every** file in the
+crate. The first pass used a single-line regex over two hand-picked files and
+reported 151; both mistakes are recorded in the inventory because the parser is
+now part of the contract.
 
 `router.rs` is not the whole route table — `/api/repairs/*` registers in its own
 module. But it composes through the **same** wrapper, and that wrapper is the
@@ -61,7 +68,7 @@ classification — `data_class`, `selector_precedence`, `capability`,
 M5 adds one field:
 
 ```rust
-pub truth_class: TruthClass,   // Automatic | Explicit | NotPageBearing
+pub truth_class: TruthClass,   // Automatic | NotPageBearing
 ```
 
 and one derived check, mirroring the existing `scope_contract_violation()`.
@@ -80,8 +87,8 @@ Found by inspection, **non-exhaustive**:
 | `/api/lint`, `/api/repairs/*` (5 routes) | automatic |
 | `/api/debug/pipeline` | automatic |
 | `/api/communities/proposals/{id}/accept`, `/reject` | automatic |
-| `/api/pages/{id}/map/*` (5 routes) | explicit |
-| `/api/pages/{id}/archive`, `/api/memory/{id}/update-page` | explicit |
+| `/api/pages/{id}/map/*` (5 routes) | automatic |
+| `/api/pages/{id}/archive`, `/api/memory/{id}/update-page` | automatic |
 
 **Two paths an earlier draft wrongly listed here**, both corrected by reading
 the response types instead of reasoning from the route name:
@@ -108,9 +115,10 @@ response types then removed two that did not belong. A hand-enumeration was
 wrong in **both directions** within one day of being written, which is why the
 inventory is generated and this table is kept only as the motivating example.
 
-Classifying a path requires reading its **response type**, not inferring from
-its name — and where the response type is `serde_json::Value`, even that is not
-enough (inventory, "the opaque routes").
+Deciding `page_bearing` requires reading the **response type**, not inferring
+from the route name; where the response type is `serde_json::Value` even that is
+not enough; and where the route writes prose to a destination, the response is
+the wrong place to look entirely. The inventory applies all three tests.
 
 ### MCP, CLI, projection, internal: no registry exists
 
@@ -130,7 +138,7 @@ query directly — the same containment `TrackedRouter` gives HTTP.
 
 ## 3. Classification table shape
 
-Each entry carries five fields. All five are required; none may be inferred.
+Each entry carries seven fields. All seven are required; none may be inferred.
 
 | Field | Values |
 |---|---|
@@ -138,8 +146,9 @@ Each entry carries five fields. All five are required; none may be inferred.
 | `path` | route / tool name / CLI command |
 | `surface` | `http \| mcp \| cli \| projection \| export \| internal` |
 | `page_bearing` | `yes \| no` |
-| `class` | `automatic \| explicit \| not_applicable` |
+| `class` | `automatic \| not_applicable` — never `explicit`, see §4 |
 | `adapter` | the exact enforcement call site |
+| `evidence` | the response fields, opacity, or effect that decided `page_bearing` |
 
 `method` is required because `TrackedRouter`'s authoritative identity is
 `(method, path)`, not path alone (`route_registry.rs:145`). Several paths carry
@@ -151,71 +160,95 @@ not-page-bearing is a claim that must be reviewed, and silence is not a claim.
 
 ### Classification rule
 
-| Reader intent | Class | Provisional pages |
+| Reader | Class | Provisional pages |
 |---|---|---|
-| a machine decides what to show, without a human naming the page | **automatic** | **excluded, unconditionally** |
-| a human explicitly named the page or asked to browse | **explicit** | allowed **only** with a declared M5 contract |
+| every route, tool, and subcommand | **automatic** | **excluded, unconditionally** |
+| a call carrying a per-call human-intent marker | **explicit**, for that call only | allowed, both axes rendered |
 
-Ambiguous readers classify **automatic**. Under-exposing a provisional page
-costs a user one click; over-exposing one attaches unearned trust to unverified
-prose, which is the failure this rung exists to prevent.
+Under-exposing a provisional page costs a user one click; over-exposing one
+attaches unearned trust to unverified prose, which is the failure this rung
+exists to prevent. §4 explains why intent cannot be a route property.
 
 ## 4. Classification — the enumeration lives in the inventory file
 
 **The manifest is `2026-07-27-m5-reader-manifest-inventory.md`**, generated from
-the merge base: all 151 registered `(method, path, handler)` triples, all 29
+the merge base: all 163 registered `(method, path, handler)` triples, all 29
 `#[tool(` declarations, all 19 `Commands` variants, each with `page_bearing`, a
-class, an adapter, and the return-type evidence the classification rests on.
-That file is the artifact this section used to only promise.
+class, an adapter, and the evidence the classification rests on. That file is
+the artifact this section used to only promise.
 
-Generating it surfaced three things a reviewed prose list did not:
+The first generated version claimed 151 triples and was wrong twice over: it
+scanned a hand-picked file list (`router.rs`, `repair_routes.rs`) and missed
+`lint_routes.rs` and `routes.rs`, and its single-line regex truncated chained
+method routers that span lines. Twelve registrations were hidden. **Enumerate by
+pattern over the whole crate, never over a hand-picked file list** — this is the
+third incomplete enumeration in this program from that same mistake.
+
+Generating it also surfaced four things a reviewed prose list did not:
 
 - `label` is a page title by another name — `PageLinkOutbound`,
   `PageLinkInbound`, `OrphanLink`, `PageMapNode` all carry one, and a scan keyed
   on `title` misses every one;
 - word-boundary matching misses `delta_summary`, because `_` is a word
   character — so the field scan must match substrings;
-- **16 routes are statically opaque**, returning `serde_json::Value` or a bare
-  `Response`, and they include `GET /api/pages`, `POST /api/pages/search`, and
-  `GET /api/pages/{id}` — the three primary page readers.
+- routes are statically opaque where they return `serde_json::Value` or a bare
+  `Response`, including `GET /api/pages`, `POST /api/pages/search`, and
+  `GET /api/pages/{id}` — the three primary page readers;
+- **response scanning is blind to effects.** `POST /api/pages/export` returns
+  only `ExportStats` and writes full page prose into the user's Obsidian vault.
+  The most consequential page reader in the product exposes nothing through its
+  response, so `page_bearing` needs an effects test alongside the response test.
 
-### The two axes are independent, including under opacity
+### `explicit` is a property of the call, not the route
 
-An opaque return type answers `page_bearing`, not `class`. A first pass at this
-section said "all 16 opaque routes classify automatic, fail-closed," which reads
-like caution and is wrong in a way worth naming: it conflates *not knowing
-whether prose is in the payload* with *not knowing whether a human named the
-page*. Only the first is unknown. `GET /api/pages/{id}` is explicit whatever its
-return type says, because reader intent is a property of the route, not the
-struct.
+Two drafts got this wrong in opposite directions, and the correction is the
+load-bearing part of this artifact.
 
-Forcing those to automatic would have denied provisional content to M5-aware
-explicit browse clients — a functional regression dressed as a safety win. The
-rules are therefore separate:
+The first said "all 16 opaque routes classify automatic, fail-closed." That
+conflated *not knowing whether prose is in the payload* with *not knowing
+whether a human named the page*, and forcing both to automatic would have denied
+provisional content to M5-aware browse clients.
 
-| Unknown | Fail-closed default | Because |
+The second fixed that by reading intent off the route — `GET /api/pages/{id}`
+names a page, so it is explicit. Live app code disproves it:
+
+| Route | Classified | What production actually does |
 |---|---|---|
-| is prose in the payload? | `page_bearing = yes` | an unguarded reader is unrecoverable |
-| did a human name the page? | read it off the route, as usual | opacity says nothing about intent |
+| `GET /api/pages` | explicit (browse) | `SpaceList.tsx:76` polls it every 10 s for sidebar counts |
+| `GET /api/pages/recent-changes` | explicit (browse) | `HomePage.tsx:75` loads it every 30 s |
+| `GET /api/pages/orphan-links` | explicit | feeds candidate generation (`memory_routes.rs:3464`) |
 
-**No provisional content is exposed anywhere without a declared M5 contract**,
-so an opaque explicit route is not a hole: it degrades to automatic behavior for
-every caller that has not declared support (§6).
+A route is not one reader. The same path serves a human who clicked and a timer
+that polls, and a client being *globally* M5-aware proves nothing about whether
+*this* request was a human naming a page. Route-level intent cannot be made
+sound by classifying more carefully; the signal is not in the route.
 
-### The classification rule
+So M5 does not classify intent per route at all:
 
-| Reader intent | Class |
-|---|---|
-| a human named the page, or asked to browse | **explicit** |
-| everything else, including every ambiguous case | **automatic** |
+- **every reader is `automatic` by default**, and the inventory's class column
+  is `automatic` throughout;
+- **`explicit` is a per-call signal** — the request carries an explicit
+  human-intent marker, the server records it, and only then may provisional
+  content appear, with both axes rendered;
+- absent the marker, automatic. No exceptions, no route allowlist.
 
-Applied per row in the inventory. The two-table prose enumeration that used to
-sit here was deleted, not moved: it was a second copy of the inventory's Class
-column, which is precisely the hand-copied-canonical-thing pattern that produced
-the misses above. One source, one positive control.
+This is simpler than what it replaces: one server-verifiable signal instead of a
+per-route intent judgment that a UI change can silently falsify. It also removes
+the entire class of "the app started polling an explicit route" regressions,
+which nothing in the previous design would have caught.
 
-**Every** explicit path degrades to automatic behavior when the caller has not
-declared the M5 contract. There is no "explicit therefore safe" path.
+### The explicit grant covers the named page only
+
+A per-call marker authorizes provisional content **for the page the human
+named**, not for every page whose text rides along in the payload.
+`PageLinkOutbound.label`, `PageLinkInbound.label`, `OrphanLink.label`, and
+`PageMapNode.label` all carry *other* pages' titles, and none of them carry
+per-item truth axes. Embedded other-page content therefore follows the automatic
+rule unless the payload is extended to carry axes per item.
+
+The two-table prose enumeration that used to sit here was deleted, not moved: it
+was a second copy of the inventory's Class column, which is precisely the
+hand-copied-canonical-thing pattern that produced the misses above.
 
 ## 5. The projection path is not wire-negotiable
 
@@ -239,6 +272,12 @@ Manifest entries for the projection surface therefore record
 - A declared version newer than the daemon supports ⇒ treated as legacy. Trust
   contracts do not negotiate upward.
 
+Contract declaration is **necessary and not sufficient**. It says the client can
+render both axes; it does not say a human named a page. Provisional content
+requires both the declared contract **and** the per-call intent marker (§4). A
+declared client polling on a timer gets automatic behavior, which is the whole
+point of separating the two.
+
 ## 7. Mutation test per entry
 
 D3 requires a mutation test per adapter, not one blanket test. For each
@@ -248,13 +287,20 @@ page-bearing entry:
   response contains the supported page and **no field** of the provisional one —
   not title, not summary, not prose, not excerpt, not ID-with-content. Then
   remove that adapter's filter and assert the test goes RED.
-- **explicit**: three cases — no contract declared (provisional absent),
-  contract declared (provisional present **with both axes rendered**), unknown
-  version (provisional absent). Removing the negotiation check must turn the
-  first or third RED.
+- **per-call explicit**: four cases — no contract declared (provisional absent),
+  contract declared but **no intent marker** (provisional absent), contract and
+  marker both present (provisional present **with both axes rendered**), unknown
+  version (provisional absent). Removing the negotiation check must turn case 1
+  or 4 RED; removing the intent-marker check must turn case 2 RED.
+- **embedded other-page content**: with contract and marker both present for
+  page A, seed a *provisional* page B linked from A, and assert B's title is
+  absent from A's links, map, and orphan-link payloads. The grant covers the
+  named page only.
 
 A blanket "search excludes provisional" test passing while one adapter is
-missing is exactly the false PASS the per-entry requirement prevents.
+missing is exactly the false PASS the per-entry requirement prevents. Case 2 is
+the one the previous design could not express at all: it had no way to
+distinguish an M5-aware client's human click from its 10-second poll.
 
 ## 8. PR-B does not activate D3
 

@@ -251,11 +251,17 @@ Dropping `claim_kind` from the revision hash **does not** turn N7 red: condition
 `claim_id` already changes the hash. The hash's `claim_kind` term is never
 exercised.
 
-The case that isolates it: **one logical claim whose kind changes while
-alignment is forced to succeed** — i.e. hold condition 5 disabled, then assert
-that the successor revision ID still differs from its predecessor's. With
-`claim_kind` in the hash it does; without, the two revisions collide and a
-support edge bound to the old revision silently describes the new kind.
+A first attempt at the isolating case was itself broken: "hold condition 5
+disabled, then assert the successor's revision ID differs from its
+predecessor's." That cannot fail either way — a successor carries a different
+`predecessor_revision_id` than its predecessor does, so the hashes differ on
+that term alone whether or not `claim_kind` is present.
+
+The case that actually isolates it: **two candidate successors sharing
+`claim_id`, `predecessor_revision_id`, and text digest, differing only in
+`claim_kind`.** Every other hash term is held equal by construction, so the two
+revision IDs differ if and only if `claim_kind` is in the hash. Without it they
+collide, and a support edge bound to one silently describes the other.
 
 This is the general shape to watch for in every mutation table here: an oracle
 is worthless when an *earlier* guard already rejects the input. Each check must

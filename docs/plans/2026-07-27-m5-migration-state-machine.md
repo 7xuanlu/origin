@@ -112,6 +112,18 @@ it in production.
 Aggregate supported-fraction does **not** satisfy this gate. An aggregate
 dominated by distilled pages hides exactly the class most likely to be broken.
 
+### Blocking dependency: the client half of D4
+
+This gate cannot pass for the human-authored class until clients send an exact
+`base_version + base_content_digest` on save. Without it every human save takes
+the base-omitted path, mints no grounded delta, and leaves the class at zero
+supported (artifact 6 §2a).
+
+Artifact 6 assigns the daemon half to PR-A (the human-root minter). **The client
+half is an app-side change in `7xuanlu/wenlan-app` and no PR in this document
+owns it.** It must be scheduled with a named owner before PR-C is scoped, or the
+gate sits permanently red with nobody accountable for the number.
+
 ## 4. PR-C — the fenced cutover ceremony
 
 Filesystem projection and SQLite truth state are **not** one atomic store. The

@@ -153,6 +153,14 @@ dominated by distilled pages would hide a human-authored class sitting at zero,
 which is precisely the failure this section exists to catch. That number gates
 PR-C (artifact 7 §4a).
 
+Report **p95 time-to-supported** for new and edited pages alongside it. Every
+edit demotes its page synchronously (artifact 2 §3) and the page leaves
+automatic context until derivation catches up. The five-part cache makes
+re-support of unchanged claims cheap, so the gap should be small — but "should
+be" is not a measurement, and this is the one cost of the design that nothing
+else in Stage 0 prices. A large p95 here means the demote-fast/promote-slow
+asymmetry is being paid by the user on every save.
+
 ## 3. Threshold
 
 One threshold per `(model_id, model_version, prompt_version)`. There is no
@@ -240,8 +248,11 @@ requeue, re-judge under the current regime.
 - **Partial results never publish** (artifact 2, row 6). A run that judges some
   claims and fails others requeues whole.
 - Retry is idempotent through the D8 finalizer CAS on
-  `(page_version, dependency_generation, active_root_set_digest)`. Any CAS miss
-  writes zero visible rows and requeues.
+  `(page_version, dependency_generation, active_root_set_digest,
+  eligibility_generation)`. Any CAS miss writes zero visible rows and requeues.
+  The fourth term is not optional: §3 added it so a version retired mid-job
+  cannot finalize, and a three-term CAS quoted here would have re-opened exactly
+  that race at the seam where retries land.
 
 ## 5. Indexes
 

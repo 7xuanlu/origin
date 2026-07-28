@@ -28,11 +28,11 @@ Added: endpoint kinds `claim_revision`, `root`; edge type `attests`.
 
 | Edge type | src_kind | dst_kind | lineage | grounded | root_id | Writer |
 |---|---|---|---|---|---|---|
-| `mentions` | page | entity | assertion | inherit | optional | existing |
-| `relates` | entity | entity | assertion | inherit | optional | existing |
-| `cites` | page | external | evidence \| legacy | 0 | optional | existing |
-| `cites` | page | **memory** | evidence \| legacy | inherit | optional | existing |
-| `links` | page | page | synthesis | 0 | optional | existing |
+| `mentions` | page | entity | assertion \| legacy | inherit | optional | existing |
+| `relates` | entity | entity | assertion \| legacy | inherit | optional | existing |
+| `cites` | page | external | evidence \| synthesis \| legacy | 0 | optional | existing |
+| `cites` | page | **memory** | evidence \| synthesis \| legacy | inherit | optional | existing |
+| `links` | page | page | synthesis \| legacy | 0 | optional | existing |
 | `supports` | **claim_revision** | **memory** | **evidence** | see §3 | required | D8 finalizer only |
 | `attests` | **root** | **claim_revision** | **assertion** | 0 | required, = src | UI-presence txn only |
 
@@ -44,6 +44,24 @@ with lineage `evidence`, or `legacy` on a cross-space downgrade
 existing rows and break the row-for-row no-behavior-change contract. The guard
 is the dangerous half of "one edge store": it must be derived from what the
 tree actually writes, never from what the spec's prose enumerates.
+
+### The lineage column had the same defect as the kind columns
+
+Adding `cites page→memory` fixed the *tuple* and left the *lineage* set wrong,
+which would have failed identically. Every live writer computes lineage from a
+same-space test and downgrades to `legacy` when the spaces differ, so **every**
+existing shape can appear with `legacy`:
+
+| Writer | Shape | Lineage it emits |
+|---|---|---|
+| citation dual-write (`db.rs:17809`, `:41004`, `:45178`) | `cites page→memory\|external` | `evidence`, `synthesis`, or `legacy` |
+| page-link dual-write (`db.rs:43861`) | `links page→page` | `synthesis`, or `legacy` |
+| relation backfill (`db.rs:17858`) | `relates entity→entity` | `assertion`, or `legacy` |
+
+A guard enumerating `cites page→memory | evidence` alone rejects the same live
+rows the missing tuple would have. The enumeration must be built by reading
+every `dual_write_edge` call site, not by extending the table one counterexample
+at a time — which is what the previous two rounds of this artifact did.
 
 Every tuple not in this table is rejected. The CHECK constraints permit the
 column values; a separate writer-side assignment guard rejects unlisted
