@@ -20,6 +20,7 @@ pub async fn global_routes_ignore_space_header() {
         ("/api/agents/missing-agent", "/api/agents/{name}"),
         ("/api/memory/stats", "/api/memory/stats"),
         ("/api/spaces", "/api/spaces"),
+        ("/api/spaces/default", "/api/spaces/default"),
         ("/api/sources", "/api/sources"),
         ("/api/profile/narrative", "/api/profile/narrative"),
         ("/api/knowledge/count", "/api/knowledge/count"),

@@ -186,6 +186,12 @@ impl ServerState {
             ..Self::default()
         }
     }
+
+    /// Override the Page projection root for an isolated server instance.
+    pub fn with_page_root(mut self, page_root: PathBuf) -> Self {
+        self.lint_config.page_root = Some(page_root);
+        self
+    }
 }
 
 /// The shared state type threaded through all Axum handlers.

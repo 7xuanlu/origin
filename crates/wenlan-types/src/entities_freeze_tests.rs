@@ -276,20 +276,26 @@ fn entity_crud_responses_freeze() {
     let with_warnings = CreateEntityResponse {
         id: "entity_1".into(),
         warnings: vec!["low confidence".into()],
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     assert_eq!(
         serde_json::to_value(&with_warnings).unwrap(),
-        json!({ "id": "entity_1", "warnings": ["low confidence"] })
+        json!({ "id": "entity_1", "warnings": ["low confidence"], "space": null })
     );
 
     // warnings has skip_serializing_if = Vec::is_empty: an empty Vec omits the key.
     let no_warnings = CreateEntityResponse {
         id: "entity_1".into(),
         warnings: vec![],
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     assert_eq!(
         serde_json::to_value(&no_warnings).unwrap(),
-        json!({ "id": "entity_1" })
+        json!({ "id": "entity_1", "space": null })
     );
 
     let list = ListEntitiesResponse {
@@ -385,7 +391,7 @@ fn store_memory_request_entity_id_freeze() {
     let some = StoreMemoryRequest {
         content: "note".into(),
         memory_type: Some("fact".into()),
-        space: Some("work".into()),
+        space: (Some("work".into())).into(),
         source_agent: Some("claude-code".into()),
         title: Some("Title".into()),
         confidence: Some(0.5),
@@ -416,7 +422,7 @@ fn store_memory_request_entity_id_freeze() {
     let none = StoreMemoryRequest {
         content: "note".into(),
         memory_type: None,
-        space: None,
+        space: (None).into(),
         source_agent: None,
         title: None,
         confidence: None,
@@ -429,7 +435,6 @@ fn store_memory_request_entity_id_freeze() {
     let none_json = json!({
         "content": "note",
         "memory_type": null,
-        "space": null,
         "source_agent": null,
         "title": null,
         "confidence": null,
@@ -447,7 +452,7 @@ fn create_and_link_entity_request_freeze() {
     let create = CreateEntityRequest {
         name: "Alice".into(),
         entity_type: "person".into(),
-        space: Some("work".into()),
+        space: (Some("work".into())).into(),
         source_agent: Some("claude-code".into()),
         confidence: Some(0.5),
     };
@@ -733,6 +738,7 @@ fn memory_item_entity_id_and_space_entity_count_freeze() {
         description: Some("Work space".into()),
         suggested: false,
         starred: true,
+        is_default: false,
         sort_order: 0,
         memory_count: 10,
         entity_count: 3,
@@ -745,6 +751,7 @@ fn memory_item_entity_id_and_space_entity_count_freeze() {
         "description": "Work space",
         "suggested": false,
         "starred": true,
+        "is_default": false,
         "sort_order": 0,
         "memory_count": 10,
         "entity_count": 3,

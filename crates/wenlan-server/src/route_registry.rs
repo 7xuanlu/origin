@@ -219,6 +219,8 @@ const NON_SENSITIVE_MIXED_ROUTES: &[(RegisteredMethod, &str)] = &[
     (RegisteredMethod::Post, "/api/spaces"),
     (RegisteredMethod::Put, "/api/spaces/{name}"),
     (RegisteredMethod::Delete, "/api/spaces/{name}"),
+    (RegisteredMethod::Put, "/api/spaces/default"),
+    (RegisteredMethod::Delete, "/api/spaces/default"),
     (RegisteredMethod::Post, "/api/pages"),
     (RegisteredMethod::Put, "/api/pages/{id}"),
     (RegisteredMethod::Delete, "/api/pages/{id}"),

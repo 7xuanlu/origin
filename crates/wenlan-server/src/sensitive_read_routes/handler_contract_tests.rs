@@ -37,7 +37,7 @@ async fn fixture() -> (crate::router::AppRouter, tempfile::TempDir) {
                 content: "scopeprobe page content".to_string(),
                 summary: None,
                 entity_id: None,
-                space: Some(space.to_string()),
+                space: (Some(space.to_string())).into(),
                 source_memory_ids: Vec::new(),
                 creation_kind: Some("authored".to_string()),
                 workspace: Some(space.to_string()),

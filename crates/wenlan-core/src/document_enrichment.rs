@@ -727,7 +727,7 @@ async fn write_source_page(
         content: content.to_string(),
         summary: summary.map(str::to_string),
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: chunk_ids.to_vec(),
         creation_kind: Some("source".to_string()),
         workspace: None,

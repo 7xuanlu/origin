@@ -12,6 +12,7 @@
 use std::sync::RwLock;
 
 static LOCKED: RwLock<Option<String>> = RwLock::new(None);
+static DEFAULT: RwLock<Option<String>> = RwLock::new(None);
 
 /// Initialise from the environment. Call once at process startup before
 /// accepting any requests. Subsequent calls overwrite the value, which is
@@ -22,6 +23,11 @@ pub fn init_from_env() {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     *LOCKED.write().expect("lock_state write lock poisoned") = value;
+    let default = std::env::var("WENLAN_DEFAULT_SPACE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    *DEFAULT.write().expect("default_state write lock poisoned") = default;
 }
 
 /// Return the locked space slug, or `None` if `WENLAN_SPACE` was not set.
@@ -29,6 +35,14 @@ pub fn locked_space() -> Option<String> {
     LOCKED
         .read()
         .expect("lock_state read lock poisoned")
+        .clone()
+}
+
+/// Return the overridable process fallback from `WENLAN_DEFAULT_SPACE`.
+pub fn default_space() -> Option<String> {
+    DEFAULT
+        .read()
+        .expect("default_state read lock poisoned")
         .clone()
 }
 
@@ -78,6 +92,18 @@ mod tests {
         init_from_env();
         assert_eq!(locked_space(), None);
         std::env::remove_var("WENLAN_SPACE");
+        init_from_env();
+    }
+
+    #[test]
+    fn default_space_is_overridable_not_locked() {
+        let _guard = ENV_LOCK.blocking_lock();
+        std::env::remove_var("WENLAN_SPACE");
+        std::env::set_var("WENLAN_DEFAULT_SPACE", "fallback");
+        init_from_env();
+        assert_eq!(default_space().as_deref(), Some("fallback"));
+        assert!(!is_locked());
+        std::env::remove_var("WENLAN_DEFAULT_SPACE");
         init_from_env();
     }
 }

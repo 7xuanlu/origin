@@ -5,6 +5,7 @@ use crate::entities::{Entity, EntitySearchResult};
 use crate::memory::{IndexedFileInfo, MemoryItem, MemoryStats, SearchResult};
 use crate::pages::Page;
 use crate::repair::RepairDigest;
+use crate::{Space, WriteOutcome, WriteSpaceSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -43,6 +44,12 @@ pub struct StoreMemoryResponse {
     /// fields as failure. Empty when the store completed fully sync.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hint: String,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_outcome: Option<WriteOutcome>,
 }
 
 fn default_extraction_method() -> String {
@@ -214,6 +221,10 @@ pub struct StatusResponse {
     /// a local model.
     #[serde(default)]
     pub on_device_inference: OnDeviceInferenceStatus,
+    /// Additive daemon capabilities. Clients must negotiate against this list
+    /// instead of inferring support from a version string.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -326,6 +337,12 @@ pub struct CreateEntityResponse {
     pub id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_outcome: Option<WriteOutcome>,
 }
 
 #[doc(hidden)]
@@ -351,6 +368,12 @@ pub struct CreatePageResponse {
     pub attached_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_outcome: Option<WriteOutcome>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -402,6 +425,15 @@ pub struct ImportMemoriesResponse {
     pub observations_added: usize,
     pub relations_created: usize,
     pub batch_id: String,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DefaultSpaceResponse {
+    pub space: Option<Space>,
 }
 
 // ===== Steep =====
@@ -1332,6 +1364,9 @@ mod tests {
             extraction_method: "none".into(),
             enrichment: "not_needed".into(),
             hint: String::new(),
+            space: None,
+            space_source: None,
+            write_outcome: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"enrichment\":\"not_needed\""));
@@ -1356,6 +1391,9 @@ mod tests {
             extraction_method: "none".into(),
             enrichment: "paused".into(),
             hint: "Stored; choose a model source to enable enrichment.".into(),
+            space: None,
+            space_source: None,
+            write_outcome: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"enrichment\":\"paused\""));
@@ -1558,6 +1596,7 @@ mod reranker_status_tests {
             },
             reranker_mode: "full".into(),
             on_device_inference: OnDeviceInferenceStatus::default(),
+            capabilities: vec!["default_save_space".into()],
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();

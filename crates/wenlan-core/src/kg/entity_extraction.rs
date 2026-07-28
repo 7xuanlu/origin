@@ -40,6 +40,14 @@ pub async fn extract_entities_for_content(
 
     let batch = [(0usize, content.to_string())];
     let kg_results = crate::extract::parse_kg_response(&response, &batch);
+    let _space_write_guard = db.lock_space_writes().await;
+    let entity_space = match source_id {
+        Some(source_id) => match db.get_memory_space(source_id).await? {
+            Some(space) => wenlan_types::WriteSpaceTarget::Named(space),
+            None => wenlan_types::WriteSpaceTarget::Uncategorized,
+        },
+        None => wenlan_types::WriteSpaceTarget::Uncategorized,
+    };
 
     let mut entity_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -53,7 +61,7 @@ pub async fn extract_entities_for_content(
             let req = wenlan_types::requests::CreateEntityRequest {
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
-                space: None,
+                space: entity_space.clone(),
                 source_agent: Some("post_ingest".to_string()),
                 confidence: None,
             };
@@ -151,6 +159,11 @@ pub async fn commit_kg(
     content: &str,
     model_version: Option<&str>,
 ) -> Result<Option<String>, WenlanError> {
+    let _space_write_guard = db.lock_space_writes().await;
+    let entity_space = match db.get_memory_space(source_id).await? {
+        Some(space) => wenlan_types::WriteSpaceTarget::Named(space),
+        None => wenlan_types::WriteSpaceTarget::Uncategorized,
+    };
     let mut entity_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut first_entity_id: Option<String> = None;
@@ -168,7 +181,7 @@ pub async fn commit_kg(
             let req = wenlan_types::requests::CreateEntityRequest {
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
-                space: None,
+                space: entity_space.clone(),
                 source_agent: Some("post_ingest".to_string()),
                 confidence: None,
             };
@@ -350,6 +363,51 @@ mod tests {
         assert_eq!(
             stored_eid, eid,
             "stored entity_id should match the one returned by commit_kg"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_kg_files_new_entities_with_the_source_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+            .await
+            .expect("MemoryDB::new failed");
+        db.create_space("work", None, false).await.unwrap();
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: "m_space".to_string(),
+            title: "Space-derived entity".to_string(),
+            content: "Space Entity Canary joined the project.".to_string(),
+            space: Some("work".to_string()),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let kg = vec![crate::extract::KgExtractionResult {
+            index: 0,
+            entities: vec![crate::extract::ExtractedEntity {
+                name: "Space Entity Canary".to_string(),
+                entity_type: "person".to_string(),
+            }],
+            observations: vec![],
+            relations: vec![],
+        }];
+        let entity_id = commit_kg(
+            &db,
+            "m_space",
+            &kg,
+            "Space Entity Canary joined the project.",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let detail = db.get_entity_detail(&entity_id).await.unwrap();
+        assert_eq!(
+            detail.entity.space.as_deref(),
+            Some("work"),
+            "new derived entities must inherit the persisted source-memory Space"
         );
     }
 

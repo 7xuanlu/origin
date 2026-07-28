@@ -308,6 +308,8 @@ Run this hygiene pass roughly once a week or whenever `git worktree list` exceed
 
 ### Misc
 - `WENLAN_BIND_ADDR=<host:port>`: override the daemon's bind address (default `127.0.0.1:7878`). Used inside Docker to listen on `0.0.0.0`.
+- `WENLAN_AGENT_NAME=<name>`: default agent identity for CLI requests when `--agent-name` is not provided.
+- `WENLAN_DEFAULT_SPACE=<name>`: overridable default save Space for CLI and MCP writes when no explicit Space is supplied. `WENLAN_SPACE` remains the strict lock and wins over explicit and default values.
 - Log filter default is `warn` — add modules explicitly for `info` logs (e.g., `wenlan_core::db=info`, `wenlan_server=info`)
 - All local data stored in the platform data directory (`dirs::data_local_dir()/origin/`; on macOS, `~/Library/Application Support/wenlan/`) — MemoryDB, config, activities, tags
 - Crate names: `wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` (CLI), `wenlan-mcp` — all in this workspace. The desktop app crate `wenlan-app` lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app).

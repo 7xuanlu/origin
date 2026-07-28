@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! API request types for all HTTP endpoints.
 
+use crate::WriteSpaceTarget;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -11,8 +12,12 @@ pub struct StoreMemoryRequest {
     pub content: String,
     #[serde(default)]
     pub memory_type: Option<String>,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
+    #[serde(
+        default,
+        alias = "domain",
+        skip_serializing_if = "WriteSpaceTarget::is_inherit"
+    )]
+    pub space: WriteSpaceTarget,
     #[serde(default)]
     pub source_agent: Option<String>,
     #[serde(default)]
@@ -83,6 +88,8 @@ pub struct ImportMemoriesRequest {
     pub content: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "WriteSpaceTarget::is_inherit")]
+    pub space: WriteSpaceTarget,
 }
 
 // ===== General search/context =====
@@ -136,8 +143,12 @@ pub struct ChatContextRequest {
 pub struct CreateEntityRequest {
     pub name: String,
     pub entity_type: String,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
+    #[serde(
+        default,
+        alias = "domain",
+        skip_serializing_if = "WriteSpaceTarget::is_inherit"
+    )]
+    pub space: WriteSpaceTarget,
     #[serde(default)]
     pub source_agent: Option<String>,
     #[serde(default)]
@@ -251,6 +262,11 @@ pub struct UpdateSpaceRequest {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetDefaultSpaceRequest {
+    pub space_id: String,
+}
+
 // ===== Concepts =====
 
 #[doc(hidden)]
@@ -262,8 +278,12 @@ pub struct CreateConceptRequest {
     pub summary: Option<String>,
     #[serde(default)]
     pub entity_id: Option<String>,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
+    #[serde(
+        default,
+        alias = "domain",
+        skip_serializing_if = "WriteSpaceTarget::is_inherit"
+    )]
+    pub space: WriteSpaceTarget,
     #[serde(default)]
     pub source_memory_ids: Vec<String>,
     #[serde(default)]

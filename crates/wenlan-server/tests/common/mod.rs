@@ -47,7 +47,7 @@ pub async fn create_page_fixture(
         content: content.to_string(),
         summary: None,
         entity_id: None,
-        space: space.map(str::to_string),
+        space: (space.map(str::to_string)).into(),
         source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
         creation_kind: Some(creation_kind.to_string()),
         workspace: space.map(str::to_string),
@@ -112,6 +112,28 @@ pub async fn test_app_no_gate() -> (AppRouter, tempfile::TempDir, Arc<MemoryDB>)
         quality_gate: QualityGate::new(gate_cfg),
         ..ServerState::default()
     };
+    let router = build_router(Arc::new(RwLock::new(state)));
+    (router, dir, db_arc)
+}
+
+/// Build a quality-gate-disabled test app with an isolated Page projection root.
+#[allow(dead_code)]
+pub async fn test_app_no_gate_with_page_root() -> (AppRouter, tempfile::TempDir, Arc<MemoryDB>) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MemoryDB::new(dir.path(), Arc::new(NoopEmitter))
+        .await
+        .unwrap();
+    let db_arc = Arc::new(db);
+    let gate_cfg = wenlan_core::tuning::GateConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let state = ServerState {
+        db: Some(db_arc.clone()),
+        quality_gate: QualityGate::new(gate_cfg),
+        ..ServerState::default()
+    }
+    .with_page_root(dir.path().join("pages"));
     let router = build_router(Arc::new(RwLock::new(state)));
     (router, dir, db_arc)
 }

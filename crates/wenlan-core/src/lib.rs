@@ -70,6 +70,7 @@ pub(crate) mod retrieval;
 pub mod router;
 pub mod schema;
 pub mod sources;
+pub mod space_context;
 pub mod spaces;
 pub mod synthesis;
 pub mod tags;

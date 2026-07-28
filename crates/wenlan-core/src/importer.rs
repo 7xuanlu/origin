@@ -352,6 +352,30 @@ pub async fn import_memories_no_llm(
     _label: Option<&str>,
     confidence_cfg: &crate::tuning::ConfidenceConfig,
 ) -> Result<ImportResult, WenlanError> {
+    import_memories_no_llm_inner(db, raw_text, source, confidence_cfg, None).await
+}
+
+/// Import memories into one daemon-resolved Space. Stable Space identity is
+/// carried through the async embedding work and re-resolved in the DB write
+/// transaction, matching the top-level store path.
+pub async fn import_memories_no_llm_in_space(
+    db: &MemoryDB,
+    raw_text: &str,
+    source: &str,
+    _label: Option<&str>,
+    confidence_cfg: &crate::tuning::ConfidenceConfig,
+    write_space: &crate::space_context::ResolvedWriteSpace,
+) -> Result<ImportResult, WenlanError> {
+    import_memories_no_llm_inner(db, raw_text, source, confidence_cfg, Some(write_space)).await
+}
+
+async fn import_memories_no_llm_inner(
+    db: &MemoryDB,
+    raw_text: &str,
+    source: &str,
+    confidence_cfg: &crate::tuning::ConfidenceConfig,
+    write_space: Option<&crate::space_context::ResolvedWriteSpace>,
+) -> Result<ImportResult, WenlanError> {
     validate_input(raw_text)?;
     let memories = parse_memories(raw_text);
     validate_parsed_count(memories.len())?;
@@ -392,7 +416,7 @@ pub async fn import_memories_no_llm(
                 ("import_batch".to_string(), batch_id.clone()),
             ]),
             memory_type: None,
-            space: None,
+            space: write_space.and_then(|resolved| resolved.space_name.clone()),
             source_agent: Some(source.to_string()),
             confidence: Some(confidence),
             confirmed: None,
@@ -407,7 +431,11 @@ pub async fn import_memories_no_llm(
 
     // Single batch upsert — one embedding generation pass for all docs
     if !docs.is_empty() {
-        db.upsert_documents_with_enrichment_origin(
+        let docs = docs
+            .into_iter()
+            .map(|doc| (doc, write_space.cloned()))
+            .collect();
+        db.upsert_documents_with_enrichment_origin_and_write_spaces(
             docs,
             crate::db::EnrichmentOrigin {
                 memory_type_explicit: false,
