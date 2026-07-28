@@ -2450,6 +2450,13 @@ pub(crate) const PARITY_GUARD_TRIGGERS: [(&str, &str); 3] = [
 
 /// Whitespace- and case-insensitive form for comparing stored DDL against its
 /// canonical text.
+///
+/// The normalization also reaches inside string literals, so the RAISE message
+/// text is pinned only up to case and spacing. That is deliberate: what makes a
+/// guard enforce anything is its timing, target table, and WHEN predicate, and
+/// none of those live in a literal -- they are pinned exactly. The message is
+/// diagnostic only, and demanding byte equality there would make the check fail
+/// on reformatting rather than on a real weakening.
 fn normalized_ddl(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
@@ -3117,7 +3124,17 @@ impl MemoryDB {
         // startup trigger inventory, then exposes the approved apply endpoint,
         // so opening an unguarded database here is exactly where the repair
         // effect guard could be laundered. Refuse rather than repair -- the
-        // repair contract does not mutate schema outside the approved manifest.
+        // repair contract does not mutate schema outside the approved manifest,
+        // and `repair_open_requires_an_existing_current_schema_without_bootstrap_or_embedder`
+        // pins that this path creates nothing.
+        //
+        // Refusing does leave an operator no way out if their repair manifest is
+        // already applied-but-unverified, since startup then forces this path.
+        // That is acceptable only because the unguarded shape is unreachable in
+        // the field: no released build has ever written schema 96, so the state
+        // exists only in development trees, where rebuilding the database is the
+        // recovery. Should 96 ever ship without the guards, this must become a
+        // narrow guard-only bootstrap instead.
         if let Some(missing) = parity_guard_shape_drift(&conn).await? {
             log::error!("[repair] refusing to open: parity guard {missing} missing or altered");
             return Err(WenlanError::Validation(
@@ -85637,6 +85654,40 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
+        // A database claiming the current schema version must actually carry
+        // the parity counter and its integrity guards -- `open_for_repair`
+        // refuses one that does not, because that path skips migrations and
+        // then exposes the approved apply endpoint. Stamping the version
+        // without them would make this fixture a shape no real database of
+        // that version has.
+        if schema_version == SCHEMA_VERSION {
+            connection
+                .execute_batch(
+                    "CREATE TABLE community_parity_input_state (
+                         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                         generation INTEGER NOT NULL,
+                         relevant_spaces_digest TEXT NOT NULL
+                     );",
+                )
+                .await
+                .unwrap();
+            for (_, canonical) in PARITY_GUARD_TRIGGERS {
+                connection
+                    .execute_batch(&format!("{canonical};"))
+                    .await
+                    .unwrap();
+            }
+            // Seeded after the guards, so the fixture also proves the seed the
+            // real migration writes is one the guards accept.
+            connection
+                .execute_batch(
+                    "INSERT INTO community_parity_input_state
+                         (singleton, generation, relevant_spaces_digest)
+                     VALUES (1, 0, '');",
+                )
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -86196,7 +86247,12 @@ pub(crate) mod tests {
         drop(rows);
         drop(connection);
 
-        assert_eq!(tables, vec!["repair_open_probe"]);
+        // Exactly what the fixture wrote, in name order -- repair recovery
+        // opens what it finds and bootstraps nothing.
+        assert_eq!(
+            tables,
+            vec!["community_parity_input_state", "repair_open_probe"]
+        );
         assert!(db
             .generate_embeddings(&["must stay unloaded".to_string()])
             .is_err());
