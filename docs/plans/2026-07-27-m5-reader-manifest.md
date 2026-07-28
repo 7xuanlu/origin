@@ -12,42 +12,90 @@ The prompt's binding constraint on this artifact: *"No single endpoint or shared
 helper is assumed to cover this set. Stage 0 must produce an executable manifest
 from actual callers."*
 
-## 1. Why a hand-written list is not acceptable
+## 1. Surface, and the seam that already exists
 
 Verified surface on the merge base (`5ba8a3b4`):
 
 | Surface | Count | Source |
 |---|---|---|
 | HTTP routes in `router.rs` | 139 | parsed `.route("…", method(handler))` |
-| HTTP routes in **other** server files | 5+ | `repair_routes.rs:27-36`, and a `/api/lint` registration outside `router.rs` |
+| HTTP routes in **other** server files | 5 | `repair_routes.rs:24-36` |
 | MCP tools | 29 | `#[tool(` in `wenlan-mcp/src/tools.rs` |
 | CLI subcommands | 18 top-level | `Commands` enum, `wenlan-cli/src/main.rs:31` |
 
-`router.rs` is **not** the whole route table. `/api/repairs/*` and `/api/lint`
-register in separate modules and are composed in. Any manifest built by reading
-one file is already wrong today, before M5 adds anything. That is the concrete
-reason the manifest must be generated and enforced, not transcribed.
+`router.rs` is not the whole route table — `/api/repairs/*` registers in its own
+module. But it composes through the **same** wrapper, and that wrapper is the
+seam M5 must use rather than reinvent:
+
+`TrackedRouter` (`wenlan-server/src/route_registry.rs`) intercepts every
+`.route()` call and already fails closed:
+
+- `route()` asserts `"unclassified router path: {path}"` unless the path
+  resolves in `wenlan_core::lint::serving::routes` or appears in
+  `NON_SENSITIVE_PATHS` / `NON_SENSITIVE_MIXED_ROUTES`;
+- `finish()` asserts `"sensitive route registration drift"` — the registered set
+  must **exactly equal** `routes::sensitive_read_routes()`, so a route that is
+  classified but never registered fails too;
+- `repair_routes.rs:24` takes and returns `TrackedRouter`, so the separate
+  module is covered by the same assert.
+
+An M5-specific source-scanning test would be a second, weaker copy of this —
+the exact hand-copied-canonical-thing pattern that produced three separate
+defects in the M4 review rounds. M5 extends the existing table instead.
 
 ## 2. Enforcement mechanism
 
-Axum exposes no public API to enumerate a composed `Router`'s paths, so the
-manifest is enforced at the **source level**, in the established `drift_guard.rs`
-idiom (teeth #2 already scans `crates/*/src` for `WENLAN_*` flags and fails the
-build on a new undocumented one).
+### HTTP: extend `SensitiveReadRoute`, reuse the existing assert
 
-`m5_reader_manifest` is a `#[cfg(test)]` lib test that:
+`SensitiveReadRoute` (`lint/serving/routes.rs:57`) already carries per-route
+classification — `data_class`, `selector_precedence`, `capability`,
+`scope_binding`, `selection_gate`, `unknown_scope`, `cross_scope_policy`.
+M5 adds one field:
 
-1. scans every `crates/*/src/**.rs` for route registrations
-   (`.route("<path>", <method>(<handler>))`), MCP `#[tool(` declarations with
-   their `async fn` names, and CLI subcommand variants;
-2. joins each discovered path against a checked-in classification table;
-3. **fails on any discovered path absent from the table** — fail-closed, exactly
-   like teeth #2. A new endpoint is unclassified until someone classifies it;
-4. fails on any table entry that no longer matches a discovered path, so the
-   table cannot rot into fiction.
+```rust
+pub truth_class: TruthClass,   // Automatic | Explicit | NotPageBearing
+```
 
-The scan runs on the same `cargo test --workspace --lib` that CI and pre-push
-already run. No new wiring.
+and one derived check, mirroring the existing `scope_contract_violation()`.
+
+### The opt-out list is the trap
+
+`truth_class` must **not** be derived from membership in
+`sensitive_read_routes()`. Verified: `NON_SENSITIVE_PATHS`
+(`route_registry.rs:190`) contains paths that are page-bearing readers under D3:
+
+| Path in `NON_SENSITIVE_PATHS` | D3 class |
+|---|---|
+| `/ws/updates` | automatic |
+| `/api/steep` | automatic |
+| `/api/distill`, `/api/distill/{page_id}` | automatic |
+| `/api/lint`, `/api/repairs/*` | automatic |
+| `/api/knowledge/path` | automatic |
+| `/api/pages/{id}/map/*` (mutating variants) | explicit |
+
+Those are opted out of *scope-sensitivity* classification, which is a different
+question from *truth exposure*. A page-bearing route can be scope-insensitive
+and still leak provisional prose. So M5's truth classification must be **total
+over every registered path**, including the opt-out lists, with its own
+fail-closed assert in `TrackedRouter::route`. Reusing the existing membership
+test would silently exempt every path in the table above — seven page-bearing
+readers, including the push channel.
+
+### MCP, CLI, projection, internal: no registry exists
+
+These have no `TrackedRouter` equivalent, so each needs its own seam:
+
+| Surface | Seam |
+|---|---|
+| MCP | a `const` table keyed by tool name; a test asserts it covers every `#[tool(` fn in `tools.rs` and nothing more |
+| CLI | a `const` table keyed by subcommand path; a test asserts it covers every `Commands` variant |
+| projection | the directory invariant (§5), not a call site |
+| internal | a `const` table of reader call sites, asserted against a source scan for the page-read helpers |
+
+The internal-reader scan is the weakest of the four, because "reads a page" is
+not a syntactic property. It is bounded by routing every page read through a
+small set of named helpers and asserting no other module calls the underlying
+query directly — the same containment `TrackedRouter` gives HTTP.
 
 ## 3. Classification table shape
 
@@ -172,9 +220,11 @@ which is the precedent this follows deliberately.
 
 | Weakening | Must fail |
 |---|---|
-| build the manifest from `router.rs` alone | §2 scan test — `/api/repairs/*` and `/api/lint` go missing |
-| allow an unclassified discovered path | §2.3 fail-closed test |
-| allow a table entry with no matching source path | §2.4 rot test |
+| derive `truth_class` from `sensitive_read_routes()` membership | §2 opt-out test — `/ws/updates` and six others go unclassified |
+| build a second source-scanning manifest beside `TrackedRouter` | §1 — review gate, duplicate seam |
+| allow an unclassified registered path | `TrackedRouter::route` assert |
+| allow a table entry with no registered path | `finish()` drift assert |
+| leave an MCP tool or CLI subcommand uncovered | §2 per-surface coverage test |
 | default ambiguous readers to `explicit` | §3 classification test |
 | treat an unknown contract version as supported | §6 test |
 | let an explicit path skip negotiation | §7 explicit case 1 |
