@@ -30,6 +30,8 @@ mod scoped_entities;
 mod scoped_pages;
 
 #[cfg(test)]
+mod claim_edge_lifecycle_test;
+#[cfg(test)]
 mod claim_identity_test;
 #[cfg(test)]
 mod edges_rebuild_test;
@@ -585,7 +587,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 99;
+pub const SCHEMA_VERSION: u32 = 100;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8535,6 +8537,15 @@ impl MemoryDB {
             if version < 99 {
                 self.migrate_99_page_truth_backfill(version).await?;
             }
+
+            // Migration 100 (M5 PR-B, F5): the lifecycle triggers that retract
+            // a claim's support and attestation edges when the page or evidence
+            // memory underneath them moves space or is deleted, plus the
+            // `root_kind` immutability rule that closes the fourth path by
+            // prevention. See ensure_claim_edge_lifecycle_triggers.
+            if version < 100 {
+                self.migrate_100_claim_edge_lifecycle(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11920,6 +11931,33 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 99 applied: {filled} page(s) backfilled to provisional, \
              unreviewed truth state"
+        );
+        Ok(())
+    }
+
+    /// Migration 100 (M5 PR-B, F5): claim-edge lifecycle triggers.
+    ///
+    /// Pure DDL, so no backup and no data pass — the triggers change what
+    /// future writes do, never what any existing row says. Deliberately its own
+    /// migration rather than an amendment to 98: 98 is a table rebuild that
+    /// must not be re-run, and this is `IF NOT EXISTS` DDL that is safe to.
+    async fn migrate_100_claim_edge_lifecycle(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 begin: {error}")))?;
+        Self::ensure_claim_edge_lifecycle_triggers(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 100", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 100 applied: claim-edge lifecycle triggers \
+             (page move/delete, memory move) + root_kind immutability"
         );
         Ok(())
     }

@@ -99,6 +99,40 @@ fn added_lines(base_content: &str, new_content: &str) -> String {
         .join("\n")
 }
 
+/// The retraction body shared by the two page-side lifecycle triggers.
+///
+/// `anchor` is the row alias naming the page — `NEW` for the space move, `OLD`
+/// for the delete. One string for both, the same reason the space fence has one
+/// `FENCE_BODY`: two hand-written copies of "which edges depend on this page"
+/// are two chances to answer it differently.
+///
+/// The `CASE` picks the endpoint that carries the claim side of the edge —
+/// `supports` asserts *from* a revision, `attests` asserts *into* one — and
+/// yields NULL for every other edge type, so `NULL IN (...)` leaves those rows
+/// alone. Writing it as one comparison rather than two `OR`ed subqueries keeps
+/// the dependent set defined in exactly one place.
+fn page_retraction_body(anchor: &str) -> String {
+    format!(
+        "
+                 UPDATE edges
+                    SET valid_until = CAST(strftime('%s','now') AS INTEGER),
+                        superseded_by = NULL
+                  WHERE valid_until IS NULL
+                    AND CASE
+                          WHEN edge_type = 'supports' AND src_kind = 'claim_revision'
+                            THEN src_id
+                          WHEN edge_type = 'attests' AND dst_kind = 'claim_revision'
+                            THEN dst_id
+                        END IN (
+                          SELECT cr.claim_revision_id
+                            FROM claim_revisions cr
+                            JOIN claims c ON c.claim_id = cr.claim_id
+                           WHERE c.page_id = {anchor}.id
+                        );
+             "
+    )
+}
+
 impl MemoryDB {
     /// Create the additive M5 claim-identity tables inside `tx`.
     ///
@@ -313,6 +347,121 @@ impl MemoryDB {
         )
         .await
         .map_err(|error| WenlanError::VectorDb(format!("m98 claim-identity DDL: {error}")))?;
+        Ok(())
+    }
+
+    /// Keep the active support/attestation set honest when the rows it depends
+    /// on move or disappear (F5).
+    ///
+    /// An `edges` row is a claim about the world at a point in time, and
+    /// `valid_until IS NULL` is the assertion that it is still true. Three
+    /// ordinary mutations falsify one without touching it: moving a page to
+    /// another space leaves its claims' support edges stamped with the old
+    /// space, moving an evidence memory leaves an edge that is now cross-space
+    /// with the fence never having fired, and deleting a page cascades the
+    /// claims and revisions away while the edges — whose endpoints are
+    /// polymorphic and therefore carry no foreign key — survive pointing at
+    /// nothing. Each leaves a row that still reads as a live, fenced,
+    /// space-consistent support.
+    ///
+    /// **Triggers rather than the call sites.** Nine production statements
+    /// write `memories.space` or `pages.space`, and more will exist; a
+    /// convention that every one of them must remember to retract is a
+    /// convention with nine chances to be forgotten and no way to notice. The
+    /// invariant belongs to storage, where it holds for writers that do not
+    /// exist yet — the same reasoning the space fence and the human-root rule
+    /// are already built on.
+    ///
+    /// Retraction is soft (`valid_until` stamped), never a delete: the support
+    /// *was* true, and the history of when it stopped being true is the point.
+    /// `superseded_by` stays NULL because nothing replaced these — they were
+    /// invalidated, not re-asserted.
+    ///
+    /// The fence's UPDATE twin is scoped `NEW.valid_until IS NULL`, so
+    /// retracting does not trip it. That matters for the space-move triggers,
+    /// which necessarily fire *after* the endpoint has already moved: a fence
+    /// that ran here would abort the very write that repairs the inconsistency.
+    ///
+    /// Idempotent (`IF NOT EXISTS`) like the rest of the M5 DDL.
+    pub(super) async fn ensure_claim_edge_lifecycle_triggers(
+        tx: &libsql::Transaction,
+    ) -> Result<(), WenlanError> {
+        tx.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS m5_retract_claim_edges_on_page_space_move
+             AFTER UPDATE OF space ON pages
+             WHEN NEW.space IS NOT OLD.space
+             BEGIN{move_body}END;
+
+             CREATE TRIGGER IF NOT EXISTS m5_retract_claim_edges_on_page_delete
+             BEFORE DELETE ON pages
+             BEGIN{delete_body}END;
+
+             CREATE TRIGGER IF NOT EXISTS m5_retract_support_on_memory_space_move
+             AFTER UPDATE OF space ON memories
+             WHEN NEW.space IS NOT OLD.space
+             BEGIN
+                 UPDATE edges
+                    SET valid_until = CAST(strftime('%s','now') AS INTEGER),
+                        superseded_by = NULL
+                  WHERE valid_until IS NULL
+                    AND edge_type = 'supports'
+                    AND dst_kind = 'memory'
+                    AND dst_id = NEW.source_id;
+             END;
+
+             -- Deleting the evidence itself is the page-delete hazard from the
+             -- other end: `memories` has no foreign key pointing at it either,
+             -- so the support survives naming a memory that is gone. Guarded
+             -- twice because `memories` is chunked -- one logical memory is
+             -- several rows sharing a `source_id`, and deleting chunk 3 of 5
+             -- retracts nothing. The edge probe comes first so the common case
+             -- (a delete with no support edge anywhere near it, including every
+             -- bulk delete) costs one lookup on the partial support index and
+             -- stops.
+             CREATE TRIGGER IF NOT EXISTS m5_retract_support_on_memory_delete
+             BEFORE DELETE ON memories
+             WHEN EXISTS (
+                      SELECT 1 FROM edges
+                       WHERE edge_type = 'supports' AND src_kind = 'claim_revision'
+                         AND lineage = 'evidence' AND valid_until IS NULL
+                         AND dst_id = OLD.source_id
+                  )
+              AND NOT EXISTS (
+                      SELECT 1 FROM memories
+                       WHERE source_id = OLD.source_id AND id <> OLD.id
+                  )
+             BEGIN
+                 UPDATE edges
+                    SET valid_until = CAST(strftime('%s','now') AS INTEGER),
+                        superseded_by = NULL
+                  WHERE valid_until IS NULL
+                    AND edge_type = 'supports'
+                    AND dst_kind = 'memory'
+                    AND dst_id = OLD.source_id;
+             END;
+
+             -- The fourth F5 path, closed by prevention rather than repair.
+             -- Flipping an attesting root from human to `generated` would leave
+             -- an active human-style attestation over a machine root, and no
+             -- retraction could fire afterwards anyway: the human-root trigger
+             -- guards every UPDATE naming `attests`, so the repair would be
+             -- refused by the rule it exists to restore. Nothing writes this
+             -- column today and nothing coherently could -- `root_kind` is an
+             -- input to `identity_digest`, so a root that changed kind would no
+             -- longer be the row its own content address names.
+             CREATE TRIGGER IF NOT EXISTS provenance_roots_kind_is_immutable
+             BEFORE UPDATE OF root_kind ON provenance_roots
+             WHEN NEW.root_kind IS NOT OLD.root_kind
+             BEGIN
+                 SELECT RAISE(ABORT, 'provenance_roots.root_kind is immutable');
+             END;",
+            move_body = page_retraction_body("NEW"),
+            delete_body = page_retraction_body("OLD"),
+        ))
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("m100 claim-edge lifecycle triggers: {error}"))
+        })?;
         Ok(())
     }
 
