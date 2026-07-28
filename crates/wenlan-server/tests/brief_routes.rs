@@ -226,9 +226,9 @@ async fn patch_commits_safe_changes_reports_stale_conflicts_and_projects_receipt
     let item_id = created.applied[0].item_id.clone().unwrap();
     assert_eq!(
         created.projection_path.as_deref(),
-        Some(temp.path().join("status/work.md").to_str().unwrap())
+        Some(temp.path().join("status").join("work.md").to_str().unwrap())
     );
-    assert!(temp.path().join("status/work.md").is_file());
+    assert!(temp.path().join("status").join("work.md").is_file());
 
     let (_, stale) = json_request(
         app,
@@ -258,5 +258,5 @@ async fn patch_commits_safe_changes_reports_stale_conflicts_and_projects_receipt
 
     assert_eq!(stale.conflicts.len(), 1);
     assert_eq!(stale.applied.len(), 1);
-    assert!(temp.path().join("status/work.md").is_file());
+    assert!(temp.path().join("status").join("work.md").is_file());
 }
