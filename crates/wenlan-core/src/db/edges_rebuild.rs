@@ -23,7 +23,8 @@ use crate::WenlanError;
 /// Named explicitly on both sides of the copy rather than using `SELECT *`, so
 /// a column added to one shape and not the other is a SQL error instead of a
 /// silent positional shift.
-const EDGE_COLUMNS: &str = "edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, \
+pub(super) const EDGE_COLUMNS: &str =
+    "edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, \
                             grounded, root_id, space, weight, payload, provenance, operation_id, \
                             created_at, superseded_by, valid_until";
 
@@ -44,7 +45,7 @@ const EDGE_COLUMNS: &str = "edge_id, src_id, src_kind, dst_id, dst_kind, edge_ty
 /// The full allowed-tuple table stays a writer-side guard, per §2. These three
 /// are here because §4 says explicitly that the rebuild is the one chance to
 /// add them.
-const EDGES_WIDENED_DDL: &str = "CREATE TABLE edges_new (
+pub(super) const EDGES_WIDENED_DDL: &str = "CREATE TABLE edges_new (
     edge_id TEXT PRIMARY KEY,
     src_id TEXT NOT NULL,
     src_kind TEXT NOT NULL CHECK(src_kind IN ('page','memory','entity','external','claim_revision','root')),
@@ -171,6 +172,55 @@ const M5_INDEXES: [(&str, &str); 4] = [
         "CREATE INDEX IF NOT EXISTS idx_edges_attests_rev ON edges(src_id, dst_id)
          WHERE edge_type='attests' AND src_kind='root'
            AND lineage='assertion' AND valid_until IS NULL",
+    ),
+];
+
+/// The one §5 rule the CHECKs cannot express: **"a `generated` root can never
+/// attest"**.
+///
+/// The six table CHECKs constrain `attests` to `src_kind='root'`,
+/// `lineage='assertion'`, `grounded=0`, and `root_id = src_id`. None of them can
+/// see whether the root at that id is a *human* one, because a SQLite CHECK may
+/// not contain a subquery — it is confined to the row being written. So the
+/// rule that decides whether a machine can manufacture human presence lives
+/// here, in a trigger, which can.
+///
+/// Fail-closed on both arms of `NOT EXISTS`: an `attests` edge naming a root
+/// that is `generated`, and one naming a root that does not exist at all, are
+/// both refused. The second matters as much as the first — "no such root" must
+/// never read as "nothing to object to".
+///
+/// Two twins for the same reason the space fence has two: an UPDATE can flip
+/// `edge_type` to `attests` or repoint `src_id` at a machine root, and a rule
+/// enforced only on INSERT is a rule with a documented way around it.
+const M5_TRIGGERS: [(&str, &str); 2] = [
+    (
+        "edges_attests_requires_human_root",
+        "CREATE TRIGGER IF NOT EXISTS edges_attests_requires_human_root
+         BEFORE INSERT ON edges
+         WHEN NEW.edge_type = 'attests'
+         BEGIN
+             SELECT RAISE(ABORT, 'attests requires a human provenance root')
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM provenance_roots
+                  WHERE root_id = NEW.src_id
+                    AND root_kind IN ('human_capture','human_edit_delta')
+             );
+         END",
+    ),
+    (
+        "edges_attests_requires_human_root_update",
+        "CREATE TRIGGER IF NOT EXISTS edges_attests_requires_human_root_update
+         BEFORE UPDATE ON edges
+         WHEN NEW.edge_type = 'attests'
+         BEGIN
+             SELECT RAISE(ABORT, 'attests requires a human provenance root')
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM provenance_roots
+                  WHERE root_id = NEW.src_id
+                    AND root_kind IN ('human_capture','human_edit_delta')
+             );
+         END",
     ),
 ];
 
@@ -341,6 +391,13 @@ impl MemoryDB {
             expected.insert(name.to_string());
         }
 
+        for (name, statement) in M5_TRIGGERS {
+            tx.execute(statement, ()).await.map_err(|error| {
+                WenlanError::VectorDb(format!("m97 create M5 trigger {name}: {error}"))
+            })?;
+            expected.insert(name.to_string());
+        }
+
         let actual: std::collections::BTreeSet<String> = Self::attached_object_names(tx, "edges")
             .await?
             .into_iter()
@@ -412,7 +469,9 @@ impl MemoryDB {
     /// materializes both sides, so on a very large `edges` this is the
     /// migration's memory ceiling; batching the comparison by `edge_id` range
     /// is the upgrade path if that ever binds.
-    async fn assert_copy_is_faithful(tx: &libsql::Transaction) -> Result<(), WenlanError> {
+    pub(super) async fn assert_copy_is_faithful(
+        tx: &libsql::Transaction,
+    ) -> Result<(), WenlanError> {
         for (from, to) in [("edges", "edges_new"), ("edges_new", "edges")] {
             let mut rows = tx
                 .query(

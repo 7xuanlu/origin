@@ -52,6 +52,8 @@ async fn every_trigger_on_edges_is_recorded_for_the_rebuild() {
     assert_eq!(
         schema_objects("trigger").await,
         [
+            "edges_attests_requires_human_root",
+            "edges_attests_requires_human_root_update",
             "edges_space_fence",
             "edges_space_fence_update",
             "m4_grouping_edge_delete",
@@ -440,4 +442,248 @@ async fn replay_fails_loud_on_a_statement_that_does_not_apply() {
     .await;
 
     assert!(result.is_err(), "replay must not swallow a failure");
+}
+
+/// Seed `pg1 → c1 → cr1`, a claim revision in space `unfiled` that an
+/// attestation can legally point at.
+///
+/// Every attestation-refusal test needs this, and the reason is the whole
+/// lesson of the mutation that found it missing. Without a real revision at
+/// `cr1`, the space fence resolves the destination to NULL and aborts the row
+/// on its own — so the test went green with the human-root trigger deleted, and
+/// was proving the fence rather than the rule it names. A refusal test only
+/// means something when exactly one rule can do the refusing.
+async fn seed_attestable_revision(db: &MemoryDB) {
+    db.insert_page(
+        "pg1",
+        "pg1",
+        None,
+        "",
+        None,
+        Some("unfiled"),
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let conn = db.conn.lock().await;
+    conn.execute_batch(
+        "INSERT INTO claims (claim_id, page_id, created_at) VALUES ('c1', 'pg1', 0);
+         INSERT INTO claim_revisions (claim_revision_id, claim_id, predecessor_revision_id,
+                                      canonical_text, canonical_text_digest, claim_kind,
+                                      extractor_version, created_at)
+         VALUES ('cr1', 'c1', '', 'a sentence', 'digest', 'observation', 1, 0);",
+    )
+    .await
+    .unwrap();
+}
+
+/// Weakening: allow a `generated` root to attest.
+///
+/// Artifact 3 §5: "The attesting root's `root_kind` must be `human_capture` or
+/// `human_edit_delta`. A `generated` root can never attest." This is the rule
+/// that decides whether a machine can manufacture human presence, and it is the
+/// one §5 rule no CHECK can carry — a CHECK sees only the row being written,
+/// and the root's kind lives in another table. Every other column of this row is
+/// individually legal, which is exactly why the gap was invisible.
+#[tokio::test]
+async fn a_generated_root_may_not_attest() {
+    let (db, _temp) = test_db().await;
+    seed_attestable_revision(&db).await;
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
+                                       root_kind, independence_group_id, created_at)
+         VALUES ('rg', 1, 'rg', 'generated', 'g', 0)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let refused = conn
+        .execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, root_id, space, created_at)
+             VALUES ('a1', 'rg', 'root', 'cr1', 'claim_revision', 'attests',
+                     'assertion', 0, 'rg', 'unfiled', 0)",
+            (),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a generated root can never attest (artifact 3 §5)"
+    );
+}
+
+/// Same rule, the arm that is easy to forget: an attestation naming a root that
+/// does not exist at all. "No such root" must not read as "nothing to object
+/// to" — the trigger has to be fail-closed on both arms of its `NOT EXISTS`.
+#[tokio::test]
+async fn an_attestation_naming_no_root_at_all_is_refused() {
+    let (db, _temp) = test_db().await;
+    seed_attestable_revision(&db).await;
+    let conn = db.conn.lock().await;
+    let refused = conn
+        .execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, root_id, space, created_at)
+             VALUES ('a1', 'ghost', 'root', 'cr1', 'claim_revision', 'attests',
+                     'assertion', 0, 'ghost', 'unfiled', 0)",
+            (),
+        )
+        .await;
+    assert!(refused.is_err(), "an unknown root cannot attest");
+}
+
+/// Weakening: enforce the human-root rule on INSERT only.
+///
+/// An UPDATE can flip `edge_type` to `attests` or repoint `src_id` at a machine
+/// root. A rule enforced on one statement is a rule with a documented way
+/// around it — the same reason the space fence carries an UPDATE twin.
+/// This is also the first test that inserts a **valid** attestation, which the
+/// refusal tests above cannot do: they only ever prove a row is rejected, and a
+/// fence that rejected everything would satisfy every one of them. Seeding a
+/// real page → claim → revision chain is what makes the happy path reachable,
+/// and therefore what makes the refusals mean something.
+#[tokio::test]
+async fn an_update_may_not_repoint_an_attestation_at_a_machine_root() {
+    let (db, _temp) = test_db().await;
+    seed_attestable_revision(&db).await;
+    let conn = db.conn.lock().await;
+    conn.execute_batch(
+        "INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
+                                       root_kind, independence_group_id, created_at)
+         VALUES ('rh', 1, 'rh', 'human_capture', 'g', 0);
+         INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
+                                       root_kind, independence_group_id, created_at)
+         VALUES ('rg', 1, 'rg', 'generated', 'g', 0);
+         INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                            lineage, grounded, root_id, space, created_at)
+         VALUES ('a1', 'rh', 'root', 'cr1', 'claim_revision', 'attests',
+                 'assertion', 0, 'rh', 'unfiled', 0);",
+    )
+    .await
+    .expect("a human root attesting a same-space revision is the valid shape");
+
+    let refused = conn
+        .execute(
+            "UPDATE edges SET src_id = 'rg', root_id = 'rg' WHERE edge_id = 'a1'",
+            (),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "an UPDATE must not move an attestation onto a machine root"
+    );
+}
+
+/// Weakening: let the migration widen past a pre-M5 `supports` row.
+///
+/// Artifact 3 §2 reserves `supports` and records that nothing writes it today.
+/// A row of that type in an existing database therefore has unknown provenance,
+/// and `supports` is precisely the shape M5 reads as truth — so the migration
+/// must HALT rather than carry it across into the trusted set.
+///
+/// The halt mechanism is the copy itself: the row cannot enter the widened
+/// table, so the `INSERT ... SELECT` aborts, so the transaction rolls back and
+/// `user_version` is never stamped. This test drives that mechanism at the table
+/// level rather than through `run_migrations`, because it cannot do otherwise
+/// and say anything true: `test_db()` hands back a database already migrated
+/// past 97, so there is no pre-97 `edges` left to seed. Hand-forging one would
+/// mean writing the old schema into the test — making the fixture a copy of the
+/// very thing under test, which proves nothing when the two drift.
+///
+/// So: build the widened shape the migration builds, and show the row bounces
+/// off it. Migration 97 wraps that in a transaction, which is what turns a
+/// bounced row into a rolled-back migration.
+#[tokio::test]
+async fn a_pre_m5_supports_row_cannot_enter_the_widened_table() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+    let tx = conn.transaction().await.unwrap();
+    tx.execute(super::edges_rebuild::EDGES_WIDENED_DDL, ())
+        .await
+        .unwrap();
+
+    let refused = tx
+        .execute(
+            "INSERT INTO edges_new (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                    lineage, grounded, space, created_at)
+             VALUES ('legacy-sup', 'p1', 'page', 'm1', 'memory', 'supports',
+                     'legacy', 0, 'unfiled', 0)",
+            (),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a supports row of unknown provenance must stop the rebuild, not ride it \
+         into the set M5 reads as truth"
+    );
+}
+
+/// Weakening: skip the copy verification entirely.
+///
+/// Artifact 3 §9 names this one and names why it is hard: "a clean corpus stays
+/// green either way, so the oracle must corrupt something". Every other rebuild
+/// test copies a healthy table, so none of them can tell a working verify from
+/// an absent one. This one corrupts the copy on purpose, in both directions a
+/// copy can be wrong — a row that went missing, and a row that arrived altered.
+#[tokio::test]
+async fn the_copy_verifier_catches_a_corrupted_copy() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                            lineage, grounded, space, created_at)
+         VALUES ('e1', 'p1', 'page', 'p2', 'page', 'links', 'legacy', 0, 'unfiled', 7)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    tx.execute(super::edges_rebuild::EDGES_WIDENED_DDL, ())
+        .await
+        .unwrap();
+    let columns = super::edges_rebuild::EDGE_COLUMNS;
+
+    // A faithful copy passes, so a later failure is the corruption talking and
+    // not the fixture.
+    tx.execute(
+        &format!("INSERT INTO edges_new ({columns}) SELECT {columns} FROM edges"),
+        (),
+    )
+    .await
+    .unwrap();
+    MemoryDB::assert_copy_is_faithful(&tx)
+        .await
+        .expect("an exact copy is faithful");
+
+    // Corruption 1: a row that never arrived.
+    tx.execute("DELETE FROM edges_new WHERE edge_id = 'e1'", ())
+        .await
+        .unwrap();
+    assert!(
+        MemoryDB::assert_copy_is_faithful(&tx).await.is_err(),
+        "a dropped row must fail the verify"
+    );
+
+    // Corruption 2: a row that arrived with a column changed. Row counts match
+    // here, so a count-only check would sail straight past it.
+    tx.execute(
+        &format!("INSERT INTO edges_new ({columns}) SELECT {columns} FROM edges"),
+        (),
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE edges_new SET created_at = 8 WHERE edge_id = 'e1'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert!(
+        MemoryDB::assert_copy_is_faithful(&tx).await.is_err(),
+        "an altered row must fail the verify even though the counts agree"
+    );
 }
