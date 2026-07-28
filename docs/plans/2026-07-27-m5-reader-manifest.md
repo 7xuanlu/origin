@@ -203,10 +203,11 @@ Generating it also surfaced five things a reviewed prose list did not:
   The most consequential page reader in the product exposes nothing through its
   response, so `page_bearing` needs an effects test alongside the response test;
 - **and blind to the error arm** — though this one is *not* a `page_bearing`
-  test, and a draft that made it one contradicted its own table. 158 of 162
-  handlers return `Result<_, ServerError>` and every variant carries a free-form
-  `String` (`error.rs:11`), so the rule would classify 158 routes page-bearing
-  while the table says 77. D4's stale-base conflict is precisely where an
+  test, and a draft that made it one contradicted its own table. Nearly every
+  handler returns `Result<_, ServerError>` and every variant carries a free-form
+  `String` (`error.rs:11`) — the exact count is in the inventory, not restated
+  here — so the rule would classify almost every route page-bearing while the
+  table says 77. D4's stale-base conflict is precisely where an
   implementer writes `current version: <title>`. The leak is real; the axis was
   wrong. It is now **one cross-cutting invariant at the error-serialization
   seam** — no `ServerError` body may carry a provisional page's title or prose —
@@ -418,6 +419,7 @@ Every unmarked row is an executable test that goes RED under its weakening.
 | let a marked call skip negotiation | §7 per-call case 1 |
 | grant `collection` to an item type that cannot carry both axes | inventory teeth 12 — `OrphanLink { label, count }` |
 | claim the shape gate bounds total exposure | §4 — `collection` + `named_page` compose |
+| let a marked call leave no durable audit row | §4 — the audit record is the *only* compensating control for the conceded composition attack; without a tooth it is a sentence |
 | remove any single adapter's filter | that entry's own §7 test goes RED |
 | leave provisional files in the legacy projection directory | §5 invariant test |
 | omit `/ws/updates` from the manifest | §2.3 |

@@ -768,7 +768,12 @@ adds a test that:
 12. asserts every `collection`-shaped route's item type can carry a page
     identity **and** both truth axes — the check that keeps
     `OrphanLink { label, count }`-shaped payloads off the allowlist;
-13. sentinel test: seed a provisional page, drive every error path that names
+13. asserts every marked call writes a durable audit row carrying caller
+    identity, the page IDs named, and a timestamp — and that removing the write
+    goes RED. The audit record is the sole compensating control for the
+    conceded `collection` + `named_page` composition attack, so an untested one
+    is a sentence, not a control;
+14. sentinel test: seed a provisional page, drive every error path that names
     it, and assert its title and prose appear in **no** error body. This is the
     single error-seam invariant, not a per-route classification.
 
