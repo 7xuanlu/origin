@@ -11545,6 +11545,35 @@ impl MemoryDB {
               AND NEW.generation <> OLD.generation + 1
              BEGIN
                SELECT RAISE(ABORT, 'community_parity_input_state generation must advance by at most 1 per write');
+             END;
+
+             -- UPDATE is not the only way to move the counter. `INSERT OR
+             -- REPLACE` resolves its conflict by replacing the row rather than
+             -- updating it, so the guard above never fires, and the replacement
+             -- costs one row change while carrying the generation arbitrarily
+             -- far forward -- the same laundering by another route. The only
+             -- legitimate insert is the seed directly below, which is always
+             -- generation 0, so anything else is rejected. (A replace that
+             -- carries generation 0 moves the counter backwards, which yields
+             -- negative compensation and so makes an escape easier to see, not
+             -- harder, besides invalidating every proof.)
+             DROP TRIGGER IF EXISTS m4_parity_input_state_seed_only_insert;
+             CREATE TRIGGER m4_parity_input_state_seed_only_insert
+             BEFORE INSERT ON community_parity_input_state
+             WHEN NEW.generation <> 0
+             BEGIN
+               SELECT RAISE(ABORT, 'community_parity_input_state may only be inserted at generation 0');
+             END;
+
+             -- DELETE+INSERT is the same bypass by a longer route, and nothing
+             -- in production ever deletes the singleton. Note this does NOT
+             -- fire for `INSERT OR REPLACE` unless recursive_triggers is on --
+             -- the seed-only insert guard above is what closes that route.
+             DROP TRIGGER IF EXISTS m4_parity_input_state_no_delete;
+             CREATE TRIGGER m4_parity_input_state_no_delete
+             BEFORE DELETE ON community_parity_input_state
+             BEGIN
+               SELECT RAISE(ABORT, 'community_parity_input_state singleton must not be deleted');
              END;",
         )
         .await
@@ -12184,6 +12213,48 @@ impl MemoryDB {
                     .to_ascii_lowercase()
                     .contains("update community_parity_input_state")
             }) {
+                return Ok(true);
+            }
+        }
+
+        // The integrity guards never bump the counter -- they forbid the write
+        // shapes that would let a bump be laundered past the repair effect
+        // guard -- so they carry their own markers rather than the bump
+        // substring above. Without this loop a missing or malformed guard is
+        // undetectable, which would leave the arithmetic silently unprotected.
+        for (trigger, marker) in [
+            ("m4_parity_input_state_unit_bump", "at most 1 per write"),
+            (
+                "m4_parity_input_state_seed_only_insert",
+                "only be inserted at generation 0",
+            ),
+            ("m4_parity_input_state_no_delete", "must not be deleted"),
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master
+                      WHERE type='trigger' AND name=?1 LIMIT 1",
+                    libsql::params![trigger],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "inspect community parity integrity guard {trigger}: {error}"
+                    ))
+                })?;
+            let sql = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "read community parity integrity guard {trigger}: {error}"
+                    ))
+                })?
+                .and_then(|row| row.get::<String>(0).ok());
+            if !sql
+                .as_deref()
+                .is_some_and(|value| value.to_ascii_lowercase().contains(marker))
+            {
                 return Ok(true);
             }
         }
@@ -50125,6 +50196,78 @@ pub(crate) mod tests {
             format!("{error}").contains("consumer_contract_version"),
             "the failure must name the missing signature, got: {error}"
         );
+    }
+
+    /// Positive control over the parity counter's conservation invariant.
+    ///
+    /// The repair effect guard subtracts the measured generation delta from
+    /// `total_changes()`, which is sound only while a unit of compensation
+    /// costs a row write. Guarding one write shape is not enough: a review
+    /// found that `INSERT OR REPLACE` replaces rather than updates, so an
+    /// `UPDATE`-only invariant never fired and the replacement bought two
+    /// units of compensation for one row change. Textual similarity between
+    /// guards is not proof of behavioural equivalence, so this walks every
+    /// SQL shape that can reach the row and asserts the invariant that
+    /// actually matters -- the generation may never advance by more than the
+    /// number of row changes the statement paid for.
+    #[tokio::test]
+    async fn parity_generation_never_outruns_the_row_changes_it_costs() {
+        let (db, _dir) = test_db().await;
+        let conn = db.conn.lock().await;
+
+        // Every way a writer can move the singleton, legal or not.
+        let shapes = [
+            ("update +2", "UPDATE community_parity_input_state SET generation=generation+2 WHERE singleton=1"),
+            ("update jump", "UPDATE community_parity_input_state SET generation=generation+9000 WHERE singleton=1"),
+            ("insert or replace", "INSERT OR REPLACE INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) SELECT 1, generation+2, relevant_spaces_digest FROM community_parity_input_state WHERE singleton=1"),
+            ("bare replace", "REPLACE INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) SELECT 1, generation+5, relevant_spaces_digest FROM community_parity_input_state WHERE singleton=1"),
+            ("upsert do update", "INSERT INTO community_parity_input_state (singleton, generation, relevant_spaces_digest) VALUES (1,0,'') ON CONFLICT(singleton) DO UPDATE SET generation=generation+3"),
+            ("delete then insert", "DELETE FROM community_parity_input_state WHERE singleton=1"),
+        ];
+
+        for (label, sql) in shapes {
+            let before_changes = conn.total_changes();
+            let before_generation: i64 = conn
+                .query(
+                    "SELECT generation FROM community_parity_input_state WHERE singleton=1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+
+            // A rejected write is the strongest outcome; a permitted one still
+            // has to pay its way. Either is acceptable, laundering is not.
+            let _ = conn.execute(sql, ()).await;
+
+            let after_generation: i64 = conn
+                .query(
+                    "SELECT COALESCE((SELECT generation FROM community_parity_input_state
+                                       WHERE singleton=1), ?1)",
+                    libsql::params![before_generation],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            let generation_delta = after_generation - before_generation;
+            let change_delta = (conn.total_changes() - before_changes) as i64;
+
+            assert!(
+                generation_delta <= change_delta,
+                "{label}: generation advanced {generation_delta} while paying only \
+                 {change_delta} row changes -- that surplus can hide an escaped write"
+            );
+        }
     }
 
     /// Mutation caught: treating a stamped local-only M96 database as current

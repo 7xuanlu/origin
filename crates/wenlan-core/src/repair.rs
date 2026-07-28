@@ -7664,6 +7664,32 @@ mod tests {
         output
     }
 
+    /// Require a repair to have failed AND surface the message, so a laundering
+    /// regression asserts the specific guard that fired rather than accepting
+    /// any error -- an unrelated precondition failure would otherwise look
+    /// exactly like the guard still holding.
+    fn expect_guard_error<T>(result: Result<T, WenlanError>, what: &str) -> String {
+        match result {
+            Ok(_) => panic!("{what} must not commit"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// The escaped write the parity-laundering regressions plant on a second,
+    /// non-target row. Read directly so rollback is asserted, not inferred.
+    async fn escaped_confidence(db: &MemoryDB) -> i64 {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(SUM(COALESCE(confidence,0)),0) FROM memories
+                 WHERE source_id='mem_other'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
     async fn verification_reports(
         db: &MemoryDB,
     ) -> (
@@ -8056,10 +8082,68 @@ mod tests {
         let result = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001).await;
 
         // Either the unit-bump invariant aborts the write or the effect guard
-        // catches the residue; what must never happen is a silent commit.
-        assert!(result.is_err(), "inflated-counter escape must not commit");
+        // catches the residue; what must never happen is a silent commit. The
+        // error is matched, not merely required, so an unrelated precondition
+        // failure cannot masquerade as the guard still working.
+        let message = expect_guard_error(result, "inflated-counter escape");
+        assert!(
+            message.contains("at most 1 per write") || message.contains("repair_effect_escape"),
+            "expected the unit-bump invariant or the effect guard, got: {message}"
+        );
         assert_eq!(before, fingerprint(&db).await);
         assert_eq!(target_memory_types(&db).await, vec![None, None]);
+        assert_eq!(escaped_confidence(&db).await, 0);
+    }
+
+    /// `INSERT OR REPLACE` resolves a conflict by replacing the row, not by
+    /// updating it, so a `BEFORE UPDATE` invariant never sees it -- and the
+    /// replacement counts one row change while carrying the generation as far
+    /// forward as the writer likes. That reopens the same laundering the
+    /// unit-bump guard closes for UPDATE, so the guard has to cover the insert
+    /// path too. DELETE+INSERT is the same bypass by a longer route.
+    #[tokio::test]
+    async fn effect_escape_cannot_hide_behind_a_replaced_parity_row() {
+        let (db, _db_dir) = fixture().await;
+        db.conn
+            .lock()
+            .await
+            .execute_batch(
+                "CREATE TRIGGER repair_escape_replace AFTER UPDATE OF memory_type ON memories
+                 WHEN NEW.source_id='mem_target'
+                 BEGIN
+                   UPDATE memories SET confidence=COALESCE(confidence,0)+1
+                    WHERE source_id='mem_other';
+                   INSERT OR REPLACE INTO community_parity_input_state
+                       (singleton, generation, relevant_spaces_digest)
+                   SELECT 1, generation+2, relevant_spaces_digest
+                     FROM community_parity_input_state
+                    WHERE singleton=1;
+                 END;",
+            )
+            .await
+            .unwrap();
+        let repair_root = tempfile::tempdir().unwrap();
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let manifest =
+            prepare_memory_reclassification(&db, &store, request(&db).await, 1_721_000_000)
+                .await
+                .unwrap();
+        let before = fingerprint(&db).await;
+
+        let result = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001).await;
+
+        let message = expect_guard_error(result, "replaced-row escape");
+        assert!(
+            message.contains("generation 0") || message.contains("repair_effect_escape"),
+            "expected the seed-only insert guard or the effect guard, got: {message}"
+        );
+        assert_eq!(before, fingerprint(&db).await);
+        assert_eq!(target_memory_types(&db).await, vec![None, None]);
+        assert_eq!(
+            escaped_confidence(&db).await,
+            0,
+            "the escaped confidence bump must roll back with the transaction"
+        );
     }
 
     #[tokio::test]
