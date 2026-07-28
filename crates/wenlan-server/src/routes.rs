@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use wenlan_core::router::classify::{classify_query, estimate_tokens, tier_allowed};
+use wenlan_core::router::classify::estimate_tokens;
 use wenlan_types::requests::ChatContextRequest;
 use wenlan_types::responses::{
     ChatContextResponse, KnowledgeContext, ProfileContext, TierTokenEstimates,
@@ -246,418 +246,122 @@ pub async fn handle_search(
 
 // ===== Context Endpoints =====
 
-/// POST /api/context - Trust-gated tiered memory retrieval for LLM context injection
+fn render_brief_for_legacy(response: &wenlan_types::BriefReadResponse) -> String {
+    use wenlan_types::BriefReadState;
+
+    let Some(brief) = response.brief.as_ref() else {
+        return match response.state {
+            BriefReadState::SpaceNotResolved => {
+                "## Space Brief\nNo Space resolved. Specify a Space to load its Brief.".into()
+            }
+            BriefReadState::BriefNotCreated => format!(
+                "## Space Brief — {}\nNo Brief has been created for this Space.",
+                response.space.as_deref().unwrap_or("unknown")
+            ),
+            BriefReadState::Ready => "## Space Brief\nBrief unavailable.".into(),
+        };
+    };
+
+    let mut output = format!("## Space Brief — {}\n", brief.space);
+    output.push_str("\n### Last session\n");
+    if brief.last_session_summary.trim().is_empty() {
+        output.push_str("_No session summary._\n");
+    } else {
+        output.push_str(brief.last_session_summary.trim());
+        output.push('\n');
+    }
+    for (heading, items) in [("Active", &brief.active), ("Backlog", &brief.backlog)] {
+        output.push_str(&format!("\n### {heading}\n"));
+        if items.is_empty() {
+            output.push_str("_None._\n");
+            continue;
+        }
+        for item in items {
+            output.push_str("- ");
+            output.push_str(&item.text);
+            if let Some(gate) = item.gate.as_deref() {
+                output.push_str(" (gated: ");
+                output.push_str(gate);
+                output.push(')');
+            }
+            output.push('\n');
+        }
+    }
+    output
+}
+
+/// POST /api/context — deprecated compatibility adapter over Space Brief.
+/// No-topic calls are storage reads only; a topic composes the same Brief with
+/// separately-labelled, same-Space recall results.
 pub async fn handle_context(
     State(state): State<Arc<RwLock<ServerState>>>,
-    headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Json(req): Json<ChatContextRequest>,
 ) -> Result<Json<ChatContextResponse>, ServerError> {
     let start = std::time::Instant::now();
-
-    let query = req
-        .query
-        .as_deref()
-        .or(req.conversation_id.as_deref())
-        .unwrap_or("recent context");
-
-    let agent_name = headers
-        .get("x-agent-name")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown");
-
-    // Snapshot the Arc handles and drop the ServerState read guard BEFORE
-    // the multi-second chain of DB awaits below. Holding the guard across
-    // ~15 sequential awaits (load_memories_by_type, search_*, log_accesses,
-    // etc.) would block every writer to ServerState — e.g. store_memory's
-    // deferred async work — for the full duration. See CLAUDE.md locking rules.
-    let (db_arc, access_tracker, reranker_light, maintenance) = {
-        let s = state.read().await;
-        let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
-        (
-            db,
-            s.access_tracker.clone(),
-            s.reranker_light.clone(),
-            s.maintenance_coordinator.clone(),
-        )
-    }; // guard dropped here
-    let scope = crate::read_scope::effective_read_scope(
-        &db_arc,
-        req.space.as_deref(),
-        header_space.as_deref(),
+    let topic = req.query.or(req.conversation_id);
+    let request = wenlan_types::BriefReadRequest {
+        topic,
+        space: req.space,
+    };
+    let Json(brief_response) = crate::brief_routes::handle_read_brief(
+        State(state),
+        crate::space_header::SpaceHeader(header_space),
+        Json(request),
     )
     .await?;
-    let db = db_arc.as_ref();
 
-    let agent_trust = if agent_name == "unknown" {
-        "unknown".to_string()
-    } else {
-        db.get_agent(agent_name)
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.trust_level)
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-
-    let classification = classify_query(query, agent_name, &agent_trust, true);
-    // Tier 1 (identity + preferences)
-    let (identity, preferences) = if tier_allowed(&classification.trust_level, 1) {
-        let id_mems = db
-            .load_memories_by_type_scoped("identity", 10, &scope)
-            .await
-            .unwrap_or_default();
-        let pref_mems = db
-            .load_memories_by_type_scoped("preference", 10, &scope)
-            .await
-            .unwrap_or_default();
-
-        (
-            id_mems
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>(),
-            pref_mems
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    // Tier 2 (corrections + decisions). Goal taxonomy folded into Identity by
-    // migration 45 (Phase 0); the goals Vec stays for ProfileContext wire compat
-    // but is always empty now. Both `req.include_goals` and `ProfileContext.goals`
-    // are deprecated and will be removed in wenlan-types 0.4.
-    let goals: Vec<String> = Vec::new();
-
-    let decisions: Vec<String> = if tier_allowed(&classification.trust_level, 2) {
-        db.load_memories_by_type_scoped("decision", 5, &scope)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|m| m.content.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let corrections = if tier_allowed(&classification.trust_level, 2) && query != "recent context" {
-        db.search_corrections_by_topic_scoped(query, 5, &scope)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|r| r.content.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // Tier 3 (search). Plain search_memory by default (it beat the old LLM reranker
-    // on LongMemEval, 0.790 base vs 0.722). Under WENLAN_RERANKER_MODE lite/full the
-    // context path adds a turbo cross-encoder pass at the HANDLER layer over a widened
-    // pool; search_memory itself stays CE-free so internal callers are unaffected.
-    let search_results = match &reranker_light {
-        Some(reranker) => {
-            let pool = wenlan_core::db::compute_rerank_fetch_pool(req.max_chunks, None, None);
-            let pooled = db
-                .search_memory(query, pool, None, &scope, None, None, None, None)
-                .await
-                .unwrap_or_default();
-            wenlan_core::db::rerank_results_light(reranker.clone(), query, pooled, req.max_chunks)
-                .await
-        }
-        None => db
-            .search_memory(query, req.max_chunks, None, &scope, None, None, None, None)
-            .await
-            .unwrap_or_default(),
-    };
-
-    let threshold = req.relevance_threshold.unwrap_or(0.0) as f32;
-    let filtered_search: Vec<_> = search_results
-        .into_iter()
-        .filter(|r| r.score >= threshold)
-        .collect();
-
-    // Source IDs from search results — used to gate page relevance.
-    // A page is only included if its source memories overlap with the
-    // memories that search_memory returned for this query.
-    let search_source_ids: std::collections::HashSet<String> = filtered_search
-        .iter()
-        .map(|r| r.source_id.clone())
-        .collect();
-
-    let page_results: Vec<String> =
-        if tier_allowed(&classification.trust_level, 2) && query != "recent context" {
-            let raw_pages = db
-                .search_pages_scoped(query, 3, None, &scope)
-                .await
-                .unwrap_or_default();
-            // Space-scope + effective-tier gate (the ONE shared visibility helper):
-            // drop pages whose dedicated workspace is a different caller's space
-            // (with no source-memory overlap) and pages whose effective read-tier
-            // (the max trust tier over their source memories) the caller's trust
-            // does not clear; then rank confirmed pages by relevance and cap at 3.
-            // Closes the cross-space + tier-declassification leaks the un-gated
-            // `select_pages_for_context` selector had on this shipped path.
-            let pages = db
-                .select_visible_pages_scoped(
-                    raw_pages,
-                    &scope,
-                    &search_source_ids,
-                    &classification.trust_level,
-                    3,
-                )
-                .await;
-            pages
-                .iter()
-                .map(|c| {
-                    let summary = c.summary.as_deref().unwrap_or("");
-                    format!("**{}**: {}\n{}", c.title, summary, c.content)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-    // T18 global-context prelude (opt-in, ship-dark). Read-only: surfaces the
-    // pre-built summary_nodes as a `## Corpus Overview` section. The build path
-    // is the refinery's SummaryRollup phase; here we only read. Honors the
-    // space filter via the source-overlap gate (a summary surfaces iff >=1 of
-    // its provenance memories survived the memory-side filter). Empty/absent
-    // unless WENLAN_ENABLE_GLOBAL_PRELUDE is on, so the default response shape
-    // is byte-identical to pre-T18.
-    let corpus_overview: Vec<String> = if wenlan_core::db::global_prelude_enabled() {
-        let nodes = db
-            .search_summary_nodes_scoped(query, 3, &scope)
-            .await
-            .unwrap_or_default();
-        let mut out = Vec::new();
-        for node in nodes {
-            out.push(format!("**{}**: {}", node.title, node.body));
-        }
-        out
-    } else {
-        Vec::new()
-    };
-
-    let narrative = db
-        .get_cached_narrative()
-        .await
-        .ok()
-        .flatten()
-        .filter(|(content, _, _)| !content.is_empty())
-        .map(|(content, _, _)| content)
+    let brief_context = render_brief_for_legacy(&brief_response);
+    let relevant_memories = brief_response
+        .related_context
+        .as_ref()
+        .map(|related| related.results.clone())
         .unwrap_or_default();
-    let narrative_brief: Option<&str> = if narrative.is_empty() {
-        None
-    } else {
-        Some(&narrative)
-    };
-
-    // Token estimates
-    let brief_text = narrative_brief.unwrap_or("");
-    let tier1_text = format!(
-        "{} {} {}",
-        brief_text,
-        identity.join(" "),
-        preferences.join(" ")
-    );
-    let tier2_text = format!(
-        "{} {} {} {}",
-        goals.join(" "),
-        corrections.join(" "),
-        decisions.join(" "),
-        page_results.join(" ")
-    );
-    let tier3_text = filtered_search
+    let related_context = brief_response.related_context.as_ref().map(|related| {
+        let mut section = format!("## Related Context — {}\n", related.query);
+        if related.results.is_empty() {
+            section.push_str("_No related memories found._\n");
+        } else {
+            for result in &related.results {
+                section.push_str(&format!("[{}] {}\n\n", result.title, result.content));
+            }
+        }
+        section
+    });
+    let context = related_context
+        .map(|related| format!("{brief_context}\n\n{related}"))
+        .unwrap_or_else(|| brief_context.clone());
+    let tier2 = estimate_tokens(&brief_context);
+    let tier3 = relevant_memories
         .iter()
-        .map(|r| r.content.as_str())
+        .map(|result| result.content.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let t1 = estimate_tokens(&tier1_text);
-    let t2 = estimate_tokens(&tier2_text);
-    let t3 = estimate_tokens(&tier3_text);
-    let token_estimates = TierTokenEstimates {
-        tier1_identity: t1,
-        tier2_project: t2,
-        tier3_relevant: t3,
-        total: t1 + t2 + t3,
-    };
+    let tier3 = estimate_tokens(&tier3);
 
-    // Build combined context string
-    let mut sections: Vec<String> = Vec::new();
-
-    if tier_allowed(&classification.trust_level, 1) {
-        if let Some(brief) = narrative_brief {
-            sections.push(format!("## About the User\n{}\n", brief));
-        }
-    }
-
-    if !identity.is_empty() {
-        let mut s = String::from("## Identity\n");
-        for item in &identity {
-            s.push_str(&format!("- {}\n", item));
-        }
-        sections.push(s);
-    }
-
-    if !preferences.is_empty() {
-        let mut s = String::from("## Preferences\n");
-        for item in &preferences {
-            s.push_str(&format!("- {}\n", item));
-        }
-        sections.push(s);
-    }
-
-    if !goals.is_empty() {
-        let mut s = String::from("## Goals\n");
-        for item in &goals {
-            s.push_str(&format!("- {}\n", item));
-        }
-        sections.push(s);
-    }
-
-    if !decisions.is_empty() {
-        let mut sec = String::from("## Relevant Decisions\n");
-        for item in &decisions {
-            sec.push_str(&format!("- {}\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !corrections.is_empty() {
-        let mut sec = String::from("## Corrections\n");
-        for item in &corrections {
-            sec.push_str(&format!("- {}\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !corpus_overview.is_empty() {
-        let mut sec = String::from("## Corpus Overview\n");
-        for item in &corpus_overview {
-            sec.push_str(&format!("{}\n\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !page_results.is_empty() {
-        let mut sec = String::from("## Compiled Knowledge\n");
-        for item in &page_results {
-            sec.push_str(&format!("{}\n\n---\n\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !filtered_search.is_empty() {
-        let mut sec = String::from("## Relevant Memories\n");
-        for r in &filtered_search {
-            sec.push_str(&format!("[{}] {}\n\n", r.title, r.content));
-        }
-        sections.push(sec);
-    }
-
-    let context = sections.join("\n");
-
-    // Track accesses
-    let all_source_ids: Vec<String> = filtered_search
-        .iter()
-        .map(|r| r.source_id.clone())
-        .collect();
-    if !all_source_ids.is_empty() {
-        access_tracker.record_accesses(&all_source_ids);
-        if let Err(e) = db.log_accesses(&all_source_ids).await {
-            tracing::warn!("Failed to log accesses: {}", e);
-        }
-    }
-
-    if !all_source_ids.is_empty() {
-        let detail = format!("used {} memories", all_source_ids.len());
-        if let Err(e) = db
-            .log_agent_activity(
-                agent_name,
-                "read",
-                &all_source_ids,
-                req.query.as_deref(),
-                &detail,
-            )
-            .await
-        {
-            tracing::warn!("Failed to log agent read activity: {}", e);
-        }
-    }
-
-    let took_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    // Fire-once onboarding milestone check (recall side).
-    //
-    // Only fires when the caller identified itself via `x-agent-name`. The
-    // evaluator skips empty-result recalls internally, so we pass the real
-    // hit count from `filtered_search` (the post-threshold search results
-    // surfaced back to the agent as `knowledge.relevant_memories`). The
-    // daemon has no UI to notify, so a fresh `NoopEmitter` is used inline —
-    // milestones are still persisted via `record_milestone` and surfaced
-    // to the frontend through /api/onboarding/*.
-    if agent_name != "unknown" {
-        let agent_for_ms = agent_name.to_string();
-        let results_count = filtered_search.len();
-        // Quote the top-ranked hit so the first-recall toast can show WHAT
-        // was just surfaced, not just who asked. Char-safe truncation
-        // (UTF-8 rule: never byte-index a Rust string).
-        let top_preview_for_ms: Option<String> = filtered_search.first().map(|r| {
-            let s = &r.content;
-            let truncated: String = s.chars().take(100).collect();
-            if truncated.chars().count() < s.chars().count() {
-                format!("{}…", truncated.trim_end())
-            } else {
-                truncated
-            }
-        });
-        let db_for_ms = db_arc.clone();
-        let emitter_for_ms: Arc<dyn wenlan_core::events::EventEmitter> =
-            Arc::new(wenlan_core::events::NoopEmitter);
-        tokio::spawn(async move {
-            let _maintenance_guard = maintenance.begin_background().await;
-            let ev = wenlan_core::onboarding::MilestoneEvaluator::new(&db_for_ms, emitter_for_ms);
-            if let Err(e) = ev
-                .check_after_context_call(
-                    &agent_for_ms,
-                    results_count,
-                    top_preview_for_ms.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(?e, "onboarding: check_after_context_call failed");
-            }
-        });
-    }
-
-    // ProfileContext.goals is deprecated (migration 45 folded goal -> identity);
-    // we still emit it as an empty Vec for wire backward compat with wenlan-mcp
-    // and any external consumers of /api/context until wenlan-types 0.4
-    // drops the field entirely.
     #[allow(deprecated)]
     let profile = ProfileContext {
-        narrative,
-        identity,
-        preferences,
-        goals,
+        narrative: String::new(),
+        identity: Vec::new(),
+        preferences: Vec::new(),
+        goals: Vec::new(),
     };
-
     Ok(Json(ChatContextResponse {
         context,
         profile,
         knowledge: KnowledgeContext {
-            pages: page_results,
-            decisions,
-            relevant_memories: filtered_search,
+            pages: Vec::new(),
+            decisions: Vec::new(),
+            relevant_memories,
             graph_context: Vec::new(),
         },
-        took_ms,
-        token_estimates,
+        took_ms: start.elapsed().as_secs_f64() * 1000.0,
+        token_estimates: TierTokenEstimates {
+            tier1_identity: 0,
+            tier2_project: tier2,
+            tier3_relevant: tier3,
+            total: tier2 + tier3,
+        },
     }))
 }
 
@@ -2040,15 +1744,8 @@ mod redistill_contract_tests {
 
 #[cfg(test)]
 mod context_page_selection_tests {
-    use crate::state::ServerState;
-    use axum::body::Body;
-    use axum::http::Request;
     use std::collections::HashSet;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-    use tower::ServiceExt;
     use wenlan_core::pages::{filter_pages_by_source_overlap, select_pages_for_context, Page};
-    use wenlan_types::requests::CreateConceptRequest;
 
     fn make_page(id: &str, source_ids: &[&str], relevance_score: f32, review_status: &str) -> Page {
         Page {
@@ -2081,64 +1778,8 @@ mod context_page_selection_tests {
         }
     }
 
-    async fn seed_confirmed_distilled_page(
-        db: &wenlan_core::db::MemoryDB,
-        title: &str,
-        content: &str,
-        source_id: &str,
-        source_type: &str,
-        space: &str,
-    ) {
-        let source = wenlan_core::sources::RawDocument {
-            source: "memory".to_string(),
-            source_id: source_id.to_string(),
-            title: format!("memory-{source_id}"),
-            content: if space == "other" {
-                "unrelated source memory outside the query result set".to_string()
-            } else {
-                content.to_string()
-            },
-            memory_type: Some(source_type.to_string()),
-            space: Some(space.to_string()),
-            source_agent: Some("test-agent".to_string()),
-            confidence: Some(0.9),
-            confirmed: Some(true),
-            ..Default::default()
-        };
-        db.upsert_documents(vec![source]).await.unwrap();
-        if space == "other" {
-            return;
-        }
-        let result = wenlan_core::post_write::create_page_with_tuning(
-            db,
-            CreateConceptRequest {
-                title: title.to_string(),
-                content: content.to_string(),
-                summary: None,
-                entity_id: None,
-                source_memory_ids: vec![source_id.to_string()],
-                creation_kind: Some("distilled".to_string()),
-                space: (Some(space.to_string())).into(),
-                workspace: Some(space.to_string()),
-            },
-            "test",
-            None,
-            1,
-            1.1,
-        )
-        .await
-        .unwrap();
-        db.set_page_review_status(&result.id, "confirmed")
-            .await
-            .unwrap();
-    }
-
-    /// Unit-locks the `select_pages_for_context` SELECTOR (the ranking stage inside
-    /// the `/api/context` gate): a high-relevance page whose source memories do NOT
-    /// intersect the memory hit pool MUST still surface — the exact case the prior
-    /// `filter_pages_by_source_overlap(.., >=1)` hard gate dropped. The full handler
-    /// wiring (now `db.select_visible_pages`, applying space-scope + effective-tier)
-    /// is locked separately by `context_page_block_enforces_space_scope_and_effective_tier`.
+    /// Unit-locks the `select_pages_for_context` ranking selector. A high-relevance
+    /// page with no source overlap still surfaces; the prior hard overlap gate dropped it.
     #[test]
     fn context_surfaces_zero_overlap_page_that_old_gate_dropped() {
         // Memory hit pool returned by search_memory for this query.
@@ -2161,128 +1802,11 @@ mod context_page_selection_tests {
             "old source-overlap gate should drop the zero-overlap page"
         );
 
-        // The NEW wiring (cap = 3, matching the handler's literal) surfaces it.
+        // The selector surfaces it when the caller requests a three-page cap.
         let selected = select_pages_for_context(&raw_pages, &search_source_ids, 3);
         assert!(
             selected.iter().any(|p| p.id == "page_zero_overlap"),
-            "un-gated context path must surface the high-relevance zero-overlap page"
-        );
-    }
-
-    /// Handler-level wiring lock (Task 5): `/api/context` routes its page block
-    /// through `db.select_visible_pages(..)`, which applies the space-scope +
-    /// effective-tier gate. Before the rewire the handler called the un-gated
-    /// `select_pages_for_context`, so for a tier-2 caller a cross-space page AND
-    /// a page distilled from a tier-1 (identity) source both leaked into the
-    /// response. This drives the real handler and asserts both leaks are closed
-    /// while a same-space, tier-3-sourced page still surfaces.
-    #[tokio::test]
-    async fn context_page_block_enforces_space_scope_and_effective_tier() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
-            Arc::new(wenlan_core::events::NoopEmitter);
-        let db = wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
-            .await
-            .expect("MemoryDB::new");
-        db.create_space("work", None, false).await.unwrap();
-
-        // A tier-2 caller: trust "review" allows tier 2, denies tier 1.
-        db.register_agent("test-agent").await.unwrap();
-        db.update_agent("test-agent", None, None, None, Some("review"), None)
-            .await
-            .unwrap();
-
-        // Source memories: an identity memory (tier 1, most sensitive) and a fact
-        // memory (tier 3). Only their presence in the `memories` table matters —
-        // the effective-tier lookup reads memory_type by source_id.
-        let mem = |source_id: &str, memory_type: &str| wenlan_core::sources::RawDocument {
-            source: "memory".to_string(),
-            source_id: source_id.to_string(),
-            title: format!("memory-{source_id}"),
-            content: "zorblax source memory".to_string(),
-            memory_type: Some(memory_type.to_string()),
-            space: Some("work".to_string()),
-            source_agent: Some("test-agent".to_string()),
-            confidence: Some(0.9),
-            confirmed: Some(true),
-            ..Default::default()
-        };
-        db.upsert_documents(vec![mem("m_identity", "identity"), mem("m_fact", "fact")])
-            .await
-            .unwrap();
-
-        // Three confirmed, active pages, all matching the query keyword "zorblax"
-        // so search_pages returns each as a candidate.
-        // Cross-space: workspace != caller space, source not in result set → DROP.
-        seed_confirmed_distilled_page(
-            &db,
-            "Crossmarker",
-            "crossmarker body outside query",
-            "unrelated",
-            "fact",
-            "other",
-        )
-        .await;
-        // Same space, only source is a tier-1 identity memory → DROP for review.
-        seed_confirmed_distilled_page(
-            &db,
-            "Zorblax Identmarker",
-            "zorblax identmarker body",
-            "m_identity",
-            "identity",
-            "work",
-        )
-        .await;
-        // Same space, tier-3 fact source → KEEP.
-        seed_confirmed_distilled_page(
-            &db,
-            "Zorblax Samemarker",
-            "zorblax samemarker body",
-            "m_fact",
-            "fact",
-            "work",
-        )
-        .await;
-
-        let state = Arc::new(RwLock::new(ServerState {
-            db: Some(Arc::new(db)),
-            ..Default::default()
-        }));
-        let app = crate::router::build_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/context")
-                    .header("x-agent-name", "test-agent")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"query":"zorblax","space":"work","max_chunks":5}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "context call should succeed");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let parsed: wenlan_types::responses::ChatContextResponse =
-            serde_json::from_slice(&bytes).unwrap();
-        let pages = parsed.knowledge.pages.join("\n");
-
-        assert!(
-            pages.contains("samemarker"),
-            "same-space tier-3 page must surface, got pages: {pages:?}"
-        );
-        assert!(
-            !pages.contains("crossmarker"),
-            "cross-space page must be dropped by the space-scope gate, got pages: {pages:?}"
-        );
-        assert!(
-            !pages.contains("identmarker"),
-            "tier-1-sourced page must be dropped for review trust, got pages: {pages:?}"
+            "selector must surface the high-relevance zero-overlap page"
         );
     }
 }

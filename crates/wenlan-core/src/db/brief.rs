@@ -3,6 +3,14 @@
 use super::MemoryDB;
 use crate::error::WenlanError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyBriefItem {
+    pub text: String,
+    pub state: wenlan_types::BriefItemState,
+    pub added_at: i64,
+    pub gate: Option<String>,
+}
+
 const BRIEF_TABLES_DDL: &str = "
 CREATE TABLE IF NOT EXISTS briefs (
     space_id TEXT PRIMARY KEY REFERENCES spaces(id) ON DELETE CASCADE,
@@ -655,5 +663,145 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("brief update commit: {error}")))?;
         Ok(receipt)
+    }
+}
+
+impl MemoryDB {
+    pub async fn import_legacy_brief(
+        &self,
+        space_name: &str,
+        last_session_summary: &str,
+        last_handoff_at: Option<i64>,
+        items: &[LegacyBriefItem],
+    ) -> Result<bool, WenlanError> {
+        let space_name = space_name.trim();
+        if space_name.is_empty() {
+            return Err(WenlanError::Validation(
+                "legacy Brief import requires a non-empty space".into(),
+            ));
+        }
+        if items.iter().any(|item| item.text.trim().is_empty()) {
+            return Err(WenlanError::Validation(
+                "legacy Brief item text must not be empty".into(),
+            ));
+        }
+
+        let _space_write_guard = self.space_write_lock.lock().await;
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("legacy Brief import begin: {error}"))
+            })?;
+        let now = chrono::Utc::now().timestamp();
+
+        let space_id = {
+            let existing = {
+                let mut rows = tx
+                    .query(
+                        "SELECT id FROM spaces WHERE name=?1",
+                        libsql::params![space_name],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("legacy Brief space lookup: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("legacy Brief space row: {error}"))
+                    })?
+                    .map(|row| row.get::<String>(0).unwrap_or_default())
+            };
+            if let Some(id) = existing {
+                id
+            } else {
+                let id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO spaces
+                        (id, name, description, suggested, sort_order, created_at, updated_at)
+                     VALUES (
+                        ?1, ?2, NULL, 0,
+                        (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM spaces),
+                        ?3, ?3
+                     )",
+                    libsql::params![id.as_str(), space_name, now as f64],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("legacy Brief create space: {error}"))
+                })?;
+                id
+            }
+        };
+
+        let brief_exists = {
+            let mut rows = tx
+                .query(
+                    "SELECT 1 FROM briefs WHERE space_id=?1",
+                    libsql::params![space_id.as_str()],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("legacy Brief existence check: {error}"))
+                })?;
+            rows.next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("legacy Brief existence row: {error}"))
+                })?
+                .is_some()
+        };
+        if brief_exists {
+            tx.commit().await.map_err(|error| {
+                WenlanError::VectorDb(format!("legacy Brief skip commit: {error}"))
+            })?;
+            return Ok(false);
+        }
+
+        tx.execute(
+            "INSERT INTO briefs
+                (space_id, last_session_summary, last_handoff_at, version, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            libsql::params![
+                space_id.as_str(),
+                last_session_summary.trim(),
+                last_handoff_at,
+                now
+            ],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("legacy Brief insert: {error}")))?;
+
+        for item in items {
+            let id = format!("brief_item_{}", uuid::Uuid::new_v4().simple());
+            let gate = item
+                .gate
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            tx.execute(
+                "INSERT INTO brief_items
+                    (id, space_id, text, state, added_at, gate, version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+                libsql::params![
+                    id,
+                    space_id.as_str(),
+                    item.text.trim(),
+                    item.state.as_str(),
+                    item.added_at,
+                    gate,
+                    now
+                ],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("legacy Brief item insert: {error}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("legacy Brief commit: {error}")))?;
+        Ok(true)
     }
 }

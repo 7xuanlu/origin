@@ -76,6 +76,9 @@ pub struct ServerState {
     /// Sticky daemon-lifecycle signal shared by HTTP and background workers.
     pub shutdown: ShutdownHandle,
     pub db: Option<Arc<MemoryDB>>,
+    /// One-way, human-readable projection of the daemon-owned Space Brief.
+    /// `None` disables projection without affecting the authoritative DB state.
+    pub brief_status_root: Option<PathBuf>,
     /// On-device LLM provider (Qwen via llama-cpp).
     pub llm: Option<Arc<dyn LlmProvider>>,
     /// Registry id of the currently-loaded on-device model (e.g. "qwen3-4b").
@@ -151,6 +154,7 @@ impl Default for ServerState {
         Self {
             shutdown: ShutdownHandle::default(),
             db: None,
+            brief_status_root: None,
             llm: None,
             loaded_on_device_model: None,
             startup_model_load_reserved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -190,6 +194,12 @@ impl ServerState {
     /// Override the Page projection root for an isolated server instance.
     pub fn with_page_root(mut self, page_root: PathBuf) -> Self {
         self.lint_config.page_root = Some(page_root);
+        self
+    }
+
+    /// Override the human-readable Brief receipt root for an isolated server.
+    pub fn with_brief_status_root(mut self, root: PathBuf) -> Self {
+        self.brief_status_root = Some(root);
         self
     }
 }

@@ -21,6 +21,7 @@ use std::sync::Arc;
 static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 mod brief;
+pub use brief::LegacyBriefItem;
 mod claim_identity;
 mod count;
 mod edges_rebuild;

@@ -6,9 +6,9 @@ pub use crate::route_registry::AppRouter;
 use crate::route_registry::{delete, get, patch, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
-    community_routes, config_routes, import_routes, ingest_routes, knowledge_routes, lint_routes,
-    memory_routes, onboarding_routes, page_map_routes, refinery_routes, repair_routes, routes,
-    security, source_routes, websocket,
+    brief_routes, community_routes, config_routes, import_routes, ingest_routes, knowledge_routes,
+    lint_routes, memory_routes, onboarding_routes, page_map_routes, refinery_routes, repair_routes,
+    routes, security, source_routes, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -48,6 +48,10 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route("/api/status", get(routes::handle_status))
         .route("/api/search", post(routes::handle_search))
         .route("/api/context", post(routes::handle_context))
+        .route(
+            "/api/brief",
+            post(brief_routes::handle_read_brief).patch(brief_routes::handle_update_brief),
+        )
         .route("/api/ping", get(routes::handle_ping))
         .route("/api/llm/test", post(routes::handle_test_llm))
         .route("/api/shutdown", post(routes::handle_shutdown))

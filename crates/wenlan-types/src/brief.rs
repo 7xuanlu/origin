@@ -56,6 +56,14 @@ pub struct BriefRelatedContext {
     pub results: Vec<SearchResult>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefReadRequest {
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default, alias = "domain")]
+    pub space: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BriefReadResponse {
     pub state: BriefReadState,
