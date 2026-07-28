@@ -292,9 +292,49 @@ rebuild. It runs as a guarded, replay-safe, row-for-row migration.
    Bump `epoch` for this rebuild.
 5. Verify destination count == source count **and** destination checksum ==
    source checksum. Mismatch aborts and rolls back.
-6. Drop old, rename, recreate triggers (space fence, both twins) **before**
-   stamping the new `user_version`.
+6. Drop old, rename, recreate **every** index and trigger the old table
+   carried, **before** stamping the new `user_version`. See below — the set is
+   larger than an earlier draft of this step claimed.
 7. Stamp `user_version` last.
+
+### Recreate the whole set, and diff it — do not trust this list
+
+An earlier draft of step 6 read "recreate triggers (space fence, both twins)".
+That names two. The live schema attaches **eight** triggers to `edges`,
+verified by querying `sqlite_master` on a freshly migrated database
+(`db/edges_rebuild_test.rs`):
+
+| Trigger | Source |
+|---|---|
+| `edges_space_fence` | `db.rs:8996` |
+| `edges_space_fence_update` | `db.rs:9021` |
+| `m4_grouping_edge_insert` | `db.rs:10607` |
+| `m4_grouping_edge_delete` | `db.rs:10628` |
+| `m4_grouping_edge_update` | `db.rs:10649` |
+| `m4_page_community_edge_insert_invalidate` | `db.rs:11099` |
+| `m4_page_community_edge_delete_invalidate` | `db.rs:11114` |
+| `m4_page_community_edge_update_invalidate` | `db.rs:11129` |
+
+Following the prose would have dropped the six M4 triggers that keep community
+grouping and page-community route inputs invalidated — and **nothing
+downstream would fail loudly.** The tables would stay correct-looking while
+their invalidation silently stopped firing, which is the worst available
+failure shape: no error, no alarm, just a control plane that quietly stops
+noticing edits.
+
+Six explicit indexes come with the same problem (`idx_edges_src`,
+`idx_edges_dst`, `idx_edges_root`, `idx_edges_operation`,
+`idx_edges_superseded`, `idx_edges_active_grounded_space_type`), plus the four
+new partial indexes from §6. `sqlite_autoindex_edges_1` is *not* on the list:
+it is SQLite's implicit index for `edge_id TEXT PRIMARY KEY` and returns with
+the `CREATE TABLE`.
+
+**The rule, not the list:** the rebuild captures the attached-object set from
+`sqlite_master` before the drop and asserts the post-rebuild set equals it,
+plus exactly the four new indexes. The table above is a record of what was true
+at authoring time, not the input to the migration. A hand-maintained list is
+the same prose-number defect this program has hit repeatedly; the census is a
+query.
 
 Step 6 before step 7 is the M4 lesson applied: migration 96 committed guards
 before stamping the version, which is exactly what made an interrupted upgrade
@@ -336,6 +376,8 @@ guards in M4.
 | write a `claim_revision` support edge with `lineage='legacy'` | §4 CHECK test — the SQL fence cannot catch this one |
 | drop the lineage predicate from a support index **or** its query | §6 — bypassed row must not enter the trusted set |
 | omit `cites page→memory` from the assignment guard | §2 live-tuple census |
+| recreate only the triggers §7 names in prose | §7 — post-rebuild `sqlite_master` trigger set must equal the pre-rebuild set |
+| lose an index in the rebuild | §7 — same census, index half, plus the four new partial indexes |
 | omit span/verdict fields from the support payload | §4a same-evidence invariant |
 | let edge `span_digest` differ from the cache key's | §4a invariant 1 |
 | write a support edge whose verdict it cannot name | §4a invariant 2 |

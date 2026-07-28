@@ -31,6 +31,8 @@ mod scoped_pages;
 #[cfg(test)]
 mod claim_identity_test;
 #[cfg(test)]
+mod edges_rebuild_test;
+#[cfg(test)]
 mod entity_page_adapter_test;
 #[cfg(test)]
 mod page_drafts_test;
