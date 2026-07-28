@@ -687,3 +687,95 @@ async fn the_copy_verifier_catches_a_corrupted_copy() {
         "an altered row must fail the verify even though the counts agree"
     );
 }
+
+/// The §2 restore drill, **executed** rather than promised: "pre-migration
+/// online backup + integrity receipt + restore drill executed, before the
+/// rebuild — a backup never restored is a hope, not a rollback plan"
+/// (`docs/plans/2026-07-27-m5-migration-state-machine.md` §2).
+///
+/// `online_backup_is_a_restorable_snapshot` already drills the generic backup
+/// primitive end to end. What it does not cover, and §2 names, is migration
+/// **97's own** restore point: that the rebuild takes one, records its receipt,
+/// and leaves a file that opens and genuinely predates the rebuild.
+///
+/// The last clause is the load-bearing one, and it is asserted structurally
+/// rather than by trusting the filename. A snapshot taken *after* the migration
+/// would still exist, still pass `integrity_check`, and still open — and would
+/// be worthless as a rollback target. So the drill asserts the M5 tables are
+/// ABSENT from it: `claims`, `claim_revisions`, and `entailment_cache` are
+/// created BY migration 97, so a restore point that contains them was taken too
+/// late. That check cannot be satisfied by a backup of the post-rebuild state,
+/// which is exactly the failure a rollback plan must not have.
+///
+/// A row-survival assertion was tried first and removed: `test_db` seeds its
+/// schema and migrates during setup, so 97's backup is already taken by the
+/// time a test can insert anything, and `backup_before_migration` then
+/// deliberately preserves that original restore point instead of
+/// re-snapshotting. The skip is correct behavior (a re-snapshot after a failed
+/// attempt would copy partially-migrated state over the pristine file), so the
+/// drill verifies what the real restore point contains rather than fighting the
+/// fixture to plant a row in it.
+#[tokio::test]
+async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
+    let (db, _temp) = test_db().await;
+    let source_path = {
+        let conn = db.conn.lock().await;
+        MemoryDB::main_db_path(&conn).await.unwrap()
+    };
+    let dest = source_path
+        .parent()
+        .unwrap()
+        .join("pre_migration_97_backup.db");
+    assert!(
+        dest.exists(),
+        "migration 97 must leave a restore point at {}",
+        dest.display()
+    );
+
+    let receipt = db
+        .get_app_metadata("backup_before_migration_97")
+        .await
+        .unwrap()
+        .expect("the backup receipt must be recorded, or the drill has nothing to verify");
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(
+        receipt["integrity_ok"], true,
+        "a restore point that failed integrity_check is not a rollback plan"
+    );
+
+    // Open the snapshot directly -- never through `MemoryDB`, which would
+    // migrate the very file whose pre-migration state is the thing under test.
+    let snapshot = libsql::Builder::new_local(dest.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = snapshot.connect().unwrap();
+
+    let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    let stamped: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert!(
+        stamped < 97,
+        "the restore point must predate the rebuild it protects against, got {stamped}"
+    );
+
+    for table in ["claims", "claim_revisions", "entailment_cache"] {
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                libsql::params![table],
+            )
+            .await
+            .unwrap();
+        let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            present, 0,
+            "{table} is created BY migration 97, so a restore point holding it was \
+             taken after the rebuild and rolls back to nothing"
+        );
+    }
+
+    // The pre-migration schema is intact and queryable, so the file is a real
+    // database rather than a valid-but-empty shell.
+    let mut rows = conn.query("SELECT count(*) FROM edges", ()).await.unwrap();
+    let _: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+}

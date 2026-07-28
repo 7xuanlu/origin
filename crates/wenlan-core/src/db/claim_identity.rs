@@ -56,6 +56,31 @@ pub struct HumanEditDelta {
     pub delta_text: String,
 }
 
+/// The span binding and the verdict a `supports` edge freezes into its
+/// immutable payload (artifact 3 §4a's table).
+///
+/// One struct rather than nine arguments because these nine fields are a single
+/// indivisible fact — "this exact text, judged this way, by this judge". Split
+/// across a signature they can be assembled from two different judgments
+/// without anything noticing, which is the failure §4a is written to prevent.
+#[derive(Debug, Clone)]
+pub struct SupportVerdict {
+    /// The exact memory version the span was read from.
+    pub source_version: i64,
+    /// Byte offsets into that version, per `faithfulness::sentence_spans`.
+    pub span_start: i64,
+    pub span_end: i64,
+    /// SHA-256 of the exact span bytes.
+    pub span_digest: String,
+    /// Which judge produced this.
+    pub model_id: String,
+    pub model_version: String,
+    pub prompt_version: String,
+    /// The verdict, and the bar it cleared.
+    pub score: f64,
+    pub threshold_at_write: f64,
+}
+
 /// The lines present in `new_content` that are absent from `base_content`, in
 /// the order they appear in `new_content`.
 ///
@@ -524,5 +549,218 @@ impl MemoryDB {
             memory_source_id,
             delta_text,
         }))
+    }
+
+    /// Write one `supports` edge, binding it to the exact span it was judged on
+    /// and the exact verdict that judged it (artifact 3 §4a).
+    ///
+    /// §4a exists because `edges` has no span columns, so a
+    /// `claim_revision → memory` edge names a *memory*, not the span inside it
+    /// that was actually read. Three independent records of "the evidence" —
+    /// the anchor, the entailment-cache key, and the edge — with nothing forcing
+    /// them to agree is the drift pattern this program keeps hitting. This
+    /// function is the one place that forces them to agree, and it refuses
+    /// rather than repairs.
+    ///
+    /// Both §4a invariants are checked before anything is written:
+    ///
+    /// 1. **Same evidence.** `span_digest` must equal the digest of the live
+    ///    bytes at `[span_start, span_end)` in the destination memory AND the
+    ///    `source_span_digest` component of the cache key that produced the
+    ///    verdict. Offsets alone are never trusted (artifact 1 §3): a span whose
+    ///    digest no longer matches invalidates the edge rather than silently
+    ///    re-pointing it at whatever text now occupies those offsets.
+    /// 2. **Same verdict.** The `model_id`/`model_version`/`prompt_version`/
+    ///    `score` must be the ones the cache recorded. A support edge may never
+    ///    be written from a verdict it cannot name.
+    ///
+    /// **`grounded` is 0, and that is the rule rather than a stub.** §3 says
+    /// grounding is inherited and never asserted — `supports` may be `grounded=1`
+    /// *only if* the destination memory span is itself grounded. No memory→root
+    /// link exists in the schema to inherit that from: the sole production
+    /// minter of a grounded root is M3g's promotion sweep, which grounds
+    /// `relates` edges, not memory spans. With nothing to inherit, writing 1
+    /// would be manufacturing grounding for evidence that has none, which is the
+    /// one thing §3 names outright. 0 satisfies the "only if" honestly.
+    ///
+    /// **Only a human-delta destination resolves today**, and that is §4a's own
+    /// "human-delta destination" case rather than a shortcut. The `supports`
+    /// CHECK requires `root_id IS NOT NULL`, §5 defines it as the provenance
+    /// root of the cited evidence, and the only memory→root link that exists is
+    /// the `hed_{root_id}` convention [`Self::mint_human_edit_delta`] writes.
+    /// Any other memory is refused by name instead of being given an invented
+    /// root — the gap is reported, not papered over.
+    pub async fn write_support_edge(
+        &self,
+        claim_revision_id: &str,
+        memory_source_id: &str,
+        verdict: &SupportVerdict,
+    ) -> Result<String, WenlanError> {
+        // §5: the evidence's provenance root. Derived from the delta memory's
+        // own id rather than looked up, because that convention IS the link.
+        let root_id = memory_source_id.strip_prefix("hed_").ok_or_else(|| {
+            WenlanError::Conflict(format!(
+                "support_evidence_has_no_root: {memory_source_id} carries no provenance root; \
+                 only human-delta evidence is resolvable in PR-A (artifact 3 §4a)"
+            ))
+        })?;
+
+        let conn = self.conn.lock().await;
+
+        let claim_text_digest: String = {
+            let mut rows = conn
+                .query(
+                    "SELECT canonical_text_digest FROM claim_revisions WHERE claim_revision_id = ?1",
+                    libsql::params![claim_revision_id],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support claim lookup: {error}")))?;
+            rows.next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support claim decode: {error}")))?
+                .ok_or_else(|| {
+                    WenlanError::Conflict(format!(
+                        "support_claim_unknown: no claim revision {claim_revision_id}"
+                    ))
+                })?
+                .get(0)
+                .map_err(|error| WenlanError::VectorDb(format!("support claim decode: {error}")))?
+        };
+
+        let (content, space): (String, String) = {
+            let mut rows = conn
+                .query(
+                    "SELECT content, COALESCE(space, 'unfiled') FROM memories WHERE source_id = ?1",
+                    libsql::params![memory_source_id],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("support memory lookup: {error}"))
+                })?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support memory decode: {error}")))?
+                .ok_or_else(|| {
+                    WenlanError::Conflict(format!(
+                        "support_evidence_unknown: no memory {memory_source_id}"
+                    ))
+                })?;
+            (
+                row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("support memory decode: {error}"))
+                })?,
+                row.get(1).map_err(|error| {
+                    WenlanError::VectorDb(format!("support memory decode: {error}"))
+                })?,
+            )
+        };
+
+        // Invariant 1, live-bytes half. `get` rather than `[..]`: these are byte
+        // offsets into a version that may have changed under us, so a boundary
+        // that no longer lands on a char is a refusal, never a panic.
+        let start = usize::try_from(verdict.span_start).unwrap_or(usize::MAX);
+        let end = usize::try_from(verdict.span_end).unwrap_or(usize::MAX);
+        let span = content.get(start..end).ok_or_else(|| {
+            WenlanError::Conflict(format!(
+                "support_span_unreadable: [{start}, {end}) is not a valid span of \
+                 {memory_source_id}"
+            ))
+        })?;
+        if crate::provenance::revision_content_digest(span) != verdict.span_digest {
+            return Err(WenlanError::Conflict(format!(
+                "support_span_moved: the bytes at [{start}, {end}) in {memory_source_id} are not \
+                 the ones this verdict judged"
+            )));
+        }
+
+        // Invariant 2: the verdict must be one the cache actually recorded,
+        // keyed by all five parts (artifact 6 §2).
+        let (cached_score, cached_threshold): (f64, f64) = {
+            let mut rows = conn
+                .query(
+                    "SELECT score, threshold_at_write FROM entailment_cache
+                     WHERE claim_text_digest = ?1 AND source_span_digest = ?2
+                       AND model_id = ?3 AND model_version = ?4 AND prompt_version = ?5",
+                    libsql::params![
+                        claim_text_digest,
+                        verdict.span_digest.clone(),
+                        verdict.model_id.clone(),
+                        verdict.model_version.clone(),
+                        verdict.prompt_version.clone(),
+                    ],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support cache lookup: {error}")))?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support cache decode: {error}")))?
+                .ok_or_else(|| {
+                    WenlanError::Conflict(
+                        "support_verdict_uncached: this edge cannot name the verdict that \
+                         produced it"
+                            .to_string(),
+                    )
+                })?;
+            (
+                row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("support cache decode: {error}"))
+                })?,
+                row.get(1).map_err(|error| {
+                    WenlanError::VectorDb(format!("support cache decode: {error}"))
+                })?,
+            )
+        };
+        if cached_score != verdict.score || cached_threshold != verdict.threshold_at_write {
+            return Err(WenlanError::Conflict(format!(
+                "support_verdict_altered: {claim_revision_id} cites a score the cache does not \
+                 record"
+            )));
+        }
+
+        // The span digest discriminates, so two spans of one memory are two
+        // edges rather than one that silently overwrites the other.
+        let edge_id = crate::provenance::compute_edge_id(
+            "supports",
+            "claim_revision",
+            claim_revision_id,
+            "memory",
+            memory_source_id,
+            &verdict.span_digest,
+        );
+        let payload = serde_json::json!({
+            "source_version": verdict.source_version,
+            "span_start": verdict.span_start,
+            "span_end": verdict.span_end,
+            "span_digest": verdict.span_digest,
+            "model_id": verdict.model_id,
+            "model_version": verdict.model_version,
+            "prompt_version": verdict.prompt_version,
+            "score": verdict.score,
+            "threshold_at_write": verdict.threshold_at_write,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                                grounded, root_id, space, weight, payload, provenance,
+                                operation_id, created_at, superseded_by, valid_until)
+             VALUES (?1, ?2, 'claim_revision', ?3, 'memory', 'supports', 'evidence',
+                     0, ?4, ?5, NULL, ?6, NULL, NULL, ?7, NULL, NULL)
+             ON CONFLICT(edge_id) DO NOTHING",
+            libsql::params![
+                edge_id.clone(),
+                claim_revision_id,
+                memory_source_id,
+                root_id,
+                space,
+                payload,
+                chrono::Utc::now().timestamp(),
+            ],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("support edge write: {error}")))?;
+
+        Ok(edge_id)
     }
 }

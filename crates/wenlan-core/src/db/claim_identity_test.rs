@@ -682,3 +682,310 @@ async fn the_delta_memory_takes_the_page_space_so_the_fence_admits_it() {
     let same: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(same, 1, "delta memory space must equal the page space");
 }
+
+// ===== The supports writer (artifact 3 §4a) =====
+
+const ADDED_PROSE: &str = "They nest in old crow nests.";
+const CLAIM_TEXT: &str = "Kestrels nest in old crow nests.";
+
+/// Everything §4a's two invariants need to agree about: a real human-delta
+/// memory, a real claim revision, and a cache row that actually recorded the
+/// verdict. Built through the production minter rather than by hand, so the
+/// test cannot accidentally agree with itself.
+struct SupportScenario {
+    claim_revision_id: String,
+    memory_source_id: String,
+    verdict: super::claim_identity::SupportVerdict,
+}
+
+async fn support_scenario(db: &MemoryDB, page_id: &str) -> SupportScenario {
+    let base = page_with_prose(db, page_id).await;
+    let minted = db
+        .mint_human_edit_delta(page_id, 1, &base, &format!("{BASE_PROSE}\n{ADDED_PROSE}"))
+        .await
+        .unwrap()
+        .expect("the scenario needs a real delta to cite");
+
+    let span_digest = crate::provenance::revision_content_digest(ADDED_PROSE);
+    let claim_digest = crate::provenance::revision_content_digest(CLAIM_TEXT);
+    let claim_revision_id = format!("cr_{page_id}");
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO claims (claim_id, page_id, created_at) VALUES (?1, ?2, 0)",
+            libsql::params![format!("c_{page_id}"), page_id],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claim_revisions (claim_revision_id, claim_id, predecessor_revision_id,
+                                          canonical_text, canonical_text_digest, claim_kind,
+                                          extractor_version, created_at)
+             VALUES (?1, ?2, '', ?3, ?4, 'observation', 1, 0)",
+            libsql::params![
+                claim_revision_id.clone(),
+                format!("c_{page_id}"),
+                CLAIM_TEXT,
+                claim_digest.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entailment_cache (claim_text_digest, source_span_digest, model_id,
+                                           model_version, prompt_version, score,
+                                           threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, 'qwen3-4b', 'v1', 'p1', 0.91, 0.7, 'on_device', 0)",
+            libsql::params![claim_digest, span_digest.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    SupportScenario {
+        claim_revision_id,
+        memory_source_id: minted.memory_source_id,
+        verdict: super::claim_identity::SupportVerdict {
+            source_version: 1,
+            span_start: 0,
+            span_end: ADDED_PROSE.len() as i64,
+            span_digest,
+            model_id: "qwen3-4b".to_string(),
+            model_version: "v1".to_string(),
+            prompt_version: "p1".to_string(),
+            score: 0.91,
+            threshold_at_write: 0.7,
+        },
+    }
+}
+
+async fn edge_row(db: &MemoryDB, edge_id: &str) -> (i64, String, String, String) {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT grounded, lineage, root_id, payload FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("the edge must exist");
+    (
+        row.get(0).unwrap(),
+        row.get(1).unwrap(),
+        row.get(2).unwrap(),
+        row.get(3).unwrap(),
+    )
+}
+
+/// Weakening: write the edge without freezing the span/verdict payload.
+///
+/// An edge that names only a memory cannot prove later that the thing judged is
+/// the thing cited — the whole reason §4a exists.
+#[tokio::test]
+async fn a_faithful_verdict_writes_an_edge_that_names_its_span_and_its_judge() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp1").await;
+
+    let edge_id = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await
+        .expect("a verdict that agrees with the bytes and the cache is the valid shape");
+
+    let (grounded, lineage, root_id, payload) = edge_row(&db, &edge_id).await;
+    assert_eq!(
+        lineage, "evidence",
+        "§2 fixes the lineage of a support edge"
+    );
+    assert_eq!(
+        root_id,
+        scenario.memory_source_id.strip_prefix("hed_").unwrap(),
+        "§5: root_id is the provenance root of the evidence cited"
+    );
+    assert_eq!(
+        grounded, 0,
+        "§3: a support edge may never manufacture grounding"
+    );
+
+    let frozen: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    for field in [
+        "source_version",
+        "span_start",
+        "span_end",
+        "span_digest",
+        "model_id",
+        "model_version",
+        "prompt_version",
+        "score",
+        "threshold_at_write",
+    ] {
+        assert!(
+            !frozen[field].is_null(),
+            "§4a's table requires {field} on the edge itself"
+        );
+    }
+}
+
+/// Weakening: trust the stored offsets instead of re-reading the bytes.
+///
+/// Artifact 1 §3: offsets alone are never trusted. A span whose digest no
+/// longer matches must invalidate the edge, not silently re-point at whatever
+/// text now occupies those offsets.
+#[tokio::test]
+async fn a_span_that_moved_invalidates_the_support_edge() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp2").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET content = ?1 WHERE source_id = ?2",
+            libsql::params![
+                "They nest on bare cliff ledges.",
+                scenario.memory_source_id.clone()
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let refused = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "the offsets still resolve, but to text this verdict never judged"
+    );
+}
+
+/// Weakening: write the edge without checking the cache at all.
+///
+/// §4a invariant 2 — a support edge may never be written from a verdict it
+/// cannot name.
+#[tokio::test]
+async fn a_verdict_the_cache_never_recorded_cannot_be_cited() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp3").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("DELETE FROM entailment_cache", ())
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        db.write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await
+        .is_err(),
+        "with no cache row there is no verdict to name"
+    );
+}
+
+/// Weakening: check that a cache row exists, but not that it says what the
+/// edge claims. A score the cache does not record is the exact shape of a
+/// verdict laundered from a different judgment.
+#[tokio::test]
+async fn a_score_the_cache_does_not_record_is_refused() {
+    let (db, _temp) = db_with_substrate().await;
+    let mut scenario = support_scenario(&db, "sp4").await;
+    scenario.verdict.score = 0.99;
+
+    assert!(
+        db.write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await
+        .is_err(),
+        "the cache recorded 0.91; an edge may not claim it cleared a different bar"
+    );
+}
+
+/// Weakening: resolve a missing provenance root to some default rather than
+/// refusing. §5 requires root_id on every support edge, and inventing one
+/// would attribute evidence to a root that never produced it.
+#[tokio::test]
+async fn evidence_with_no_provenance_root_is_refused_by_name() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp5").await;
+
+    let error = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            "mem_ordinary",
+            &scenario.verdict,
+        )
+        .await
+        .expect_err("a memory with no resolvable root cannot be cited");
+    assert!(
+        format!("{error}").contains("support_evidence_has_no_root"),
+        "the refusal must name the gap rather than paper over it: {error}"
+    );
+}
+
+/// Weakening: discriminate the edge id by memory alone. Two spans of one
+/// memory would then collapse onto one edge, and the second verdict would be
+/// silently dropped by ON CONFLICT DO NOTHING.
+#[tokio::test]
+async fn two_spans_of_one_memory_are_two_distinct_edges() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp6").await;
+
+    let first = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await
+        .unwrap();
+
+    // A second, shorter span of the same memory, with its own cache row.
+    let short = &ADDED_PROSE[..12];
+    let short_digest = crate::provenance::revision_content_digest(short);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entailment_cache (claim_text_digest, source_span_digest, model_id,
+                                           model_version, prompt_version, score,
+                                           threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, 'qwen3-4b', 'v1', 'p1', 0.91, 0.7, 'on_device', 0)",
+            libsql::params![
+                crate::provenance::revision_content_digest(CLAIM_TEXT),
+                short_digest.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    let second = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &super::claim_identity::SupportVerdict {
+                span_end: short.len() as i64,
+                span_digest: short_digest,
+                ..scenario.verdict.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        first, second,
+        "the span digest must discriminate, or one verdict silently replaces the other"
+    );
+}
