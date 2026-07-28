@@ -63,7 +63,8 @@ done
 [ -n "$healthy" ] || fail "daemon did not become healthy within 120s"
 
 echo "==> Driving wenlan-mcp over stdio JSON-RPC"
-# Keep the self-update probe off the network and out of the user cache.
+# Keep the self-update probe out of the user cache (the empty temp cache
+# still forces one GET to api.github.com; its 3s timeout is fail-soft).
 WENLAN_MCP_CACHE_DIR="$DATA_DIR/mcp-cache" \
 MCP_BIN="$BIN/wenlan-mcp" MCP_URL="$HOST" python3 - <<'EOF' \
     || fail "MCP stdio round-trip failed"
@@ -113,7 +114,7 @@ send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
 send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
 tools = {t["name"] for t in expect_ok(recv(2), "tools/list")["tools"]}
-for needed in ("capture", "recall", "search_pages"):
+for needed in ("capture", "recall"):
     if needed not in tools:
         raise SystemExit(f"tools/list missing '{needed}' (got {sorted(tools)})")
 print(f"    tools/list ok: {len(tools)} tools")

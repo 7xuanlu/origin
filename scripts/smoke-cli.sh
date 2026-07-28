@@ -75,18 +75,25 @@ CLI capture "The ${SENTINEL} sentinel sentence lives in the CLI smoke." \
     --type fact >/dev/null || fail "wenlan capture exited nonzero"
 
 echo "==> wenlan memories contains the sentinel"
-CLI memories --limit 20 | grep -q "$SENTINEL" \
-    || fail "captured sentinel not listed by wenlan memories"
+# Capture then match: piping into grep -q can SIGPIPE the CLI under pipefail.
+MEMS_OUT="$(CLI memories --limit 20)" || fail "wenlan memories exited nonzero"
+case "$MEMS_OUT" in
+    *"$SENTINEL"*) ;;
+    *) fail "captured sentinel not listed by wenlan memories" ;;
+esac
 
 echo "==> wenlan search finds the sentinel"
 hit=""
 for i in $(seq 1 30); do
-    if CLI search "kumquat lighthouse sentinel sentence" --limit 5 \
-        | grep -q "$SENTINEL"; then
-        echo "    hit after ${i} poll(s)"
-        hit=1
-        break
-    fi
+    SEARCH_OUT="$(CLI search "kumquat lighthouse sentinel sentence" --limit 5)" \
+        || fail "wenlan search exited nonzero"
+    case "$SEARCH_OUT" in
+        *"$SENTINEL"*)
+            echo "    hit after ${i} poll(s)"
+            hit=1
+            break
+            ;;
+    esac
     sleep 2
 done
 [ -n "$hit" ] || fail "sentinel not retrievable via wenlan search within 60s"

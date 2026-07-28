@@ -31,13 +31,15 @@ import re
 import sys
 
 BEHAVIOR_RE = re.compile(r"^\s*[-*]\s+\**\b(B\d+)\**\s*:", re.MULTILINE)
-COVERS_RE = re.compile(r"covers:\s*(B\d+(?:\s*,\s*B\d+)*)")
+# Comment-anchored: a covers-tag must sit in a comment, so a tag inside a
+# string literal or prose neither covers nor dangles.
+COVERS_RE = re.compile(r"(?:<!--|--|//|/\*|\*|#)\s*covers:\s*(B\d+(?:\s*,\s*B\d+)*)")
 TEST_EXTS = (".rs", ".py", ".sh", ".ts", ".js", ".tsx", ".go")
 
 
 def parse_behaviors(plan_path):
     text = open(plan_path).read()
-    section = re.search(r"^##+\s+Behaviors\s*$(.*?)(?=^##+\s|\Z)",
+    section = re.search(r"^##+\s+Behaviors\b[^\n]*$(.*?)(?=^##+\s|\Z)",
                         text, re.MULTILINE | re.DOTALL)
     if not section:
         return None
@@ -54,7 +56,10 @@ def collect_covers(paths):
                           if n.endswith(TEST_EXTS)]
         else:
             files.append(p)
+    own_name = os.path.basename(__file__)
     for f in files:
+        if os.path.basename(f) == own_name:
+            continue  # the docstring's own covers: examples must not count
         try:
             lines = open(f, errors="replace").read().splitlines()
         except OSError:
@@ -67,7 +72,11 @@ def collect_covers(paths):
 
 
 def run(plan_path, test_paths):
-    behaviors = parse_behaviors(plan_path)
+    try:
+        behaviors = parse_behaviors(plan_path)
+    except OSError as e:
+        print(f"error: cannot read plan {plan_path}: {e}", file=sys.stderr)
+        return 2
     if behaviors is None:
         print(f"error: no '## Behaviors' section in {plan_path}", file=sys.stderr)
         return 2
@@ -140,10 +149,25 @@ def self_test():
         if run(plan, [td]) != 0:
             failures.append("multi-id covers tag should cover both")
 
+        # 6. tag inside a string literal (no comment marker) -> not a cover
+        write("## Behaviors\n- B1: x\n",
+              'fn a(){ let m = "covers: B1 is just prose"; }\n')
+        if run(plan, [td]) != 1:
+            failures.append("string-literal tag must not count as coverage")
+
+        # 7. heading with a suffix still parses
+        write("## Behaviors (contract)\n- B1: x\n", "// covers: B1\nfn a(){}\n")
+        if run(plan, [td]) != 0:
+            failures.append("suffixed Behaviors heading should parse")
+
+        # 8. unreadable plan path -> usage error, not a crash
+        if run(os.path.join(td, "no-such-plan.md"), [td]) != 2:
+            failures.append("missing plan file should return 2")
+
     if failures:
         print("SELF-TEST FAILED:\n  " + "\n  ".join(failures))
         return 1
-    print("self-test: 5/5 cases correct")
+    print("self-test: 8/8 cases correct")
     return 0
 
 
