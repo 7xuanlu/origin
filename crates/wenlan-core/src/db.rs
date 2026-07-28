@@ -22,6 +22,7 @@ static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 
 mod claim_identity;
 mod count;
+mod edges_rebuild;
 mod entity_page_adapter;
 mod page_drafts;
 pub mod page_map;

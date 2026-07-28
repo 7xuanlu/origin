@@ -11,18 +11,20 @@
 //! must restore exactly this set.
 
 use super::tests::test_db;
+use super::MemoryDB;
 
 async fn schema_objects(kind: &str) -> Vec<String> {
     let (db, _temp) = test_db().await;
     let conn = db.conn.lock().await;
-    // `sqlite_autoindex_edges_1` is excluded: it is SQLite's implicit index for
-    // `edge_id TEXT PRIMARY KEY`, created by the PK declaration itself, so the
-    // rebuild gets it back from `CREATE TABLE` rather than restoring it.
+    // `sql IS NOT NULL` skips SQLite's implicit index for `edge_id TEXT PRIMARY
+    // KEY`: it is derived from the PK declaration, has no `CREATE` statement of
+    // its own, and returns with the `CREATE TABLE`. Same predicate the capture
+    // helper uses, so the census and the rebuild cannot disagree about what
+    // counts as attached.
     let mut rows = conn
         .query(
             "SELECT name FROM sqlite_master
-             WHERE type = ?1 AND tbl_name = 'edges'
-               AND name NOT LIKE 'sqlite_autoindex%'
+             WHERE type = ?1 AND tbl_name = 'edges' AND sql IS NOT NULL
              ORDER BY name",
             libsql::params![kind],
         )
@@ -80,4 +82,110 @@ async fn every_index_on_edges_is_recorded_for_the_rebuild() {
         "the edges rebuild must restore every one of these, plus the four \
          partial support/attest indexes it adds (artifact 3 §6)"
     );
+}
+
+/// Weakening: hand-maintain the recreate list instead of reading the schema.
+///
+/// The round trip is the whole point — capture, drop, recreate the table,
+/// replay — because it stays correct when a later rung attaches a ninth
+/// trigger without touching the rebuild.
+#[tokio::test]
+async fn capture_and_replay_round_trip_restores_every_attached_object() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+    conn.execute_batch(
+        "CREATE TABLE scratch (id TEXT PRIMARY KEY, v INTEGER NOT NULL);
+         CREATE INDEX idx_scratch_v ON scratch(v);
+         CREATE INDEX idx_scratch_positive ON scratch(v) WHERE v > 0;
+         CREATE TRIGGER scratch_guard AFTER INSERT ON scratch
+         BEGIN
+             SELECT RAISE(ABORT, 'negative') WHERE NEW.v < 0;
+         END;",
+    )
+    .await
+    .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    let captured = MemoryDB::capture_attached_objects(&tx, "scratch")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        captured.len(),
+        3,
+        "two indexes and one trigger: {captured:?}"
+    );
+
+    conn.execute_batch(
+        "DROP TABLE scratch;
+         CREATE TABLE scratch (id TEXT PRIMARY KEY, v INTEGER NOT NULL);",
+    )
+    .await
+    .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    assert!(
+        MemoryDB::capture_attached_objects(&tx, "scratch")
+            .await
+            .unwrap()
+            .is_empty(),
+        "DROP TABLE must take the attached objects with it"
+    );
+    MemoryDB::replay_attached_objects(&tx, &captured)
+        .await
+        .unwrap();
+    let restored = MemoryDB::capture_attached_objects(&tx, "scratch")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(restored, captured, "replay must restore the exact set");
+
+    // The trigger is not merely present, it fires.
+    let rejected = conn
+        .execute("INSERT INTO scratch VALUES ('a', -1)", ())
+        .await;
+    assert!(rejected.is_err(), "replayed trigger must still abort");
+}
+
+/// Weakening: filter implicit indexes by an `sqlite_autoindex%` name prefix.
+///
+/// The property that makes them unreplayable is that they have no statement,
+/// not that they have a particular name — and replaying a NULL is what a
+/// name-prefix filter eventually lets through.
+#[tokio::test]
+async fn capture_skips_the_implicit_primary_key_index() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+    conn.execute("CREATE TABLE scratch (id TEXT PRIMARY KEY)", ())
+        .await
+        .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    let captured = MemoryDB::capture_attached_objects(&tx, "scratch")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert!(
+        captured.is_empty(),
+        "the PK's implicit index has no CREATE statement to replay: {captured:?}"
+    );
+}
+
+/// Weakening: swallow a replay failure. That leaves a widened table with part
+/// of its fence missing — artifact 3 §8's "after rename, before triggers"
+/// window, which must refuse to serve rather than accept writes.
+#[tokio::test]
+async fn replay_fails_loud_on_a_statement_that_does_not_apply() {
+    let (db, _temp) = test_db().await;
+    let conn = db.conn.lock().await;
+    let tx = conn.transaction().await.unwrap();
+
+    let result = MemoryDB::replay_attached_objects(
+        &tx,
+        &["CREATE INDEX idx_missing ON no_such_table(col)".to_string()],
+    )
+    .await;
+
+    assert!(result.is_err(), "replay must not swallow a failure");
 }
