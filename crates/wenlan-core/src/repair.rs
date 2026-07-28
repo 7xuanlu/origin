@@ -8003,6 +8003,63 @@ mod tests {
         ));
         assert_eq!(before, fingerprint(&db).await);
         assert_eq!(target_memory_types(&db).await, vec![None, None]);
+        // The fingerprint covers known tables only, so assert the escape's own
+        // table directly rather than inferring rollback from the checks above.
+        let escaped: i64 = db
+            .conn
+            .lock()
+            .await
+            .query("SELECT COUNT(*) FROM repair_escape", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(escaped, 0, "escaped insert must not survive the rollback");
+    }
+
+    /// The guard compensates for parity bookkeeping by subtracting the measured
+    /// generation delta. That is only safe while a bump costs a row write: a
+    /// trigger advancing the counter by 2 in one statement would earn 2 units of
+    /// compensation for 1 row change, and could spend the surplus hiding an
+    /// escaped write. Here the escape both mutates a second `memories` row and
+    /// inflates the counter, so the arithmetic alone would net to zero.
+    #[tokio::test]
+    async fn effect_escape_cannot_hide_behind_an_inflated_parity_generation() {
+        let (db, _db_dir) = fixture().await;
+        db.conn
+            .lock()
+            .await
+            .execute_batch(
+                "CREATE TRIGGER repair_escape_inflate AFTER UPDATE OF memory_type ON memories
+                 WHEN NEW.source_id='mem_target'
+                 BEGIN
+                   UPDATE memories SET confidence=COALESCE(confidence,0)+1
+                    WHERE source_id='mem_other';
+                   UPDATE community_parity_input_state SET generation=generation+2
+                    WHERE singleton=1;
+                 END;",
+            )
+            .await
+            .unwrap();
+        let repair_root = tempfile::tempdir().unwrap();
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let manifest =
+            prepare_memory_reclassification(&db, &store, request(&db).await, 1_721_000_000)
+                .await
+                .unwrap();
+        let before = fingerprint(&db).await;
+
+        let result = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001).await;
+
+        // Either the unit-bump invariant aborts the write or the effect guard
+        // catches the residue; what must never happen is a silent commit.
+        assert!(result.is_err(), "inflated-counter escape must not commit");
+        assert_eq!(before, fingerprint(&db).await);
+        assert_eq!(target_memory_types(&db).await, vec![None, None]);
     }
 
     #[tokio::test]

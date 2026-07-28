@@ -2397,6 +2397,22 @@ fn community_relevant_spaces_digest(spaces: impl IntoIterator<Item = String>) ->
     hex::encode(digest.finalize())
 }
 
+/// The consumer-behaviour contract a proof was taken under. The global input
+/// generation only advances on DB mutations, so a proof stays "current" across
+/// a restart that changes a tuning knob the consumer predicate actually reads.
+/// `summary_eligibility` inlines `min_bucket_members()` into its SQL, so a
+/// changed threshold silently redefines eligibility with no mutation behind it.
+/// Folding the value into a cached token the gate compares as a literal closes
+/// that without any read-time computation -- same shape as the algo/projection
+/// version literals below.
+pub(crate) fn community_consumer_contract_version() -> String {
+    // Digits only: safe to inline, and no consumer can smuggle SQL through it.
+    format!(
+        "min_members={}",
+        crate::refinery::summary::min_bucket_members()
+    )
+}
+
 /// The one fail-closed durable-reader invariant used by the direct reader,
 /// summary eligibility SQL, and pending-reconcile detection. The expensive
 /// membership digest is reconciliation-time work: reads compare only cached
@@ -2424,6 +2440,7 @@ pub(crate) fn community_reader_durable_gate_sql(consumer: &str) -> String {
                 AND watermark.relevant_spaces_digest=current_input.relevant_spaces_digest
               WHERE cutover.consumer='{consumer}'
                 AND cutover.enabled=1
+                AND watermark.consumer_contract_version='{contract}'
                 AND watermark.unexplained_drift_count=0
                 AND watermark.relevant_space_count=(
                     SELECT COUNT(*) FROM community_reader_space_proof proof
@@ -2451,7 +2468,8 @@ pub(crate) fn community_reader_durable_gate_sql(consumer: &str) -> String {
                 )
         )",
         algorithm = crate::community_grouping::COMMUNITY_ALGO_VERSION,
-        projection = crate::community_grouping::COMMUNITY_PROJECTION_VERSION
+        projection = crate::community_grouping::COMMUNITY_PROJECTION_VERSION,
+        contract = community_consumer_contract_version()
     )
 }
 
@@ -11418,6 +11436,7 @@ impl MemoryDB {
                  proven_input_generation INTEGER NOT NULL,
                  relevant_spaces_digest TEXT NOT NULL,
                  relevant_space_count INTEGER NOT NULL,
+                 consumer_contract_version TEXT NOT NULL,
                  source_coverage_delta_count INTEGER NOT NULL,
                  output_delta_count INTEGER NOT NULL,
                  unexplained_drift_count INTEGER NOT NULL,
@@ -11508,6 +11527,24 @@ impl MemoryDB {
              END;
              CREATE TRIGGER m4_parity_input_state_update AFTER UPDATE ON space_graph_state BEGIN
                UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+             END;
+
+             -- The repair effect guard proves write scope by differencing
+             -- total_changes() and subtracting the measured generation delta,
+             -- which is only exact while every bump costs one row write. A
+             -- single UPDATE advancing the counter by more than 1 would buy
+             -- compensation without paying a row change, letting an escaped
+             -- write hide under the subtraction. Enforcing at-most-unit
+             -- advance makes the compensation conservation-preserving: the
+             -- only legal shapes are the triggers' +1 and reconciliation's
+             -- digest-only CAS, which leaves the generation untouched.
+             DROP TRIGGER IF EXISTS m4_parity_input_state_unit_bump;
+             CREATE TRIGGER m4_parity_input_state_unit_bump
+             BEFORE UPDATE ON community_parity_input_state
+             WHEN NEW.generation <> OLD.generation
+              AND NEW.generation <> OLD.generation + 1
+             BEGIN
+               SELECT RAISE(ABORT, 'community_parity_input_state generation must advance by at most 1 per write');
              END;",
         )
         .await
@@ -11783,6 +11820,7 @@ impl MemoryDB {
                     "proven_input_generation integer not null",
                     "relevant_spaces_digest text not null",
                     "relevant_space_count integer not null",
+                    "consumer_contract_version text not null",
                     "source_coverage_delta_count integer not null",
                     "output_delta_count integer not null",
                     "unexplained_drift_count integer not null",
@@ -14852,13 +14890,15 @@ impl MemoryDB {
         tx.execute(
             "INSERT INTO community_reader_watermark
                 (consumer, proven_input_generation, relevant_spaces_digest,
-                 relevant_space_count, source_coverage_delta_count, output_delta_count,
+                 relevant_space_count, consumer_contract_version,
+                 source_coverage_delta_count, output_delta_count,
                  unexplained_drift_count, checked_at, report_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(consumer) DO UPDATE SET
                 proven_input_generation=excluded.proven_input_generation,
                 relevant_spaces_digest=excluded.relevant_spaces_digest,
                 relevant_space_count=excluded.relevant_space_count,
+                consumer_contract_version=excluded.consumer_contract_version,
                 source_coverage_delta_count=excluded.source_coverage_delta_count,
                 output_delta_count=excluded.output_delta_count,
                 unexplained_drift_count=excluded.unexplained_drift_count,
@@ -14869,6 +14909,7 @@ impl MemoryDB {
                 input_generation,
                 relevant_spaces_digest,
                 i64::try_from(relevant_spaces.len()).unwrap_or(i64::MAX),
+                community_consumer_contract_version(),
                 i64::try_from(source_coverage_delta).unwrap_or(i64::MAX),
                 i64::try_from(output_delta).unwrap_or(i64::MAX),
                 i64::try_from(unexplained_total).unwrap_or(i64::MAX),
@@ -50032,6 +50073,60 @@ pub(crate) mod tests {
         }
     }
 
+    /// A fresh database must get the contract-version column from M96 itself,
+    /// and a staged M96 file carrying the pre-column watermark must fail LOUD
+    /// naming the exact missing signature rather than silently serving a
+    /// watermark the gate can no longer evaluate. `CREATE TABLE IF NOT EXISTS`
+    /// cannot add a column, so silent tolerance here would mean a durable read
+    /// proved under a contract nobody recorded.
+    #[tokio::test]
+    async fn migration_96_requires_the_contract_version_column_on_the_watermark() {
+        let (db, _dir) = test_db().await;
+        {
+            let conn = db.conn.lock().await;
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM pragma_table_info('community_reader_watermark')
+                      WHERE name='consumer_contract_version'",
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1,
+                "a fresh M96 database must carry the contract-version column"
+            );
+            drop(rows);
+            conn.execute_batch(
+                "DROP TABLE community_reader_watermark;
+                 CREATE TABLE community_reader_watermark (
+                     consumer TEXT PRIMARY KEY,
+                     proven_input_generation INTEGER NOT NULL,
+                     relevant_spaces_digest TEXT NOT NULL,
+                     relevant_space_count INTEGER NOT NULL,
+                     source_coverage_delta_count INTEGER NOT NULL,
+                     output_delta_count INTEGER NOT NULL,
+                     unexplained_drift_count INTEGER NOT NULL,
+                     checked_at INTEGER NOT NULL,
+                     report_json TEXT NOT NULL
+                 );",
+            )
+            .await
+            .unwrap();
+        }
+
+        let error = db
+            .community_cutover_needs_repair()
+            .await
+            .expect_err("a pre-column watermark must not be accepted as current");
+
+        assert!(
+            format!("{error}").contains("consumer_contract_version"),
+            "the failure must name the missing signature, got: {error}"
+        );
+    }
+
     /// Mutation caught: treating a stamped local-only M96 database as current
     /// leaves per-space receipts trusted and never installs the global
     /// generation/watermark/proof model.
@@ -50591,6 +50686,33 @@ pub(crate) mod tests {
     fn community_reader_gate_sql_fails_closed_for_unknown_consumers() {
         assert_eq!(community_reader_durable_gate_sql("bogus_consumer"), "0=1");
         assert_eq!(community_reader_durable_gate_sql(""), "0=1");
+    }
+
+    /// The gate must compare the consumer-behaviour contract a proof was taken
+    /// under, or a tuning knob can be changed across a restart with no DB
+    /// mutation and the cached proof stays "current" while the predicate it
+    /// proved has silently changed underneath it.
+    #[test]
+    fn community_reader_gate_sql_pins_the_consumer_contract_version() {
+        let contract = community_consumer_contract_version();
+        assert_eq!(
+            contract,
+            format!(
+                "min_members={}",
+                crate::refinery::summary::min_bucket_members()
+            ),
+            "the contract token must track the threshold the predicate actually reads"
+        );
+        for consumer in [
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+        ] {
+            let sql = community_reader_durable_gate_sql(consumer);
+            assert!(
+                sql.contains(&format!("watermark.consumer_contract_version='{contract}'")),
+                "gate for {consumer} does not pin the contract version"
+            );
+        }
     }
 
     #[tokio::test]
