@@ -421,7 +421,14 @@ prose-column reference (`content`, `title`, `summary`, `excerpt`, `body`,
 
 A first pass reported 24. It stripped each file at its **first** `#[cfg(test)]`
 line rather than tracking the block's braces, which truncated `db.rs` — the file
-holding 46 of the 76 — near its top. Same failure family as the three wrong
+holding 46 of the 76 — near its top.
+
+The 76 is cross-checked, not asserted once. Two test-strippers were written
+independently — one tracking braces character-by-character over the whole file,
+one tracking them line-by-line — and both return the same 76 rows and the same
+46-in-`db.rs` split. A single scan agreeing with itself proves nothing; two
+implementations of the tricky half agreeing is the differential control this
+file demands of everything else in it. Same failure family as the three wrong
 route counts: a scan that silently narrows its own input. The rule is now
 recorded with the others: **strip test modules by brace tracking, never by
 first-match truncation.**
