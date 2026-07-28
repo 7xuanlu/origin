@@ -5575,3 +5575,217 @@ fn section_resolver_detects_moved_heading() {
         "resolver must accept a heading present in the target"
     );
 }
+
+#[test]
+fn m5_reader_inventory_matches_current_tree() {
+    let root = repo_root();
+    let output = std::process::Command::new("python3")
+        .arg("scripts/m5-reader-sweep.py")
+        .arg("--check")
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/m5-reader-sweep.py --check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "M5 reader inventory drifted from the current source tree.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("reader inventory check: ok"),
+        "reader sweep check mode did not emit its success receipt.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+// ── R0: shrink-only direct DB connection access ──
+
+const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
+    ("crates/wenlan-core/src/citations.rs", 1),
+    ("crates/wenlan-core/src/community_grouping.rs", 1),
+    ("crates/wenlan-core/src/derived_artifact_state.rs", 2),
+    ("crates/wenlan-core/src/derived_artifact_state/sweep.rs", 1),
+    ("crates/wenlan-core/src/document_enrichment.rs", 12),
+    ("crates/wenlan-core/src/eval/answer_quality.rs", 1),
+    ("crates/wenlan-core/src/eval/lifecycle.rs", 4),
+    ("crates/wenlan-core/src/eval/locomo.rs", 1),
+    ("crates/wenlan-core/src/eval/longmemeval.rs", 3),
+    ("crates/wenlan-core/src/eval/paired.rs", 1),
+    ("crates/wenlan-core/src/eval/pipeline.rs", 2),
+    ("crates/wenlan-core/src/eval/shared.rs", 3),
+    ("crates/wenlan-core/src/eval/signals.rs", 2),
+    ("crates/wenlan-core/src/importer.rs", 1),
+    ("crates/wenlan-core/src/kg/entity_extraction.rs", 1),
+    ("crates/wenlan-core/src/kg_quality.rs", 26),
+    ("crates/wenlan-core/src/lint/deep_test.rs", 3),
+    ("crates/wenlan-core/src/lint/identity_test.rs", 7),
+    ("crates/wenlan-core/src/lint/kg_config_test.rs", 1),
+    ("crates/wenlan-core/src/lint/kg_test.rs", 8),
+    (
+        "crates/wenlan-core/src/lint/memories_integration_test.rs",
+        2,
+    ),
+    (
+        "crates/wenlan-core/src/lint/memories_lifecycle_regression_test.rs",
+        1,
+    ),
+    (
+        "crates/wenlan-core/src/lint/memories_review_regression_test.rs",
+        3,
+    ),
+    ("crates/wenlan-core/src/lint/memories_test.rs", 1),
+    (
+        "crates/wenlan-core/src/lint/operations_test/config_queue.rs",
+        2,
+    ),
+    (
+        "crates/wenlan-core/src/lint/operations_test/nonmutation.rs",
+        1,
+    ),
+    (
+        "crates/wenlan-core/src/lint/operations_test/refinement_states.rs",
+        1,
+    ),
+    (
+        "crates/wenlan-core/src/lint/operations_test/review_maintenance.rs",
+        4,
+    ),
+    (
+        "crates/wenlan-core/src/lint/pages/integration_test_support.rs",
+        1,
+    ),
+    ("crates/wenlan-core/src/lint/pages/integration_tests.rs", 1),
+    (
+        "crates/wenlan-core/src/lint/pages/link_checks_test/manifest.rs",
+        1,
+    ),
+    ("crates/wenlan-core/src/lint/pages/state_checks_test.rs", 2),
+    ("crates/wenlan-core/src/lint/runtime_readiness_test.rs", 1),
+    ("crates/wenlan-core/src/lint/runtime_test.rs", 3),
+    ("crates/wenlan-core/src/lint/semantic_test.rs", 16),
+    ("crates/wenlan-core/src/lint/serving_review_fact_test.rs", 2),
+    ("crates/wenlan-core/src/lint/serving_review_test.rs", 3),
+    ("crates/wenlan-core/src/lint/serving_test.rs", 3),
+    ("crates/wenlan-core/src/lint/snapshot_tests.rs", 3),
+    ("crates/wenlan-core/src/lint/tests.rs", 1),
+    ("crates/wenlan-core/src/maintenance.rs", 7),
+    ("crates/wenlan-core/src/maintenance/duplicates.rs", 2),
+    ("crates/wenlan-core/src/maintenance/survivor_tests.rs", 1),
+    ("crates/wenlan-core/src/post_ingest.rs", 2),
+    ("crates/wenlan-core/src/post_write.rs", 20),
+    ("crates/wenlan-core/src/refinery/mod.rs", 13),
+    ("crates/wenlan-core/src/repair.rs", 20),
+    (
+        "crates/wenlan-core/src/repair/entity_extraction_tests.rs",
+        17,
+    ),
+    ("crates/wenlan-core/src/repair/title_rename_tests.rs", 8),
+    (
+        "crates/wenlan-core/src/repair_plan/deterministic_tests.rs",
+        38,
+    ),
+    ("crates/wenlan-core/src/repair_plan_tests.rs", 29),
+    ("crates/wenlan-core/src/retrieval/hard_filters.rs", 2),
+    ("crates/wenlan-core/src/space_context.rs", 6),
+    ("crates/wenlan-core/src/synthesis/detect.rs", 3),
+    ("crates/wenlan-core/src/synthesis/distill.rs", 13),
+    ("crates/wenlan-core/src/synthesis/refinement_queue.rs", 19),
+];
+
+fn direct_conn_access_count(source: &str) -> usize {
+    regex::Regex::new(r"\.conn\s*\.\s*lock\s*\(\s*\)\s*\.\s*await")
+        .unwrap()
+        .find_iter(source)
+        .count()
+}
+
+fn current_external_conn_access(root: &Path) -> BTreeMap<String, usize> {
+    git_ls_files(root, "crates/wenlan-core/src")
+        .into_iter()
+        .filter(|path| path.ends_with(".rs"))
+        .filter(|path| {
+            path != "crates/wenlan-core/src/db.rs"
+                && !path.starts_with("crates/wenlan-core/src/db/")
+        })
+        .filter_map(|path| {
+            let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
+            let count = direct_conn_access_count(&source);
+            (count > 0).then_some((path, count))
+        })
+        .collect()
+}
+
+fn external_conn_access_violations(
+    baseline: &BTreeMap<String, usize>,
+    current: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter_map(|(path, count)| match baseline.get(path) {
+            Some(allowed) if count <= allowed => None,
+            Some(allowed) => Some(format!(
+                "{path}: direct .conn.lock() access increased {allowed} -> {count}"
+            )),
+            None => Some(format!(
+                "{path}: {count} new direct .conn.lock() access{}",
+                if *count == 1 { "" } else { "es" }
+            )),
+        })
+        .collect()
+}
+
+#[test]
+fn external_conn_access_does_not_grow() {
+    let baseline: BTreeMap<String, usize> = EXTERNAL_CONN_ACCESS_BASELINE
+        .iter()
+        .map(|(path, count)| ((*path).to_string(), *count))
+        .collect();
+    let current = current_external_conn_access(&repo_root());
+    let violations = external_conn_access_violations(&baseline, &current);
+
+    assert!(
+        violations.is_empty(),
+        "direct MemoryDB connection access outside db.rs/db/** is shrink-only; \
+         use a MemoryDB method instead of adding a new lock:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn external_conn_access_ratchet_detects_new_and_increased_files() {
+    let baseline = BTreeMap::from([
+        ("crates/wenlan-core/src/a.rs".to_string(), 2),
+        ("crates/wenlan-core/src/shrinking.rs".to_string(), 3),
+        ("crates/wenlan-core/src/removed.rs".to_string(), 1),
+    ]);
+    let current = BTreeMap::from([
+        ("crates/wenlan-core/src/a.rs".to_string(), 3),
+        ("crates/wenlan-core/src/new.rs".to_string(), 1),
+        ("crates/wenlan-core/src/shrinking.rs".to_string(), 1),
+    ]);
+
+    assert_eq!(
+        external_conn_access_violations(&baseline, &current),
+        vec![
+            "crates/wenlan-core/src/a.rs: direct .conn.lock() access increased 2 -> 3",
+            "crates/wenlan-core/src/new.rs: 1 new direct .conn.lock() access",
+        ],
+        "the ratchet must reject increases and new files while accepting shrinkage"
+    );
+}
+
+#[test]
+fn external_conn_access_matcher_catches_formatted_await_chains() {
+    let source = concat!(
+        "let one = db.",
+        "conn.lock().await;\n",
+        "let two = db\n    .",
+        "conn\n    .lock()\n    .await;\n",
+        "let not_an_access = \".conn.lock()\";\n",
+    );
+    assert_eq!(
+        direct_conn_access_count(source),
+        2,
+        "the matcher must catch one-line and rustfmt-split access chains"
+    );
+}

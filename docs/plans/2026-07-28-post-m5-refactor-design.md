@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 approved after required document fixes; R0 may start**
+Status: **Fable gate 1 approved; R0 implemented and verified**
 
 ## Authority and change control
 
@@ -65,7 +65,7 @@ child-module `MemoryDB` definition back to `db.rs`. A whole-workspace
 `MemoryDB` reference query still times out. File decomposition has therefore
 improved local navigation but has not removed the supernode.
 
-The M5 internal-reader generator currently reports:
+Before R0, the M5 internal-reader generator reported:
 
 - 191 total internal page-prose readers;
 - 22 exposure paths;
@@ -76,6 +76,14 @@ Its committed inventory still says `190 / 22`. The extra live row is
 page after creation. The generator self-test passes, so this is an artifact
 freshness gap, not a self-test failure. Until set equality is executable, the
 inventory is evidence but not a refactor gate.
+
+R0 then found that the passing self-test was insufficient: the brace matcher
+counted braces inside Rust strings/comments, so `run_migrations` swallowed
+later sibling methods despite staying below `MAX_FN_LINES`. An LSP
+document-symbol comparison exposed the boundary mismatch. After adding a
+structural lexer and positive controls, the same baseline resolves to `192`
+readers with partition `55 / 50 / 87`; the second previously hidden row is
+`MemoryDB::migrate_89_page_kind_fold`.
 
 `crate::db::tests::test_db` and DB test hooks are used widely outside `db.rs`.
 Moving the main test module must preserve the exact
@@ -282,6 +290,27 @@ Required evidence:
 - deliberate new/increased external `.conn.lock()` mutations make the
   connection ratchet fail;
 - Opus reviews both predicates and their positive controls.
+
+Execution record (2026-07-28):
+
+- RED 1: the first Rust guard failed because the old script ignored `--check`
+  and emitted no success receipt;
+- RED 2: the connection-ratchet positive control failed while its helper
+  returned an empty violation set;
+- RED 3: an LSP document-symbol comparison showed that the first exact reader
+  gate still let `run_migrations` swallow sibling methods; a synthetic
+  string/raw-string/comment fixture reproduced the truncation;
+- GREEN: the generated inventory now has `192` rows, partition
+  `55 / 50 / 87`, with `22` exposure paths, and is exact-compared through
+  `drift_guard`;
+- GREEN: direct `.conn.lock().await` access outside `db.rs`/`db/**` is frozen
+  at `333` occurrences across `56` tracked files, including explicit test
+  support per D4, with new files and per-file increases rejected;
+- Opus re-reviewed the structural lexer and both ratchets and found the design
+  sound. Its Windows `python3` concern does not apply to the current CI
+  contract because workspace lib tests run on Linux/macOS and are explicitly
+  skipped on Windows; its proposed broad test exclusion contradicts D4's
+  locked explicit-test-support rule.
 
 ### R1 — externalize the main `db.rs` test module
 
