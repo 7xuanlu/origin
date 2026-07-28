@@ -11777,8 +11777,17 @@ impl MemoryDB {
             Self::ensure_claim_identity_tables(&tx).await?;
             Self::rebuild_edges_widened(&tx).await?;
 
+            // Scoped to `edges` on purpose. The bare pragma walks every foreign
+            // key in the database, so a pre-existing orphan in an unrelated
+            // table -- and migrations have suspended FK enforcement before, so
+            // that window is historical fact, not theory -- would abort 97,
+            // roll back, and leave `user_version` at 96. The daemon would then
+            // fail identically on every subsequent boot, blaming the rebuild
+            // for damage it did not cause and with no way forward. The guard is
+            // here to catch a reference THE REBUILD broke; scoping it to the
+            // rebuilt table is what makes it answer that question and no other.
             let mut violations = tx
-                .query("PRAGMA foreign_key_check", ())
+                .query("PRAGMA foreign_key_check(edges)", ())
                 .await
                 .map_err(|error| WenlanError::VectorDb(format!("m97 fk check: {error}")))?;
             let violation = violations

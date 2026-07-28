@@ -31,11 +31,20 @@ pub(super) const EDGE_COLUMNS: &str =
 /// The widened table. Three CHECKs are new, and each one is a storage-layer
 /// tooth the artifacts asked for by name.
 ///
-/// The **lineage tooth** (artifact 3 §4) exists because the space fence skips
-/// its whole body on `lineage='legacy'`. A `claim_revision → memory` row
-/// written as legacy would bypass the fence entirely and land straight in the
-/// trusted support set, with nothing but writer discipline in the way. A CHECK
-/// has no such exemption, so the storage layer refuses the row.
+/// The **lineage tooth** (artifact 3 §4) addresses a real lane: the space fence
+/// skips its whole body on `lineage='legacy'`, so a `claim_revision → memory`
+/// row written as legacy would bypass the fence entirely and land straight in
+/// the trusted support set, with nothing but writer discipline in the way.
+///
+/// It is belt-and-braces rather than the thing that closes that lane, and the
+/// distinction is recorded here because the first version of this comment
+/// claimed otherwise. Review brute-forced the tooth's entire domain — every
+/// `src_kind` × `dst_kind` × `edge_type` × `grounded` × `root_id` nullity with
+/// `lineage='legacy'` and a `claim_revision` or `root` endpoint — against this
+/// table with the tooth REMOVED, and 0 of 480 rows were accepted. CHECK #4
+/// below, plus the `attests`/`supports` shape CHECKs pinning `lineage` to
+/// `assertion`/`evidence`, already reject all of them. The tooth can never be
+/// the sole refuser. Keep it as depth; do not cite it as the guarantee.
 ///
 /// The **attests** and **supports** shape CHECKs encode §3 (attestation is
 /// never grounded — human presence is provenance, not grounding) and §5
@@ -327,7 +336,48 @@ impl MemoryDB {
     /// which is the fail-closed halt artifact 3 §2 asks for — a `supports` edge
     /// of unknown provenance is exactly the shape M5 reads as truth, so it is
     /// never waved through.
+    /// `EDGE_COLUMNS` describes the live `edges`, checked rather than trusted.
+    ///
+    /// Naming the columns explicitly catches one direction only: a column in
+    /// the list that the table lacks is a SQL error. The reverse is silent. A
+    /// column the TABLE has and the list omits is never selected, never created
+    /// on `edges_new`, and then compared away by a verifier built from that
+    /// same list — the oracle reading its own input, agreeing with itself while
+    /// the data is gone. So the list is reconciled against the live table
+    /// before a single row is copied.
+    async fn assert_column_list_matches_table(tx: &libsql::Transaction) -> Result<(), WenlanError> {
+        let mut rows = tx
+            .query("PRAGMA table_info(edges)", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m97 column census: {error}")))?;
+        let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m97 column census read: {error}")))?
+        {
+            live.insert(row.get(1).map_err(|error| {
+                WenlanError::VectorDb(format!("m97 column census decode: {error}"))
+            })?);
+        }
+        let declared: std::collections::BTreeSet<String> = EDGE_COLUMNS
+            .split(',')
+            .map(|column| column.trim().to_string())
+            .collect();
+        if live != declared {
+            let unlisted: Vec<&str> = live.difference(&declared).map(String::as_str).collect();
+            let phantom: Vec<&str> = declared.difference(&live).map(String::as_str).collect();
+            return Err(WenlanError::VectorDb(format!(
+                "m97 EDGE_COLUMNS is stale: columns on the table but not in the list \
+                 (these would be SILENTLY DROPPED by the rebuild): {unlisted:?}; columns in \
+                 the list but not on the table: {phantom:?}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) async fn rebuild_edges_widened(tx: &libsql::Transaction) -> Result<(), WenlanError> {
+        Self::assert_column_list_matches_table(tx).await?;
         let captured = Self::capture_attached_objects(tx, "edges").await?;
         // A set, not a list: on a re-run the four M5 indexes are already
         // attached, so they arrive through the census as well as through the

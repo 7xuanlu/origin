@@ -440,7 +440,7 @@ impl MemoryDB {
     ) -> Result<Option<HumanEditDelta>, WenlanError> {
         // Scoped so the connection guard is dropped before
         // `acquire_provenance_root`, which locks the same mutex itself.
-        let (base_content, space) = {
+        let (base_content, space, live_version) = {
             let conn = self.conn.lock().await;
             let mut rows = conn
                 .query(
@@ -468,26 +468,49 @@ impl MemoryDB {
 
             let mut rows = conn
                 .query(
-                    "SELECT space FROM pages WHERE id = ?1",
+                    "SELECT space, version FROM pages WHERE id = ?1",
                     libsql::params![page_id],
                 )
                 .await
                 .map_err(|error| {
                     WenlanError::VectorDb(format!("human delta page space: {error}"))
                 })?;
-            let space: Option<String> = rows
+            let row = rows
                 .next()
                 .await
                 .map_err(|error| WenlanError::VectorDb(format!("human delta space row: {error}")))?
                 .ok_or_else(|| {
                     WenlanError::Conflict(format!("human_delta_base_unknown: no page {page_id}"))
-                })?
-                .get(0)
-                .map_err(|error| {
-                    WenlanError::VectorDb(format!("human delta space decode: {error}"))
                 })?;
-            (base_content, space)
+            let space: Option<String> = row.get(0).map_err(|error| {
+                WenlanError::VectorDb(format!("human delta space decode: {error}"))
+            })?;
+            let live_version: i64 = row.get(1).map_err(|error| {
+                WenlanError::VectorDb(format!("human delta version decode: {error}"))
+            })?;
+            (base_content, space, live_version)
         };
+
+        // The base has to be the CURRENT text, not merely a real one. The digest
+        // check below asks "did version N say what you think it said" and every
+        // superseded version answers yes forever, because `page_history` is
+        // immutable -- so on its own it accepts a save written against version 3
+        // of a page that is now at version 9, mints the delta, and loses the
+        // intervening edits with no conflict reported. That is the "stale base"
+        // row of D4's table, and until this check it was the one row the code did
+        // not implement.
+        //
+        // `append_page_history` writes the history row for the version a write
+        // just produced, inside that write's own transaction, so the current
+        // version is always present in `page_history` -- an equal `base_version`
+        // can always be read back above, and this guard rejects only genuinely
+        // superseded saves.
+        if live_version != base_version {
+            return Err(WenlanError::Conflict(format!(
+                "human_delta_base_stale: {page_id} has moved to version {live_version} since this \
+                 save was written against version {base_version}"
+            )));
+        }
 
         // T6: the human must have been looking at exactly this text. Compared
         // byte-exactly, never canonically -- see `revision_content_digest`.
@@ -537,11 +560,57 @@ impl MemoryDB {
                     format!("Edit to {page_id}"),
                     now_ts,
                     word_count,
-                    space,
+                    space.clone(),
                 ],
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("human delta memory store: {error}")))?;
+
+            // `INSERT OR IGNORE` converges a retry onto the same row, which is
+            // the point -- but the row it converges onto carries whichever SPACE
+            // won the race, and roots are content-addressed over the prose
+            // ALONE. Two pages in different spaces gaining the identical line
+            // therefore resolve to one memory filed in the first page's space.
+            //
+            // Left unchecked, this call returns Ok with evidence the space fence
+            // will refuse to cite, and the refusal surfaces later at an unrelated
+            // support write that has no way to explain itself. Read the stored
+            // space back and refuse HERE, where the cause is.
+            //
+            // The identity question underneath -- whether one sentence written
+            // twice in two spaces is one piece of evidence or two -- is deferred
+            // to M5's identity axis (docs/plans/2026-07-28-m5-pr-a-review-followups.md).
+            // This closes the silent half only.
+            let mut rows = conn
+                .query(
+                    "SELECT space FROM memories WHERE source_id = ?1",
+                    libsql::params![memory_source_id.clone()],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("human delta space readback: {error}"))
+                })?;
+            let stored_space: Option<String> = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("human delta space readback row: {error}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb(
+                        "human delta space readback: the row just written is missing".to_string(),
+                    )
+                })?
+                .get(0)
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("human delta space readback decode: {error}"))
+                })?;
+            if stored_space != space {
+                return Err(WenlanError::Conflict(format!(
+                    "human_delta_space_conflict: this prose already exists as evidence in another \
+                     space, so the delta minted for {page_id} would be uncitable there"
+                )));
+            }
         }
 
         Ok(Some(HumanEditDelta {
@@ -596,6 +665,27 @@ impl MemoryDB {
         memory_source_id: &str,
         verdict: &SupportVerdict,
     ) -> Result<String, WenlanError> {
+        // A `supports` edge is what M5 reads as truth, so the verdict must
+        // actually clear the bar it recorded. Everything below this line checks
+        // that the three records AGREE; none of it checks that what they agree
+        // on means "supported". Without this, an honestly-cached failure --
+        // score 0.55 against a threshold of 0.7, all three records in perfect
+        // agreement that the claim was NOT entailed -- writes an edge that
+        // reads as support. Comparing against the cache cannot catch that,
+        // because the cache faithfully recorded the failure.
+        //
+        // Written `!(score >= bar)` rather than `score < bar` so a NaN score is
+        // a refusal too: every float comparison against NaN is false, so the
+        // `<` form would wave it through.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        if !(verdict.score >= verdict.threshold_at_write) {
+            return Err(WenlanError::Conflict(format!(
+                "support_verdict_below_threshold: {claim_revision_id} scored {} against a bar of \
+                 {}; a verdict that failed its own threshold is not support",
+                verdict.score, verdict.threshold_at_write
+            )));
+        }
+
         // §5: the evidence's provenance root. Derived from the delta memory's
         // own id rather than looked up, because that convention IS the link.
         let root_id = memory_source_id.strip_prefix("hed_").ok_or_else(|| {
@@ -627,11 +717,19 @@ impl MemoryDB {
                 .map_err(|error| WenlanError::VectorDb(format!("support claim decode: {error}")))?
         };
 
-        let (content, space): (String, String) = {
+        let (content, space, live_version): (String, String, i64) = {
             let mut rows = conn
                 .query(
-                    "SELECT content, COALESCE(space, 'unfiled') FROM memories WHERE source_id = ?1",
-                    libsql::params![memory_source_id],
+                    // The fallback is the reserved UUID sentinel, never the word
+                    // "unfiled" -- that word is a legal user space name, and the
+                    // sentinel is a UUID precisely so the two cannot collide. A
+                    // literal here would produce a space the fence then rejects
+                    // with a misleading cross-space error. Unreachable while
+                    // `memories.space` stays NOT NULL (migration 91), which is
+                    // exactly why it has to be right rather than merely untested.
+                    "SELECT content, COALESCE(space, ?2), COALESCE(version, 1)
+                     FROM memories WHERE source_id = ?1",
+                    libsql::params![memory_source_id, super::UNFILED_SPACE_ID],
                 )
                 .await
                 .map_err(|error| {
@@ -653,8 +751,33 @@ impl MemoryDB {
                 row.get(1).map_err(|error| {
                     WenlanError::VectorDb(format!("support memory decode: {error}"))
                 })?,
+                row.get(2).map_err(|error| {
+                    WenlanError::VectorDb(format!("support memory decode: {error}"))
+                })?,
             )
         };
+
+        // The payload records which VERSION the span was read from, and until
+        // this check nothing made that number true -- the caller supplied it and
+        // it was copied into the edge verbatim. The digest check below proves the
+        // BYTES are right; it says nothing about the version they are labelled
+        // with. A verdict claiming version 1 of a memory now at version 7 stores
+        // a provenance record that is false in the one field a reader would use
+        // to fetch the text back, and false in a way no later reader can detect,
+        // because the digest agrees.
+        //
+        // Fail-closed on disagreement rather than overwriting with the live
+        // number: a caller that judged an older version and mislabelled it, and a
+        // caller that judged the live version and mistyped the label, are
+        // indistinguishable here, and silently rewriting the field would launder
+        // the first case into a record that looks correct.
+        if live_version != verdict.source_version {
+            return Err(WenlanError::Conflict(format!(
+                "support_source_version_stale: verdict names version {} of {memory_source_id}, \
+                 which is at version {live_version}",
+                verdict.source_version
+            )));
+        }
 
         // Invariant 1, live-bytes half. `get` rather than `[..]`: these are byte
         // offsets into a version that may have changed under us, so a boundary
@@ -719,15 +842,29 @@ impl MemoryDB {
             )));
         }
 
-        // The span digest discriminates, so two spans of one memory are two
-        // edges rather than one that silently overwrites the other.
+        // The LOCATION discriminates -- offsets and digest, not the digest
+        // alone. Cross-model review caught the difference: a memory may contain
+        // the same sentence twice, and two occurrences share a digest. Under a
+        // digest-only discriminator those two genuinely distinct citations
+        // collide on one edge id, and the second is either silently dropped or
+        // (once the conflict below started refusing) rejected with a
+        // "supersedes" error that misdescribes what happened -- nothing is
+        // superseding anything, they are two different places in the text.
+        //
+        // Offsets in, and the two axes separate cleanly: a different PLACE is a
+        // different edge, while a re-judgment of the SAME place keeps the same
+        // id and is caught by the conflict check as the verdict change it is.
+        let span_locator = format!(
+            "{}:{}:{}",
+            verdict.span_start, verdict.span_end, verdict.span_digest
+        );
         let edge_id = crate::provenance::compute_edge_id(
             "supports",
             "claim_revision",
             claim_revision_id,
             "memory",
             memory_source_id,
-            &verdict.span_digest,
+            &span_locator,
         );
         let payload = serde_json::json!({
             "source_version": verdict.source_version,
@@ -741,6 +878,49 @@ impl MemoryDB {
             "threshold_at_write": verdict.threshold_at_write,
         })
         .to_string();
+
+        // The judge is deliberately NOT part of `edge_id` -- one span of one
+        // memory is one support edge, not one per model that ever looked at it.
+        // But that makes `ON CONFLICT DO NOTHING` alone a silent discard:
+        // re-judge the same span with a new model or a new score, and the write
+        // would return Ok while the stored edge still names the OLD verdict.
+        // Three records disagreeing with nothing forcing them to agree is the
+        // exact drift §4a exists to close, so the conflict is read rather than
+        // swallowed. Same-verdict rewrites stay idempotent; a CHANGED verdict
+        // refuses, because this function refuses rather than repairs.
+        //
+        // No TOCTOU: `conn` is the single writer's one connection and this
+        // guard has been held unbroken since the top of the function.
+        let existing: Option<String> = {
+            let mut rows = conn
+                .query(
+                    "SELECT payload FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.clone()],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("support edge conflict read: {error}"))
+                })?;
+            match rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("support edge conflict decode: {error}"))
+            })? {
+                Some(row) => Some(row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("support edge conflict decode: {error}"))
+                })?),
+                None => None,
+            }
+        };
+        if let Some(stored) = existing {
+            if stored == payload {
+                return Ok(edge_id);
+            }
+            return Err(WenlanError::Conflict(format!(
+                "support_verdict_supersedes_existing: {claim_revision_id} already has a support \
+                 edge for this span naming a different verdict; supersede it explicitly rather \
+                 than overwriting it"
+            )));
+        }
+
         conn.execute(
             "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
                                 grounded, root_id, space, weight, payload, provenance,

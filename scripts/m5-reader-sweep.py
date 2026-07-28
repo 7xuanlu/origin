@@ -64,6 +64,13 @@ def strip_test(lines):
         if not skip and re.match(r'\s*#\[cfg\(test\)\]', l):
             armed = True; out.append(''); continue
         if armed and not skip:
+            if '{' not in l and l.strip().endswith(';'):
+                # `#[cfg(test)] mod foo;` / `use ...;` / a test-only const.
+                # The attribute governs an item that never opens a brace, so
+                # arming the brace scan here would blank forward until the NEXT
+                # unrelated `{` and swallow real code -- 45% of db.rs, in the
+                # version that shipped. Blank the item, disarm, move on.
+                out.append(''); armed = False; continue
             if '{' in l:
                 skip, depth, armed = 1, l.count('{') - l.count('}'), False
                 out.append('')
@@ -140,7 +147,9 @@ def sweep():
             for p, t in texts.items():
                 if p.startswith(CORE): continue
                 for m in pat.finditer(t):
-                    ext.append('%s:%d' % (p, t[:m.start()].count('\n') + 1))
+                    ln = t[:m.start()].count('\n') + 1
+                    if p == r['file'] and ln == r['line']: continue
+                    ext.append('%s:%d' % (p, ln))
         r['ext'] = sorted(set(ext))
         r['exposure'] = (r['vis'] == 'pub') and bool(r['ext'])
     readers.sort(key=lambda r: (r['file'], r['line']))
@@ -180,14 +189,63 @@ def sweep():
             for p, t in texts.items():
                 if p.startswith(CORE): continue
                 for m in pat.finditer(t):
-                    ext.append('%s:%d' % (p, t[:m.start()].count('\n') + 1))
+                    ln = t[:m.start()].count('\n') + 1
+                    if p == r['file'] and ln == r['line']: continue
+                    ext.append('%s:%d' % (p, ln))
             r['ext'] = sorted(set(ext))
             r['exposure'] = (r['vis'] == 'pub') and bool(r['ext'])
     out.sort(key=lambda r: (r['depth'], r['file'], r['line']))
     return out
 
 
+def selftest():
+    """Assert the two predicates that decide what this script can even see.
+
+    Both bugs these cover shipped once. `strip_test` armed the brace scan on
+    `#[cfg(test)] mod foo;` -- an attribute over an item with no brace -- and
+    then blanked forward to the next unrelated `{`, hiding real code from the
+    whole sweep; five HTTP route handlers went uncounted. The `ext` scan
+    reported a function's own definition line as an external caller of itself,
+    which reads as an exposure path in the output table.
+    """
+    src = """#[cfg(test)]
+mod claim_identity_test;
+
+#[cfg(test)]
+#[path = "other_test.rs"]
+mod other_test;
+
+pub async fn real_reader(&self) {
+    let q = "SELECT content FROM pages WHERE id = ?1";
+}
+
+#[cfg(test)]
+mod tests {
+    fn hidden_by_design() {
+        let q = "SELECT content FROM pages";
+    }
+}
+
+pub async fn also_real(&self) {
+    let q = "SELECT title FROM pages";
+}"""
+    kept = '\n'.join(strip_test(src.split('\n')))
+    assert 'real_reader' in kept, 'a `#[cfg(test)] mod foo;` swallowed the code after it'
+    assert 'also_real' in kept, 'a #[cfg(test)] block swallowed the code after it'
+    assert 'hidden_by_design' not in kept, 'a real #[cfg(test)] block was not stripped'
+    assert len(kept.split('\n')) == len(src.split('\n')), 'line numbers must survive stripping'
+
+    # A definition is not a call site of itself.
+    for r in sweep():
+        assert '%s:%d' % (r['file'], r['line']) not in r['ext'], \
+            '%s counts its own definition as an external caller' % r['fn']
+    print('selftest: ok')
+
+
 if __name__ == '__main__':
+    if '--selftest' in sys.argv:
+        selftest()
+        sys.exit(0)
     rows = sweep()
     if '--json' in sys.argv:
         json.dump(rows, sys.stdout, indent=1)

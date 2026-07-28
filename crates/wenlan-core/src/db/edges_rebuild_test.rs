@@ -295,13 +295,24 @@ async fn the_rebuild_preserves_every_row_unchanged() {
 
 /// Weakening: widen the CHECK enumerations and call the fail-open lane closed.
 ///
-/// Artifact 3 §4 is explicit that it is not: both fence triggers carry
+/// Artifact 3 §4 is explicit that the lane is real: both fence triggers carry
 /// `WHEN NEW.lineage != 'legacy'`, so a `claim_revision → memory` row written
-/// as legacy skips the fence body entirely and lands in the trusted support set
-/// with only writer discipline in the way. A CHECK has no lineage exemption,
-/// which is why the rebuild is the one chance to add one.
+/// as legacy skips the fence body entirely and would land in the trusted
+/// support set with only writer discipline in the way. The rebuild is the one
+/// chance to close it in storage.
+///
+/// This asserts the PROPERTY — storage refuses the row — and deliberately not
+/// the mechanism. Review found that the lineage tooth is never the sole
+/// refuser: brute-forcing its whole domain (every `src_kind` × `dst_kind` ×
+/// `edge_type` × `grounded` × `root_id` nullity with `lineage='legacy'` and a
+/// `claim_revision`/`root` endpoint) against the widened table with the tooth
+/// REMOVED accepted 0 of 480, because CHECK #4 and the `supports`/`attests`
+/// shape CHECKs already pin `lineage`. The tooth is defense-in-depth, and a
+/// test that named it as the refuser would be claiming a protection it is not
+/// the one providing. The lane staying shut is what matters and is what this
+/// locks; which constraint shuts it is free to change.
 #[tokio::test]
-async fn a_legacy_lineage_claim_revision_edge_is_refused_by_the_check() {
+async fn a_legacy_lineage_claim_revision_edge_is_refused_by_storage() {
     let (db, _temp) = test_db().await;
     let conn = db.conn.lock().await;
 
@@ -329,6 +340,10 @@ async fn a_legacy_lineage_claim_revision_edge_is_refused_by_the_check() {
 #[tokio::test]
 async fn an_attestation_may_not_name_a_root_other_than_its_source() {
     let (db, _temp) = test_db().await;
+    // Without a real `cr1`, the space fence resolves the destination space to
+    // NULL and aborts the row on its own — the test would pass with the §5 rule
+    // deleted, proving the fence instead of the rule it names.
+    seed_attestable_revision(&db).await;
     let conn = db.conn.lock().await;
     for root in ["r-src", "r-other"] {
         conn.execute(
@@ -366,6 +381,9 @@ async fn an_attestation_may_not_name_a_root_other_than_its_source() {
 #[tokio::test]
 async fn an_attestation_may_not_assert_grounding() {
     let (db, _temp) = test_db().await;
+    // Same reason as the §5 test above: an unseeded `cr1` lets the space fence
+    // do the refusing, and the §3 rule under test never fires.
+    seed_attestable_revision(&db).await;
     let conn = db.conn.lock().await;
     conn.execute(
         "INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
@@ -515,11 +533,19 @@ async fn a_generated_root_may_not_attest() {
     );
 }
 
-/// Same rule, the arm that is easy to forget: an attestation naming a root that
-/// does not exist at all. "No such root" must not read as "nothing to object
-/// to" — the trigger has to be fail-closed on both arms of its `NOT EXISTS`.
+/// An attestation naming a root that does not exist at all is refused — and
+/// review established that the refuser here is the `root_id REFERENCES
+/// provenance_roots(root_id)` foreign key, not the human-root trigger.
+///
+/// Kept, and renamed to say so. The property is real and worth locking: drop
+/// that FK and "no such root" starts reading as "nothing to object to". But
+/// the trigger's fail-closed `NOT EXISTS` arm is NOT what this exercises, and
+/// it cannot be — isolating that arm needs a root the FK accepts and the
+/// trigger rejects, which is exactly what `a_generated_root_may_not_attest`
+/// above already does with a real-but-machine-generated root. Naming the
+/// trigger here would have this test claim a protection its sibling provides.
 #[tokio::test]
-async fn an_attestation_naming_no_root_at_all_is_refused() {
+async fn an_attestation_naming_an_unknown_root_is_refused_by_the_foreign_key() {
     let (db, _temp) = test_db().await;
     seed_attestable_revision(&db).await;
     let conn = db.conn.lock().await;
@@ -778,4 +804,81 @@ async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
     // database rather than a valid-but-empty shell.
     let mut rows = conn.query("SELECT count(*) FROM edges", ()).await.unwrap();
     let _: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+}
+
+/// Weakening: guard the rebuild with a bare `PRAGMA foreign_key_check`.
+///
+/// Review found this one, and it was the ship blocker. The bare pragma walks
+/// EVERY foreign key in the database, not just the rebuilt table. Migrations
+/// have suspended FK enforcement before (`db.rs:4657`, `6584`, `6929`), so a
+/// pre-existing orphan in some unrelated table is a real historical
+/// possibility — and it would abort 97, roll back, and leave `user_version` at
+/// 96. The daemon would then fail on every subsequent boot with
+/// "m97 rebuild left a dangling foreign-key reference", blaming the rebuild for
+/// damage it did not cause, with no way forward short of hand-surgery on the
+/// user's database.
+///
+/// The guard exists to catch a reference THE REBUILD broke. Scoping it to
+/// `edges` is what makes it answer that question and no other.
+#[tokio::test]
+async fn a_pre_existing_orphan_elsewhere_does_not_block_the_rebuild() {
+    let (db, _temp) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        // An orphan in a table the rebuild never touches, planted the way a
+        // historical migration could have: enforcement off, row in, back on.
+        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
+        conn.execute(
+            // `page_id REFERENCES pages(id)` is the FK that goes dangling.
+            "INSERT INTO page_sources (page_id, memory_source_id, linked_at)
+             VALUES ('no_such_page', 'no_such_memory', 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+
+        // Precondition: the bare pragma really does see it. Without this the
+        // test would pass on a database where nothing was ever wrong.
+        let mut rows = conn.query("PRAGMA foreign_key_check", ()).await.unwrap();
+        assert!(
+            rows.next().await.unwrap().is_some(),
+            "the orphan must be visible to the unscoped pragma, or this proves nothing"
+        );
+    }
+
+    // The whole chain still runs to completion.
+    rerun_migrations_from_96(&db).await;
+}
+
+/// Weakening: let `EDGE_COLUMNS` and the live `edges` drift apart.
+///
+/// Review found this one. Naming the columns explicitly catches a column in the
+/// LIST that the table lacks — that is a SQL error. The reverse is silent: a
+/// column the TABLE has and the list omits is never selected, never created on
+/// `edges_new`, and then compared away by `assert_copy_is_faithful`, which is
+/// built from the same list. The verifier reads its own input and agrees with
+/// itself while the data is gone.
+///
+/// Not reachable today — the shipped DDL and the list match column for column.
+/// It becomes reachable the moment a later migration adds an `edges` column,
+/// which is exactly when nobody will be looking at this file.
+#[tokio::test]
+async fn a_column_missing_from_the_list_fails_loudly_instead_of_vanishing() {
+    let (db, _temp) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("ALTER TABLE edges ADD COLUMN future_column TEXT", ())
+            .await
+            .unwrap();
+        conn.execute("PRAGMA user_version = 96", ()).await.unwrap();
+    }
+
+    let refused = db.run_migrations(&crate::events::NoopEmitter).await;
+    let error = refused.expect_err("a column the rebuild would silently drop must abort it");
+    assert!(
+        format!("{error}").contains("EDGE_COLUMNS is stale")
+            && format!("{error}").contains("future_column"),
+        "the failure must name the column that would have been dropped: {error}"
+    );
 }

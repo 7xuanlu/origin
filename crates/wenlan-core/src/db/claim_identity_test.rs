@@ -699,9 +699,16 @@ struct SupportScenario {
 }
 
 async fn support_scenario(db: &MemoryDB, page_id: &str) -> SupportScenario {
+    support_scenario_saving(db, page_id, &format!("{BASE_PROSE}\n{ADDED_PROSE}")).await
+}
+
+/// The same scenario, over an arbitrary saved body — so a test can control what
+/// the delta memory actually contains (two copies of one sentence, say) rather
+/// than only ever seeing the single-occurrence shape.
+async fn support_scenario_saving(db: &MemoryDB, page_id: &str, saved: &str) -> SupportScenario {
     let base = page_with_prose(db, page_id).await;
     let minted = db
-        .mint_human_edit_delta(page_id, 1, &base, &format!("{BASE_PROSE}\n{ADDED_PROSE}"))
+        .mint_human_edit_delta(page_id, 1, &base, saved)
         .await
         .unwrap()
         .expect("the scenario needs a real delta to cite");
@@ -954,8 +961,10 @@ async fn two_spans_of_one_memory_are_two_distinct_edges() {
         .unwrap();
 
     // A second, shorter span of the same memory, with its own cache row.
-    let short = &ADDED_PROSE[..12];
-    let short_digest = crate::provenance::revision_content_digest(short);
+    // char-safe rather than `&ADDED_PROSE[..12]`: ASCII today, but the repo's
+    // UTF-8 rule is a rule about the habit, not about this literal.
+    let short: String = ADDED_PROSE.chars().take(12).collect();
+    let short_digest = crate::provenance::revision_content_digest(&short);
     {
         let conn = db.conn.lock().await;
         conn.execute(
@@ -988,4 +997,339 @@ async fn two_spans_of_one_memory_are_two_distinct_edges() {
         first, second,
         "the span digest must discriminate, or one verdict silently replaces the other"
     );
+}
+
+/// Weakening: keep `ON CONFLICT(edge_id) DO NOTHING` as the whole conflict
+/// story, and let a re-judged span return `Ok` while the stored edge still
+/// names the verdict it replaced.
+///
+/// Review found this one. `compute_edge_id` deliberately does NOT hash the
+/// judge — one span of one memory is one support edge, not one per model that
+/// ever looked at it — which is right, and which is exactly what makes a bare
+/// `DO NOTHING` a silent discard. `entailment_cache`'s five-part key admits a
+/// second row for the same span under a new `model_version`, so both §4a
+/// invariants pass on the second write: the live bytes still match the span
+/// digest, and the cache genuinely records that verdict. The edge id is
+/// byte-identical, the insert does nothing, and the caller is told it
+/// succeeded. Three records disagreeing with nothing forcing them to agree is
+/// the drift §4a exists to close, so the conflict is read and refused.
+#[tokio::test]
+async fn a_second_verdict_for_one_span_is_refused_rather_than_silently_dropped() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp7").await;
+    let first = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await
+        .unwrap();
+
+    // Re-judged: same claim, same span, a newer model and a lower score. The
+    // cache records it honestly, so nothing upstream objects.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entailment_cache (claim_text_digest, source_span_digest, model_id,
+                                           model_version, prompt_version, score,
+                                           threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, 'qwen3-4b', 'v2', 'p1', 0.83, 0.7, 'on_device', 0)",
+            libsql::params![
+                crate::provenance::revision_content_digest(CLAIM_TEXT),
+                scenario.verdict.span_digest.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &super::claim_identity::SupportVerdict {
+                model_version: "v2".to_string(),
+                score: 0.83,
+                ..scenario.verdict.clone()
+            },
+        )
+        .await
+        .expect_err("a changed verdict must refuse rather than return Ok");
+    assert!(
+        format!("{error}").contains("support_verdict_supersedes_existing"),
+        "the refusal must name the superseding verdict: {error}"
+    );
+
+    // And the stored edge is untouched -- still the verdict that was actually
+    // written, not a half-applied blend of the two.
+    let payload = edge_row(&db, &first).await.3;
+    assert!(
+        payload.contains("\"model_version\":\"v1\"") && payload.contains("0.91"),
+        "the original verdict must survive the refused write: {payload}"
+    );
+}
+
+/// Weakening: check only that the three records AGREE, never that what they
+/// agree on means "supported".
+///
+/// Review found this one too, and it is the sharpest of them: every check in
+/// `write_support_edge` is an equality against the cache, and an honestly
+/// recorded FAILURE satisfies all of them. A verdict that scored 0.55 against
+/// its own 0.7 bar is the entailment judge saying no — and it would have
+/// written a `supports` edge, which is the shape M5 reads as truth. Comparing
+/// against the cache cannot catch it, because the cache faithfully recorded
+/// the failure.
+#[tokio::test]
+async fn a_verdict_that_failed_its_own_threshold_is_not_support() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp8").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entailment_cache (claim_text_digest, source_span_digest, model_id,
+                                           model_version, prompt_version, score,
+                                           threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, 'qwen3-4b', 'v3', 'p1', 0.55, 0.7, 'on_device', 0)",
+            libsql::params![
+                crate::provenance::revision_content_digest(CLAIM_TEXT),
+                scenario.verdict.span_digest.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &super::claim_identity::SupportVerdict {
+                model_version: "v3".to_string(),
+                score: 0.55,
+                threshold_at_write: 0.7,
+                ..scenario.verdict.clone()
+            },
+        )
+        .await
+        .expect_err("a verdict below its own bar is not support");
+    assert!(
+        format!("{error}").contains("support_verdict_below_threshold"),
+        "the refusal must name the threshold: {error}"
+    );
+}
+
+/// Weakening: verify the base against `page_history` alone, and let a save
+/// written against a superseded version mint as if it were current.
+///
+/// Cross-model review found this one. `page_history` is immutable, so every
+/// version that ever existed answers the digest question correctly forever —
+/// which means the digest check proves only "version N really said this", never
+/// "N is the version you were editing". A human who opened the page at version
+/// 1, went to lunch while a distill cycle rewrote it to version 2, and then
+/// saved would mint a delta whose prose was computed against text no longer on
+/// the page, silently discarding the intervening edit. D4's table calls that
+/// row "stale base -> Err(Conflict), nothing written"; it was the one row the
+/// code did not implement.
+#[tokio::test]
+async fn a_save_against_a_superseded_version_is_refused() {
+    let (db, _temp) = db_with_substrate().await;
+    let base = page_with_prose(&db, "hp11").await;
+
+    // Someone else edits the page through the ordinary path, which bumps
+    // `pages.version` and appends the matching history row.
+    db.update_page_content(
+        "hp11",
+        &format!("{BASE_PROSE}\nThey also take beetles."),
+        &[],
+        "test",
+    )
+    .await
+    .unwrap();
+
+    let error = db
+        .mint_human_edit_delta(
+            "hp11",
+            1,
+            &base,
+            &format!("{BASE_PROSE}\nThey nest in old crow nests."),
+        )
+        .await
+        .expect_err("version 1 is no longer the text this page carries");
+    assert!(
+        format!("{error}").contains("human_delta_base_stale"),
+        "the refusal must name the stale base: {error}"
+    );
+    assert_eq!(
+        human_delta_root_count(&db).await,
+        0,
+        "a refused save mints nothing"
+    );
+}
+
+/// Weakening: copy the caller's `source_version` into the payload without ever
+/// checking it against the memory.
+///
+/// Cross-model review found this one. The digest check proves the BYTES are the
+/// judged ones; it says nothing about the version number they are filed under,
+/// because a span can survive an edit elsewhere in the memory unchanged. The
+/// edge then carries a provenance record that is false in the single field a
+/// later reader would use to fetch the source text back — and false
+/// undetectably, since the digest agrees.
+#[tokio::test]
+async fn a_verdict_naming_a_version_the_memory_has_moved_past_is_refused() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp9").await;
+
+    // The memory moves to version 2 with its judged span byte-identical: an
+    // edit elsewhere in the same row. Every other check still passes.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET version = 2 WHERE source_id = ?1",
+            libsql::params![scenario.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await
+        .expect_err("a verdict may not name a version the memory has moved past");
+    assert!(
+        format!("{error}").contains("support_source_version_stale"),
+        "the refusal must name the version disagreement: {error}"
+    );
+}
+
+/// Weakening: discriminate the edge id by span DIGEST alone, dropping the
+/// offsets.
+///
+/// Cross-model review found this one in a fix rather than in the original
+/// code — the conflict refusal above turns a digest-only id from a silent drop
+/// into a LOUD WRONG ANSWER. A memory may say the same sentence twice, and the
+/// two occurrences share a digest; under a digest-only discriminator the second
+/// citation is rejected as "superseding" the first, which misdescribes it
+/// completely. Nothing is superseding anything: they are two different places
+/// in the text, judged identically, and both are true.
+#[tokio::test]
+async fn the_same_sentence_twice_is_two_citations_not_a_superseding_verdict() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario_saving(
+        &db,
+        "sp10",
+        &format!("{BASE_PROSE}\n{ADDED_PROSE}\n{ADDED_PROSE}"),
+    )
+    .await;
+
+    // Precondition: the delta really does carry the sentence twice, so the two
+    // spans below are genuinely distinct places with one shared digest.
+    let doubled = format!("{ADDED_PROSE}\n{ADDED_PROSE}");
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT content FROM memories WHERE source_id = ?1",
+                libsql::params![scenario.memory_source_id.clone()],
+            )
+            .await
+            .unwrap();
+        let content: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(content, doubled, "precondition: two identical occurrences");
+    }
+
+    let second_start = (ADDED_PROSE.len() + 1) as i64;
+    let first = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.verdict,
+        )
+        .await
+        .expect("the first occurrence is an ordinary citation");
+    let second = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &super::claim_identity::SupportVerdict {
+                span_start: second_start,
+                span_end: second_start + ADDED_PROSE.len() as i64,
+                ..scenario.verdict.clone()
+            },
+        )
+        .await
+        .expect("a second occurrence is a second citation, not a superseding verdict");
+
+    assert_ne!(
+        first, second,
+        "the LOCATION must discriminate, or one true citation is refused as the other's replacement"
+    );
+}
+
+/// Weakening: `INSERT OR IGNORE` the delta memory and report success without
+/// looking at the row that already occupies its id.
+///
+/// Cross-model review found this one. A provenance root is content-addressed
+/// over the prose ALONE, and the memory id derives from the root, so the same
+/// sentence added to a page in space A and a page in space B resolves to ONE
+/// memory — filed in whichever space got there first. The minter returns Ok
+/// either way, and the truth only emerges much later, when the space fence
+/// refuses a support edge nobody can trace back to this call.
+///
+/// The refusal moves the failure to where the cause is. Whether one sentence
+/// written twice in two spaces should be one piece of evidence or two is a
+/// separate, deferred question — see the follow-ups doc.
+#[tokio::test]
+async fn the_same_prose_in_a_second_space_is_refused_rather_than_aliased() {
+    let (db, _temp) = db_with_substrate().await;
+    for (id, space) in [("hp12", "birds"), ("hp13", "falconry")] {
+        db.insert_page(
+            id,
+            id,
+            None,
+            BASE_PROSE,
+            None,
+            Some(space),
+            &[],
+            "2026-07-27T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    }
+    let base = crate::provenance::revision_content_digest(BASE_PROSE);
+    let saved = format!("{BASE_PROSE}\n{ADDED_PROSE}");
+
+    let first = db
+        .mint_human_edit_delta("hp12", 1, &base, &saved)
+        .await
+        .unwrap()
+        .expect("the first space mints normally");
+
+    let error = db
+        .mint_human_edit_delta("hp13", 1, &base, &saved)
+        .await
+        .expect_err("the identical line in another space may not silently alias the first");
+    assert!(
+        format!("{error}").contains("human_delta_space_conflict"),
+        "the refusal must name the space conflict: {error}"
+    );
+
+    // And the first space's evidence is untouched -- the refusal does not
+    // retro-file the existing memory into the second space.
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT space FROM memories WHERE source_id = ?1",
+            libsql::params![first.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(space, "birds", "the refused save must change nothing");
 }

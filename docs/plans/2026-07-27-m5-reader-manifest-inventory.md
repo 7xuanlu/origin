@@ -450,14 +450,30 @@ categories.
 ## Internal readers — enumerated by a committed generator
 
 Four drafts of this section were wrong in four different ways, and the sequence
-is worth more than any of the numbers.
+is worth more than any of the numbers. The fourth is the one to read: it was
+produced by a committed generator, which is the fix for the first three, and it
+was still wrong — because nothing checked the generator.
 
 | Draft | Claim | Why it was wrong |
 |---|---|---|
 | 1 | four categories, enumeration deferred to PR-B | the categories named modules that hold no page reader at all |
 | 2 | 76 call sites | bodies delimited by the next `fn` match, so neighbours merged; `pages` and prose matched anywhere in the body, so `list_tags_scoped` and `tally` counted |
 | 3 | 54 SQL-bearing definitions | correct as far as it went, and **the wrong set** — see below |
-| 4 | this one, from `scripts/m5-reader-sweep.py` | the number is whatever the script prints |
+| 4 | 186 readers / 28 exposure, from `scripts/m5-reader-sweep.py` | the generator's `#[cfg(test)]` stripper armed its brace scan on `#[cfg(test)] mod foo;` — an attribute over an item that never opens a brace — and blanked forward to the next unrelated `{`, hiding real code from the sweep |
+| 5 | this one, 190 / 22, from the same script with a self-check | the number is whatever the script prints, and the script now proves it can see |
+
+**Draft 4's error is the one that matters most**, because it was invisible.
+Drafts 1-3 were wrong in ways a careful reader could argue with; draft 4 was
+wrong in a way no reader could see, because the generator silently deleted the
+code before counting it. What it hid was not incidental: five HTTP route
+handlers, `handle_update_page` and `handle_refresh_page` among them — the page
+prose write path, exactly what the manifest governs. A generator is only as
+trustworthy as its input filter, and that filter had no check. It has one now
+(`python3 scripts/m5-reader-sweep.py --selftest`), asserting both that a
+`#[cfg(test)] mod foo;` does not swallow the code after it and that a real
+`#[cfg(test)]` block still gets stripped. The exposure count also fell 28 → 22
+because a name-keyed caller scan was reporting each function's own definition
+line as an external caller of itself.
 
 **Draft 3's error is the instructive one.** SQL-bearing definitions are where
 page prose is *materialized*, not where it is *read*. `get_page_inner` is
@@ -474,11 +490,11 @@ being flattened into one number:
 | Depth | What it is | Count |
 |---|---|---|
 | 0 | SQL-bearing definitions — where prose is materialized | 54 |
-| 1 | wrapper layer — `get_page` over `get_page_inner` | 48 |
-| 2 | consumers — what the spec asks for | 84 |
-| | **total** | **186** |
+| 1 | wrapper layer — `get_page` over `get_page_inner` | 50 |
+| 2 | consumers — what the spec asks for | 86 |
+| | **total** | **190** |
 
-Of these, **28** are exposure paths (`pub` and called from outside
+Of these, **22** are exposure paths (`pub` and called from outside
 `wenlan-core`) and **9** are name-ambiguous, excluded from the exposure set
 rather than given caller edges a name scan cannot attribute.
 
@@ -610,7 +626,9 @@ carrying the authority of agreement.
 | `core/synthesis/wikilinks.rs:71` | `resolve_against_pages` | `pub` | `find_unique_active_page_id_by_title_scoped` |
 | `server/cmd_backfill.rs:19` | `run` | `pub` | `find_stale_archived_pages` |
 | `server/knowledge_routes.rs:54` | `handle_list_recent_relations` | `pub` | `list_recent_relations_scoped` |
-| `server/memory_routes.rs:277` | `handle_store_memory` | `pub` | `list_entities_scoped` |
+| `server/memory_routes.rs:1416` | `handle_list_entities` | `pub` | `list_entities_scoped` |
+| `server/memory_routes.rs:1435` | `handle_get_entity_detail` | `pub` | `get_entity_detail_scoped` |
+| `server/memory_routes.rs:1467` | `handle_search_entities` | `pub` | `search_entities_by_vector_scoped` |
 | `server/routes.rs:775` | `handle_distill` | `pub` | `load_page_source_index` |
 | `server/routes.rs:1108` | `handle_recent_retrievals` | `pub` | `list_recent_retrievals_scoped` |
 | `server/routes.rs:1128` | `handle_recent_page_changes` | `pub` | `list_recent_changes_scoped` |
@@ -697,6 +715,8 @@ carrying the authority of agreement.
 | `core/synthesis/overview.rs:104` | `refresh_overview_page` | `pub` | `ensure_overview_page` |
 | `core/synthesis/refinement_queue.rs:125` | `apply_refinement_with_decision` | `pub` | `accept_page_merge` |
 | `server/main.rs:1037` | `run_daemon` | `private` | `list_pages` |
+| `server/memory_routes.rs:3505` | `handle_update_page` | `pub` | `get_page` |
+| `server/memory_routes.rs:3580` | `handle_refresh_page` | `pub` | `get_page` |
 | `server/page_map_routes.rs:31` | `ensure_page_exists` | `private` | `get_page` |
 | `server/page_map_routes.rs:38` | `ensure_page_is_active` | `private` | `get_page` |
 | `server/page_map_routes.rs:64` | `compute_ref_state` | `private` | `get_page` |
