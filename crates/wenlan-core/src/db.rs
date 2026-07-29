@@ -23,6 +23,7 @@ mod brief;
 pub use brief::LegacyBriefItem;
 mod claim_identity;
 mod count;
+mod derived_artifact_sweep;
 mod edges_rebuild;
 mod entity_page_adapter;
 mod memory_point_reads;

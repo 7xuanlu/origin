@@ -111,7 +111,7 @@ to it. Only two of the spec's three consumers are daemon-side (below); the third
   `db.rs:19399-19416`; grouped into per-community buckets in a Rust `BTreeMap`, NOT SQL
   `GROUP BY`, `db.rs:19422-19423`) feeding `refinery/summary.rs` (`:214`, `:243`, `:258`
   — `sum_b_{community_id}` nodes); (2) **peer-entity community eligibility** for summary
-  refresh — `summary_eligible_predicate` (`derived_artifact_state.rs:7-32`, groups by
+  refresh — `summary_eligible_predicate` (`derived_artifact_state.rs:5-67`, groups by
   `peer_entity.community_id`, `community_id IS NOT NULL`, `HAVING COUNT(*) >= minimum`).
   These are the **two daemon-side** consumers M4's PR-2 cuts over. Map-region/overview
   rollups are the spec's third §3 consumer but are **client-side** today (the app's degree

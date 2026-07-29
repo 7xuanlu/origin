@@ -2,8 +2,6 @@ use crate::db::MemoryDB;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-mod sweep;
-
 pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     let minimum = crate::refinery::summary::min_bucket_members();
     let durable_gate = crate::db::community_reader_durable_gate_sql(

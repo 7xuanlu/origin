@@ -608,15 +608,23 @@ slices:
    in every build. A broad filename or `#[cfg(test)]` exemption is forbidden
    because production and test code coexist in several source files.
 
-The test-support choice is locked to the fourth approach above: `conn` remains
-private in every build, and the existing test-only callers move mechanically
-to the named helper. Conditional `pub(crate)` field visibility was rejected
-because `cargo test` would expose the raw field to every production module
-compiled in that build; the AST manifest would then be policy rather than a
-type-system boundary. Opus independently preferred the always-private field
-for the same reason. Its suggestion that the community cleanup could remain an
-audited exception is rejected: the zero-production-capability contract includes
-that retained handle.
+The test-support choice is locked to the fourth approach above: both `conn` and
+the alternate `_db.connect()` capability remain private in every build, and the
+existing test-only callers move mechanically to the named helper. Conditional
+`pub(crate)` field visibility was rejected because `cargo test` would expose
+the raw fields to every production module compiled in that build; the AST
+manifest would then be policy rather than a type-system boundary. Opus
+independently preferred the always-private field for the same reason. Its
+suggestion that the community cleanup could remain an audited exception is
+rejected: the zero-production-capability contract includes that retained
+`MemoryDB` handle.
+
+Here “raw capability” means a connection extracted from, cloned from, retained
+from, or generically yielded by `MemoryDB`, including its primary mutex and
+alternate database handle. A separately created private observer connection
+behind a narrow domain API, such as `LintFreshnessClock`, is not a `MemoryDB`
+capability escape and is outside R4; banning every internal use of
+`libsql::Connection` would conflate DB implementation with DB boundary.
 
 Every slice removes its old allowlist entries immediately, keeps the external
 set monotonically decreasing, runs the M5 inventories plus affected behavior
@@ -764,6 +772,42 @@ Execution evidence:
   positive-control nits: the ratchet heading now names exact matching, an
   equal-count fixture proves the accept branch, and the three bounded reads
   document physical-id, legacy precedence, and chunk-zero/`NULL` semantics.
+
+#### R4-3 — derived-artifact sweep DB ownership
+
+- Move the complete `MemoryDB` sweep implementation and its population helper
+  from `derived_artifact_state/sweep.rs` into
+  `db/derived_artifact_sweep.rs`. Keep only liveness/runtime state and the
+  shared summary-eligibility predicate in `derived_artifact_state`.
+- This is a genuine DB-owned transaction body, not orchestration moved to evade
+  the matcher. Preserve the public scheduler method, test-only timestamp
+  method, feature capture timing, exact eligibility SQL, 30-minute receipt
+  cadence, one held lock, `BEGIN`/`COMMIT`/`ROLLBACK`, and every error prefix.
+- The implementation bodies are byte-identical after the necessary import
+  lines. Git recognizes the main file as a `98%` rename and its population
+  child as `100%`.
+- The exact ratchet removes the old external path. External literals fall
+  `327 → 326`; production falls `38 → 37`; tests remain `289`. This is
+  ownership relocation into the sanctioned DB layer, not deletion of the
+  transaction's internal lock.
+- Existing behavior gates pass:
+  `durable_sweeps_drive_runner_readiness_and_active_backfill_suppresses_findings`
+  `1 / 1` and
+  `source_text_controls_episode_eligibility_in_sweep_and_runner` `1 / 1`.
+  The ratchet passes `3 / 3`; core lib Clippy with `-D warnings` and formatting
+  pass.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only the 65 generated `db.rs` addresses
+  shift by `+1` for the new module declaration. The sweep reads memory and
+  receipt tables, not Pages, and changes no truth adapter, manifest row,
+  permit, or cutover generation.
+- REVIEW 1, 2026-07-29: Opus/xhigh returned **sound, ship it** with no
+  correctness defects. It independently verified method resolution,
+  visibility, imports, the required ratchet-row removal, all 65 inventory
+  address shifts, and absence from the Page-reader set. Its useful
+  non-blocking note fixed the M4 plan pointer to
+  `summary_eligible_predicate`; the existing shared predicate dependency is
+  retained rather than widening this movement-only slice.
 
 ### R5 — server vertical slices
 
