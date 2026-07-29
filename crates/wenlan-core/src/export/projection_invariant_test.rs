@@ -18,9 +18,16 @@ use crate::export::knowledge::KnowledgeProjectionWrite;
 use crate::pages::Page;
 use std::path::Path;
 
-/// `p1` supported, `p2` provisional, `p3` with no truth row at all -- the same
-/// post-migration shape `db/truth_exposure_test.rs` seeds, where absence of a
-/// support record is the normal case and reads as unsupported.
+/// `p1` supported, `p2` and `p3` judged and found wanting -- the same shape
+/// `db/truth_exposure_test.rs` seeds. Two failing pages, not one, because the
+/// error path below has to prove the pass keeps going after a page it cannot
+/// move.
+///
+/// Every row here carries `evaluated_at`, because these tests are about what a
+/// *verdict* costs a page. A page nobody has judged keeps its file by design, so
+/// seeding one here would quietly turn every eviction assertion into a test of
+/// nothing; `an_unjudged_page_keeps_its_file_after_the_cutover` seeds that case
+/// on purpose and asserts the opposite.
 ///
 /// The cutover stays at 0 here; each test advances it itself, so the inert case
 /// and the live case are seeded identically and differ in one value.
@@ -35,6 +42,7 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
         let conn = db.conn.lock().await;
         set_truth(&conn, "p1", "supported").await;
         set_truth(&conn, "p2", "provisional").await;
+        set_truth(&conn, "p3", "provisional").await;
     }
     (db, temp)
 }
@@ -42,8 +50,9 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
 async fn set_truth(conn: &libsql::Connection, page_id: &str, status: &str) {
     conn.execute(
         "INSERT INTO page_truth_state
-            (page_id,page_version,support_status,human_reviewed,updated_at)
-         VALUES (?1,1,?2,0,1)",
+            (page_id,page_version,support_status,human_reviewed,updated_at,
+             evaluated_at)
+         VALUES (?1,1,?2,0,1,1)",
         libsql::params![page_id, status],
     )
     .await
@@ -165,8 +174,8 @@ async fn a_gated_write_declines_instead_of_projecting_or_failing() {
 }
 
 /// The PR-B production configuration. The pass runs, and the directory keeps
-/// every page -- including the provisional one and the one with no truth row at
-/// all. If this ever goes RED, the cutover has happened without PR-C's ceremony.
+/// every page -- including the two the judge failed. If this ever goes RED, the
+/// cutover has happened without PR-C's ceremony.
 #[tokio::test]
 async fn at_generation_zero_the_projection_keeps_every_page() {
     let (db, _tmp) = db_with_truth_rows().await;
@@ -186,9 +195,8 @@ async fn at_generation_zero_the_projection_keeps_every_page() {
     assert_eq!(removed, 0);
 }
 
-/// After the cutover the directory is the boundary, so the provisional page and
-/// the page with no truth row both leave it. `p3` is the post-migration normal
-/// case: absence of a support record is not evidence of support.
+/// After the cutover the directory is the boundary, so both judged-unsupported
+/// pages leave it.
 #[tokio::test]
 async fn after_the_cutover_the_projection_holds_supported_pages_only() {
     let (db, _tmp) = db_with_truth_rows().await;
@@ -418,13 +426,9 @@ async fn a_dry_run_names_the_unsupported_pages_while_the_cutover_is_still_off() 
     let plan = writer.plan_truth_cutover(&db, 1).await.unwrap();
 
     let named: Vec<String> = plan.evictions.iter().map(|e| e.page_id.clone()).collect();
-    assert_eq!(
-        named,
-        ["p2", "p3"],
-        "the provisional page and the page with no truth row at all"
-    );
+    assert_eq!(named, ["p2", "p3"], "the two pages the judge failed");
     assert_eq!(plan.projected, 3);
-    assert!(plan.evictions.iter().all(|e| e.filename.is_some()));
+    assert!(plan.evictions.iter().all(|e| !e.files.is_empty()));
     assert_eq!(
         readable_pages(root.path()),
         ["p1", "p2", "p3"],
@@ -647,4 +651,174 @@ async fn a_failed_eviction_leaves_the_generation_uncommitted() {
         .await
         .unwrap()
         .is_some());
+}
+
+/// The reason `Support` has three states instead of a bool.
+///
+/// Every page predating claim derivation is backfilled unjudged, so a cutover
+/// that read "no verdict" as "failed" would empty the whole vault on day one --
+/// 511 pages on the author's own machine -- and call it enforcement. A page
+/// nobody has judged keeps its file, at every generation, forever.
+#[tokio::test]
+async fn an_unjudged_page_keeps_its_file_after_the_cutover() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    db.insert_page(
+        "p4",
+        "p4",
+        None,
+        "",
+        None,
+        None,
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    projection.write_page(&page("p4")).unwrap();
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1", "p4"],
+        "p4 has no truth row at all, which is not a verdict against it"
+    );
+}
+
+/// A human who approved this page outranks the machine that failed it.
+///
+/// `human_reviewed` has existed since migration 98 and was read into
+/// `PageTruth` and then dropped on the floor -- no visibility or eviction path
+/// consulted it -- so a page its owner had personally approved was archived
+/// exactly like one nobody had ever seen.
+///
+/// The version and digest are not decoration: migration 98's CHECK refuses a
+/// review that does not name the exact page version and bytes a person signed
+/// off, which is what stops "reviewed" from being a sticky bit someone sets once.
+#[tokio::test]
+async fn a_human_reviewed_page_keeps_its_file_after_a_failed_judgement() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE page_truth_state
+                SET human_reviewed=1, reviewed_page_version=1,
+                    reviewed_page_digest='deadbeef'
+              WHERE page_id='p2'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1", "p2"],
+        "p2 failed the same judgement p3 did, and a person had already approved it"
+    );
+}
+
+/// Hiding a page is a retrieval decision, not a licence to destroy prose.
+///
+/// The bytes have to survive somewhere a human can find them, because
+/// `knowledge_path` is very often the user's own vault and they may have edited
+/// the file by hand. `archive/` is plain and visible for exactly that reason,
+/// and it is out of `wenlan pages` because that reader takes one directory level
+/// of `*.md`.
+#[tokio::test]
+async fn an_evicted_page_is_moved_into_archive_not_deleted() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    let before = std::fs::read_to_string(root.path().join("p2.md")).unwrap();
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(readable_pages(root.path()), ["p1"]);
+    let archived = root.path().join("archive").join("p2.md");
+    assert_eq!(
+        std::fs::read_to_string(&archived).unwrap(),
+        before,
+        "the archived file must be the page, byte for byte, not a stub"
+    );
+    assert!(root.path().join("archive").join("p3.md").is_file());
+}
+
+/// An archived page must not be rediscovered on the next pass.
+///
+/// `archive/` has no `.md` extension, so the directory scan skips it. If that
+/// ever stopped being true the second pass would find the archived file, try to
+/// archive it again, and collide with itself.
+#[tokio::test]
+async fn a_second_pass_leaves_the_archive_alone() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+    let removed_again = projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(removed_again, 0, "the second pass found nothing left to do");
+    assert!(root.path().join("archive").join("p2.md").is_file());
+    assert!(
+        !root.path().join("archive").join("archive").exists(),
+        "the archive archived itself"
+    );
+}
+
+/// Nothing on disk enforces one file per page.
+///
+/// A sync conflict copies the whole `.md`, `origin_id` frontmatter and all. The
+/// scan used to keep one filename per page, so the eviction archived one copy
+/// and left the other sitting in the projection root -- readable by
+/// `wenlan pages`, which is the exact disclosure the cutover exists to close.
+#[tokio::test]
+async fn every_copy_of_a_page_leaves_the_projection_not_just_one() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    let conflict = root.path().join("p2 (conflicted copy).md");
+    std::fs::copy(root.path().join("p2.md"), &conflict).unwrap();
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1"],
+        "the conflicted copy carries p2's origin_id and is just as readable"
+    );
+    assert!(root
+        .path()
+        .join("archive")
+        .join("p2 (conflicted copy).md")
+        .is_file());
 }

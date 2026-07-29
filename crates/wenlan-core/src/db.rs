@@ -597,7 +597,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 102;
+pub const SCHEMA_VERSION: u32 = 103;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8571,6 +8571,12 @@ impl MemoryDB {
             if version < 102 {
                 self.migrate_102_brief(version).await?;
             }
+
+            // Migration 103 (M5 ceremony): tell an unjudged page apart from a
+            // judged-and-failed one, so the cutover archives only the second.
+            if version < 103 {
+                self.migrate_103_page_evaluated_at(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12007,6 +12013,43 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("m101 bump: {error}")))?;
         log::info!("[migration] Migration 101 applied: truth-marker audit log");
+        Ok(())
+    }
+
+    /// Migration 103: `page_truth_state.evaluated_at`.
+    ///
+    /// A nullable column rather than a third `support_status` value, because
+    /// SQLite cannot widen a CHECK constraint without rebuilding the table --
+    /// and a rebuild would be a lot of moving parts to buy the same one bit.
+    ///
+    /// Every existing row keeps NULL, which reads as never-judged, which keeps
+    /// its projected file. That is the whole point: `provisional` is what
+    /// migration 99 stamped on every page that predates claim derivation, so
+    /// treating it as a failed verdict would archive an entire vault the moment
+    /// the cutover generation advanced.
+    async fn migrate_103_page_evaluated_at(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        // Additive and idempotent-by-inspection: a database created after this
+        // shipped already has the column from `ensure_claim_identity_tables`,
+        // and `ALTER TABLE ADD COLUMN` on an existing column is an error rather
+        // than a no-op, so the duplicate is tolerated instead of assumed absent.
+        if let Err(error) = conn
+            .execute(
+                "ALTER TABLE page_truth_state ADD COLUMN evaluated_at INTEGER",
+                (),
+            )
+            .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(WenlanError::VectorDb(format!("m103 add column: {error}")));
+            }
+        }
+
+        conn.execute("PRAGMA user_version = 103", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m103 bump: {error}")))?;
+        log::info!("[migration] Migration 103 applied: page_truth_state.evaluated_at");
         Ok(())
     }
 

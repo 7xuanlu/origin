@@ -12,8 +12,14 @@ use crate::pages::Page;
 use crate::truth_adapter::{filter_page, filter_page_refs, filter_pages, page_write_permit};
 use crate::truth_contract::TruthGrant;
 
-/// `p1` supported, `p2` provisional, `p3` with no truth row at all -- the
-/// post-migration shape, where most pages have no row yet.
+/// `p1` supported and human-reviewed, `p2` and `p3` both judged and failed.
+///
+/// `p3` used to have no truth row at all, standing in for "the post-migration
+/// shape, where most pages have no row yet". It cannot play the unsupported
+/// role any more: a page with no row has never been judged, and an unjudged
+/// page keeps its prose. It is a second *failed* page now, so the assertions
+/// below still test what they claim to. The no-row case has its own tooth --
+/// see `a_page_with_no_truth_row_is_unjudged_not_condemned`.
 async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
     let (db, temp) = test_db().await;
     for id in ["p1", "p2", "p3"] {
@@ -34,10 +40,24 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
         )
         .await
         .unwrap();
+        // `evaluated_at` is what makes p2 a *failed* judgement rather than an
+        // unjudged page. Without it these tests would assert hiding against a
+        // page that is merely unexamined, and unexamined pages are deliberately
+        // never hidden -- see `an_unjudged_page_is_never_hidden_no_matter_who_is_asking`.
         conn.execute(
             "INSERT INTO page_truth_state
-                (page_id,page_version,support_status,human_reviewed,updated_at)
-             VALUES ('p2',1,'provisional',0,1)",
+                (page_id,page_version,support_status,human_reviewed,updated_at,
+                 evaluated_at)
+             VALUES ('p2',1,'provisional',0,1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO page_truth_state
+                (page_id,page_version,support_status,human_reviewed,updated_at,
+                 evaluated_at)
+             VALUES ('p3',1,'provisional',0,1,1)",
             (),
         )
         .await

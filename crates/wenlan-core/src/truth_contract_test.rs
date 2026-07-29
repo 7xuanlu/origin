@@ -218,12 +218,19 @@ fn at_generation_zero_every_adapter_is_pass_through() {
         TruthGrant::CollectionEntries,
         TruthGrant::NamedPages(pages(&["other"])),
     ] {
-        for supported in [true, false] {
-            assert_eq!(
-                visible_at(0, &grant, "pg1", supported),
-                Visibility::Full,
-                "generation 0 filtered {grant:?} (supported={supported}) -- PR-B is no longer inert"
-            );
+        for support in [
+            Support::Supported,
+            Support::Unsupported,
+            Support::Unevaluated,
+        ] {
+            for reviewed in [true, false] {
+                assert_eq!(
+                    visible_at(0, &grant, "pg1", support, reviewed),
+                    Visibility::Full,
+                    "generation 0 filtered {grant:?} ({support:?}, reviewed={reviewed}) -- \
+                     PR-B is no longer inert"
+                );
+            }
         }
     }
 }
@@ -235,14 +242,64 @@ fn a_supported_page_is_always_fully_visible() {
         TruthGrant::CollectionEntries,
         TruthGrant::NamedPages(vec![]),
     ] {
-        assert_eq!(visible_at(1, &grant, "pg1", true), Visibility::Full);
+        assert_eq!(
+            visible_at(1, &grant, "pg1", Support::Supported, false),
+            Visibility::Full
+        );
+    }
+}
+
+/// The rule that keeps a cutover from emptying a vault.
+///
+/// Every page predating claim derivation is backfilled `provisional`, which
+/// reads as [`Support::Unevaluated`] -- 511 of them on the author's machine at
+/// the time this was written. If unjudged collapsed into unsupported, advancing
+/// the generation would archive all of them at once, which is not enforcement,
+/// it is data loss with a rationale. Only a page that was actually judged and
+/// actually failed loses its file.
+#[test]
+fn an_unjudged_page_is_never_hidden_no_matter_who_is_asking() {
+    for grant in [
+        TruthGrant::Automatic,
+        TruthGrant::CollectionEntries,
+        TruthGrant::NamedPages(pages(&["other"])),
+    ] {
+        assert_eq!(
+            visible_at(1, &grant, "pg1", Support::Unevaluated, false),
+            Visibility::Full,
+            "{grant:?} hid a page nobody has ever judged"
+        );
+    }
+}
+
+/// The human axis outranks the machine's. `human_reviewed` is set only by a
+/// person approving one specific page version against one specific digest, and
+/// it sat in the schema unread by every visibility path until this test.
+#[test]
+fn a_human_reviewed_page_survives_a_failed_judgement() {
+    for grant in [
+        TruthGrant::Automatic,
+        TruthGrant::CollectionEntries,
+        TruthGrant::NamedPages(pages(&["other"])),
+    ] {
+        assert_eq!(
+            visible_at(1, &grant, "pg1", Support::Unsupported, true),
+            Visibility::Full,
+            "{grant:?} overrode a human's approval with a machine judgement"
+        );
     }
 }
 
 #[test]
 fn an_unsupported_page_is_hidden_from_an_automatic_reader() {
     assert_eq!(
-        visible_at(1, &TruthGrant::Automatic, "pg1", false),
+        visible_at(
+            1,
+            &TruthGrant::Automatic,
+            "pg1",
+            Support::Unsupported,
+            false
+        ),
         Visibility::Hidden
     );
 }
@@ -252,7 +309,13 @@ fn an_unsupported_page_is_hidden_from_an_automatic_reader() {
 #[test]
 fn an_unsupported_page_appears_as_an_entry_in_a_marked_collection() {
     assert_eq!(
-        visible_at(1, &TruthGrant::CollectionEntries, "pg1", false),
+        visible_at(
+            1,
+            &TruthGrant::CollectionEntries,
+            "pg1",
+            Support::Unsupported,
+            false
+        ),
         Visibility::EntryOnly
     );
 }
@@ -260,7 +323,13 @@ fn an_unsupported_page_appears_as_an_entry_in_a_marked_collection() {
 #[test]
 fn a_named_page_grant_opens_the_page_it_named() {
     assert_eq!(
-        visible_at(1, &TruthGrant::NamedPages(pages(&["pg1"])), "pg1", false),
+        visible_at(
+            1,
+            &TruthGrant::NamedPages(pages(&["pg1"])),
+            "pg1",
+            Support::Unsupported,
+            false
+        ),
         Visibility::Full
     );
 }
@@ -271,7 +340,13 @@ fn a_named_page_grant_opens_the_page_it_named() {
 #[test]
 fn a_named_page_grant_does_not_cover_a_page_riding_along_beside_it() {
     assert_eq!(
-        visible_at(1, &TruthGrant::NamedPages(pages(&["pg1"])), "pg2", false),
+        visible_at(
+            1,
+            &TruthGrant::NamedPages(pages(&["pg1"])),
+            "pg2",
+            Support::Unsupported,
+            false
+        ),
         Visibility::Hidden
     );
 }

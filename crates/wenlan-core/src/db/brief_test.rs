@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::tests::test_db;
-use super::{MemoryDB, SCHEMA_VERSION};
+use super::MemoryDB;
 use wenlan_types::{
     BriefConflictReason, BriefItemState, BriefMutation, BriefSummaryUpdate, BriefUpdateRequest,
 };
@@ -34,6 +34,11 @@ async fn brief_migration_creates_fk_backed_tables() {
         assert!(rows.next().await.unwrap().is_some(), "missing {table}");
     }
 
+    // 102, not `SCHEMA_VERSION`. This test winds the database back to 101 and
+    // calls migration 102 alone, so what it can prove is that migration 102
+    // stamps *its own* version. Comparing against the head instead held only
+    // while 102 happened to be the last migration in the chain, which made the
+    // next one -- any next one -- fail a test about briefs.
     let mut version_rows = conn.query("PRAGMA user_version", ()).await.unwrap();
     assert_eq!(
         version_rows
@@ -43,7 +48,7 @@ async fn brief_migration_creates_fk_backed_tables() {
             .unwrap()
             .get::<i64>(0)
             .unwrap(),
-        i64::from(SCHEMA_VERSION)
+        102
     );
 }
 

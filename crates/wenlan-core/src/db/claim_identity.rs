@@ -282,6 +282,13 @@ impl MemoryDB {
                 support_status TEXT NOT NULL
                     CHECK(support_status IN ('supported','provisional')),
                 provisional_reason TEXT,
+                -- When a judgement last ran, or NULL if none ever has.
+                -- provisional alone conflates never-looked-at with
+                -- looked-and-the-evidence-fell-short, and only the second is a
+                -- verdict that may cost a page its projected file. Migration 99
+                -- leaves this NULL for every backfilled page, which is what
+                -- keeps a cutover from archiving a whole vault on day one.
+                evaluated_at INTEGER,
                 human_reviewed INTEGER NOT NULL DEFAULT 0
                     CHECK(human_reviewed IN (0,1)),
                 reviewed_page_version INTEGER,

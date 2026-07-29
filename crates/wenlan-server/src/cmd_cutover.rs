@@ -93,12 +93,17 @@ pub async fn run(generation: i64, apply: bool) -> Result<()> {
         plan.projected
     );
     for eviction in &plan.evictions {
-        match &eviction.filename {
-            Some(name) => println!("  {}  ->  delete {name}", eviction.page_id),
-            None => println!(
+        if eviction.files.is_empty() {
+            println!(
                 "  {}  ->  no file on disk (stale state entry)",
                 eviction.page_id
-            ),
+            );
+        } else {
+            println!(
+                "  {}  ->  move to archive/: {}",
+                eviction.page_id,
+                eviction.files.join(", ")
+            );
         }
     }
     println!("\nPlan digest: {}", plan.digest);

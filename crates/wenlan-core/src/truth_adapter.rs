@@ -93,7 +93,7 @@ async fn verdicts(
             (
                 id,
                 wenlan_types::pages::PageTruth {
-                    supported: state.supported,
+                    supported: state.supported(),
                     human_reviewed: state.human_reviewed,
                 },
             )

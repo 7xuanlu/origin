@@ -151,11 +151,18 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
     (db, temp)
 }
 
+/// Seed a page whose truth has actually been decided.
+///
+/// `evaluated_at` is always stamped, because these tests are about what a
+/// *verdict* does. An unjudged page (NULL) keeps full visibility by design, so
+/// seeding one here would quietly turn every hiding assertion below into a test
+/// of nothing.
 async fn set_truth(conn: &libsql::Connection, page_id: &str, status: &str) {
     conn.execute(
         "INSERT INTO page_truth_state
-            (page_id,page_version,support_status,human_reviewed,updated_at)
-         VALUES (?1,1,?2,0,1)",
+            (page_id,page_version,support_status,human_reviewed,updated_at,
+             evaluated_at)
+         VALUES (?1,1,?2,0,1,1)",
         libsql::params![page_id, status],
     )
     .await
@@ -166,9 +173,19 @@ fn ids(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// The default reader, post-cutover. Supported prose flows; unsupported prose
-/// does not, and a page with no truth row is unsupported -- absence of a support
-/// record is not evidence of support.
+/// The default reader, post-cutover. Supported prose flows, a failed judgement
+/// does not, and a page with no truth row at all is unjudged rather than
+/// condemned.
+///
+/// That last clause used to read the other way -- no row meant unsupported, on
+/// the principle that absence of a support record is not evidence of support.
+/// It sounds fail-closed and it is not, because of what actually populates the
+/// table: the ONLY writer is migration 99's backfill, and `insert_page` creates
+/// no row. So every page created after that migration has no row, forever. The
+/// old rule did not fail closed on a rare gap, it hid one hundred percent of
+/// future pages the instant the generation advanced -- and hid them silently,
+/// since nothing would ever arrive to un-hide them. A rule whose fail-closed
+/// case is *every* case is not a safety property, it is an outage.
 #[tokio::test]
 async fn an_automatic_reader_sees_only_supported_pages_after_the_cutover() {
     let (db, _tmp) = db_with_truth_rows().await;
@@ -180,13 +197,14 @@ async fn an_automatic_reader_sees_only_supported_pages_after_the_cutover() {
     assert_eq!(seen["p2"], Visibility::Hidden);
     assert_eq!(
         seen["p3"],
-        Visibility::Hidden,
-        "a page with no truth row must read as unsupported"
+        Visibility::Full,
+        "a page with no truth row has not been judged, and an unjudged page keeps its prose"
     );
 }
 
-/// The collection carve-out: an unsupported page may be *listed* with its state,
-/// which is what keeps the review loop from having no entry point. Never prose.
+/// The collection carve-out: a page whose judgement failed may be *listed* with
+/// its state, which is what keeps the review loop from having no entry point.
+/// Never prose. An unjudged page is untouched by any of this.
 #[tokio::test]
 async fn a_collection_grant_degrades_unsupported_pages_to_entry_only() {
     let (db, _tmp) = db_with_truth_rows().await;
@@ -196,21 +214,47 @@ async fn a_collection_grant_degrades_unsupported_pages_to_entry_only() {
         .unwrap();
     assert_eq!(seen["p1"], Visibility::Full);
     assert_eq!(seen["p2"], Visibility::EntryOnly);
-    assert_eq!(seen["p3"], Visibility::EntryOnly);
+    assert_eq!(seen["p3"], Visibility::Full);
 }
 
 /// The grant covers the page the call named and nothing riding along beside it.
-/// `p2` is named and opens; `p3` is just as unsupported and stays shut.
+/// `p2` is named and opens.
+///
+/// `p3` can no longer carry this test -- it has no truth row, so it is unjudged
+/// and visible on its own account, which would pass whether or not the
+/// named-grant rule held. The real check is a *judged-and-failed* page that was
+/// not named, so the assertion moved onto one.
 #[tokio::test]
 async fn a_named_grant_opens_the_named_page_and_nothing_else() {
     let (db, _tmp) = db_with_truth_rows().await;
+    // `insert_page` takes the connection mutex itself, so it has to happen
+    // before this scope opens one -- holding the guard across it self-deadlocks.
+    db.insert_page(
+        "p4",
+        "p4",
+        None,
+        "",
+        None,
+        None,
+        &[],
+        "2026-07-28T00:00:00Z",
+    )
+    .await
+    .ok();
+    {
+        let conn = db.conn.lock().await;
+        set_truth(&conn, "p4", "provisional").await;
+    }
     let seen = db
-        .page_visibility(&TruthGrant::NamedPages(ids(&["p2"])), &ids(&["p2", "p3"]))
+        .page_visibility(
+            &TruthGrant::NamedPages(ids(&["p2"])),
+            &ids(&["p2", "p3", "p4"]),
+        )
         .await
         .unwrap();
     assert_eq!(seen["p2"], Visibility::Full);
     assert_eq!(
-        seen["p3"],
+        seen["p4"],
         Visibility::Hidden,
         "a grant for one page must not cover another page in the same payload"
     );

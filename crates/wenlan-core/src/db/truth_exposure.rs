@@ -154,10 +154,37 @@ impl CutoverLease {
 /// Independent by construction: neither is inferred from the other. A page can
 /// be machine-supported and unreviewed, or human-reviewed and unsupported, and
 /// both facts have to reach the reader for a `collection` entry to be legal.
+///
+/// The machine axis is a three-state [`Support`] rather than a bool, so an
+/// unjudged page cannot be mistaken for a judged-and-failed one. It was a bool
+/// until the ceremony review: `support_status` has only ever held `supported`
+/// or `provisional`, and reading `provisional` as "the evidence does not back
+/// this" made every page that predates claim derivation an eviction target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageTruth {
-    pub supported: bool,
+    pub support: crate::truth_contract::Support,
     pub human_reviewed: bool,
+}
+
+/// A page nothing knows anything about: unjudged, unreviewed. The right answer
+/// for a missing row, because absence of a judgement is not a judgement.
+impl Default for PageTruth {
+    fn default() -> Self {
+        Self {
+            support: crate::truth_contract::Support::Unevaluated,
+            human_reviewed: false,
+        }
+    }
+}
+
+impl PageTruth {
+    /// Whether the evidence has been checked and found to back the prose.
+    ///
+    /// Kept as a method rather than a field so `unevaluated` can never silently
+    /// read as `supported` at a call site that only wanted the happy case.
+    pub fn supported(&self) -> bool {
+        self.support == crate::truth_contract::Support::Supported
+    }
 }
 
 /// One recorded marked call.
@@ -313,7 +340,7 @@ impl MemoryDB {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT page_id, support_status, human_reviewed
+                "SELECT page_id, support_status, human_reviewed, evaluated_at
                    FROM page_truth_state
                   WHERE page_id IN ({placeholders})"
             );
@@ -333,10 +360,28 @@ impl MemoryDB {
                 let page_id: String = row.get(0).unwrap_or_default();
                 let status: String = row.get(1).unwrap_or_default();
                 let reviewed: i64 = row.get(2).unwrap_or(0);
+                // `support_status` cannot answer this alone. Its only
+                // non-supported value is `provisional`, which migration 99
+                // stamps on every pre-existing page with the reason "never
+                // evaluated: predates claim derivation" -- so `provisional`
+                // covers both "nobody looked" and "looked, and the evidence
+                // fell short". `evaluated_at` is what separates them, and it is
+                // a nullable column rather than a third `support_status` value
+                // because SQLite cannot widen a CHECK without rebuilding the
+                // table.
+                //
+                // `unwrap_or(None)` puts a malformed or absent column on the
+                // unjudged side -- the side that keeps a page's file.
+                let evaluated_at: Option<i64> = row.get(3).unwrap_or(None);
+                let support = match (status.as_str(), evaluated_at) {
+                    ("supported", _) => crate::truth_contract::Support::Supported,
+                    (_, Some(_)) => crate::truth_contract::Support::Unsupported,
+                    (_, None) => crate::truth_contract::Support::Unevaluated,
+                };
                 out.insert(
                     page_id,
                     PageTruth {
-                        supported: status == "supported",
+                        support,
                         human_reviewed: reviewed == 1,
                     },
                 );
@@ -372,8 +417,18 @@ impl MemoryDB {
         Ok(page_ids
             .iter()
             .map(|id| {
-                let supported = states.get(id).is_some_and(|s| s.supported);
-                (id.clone(), visible_at(generation, grant, id, supported))
+                // A page with no row at all has never been judged either, so it
+                // gets the unjudged verdict rather than the failed one. Same
+                // reasoning as the NULL `evaluated_at` above: absence of a
+                // judgement is not a judgement.
+                let truth = states.get(id).copied().unwrap_or(PageTruth {
+                    support: crate::truth_contract::Support::Unevaluated,
+                    human_reviewed: false,
+                });
+                (
+                    id.clone(),
+                    visible_at(generation, grant, id, truth.support, truth.human_reviewed),
+                )
             })
             .collect())
     }
