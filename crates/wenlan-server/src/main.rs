@@ -2,6 +2,7 @@
 //! Wenlan headless daemon — runs the memory server without Tauri.
 
 mod cmd_backfill;
+mod cmd_cutover;
 
 struct DaemonDataLock {
     _file: std::fs::File,
@@ -1053,6 +1054,19 @@ enum Command {
         /// Print candidates without modifying the database.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Internal maintenance: advance the M5 truth cutover. Daemon must be stopped
+    /// first. Deletes unsupported pages' Markdown from the projection directory;
+    /// `--apply` refuses without a matching dry run.
+    #[command(name = "truth-cutover", hide = true)]
+    TruthCutover {
+        /// Generation to advance to. 1 is the first live generation.
+        #[arg(long, default_value_t = 1)]
+        generation: i64,
+        /// Carry out the plan. Without it this is a dry run and records nothing
+        /// but the plan digest.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -2315,6 +2329,9 @@ async fn main() -> anyhow::Result<()> {
 
         match cli.command {
             Some(Command::BackfillStalePages { dry_run }) => cmd_backfill::run(dry_run).await,
+            Some(Command::TruthCutover { generation, apply }) => {
+                cmd_cutover::run(generation, apply).await
+            }
             None => run_daemon(startup_repair_claim).await,
         }
     }

@@ -394,3 +394,248 @@ async fn a_page_that_cannot_be_evicted_does_not_shelter_the_next_one() {
         "the supported page is untouched"
     );
 }
+
+// ---- the ceremony: plan, then apply -------------------------------------
+//
+// Same directory-level standard as everything above. A plan that named the
+// right pages while the wrong files stayed on disk would be exactly the lie
+// this file exists to catch.
+
+use crate::export::knowledge::KnowledgeWriter;
+
+/// The dry run has to answer a question the live gate cannot: what *would*
+/// happen. At generation 0 `page_visibility` short-circuits every page to
+/// `Full`, so a plan built on it would report "nothing would be evicted" and
+/// the operator would advance blind.
+#[tokio::test]
+async fn a_dry_run_names_the_unsupported_pages_while_the_cutover_is_still_off() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let _projection = project_all(&db, root.path());
+    let writer = KnowledgeWriter::new(root.path().to_path_buf(), &db);
+
+    assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
+    let plan = writer.plan_truth_cutover(&db, 1).await.unwrap();
+
+    let named: Vec<String> = plan.evictions.iter().map(|e| e.page_id.clone()).collect();
+    assert_eq!(
+        named,
+        ["p2", "p3"],
+        "the provisional page and the page with no truth row at all"
+    );
+    assert_eq!(plan.projected, 3);
+    assert!(plan.evictions.iter().all(|e| e.filename.is_some()));
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1", "p2", "p3"],
+        "a dry run that deleted anything is not a dry run"
+    );
+    assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
+}
+
+/// The support status underneath a plan changed, so the plan is not the one the
+/// operator read.
+#[tokio::test]
+async fn an_apply_refuses_after_a_support_status_changes() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let _projection = project_all(&db, root.path());
+    let writer = KnowledgeWriter::new(root.path().to_path_buf(), &db);
+
+    let stale = writer.plan_truth_cutover(&db, 1).await.unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE page_truth_state SET support_status = 'supported' WHERE page_id = 'p2'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let refused = writer.run_truth_cutover(&db, 1, &stale.digest).await;
+    assert!(refused.is_err(), "a stale plan must not be applied");
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1", "p2", "p3"],
+        "the refusal must happen before anything is deleted"
+    );
+    assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
+    assert_eq!(
+        db.cutover_fence().await.unwrap(),
+        crate::db::CutoverFence::INITIAL,
+        "refusing before the lease is taken leaves the fence untouched"
+    );
+}
+
+/// Directory first, then the commit, then the fence. Asserted at the directory,
+/// because that is the surface `wenlan pages` reads.
+#[tokio::test]
+async fn the_ceremony_evicts_then_commits_then_releases_the_fence() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let _projection = project_all(&db, root.path());
+    let writer = KnowledgeWriter::new(root.path().to_path_buf(), &db);
+
+    let plan = writer.plan_truth_cutover(&db, 1).await.unwrap();
+    writer
+        .run_truth_cutover(&db, 1, &plan.digest)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1"],
+        "only the supported page may still be readable off the directory"
+    );
+    assert_eq!(db.truth_cutover_generation().await.unwrap(), 1);
+    let fence = db.cutover_fence().await.unwrap();
+    assert_eq!(fence.phase, crate::db::CutoverPhase::Committed);
+    assert!(
+        fence.epoch >= 2,
+        "begin and commit each bump the epoch, so a committed fence is past 1"
+    );
+}
+
+/// After the ceremony, ordinary page writes are allowed again -- the fence is
+/// released, not left holding. A ceremony that permanently wedged the writers
+/// would be safe and useless.
+#[tokio::test]
+async fn writers_are_allowed_back_after_the_commit() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let _projection = project_all(&db, root.path());
+    let writer = KnowledgeWriter::new(root.path().to_path_buf(), &db);
+
+    let plan = writer.plan_truth_cutover(&db, 1).await.unwrap();
+    writer
+        .run_truth_cutover(&db, 1, &plan.digest)
+        .await
+        .unwrap();
+
+    assert!(
+        crate::truth_adapter::page_write_permit(&db, "p1")
+            .await
+            .unwrap()
+            .is_some(),
+        "the supported page must still be projectable after the ceremony"
+    );
+    assert!(
+        crate::truth_adapter::page_write_permit(&db, "p2")
+            .await
+            .unwrap()
+            .is_none(),
+        "and the unsupported one must now be refused on its own merits, not by \
+         the fence"
+    );
+}
+
+/// The digest covers the **whole projection**, not the eviction list.
+///
+/// This is the case a digest over the evictions alone cannot catch: a page that
+/// appears between the dry run and the apply, and is supported, leaves the
+/// eviction list byte-identical. The operator approved a plan over a three-page
+/// directory; applying it against a four-page directory puts a page they never
+/// saw inside the ceremony's scope. Deletions here are unrecoverable, so
+/// "the list happens to match" is not consent.
+#[tokio::test]
+async fn an_apply_refuses_when_a_page_appeared_that_the_plan_never_covered() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    let writer = KnowledgeWriter::new(root.path().to_path_buf(), &db);
+
+    let plan = writer.plan_truth_cutover(&db, 1).await.unwrap();
+
+    // A fourth page lands, supported, so the eviction list does not move.
+    db.insert_page(
+        "p4",
+        "p4",
+        None,
+        "",
+        None,
+        None,
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        set_truth(&conn, "p4", "supported").await;
+    }
+    projection.write_page(&page("p4")).unwrap();
+
+    let fresh = writer.plan_truth_cutover(&db, 1).await.unwrap();
+    let before: Vec<&str> = plan.evictions.iter().map(|e| e.page_id.as_str()).collect();
+    let after: Vec<&str> = fresh.evictions.iter().map(|e| e.page_id.as_str()).collect();
+    assert_eq!(
+        before, after,
+        "the premise of this test is that the eviction list is unchanged"
+    );
+    assert_ne!(
+        plan.digest, fresh.digest,
+        "an identical eviction list over a changed projection must still change \
+         the digest, or the apply gate is blind to exactly this case"
+    );
+
+    let refused = writer.run_truth_cutover(&db, 1, &plan.digest).await;
+    assert!(
+        refused.is_err(),
+        "a plan that predates p4 must not be applied"
+    );
+    assert_eq!(readable_pages(root.path()), ["p1", "p2", "p3", "p4"]);
+    assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
+}
+
+/// The commit is downstream of the directory work, and conditional on it.
+///
+/// The happy path cannot prove this on its own: the reconcile pass that runs
+/// after the commit deletes the same files, so a ceremony that committed first
+/// and evicted second would leave an identical directory. The ordering is only
+/// observable when the directory work FAILS -- and then the generation must
+/// still read 0, because a committed generation with the prose still on disk is
+/// precisely the "false trust" state the directory-first rule exists to prevent.
+///
+/// Unix-only: the forced failure is a read-only projection root, and Windows
+/// permits unlinking from a read-only directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_eviction_leaves_the_generation_uncommitted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let _projection = project_all(&db, root.path());
+    let writer = KnowledgeWriter::new(root.path().to_path_buf(), &db);
+
+    let plan = writer.plan_truth_cutover(&db, 1).await.unwrap();
+    assert!(!plan.evictions.is_empty(), "nothing to fail at otherwise");
+
+    let readonly = std::fs::Permissions::from_mode(0o555);
+    let writable = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(root.path(), readonly).unwrap();
+    let outcome = writer.run_truth_cutover(&db, 1, &plan.digest).await;
+    std::fs::set_permissions(root.path(), writable).unwrap();
+
+    assert!(outcome.is_err(), "the eviction could not have succeeded");
+    assert_eq!(
+        db.truth_cutover_generation().await.unwrap(),
+        0,
+        "the generation was committed even though the prose is still on disk"
+    );
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1", "p2", "p3"],
+        "nothing was removed, which is the premise of the assertion above"
+    );
+
+    // And the lease was given back, at a new epoch, so writers are not wedged.
+    let fence = db.cutover_fence().await.unwrap();
+    assert_eq!(fence.phase, crate::db::CutoverPhase::Off);
+    assert!(fence.epoch > 0, "the abort must not reuse the old epoch");
+    assert!(crate::truth_adapter::page_write_permit(&db, "p1")
+        .await
+        .unwrap()
+        .is_some());
+}

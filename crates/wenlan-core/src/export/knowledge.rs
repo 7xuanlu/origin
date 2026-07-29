@@ -546,6 +546,138 @@ impl KnowledgeWriter {
         self.evict_projected_pages(guard, &evict)
     }
 
+    /// Every page this projection directory would lose at `generation`, without
+    /// losing it.
+    ///
+    /// The point of a dry run is that it is computed the same way the real thing
+    /// is, so this shares the invariant's enumeration exactly: the union of
+    /// `state.json`'s keys and the IDs recovered from the `.md` frontmatter
+    /// actually on disk. A plan built from a different enumeration would be a
+    /// forecast of a different operation.
+    ///
+    /// `generation` is *hypothetical*. The database is still at whatever it is
+    /// at -- typically 0, where `page_visibility` short-circuits everything to
+    /// `Full` -- so the verdict is computed through the pure
+    /// [`crate::truth_contract::visible_at`] rather than through the live gate.
+    /// Asking the live gate would answer "nothing would be evicted" and be
+    /// useless, which is the trap this method exists to avoid.
+    pub async fn plan_truth_cutover(
+        &self,
+        database: &crate::db::MemoryDB,
+        generation: i64,
+    ) -> Result<CutoverPlan, WenlanError> {
+        let on_disk = self.scan_projected_page_ids()?;
+        let mut projected: Vec<String> = self
+            .load_state()
+            .pages
+            .into_keys()
+            .chain(on_disk.keys().cloned())
+            .collect();
+        projected.sort();
+        projected.dedup();
+
+        let states = database.page_truth_states(&projected).await?;
+        let mut evictions = Vec::new();
+        for page_id in &projected {
+            let supported = states.get(page_id).is_some_and(|s| s.supported);
+            let visibility = crate::truth_contract::visible_at(
+                generation,
+                &crate::truth_contract::TruthGrant::Automatic,
+                page_id,
+                supported,
+            );
+            if visibility != crate::truth_contract::Visibility::Full {
+                evictions.push(CutoverEviction {
+                    page_id: page_id.clone(),
+                    filename: on_disk.get(page_id).cloned(),
+                });
+            }
+        }
+
+        // The digest covers everything the decision rests on: which generation,
+        // which pages, whether each is supported, and which file each would cost.
+        // Anything that changes between the dry run and the apply changes this
+        // string, and the apply refuses. It is deliberately not a digest of the
+        // eviction list alone -- a page flipping from unsupported to supported
+        // shortens that list without the operator ever seeing the new plan.
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut hasher, generation.to_string().as_bytes());
+        for page_id in &projected {
+            let supported = states.get(page_id).is_some_and(|s| s.supported);
+            let file = on_disk.get(page_id).map(String::as_str).unwrap_or("-");
+            sha2::Digest::update(
+                &mut hasher,
+                format!("\n{page_id}\t{supported}\t{file}").as_bytes(),
+            );
+        }
+        Ok(CutoverPlan {
+            generation,
+            projected: projected.len(),
+            evictions,
+            digest: hex::encode(sha2::Digest::finalize(hasher)),
+        })
+    }
+
+    /// Advance the cutover, fenced and directory-first.
+    ///
+    /// The order is the whole design:
+    ///
+    /// 1. take the lease, which stops every page writer;
+    /// 2. remove the files the plan named, *before* the database says anything
+    ///    has changed;
+    /// 3. commit the generation, then release the fence;
+    /// 4. reconcile through the ordinary invariant, which now sees the live
+    ///    generation and catches anything the plan missed.
+    ///
+    /// Directory-first is deliberate. A legacy reader may briefly see a page
+    /// missing that the database still calls supported; it must never see stale
+    /// provisional prose after the cutover. Omission is recoverable, false trust
+    /// is not.
+    ///
+    /// `expected_digest` is the operator's dry run. It is re-planned here rather
+    /// than trusted, so an apply that races a distillation cycle refuses instead
+    /// of deleting files nobody reviewed.
+    ///
+    /// Any failure between (1) and (3) aborts the lease, which returns the fence
+    /// to `off` at a **new** epoch and lets writers back in.
+    pub async fn run_truth_cutover(
+        &self,
+        database: &crate::db::MemoryDB,
+        generation: i64,
+        expected_digest: &str,
+    ) -> Result<CutoverPlan, WenlanError> {
+        let plan = self.plan_truth_cutover(database, generation).await?;
+        if plan.digest != expected_digest {
+            return Err(WenlanError::Conflict(format!(
+                "the projection changed since the dry run (planned {expected_digest}, \
+                 now {}); re-run the dry run and read it before applying",
+                plan.digest
+            )));
+        }
+
+        let lease = database.begin_cutover().await?;
+        let evict: Vec<String> = plan.evictions.iter().map(|e| e.page_id.clone()).collect();
+        let outcome = async {
+            if !evict.is_empty() {
+                let guard = database.begin_page_projection_write();
+                self.evict_projected_pages(&guard, &evict)?;
+            }
+            database.commit_cutover(&lease, generation).await
+        }
+        .await;
+        if let Err(error) = outcome {
+            // Best effort: if the abort also fails the fence stays `preparing`,
+            // which refuses page writes. That is the safe side to be stuck on.
+            let _ = database.abort_cutover(&lease).await;
+            return Err(error);
+        }
+
+        let guard = database.begin_page_projection_write();
+        self.enforce_projection_directory_invariant(database, &guard)
+            .await?;
+        Ok(plan)
+    }
+
     /// Every page ID this directory actually holds a file for, with its filename.
     ///
     /// Recovered from `origin_id:` in the frontmatter `write_page` renders, which
@@ -875,6 +1007,32 @@ fn check_permit(permit: &crate::truth_adapter::PagePermit, page: &Page) -> Resul
         )));
     }
     Ok(())
+}
+
+/// One page the cutover would stop projecting, and the file that costs.
+///
+/// `filename` is `None` when `state.json` names a page whose `.md` is already
+/// gone. Reporting it anyway is the point: the entry is still there to be
+/// resurrected by the next write, so it is part of what the ceremony cleans up
+/// even though no bytes are lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverEviction {
+    pub page_id: String,
+    pub filename: Option<String>,
+}
+
+/// What advancing to a generation would do to the projection directory.
+///
+/// Produced by [`KnowledgeWriter::plan_truth_cutover`] and re-produced inside
+/// [`KnowledgeWriter::run_truth_cutover`], which refuses when the two digests
+/// differ. The operator reads the eviction list; the machine reads the digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverPlan {
+    pub generation: i64,
+    /// Every page the directory currently accounts for, evicted or not.
+    pub projected: usize,
+    pub evictions: Vec<CutoverEviction>,
+    pub digest: String,
 }
 
 pub struct KnowledgeProjectionWrite {
