@@ -49,6 +49,12 @@ openssl-sys = { workspace = true }
 cc = "1"
 
 [dev-dependencies]
+# Test builds resolve `config.json` to a temp dir instead of the developer's
+# real one, so the hand-rolled `DataDirGuard` env juggling stops being what
+# keeps `save_config` off it (see `default_config_root` in wenlan-core).
+# Resolver 2 keeps a dev-dependency feature out of `cargo build`, so the
+# shipped daemon never has it.
+wenlan-core = { workspace = true, features = ["scratch-config"] }
 async-trait = { workspace = true }
 libsql = { workspace = true }
 temp-env = { version = "0.3" }

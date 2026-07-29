@@ -10,6 +10,13 @@ description = "Core business logic for Wenlan — memory storage, retrieval, and
 default = []
 closed-core-eval = []
 eval-harness = []
+# Redirect config reads/writes to a disposable per-process directory so a test
+# binary can never resolve to the developer's real `config.json` (rationale on
+# `default_config_root` in src/config.rs). Enabled from `wenlan-server`'s
+# `[dev-dependencies]`; with resolver 2 a dev-dependency feature is not unified
+# into a normal build, so a shipped daemon never has it. `wenlan-core`'s own
+# tests get the same behaviour through `cfg(test)`.
+scratch-config = []
 
 [dependencies]
 wenlan-types = { workspace = true }
