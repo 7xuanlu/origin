@@ -1725,6 +1725,87 @@ Execution evidence:
 - GREEN floor: external literals `297 → 296`, production `8 → 7`, tests remain
   `289`.
 
+Frozen slice contract:
+
+- Add `db/repair_deterministic.rs` plus its sibling direct-test module. The
+  named inherent operation is `MemoryDB::apply_deterministic_repair_cas`; the
+  existing public `post_write::apply_deterministic_repair_cas` name, signature,
+  visibility, and callers remain unchanged and delegate exactly once. Do not
+  add a generic transaction runner, connection parameter, transaction token,
+  or callback other than the existing synchronous proof hook.
+- Move the complete body, not only its SQL match. Preserve the exact order:
+  reject the reclassification/projection writer mismatch before locking; take
+  the DB mutex; `BEGIN IMMEDIATE`; validate the tag-record set; read and compare
+  the initial target receipt; conditionally capture archive-page route
+  generations; capture parity and non-target guards; dispatch exactly the
+  seven existing writer/mutation arms; require a nonzero affected count; read
+  and compare the final target receipt; verify route invalidation; normalize
+  allowed changes and parity; compare the non-target guard; capture the final
+  database digest; construct the opaque proof; run the synchronous hook; then
+  `COMMIT`. Do not call R4-17's separately locking receipt method from inside
+  the transaction.
+- Preserve every arm and predicate byte-for-byte apart from mechanical
+  qualification/formatting:
+  `NormalizeMemorySourceAgent`, `ClearMemorySupersedes`,
+  `UnstageOrphanRevision`, `DeleteTagRow`, `DeleteMemoryEntityLink`,
+  `BindPageLink`, and `ArchiveEmptySourcePage`. The archive arm must still
+  require the empty, active, unconfirmed, unedited, source-kind, source-less
+  page at the expected version and scope.
+- Preserve route-invalidation arithmetic exactly. Only archive-page repair
+  captures the pre-state; its page generation must equal
+  `page_generation.saturating_add(1)`, its space and space generation must
+  remain equal, and exactly one derived change is added with `checked_add`.
+  That saturating compare, parity subtraction, total-change subtraction, and
+  `repair_effect_counter_{overflow,underflow}` errors do not change.
+- Preserve this operation's existing error mapping, which intentionally is not
+  R4-18's recovery-required mapping. Body or proof-hook failure attempts
+  `ROLLBACK`; rollback failure returns
+  `VectorDb("{error}; repair rollback failed: {rollback_error}")`. `COMMIT`
+  failure performs best-effort rollback and returns
+  `VectorDb("repair commit failed: {error}")`. No new production failure
+  injection is added. `RepairWriteProof` fields remain private; use only its
+  existing crate-private constructor at the DB boundary.
+- Direct controls live under the DB child without widening production
+  visibility. A simple deterministic writer proves success, proof contents,
+  committed state, and the mutex boundary. Its synchronous hook uses the
+  no-hang scoped-thread protocol: attempt `try_lock`, record whether blocked,
+  drop any unexpectedly acquired guard, always rendezvous at a two-party
+  `Barrier`, then assert in the hook. A separate hook-failure control proves the
+  target mutation rolls back and the mutex is acquirable after return.
+- A positive `ArchiveEmptySourcePage` control must prove the page commits as
+  archived, the page-route generation advances by exactly one, the route space
+  and space generation do not change, and the proof's non-target guards match.
+  It catches missing or broadened derived-change accounting. Add a separate
+  negative control in the disposable test DB: seed a valid archive-page route
+  row, drop `m4_page_community_page_invalidate`, invoke the DB method, and
+  require the exact `repair target page route invalidation unproven` error plus
+  rollback to an active page. That control must fail if route verification is
+  removed or weakened. Existing writer-specific deterministic repair tests
+  remain unchanged and green.
+- RED lowers only the `post_write.rs` exact ratchet row `16 → 15`. GREEN is
+  external `297 → 296`, production `8 → 7`, tests `289`. Expected files are
+  `db.rs`, the two new DB child files, `drift_guard.rs`, `post_write.rs`, the
+  generated M5 inventory, and this ledger; no existing policy-test file,
+  truth/generation surface, or later R4 slice changes.
+- The new DB method's LSP reference set must be its declaration, exactly one
+  production facade, and the direct controls. For the retained public facade,
+  a syntax-aware census must show exactly one production call plus the same
+  four test call expressions at current `deterministic_tests.rs` lines `941`,
+  `1153`, `1241`, and `3568`; LSP `goto_definition` from every call must resolve
+  to the facade. Do not require `find_references` alone to enumerate the fourth
+  test call: rust-analyzer currently omits line `1241` even though its
+  definition lookup resolves correctly. The moved raw lock disappears from
+  `post_write.rs`; no raw DB capability escapes the child.
+- Start from the green R4-18 M5 state `191 / 55-50-86 / exposure 22`.
+  Regenerate the inventory only after all code, test, and ledger changes, then
+  run both the script and Rust drift gate again after any review delta. Counts
+  and depth/exposure partition remain unchanged; only mechanical source
+  addresses may move.
+- CONTRACT GATE, 2026-07-29: routine Sol and the independent contract auditor
+  both returned `APPROVE` after the dropped-trigger negative control,
+  saturating route-generation semantics, and the four-call syntax/LSP split
+  were made explicit. No implementation file changed during contract review.
+
 #### R4-20 — rename-page apply and recovery transactions
 
 - Move the rename apply CAS and pending-receipt recovery as two named
