@@ -585,8 +585,10 @@ async fn a_committed_cutover_cannot_be_rolled_back_to_off() {
 #[tokio::test]
 async fn a_ceremony_killed_mid_flight_does_not_wedge_page_writes_forever() {
     let (db, _tmp) = test_db().await;
-    let lease = db.begin_cutover().await.unwrap();
-    drop(lease); // the process that held it is gone
+    // Bound and then never spent: the process that held the lease is gone, and
+    // the fence it took is all that is left on disk. `drop` would say this more
+    // loudly, but the lease owns nothing, so clippy reads that as dead code.
+    let _lease = db.begin_cutover().await.unwrap();
 
     assert!(
         crate::truth_adapter::page_write_permit(&db, "p1")
