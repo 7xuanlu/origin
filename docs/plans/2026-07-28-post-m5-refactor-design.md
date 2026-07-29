@@ -577,6 +577,98 @@ Execution evidence:
 Replace remaining external connection locks with bounded domain APIs. Make the
 field private only after the caller census reaches its accepted floor.
 
+#### R4 execution ledger
+
+The current shrink-only guard is a migration ratchet, not the end-state
+contract. The corrected brace-aware census at R4 entry is 336 literal
+`.conn.lock().await` occurrences across 59 external files: 47 production
+occurrences in 15 files and 289 test-scoped occurrences in 50 files. One
+additional production escape is not counted by that regex:
+`CommunityGroupingLeaseCleanup` retains an `Arc<Mutex<Connection>>` and locks
+it from `Drop`. R4 closes the boundary in bounded, independently reviewed
+slices:
+
+1. Move the existing Space-context `MemoryDB` implementation into a DB child
+   module without changing its public methods, SQL, transaction boundaries, or
+   public type paths. This removes the six raw-lock occurrences from
+   `crate::space_context` without inventing another API.
+2. Replace callers that already have an adequate domain method, then add narrow
+   typed read methods for the remaining point reads, maintenance scans,
+   knowledge-quality scans, derived-state sweep, community-grouping lease and
+   cursor work, and eval integrity reads. Code is moved under `db/**` only when
+   it is genuinely a `MemoryDB` implementation; moving orchestration merely to
+   disappear from the matcher is forbidden.
+3. Close the repair and post-write CAS/recovery group as its own high-risk
+   slice. Its explicit `BEGIN IMMEDIATE`, receipt checks, commit/rollback, and
+   same-lock ownership semantics must remain one atomic DB-owned operation; a
+   generic `with_conn`, renamed connection accessor, or public transaction
+   escape hatch is not an acceptable substitute.
+4. Replace the remaining test fixture access with one `#[cfg(test)]` DB-owned
+   support seam and an exact, location-aware manifest. Then make `conn` private
+   in every build. A broad filename or `#[cfg(test)]` exemption is forbidden
+   because production and test code coexist in several source files.
+
+The test-support choice is locked to the fourth approach above: `conn` remains
+private in every build, and the existing test-only callers move mechanically
+to the named helper. Conditional `pub(crate)` field visibility was rejected
+because `cargo test` would expose the raw field to every production module
+compiled in that build; the AST manifest would then be policy rather than a
+type-system boundary. Opus independently preferred the always-private field
+for the same reason. Its suggestion that the community cleanup could remain an
+audited exception is rejected: the zero-production-capability contract includes
+that retained handle.
+
+Every slice removes its old allowlist entries immediately, keeps the external
+set monotonically decreasing, runs the M5 inventories plus affected behavior
+tests, receives an Opus review, and commits before the next slice. R4 is
+complete only when production raw connection access is zero, retained or
+renamed raw handles are also rejected, the named test-support set is exact,
+and a RED mutation control proves the final guard catches a production bypass.
+
+#### R4-1 — Space-context DB implementation
+
+- RED: removing the six-occurrence `space_context.rs` allowance from the
+  shrink-only ratchet failed with exactly
+  `crates/wenlan-core/src/space_context.rs: 6 new direct .conn.lock() accesses`.
+- Move the complete existing `impl MemoryDB`, legacy watermark constant, and
+  private TOML helper into `db/space_context.rs`. Keep
+  `ResolvedWriteSpace`, `LegacyDefaultImport`, their public paths, and the
+  existing tests in `crate::space_context`.
+- The normalized old and new moved blocks are byte-identical with SHA-256
+  `2c695b82ad063355ee9cd14c67eaaecec79666932ddd64f42841edd5233897ae`.
+  Public types and tests are also byte-identical. SQL, error/log text,
+  signatures, locking, transactions, ordering, and callers are unchanged.
+- GREEN: the direct-access ratchet passes `1 / 1`; Space-context behavior
+  passes `4 / 4`; rust-analyzer reports no diagnostics in either Space module
+  and no errors in `db.rs`.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only `db.rs` line addresses shift by
+  `+1` for the new module declaration. No truth adapter, manifest row, writer
+  permit, or cutover generation changes.
+- PR-level verification passes: all-target Clippy with `-D warnings` for
+  `wenlan-core` plus `wenlan-server`, and one uninterrupted
+  `cargo test --workspace --lib --quiet`: CLI `32 / 32`; core `3,302` passed
+  with `33` ignored; MCP `178 / 178`; server `339` passed with `2` ignored;
+  types `183 / 183`.
+- REVIEW 1, 2026-07-29: Opus/xhigh judged the refactor sound and independently
+  confirmed movement fidelity, private-method callers, descendant-module
+  visibility, import wiring, honest ratchet shrinkage, and the uniform `+1`
+  generated inventory shift. Its one **FIX-FIRST** blocker was mechanical:
+  `db/space_context.rs` was still untracked, so worktree tests could pass while
+  the committed tree omitted the declared module. Exact staging of the new
+  child plus the five tracked files is therefore the commit gate. The four
+  behavior tests intentionally stay with the public Space-context types: they
+  exercise the stable public lifecycle rather than private SQL mechanics.
+- REVIEW 2, 2026-07-29: after exact staging and the staged-tree drift/M5
+  rerun, Opus/xhigh returned **clean, mergeable**. It independently confirmed
+  the child is present in the index, all 65 live `db.rs` inventory addresses,
+  private-method locality, descendant visibility, and that this is a genuine
+  DB implementation rather than path-based matcher evasion. Two non-blocking
+  guard gaps remain explicit R4 closure work: dead baseline rows must not
+  remain standing grants, and the final boundary must reject external
+  connection retention or renamed access rather than trust the `db/**` path
+  exclusion alone.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,

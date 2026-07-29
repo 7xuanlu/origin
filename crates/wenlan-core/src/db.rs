@@ -32,6 +32,7 @@ pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
 mod source_sync;
+mod space_context;
 mod truth_exposure;
 
 pub use truth_exposure::{TruthMarkerAudit, TRUTH_CUTOVER_GENERATION_KEY};
