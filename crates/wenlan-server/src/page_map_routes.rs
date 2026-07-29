@@ -18,6 +18,7 @@ use wenlan_core::db::page_map::{
     PageMapEdge as CoreEdge, PageMapNode as CoreNode,
 };
 use wenlan_core::db::MemoryDB;
+use wenlan_core::truth_contract::TruthGrant;
 use wenlan_types::page_map::{
     CreateMapEdgeRequest, CreateMapNodeRequest, DeleteMapEdgeRequest, DeleteMapNodeRequest,
     EdgeMutationResponse, NodeMutationResponse, PageMapEdge as WireEdge, PageMapNode as WireNode,
@@ -28,8 +29,38 @@ use wenlan_types::page_map::{
 use crate::error::ServerError;
 use crate::state::ServerState;
 
-async fn ensure_page_exists(db: &MemoryDB, page_id: &str) -> Result<(), ServerError> {
-    db.get_page(page_id)
+/// The grant every *mutation* route in this module resolves to.
+///
+/// Their manifest marker shape is `None`, so the wire guard refuses a
+/// reader-intent marker before the handler ever runs: a mutation response here
+/// can only be automatic. Naming that beats threading a `TruthView` through
+/// eight write handlers to carry a value the router already fixed -- and if one
+/// of them is ever given a marker shape, this under-exposes (fail closed)
+/// rather than over. The one read route, `GET /api/pages/{id}/map`, carries
+/// `NamedPage` and takes the resolved view instead.
+const MUTATION_GRANT: TruthGrant = TruthGrant::Automatic;
+
+/// The page this call may see, or `None`.
+///
+/// Every page lookup in this module goes through here so a page the caller was
+/// not granted reads as **absent** rather than as a page whose existence leaks
+/// through a probe. `filter_page` collapses `Hidden` to `None`, which is what
+/// makes that the same answer a genuinely missing page already gets.
+async fn visible_page(
+    db: &MemoryDB,
+    grant: &TruthGrant,
+    page_id: &str,
+) -> Result<Option<wenlan_core::pages::Page>, ServerError> {
+    let page = db.get_page(page_id).await?;
+    Ok(wenlan_core::truth_adapter::filter_page(db, grant, page).await?)
+}
+
+async fn ensure_page_exists(
+    db: &MemoryDB,
+    grant: &TruthGrant,
+    page_id: &str,
+) -> Result<(), ServerError> {
+    visible_page(db, grant, page_id)
         .await?
         .ok_or_else(|| ServerError::NotFound(format!("page {page_id} not found")))?;
     Ok(())
@@ -63,15 +94,23 @@ fn root_node_id(nodes: &[CoreNode]) -> Option<String> {
 /// logic.
 async fn compute_ref_state(
     db: &MemoryDB,
+    grant: &TruthGrant,
     ref_kind: &str,
     ref_id: &str,
 ) -> Result<RefState, ServerError> {
     let live = match ref_kind {
         "memory" => db.get_memory_type(ref_id).await?.is_some(),
         "entity" => db.get_entity_name_type(ref_id).await?.is_some(),
-        "page" => db.get_page(ref_id).await?.is_some(),
+        // A page this caller may not see has to read as ABSENT to the probe,
+        // otherwise the map leaks the existence of a page that was never
+        // granted. The resulting answer is "link unresolved" -- `Dangling`, the
+        // shape a broken ref already has -- not an error.
+        "page" => visible_page(db, grant, ref_id).await?.is_some(),
+        // Same for a section ref, with prose on top: the heading check reads
+        // the page's body, so an ungranted page must not reach it. A reduced
+        // entry carries an empty body, which lands on `false` for free.
         "section" => match ref_id.split_once('#') {
-            Some((page_id, heading_slug)) => match db.get_page(page_id).await? {
+            Some((page_id, heading_slug)) => match visible_page(db, grant, page_id).await? {
                 Some(page) => wenlan_core::page_map_improve::extract_headings(&page.content)
                     .iter()
                     .any(|h| wenlan_core::export::obsidian::slugify(h) == heading_slug),
@@ -88,8 +127,12 @@ async fn compute_ref_state(
     })
 }
 
-async fn wire_node(db: &MemoryDB, node: CoreNode) -> Result<WireNode, ServerError> {
-    let ref_state = compute_ref_state(db, &node.ref_kind, &node.ref_id).await?;
+async fn wire_node(
+    db: &MemoryDB,
+    grant: &TruthGrant,
+    node: CoreNode,
+) -> Result<WireNode, ServerError> {
+    let ref_state = compute_ref_state(db, grant, &node.ref_kind, &node.ref_id).await?;
     Ok(WireNode {
         id: node.id,
         parent_id: node.parent_id,
@@ -122,6 +165,7 @@ fn wire_edge(edge: CoreEdge) -> WireEdge {
 
 async fn build_map_response(
     db: &MemoryDB,
+    grant: &TruthGrant,
     page_id: &str,
     data: PageMapData,
 ) -> Result<PageMapResponse, ServerError> {
@@ -132,7 +176,7 @@ async fn build_map_response(
         .and_then(|v| serde_json::from_str::<PageMapViewport>(v).ok());
     let mut nodes = Vec::with_capacity(data.nodes.len());
     for node in data.nodes {
-        nodes.push(wire_node(db, node).await?);
+        nodes.push(wire_node(db, grant, node).await?);
     }
     let edges = data.edges.into_iter().map(wire_edge).collect();
     Ok(PageMapResponse {
@@ -160,18 +204,19 @@ pub struct MapIncludeQuery {
 pub async fn handle_get_page_map(
     State(state): State<Arc<RwLock<ServerState>>>,
     Path(page_id): Path<String>,
+    view: crate::truth_guard::TruthView,
     Query(query): Query<MapIncludeQuery>,
 ) -> Result<Json<PageMapResponse>, ServerError> {
     let db = {
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    ensure_page_exists(&db, &page_id).await?;
+    ensure_page_exists(&db, &view.grant, &page_id).await?;
 
     let include_dismissed = query.include.as_deref() == Some("dismissed");
     let data = db.get_page_map(&page_id, include_dismissed).await?;
     let response = match data {
-        Some(data) => build_map_response(&db, &page_id, data).await?,
+        Some(data) => build_map_response(&db, &view.grant, &page_id, data).await?,
         None => PageMapResponse {
             page_id,
             revision: 0,
@@ -223,7 +268,9 @@ pub async fn handle_put_page_map_layout(
             &positions,
         )
         .await?;
-    Ok(Json(build_map_response(&db, &page_id, data).await?))
+    Ok(Json(
+        build_map_response(&db, &MUTATION_GRANT, &page_id, data).await?,
+    ))
 }
 
 /// POST /api/pages/{id}/map/nodes
@@ -287,11 +334,11 @@ pub async fn handle_create_map_node(
     match outcome {
         CreateNodeOutcome::Created(node) => Ok(Json(NodeMutationResponse {
             revision: base_revision + 1,
-            node: wire_node(&db, node).await?,
+            node: wire_node(&db, &MUTATION_GRANT, node).await?,
         })),
         CreateNodeOutcome::Duplicate(node) => Ok(Json(NodeMutationResponse {
             revision: base_revision,
-            node: wire_node(&db, node).await?,
+            node: wire_node(&db, &MUTATION_GRANT, node).await?,
         })),
         CreateNodeOutcome::Tombstoned => Err(ServerError::Conflict(format!(
             "node for {ref_kind}:{ref_id} was previously dismissed under this parent"
@@ -324,7 +371,7 @@ pub async fn handle_patch_map_node(
         .await?;
     Ok(Json(NodeMutationResponse {
         revision: base_revision + 1,
-        node: wire_node(&db, node).await?,
+        node: wire_node(&db, &MUTATION_GRANT, node).await?,
     }))
 }
 
@@ -345,7 +392,7 @@ pub async fn handle_delete_map_node(
         .await?;
     Ok(Json(NodeMutationResponse {
         revision: req.base_revision + 1,
-        node: wire_node(&db, node).await?,
+        node: wire_node(&db, &MUTATION_GRANT, node).await?,
     }))
 }
 
@@ -483,7 +530,7 @@ pub async fn handle_improve_page_map(
     // None arm is defensive and mirrors GET's empty-map shape.
     let data = db.get_page_map(&page_id, false).await?;
     let response = match data {
-        Some(data) => build_map_response(&db, &page_id, data).await?,
+        Some(data) => build_map_response(&db, &MUTATION_GRANT, &page_id, data).await?,
         None => PageMapResponse {
             page_id,
             revision: 0,
@@ -625,6 +672,7 @@ mod tests {
         let Json(response) = handle_get_page_map(
             State(state),
             Path(page_id.clone()),
+            crate::truth_guard::TruthView::automatic(),
             Query(MapIncludeQuery { include: None }),
         )
         .await
@@ -644,6 +692,7 @@ mod tests {
         let result = handle_get_page_map(
             State(state),
             Path("nonexistent-page".to_string()),
+            crate::truth_guard::TruthView::automatic(),
             Query(MapIncludeQuery { include: None }),
         )
         .await;
@@ -926,6 +975,7 @@ mod tests {
         let Json(without) = handle_get_page_map(
             State(state.clone()),
             Path(page_id.clone()),
+            crate::truth_guard::TruthView::automatic(),
             Query(MapIncludeQuery { include: None }),
         )
         .await
@@ -938,6 +988,7 @@ mod tests {
         let Json(with) = handle_get_page_map(
             State(state),
             Path(page_id),
+            crate::truth_guard::TruthView::automatic(),
             Query(MapIncludeQuery {
                 include: Some("dismissed".to_string()),
             }),
@@ -1078,7 +1129,9 @@ mod tests {
         let ref_id = format!("{page_id}#{slug}");
 
         assert_eq!(
-            compute_ref_state(&db, "section", &ref_id).await.unwrap(),
+            compute_ref_state(&db, &TruthGrant::Automatic, "section", &ref_id)
+                .await
+                .unwrap(),
             RefState::Live
         );
 
@@ -1088,7 +1141,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            compute_ref_state(&db, "section", &ref_id).await.unwrap(),
+            compute_ref_state(&db, &TruthGrant::Automatic, "section", &ref_id)
+                .await
+                .unwrap(),
             RefState::Dangling
         );
     }

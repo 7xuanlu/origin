@@ -22,7 +22,7 @@
 
 use axum::{
     extract::{FromRequestParts, MatchedPath, RawPathParams, Request, State},
-    http::StatusCode,
+    http::{request::Parts, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -64,6 +64,31 @@ impl TruthView {
             .get::<Self>()
             .cloned()
             .unwrap_or_else(Self::automatic)
+    }
+}
+
+/// Handlers read the resolved view as an ordinary extractor.
+///
+/// This does not weaken the middleware argument at the top of this file. The
+/// guard is total because it must *refuse* on routes that have no adapter, and
+/// an extractor cannot be total. This extractor only hands an adapter-bearing
+/// handler the answer the guard already resolved -- it decides nothing.
+///
+/// It cannot fail: a request that never passed the guard has no extension, and
+/// the answer for that is the conservative one, not a rejection. A unit test
+/// that builds a bare `Request` gets `Automatic`, which is what it should get.
+impl<S> FromRequestParts<S> for TruthView
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(Self::automatic))
     }
 }
 

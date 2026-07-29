@@ -622,3 +622,151 @@ async fn selected_summary_requires_nonempty_all_matching_sources() {
         vec!["work-summary"]
     );
 }
+
+// ---- fold_orphan_labels ----
+//
+// Pure and DB-free: these assert that the Rust fold reproduces the SQL
+// aggregate it replaced (`GROUP BY label_key HAVING n >= ? ORDER BY n DESC,
+// display_label ASC LIMIT 100`). That equivalence is the load-bearing claim --
+// the truth adapter can only filter orphan rows before the fold if the fold is
+// the same grouping the aggregate did.
+
+use super::scoped_pages::OrphanLinkRow;
+use crate::db::MemoryDB;
+
+fn orphan_row(label_key: &str, label: &str, source_page_id: &str) -> OrphanLinkRow {
+    OrphanLinkRow {
+        label_key: label_key.to_string(),
+        label: label.to_string(),
+        source_page_id: source_page_id.to_string(),
+    }
+}
+
+#[test]
+fn fold_orphan_labels_applies_the_min_count_threshold() {
+    let rows = vec![
+        orphan_row("rust", "Rust", "page_a"),
+        orphan_row("rust", "Rust", "page_b"),
+        orphan_row("zig", "Zig", "page_a"),
+    ];
+
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows.clone(), 2),
+        vec![("Rust".to_string(), 2)]
+    );
+    // Below the threshold the single-source label comes back too, ordered
+    // after the 2-source one.
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 1),
+        vec![("Rust".to_string(), 2), ("Zig".to_string(), 1)]
+    );
+}
+
+#[test]
+fn fold_orphan_labels_picks_the_lexicographic_min_label_like_sql_min() {
+    // Same key, three casings. `MIN(pl.label)` under BINARY collation is byte
+    // order, so uppercase wins over lowercase.
+    let rows = vec![
+        orphan_row("rust", "rust", "page_a"),
+        orphan_row("rust", "Rust", "page_b"),
+        orphan_row("rust", "RUST", "page_c"),
+    ];
+
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 1),
+        vec![("RUST".to_string(), 3)]
+    );
+}
+
+#[test]
+fn fold_orphan_labels_orders_by_count_desc_then_label_asc() {
+    let rows = vec![
+        orphan_row("beta", "Beta", "page_a"),
+        orphan_row("alpha", "Alpha", "page_a"),
+        orphan_row("alpha", "Alpha", "page_b"),
+        orphan_row("gamma", "Gamma", "page_a"),
+        orphan_row("gamma", "Gamma", "page_b"),
+    ];
+
+    // Alpha and Gamma tie at 2 and break on label ASC; Beta trails at 1.
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 1),
+        vec![
+            ("Alpha".to_string(), 2),
+            ("Gamma".to_string(), 2),
+            ("Beta".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn fold_orphan_labels_counts_distinct_source_pages() {
+    // A repeated (source_page_id, label_key) pair cannot exist under the
+    // `page_links` primary key, but the count is DISTINCT regardless of it.
+    let rows = vec![
+        orphan_row("rust", "Rust", "page_a"),
+        orphan_row("rust", "Rust", "page_a"),
+        orphan_row("rust", "Rust", "page_b"),
+    ];
+
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 2),
+        vec![("Rust".to_string(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn orphan_link_rows_scoped_agrees_with_the_aggregate_twin() {
+    // The rows query exists so a reader can filter by source page BEFORE the
+    // grouping happens. That only holds if rows + fold == the aggregate, so
+    // assert the equivalence against a real DB on both scope arms.
+    let (db, _tmp) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, workspace) in [
+        ("work-a", "work"),
+        ("work-b", "work"),
+        ("personal-a", "personal"),
+    ] {
+        db.insert_page_with_kind(
+            id,
+            id,
+            None,
+            "orphan row canary",
+            None,
+            Some("decision"),
+            &[],
+            &now,
+            "authored",
+            "confirmed",
+            Some(workspace),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO page_links (source_page_id, target_page_id, label, label_key)
+         VALUES ('work-a', NULL, 'Shared topic', 'shared topic'),
+                ('work-b', NULL, 'shared topic', 'shared topic'),
+                ('personal-a', NULL, 'Shared topic', 'shared topic'),
+                ('work-a', NULL, 'Lone topic', 'lone topic')",
+        (),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    for scope in [ReadScope::Global, ReadScope::Space("work".to_string())] {
+        for min_count in [1, 2, 3] {
+            let rows = db.list_orphan_link_rows_scoped(&scope).await.unwrap();
+            assert_eq!(
+                MemoryDB::fold_orphan_labels(rows, min_count),
+                db.list_orphan_link_labels_scoped(min_count, &scope)
+                    .await
+                    .unwrap(),
+                "rows+fold diverged from the aggregate at {scope:?} min_count={min_count}"
+            );
+        }
+    }
+}

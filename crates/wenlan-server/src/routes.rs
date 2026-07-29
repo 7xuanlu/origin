@@ -148,6 +148,7 @@ pub async fn handle_search(
     State(state): State<Arc<RwLock<ServerState>>>,
     headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ServerError> {
     let start = std::time::Instant::now();
@@ -225,16 +226,21 @@ pub async fn handle_search(
         let visible = db
             .select_visible_pages_scoped(raw, &scope, &ids, &trust_level, 3)
             .await;
-        if visible.is_empty() {
-            None
-        } else {
-            Some(
-                visible
-                    .into_iter()
-                    .map(wenlan_core::db::MemoryDB::search_result_from_page)
-                    .collect(),
-            )
-        }
+        // A surfaced page arrives as a `SearchResult` carrying the page's PROSE
+        // in `content`, not as a `Page`, so it rides on `Full` -- there is no
+        // entry form for a search hit. `source_id` is the page id
+        // (`search_result_from_page`, db.rs).
+        let surfaced: Vec<wenlan_types::memory::SearchResult> = visible
+            .into_iter()
+            .map(wenlan_core::db::MemoryDB::search_result_from_page)
+            .collect();
+        let surfaced =
+            wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, surfaced, |row| {
+                row.source_id.as_str()
+            })
+            .await
+            .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+        (!surfaced.is_empty()).then_some(surfaced)
     };
 
     Ok(Json(SearchResponse {
@@ -296,6 +302,7 @@ fn render_brief_for_legacy(response: &wenlan_types::BriefReadResponse) -> String
 pub async fn handle_context(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<ChatContextRequest>,
 ) -> Result<Json<ChatContextResponse>, ServerError> {
     let start = std::time::Instant::now();
@@ -478,8 +485,18 @@ pub struct DistillRequest {
 }
 
 /// POST /api/distill
+/// The write half of this route is gated downstream, but the RESPONSE is a page
+/// reader three times over: stale pages carry title/summary/stale_reason and
+/// their source ids, each pending cluster can name the page it overlaps, and the
+/// orphan feed is text lifted out of page bodies. All three go through the
+/// adapter below.
+///
+/// Its manifest shape is `MarkerShape::None`, so `view.grant` always resolves to
+/// `Automatic` today. Taking the view anyway is what keeps that a fact about the
+/// manifest rather than an assumption baked into the handler.
 pub async fn handle_distill(
     State(state): State<Arc<RwLock<ServerState>>>,
+    view: crate::truth_guard::TruthView,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let req: DistillRequest = if body.is_empty() {
@@ -635,14 +652,51 @@ pub async fn handle_distill(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
+    // The overlap match names a page, and the cluster payload publishes that
+    // name. Resolve the whole loop's candidates in ONE adapter call up front --
+    // per-cluster calls would be one `page_visibility` query per pending
+    // cluster, and the overlap itself is a pure in-memory scan of `page_index`.
+    let best_per_cluster: Vec<_> = result
+        .pending
+        .iter()
+        .map(|cluster| {
+            wenlan_core::db::best_overlapping_page_in_index(&page_index, &cluster.source_ids)
+        })
+        .collect();
+    let overlap_candidates: Vec<String> = best_per_cluster
+        .iter()
+        .flatten()
+        .map(|m| m.page_id.clone())
+        .collect();
+    let visible_overlaps: std::collections::HashSet<String> =
+        wenlan_core::truth_adapter::filter_page_refs(
+            &db,
+            &view.grant,
+            overlap_candidates,
+            |page_id| page_id.as_str(),
+        )
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .into_iter()
+        .collect();
+
     let mut filtered_pending: Vec<serde_json::Value> = Vec::new();
-    for cluster in &result.pending {
+    for (cluster, best) in result.pending.iter().zip(best_per_cluster) {
         let cluster_size = cluster.source_ids.len();
-        let best =
-            wenlan_core::db::best_overlapping_page_in_index(&page_index, &cluster.source_ids);
 
         let (existing_page_id, existing_page_title, new_memory_count) = match best {
+            // Gate the disclosure, keep the suppression. A fully-covered cluster
+            // is dropped whether or not the caller may see the page that covers
+            // it: suppressing a duplicate uses the knowledge without disclosing
+            // it, and surfacing the cluster instead would have the agent mint a
+            // second page for a topic that already has one.
             Some(m) if m.intersection >= cluster_size || m.jaccard >= 0.8 => continue,
+            // For this caller the overlapping page does not exist, so neither
+            // its id nor its title is emitted -- and every memory in the cluster
+            // is new. `cluster_size - m.intersection` is derived from the hidden
+            // page's own source list, so publishing it would leak how much of
+            // this cluster that page already covers.
+            Some(m) if !visible_overlaps.contains(&m.page_id) => (None, None, cluster_size),
             Some(m) => (
                 Some(m.page_id),
                 Some(m.page_title),
@@ -681,6 +735,22 @@ pub async fn handle_distill(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
+    // 10 is the LIMIT inside list_stale_pages_scoped. Surface a hint so the
+    // skill can tell the user to re-run instead of silently dropping rows.
+    // Read PRE-filter on purpose: the flag means "the query hit its cap", not
+    // "you were shown ten", so the adapter below must not move it.
+    let stale_truncated = stale_pages_list.len() == 10;
+
+    // The payload quotes page prose -- title, summary, and `stale_reason`, which
+    // names why the page changed -- and hands out `source_memory_ids` on top, so
+    // the pages are reduced before it is built rather than after. Filtering here
+    // means an `EntryOnly` page arrives with those fields already blanked and
+    // flows through the map below unchanged.
+    let stale_pages_list =
+        wenlan_core::truth_adapter::filter_pages(&db, &view.grant, stale_pages_list)
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
+
     let stale_pages_payload: Vec<serde_json::Value> = stale_pages_list
         .iter()
         .map(|p| {
@@ -695,9 +765,6 @@ pub async fn handle_distill(
             })
         })
         .collect();
-    // 10 is the LIMIT inside list_stale_pages_scoped. Surface a hint so the
-    // skill can tell the user to re-run instead of silently dropping rows.
-    let stale_truncated = stale_pages_list.len() == 10;
 
     // Walk orphan rows in case a page minted earlier in this pass (or by
     // a concurrent create_page call) now matches an existing orphan label.
@@ -722,11 +789,22 @@ pub async fn handle_distill(
     let orphan_topics: Vec<serde_json::Value> = if scoped {
         Vec::new()
     } else {
-        let raw = db
-            .list_orphan_link_labels(2)
+        // Same rows-then-fold shape as GET /api/pages/orphan-links, and for the
+        // same reason: a label leaks the page whose body it was lifted out of,
+        // and the aggregate twin would compute its counts and its 100-row cap
+        // over pages this caller cannot see. `Global` keeps this feed's existing
+        // unscoped reach -- the route already ignored the request's Space here.
+        let rows = db
+            .list_orphan_link_rows_scoped(&wenlan_core::read_scope::ReadScope::Global)
             .await
             .map_err(|e| ServerError::Internal(e.to_string()))?;
-        raw.into_iter()
+        let rows = wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, rows, |row| {
+            row.source_page_id.as_str()
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        wenlan_core::db::MemoryDB::fold_orphan_labels(rows, 2)
+            .into_iter()
             .map(|(label, count)| serde_json::json!({"label": label, "count": count}))
             .collect()
     };
@@ -814,6 +892,7 @@ pub struct RecentLimitQuery {
 pub async fn handle_recent_retrievals(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(q): axum::extract::Query<RecentLimitQuery>,
 ) -> Result<Json<Vec<wenlan_types::RetrievalEvent>>, ServerError> {
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
@@ -823,10 +902,53 @@ pub async fn handle_recent_retrievals(
     };
     let db = db.ok_or(ServerError::DbNotInitialized)?;
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let events = db
+    let mut events = db
         .list_recent_retrievals_scoped(limit, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // A retrieval event is not a page, but `page_titles` is page prose -- here
+    // the title IS the disclosure, so a title survives only when its page does.
+    // `page_ids` is documented as corresponding 1:1 with `page_titles`, so the
+    // pair is the unit that lives or dies, and there is no entry form for half
+    // of one: `Full` or dropped.
+    //
+    // The event itself is never dropped. Its query, agent and timestamp are the
+    // caller's own activity rather than anything about a page, and an event that
+    // vanished would say more than one that came back with no titles.
+    //
+    // One adapter call for the whole feed: every candidate id across every
+    // event goes in, the survivors come back as a set, and each event rebuilds
+    // its pairs from that. Per-event calls would be one `page_visibility` query
+    // per row of a 100-row feed.
+    let page_ids: Vec<String> = events
+        .iter()
+        .filter(|event| event.page_ids.len() == event.page_titles.len())
+        .flat_map(|event| event.page_ids.iter().cloned())
+        .collect();
+    let visible: std::collections::HashSet<String> =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, page_ids, |id| id.as_str())
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .into_iter()
+            .collect();
+    for event in &mut events {
+        // Legacy rows recorded before `page_ids` existed carry titles and no
+        // ids, and any other length mismatch is the same situation: nothing
+        // attributes a title to a page, so nothing can be checked against a
+        // verdict. Unknown is not permission -- both vectors clear.
+        if event.page_ids.len() != event.page_titles.len() {
+            event.page_ids.clear();
+            event.page_titles.clear();
+            continue;
+        }
+        let (ids, titles): (Vec<String>, Vec<String>) = std::mem::take(&mut event.page_ids)
+            .into_iter()
+            .zip(std::mem::take(&mut event.page_titles))
+            .filter(|(id, _)| visible.contains(id))
+            .unzip();
+        event.page_ids = ids;
+        event.page_titles = titles;
+    }
     Ok(Json(events))
 }
 
@@ -834,6 +956,7 @@ pub async fn handle_recent_retrievals(
 pub async fn handle_recent_page_changes(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(q): axum::extract::Query<RecentLimitQuery>,
 ) -> Result<Json<Vec<wenlan_types::PageChange>>, ServerError> {
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
@@ -847,6 +970,15 @@ pub async fn handle_recent_page_changes(
         .list_recent_changes_scoped(limit, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // A change row hangs off a page (id + title + what happened to it) rather
+    // than being one, and it carries no truth axes of its own, so there is no
+    // entry form for it: `Full` or dropped.
+    let changes =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, changes, |change| {
+            change.page_id.as_str()
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Json(changes))
 }
 
@@ -855,6 +987,7 @@ pub async fn handle_recent_page_changes(
 pub async fn handle_recent_pages(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(q): axum::extract::Query<crate::memory_routes::RecentActivityQuery>,
 ) -> Result<Json<Vec<wenlan_types::RecentActivityItem>>, ServerError> {
     let db = {
@@ -863,10 +996,29 @@ pub async fn handle_recent_pages(
     };
     let db = db.ok_or(ServerError::DbNotInitialized)?;
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let items = db
+    let mut items = db
         .list_recent_pages_with_badges_scoped(q.limit.unwrap_or(10), q.since_ms, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // The feed interleaves pages and memories under one `id` field, so only the
+    // page rows may be keyed on it -- a memory source_id carries no truth state
+    // and would read as unsupported, dropping memories that this contract says
+    // nothing about. An item carries a `snippet` of the page's prose, so the
+    // page rows ride on `Full` with no entry form.
+    let page_ids: Vec<String> = items
+        .iter()
+        .filter(|item| item.kind == wenlan_types::memory::ActivityKind::Page)
+        .map(|item| item.id.clone())
+        .collect();
+    let visible: std::collections::HashSet<String> =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, page_ids, |id| id.as_str())
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .into_iter()
+            .collect();
+    items.retain(|item| {
+        item.kind != wenlan_types::memory::ActivityKind::Page || visible.contains(&item.id)
+    });
     Ok(Json(items))
 }
 
