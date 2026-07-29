@@ -897,6 +897,7 @@ pub async fn handle_search_memory(
     State(state): State<Arc<RwLock<ServerState>>>,
     headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<SearchMemoryRequest>,
 ) -> Result<Json<SearchMemoryResponse>, ServerError> {
     let start = std::time::Instant::now();
@@ -1052,6 +1053,24 @@ pub async fn handle_search_memory(
             }
             None => None,
         }
+    };
+
+    // Both branches above land here, so the gate is total over the field. A
+    // page-channel row is a `SearchResult` carrying the page's PROSE in
+    // `content`, not a `Page`, so it rides on `Full` -- there is no entry form
+    // for a search hit, and reducing one would leave a titled row with an empty
+    // body. `source_id` is the page id (`search_result_from_page`, db.rs).
+    let supplemental_pages = match supplemental_pages {
+        Some(pages) => {
+            let kept =
+                wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, pages, |row| {
+                    row.source_id.as_str()
+                })
+                .await
+                .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+            (!kept.is_empty()).then_some(kept)
+        }
+        None => None,
     };
 
     Ok(Json(SearchMemoryResponse {
@@ -1954,6 +1973,7 @@ pub async fn handle_get_rejections(
 pub async fn handle_list_pages(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("active");
@@ -1984,6 +2004,9 @@ pub async fn handle_list_pages(
         .list_pages_scoped_browse(status, limit as i64, offset as i64, &scope)
         .await
         .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    let pages = wenlan_core::truth_adapter::filter_pages(&db, &view.grant, pages)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
     Ok(Json(serde_json::json!({ "pages": pages })))
 }
 
@@ -1991,6 +2014,7 @@ pub async fn handle_list_pages(
 pub async fn handle_get_page(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let db = {
@@ -2000,10 +2024,18 @@ pub async fn handle_get_page(
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     // Q1 browse surface: a shadow id resolves 200 here, so read the unfenced
     // `_browse` twin (mutation/export by-id reads keep fenced `get_page_scoped`).
-    match db.get_page_scoped_browse(&id, &scope).await {
-        Ok(Some(page)) => Ok(Json(serde_json::json!({ "page": page }))),
-        Ok(None) => Err(ServerError::NotFound("page not found".to_string())),
-        Err(e) => Err(ServerError::SearchFailed(e.to_string())),
+    let page = db
+        .get_page_scoped_browse(&id, &scope)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    match wenlan_core::truth_adapter::filter_page(&db, &view.grant, page)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?
+    {
+        Some(page) => Ok(Json(serde_json::json!({ "page": page }))),
+        // A hidden page 404s rather than 200-ing empty: for this caller it is
+        // not there, and the existing not-found answer is the honest one.
+        None => Err(ServerError::NotFound("page not found".to_string())),
     }
 }
 
@@ -2014,6 +2046,7 @@ pub async fn handle_get_page(
 pub async fn handle_get_page_sources(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<wenlan_types::PageSourceWithMemory>>, ServerError> {
     let db = {
@@ -2023,6 +2056,15 @@ pub async fn handle_get_page_sources(
 
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     let sources = db.get_page_sources_scoped(&id, &scope).await?;
+    // The provenance trail hangs off the page rather than being it, so it has
+    // no entry form: `reduce_to_entry` strips `source_memory_ids` precisely
+    // because handing them out turns a listing into a retrieval plan, and this
+    // route hands out the memories themselves on top. Full or nothing.
+    let sources =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, sources, |source| {
+            source.page_id.as_str()
+        })
+        .await?;
 
     let source_id_strings: Vec<String> =
         sources.iter().map(|s| s.memory_source_id.clone()).collect();
@@ -2108,6 +2150,7 @@ pub async fn handle_delete_page(
 pub async fn handle_search_pages(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<SearchPagesRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let db = {
@@ -2124,6 +2167,9 @@ pub async fn handle_search_pages(
             req.page_type.as_deref(),
             &scope,
         )
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    let results = wenlan_core::truth_adapter::filter_pages(&db, &view.grant, results)
         .await
         .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
     Ok(Json(serde_json::json!({ "pages": results })))
@@ -2244,6 +2290,29 @@ pub async fn handle_export_pages(
         .list_pages_scoped("active", 1000, 0, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // A write, not a read: this puts page prose into a vault the caller names,
+    // and whoever opens that vault later declared no contract and made no
+    // gesture -- so the write has to satisfy the automatic reader, which is
+    // what `page_write_permit` asks. The projection writer takes its permit
+    // through `write_page_gated`; this exporter has no such twin, so the permit
+    // is taken here. A declined page is skipped rather than failing the export:
+    // refusing to export an unsupported page is the contract working.
+    let mut exportable = Vec::with_capacity(pages.len());
+    let mut declined = 0usize;
+    for page in pages {
+        if wenlan_core::truth_adapter::page_write_permit(&db, &page.id)
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .is_some()
+        {
+            exportable.push(page);
+        } else {
+            declined += 1;
+        }
+    }
+    if declined > 0 {
+        tracing::info!("[export] skipped {declined} page(s) the automatic reader may not see");
+    }
     let vault_path = req
         .vault_path
         .unwrap_or_else(|| "~/obsidian-vault/Wenlan/pages".to_string());
@@ -2257,7 +2326,7 @@ pub async fn handle_export_pages(
         wenlan_core::export::obsidian::ObsidianExporter::new(std::path::PathBuf::from(expanded));
     use wenlan_core::export::PageExporter;
     let stats = exporter
-        .export_all(&pages)
+        .export_all(&exportable)
         .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Json(stats))
 }
@@ -2286,6 +2355,18 @@ pub async fn handle_export_page(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?
         .ok_or_else(|| ServerError::NotFound("page not found".to_string()))?;
+
+    // Same permit as the bulk export, and for the same reason: the vault this
+    // writes into is read later by someone who declared no contract. A page the
+    // automatic reader may not see is not there for that reader, so the route's
+    // existing not-found answer is the honest one.
+    if wenlan_core::truth_adapter::page_write_permit(&db, &page.id)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .is_none()
+    {
+        return Err(ServerError::NotFound("page not found".to_string()));
+    }
 
     let expanded = if let Some(rest) = req.vault_path.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -3502,6 +3583,7 @@ pub async fn handle_get_snapshot_captures_with_content(
 pub async fn handle_get_page_links(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Path(id): Path<String>,
 ) -> Result<Json<wenlan_types::responses::PageLinksResponse>, ServerError> {
     let db = {
@@ -3509,13 +3591,57 @@ pub async fn handle_get_page_links(
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    // The whole graph hangs off page `id`: outbound labels are text lifted out
+    // of ITS body, and inbound rows exist only because they point at it. A
+    // caller who may not see the page in full gets neither -- which is what
+    // this route's `NamedPage` marker shape is for. Empty rather than 404,
+    // matching the answer an absent page already gets here.
+    let named_visible = !wenlan_core::truth_adapter::filter_page_refs(
+        &db,
+        &view.grant,
+        vec![id.clone()],
+        |page_id| page_id.as_str(),
+    )
+    .await?
+    .is_empty();
+    if !named_visible {
+        return Ok(Json(wenlan_types::responses::PageLinksResponse {
+            outbound: Vec::new(),
+            inbound: Vec::new(),
+        }));
+    }
     let outbound_raw = db.get_page_outbound_links_scoped(&id, &scope).await?;
     let inbound_raw = db.get_page_inbound_links_scoped(&id, &scope).await?;
+    // An inbound row names ANOTHER page and carries the label it links with; a
+    // grant for `id` does not cover page B's title in A's links.
+    let inbound_raw =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, inbound_raw, |row| {
+            row.0.as_str()
+        })
+        .await?;
+    // Outbound rows are this page's own link text, so they stay -- but a
+    // resolved target names another page. A target the caller may not see reads
+    // as unresolved, the same answer a dangling link already gets, rather than
+    // disclosing that the page exists.
+    let resolved_targets: Vec<String> = outbound_raw
+        .iter()
+        .filter_map(|l| l.target_page_id.clone())
+        .collect();
+    let visible_targets: std::collections::HashSet<String> =
+        wenlan_core::truth_adapter::filter_page_refs(
+            &db,
+            &view.grant,
+            resolved_targets,
+            |target| target.as_str(),
+        )
+        .await?
+        .into_iter()
+        .collect();
     let outbound = outbound_raw
         .into_iter()
         .map(|l| wenlan_types::responses::PageLinkOutbound {
             label: l.label,
-            target_page_id: l.target_page_id,
+            target_page_id: l.target_page_id.filter(|t| visible_targets.contains(t)),
         })
         .collect();
     let inbound = inbound_raw
@@ -3549,6 +3675,7 @@ pub struct OrphanLinksQuery {
 pub async fn handle_list_orphan_links(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(q): axum::extract::Query<OrphanLinksQuery>,
 ) -> Result<Json<wenlan_types::responses::OrphanLinksResponse>, ServerError> {
     let db = {
@@ -3557,11 +3684,27 @@ pub async fn handle_list_orphan_links(
     };
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     let min_count = q.min_count.unwrap_or(2).max(1);
-    let labels = db
-        .list_orphan_link_labels_scoped(min_count, &scope)
+    // The page an orphan label leaks is the SOURCE, not the target it fails to
+    // resolve to: the label is `[[wikilink]]` text lifted out of some page's
+    // body, so a caller who may not read that body may not read the text either.
+    // Label prose has no entry form, hence `filter_page_refs` -- `Full` or gone.
+    //
+    // Filtering has to happen on ROWS, which is why this reads the row query
+    // rather than the aggregate it replaced: `list_orphan_link_labels_scoped`
+    // does the grouping, the `HAVING n >= ?` threshold and the `LIMIT 100`
+    // inside SQL, so post-filtering its output would report counts and a
+    // truncation point computed over pages this caller cannot see.
+    // `fold_orphan_labels` is that same aggregate, applied to what survives.
+    let rows = db
+        .list_orphan_link_rows_scoped(&scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
-    let orphan_labels = labels
+    let rows = wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, rows, |row| {
+        row.source_page_id.as_str()
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let orphan_labels = wenlan_core::db::MemoryDB::fold_orphan_labels(rows, min_count)
         .into_iter()
         .map(|(label, count)| wenlan_types::responses::OrphanLink { label, count })
         .collect();
@@ -3771,11 +3914,13 @@ pub async fn handle_refresh_page(
         // (Global Constraints: stale claim-maps must not survive a content edit).
         citations: Vec::new(),
         kind: existing.kind.clone(),
+        truth: None,
     };
 
     // 1. md-first
     projection
-        .write_page(&refreshed_page)
+        .write_page_gated(&db, &refreshed_page)
+        .await
         .map_err(|e| ServerError::IngestFailed(format!("write_page: {}", e)))?;
 
     use wenlan_core::post_write::WriteOutcome;
@@ -5533,6 +5678,7 @@ pub async fn handle_get_memory_revisions(
 pub async fn handle_get_page_revisions(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Path(id): Path<String>,
 ) -> Result<Json<wenlan_types::responses::ListPageRevisionsResponse>, ServerError> {
     let db = {
@@ -5542,14 +5688,33 @@ pub async fn handle_get_page_revisions(
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     // Q1 sub-resource: revisions is a read-only browse surface, so a shadow id
     // resolves 200 (empty changelog) via the unfenced `_browse` twin.
-    let page = db
-        .get_page_scoped_browse(&id, &scope)
+    let page = db.get_page_scoped_browse(&id, &scope).await?;
+    // A hidden page 404s here for the same reason it does at `GET /api/pages/
+    // {id}`: for this caller it is not there. An `EntryOnly` verdict arrives
+    // already reduced, which is what clears the envelope's own `stale_reason`.
+    let page = wenlan_core::truth_adapter::filter_page(&db, &view.grant, page)
         .await?
         .ok_or_else(|| ServerError::NotFound("page not found".to_string()))?;
-    let changelog_str = db.get_page_changelog_scoped(&id, &scope).await?;
-    let entries: Vec<wenlan_types::responses::PageChangelogEntry> =
+    // A changelog entry is prose about the page -- a delta summary, a citation
+    // verdict -- so it rides on `Full`, never on the `EntryOnly` carve-out that
+    // lets a listing keep a title. `filter_page_refs` over the named id alone
+    // answers "is this page Full for this caller", since the entries have no id
+    // of their own to key on; short of Full the changelog is not even read.
+    let full = !wenlan_core::truth_adapter::filter_page_refs(
+        &db,
+        &view.grant,
+        vec![id.clone()],
+        |page_id| page_id.as_str(),
+    )
+    .await?
+    .is_empty();
+    let entries: Vec<wenlan_types::responses::PageChangelogEntry> = if full {
+        let changelog_str = db.get_page_changelog_scoped(&id, &scope).await?;
         serde_json::from_str(&changelog_str)
-            .map_err(|e| ServerError::Internal(format!("parse changelog: {e}")))?;
+            .map_err(|e| ServerError::Internal(format!("parse changelog: {e}")))?
+    } else {
+        Vec::new()
+    };
     Ok(Json(wenlan_types::responses::ListPageRevisionsResponse {
         page_id: id,
         current_version: page.version,

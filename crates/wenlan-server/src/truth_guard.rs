@@ -22,7 +22,7 @@
 
 use axum::{
     extract::{FromRequestParts, MatchedPath, RawPathParams, Request, State},
-    http::StatusCode,
+    http::{request::Parts, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -64,6 +64,31 @@ impl TruthView {
             .get::<Self>()
             .cloned()
             .unwrap_or_else(Self::automatic)
+    }
+}
+
+/// Handlers read the resolved view as an ordinary extractor.
+///
+/// This does not weaken the middleware argument at the top of this file. The
+/// guard is total because it must *refuse* on routes that have no adapter, and
+/// an extractor cannot be total. This extractor only hands an adapter-bearing
+/// handler the answer the guard already resolved -- it decides nothing.
+///
+/// It cannot fail: a request that never passed the guard has no extension, and
+/// the answer for that is the conservative one, not a rejection. A unit test
+/// that builds a bare `Request` gets `Automatic`, which is what it should get.
+impl<S> FromRequestParts<S> for TruthView
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(Self::automatic))
     }
 }
 
@@ -133,24 +158,15 @@ pub async fn guard(
     let (named_pages, req) = named_pages(req).await;
     let decision = truth_contract::resolve(shape, contract, marker, &named_pages);
 
-    // Every marked call, granted or refused. Best-effort: an audit write that
-    // fails must not take the request with it, but it must be loud, because a
-    // silently absent audit row is the compensating control quietly not being
-    // there.
-    //
-    // Best-effort is a generation-0 choice and PR-C must revisit it. While
-    // `page_visibility` answers `Full` for everything, a lost row records the
-    // absence of a restriction that is not in force, so availability wins.
-    // Once the generation advances the row IS the control for the conceded
-    // composition, and a grant issued without one should refuse instead.
+    // Every marked call, granted or refused, leaves a row.
     //
     // `caller` is whatever the request put in `x-agent-name`. It is unverified,
     // same cooperative tier as the marker itself: a caller that forges the
     // marker can attribute the walk to someone else. The row proves a marked
     // call happened, not who made it.
     let db = { guard_state.state.read().await.db.clone() };
-    if let Some(db) = db {
-        if let Err(error) = db
+    let audited = match &db {
+        Some(db) => match db
             .record_truth_marker(
                 &caller,
                 &method_str,
@@ -160,19 +176,61 @@ pub async fn guard(
             )
             .await
         {
-            tracing::error!("[truth] marker audit write failed for {method_str} {path}: {error}");
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(
+                    "[truth] marker audit write failed for {method_str} {path}: {error}"
+                );
+                false
+            }
+        },
+        None => {
+            // Same failure, different cause: no row was written, so the
+            // compensating control for the conceded enumerate-then-fetch walk is
+            // not there for this call. Latent -- no known window serves requests
+            // before `db` is set.
+            tracing::error!(
+                "[truth] no database open; the marker audit row for {method_str} {path} from \
+                 {caller} (outcome {}, pages {named_pages:?}) was not written",
+                MarkerOutcome::of(&decision).as_str(),
+            );
+            false
         }
-    } else {
-        // Same failure, different cause: no row was written, so the compensating
-        // control for the conceded enumerate-then-fetch walk is not there for
-        // this call. Silence here would be the exact shape the comment above
-        // rules out. Latent -- no known window serves requests before `db` is
-        // set -- which is why the request is still allowed to proceed.
-        tracing::error!(
-            "[truth] no database open; the marker audit row for {method_str} {path} from \
-             {caller} (outcome {}, pages {named_pages:?}) was not written",
-            MarkerOutcome::of(&decision).as_str(),
-        );
+    };
+
+    // PR-C: the row is the ONLY compensating control for the one attack D3
+    // concedes -- `Collection` and `NamedPage` compose, so a caller willing to
+    // forge the marker can enumerate provisional IDs and fetch them one at a
+    // time. Once the cutover is live, a grant issued without a row is that walk
+    // happening invisibly, which is the single thing the control exists to stop.
+    // So a grant that could not be recorded is refused instead.
+    //
+    // Automatic and refused outcomes stay best-effort on purpose: neither issues
+    // any exposure, so failing them closed would trade a real availability loss
+    // for no control at all.
+    //
+    // Before the cutover this branch is unreachable in effect: `page_visibility`
+    // answers `Full` for everything, so a lost row records the absence of a
+    // restriction that is not in force and availability wins. The generation is
+    // read from the same handle that just failed, which is why an absent handle
+    // counts as "cannot establish that the cutover is off" and fails closed.
+    let issues_exposure = matches!(
+        decision,
+        TruthDecision::Grant(TruthGrant::CollectionEntries | TruthGrant::NamedPages(_))
+    );
+    if issues_exposure && !audited {
+        let live = match &db {
+            Some(db) => db.truth_cutover_generation().await.unwrap_or(1) != 0,
+            None => true,
+        };
+        if live {
+            tracing::error!(
+                "[truth] refusing a granted marker at {method_str} {path} from {caller}: the \
+                 audit row could not be written and the cutover is live, so the grant would be \
+                 an unrecorded disclosure"
+            );
+            return refusal(&method_str, &path);
+        }
     }
 
     match decision {

@@ -1471,8 +1471,10 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                     let mut written = 0usize;
                     let mut failed = 0usize;
                     for page in &pages {
-                        match projection.write_page(page) {
-                            Ok(_) => written += 1,
+                        match projection.write_page_gated(&db_arc, page).await {
+                            Ok(Some(_)) => written += 1,
+                            // gated: not projected, not a failure
+                            Ok(None) => {}
                             Err(e) => {
                                 tracing::warn!(
                                     "[backfill] write_page failed for {}: {}",
@@ -1579,10 +1581,30 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                         Ok(removed) => tracing::info!(
                             "[truth] projection invariant evicted {removed} unsupported page(s)"
                         ),
-                        // `error!`, not `warn!`: the pass now runs to completion
-                        // and only returns `Err` when a file it was supposed to
-                        // evict is still on disk and still readable.
-                        Err(e) => tracing::error!("[truth] projection invariant pass failed: {e}"),
+                        // M5 PR-C item 4. A failure means a file the reader may
+                        // not see is still on disk. `wenlan pages` reads that
+                        // directory directly — there is no HTTP response to
+                        // filter and no wire gate in front of it — so at
+                        // generation >= 1 the daemon refuses to open a door it
+                        // cannot hold. At generation 0 the pass removes nothing,
+                        // so a failure records the absence of a restriction that
+                        // is not in force: `error!` and serve, as before.
+                        //
+                        // Refusing to start is acceptable rather than a brick
+                        // because advancing the generation is a deliberate
+                        // ceremony with an operator present.
+                        Err(e) => {
+                            let live = db_arc.truth_cutover_generation().await.unwrap_or(1) != 0;
+                            if live {
+                                let msg = format!(
+                                    "[truth] projection invariant pass failed at cutover \
+                                     generation >= 1; refusing to serve page traffic: {e}"
+                                );
+                                report_bootstrap_error(&wenlan_root, &msg);
+                                return Err(anyhow::anyhow!(msg));
+                            }
+                            tracing::error!("[truth] projection invariant pass failed: {e}");
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("[reconcile] list_pages failed: {e}"),

@@ -142,15 +142,66 @@ async fn an_unmarked_call_at_a_none_shaped_route_is_not_refused() {
 async fn a_marker_at_a_shaped_route_is_served() {
     for (method, uri) in [
         ("GET", "/api/pages"),
-        ("GET", "/api/pages/recent-changes"),
         ("GET", "/api/pages/pg1"),
         ("GET", "/api/pages/pg1/links"),
     ] {
-        let status = status_of(Call::new(method, uri).marked().declaring()).await;
+        // A real database, because this asserts a property of the route's
+        // *shape*. Without one the grant is unauditable and the fail-closed
+        // rule below refuses it, which would make this test pass or fail for a
+        // reason that has nothing to do with shape.
+        let (state, _db, _tmp) = db_state().await;
+        let status = Call::new(method, uri)
+            .marked()
+            .declaring()
+            .send(state)
+            .await;
         assert_ne!(
             status,
             StatusCode::FORBIDDEN,
             "{method} {uri} refused a marker it is shaped to accept"
+        );
+    }
+}
+
+/// The two recent-activity feeds advertised `collection` until PR-C. Their wire
+/// types cannot carry what that shape promises -- `RecentActivityItem` has a
+/// prose `snippet` and no axes, `PageChange` a bare title -- so they were
+/// demoted to `none`, and `none` refuses rather than downgrades. A client that
+/// sends a marker here is misconfigured, and this is where it finds out.
+#[tokio::test]
+async fn the_recent_feeds_refuse_a_marker_they_cannot_honour() {
+    for (method, uri) in [
+        ("GET", "/api/pages/recent"),
+        ("GET", "/api/pages/recent-changes"),
+    ] {
+        let status = status_of(Call::new(method, uri).marked().declaring()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} accepted a marker its wire type cannot carry"
+        );
+    }
+}
+
+/// The audit row is the only compensating control for the one attack D3
+/// concedes: `Collection` and `NamedPage` compose, so a caller willing to forge
+/// the marker can enumerate provisional IDs and fetch them one at a time. A
+/// grant that leaves no row is that walk, unobserved -- so it is refused rather
+/// than served.
+///
+/// A server with no database is the reachable form of "the row could not be
+/// written": it also cannot be asked what generation it is on, and unknown is
+/// not permission. The other form -- a live database at generation >= 1 whose
+/// audit INSERT fails -- takes the same branch by construction but cannot be
+/// provoked from here without a fault-injection seam this does not have.
+#[tokio::test]
+async fn a_grant_that_cannot_be_audited_is_refused() {
+    for (method, uri) in [("GET", "/api/pages"), ("GET", "/api/pages/pg1")] {
+        let status = status_of(Call::new(method, uri).marked().declaring()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} issued an exposure grant it could not record"
         );
     }
 }
