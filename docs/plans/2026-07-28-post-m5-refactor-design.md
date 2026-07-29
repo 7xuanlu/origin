@@ -846,6 +846,50 @@ Execution evidence:
   in this movement slice; consolidating it would change query construction and
   is intentionally deferred.
 
+#### R4-5 — bounded automatic-retro Page scan
+
+- Add `db/maintenance_retro_scan.rs` with one typed
+  `scan_automatic_retro_stub_slice` method. It receives the existing cursor and
+  fixed caller-owned source-read limit, holds one DB lock across the Page and
+  normalized-source queries, and returns only `next_cursor`,
+  `eligible_source_count`, and `more`.
+- Preserve exact mechanism: keyset `id > cursor`, `ORDER BY id LIMIT 2`,
+  active/distilled/not-user-edited/non-Overview eligibility,
+  `page_sources ORDER BY memory_source_id LIMIT 3`, normalized-first semantics,
+  legacy `source_memory_ids` fallback only when no normalized row exists, and
+  all error text.
+- Keep candidate and stage policy in the stage branch:
+  `< STUB_PAGE_SOURCE_FLOOR`, `StubPageCandidate`, work counters, card
+  emission, cursor persistence, and completion remain in `maintenance.rs`.
+  The existing eligibility predicate remains with its SQL in the DB method.
+- The first draft was rejected **FIX-FIRST** by the independent auditor. It
+  returned a DB-owned `candidate_source_count` and left a wrapper, which moved
+  policy into DB and changed the M5 topology to `192 / 55-51-86 / 22`.
+  Removing the wrapper, returning the raw capped count, and retaining the
+  original function name restores the exact reader set.
+- RED is the `maintenance.rs` exact baseline reduction `5 → 4` before caller
+  migration. GREEN moves one production lock: external literals `324 → 323`,
+  production `35 → 34`, tests `289` unchanged.
+- Direct contract tests pass `5 / 5`: empty and ineligible rows; zero, one,
+  and four normalized sources with a three-row cap; legacy fallback and
+  normalized precedence; malformed legacy JSON plus the reachable
+  `user_edited = NULL` compatibility case; and two-row `more` with cursor
+  advance. The
+  maintenance suite passes `19 / 19`, including an ineligible-first-row
+  control that advances the cursor without creating a card.
+- The exact ratchet passes `3 / 3`; formatting and core all-target Clippy with
+  `-D warnings` pass. The generated M5 inventory is again exactly `191` rows
+  with depth `55 / 50 / 86` and exposure `22`: the sole depth-zero reader moves
+  from `maintenance.rs` to the DB child with the same function identity. No
+  truth adapter, manifest row, permit, or cutover generation changes.
+- REVIEW 1, 2026-07-29: Opus/xhigh returned **behavior-preserving extraction**
+  after tracing every empty, ineligible, and eligible caller output, lock
+  ordering, exact ratchet counts, test wiring, and generated-reader movement.
+  Its non-blocking findings made the result type explicitly nameable, aligned
+  comments with the caller-supplied cap, removed an unreachable
+  `writable_schema` test in favor of nullable `user_edited`, restored the
+  movement-only blank line, and narrowed the plan's policy claim.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
