@@ -530,6 +530,7 @@ fn sample_page(entity_id: Option<String>) -> Page {
         review_status: "confirmed".into(),
         citations: vec![],
         kind: "concept".into(),
+        truth: None,
     }
 }
 

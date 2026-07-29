@@ -56,9 +56,19 @@ where
 
 /// POST /api/brief — read the complete Space Brief, optionally composed with
 /// separately-labelled recall results for the same Space.
+///
+/// Page-bearing through `related_context`: `search_memory` merges the page
+/// channel inline, so a page's prose can arrive as a `SearchResult` with
+/// `source == "page"` and `source_id` the page id (`search_result_from_page`,
+/// db.rs). The channel is default-OFF behind `WENLAN_ENABLE_PAGE_CHANNEL`, but
+/// an exposure contract that only holds while a flag is off is not a contract,
+/// so the gate is unconditional. `/api/context` reaches its pages through this
+/// same handler, which is why the view is a parameter rather than an extractor
+/// read here.
 pub async fn handle_read_brief(
     State(state): State<SharedState>,
     SpaceHeader(header_space): SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(request): Json<BriefReadRequest>,
 ) -> Result<Json<BriefReadResponse>, ServerError> {
     let db = {
@@ -91,7 +101,7 @@ pub async fn handle_read_brief(
     let related_context = related_context_if_requested(request.topic.as_deref(), move |query| {
         let scope = ReadScope::Space(recall_space);
         async move {
-            recall_db
+            let results = recall_db
                 .search_memory(
                     &query,
                     legacy_context_limit,
@@ -103,7 +113,35 @@ pub async fn handle_read_brief(
                     None,
                 )
                 .await
-                .map_err(|error| ServerError::SearchFailed(error.to_string()))
+                .map_err(|error| ServerError::SearchFailed(error.to_string()))?;
+            // Only the page-channel rows are page-bearing. Handing the whole
+            // batch to the adapter would key memory rows by a memory id, which
+            // no page grant covers, and drop legitimate results.
+            let page_ids: Vec<String> = results
+                .iter()
+                .filter(|row| row.source == "page")
+                .map(|row| row.source_id.clone())
+                .collect();
+            if page_ids.is_empty() {
+                return Ok(results);
+            }
+            let visible: std::collections::HashSet<String> =
+                wenlan_core::truth_adapter::filter_page_refs(
+                    &recall_db,
+                    &view.grant,
+                    page_ids,
+                    |id| id.as_str(),
+                )
+                .await
+                .map_err(|error| ServerError::SearchFailed(error.to_string()))?
+                .into_iter()
+                .collect();
+            // Retain rather than partition-and-append: `search_memory` has
+            // already merged the page rows into RRF order, and a surviving page
+            // belongs where that merge put it.
+            let mut results = results;
+            results.retain(|row| row.source != "page" || visible.contains(&row.source_id));
+            Ok(results)
         }
     })
     .await?;
