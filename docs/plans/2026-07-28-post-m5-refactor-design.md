@@ -1612,8 +1612,24 @@ Execution evidence:
 
 - Move the complete transaction bodies of `reclassify_memory_cas_inner` and
   `complete_entity_extraction_cas_inner` behind two named `MemoryDB` methods in
-  one DB child. Caller facades and test hooks retain their current public or
-  crate-visible paths.
+  `db/repair_memory_cas.rs`:
+  `reclassify_memory_repair_cas` and
+  `complete_entity_extraction_repair_cas`. Caller facades retain their current
+  public or crate-visible names, signatures, proof callback, and paths and
+  delegate exactly once.
+- The deliberate rollback-failure injection remains production-excluded:
+  expose one `#[cfg(test)]` companion DB method per operation through the
+  existing `*_with_forced_rollback_failure` facades. Normal and forced methods
+  may share one private operation-specific inner with the existing boolean;
+  no production-callable failure flag/enum, generic transaction callback, or
+  common CAS executor is allowed.
+- Keep `RepairWriteProof` at `crate::post_write` with private fields and its
+  existing public methods. Add only a crate-private
+  `RepairWriteProof::from_parts` constructor so the DB child can construct the
+  existing type. Move `rollback_repair_transaction` and
+  `recovery_required_after_rollback_failure` into the DB child as private
+  helpers; do not make the proof fields, connection, rollback helper, or
+  transaction state broadly visible.
 - Preserve each exact `BEGIN IMMEDIATE`, validation and receipt order,
   `total_changes` normalization, proof construction, hook-before-commit
   position, forced rollback-failure path, commit handling, and mutex lifetime.
@@ -1622,9 +1638,39 @@ Execution evidence:
   generic CAS executor.
 - Direct controls must cover stale target, successful proof, hook failure,
   ordinary rollback, forced rollback failure, and a blocked concurrent writer
-  across the pre-commit hook.
+  across the pre-commit hook for each operation. Put the direct method controls
+  in `db/repair_memory_cas_test.rs`; existing repair and entity-extraction
+  tests remain facade/integration proof rather than the sole evidence.
+- The mutex control is deterministic, not timeout-based: while the existing
+  synchronous proof hook runs, a scoped OS thread and two-party
+  `std::sync::Barrier` must attempt `db.conn.try_lock()`, record whether it was
+  blocked, drop any unexpectedly acquired guard, and always rendezvous. Only
+  after the rendezvous does the hook assert that the attempt was blocked.
+  Never assert on the worker before the barrier: an early-unlock mutation must
+  fail cleanly rather than panic one party and strand the hook. After the
+  method returns, the test proves the committed state is visible and the mutex
+  can be acquired. No production async callback or new test hook is added.
 - GREEN floor: external literals `299 → 297`, production `10 → 8`, tests
-  remain `289`.
+  remain `289`; lower only the `post_write.rs` ratchet row `18 → 16`.
+- LSP must show each normal DB method with one production facade caller plus
+  its direct tests, and each forced companion reachable only through the
+  retained `#[cfg(test)]` facade and direct tests. The public reclassification
+  facade remains declaration plus one production caller; the complete-entity
+  facade remains declaration plus one production and two existing direct-test
+  callers. Neither moved lock remains in `post_write.rs`.
+- PRE-IMPLEMENTATION PREFLIGHT, 2026-07-29: independent Sol and auditor reviews
+  returned **FIX-FIRST** until the proof-construction seam,
+  production-excluded rollback injection, purpose-specific DB methods, and
+  per-operation barrier controls above were explicit. Both traced the current
+  bodies as one mutex plus one `BEGIN IMMEDIATE`, with every body error,
+  callback error, and commit error routed through the same rollback mapping.
+  Existing tests already cover stale, success, ordinary rollback, and forced
+  rollback for both operations, but neither directly names the new DB methods
+  or proves the mutex is held across the live proof hook; the new controls
+  close those gaps. Both confirmed `299 → 297`, `10 → 8`, tests `289`, and no
+  M5/truth or generation change. The independently discovered stale R4-17 M5
+  addresses were corrected in commit `111d0fc7` before this slice began, so
+  R4-18 starts from a green `191 / 55-50-86 / 22` inventory.
 
 #### R4-19 — deterministic database repair transaction
 
