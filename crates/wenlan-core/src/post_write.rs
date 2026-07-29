@@ -2845,6 +2845,7 @@ async fn create_page_impl(
         // `insert_page` never sets `kind` explicitly, so the row lands with the
         // schema DEFAULT ('concept') -- mirror that here for consistency.
         kind: "concept".to_string(),
+        truth: None,
     };
 
     // md-first write (only if a knowledge_path was provided)
@@ -2852,8 +2853,9 @@ async fn create_page_impl(
         crate::export::knowledge::KnowledgeProjectionWrite::new(path.to_path_buf(), db)
     });
     if let Some(ref projection) = projection {
-        projection
-            .write_page(&page)
+        let _ = projection
+            .write_page_gated(db, &page)
+            .await
             .map_err(|e| WenlanError::VectorDb(format!("write_page: {e}")))?;
     }
 
@@ -3950,7 +3952,7 @@ async fn update_page_impl(
     // ── md re-write ─────────────────────────────────────────────────────────
     if let Some(ref projection) = projection {
         if let Ok(Some(updated_page)) = db.get_page(page_id).await {
-            if let Err(e) = projection.write_page(&updated_page) {
+            if let Err(e) = projection.write_page_gated(db, &updated_page).await {
                 log::warn!("[update_page] md re-write failed for {page_id}: {e}");
             }
         }
@@ -4140,7 +4142,7 @@ async fn accept_page_revision_card(
 
     if let Some(ref projection) = projection {
         if let Ok(Some(updated_page)) = db.get_page(&card.page_id).await {
-            if let Err(e) = projection.write_page(&updated_page) {
+            if let Err(e) = projection.write_page_gated(db, &updated_page).await {
                 log::warn!(
                     "[accept_page_revision_card] md re-write failed for {}: {e}",
                     card.page_id
@@ -4198,11 +4200,28 @@ pub async fn accept_pending_revision_with_knowledge_path(
 /// triggers. Unstages the pending revision (clears its false revision link,
 /// keeping it as an independent row); the original is untouched.
 /// Returns `NotFound` if no pending revision exists for the supplied id.
+///
+/// A PAGE revision card is the exception and is DELETED, mirroring the accept
+/// path's `consume_revision_id`. Unstage-and-keep is right for a memory card,
+/// which is a distinct capture that merely topic-matched; a page card is
+/// manufactured by `stage_page_revision_card` from the page's own prose, so
+/// keeping it would leave a permanent standalone copy of the page body in
+/// `memories` — reachable from every memory reader, carrying none of the
+/// page's truth state.
 pub async fn dismiss_pending_revision(
     db: &MemoryDB,
     id: &str,
     agent: &str,
 ) -> Result<wenlan_types::RevisionDismissResponse, WenlanError> {
+    if let Some(card) = resolve_page_revision_card(db, id).await? {
+        db.delete_by_source_id("memory", &card.revision_id).await?;
+        log_activity_best_effort(db, agent, "revision_dismiss", &card.page_id).await;
+        return Ok(wenlan_types::RevisionDismissResponse {
+            target_source_id: card.page_id,
+            wrote: true,
+        });
+    }
+
     let (target_source_id, _revision_source_id) = db.dismiss_pending_revision(id).await?;
     log_activity_best_effort(db, agent, "revision_dismiss", &target_source_id).await;
     Ok(wenlan_types::RevisionDismissResponse {
@@ -8023,6 +8042,83 @@ mod tests {
         assert_eq!(result.target_source_id, "mem_apr_target");
         assert_eq!(result.revision_source_id, "mem_apr_rev");
         assert!(result.wrote);
+    }
+
+    /// Dismiss must dispose of a page card the same way accept does.
+    ///
+    /// The memory path deliberately unstages rather than deletes -- a card that
+    /// merely topic-matched is still a real capture, and deleting it would lose
+    /// it. A page card has no capture behind it: `stage_page_revision_card`
+    /// manufactured it from the page's own prose. Unstaging one leaves a
+    /// permanent, ordinary, retrievable memory holding a full copy of that
+    /// prose, with `pending_revision` cleared -- which is the exact flag the
+    /// ordinary memory readers filter on.
+    #[tokio::test]
+    async fn dismiss_pending_revision_deletes_a_page_card_rather_than_unstaging_it() {
+        let (db, _dir) = test_db().await;
+        let mem_id = "mem_page_dismiss_original";
+        let original_content = "Rust ownership keeps memory safety rules explicit";
+        let human_content = "Rust ownership keeps memory safety rules explicit, with human notes";
+        let proposed_content = "Rust ownership is enforced by the compiler at compile time";
+
+        seed_memory(&db, mem_id, original_content).await;
+        let page_id = seed_page(&db, mem_id, original_content).await;
+        update_page(
+            &db,
+            &page_id,
+            UpdatePageRequest {
+                content: human_content.to_string(),
+                source_memory_ids: vec![mem_id.to_string()],
+                expected_version: None,
+                caller_id: None,
+                operation_id: None,
+            },
+            "fs_edit",
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before = db.get_page(&page_id).await.unwrap().unwrap();
+        assert!(before.user_edited, "precondition: page is human-owned");
+        let card = stage_page_revision_card(
+            &db,
+            &before,
+            proposed_content,
+            &[mem_id.to_string()],
+            "page_growth",
+            None,
+        )
+        .await
+        .unwrap();
+        let card_id = card
+            .revision_card_id
+            .as_deref()
+            .expect("staged page card must return an id");
+
+        let dismissed = dismiss_pending_revision(&db, card_id, "test-agent")
+            .await
+            .unwrap();
+        assert_eq!(
+            dismissed.target_source_id, page_id,
+            "a dismissed page card reports the page it targeted, not the card"
+        );
+
+        assert!(
+            db.get_memory_detail(card_id).await.unwrap().is_none(),
+            "a dismissed page card must not survive as an ambient memory"
+        );
+        assert!(
+            db.list_pending_revisions(10).await.unwrap().is_empty(),
+            "the card must leave the pending revision queue"
+        );
+        let page_after = db.get_page(&page_id).await.unwrap().unwrap();
+        assert_eq!(
+            page_after.content, human_content,
+            "dismissing must leave the human's prose untouched"
+        );
     }
 
     #[tokio::test]

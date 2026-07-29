@@ -4,10 +4,11 @@ use axum::response::IntoResponse;
 use axum::routing::MethodRouter;
 use axum::routing::Route;
 use axum::Router;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use tower::{Layer, Service};
 use wenlan_core::lint::serving::routes::{self, Method};
+use wenlan_core::truth_manifest::{self, Builder, ReaderMethod};
 
 #[path = "route_registry/app.rs"]
 mod app;
@@ -16,6 +17,16 @@ pub use app::AppRouter;
 pub(crate) struct TrackedRouter<S = ()> {
     inner: Router<S>,
     reads: BTreeMap<(Method, &'static str), usize>,
+    /// Which router instance this is. Truth classification is keyed on
+    /// `(builder, method, path)` -- `/api/health` registers once per builder,
+    /// and two call sites land in both -- so the builder cannot be inferred.
+    builder: Builder,
+    /// Every `(method, path)` registered here, for the M5 truth-manifest drift
+    /// assert. Separate from `reads`, which tracks only the scope-sensitive
+    /// subset: a route can be scope-insensitive and still serve page prose, so
+    /// deriving truth coverage from `reads` would leave the opt-out lists
+    /// unclassified. Truth classification is total over the router.
+    truth: BTreeSet<(ReaderMethod, &'static str)>,
 }
 
 pub(crate) struct TrackedMethodRouter<S = ()> {
@@ -42,6 +53,19 @@ impl RegisteredMethod {
             Self::Get => Some(Method::Get),
             Self::Post => Some(Method::Post),
             Self::Put | Self::Delete | Self::Patch => None,
+        }
+    }
+
+    /// Total, unlike `sensitive()`. Scope sensitivity is a read-path concern so
+    /// it drops the mutating methods; truth classification may not, because a
+    /// `PUT` that echoes a page title back is page-bearing all the same.
+    const fn truth(self) -> ReaderMethod {
+        match self {
+            Self::Get => ReaderMethod::Get,
+            Self::Post => ReaderMethod::Post,
+            Self::Put => ReaderMethod::Put,
+            Self::Delete => ReaderMethod::Delete,
+            Self::Patch => ReaderMethod::Patch,
         }
     }
 }
@@ -101,16 +125,28 @@ where
         self.methods.push(RegisteredMethod::Delete);
         self
     }
+
+    pub(crate) fn patch<H, T>(mut self, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        self.inner = self.inner.patch(handler);
+        self.methods.push(RegisteredMethod::Patch);
+        self
+    }
 }
 
 impl<S> TrackedRouter<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(builder: Builder) -> Self {
         Self {
             inner: Router::new(),
             reads: BTreeMap::new(),
+            builder,
+            truth: BTreeSet::new(),
         }
     }
 
@@ -138,8 +174,47 @@ where
         for row in rows {
             *self.reads.entry((row.method, row.path)).or_default() += 1;
         }
+
+        // Truth classification is TOTAL over the router, so this runs for every
+        // method at every path -- including the ones the scope-sensitivity
+        // check opts out of above. A route can be scope-insensitive and still
+        // serve page prose (`/api/steep`, `/api/distill`, every `/api/repairs/*`
+        // are all in `NON_SENSITIVE_PATHS` and all page-bearing), so deriving
+        // truth coverage from that opt-out list would leave the page-bearing
+        // half of it silently unclassified.
+        for method in &route.methods {
+            let method = method.truth();
+            assert!(
+                truth_manifest::http_reader(self.builder, method, path).is_some(),
+                "unclassified reader path: {method:?} {path} in {:?}. Add a row to \
+                 wenlan_core::truth_manifest and to \
+                 docs/plans/2026-07-27-m5-reader-manifest-inventory.md; a new route is \
+                 page_bearing until its response type says otherwise.",
+                self.builder
+            );
+            self.truth.insert((method, path));
+        }
+
         self.inner = self.inner.route(path, route.inner);
         self
+    }
+
+    /// Registered-versus-classified set equality for the truth manifest.
+    ///
+    /// Both directions matter. A route with no row is caught in `route()` at
+    /// registration; this catches the other half -- a row for a route that is
+    /// no longer registered, which would otherwise sit in the table looking
+    /// like coverage of something that does not exist.
+    fn assert_truth_coverage(&self) {
+        let expected: BTreeSet<(ReaderMethod, &'static str)> = truth_manifest::runtime_entries()
+            .filter(|(builder, _, _)| *builder == self.builder)
+            .map(|(_, method, path)| (method, path))
+            .collect();
+        assert_eq!(
+            self.truth, expected,
+            "truth manifest registration drift in {:?}",
+            self.builder
+        );
     }
 
     pub(crate) fn finish(self) -> FinalizedRouter<S> {
@@ -147,6 +222,7 @@ where
             .map(|row| ((row.method, row.path), 1usize))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(self.reads, expected, "sensitive route registration drift");
+        self.assert_truth_coverage();
         FinalizedRouter { inner: self.inner }
     }
 
@@ -160,6 +236,11 @@ where
                 .all(|(route, count)| expected.get(route) == Some(count)),
             "restricted router registered an unknown or duplicate sensitive read route"
         );
+        // Truth coverage is exact even here. `finish_restricted` is loose about
+        // *sensitive* routes because the repair router deliberately serves a
+        // subset of them, but the manifest enumerates the repair builder's six
+        // entries exactly, so there is no reason to accept less.
+        self.assert_truth_coverage();
         FinalizedRouter { inner: self.inner }
     }
 }
@@ -178,6 +259,25 @@ where
     {
         Self {
             inner: self.inner.layer(layer),
+        }
+    }
+
+    /// Like [`Self::layer`], but only for requests that matched a route.
+    ///
+    /// The M5 truth guard needs this rather than `layer`: it looks the route up
+    /// in the manifest by `MatchedPath`, which only exists once routing has
+    /// happened, and a request that matched nothing has no marker shape to
+    /// enforce -- it is a 404 either way.
+    pub(crate) fn route_layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: Service<Request> + Clone + Send + Sync + 'static,
+        <L::Service as Service<Request>>::Response: IntoResponse + 'static,
+        <L::Service as Service<Request>>::Error: Into<Infallible> + 'static,
+        <L::Service as Service<Request>>::Future: Send + 'static,
+    {
+        Self {
+            inner: self.inner.route_layer(layer),
         }
     }
 
@@ -213,6 +313,7 @@ const NON_SENSITIVE_PATHS: &[&str] = &[
 ];
 
 const NON_SENSITIVE_MIXED_ROUTES: &[(RegisteredMethod, &str)] = &[
+    (RegisteredMethod::Patch, "/api/brief"),
     (RegisteredMethod::Put, "/api/profile"),
     (RegisteredMethod::Put, "/api/agents/{name}"),
     (RegisteredMethod::Delete, "/api/agents/{name}"),

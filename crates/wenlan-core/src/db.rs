@@ -20,6 +20,8 @@ use std::sync::Arc;
 #[cfg(test)]
 static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+mod brief;
+pub use brief::LegacyBriefItem;
 mod claim_identity;
 mod count;
 mod edges_rebuild;
@@ -28,7 +30,14 @@ mod page_drafts;
 pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
+mod truth_exposure;
 
+pub use truth_exposure::{TruthMarkerAudit, TRUTH_CUTOVER_GENERATION_KEY};
+
+#[cfg(test)]
+mod brief_test;
+#[cfg(test)]
+mod claim_edge_lifecycle_test;
 #[cfg(test)]
 mod claim_identity_test;
 #[cfg(test)]
@@ -585,7 +594,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 99;
+pub const SCHEMA_VERSION: u32 = 102;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8535,6 +8544,30 @@ impl MemoryDB {
             if version < 99 {
                 self.migrate_99_page_truth_backfill(version).await?;
             }
+
+            // Migration 100 (M5 PR-B, F5): the lifecycle triggers that retract
+            // a claim's support and attestation edges when the page or evidence
+            // memory underneath them moves space or is deleted, plus the
+            // `root_kind` immutability rule that closes the fourth path by
+            // prevention. See ensure_claim_edge_lifecycle_triggers.
+            if version < 100 {
+                self.migrate_100_claim_edge_lifecycle(version).await?;
+            }
+
+            // Migration 101 (M5 PR-B): the marker audit log. Nothing writes to
+            // it until a call carries the intent marker, and nothing does that
+            // yet — but the table has to exist before the first one can, and a
+            // compensating control that appears at the same moment as the thing
+            // it compensates for has a window where it does not.
+            if version < 101 {
+                self.migrate_101_truth_exposure(version).await?;
+            }
+
+            // Migration 102: daemon-authoritative Brief state, keyed by the
+            // stable Space id so renames preserve current work.
+            if version < 102 {
+                self.migrate_102_brief(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11921,6 +11954,56 @@ impl MemoryDB {
             "[migration] Migration 99 applied: {filled} page(s) backfilled to provisional, \
              unreviewed truth state"
         );
+        Ok(())
+    }
+
+    /// Migration 100 (M5 PR-B, F5): claim-edge lifecycle triggers.
+    ///
+    /// Pure DDL, so no backup and no data pass — the triggers change what
+    /// future writes do, never what any existing row says. Deliberately its own
+    /// migration rather than an amendment to 98: 98 is a table rebuild that
+    /// must not be re-run, and this is `IF NOT EXISTS` DDL that is safe to.
+    async fn migrate_100_claim_edge_lifecycle(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 begin: {error}")))?;
+        Self::ensure_claim_edge_lifecycle_triggers(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 100", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 100 applied: claim-edge lifecycle triggers \
+             (page move/delete, memory move) + root_kind immutability"
+        );
+        Ok(())
+    }
+
+    /// Migration 101 (M5 PR-B): the truth-marker audit log.
+    ///
+    /// Additive `IF NOT EXISTS` DDL, same shape as 100 and for the same reason.
+    /// The cutover generation needs no DDL — it is an `app_metadata` key, absent
+    /// until someone sets it, and absent reads as off.
+    async fn migrate_101_truth_exposure(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 begin: {error}")))?;
+        Self::ensure_truth_exposure_tables(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 101", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 bump: {error}")))?;
+        log::info!("[migration] Migration 101 applied: truth-marker audit log");
         Ok(())
     }
 
@@ -43934,20 +44017,27 @@ impl MemoryDB {
     /// wikilinks that resolve immediately instead of inventing labels the
     /// resolver has to leave as orphans.
     pub async fn list_active_page_titles(&self, limit: usize) -> Result<Vec<String>, WenlanError> {
-        self.list_active_page_titles_scoped(None, limit).await
+        Ok(self
+            .list_active_page_titles_scoped(None, limit)
+            .await?
+            .into_iter()
+            .map(|(_, title)| title)
+            .collect())
     }
 
-    /// Title-only fallback for Page compilation, optionally constrained to a
-    /// workspace. Unlike `list_pages`, this never materializes Page bodies.
+    /// Id+title fallback for Page compilation, optionally constrained to a
+    /// workspace. Unlike `list_pages`, this never materializes Page bodies. The
+    /// id rides along so a caller can gate the result through
+    /// `truth_adapter::filter_page_refs` before handing titles to the LLM.
     pub async fn list_active_page_titles_scoped(
         &self,
         workspace: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<String>, WenlanError> {
+    ) -> Result<Vec<(String, String)>, WenlanError> {
         let conn = self.conn.lock().await;
         let (sql, params): (&str, Vec<libsql::Value>) = match workspace {
             Some(workspace) => (
-                "SELECT title FROM pages WHERE status = 'active'
+                "SELECT id, title FROM pages WHERE status = 'active'
                    AND COALESCE(kind, 'concept') != 'entity'
                    AND COALESCE(workspace, space) = ?1
                  ORDER BY last_modified DESC LIMIT ?2",
@@ -43957,7 +44047,7 @@ impl MemoryDB {
                 ],
             ),
             None => (
-                "SELECT title FROM pages WHERE status = 'active'
+                "SELECT id, title FROM pages WHERE status = 'active'
                    AND COALESCE(kind, 'concept') != 'entity'
                  ORDER BY last_modified DESC LIMIT ?1",
                 vec![libsql::Value::Integer(limit as i64)],
@@ -43973,20 +44063,25 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            out.push(row.get::<String>(0).unwrap_or_default());
+            out.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+            ));
         }
         Ok(out)
     }
 
-    /// Return active page titles ranked by embedding similarity to `query`,
-    /// optionally constrained to the same space (M1 honest columns:
+    /// Return active page (id, title) pairs ranked by embedding similarity to
+    /// `query`, optionally constrained to the same space (M1 honest columns:
     /// `workspace` and `space` are mirrored duplicates, so this reads `space`).
+    /// The id rides along so a caller can gate the result through
+    /// `truth_adapter::filter_page_refs` before handing titles to the LLM.
     pub async fn list_relevant_active_page_titles(
         &self,
         query: &str,
         workspace: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<String>, WenlanError> {
+    ) -> Result<Vec<(String, String)>, WenlanError> {
         if limit == 0 {
             return Ok(vec![]);
         }
@@ -43997,7 +44092,7 @@ impl MemoryDB {
 
         let (sql, params): (String, Vec<libsql::Value>) = match workspace {
             Some(workspace) => (
-                "SELECT title FROM pages \
+                "SELECT id, title FROM pages \
                  WHERE status = 'active' \
                    AND COALESCE(kind, 'concept') != 'entity' \
                    AND embedding IS NOT NULL \
@@ -44012,7 +44107,7 @@ impl MemoryDB {
                 ],
             ),
             None => (
-                "SELECT title FROM pages \
+                "SELECT id, title FROM pages \
                  WHERE status = 'active' \
                    AND COALESCE(kind, 'concept') != 'entity' \
                    AND embedding IS NOT NULL \
@@ -44036,7 +44131,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            out.push(row.get::<String>(0).unwrap_or_default());
+            out.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+            ));
         }
         Ok(out)
     }
@@ -44774,6 +44872,7 @@ impl MemoryDB {
             kind: row
                 .get::<String>(20)
                 .unwrap_or_else(|_| "concept".to_string()),
+            truth: None,
         })
     }
 
@@ -54777,6 +54876,7 @@ pub(crate) mod tests {
             workspace: workspace.map(|w| w.to_string()),
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         }
     }
 
@@ -79447,6 +79547,7 @@ pub(crate) mod tests {
             workspace: None,
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         };
         let r = MemoryDB::search_result_from_page(page);
         assert_eq!(r.source, "page");
@@ -89420,7 +89521,7 @@ pub(crate) mod tests {
         assert!(
             !unscoped
                 .iter()
-                .any(|t| t == "Relevant Titles Zephyr Marker"),
+                .any(|(_, t)| t == "Relevant Titles Zephyr Marker"),
             "list_relevant_active_page_titles(None) must not surface a shadow title"
         );
 
@@ -89429,7 +89530,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            !scoped.iter().any(|t| t == "Relevant Titles Zephyr Marker"),
+            !scoped
+                .iter()
+                .any(|(_, t)| t == "Relevant Titles Zephyr Marker"),
             "list_relevant_active_page_titles(Some(space)) must not surface a shadow title"
         );
     }

@@ -164,24 +164,22 @@ The eval-specific machinery — the baseline/scenario-DB cache (`EVAL_BASELINES_
 
 Releases are automated via [release-please](https://github.com/googleapis/release-please): every push to `main` maintains an open "release PR" that bumps the version and updates `CHANGELOG.md`; merging that PR publishes a GitHub release + `v*` tag, which triggers `.github/workflows/release.yml` to build and publish `wenlan`, `wenlan-server`, and `wenlan-mcp`. **The operator runbook — manual `bump-version.sh`, tag steps, the release-workflow breakdown, config files, and required secrets — lives in [`RELEASING.md`](RELEASING.md).** What an agent must keep in mind while coding:
 
-**Commit messages control version bumps.** Pre-1.0:
+**Every release bumps patch.** `release-please-config.json` sets `"versioning": "always-bump-patch"`, so the commit prefix decides only what lands in the changelog, never the bump size:
 
-| Commit prefix | Version bump | Example |
+| Commit prefix | Version bump | Changelog |
 |---|---|---|
-| `fix:` | patch | 0.1.1 -> 0.1.2 |
-| `feat:` | **minor** | 0.1.1 -> 0.2.0 |
-| `BREAKING CHANGE` | minor (capped) | 0.1.1 -> 0.2.0 |
-| `chore:`, `ci:`, `docs:`, `refactor:`, `test:` | no bump | (hidden in changelog) |
+| `fix:` | patch | Bug Fixes |
+| `feat:` | patch | Features |
+| `BREAKING CHANGE` | patch | Breaking |
+| `chore:`, `ci:`, `docs:`, `refactor:`, `test:` | no bump on its own | hidden |
 
-After 1.0, standard semver: `feat:` bumps minor, `BREAKING CHANGE` bumps major.
+**A deliberate minor or major is a config change, not a commit-message trick.** Add `"release-as": "0.16.0"` under `packages["."]` (or switch `versioning`), merge it to main, let release-please open the PR, then remove the override. Never rewrite history to steer a version bump.
 
-**IMPORTANT: `feat:` bumps minor, not patch.** Use `fix:` for small features, improvements, and bug fixes. Only use `feat:` when you intentionally want 0.x.0 -> 0.(x+1).0. The `bump-patch-for-minor-pre-major` and `release-as` config flags do NOT work with release-please v17 + simple release type. If a `feat:` commit lands on main, the only way to prevent the minor bump is to rewrite the commit message via `git filter-branch` and force-push.
-
-**Squash merge commit messages matter.** When GitHub squash-merges a PR, the commit message defaults to the PR title. A PR titled `feat: ...` creates a `feat:` commit on main, triggering a minor version bump. Review PR titles before merging — rename to `fix:` if a minor bump is not intended.
+**Squash merge commit messages still matter — for the changelog.** When GitHub squash-merges a PR, the commit message defaults to the PR title. The prefix no longer changes the bump size (always patch), but it decides whether and where the change appears in `CHANGELOG.md`, and a title without a conventional `type:` prefix is invisible to release-please entirely. Keep PR titles valid conventional commits.
 
 **Version files must stay in sync:** `version.txt`, `.release-please-manifest.json`, and the root workspace `Cargo.toml` (`# x-release-please-version` marker on the `[workspace.package]` version line; the 4 crates inherit it via `version.workspace = true`). Teeth #3 enforces this; the release-please workflow syncs them on the release branch, so any manual version edit must touch all three. The desktop app version lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app) and bumps independently.
 
-**Undoing a release is not just deleting a tag.** release-please derives the "last version" from merged `chore(main): release X.Y.Z` commit messages — not tags or the manifest. A rollback must rewrite that commit message (`git filter-branch --msg-filter`), delete the tag + GitHub Release, and rename the merged PR title, or the next run keeps bumping from the old version. Full procedure in [`RELEASING.md`](RELEASING.md).
+**Undoing a release: edit the manifest, don't rewrite history.** In manifest mode the "last version" comes from `.release-please-manifest.json`, so a rollback is a normal PR that resets it (plus `version.txt` and the workspace `Cargo.toml`, per teeth #3) alongside deleting the tag + GitHub Release. Leave the merged release PR's `autorelease: tagged` label alone — that label is what stops release-please re-releasing it. No commit-message rewrite, no PR rename.
 
 ### Branch protection
 
@@ -295,6 +293,7 @@ All post-store enrichment goes through the ONE canonical path (`wenlan_core::ing
 **Other:**
 - **Metal/ggml on macOS Tahoe 26.x**: `ggml_metal_init` may fail even though native Metal works. The daemon auto-degrades and continues without LLM. Not a code bug. Check for competing GPU processes: `pgrep -la wenlan`.
 - **Dev and prod share data by default**: Both use port 7878 and the platform data directory (on macOS, `~/Library/Application Support/wenlan/`). For isolated testing, override explicitly: `WENLAN_PORT=7879 WENLAN_DATA_DIR=/tmp/origin-test cargo run -p wenlan-server`.
+- **Isolation has THREE axes, not two — `WENLAN_DATA_DIR` does not cover the page vault.** The projection directory comes from the `knowledge_path` config field, which `Config::knowledge_path_or_default()` (`crates/wenlan-core/src/config.rs:147`) resolves to `~/.wenlan/pages` when unset — it reads nothing from `WENLAN_DATA_DIR`. A fresh isolated data dir therefore has no override, so an "isolated" daemon that creates or exports pages writes real `.md` files into the user's live vault. Before starting an isolated daemon that will touch pages, seed its data dir with a `config.json` carrying `{"knowledge_path": "<scratch>/pages"}`, then confirm via `GET /api/knowledge/path` that the daemon reports the scratch path. Fingerprint the real vault before and after if the run is at all destructive.
 
 ### Worktree cleanup after squash-merge
 

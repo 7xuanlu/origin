@@ -1,297 +1,175 @@
 ---
 name: handoff
 description: >
-  End-of-session ritual. Captures decisions, lessons, gotchas, and open
-  threads. Writes a narrative session log to ~/.wenlan/sessions/ and stores
-  granular memories via Wenlan MCP. Previews any unconfirmed captures from
-  the current session before closing. Invoked as `/handoff`.
+  End a work session. Stores durable captures, writes a narrative session log,
+  and automatically applies typed item-level deltas to the current Space Brief.
+  Invoked as `/handoff`.
 allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__list_pending"]
 ---
 
 # /handoff
 
-End-of-session debrief. Three artifacts each pass:
+Close the session with three separate artifacts:
 
-1. **Granular MCP captures** — one per decision/lesson/gotcha (DB authoritative).
-2. **Session log md** — narrative thread at `~/.wenlan/sessions/<YYYY-MM-DD-HHmm>-<slug>.md`.
-3. **Project status md + json** — current goals + last-handoff timestamp at `~/.wenlan/sessions/_status/`.
+1. A typed update to the daemon-owned Space Brief.
+2. Durable MCP captures in that Space.
+3. A chronological session log in `~/.wenlan/sessions/`.
 
-These are orthogonal: captures are queryable atoms, session log is the
-narrative thread, status file lets the next session see where we left off.
+The daemon Brief is current-work authority. Its
+`~/.wenlan/sessions/_status/<space>.md` projection is a one-way human receipt.
+Never read, edit, or overwrite that receipt as authority.
 
-## Steps
+## 1. Resolve repository and Space
 
-### 1. Detect project + last handoff time
-
-```
-Bash: cd_repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null); echo "${cd_repo:-no-git}"
-```
-
-- If output is a path → use the basename as `<project>` (e.g. `wenlan`).
-- If `no-git` → use the cwd basename. Skip git steps below; rely entirely
-  on conversation context.
-
-Read `~/.wenlan/sessions/_status/handoff-<project>.json` for `lastHandoff`
-timestamp (ISO-8601). If file missing, default to "12 hours ago".
-
-### 1.5 Pending-captures preview
-
-After establishing `<lastHandoff>`, call:
-
-```
-list_pending(limit=50)
-```
-
-The MCP returns memory rows with `source_id`, `content`, `created_at`, and
-other metadata. Convert `lastHandoff` (ISO-8601 string, e.g.
-`2026-05-13T22:50:00Z`) to a Unix epoch seconds integer before filtering:
-
-```
-Bash: date -j -f %Y-%m-%dT%H:%M:%SZ "$lastHandoff" +%s
+```bash
+repo="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$repo" ]; then
+  common="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  case "$common" in
+    */.git) project="$(basename "$(dirname "$common")")" ;;
+    *) project="$(basename "$repo")" ;;
+  esac
+else
+  project=""
+fi
+resolved="$("$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" 2>/dev/null)"
+space="$(printf '%s\n' "$resolved" | cut -f1)"
+source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
+if [ -z "$space" ] && [ -n "$project" ]; then
+  space="$project"
+  source_layer="cwd-repo-new"
+fi
 ```
 
-Or in your scripting language of choice (Python's `datetime.fromisoformat`,
-JavaScript's `Date.parse`, etc.). Save the result as `lastHandoffEpoch`.
+Print `space` and `source_layer`. Explicit pins, defaults, and mappings still
+win. `cwd-repo-new` is the approved first-handoff fallback: use the canonical
+repository basename, which the user can override through normal Space config.
+Do not invent any other Space name.
 
-Then filter the response rows: keep where `row.created_at >= lastHandoffEpoch`.
-These are captures this session produced that the quality gate left unconfirmed
-(untrusted-source captures).
+Outside a Git repository, do not derive a new Space from the directory
+basename. If resolution still leaves `space` empty, skip the Brief read and
+typed update, do not issue Space-scoped captures, and continue with the
+unscoped session log and any unscoped durable captures.
 
-If the filtered list is empty, say nothing. Proceed to Step 2.
+## 2. Read the Brief before composing deltas
 
-If non-empty, render a preview block once, before the existing capture flow:
-
-```
-Pending captures this session (<N> total, top 3 shown):
-
-1. mem_xyz789  "..."  (untrusted source: <agent>)
-2. ...
-
-Default: proceed (captures stay pending). Opt in by running
-`/curate captures` before re-invoking /handoff if you want to walk them.
-```
-
-Do NOT prompt for per-item action inline. The user proceeds with /handoff
-regardless; the preview is informational only.
-
-### 2. Gather session context (parallel, only if git repo)
-
-```
-Bash: git -C <repo> log --oneline --since=<lastHandoff>
-Bash: git -C <repo> status --short
-Bash: git -C <repo> diff --stat HEAD~5..HEAD 2>/dev/null
-Bash: git -C <repo> worktree list
-```
-
-Capture output. Use it alongside conversation history to infer what
-happened. If not a git repo, skip — conversation context is the source.
-
-### 3. Infer, do not ask
-
-Synthesize silently from git output + conversation. Categorize each item
-into user-facing groups. Each maps to a daemon `memory_type` for the
-capture call:
-
-| Display label | daemon memory_type | What belongs here |
-|---|---|---|
-| Decisions | `decision` | architectural choice, tool/pattern selection (with WHY) |
-| Lessons | `lesson` | root cause discovered, workaround found, technical insight |
-| Insights | `gotcha` | unexpected behavior, debugging discovery, sharp edge |
-| Corrections | `preference` | user pushed back, corrected approach or assumption |
-| Facts | `fact` | durable project/people/tool fact worth persisting |
-
-Non-memory items (not stored, session-log only):
-- **Open threads** — started but not finished, blockers.
-
-Skip purely mechanical facts already in git (file paths, function names,
-config values). The commit log preserves those.
-
-## Resolve the active space (once per /handoff invocation)
-
-Call the bundled resolver once at the top of the handoff, before any
-captures:
-
-    resolved="$("$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" 2>/dev/null)"
-    space="$(printf '%s\n' "$resolved" | cut -f1)"
-    source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
-
-    if [ -n "$space" ]; then
-      echo "Resolved space: $space (from $source_layer)"
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+brief_before=""
+brief_absent=0
+if [ -n "$space" ]; then
+  if [ "$source_layer" = "cwd-repo-new" ]; then
+    space_probe_status=0
+    space_probe="$("$W" --format json spaces show "$space" 2>&1)" || space_probe_status=$?
+    if [ "$space_probe_status" -eq 0 ]; then
+      brief_before="$("$W" --format json --space "$space" brief)"
+      source_layer="cwd-repo"
+    elif [ "$space_probe" = "Error: space '$space' not found" ]; then
+      brief_absent=1
     else
-      echo "Resolved space: none (unscoped)"
+      printf "%s\n" "$space_probe" >&2
+      exit "$space_probe_status"
     fi
-
-Pass `space="$space"` to every `capture(...)` call in the loop only when
-`space` is non-empty. /handoff does not accept a `space:X` inline arg — if
-the user wants a different space, they set `WENLAN_SPACE` before invoking.
-
-### 4. MCP captures (one per item)
-
-For each non-trivial item, call with the mapped `memory_type`:
-
-```
-capture(content="<one self-contained sentence with WHY>", memory_type="<decision|lesson|gotcha|preference|fact>", space=<resolved if non-empty>)
+  else
+    brief_before="$("$W" --format json --space "$space" brief)"
+  fi
+fi
 ```
 
-Atomic: one decision per call. Don't merge multiple items into one
-memory. The daemon dedups against existing knowledge, so re-storing
-known facts is a no-op.
+Read the Brief before composing deltas. This read is mandatory before any Brief
+delta is authored for a registered Space. Retain the Brief version and every
+item's exact ID, version, state, text, added date, and gate. Use
+`last_handoff_at` for the pending-capture window.
 
-Only surface items to the user BEFORE storing if they meet one of these
-bars:
+`brief_not_created` is valid and write-free. Use summary
+`expected_version: 0`. For `cwd-repo-new`, prove the Space is absent with
+`spaces show` before composing deltas. Accept only the exact CLI error
+`Error: space '<name>' not found` as first-handoff absence; any other probe
+failure stops the handoff. An absent Space cannot have a Brief or existing
+items, so use `expected_version: 0` and author no existing-item mutations. The
+typed update may then create the Space and Brief.
 
-- Contradicts an existing memory (recall returned a conflicting fact).
-- Marks a critical incident, irreversible action, or production change.
-- You are uncertain whether the item is durable vs transient.
+## 3. Preview pending captures and gather evidence
 
-Otherwise just store and report counts at the end.
+Call `mcp__plugin_wenlan_wenlan__list_pending(limit=50)`. Filter by
+`created_at >= last_handoff_at`, or 12 hours ago when absent. Show at most three
+when any match, then continue automatically; `/curate captures` remains opt-in.
 
-### 5. Write session log
+For a repository, inspect a bounded recent log, short status, diff stat, and
+worktree list. Combine that evidence with the conversation. Draft atomic
+captures only for durable decisions, lessons, gotchas, corrections,
+preferences, and facts. Skip transient or git-recoverable state.
 
-Bash heredoc to `~/.wenlan/sessions/<YYYY-MM-DD-HHmm>-<slug>.md`:
+## 4. Build and apply one typed Brief update
 
-```markdown
-# Session <YYYY-MM-DD HH:MM> — <slug>
-
-**Project:** <project>
-**Range:** <lastHandoff> → <now>
-
-## Accomplished
-- <item>
-
-## Decisions
-- <decision and rationale>
-
-## Lessons & Gotchas
-- <root cause / workaround>
-
-## Open Threads
-- <what's unfinished>
-
-## Captures stored
-- <source_id_or_brief_summary>
-
-## Git summary
-<git log --oneline output>
-```
-
-`<slug>` = kebab-case 2-4 word summary (`session-handoff-md-writer`).
-
-### 6. Update project status
-
-Overwrite `~/.wenlan/sessions/_status/<project>.md`:
-
-```markdown
-# <Project> — Current Status
-
-## Last session (<date>)
-- <accomplished bullet>
-
-## Active
-<!-- Items touched/spawned in the last 1-2 sessions. Real next-move candidates. -->
-- <item> (added <YYYY-MM-DD>)
-- <blocked item> (added <YYYY-MM-DD>) (gated: <trigger>)
-
-## Backlog
-<!-- Older accretion. Not gated, not picked. Promote back to Active when re-engaged. -->
-- <item> (added <YYYY-MM-DD>)
-```
-
-Single file per project. New session overwrites — this is the *current*
-state, not a log.
-
-**Two sections, not one flat list:** `## Active` and `## Backlog` separate
-the two types of tasks that get mixed otherwise. Active = fresh signal
-worth picking next. Backlog = older parked items, kept for reference but
-not in the "what next?" frame.
-
-**Date stamp every bullet** with `(added <YYYY-MM-DD>)`. Use today's date
-when adding a new item; preserve the original date when carrying an item
-forward. Dates make age visible at a glance and avoid relative-time drift.
-
-**Gated items stay inline-tagged** with `(gated: <trigger>)` — no separate
-section. The tag tells the reader why it can't move yet; the bullet stays
-in whichever section reflects its recency.
-
-**Promotion / demotion rules:**
-- New item this session → `## Active` with today's date
-- Item in `## Active` that wasn't touched this session AND wasn't touched
-  the prior session → demote to `## Backlog` (keep original date)
-- Item in `## Backlog` that work resumed on → promote back to `## Active`
-  (keep original date — staleness is a property of the work, not the
-  bullet text)
-
-### 7. Write timestamp
-
-Overwrite `~/.wenlan/sessions/_status/handoff-<project>.json`:
+Compare the session outcome with `brief_before` and write one
+`BriefUpdateRequest` JSON file:
 
 ```json
 {
-  "lastHandoff": "<ISO-8601 now>",
-  "project": "<project>",
-  "summary": "<one-line>"
+  "space": "<resolved Space>",
+  "caller_id": "claude-code",
+  "operation_id": "<unique id retained for retries of this handoff>",
+  "summary": {
+    "text": "<concise last-session summary>",
+    "expected_version": 0
+  },
+  "mutations": []
 }
 ```
 
-Per-project file prevents parallel sessions from clobbering each other.
+Use the existing Brief version instead of `0` when present.
+If `space` is empty, skip this typed update entirely.
 
-### 8. Auto-commit ~/.wenlan/
+- `add`: genuinely new open work, in `active` or `backlog`, with an optional
+  gate.
+- `edit`, `move`, `set_gate`, and `complete`: use the exact existing item ID.
+- Every delta for one existing item uses the same version from the pre-handoff Brief snapshot.
+  Do not chain versions generated by earlier deltas in the same request.
+- `complete` removes the item; there is no Done state.
+- Never fuzzy-match. Leave an ambiguous item unchanged.
+- Never auto-demote untouched Active work.
+- Do not add an unchanged duplicate.
 
-After writing the files above, snapshot the change so the user can `git
-log` their memory's life timeline. Defensive — silent skip if `git` is
-missing or `~/.wenlan/` is not a repo yet.
+Apply exactly once:
 
-```
-Bash: git -C ~/.wenlan add -A && \
-      git -C ~/.wenlan -c user.name=Wenlan -c user.email=daemon@wenlan.local \
-          commit --quiet -m "session: <slug>" 2>/dev/null || \
-      (sleep 1 && git -C ~/.wenlan add -A && \
-       git -C ~/.wenlan -c user.name=Wenlan -c user.email=daemon@wenlan.local \
-           commit --quiet -m "session: <slug>" 2>/dev/null) || true
-```
-
-The retry handles index.lock races — the daemon may be writing to
-`~/.wenlan/` at the same moment. Commits land at session boundaries
-(handoff or daemon events), not per capture; uncommitted page edits
-between sessions are normal. One second is enough for the daemon to
-release the lock.
-
-### 9. Confirm
-
-Print one summary block with captures grouped by display label:
-
-```
-Handoff stored.
-  Decisions:   <N> (brief list)
-  Lessons:     <N> (brief list)
-  Insights:    <N> (brief list)
-  Corrections: <N> (brief list)
-  Facts:       <N> (brief list)
-  Session:     ~/.wenlan/sessions/<filename>
-  Status:      ~/.wenlan/sessions/_status/<project>.md
-  Git:         <commit hash> session: <slug>
+```bash
+"$W" --format json --space "$space" brief update --file "$update_file"
 ```
 
-Show each label only if non-empty. List items as short phrases, not
-full sentences — the session log has the details.
+Do not ask approval for this normal handoff update. Interpret `applied`,
+`conflicts`, `projection_path`, and `warnings` independently. Non-overlapping
+changes may commit while a stale same-item delta conflicts. Re-read before any
+safe mechanical reconciliation; never guess.
 
-## When to use
+Apply the Brief update before Space-scoped captures when this fallback is new.
+That creates the basename Space through the typed handoff path without making a
+read or a capture create state. If this first update fails, stop Space-scoped
+captures and report the exact failure.
 
-- "Wrapping up", "let's call it", "we're done".
-- Session about to close and useful state would otherwise be lost.
+## 5. Store durable captures
 
-## When NOT to use
+For each drafted durable item, call:
 
-- Mid-flow capture during work → use `/capture` (single memory).
-- Search / lookup → use `/recall`.
-- One-off chat with no decisions or lessons — captures alone are enough.
+```text
+mcp__plugin_wenlan_wenlan__capture(
+  content="<self-contained statement with why>",
+  memory_type="<decision|lesson|gotcha|preference|fact>",
+  space="<resolved Space>"
+)
+```
 
-## Notes on the three artifact classes
+Use one atomic item per call. Do not ask about ordinary captures. Pause only
+for a contradiction, critical incident, irreversible production action, or
+genuine durability ambiguity.
 
-- **Memories** (MCP captures) live in the daemon DB only. Confirmation flips
-  a `stability` flag — they never get exported to md.
-- **Pages** are wiki-style syntheses written to `~/.wenlan/pages/` by the
-  daemon when `/distill` runs. Citations link back to source memory ids.
-- **Sessions** (this skill) live only at `~/.wenlan/sessions/`. They are
-  the narrative axis: chronological, not topical. Browse them as a
-  changelog of your work.
+## 6. Write the session log and report
+
+Write `~/.wenlan/sessions/<YYYY-MM-DD-HHmm>-<slug>.md` with Accomplished,
+Decisions, Lessons & Gotchas, Open Threads, Captures stored, and Git summary.
+This is narrative history, not current-work authority.
+
+Best-effort commit the logical `~/.wenlan/` file batch; do not fail if no
+repository is configured or a commit races. Report capture counts, session-log
+path, applied/conflicted Brief deltas, Brief version, and projection path or
+warning.

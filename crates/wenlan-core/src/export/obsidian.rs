@@ -131,6 +131,7 @@ mod tests {
             workspace: None,
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         }
     }
 

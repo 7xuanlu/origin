@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=0c3916de21e35f6406098cbd41b562ab98d36eaf06b057081e14b658aa55f6c6 -->
+<!-- README_SYNC: source=README.md sha256=00a9e0d18b88c59ba9ffd709551d33aecc990a22fc4c2daf8e11b41e46a868c9 -->
 
 <p align="center">
   <picture>
@@ -261,9 +261,9 @@ El sistema anterior se convierte en un pequeño bucle diario: comienza con el co
 
 El bucle tiene cuatro pasos:
 
-1. **Encontrar el conocimiento actual.** Abre una Página relevante, busca o usa `/recall <consulta>`; `/brief [tema]` puede ensamblar opcionalmente una instantánea más amplia para iniciar la sesión. Los clientes sin comandos de plugin usan las herramientas equivalentes de página, búsqueda, recuerdo y contexto.
+1. **Encontrar el conocimiento actual.** Abre una Página relevante, busca o usa `/recall <consulta>`; `/brief [tema]` lee el Brief del Espacio actual y, si proporcionas un tema, añade contexto etiquetado por separado de ese mismo Espacio. Los clientes sin comandos de plugin usan las herramientas equivalentes de página, búsqueda, recuerdo y brief.
 2. **Capturar y encontrar conocimiento mientras trabajas.** `/capture <cosa>` guarda una decisión, lección, advertencia o hecho con su fuente. `/recall <consulta>` recupera solo lo que es relevante en lugar de cargar todo tu historial.
-3. **Cerrar el bucle.** `/handoff` registra qué cambió, qué queda pendiente y dónde debe continuar la próxima sesión.
+3. **Cerrar el bucle.** `/handoff` registra qué cambió y aplica actualizaciones tipadas a cada elemento del Brief del Espacio actual.
 4. **Mantener la wiki actualizada.** `/distill` crea o actualiza páginas deliberadamente. Entre sesiones, pasos opcionales basados en modelos pueden enriquecer capturas, conectar entidades relacionadas y actualizar páginas elegibles. `/lint` verifica la salud del conocimiento; `/curate` te presenta las revisiones propuestas y cualquier elemento de revisión de conflictos creado por el paso de reconciliación opcional.
 
 ### Modelos y privacidad

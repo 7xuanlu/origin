@@ -15,7 +15,7 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          release-type: simple
+          # No release-type input — setting it makes the action ignore config-file.
           manifest-file: .release-please-manifest.json
           config-file: release-please-config.json
           # GITHUB_TOKEN events don't trigger other workflows (GitHub security policy).

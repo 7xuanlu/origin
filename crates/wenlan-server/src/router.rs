@@ -6,11 +6,12 @@ pub use crate::route_registry::AppRouter;
 use crate::route_registry::{delete, get, patch, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
-    community_routes, config_routes, import_routes, ingest_routes, knowledge_routes, lint_routes,
-    memory_routes, onboarding_routes, page_map_routes, refinery_routes, repair_routes, routes,
-    security, source_routes, websocket,
+    brief_routes, community_routes, config_routes, import_routes, ingest_routes, knowledge_routes,
+    lint_routes, memory_routes, onboarding_routes, page_map_routes, refinery_routes, repair_routes,
+    routes, security, source_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use wenlan_core::truth_manifest::Builder;
 
 /// Build the shared application router with all routes.
 pub fn build_router(state: SharedState) -> AppRouter {
@@ -42,12 +43,16 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .allow_methods(Any)
         .allow_headers(Any);
 
-    repair_routes::register(lint_routes::register(TrackedRouter::new()))
+    repair_routes::register(lint_routes::register(TrackedRouter::new(Builder::Main)))
         // General
         .route("/api/health", get(routes::handle_health))
         .route("/api/status", get(routes::handle_status))
         .route("/api/search", post(routes::handle_search))
         .route("/api/context", post(routes::handle_context))
+        .route(
+            "/api/brief",
+            post(brief_routes::handle_read_brief).patch(brief_routes::handle_update_brief),
+        )
         .route("/api/ping", get(routes::handle_ping))
         .route("/api/llm/test", post(routes::handle_test_llm))
         .route("/api/shutdown", post(routes::handle_shutdown))
@@ -572,6 +577,16 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         // WebSocket
         .route("/ws/updates", get(websocket::handle_ws_upgrade))
         .finish()
+        // Innermost of the three, and `route_layer` rather than `layer`: it
+        // resolves the route's marker shape from `MatchedPath`, which only
+        // exists after routing.
+        .route_layer(axum::middleware::from_fn_with_state(
+            truth_guard::TruthGuardState {
+                state: state.clone(),
+                builder: Builder::Main,
+            },
+            truth_guard::guard,
+        ))
         .layer(cors)
         // Outermost: reject cross-origin browser traffic before CORS/handlers.
         .layer(axum::middleware::from_fn(security::guard_local_only))
@@ -594,10 +609,17 @@ pub fn build_repair_router(state: SharedState) -> AppRouter {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    repair_routes::register_execution(lint_routes::register(TrackedRouter::new()))
+    repair_routes::register_execution(lint_routes::register(TrackedRouter::new(Builder::Repair)))
         .route("/api/health", get(routes::handle_health))
         .route("/api/status", get(routes::handle_status))
         .finish_restricted()
+        .route_layer(axum::middleware::from_fn_with_state(
+            truth_guard::TruthGuardState {
+                state: state.clone(),
+                builder: Builder::Repair,
+            },
+            truth_guard::guard,
+        ))
         .layer(cors)
         .layer(axum::middleware::from_fn(security::guard_local_only))
         .with_state(state)

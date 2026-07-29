@@ -995,8 +995,16 @@ async fn write_grown_page(
     projection: &crate::export::knowledge::KnowledgeProjectionWrite,
 ) {
     match db.find_page_by_source_memory(source_id).await {
-        Ok(Some(page)) => match projection.write_page(&page) {
-            Ok(path) => log::info!("[post_ingest] wrote page to {path}"),
+        Ok(Some(page)) => match projection.write_page_gated(db, &page).await {
+            Ok(Some(path)) => log::info!("[post_ingest] wrote page to {path}"),
+            // Debug, not info: past the cutover this is the steady state for
+            // every provisional page, so at info it would be pure noise. It is
+            // still worth a line -- a page that silently stops being projected
+            // is exactly the thing someone will come looking for.
+            Ok(None) => log::debug!(
+                "[post_ingest] not projecting page {} — an automatic reader may not see it",
+                page.id
+            ),
             Err(e) => log::warn!("[post_ingest] knowledge write failed: {e}"),
         },
         Ok(None) => {}

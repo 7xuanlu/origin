@@ -7,7 +7,7 @@ These skills keep the daily interface short:
 ```text
 /setup       verify setup end-to-end
 /help        one-screen reference
-/brief       load session context
+/brief [topic] read the Space Brief; topic adds same-Space context
 /capture     save one durable memory
 /recall      search local memory
 /lint [deep|repair] [scope]   diagnose, or resolve all findings safely
@@ -26,7 +26,7 @@ The skills do not store data themselves. They guide Claude Code to use the local
 | --- | --- |
 | `setup` | End-to-end setup verifier (local runtime + MCP + round-trip). |
 | `help` | One-screen quick reference of the daily verbs and flow. |
-| `brief` | Load working context at session start or topic shifts. |
+| `brief` | Read the current Space Brief; a topic appends related same-Space context. |
 | `capture` | Save one durable memory: decision, lesson, gotcha, preference, fact, or correction. |
 | `recall` | Query Wenlan for focused context. |
 | `lint` | Run read-only diagnostics, or resolve all findings into ready, review, system-action, or blocked items. |

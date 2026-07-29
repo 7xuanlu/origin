@@ -7,22 +7,23 @@
 //! point the CLI at a remote daemon over a tunnel.
 //!
 //! The methods exposed here are the subset the CLI subcommands need:
-//! status, ping, search, context, store, list, agents.
+//! status, ping, search, recall, brief, store, list, agents.
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use wenlan_types::{
     requests::{
-        ListMemoriesRequest, SearchRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
-        UpdateAgentRequest,
+        ListMemoriesRequest, SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest,
+        StoreMemoryRequest, UpdateAgentRequest,
     },
     responses::{
-        AgentResponse, DefaultSpaceResponse, HealthResponse, KnowledgeContext,
-        ListMemoriesResponse, MemoryDetailResponse, PendingRevisionItem, RevisionAcceptResponse,
-        RevisionDismissResponse, SearchResponse, StoreMemoryResponse,
+        AgentResponse, DefaultSpaceResponse, HealthResponse, ListMemoriesResponse,
+        MemoryDetailResponse, PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse,
+        SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
     },
     sources::Source,
+    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest,
 };
 
 mod lint;
@@ -121,31 +122,63 @@ impl WenlanClient {
         resp.json().await.context("parsing /api/search response")
     }
 
-    /// POST /api/context — contextual knowledge bundle for a query.
-    ///
-    /// Note: `/api/context` (the older endpoint) takes `current_file` +
-    /// `cursor_prefix` and is hidden from the public API. The CLI uses
-    /// `/api/context` which accepts a free-form query and returns
-    /// the same `KnowledgeContext` shape inside its response.
-    pub async fn context(&self, query: String) -> Result<KnowledgeContext> {
-        let url = format!("{}/api/context", self.base_url);
-        let req = serde_json::json!({ "query": query });
-        let resp = self
+    /// POST /api/memory/search — semantic recall for one query.
+    pub async fn recall(&self, query: String, limit: usize) -> Result<SearchMemoryResponse> {
+        let url = format!("{}/api/memory/search", self.base_url);
+        let request = SearchMemoryRequest {
+            query,
+            limit,
+            memory_type: None,
+            space: None,
+            source_agent: None,
+            rerank: false,
+        };
+        let response = self
             .http
             .post(&url)
-            .json(&req)
+            .json(&request)
             .send()
             .await
-            .with_context(|| format!("POST {} failed", url))?;
-        let resp = resp
+            .with_context(|| format!("POST {url} failed"))?
             .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        let full: serde_json::Value = resp.json().await.context("parsing /api/context response")?;
-        let knowledge = full
-            .get("knowledge")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("/api/context response missing `knowledge`"))?;
-        serde_json::from_value(knowledge).context("parsing knowledge subobject")
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        response
+            .json()
+            .await
+            .context("parsing /api/memory/search response")
+    }
+
+    /// POST /api/brief — complete Brief plus optional same-Space recall.
+    pub async fn brief(&self, request: &BriefReadRequest) -> Result<BriefReadResponse> {
+        let url = format!("{}/api/brief", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(request)
+            .send()
+            .await
+            .with_context(|| format!("POST {url} failed"))?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        response.json().await.context("parsing /api/brief response")
+    }
+
+    /// PATCH /api/brief — item-level handoff deltas.
+    pub async fn update_brief(&self, request: &BriefUpdateRequest) -> Result<BriefUpdateReceipt> {
+        let url = format!("{}/api/brief", self.base_url);
+        let response = self
+            .http
+            .patch(&url)
+            .json(request)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url} failed"))?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        response
+            .json()
+            .await
+            .context("parsing PATCH /api/brief response")
     }
 
     /// POST /api/memory/store — write a memory.

@@ -138,6 +138,16 @@ fn resolve_wenlan_root() -> std::path::PathBuf {
         })
 }
 
+fn resolve_brief_status_root(wenlan_root: &std::path::Path) -> std::path::PathBuf {
+    if wenlan_core::env_compat::var_compat("WENLAN_DATA_DIR").is_some() {
+        return wenlan_root.join("sessions/_status");
+    }
+
+    dirs::home_dir()
+        .map(|home| home.join(".wenlan/sessions/_status"))
+        .unwrap_or_else(|| wenlan_root.join("sessions/_status"))
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn preflight_rotating_log_path(path: &std::path::Path) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
@@ -495,6 +505,18 @@ mod bind_addr_tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var("WENLAN_BIND_ADDR");
         assert_eq!(resolve_bind_addr(7878), "127.0.0.1:7878");
+    }
+
+    #[test]
+    fn brief_status_root_stays_inside_isolated_data_dir() {
+        let _guard = env_lock().lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        temp_env::with_var("WENLAN_DATA_DIR", Some(root.path()), || {
+            assert_eq!(
+                resolve_brief_status_root(root.path()),
+                root.path().join("sessions/_status")
+            );
+        });
     }
 
     #[test]
@@ -879,7 +901,7 @@ mod bind_addr_tests {
 // All other modules live in the library target (src/lib.rs) so that
 // integration tests in tests/ can reference them as wenlan_server::<mod>.
 use wenlan_server::{
-    ingest_batcher, lifecycle, router, scheduler,
+    brief_files, ingest_batcher, lifecycle, router, scheduler,
     state::{ServerState, SharedState},
 };
 
@@ -1043,6 +1065,7 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
     let termination_signals = install_termination_signals()
         .map_err(|error| anyhow::anyhow!("install termination signal handlers: {error}"))?;
     let wenlan_root = resolve_wenlan_root();
+    let brief_status_root = resolve_brief_status_root(&wenlan_root);
 
     // Port (clap `--port`/`WENLAN_PORT` → env var set by main(); read here)
     let configured_port: u16 = wenlan_core::env_compat::var_compat("WENLAN_PORT")
@@ -1162,6 +1185,7 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
     // Build state and restore the process-local fence while recovery is still
     // sealed. No background acquisition can start before `finish_recovery`.
     let mut server_state = ServerState::new();
+    server_state.brief_status_root = Some(brief_status_root.clone());
     server_state.optional_runtime_workers_suspended = repair_recovery_pending;
     server_state.repair_root = Some(repair_store.root().to_path_buf());
     let startup_repair_authority = match startup_repair_claim.as_ref() {
@@ -1197,6 +1221,22 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
     };
     let db_arc = Arc::new(db);
     server_state.db = Some(db_arc.clone());
+
+    // Legacy Markdown is imported once into daemon-owned Brief state. The source
+    // remains untouched until a later successful update replaces it with a receipt.
+    if !repair_recovery_pending {
+        match brief_files::import_legacy_status_files(&db_arc, &brief_status_root).await {
+            Ok(report) => {
+                if report.imported > 0 {
+                    tracing::info!("[brief] imported {} legacy Space Brief(s)", report.imported);
+                }
+                for warning in report.warnings {
+                    tracing::warn!("[brief] legacy import: {warning}");
+                }
+            }
+            Err(error) => tracing::warn!("[brief] legacy import failed: {error}"),
+        }
+    }
 
     // Run migration-55 backfill (event_date regex Pass A + memory_entities Pass B)
     // before the HTTP listener binds so no ingest races the backfill. Idempotent.
@@ -1431,8 +1471,10 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                     let mut written = 0usize;
                     let mut failed = 0usize;
                     for page in &pages {
-                        match projection.write_page(page) {
-                            Ok(_) => written += 1,
+                        match projection.write_page_gated(&db_arc, page).await {
+                            Ok(Some(_)) => written += 1,
+                            // gated: not projected, not a failure
+                            Ok(None) => {}
                             Err(e) => {
                                 tracing::warn!(
                                     "[backfill] write_page failed for {}: {}",
@@ -1520,6 +1562,49 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                             );
                         }
                         Err(e) => tracing::warn!("[reconcile] pass failed: {e}"),
+                    }
+
+                    // M5 PR-B: the projection directory is the enforcement
+                    // boundary for `wenlan pages`, which reads Markdown off
+                    // disk and cannot negotiate a truth contract. Inert until
+                    // the PR-C cutover — `page_visibility` answers `Full` for
+                    // every page at generation 0, so this removes nothing and
+                    // there is no generation branch here to weaken. It runs
+                    // anyway, so the pass is live rather than proven-and-
+                    // unwired, and it runs AFTER reconcile so it evicts from a
+                    // directory that is already consistent with the DB.
+                    match projection
+                        .enforce_projection_directory_invariant(&db_arc)
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(removed) => tracing::info!(
+                            "[truth] projection invariant evicted {removed} unsupported page(s)"
+                        ),
+                        // M5 PR-C item 4. A failure means a file the reader may
+                        // not see is still on disk. `wenlan pages` reads that
+                        // directory directly — there is no HTTP response to
+                        // filter and no wire gate in front of it — so at
+                        // generation >= 1 the daemon refuses to open a door it
+                        // cannot hold. At generation 0 the pass removes nothing,
+                        // so a failure records the absence of a restriction that
+                        // is not in force: `error!` and serve, as before.
+                        //
+                        // Refusing to start is acceptable rather than a brick
+                        // because advancing the generation is a deliberate
+                        // ceremony with an operator present.
+                        Err(e) => {
+                            let live = db_arc.truth_cutover_generation().await.unwrap_or(1) != 0;
+                            if live {
+                                let msg = format!(
+                                    "[truth] projection invariant pass failed at cutover \
+                                     generation >= 1; refusing to serve page traffic: {e}"
+                                );
+                                report_bootstrap_error(&wenlan_root, &msg);
+                                return Err(anyhow::anyhow!(msg));
+                            }
+                            tracing::error!("[truth] projection invariant pass failed: {e}");
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("[reconcile] list_pages failed: {e}"),

@@ -425,6 +425,19 @@ pub struct RecallParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BriefParams {
+    #[schemars(
+        description = "Optional topic. Omit it to read only the complete Space Brief; provide it to append separately labeled related context from the same Space."
+    )]
+    pub topic: Option<String>,
+    #[schemars(
+        description = "Space (project) whose Brief to read. Uses the locked or configured default Space when omitted."
+    )]
+    #[serde(default, alias = "domain")]
+    pub space: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ContextParams {
     #[schemars(
         description = "Topic or conversation summary to focus context retrieval. Omit at session start for general orientation; provide when shifting topics."
@@ -1122,6 +1135,45 @@ impl WenlanMcpServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             output.push_str(&format!("\n\nCompiled pages:\n{}", pages_json));
         }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    pub async fn brief_impl(&self, params: BriefParams) -> Result<CallToolResult, McpError> {
+        let request = wenlan_types::BriefReadRequest {
+            topic: params.topic,
+            space: effective_space(&params.space),
+            legacy_context_limit: None,
+        };
+        let response: wenlan_types::BriefReadResponse =
+            try_call!(self.client.post("/api/brief", &request), "brief load");
+
+        let output = match response.state {
+            wenlan_types::BriefReadState::SpaceNotResolved => {
+                "Space not resolved. Pass `space` or configure a default Space.".to_string()
+            }
+            wenlan_types::BriefReadState::BriefNotCreated => format!(
+                "No Brief exists for Space `{}` yet. Reads never create one; the first handoff update can.",
+                response.space.as_deref().unwrap_or("unknown")
+            ),
+            wenlan_types::BriefReadState::Ready => {
+                let brief = response.brief.as_ref().ok_or_else(|| {
+                    McpError::internal_error("ready Brief response omitted brief", None)
+                })?;
+                let brief_json = serde_json::to_string_pretty(brief)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let mut output = format!("Space Brief:\n{brief_json}");
+                if let Some(related) = response.related_context.as_ref() {
+                    let results_json = serde_json::to_string_pretty(&related.results)
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                    output.push_str(&format!(
+                        "\n\nRelated Context (query: {}):\n{}",
+                        related.query, results_json
+                    ));
+                }
+                output
+            }
+        };
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -2159,7 +2211,7 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Search memories by query. Use when the user asks 'do you remember', 'what do you know about', 'look up', or when you need a specific fact before acting.\n\nWrite queries as natural language — the search engine handles semantic matching. For precision, use filters (memory_type, space) to narrow results. If you get too many results, add filters rather than making the query longer.\n\nFor higher retrieval quality at the cost of latency, pass `rerank: true` to opt into the cross-encoder reranker (requires WENLAN_RERANKER_ENABLED=1 on the daemon).\n\nThis is for targeted lookups. For broad session orientation, use context instead.",
+        description = "Search memories by query. Use when the user asks 'do you remember', 'what do you know about', 'look up', or when you need a specific fact before acting.\n\nWrite queries as natural language — the search engine handles semantic matching. For precision, use filters (memory_type, space) to narrow results. If you get too many results, add filters rather than making the query longer.\n\nFor higher retrieval quality at the cost of latency, pass `rerank: true` to opt into the cross-encoder reranker (requires WENLAN_RERANKER_ENABLED=1 on the daemon).\n\nThis is for targeted lookups. To resume work from a Space-owned project snapshot, use brief instead.",
         annotations(title = "Recall", read_only_hint = true, open_world_hint = false)
     )]
     async fn recall(
@@ -2170,8 +2222,23 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Load session context — identity, preferences, and topic-relevant memories. Call this FIRST at the start of every session before doing anything else. Also call on major topic shifts or when the user says 'catch me up' or 'what's the background on'.\n\nThis returns a curated blend of who the user is and what's relevant. For specific factual lookups, use recall instead. Use the result to model how the user thinks, not just to look things up — their preferences and corrections tell you how they want to be helped.",
-        annotations(title = "Context", read_only_hint = true, open_world_hint = false)
+        description = "Read the current Space Brief when resuming project work or when the user asks to catch up. Omit `topic` to return only the complete Brief. Provide `topic` to append separately labeled related context scoped to the same Space. Reads never create or mutate a Brief; the first handoff update can create it.",
+        annotations(title = "Brief", read_only_hint = true, open_world_hint = false)
+    )]
+    async fn brief(
+        &self,
+        Parameters(params): Parameters<BriefParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.brief_impl(params).await
+    }
+
+    #[tool(
+        description = "Deprecated compatibility adapter for known callers. Use brief for Space-owned project orientation and recall for targeted memory lookup.",
+        annotations(
+            title = "Context (deprecated)",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn context(
         &self,
@@ -2635,8 +2702,9 @@ fn strip_space_from_tool_schema(mut tool: Tool) -> Tool {
     tool
 }
 
-/// Tools whose every lane hard-rejects over remote HTTP transport; hidden
-/// from tools/list there so remote clients don't pay for error-only tools.
+/// Deprecated tools remain routable for known callers but are not advertised.
+const HIDDEN_LEGACY_TOOL_NAMES: &[&str] = &["context"];
+
 const LOCAL_ONLY_TOOL_NAMES: &[&str] = &[
     "get_lint_agent_work_page",
     "prepare_lint_repair_plan",
@@ -2656,6 +2724,7 @@ const LOCAL_ONLY_TOOL_NAMES: &[&str] = &[
 impl WenlanMcpServer {
     fn visible_tools(&self) -> Vec<Tool> {
         let mut tools = Self::tool_router().list_all();
+        tools.retain(|tool| !HIDDEN_LEGACY_TOOL_NAMES.contains(&tool.name.as_ref()));
         if self.transport == TransportMode::Http {
             tools.retain(|tool| !LOCAL_ONLY_TOOL_NAMES.contains(&tool.name.as_ref()));
         }
@@ -2716,10 +2785,9 @@ impl ServerHandler for WenlanMcpServer {
              Wenlan is cumulative: each memory you store can be recalled, linked, and distilled into knowledge over time. \
              It's also shared across all the user's tools: what you write, other agents (Claude Desktop, Claude Code, \
              ChatGPT, Cursor, etc.) will read later. Write for any future reader, not just this conversation.\n\n\
-             FIRST THING EVERY SESSION: Call context to load the user's identity, preferences, and\n\
-             topic-relevant memories. This is how you know who you're talking to. Use the result to model how the \
-             user thinks — their preferences, corrections, and past decisions tell you how they want to be helped, \
-             not just what they already know.\n\n\
+             BRIEF: When resuming project work or when the user asks to catch up, call brief for the current Space. \
+             Omit topic for the complete Brief alone; provide topic only when same-Space related context is useful. \
+             Brief reads never create or mutate state.\n\n\
              STORE PROACTIVELY — don't wait for the user to ask.\n\
              - The user states a preference (\"I use X because...\", \"I prefer Y over Z\")\n\
              - The user makes a decision (\"going with approach A\", \"switching to B\")\n\
@@ -2762,8 +2830,8 @@ impl ServerHandler for WenlanMcpServer {
              articulated alternatives weighed AND the reasoning for the choice. A bare \"I'm switching to Cursor\" \
              is just a preference change — omit the type. \"Switching to Cursor over VSCode because of better \
              Claude integration, and we can always go back\" — that's a decision.\n\n\
-             RECALL vs CONTEXT:\n\
-             - context: broad orientation, session start, topic shifts, \"catch me up\"\n\
+             BRIEF vs RECALL:\n\
+             - brief: Space-owned project snapshot; topic optionally adds same-Space related context\n\
              - recall: specific lookup (\"what's Alice's role?\", \"database preferences\", \"our auth decision\")\n\n\
              The backend handles classification, entity extraction, structured fields, quality scoring,\n\
              and dedup — you don't need to replicate that logic. Focus on what only you know:\n\
@@ -4887,11 +4955,11 @@ mod tests {
     }
 
     #[test]
-    fn instructions_mention_how_user_thinks() {
-        assert!(
-            server_instructions().contains("how the user thinks"),
-            "with_instructions must frame context as modeling how the user thinks"
-        );
+    fn instructions_define_brief_recall_boundary() {
+        let instructions = server_instructions();
+        assert!(instructions.contains("BRIEF vs RECALL"));
+        assert!(instructions.contains("Brief reads never create or mutate state"));
+        assert!(!instructions.contains("FIRST THING EVERY SESSION"));
     }
 
     #[test]
@@ -5021,12 +5089,12 @@ mod tests {
     }
 
     #[test]
-    fn context_description_frames_modeling_user() {
+    fn brief_description_defines_topic_boundary() {
         let descriptions = tool_descriptions();
-        let ctx = descriptions.get("context").expect("context tool exists");
+        let brief = descriptions.get("brief").expect("brief tool exists");
         assert!(
-            ctx.contains("how the user thinks"),
-            "context description must frame the result as modeling how the user thinks, got: {ctx}"
+            brief.contains("Omit `topic`") && brief.contains("same Space"),
+            "brief description must distinguish the full Brief from topic-related context: {brief}"
         );
     }
 
@@ -5791,7 +5859,7 @@ mod tests {
             "apply_lint_repair",
             "capture",
             "confirm_memory",
-            "context",
+            "brief",
             "create_entity",
             "create_relation",
             "delete_page",
@@ -5819,9 +5887,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_context_is_registered_but_not_visible() {
+        let raw = WenlanMcpServer::tool_router().list_all();
+        assert!(raw.iter().any(|tool| tool.name == "context"));
+        assert!(make_server(TransportMode::Stdio, "agent", None)
+            .visible_tools()
+            .iter()
+            .all(|tool| tool.name != "context"));
+    }
+
+    #[test]
     fn tool_surface_is_locked() {
-        let mut actual: Vec<String> = WenlanMcpServer::tool_router()
-            .list_all()
+        let mut actual: Vec<String> = make_server(TransportMode::Stdio, "agent", None)
+            .visible_tools()
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();

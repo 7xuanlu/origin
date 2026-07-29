@@ -163,6 +163,82 @@ def validate_capture_relation_flow(
             )
 
 
+def validate_session_brief_flow(
+    root: Path,
+    _surface: str,
+    skill_path: Path,
+    expected_prefix: str,
+    frontmatter: dict[str, str],
+    text: str,
+) -> None:
+    normalized = " ".join(text.split())
+    forbidden = [
+        "context(",
+        "Call FIRST at session start",
+        "BEFORE any other Wenlan",
+        "cat ~/.wenlan/sessions/_status",
+    ]
+    for needle in forbidden:
+        if needle in text:
+            fail(f"{rel(root, skill_path)} contains retired Brief flow {needle!r}")
+    if re.search(r"cat[^\n]*sessions/_status", text):
+        fail(f"{rel(root, skill_path)} must not read the Markdown status receipt")
+
+    if frontmatter.get("name") == "brief":
+        expected_allowed = {
+            "Bash",
+            f"{expected_prefix}brief",
+            f"{expected_prefix}list_pending_revisions",
+            f"{expected_prefix}accept_revision",
+            f"{expected_prefix}dismiss_revision",
+        }
+        allowed: Any = None
+        try:
+            allowed = json.loads(frontmatter.get("allowed-tools", ""))
+        except json.JSONDecodeError:
+            fail(f"{rel(root, skill_path)} allowed-tools must be a JSON array")
+        if not isinstance(allowed, list) or set(allowed) != expected_allowed:
+            fail(
+                f"{rel(root, skill_path)} allowed-tools must be exactly "
+                f"{sorted(expected_allowed)!r}"
+            )
+        required = [
+            "No topic means the complete Brief alone.",
+            "Related Context",
+            "Brief reads never create state.",
+            "It is not a mandatory every-session boot step.",
+            "one-way human-readable receipt",
+        ]
+    else:
+        required = [
+            "Read the Brief before composing deltas",
+            "This read is mandatory before any Brief delta is authored for a registered Space.",
+            "brief update --file",
+            "Never fuzzy-match",
+            "Never auto-demote",
+            "one-way human receipt",
+            "Never read, edit, or overwrite that receipt as authority.",
+            "cwd-repo-new",
+            "For `cwd-repo-new`, prove the Space is absent with `spaces show` before composing deltas.",
+            "Outside a Git repository, do not derive a new Space from the directory basename.",
+            "Apply the Brief update before Space-scoped captures when this fallback is new.",
+            "Every delta for one existing item uses the same version from the pre-handoff Brief snapshot.",
+        ]
+        retired_handoff = [
+            "status_json=",
+            "Promotion / demotion rules",
+            "Overwrite `~/.wenlan/sessions/_status",
+            "handoff-<project>.json",
+        ]
+        for needle in retired_handoff:
+            if needle in text:
+                fail(f"{rel(root, skill_path)} contains retired handoff state {needle!r}")
+
+    for needle in required:
+        if needle not in normalized:
+            fail(f"{rel(root, skill_path)} must contain Brief guardrail {needle!r}")
+
+
 def fail(message: str) -> None:
     print(f"plugin contract validation failed: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -469,6 +545,10 @@ def validate_skill_surface(
             fail(f"{rel(root, skill_path)} contains unexpected MCP tools: {wrong_tools}")
         if mcp_tools and not any(token.startswith(expected_prefix) for token in mcp_tools):
             fail(f"{rel(root, skill_path)} must use MCP prefix {expected_prefix!r}")
+        if name in {"brief", "handoff"}:
+            validate_session_brief_flow(
+                root, surface, skill_path, expected_prefix, frontmatter, text
+            )
         if name == "capture":
             validate_capture_relation_flow(
                 root,

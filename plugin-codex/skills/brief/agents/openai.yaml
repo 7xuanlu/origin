@@ -1,3 +1,3 @@
 interface:
   display_name: "Wenlan Brief"
-  short_description: "Load status, relevant memories, and pending Wenlan revisions"
+  short_description: "Read the Space Brief and optional related context"

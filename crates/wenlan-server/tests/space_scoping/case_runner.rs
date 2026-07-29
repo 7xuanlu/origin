@@ -17,6 +17,7 @@ pub struct ExpectedContract {
 pub const WAVE_1: &[ExpectedContract] = &[
     body(Method::Post, "/api/search"),
     body(Method::Post, "/api/context"),
+    body(Method::Post, "/api/brief"),
     header(Method::Get, "/api/memory/recent"),
     header(Method::Get, "/api/memory/unconfirmed"),
     body(Method::Post, "/api/memory/search"),
@@ -220,8 +221,8 @@ pub fn assert_wave_1_catalog_contract() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         keys.len(),
-        8,
-        "Wave 1 registry must contain eight unique keys"
+        9,
+        "Wave 1 registry must contain nine unique keys"
     );
 
     for expected in WAVE_1 {
@@ -370,7 +371,7 @@ pub fn assert_wave_4_knowledge_catalog_contract() {
     }
 
     let rows = wenlan_server::sensitive_read_routes::sensitive_read_routes().collect::<Vec<_>>();
-    assert_eq!(rows.len(), 63);
+    assert_eq!(rows.len(), 64);
     assert_eq!(
         rows.iter()
             .filter(|row| row.scope_binding == ScopeBinding::Global)
@@ -381,7 +382,7 @@ pub fn assert_wave_4_knowledge_catalog_contract() {
         rows.iter()
             .filter(|row| row.scope_binding != ScopeBinding::Global)
             .count(),
-        47
+        48
     );
     assert_eq!(
         rows.iter()
