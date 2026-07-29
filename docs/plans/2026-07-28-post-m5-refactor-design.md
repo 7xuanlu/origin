@@ -1321,6 +1321,47 @@ Execution evidence:
   **APPROVE** after the correction, with the staged scope still exact and
   clean.
 
+#### R4-15 — paired-eval summary-node guard
+
+- Add `db/eval_paired_guard.rs` with one narrow
+  `MemoryDB::eval_paired_summary_node_count() -> Result<i64, WenlanError>`
+  mechanic. It owns only the DB mutex, literal
+  `SELECT COUNT(*) FROM summary_nodes` query with `libsql::params![]`, row
+  iteration, and `i64` field decode. Query, `next`, and `get` failures surface
+  as `Err`; an `Ok` query with no row returns `Ok(0)`. The method must not
+  default an error to zero, assert, expose a raw handle, or accept a callback.
+- Keep the fail-soft fairness policy in
+  `eval/paired.rs::assert_summary_nodes_empty`: only the caller applies
+  `.unwrap_or(0)`, so a missing table or any query/row/decode failure still
+  behaves as zero. Keep the existing `assert_eq!` and its complete diagnostic
+  text unchanged; only a positive `i64` count refuses the paired baseline.
+  The DB mutex releases after read/decode and before caller fallback/assert.
+- Keep both existing calls in their exact pre-fixture position: before
+  `load_locomo` in the LoCoMo cross-rerank collector and before
+  `load_longmemeval` in the LongMemEval collector. No scoring, attribution,
+  fixture, or statistical policy moves under `MemoryDB`.
+- Direct controls use an isolated DB to prove a missing table yields `Err`, an
+  empty table yields `0`, and one inserted row yields `1`. Caller controls
+  prove the missing-table error still passes and one row panics with the
+  existing `summary_nodes is non-empty (1 rows): the global-prelude prepend`
+  diagnostic prefix. The DB test module uses an `_test.rs` suffix.
+- RED removes only the `eval/paired.rs: 1` baseline row; before extraction the
+  exact guard reports one new direct access. GREEN moves that production lock
+  under `db/**`: external literals `303 → 302`, production `14 → 13`, and
+  tests remain `289`. Both `eval/longmemeval.rs: 2` event-date write loops
+  remain unchanged.
+- The generated M5 inventory must remain exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only mechanically shifted source addresses
+  may change. No truth adapter, manifest row, permit, or cutover generation
+  changes. This is a movement-only evaluator-integrity slice: run focused
+  unit and structural controls, not a real paired quality benchmark, and make
+  no eval-effect claim.
+- PRE-IMPLEMENTATION PREFLIGHT, 2026-07-29: independent Sol and auditor reviews
+  both returned **APPROVE** for this boundary. Both rejected an `*_or_zero` DB
+  method because error-to-zero is evaluator fairness policy, not a storage
+  mechanic; the `Result<i64, WenlanError>` seam and caller fallback above are
+  the frozen resolution.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
