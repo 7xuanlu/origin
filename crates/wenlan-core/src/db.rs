@@ -27,6 +27,7 @@ mod count;
 mod derived_artifact_sweep;
 mod edges_rebuild;
 mod entity_page_adapter;
+mod eval_lifecycle_integrity;
 mod eval_substrate_guard;
 mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;
@@ -65,6 +66,8 @@ mod claim_identity_test;
 mod edges_rebuild_test;
 #[cfg(test)]
 mod entity_page_adapter_test;
+#[cfg(test)]
+mod eval_lifecycle_integrity_test;
 #[cfg(test)]
 mod eval_substrate_guard_test;
 #[cfg(test)]

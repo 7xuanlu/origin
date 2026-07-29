@@ -5678,7 +5678,6 @@ const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ("crates/wenlan-core/src/derived_artifact_state.rs", 2),
     ("crates/wenlan-core/src/document_enrichment.rs", 12),
     ("crates/wenlan-core/src/eval/answer_quality.rs", 1),
-    ("crates/wenlan-core/src/eval/lifecycle.rs", 4),
     ("crates/wenlan-core/src/eval/longmemeval.rs", 2),
     ("crates/wenlan-core/src/eval/paired.rs", 1),
     ("crates/wenlan-core/src/eval/pipeline.rs", 2),

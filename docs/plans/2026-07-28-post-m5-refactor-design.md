@@ -1195,6 +1195,51 @@ Execution evidence:
   cross-statement snapshot. REVIEW 2 returned **APPROVE** with no remaining
   material finding.
 
+#### R4-13 — eval lifecycle integrity reads
+
+- Add `db/eval_lifecycle_integrity.rs` with four purpose-bounded reads:
+  supersedes inputs, lifecycle state counts, merged source ids, and archived
+  search inputs. Exact SQL, binds, error prefixes, lossy field decoding, and
+  silent row-iteration termination move under `MemoryDB`; the methods return
+  typed rows/state or a deduplicated id set, never a raw handle or callback.
+- Keep `merged_before` filtering, cluster matching, tracker-map construction,
+  relevance grades, and relevant-set policy in `eval/lifecycle.rs`. Keep
+  archive-id construction, leakage calculation, and the search loop there.
+  The supersedes, merged-id, and archive guards release after complete rows
+  materialize and before caller policy or search.
+- Preserve `count_db_state` as one mutex-held ordered sequence of its four
+  count queries. It opens no transaction and promises no cross-statement
+  database snapshot. The DB method returns only the four typed counts;
+  `PhaseMetrics` construction and tuple interpretation remain in lifecycle.
+  The legacy `concepts WHERE status = 'active'` query is unchanged even though
+  current production schema no longer owns that table.
+- RED removes the `eval/lifecycle.rs: 4` baseline row first; the exact guard
+  reports four new direct accesses. GREEN moves those four production locks
+  under `db/**`: external literals `309 → 305`, production `20 → 16`, tests
+  remain `289`, and lifecycle disappears from the per-file baseline.
+- Direct DB controls pass `3 / 3`: supersedes inputs retain preexisting rows,
+  `DISTINCT` collapse, and NULL; merged ids exclude nonmerged/non-memory rows
+  and deduplicate; the four counts preserve memory/archive/entity/legacy-active
+  concept selection with negative controls; archived inputs retain empty
+  content and include only archived memory heads. The exact legacy concepts
+  surface exists only in the test fixture.
+- Lifecycle controls pass `16 / 16`, including a caller-level control seeded
+  through `upsert_documents`: `SupersedesTracker::build` filters the
+  preexisting merged id, matches only the new row to its cluster, and extends
+  grades/relevance only for that row. The exact external-access ratchet passes
+  `3 / 3`.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only generated source addresses move. No
+  truth adapter, manifest row, permit, or cutover generation changes.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: the independent auditor returned
+  **APPROVE**, confirming exact lossy read behavior, legacy-count semantics,
+  caller-owned tracker and leakage policy, substantive direct and caller
+  controls, ratchet accounting, and unchanged M5 topology.
+- REVIEW, 2026-07-29: the independent Sol reviewer returned **APPROVE** with no
+  material finding. It independently verified all four DB methods, the
+  same-guard count sequence, accepted materialization lock shrink, exact
+  staging, and truth isolation.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
