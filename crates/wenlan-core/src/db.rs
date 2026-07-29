@@ -44017,20 +44017,27 @@ impl MemoryDB {
     /// wikilinks that resolve immediately instead of inventing labels the
     /// resolver has to leave as orphans.
     pub async fn list_active_page_titles(&self, limit: usize) -> Result<Vec<String>, WenlanError> {
-        self.list_active_page_titles_scoped(None, limit).await
+        Ok(self
+            .list_active_page_titles_scoped(None, limit)
+            .await?
+            .into_iter()
+            .map(|(_, title)| title)
+            .collect())
     }
 
-    /// Title-only fallback for Page compilation, optionally constrained to a
-    /// workspace. Unlike `list_pages`, this never materializes Page bodies.
+    /// Id+title fallback for Page compilation, optionally constrained to a
+    /// workspace. Unlike `list_pages`, this never materializes Page bodies. The
+    /// id rides along so a caller can gate the result through
+    /// `truth_adapter::filter_page_refs` before handing titles to the LLM.
     pub async fn list_active_page_titles_scoped(
         &self,
         workspace: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<String>, WenlanError> {
+    ) -> Result<Vec<(String, String)>, WenlanError> {
         let conn = self.conn.lock().await;
         let (sql, params): (&str, Vec<libsql::Value>) = match workspace {
             Some(workspace) => (
-                "SELECT title FROM pages WHERE status = 'active'
+                "SELECT id, title FROM pages WHERE status = 'active'
                    AND COALESCE(kind, 'concept') != 'entity'
                    AND COALESCE(workspace, space) = ?1
                  ORDER BY last_modified DESC LIMIT ?2",
@@ -44040,7 +44047,7 @@ impl MemoryDB {
                 ],
             ),
             None => (
-                "SELECT title FROM pages WHERE status = 'active'
+                "SELECT id, title FROM pages WHERE status = 'active'
                    AND COALESCE(kind, 'concept') != 'entity'
                  ORDER BY last_modified DESC LIMIT ?1",
                 vec![libsql::Value::Integer(limit as i64)],
@@ -44056,20 +44063,25 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            out.push(row.get::<String>(0).unwrap_or_default());
+            out.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+            ));
         }
         Ok(out)
     }
 
-    /// Return active page titles ranked by embedding similarity to `query`,
-    /// optionally constrained to the same space (M1 honest columns:
+    /// Return active page (id, title) pairs ranked by embedding similarity to
+    /// `query`, optionally constrained to the same space (M1 honest columns:
     /// `workspace` and `space` are mirrored duplicates, so this reads `space`).
+    /// The id rides along so a caller can gate the result through
+    /// `truth_adapter::filter_page_refs` before handing titles to the LLM.
     pub async fn list_relevant_active_page_titles(
         &self,
         query: &str,
         workspace: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<String>, WenlanError> {
+    ) -> Result<Vec<(String, String)>, WenlanError> {
         if limit == 0 {
             return Ok(vec![]);
         }
@@ -44080,7 +44092,7 @@ impl MemoryDB {
 
         let (sql, params): (String, Vec<libsql::Value>) = match workspace {
             Some(workspace) => (
-                "SELECT title FROM pages \
+                "SELECT id, title FROM pages \
                  WHERE status = 'active' \
                    AND COALESCE(kind, 'concept') != 'entity' \
                    AND embedding IS NOT NULL \
@@ -44095,7 +44107,7 @@ impl MemoryDB {
                 ],
             ),
             None => (
-                "SELECT title FROM pages \
+                "SELECT id, title FROM pages \
                  WHERE status = 'active' \
                    AND COALESCE(kind, 'concept') != 'entity' \
                    AND embedding IS NOT NULL \
@@ -44119,7 +44131,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            out.push(row.get::<String>(0).unwrap_or_default());
+            out.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+            ));
         }
         Ok(out)
     }
@@ -44857,6 +44872,7 @@ impl MemoryDB {
             kind: row
                 .get::<String>(20)
                 .unwrap_or_else(|_| "concept".to_string()),
+            truth: None,
         })
     }
 
@@ -54860,6 +54876,7 @@ pub(crate) mod tests {
             workspace: workspace.map(|w| w.to_string()),
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         }
     }
 
@@ -79530,6 +79547,7 @@ pub(crate) mod tests {
             workspace: None,
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         };
         let r = MemoryDB::search_result_from_page(page);
         assert_eq!(r.source, "page");
@@ -89503,7 +89521,7 @@ pub(crate) mod tests {
         assert!(
             !unscoped
                 .iter()
-                .any(|t| t == "Relevant Titles Zephyr Marker"),
+                .any(|(_, t)| t == "Relevant Titles Zephyr Marker"),
             "list_relevant_active_page_titles(None) must not surface a shadow title"
         );
 
@@ -89512,7 +89530,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            !scoped.iter().any(|t| t == "Relevant Titles Zephyr Marker"),
+            !scoped
+                .iter()
+                .any(|(_, t)| t == "Relevant Titles Zephyr Marker"),
             "list_relevant_active_page_titles(Some(space)) must not surface a shadow title"
         );
     }

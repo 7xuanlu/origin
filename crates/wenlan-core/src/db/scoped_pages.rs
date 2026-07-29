@@ -51,6 +51,21 @@ fn page_not_found() -> WenlanError {
     WenlanError::NotFound("page not found".to_string())
 }
 
+/// One unresolved wikilink, still attached to the page whose body it came from.
+///
+/// This is the row `list_orphan_link_labels_scoped` throws away:
+/// `COUNT(DISTINCT pl.source_page_id)` folds the source page out inside SQL,
+/// and the source page is the only thing the exposure contract has a verdict
+/// about -- an orphan label is `[[wikilink]]` text lifted out of ITS body, not
+/// a name for the page it fails to resolve to. A reader that must filter by
+/// source page therefore needs the rows, not the aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanLinkRow {
+    pub label_key: String,
+    pub label: String,
+    pub source_page_id: String,
+}
+
 impl MemoryDB {
     /// Route-facing Page search. Selected scopes use a workspace predicate in
     /// the same query that ranks and limits candidates; Global preserves the
@@ -523,6 +538,96 @@ impl MemoryDB {
             pages.push(Self::row_to_page(&row)?);
         }
         Ok(pages)
+    }
+
+    /// Every orphan link as a row, source page intact, for readers that have to
+    /// filter before they fold.
+    ///
+    /// Same predicate as `list_orphan_link_labels_scoped` -- unresolved target,
+    /// active source page, the scope clause -- with the aggregation removed.
+    /// Splitting it that way is the whole point: the aggregate applies
+    /// `HAVING n >= ?` and `LIMIT 100` inside SQL, so a caller that filters the
+    /// aggregate's output reports counts and a truncation point computed over
+    /// pages it may not see. Pair this with [`MemoryDB::fold_orphan_labels`],
+    /// which reproduces the aggregate over whatever survives the filter.
+    ///
+    /// Global is handled here rather than delegating to a separate twin: with
+    /// no `min_count` parameter the scope clause is the only difference between
+    /// the arms, and `page_scope_clause` already answers empty for Global.
+    ///
+    /// ponytail: the flat `LIMIT 20000` is a ceiling, not a page. Orphan links
+    /// are a per-page-body artifact, and a graph that produces more than 20k of
+    /// them has a bigger problem than this feed. If one ever does, the upgrade
+    /// is a keyset walk over `label_key` feeding the same fold, not a larger
+    /// number here.
+    pub async fn list_orphan_link_rows_scoped(
+        &self,
+        scope: &ReadScope,
+    ) -> Result<Vec<OrphanLinkRow>, WenlanError> {
+        let (scope_sql, scope_value) = page_scope_clause(scope, "p.workspace", 1);
+        let sql = format!(
+            "SELECT pl.label_key, pl.label, pl.source_page_id \
+             FROM page_links pl INNER JOIN pages p ON p.id = pl.source_page_id \
+             WHERE pl.target_page_id IS NULL AND p.status = 'active'{scope_sql} \
+             LIMIT 20000"
+        );
+        let mut params = Vec::new();
+        if let Some(value) = scope_value {
+            params.push(value);
+        }
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(&sql, params).await.map_err(|error| {
+            WenlanError::VectorDb(format!("list_orphan_link_rows_scoped: {error}"))
+        })?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(error.to_string()))?
+        {
+            out.push(OrphanLinkRow {
+                label_key: row.get(0).unwrap_or_default(),
+                label: row.get(1).unwrap_or_default(),
+                source_page_id: row.get(2).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The aggregate twin's `GROUP BY label_key HAVING n >= ? ORDER BY n DESC,
+    /// display_label ASC LIMIT 100`, in Rust, over rows a caller has already
+    /// filtered.
+    ///
+    /// It has to be a re-implementation rather than a second query, because the
+    /// point is to count and cap over the pages *this* caller may see and SQL
+    /// cannot know that. The semantics are copied deliberately: display label is
+    /// the lexicographic minimum in the group (`MIN(pl.label)`, BINARY collation,
+    /// which is `String::cmp`), and `n` counts DISTINCT source pages.
+    /// `page_links` is keyed `(source_page_id, label_key)`, so a duplicate pair
+    /// cannot exist today -- the DISTINCT logic is written out anyway rather
+    /// than leaning on a primary key this function has no way to check.
+    ///
+    /// Pure and DB-free; it hangs off `MemoryDB` only because that is what makes
+    /// it nameable outside `db`'s private module tree.
+    pub fn fold_orphan_labels(rows: Vec<OrphanLinkRow>, min_count: i64) -> Vec<(String, i64)> {
+        let mut groups: HashMap<String, (String, HashSet<String>)> = HashMap::new();
+        for row in rows {
+            let group = groups
+                .entry(row.label_key)
+                .or_insert_with(|| (row.label.clone(), HashSet::new()));
+            if row.label < group.0 {
+                group.0 = row.label;
+            }
+            group.1.insert(row.source_page_id);
+        }
+        let mut folded: Vec<(String, i64)> = groups
+            .into_values()
+            .map(|(label, sources)| (label, sources.len() as i64))
+            .filter(|(_, n)| *n >= min_count)
+            .collect();
+        folded.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        folded.truncate(100);
+        folded
     }
 
     pub async fn list_orphan_link_labels_scoped(

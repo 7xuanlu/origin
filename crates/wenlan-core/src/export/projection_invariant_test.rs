@@ -78,6 +78,7 @@ fn page(id: &str) -> Page {
         workspace: None,
         citations: Vec::new(),
         kind: "concept".to_string(),
+        truth: None,
     }
 }
 
@@ -109,6 +110,58 @@ fn project_all(db: &MemoryDB, root: &Path) -> KnowledgeProjectionWrite {
         "the seed itself must put all three on disk, or the eviction proves nothing"
     );
     projection
+}
+
+/// The other half of the invariant: a boot-time sweep alone would let the very
+/// next distillation put an unsupported page straight back on disk, where it
+/// stays readable until the daemon happens to restart. So the write declines
+/// too, and the pair is what makes the invariant hold continuously rather than
+/// at boot.
+///
+/// Declining is not an error. A gated page is a page this projection has no
+/// business writing, not a failure to write one -- so it returns `Ok(None)` and
+/// the caller carries on.
+#[tokio::test]
+async fn a_gated_write_declines_instead_of_projecting_or_failing() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = KnowledgeProjectionWrite::new(root.path().to_path_buf(), &db);
+
+    // Generation 0: pass-through, both pages land.
+    for id in ["p1", "p2"] {
+        let written = projection
+            .write_page_gated(&db, &page(id))
+            .await
+            .unwrap_or_else(|e| panic!("{id} must write at generation 0: {e}"));
+        assert!(written.is_some(), "{id} was gated while the cutover is off");
+    }
+    assert_eq!(readable_pages(root.path()), ["p1", "p2"]);
+
+    // Generation 1: same substrate, and only the supported page may be rewritten.
+    db.set_truth_cutover_generation(1).await.unwrap();
+    std::fs::remove_file(root.path().join("p2.md")).unwrap();
+
+    assert!(
+        projection
+            .write_page_gated(&db, &page("p1"))
+            .await
+            .expect("a supported page still writes")
+            .is_some(),
+        "the cutover must not stop supported pages from projecting"
+    );
+    assert!(
+        projection
+            .write_page_gated(&db, &page("p2"))
+            .await
+            .expect("a gated write is a decision, not an error")
+            .is_none(),
+        "an unsupported page must not be projected"
+    );
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1"],
+        "the declined write must leave nothing on disk for `wenlan pages` to read"
+    );
 }
 
 /// The PR-B production configuration. The pass runs, and the directory keeps
@@ -157,6 +210,121 @@ async fn after_the_cutover_the_projection_holds_supported_pages_only() {
          cannot negotiate -- the file has to be gone, not merely unlisted"
     );
     assert_eq!(removed, 2);
+}
+
+/// The reason the pass enumerates the directory and not `state.json`.
+///
+/// A projected file that `state.json` has lost is still a file on disk, and
+/// `wenlan pages` reads the disk. Enumerating `state.json` walks straight past
+/// it. Enumerating the directory but evicting through `remove_page` is no
+/// better and is arguably worse: that function looks the id up in `state.pages`
+/// and returns `Ok(())` *without touching the disk* when it is absent, so the
+/// pass would count a silent no-op as a removal -- a false success in the
+/// receipt, with the file still readable.
+#[tokio::test]
+async fn a_file_state_json_has_forgotten_is_still_evicted() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    // Total amnesia: every entry dropped, every file left exactly where it is.
+    std::fs::write(
+        root.path().join(".wenlan/state.json"),
+        r#"{"schema_version":2,"pages":{}}"#,
+    )
+    .unwrap();
+
+    let removed = projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1"],
+        "eviction must not depend on the projection remembering it wrote the file"
+    );
+    assert_eq!(removed, 2);
+}
+
+/// The frontmatter scan reads a bounded prefix of each file, and that bound can
+/// land in the middle of a multi-byte character. `read_to_string` fails the
+/// entire read when it does, and the failure is swallowed -- so the file drops
+/// out of the scan and a page `state.json` has forgotten keeps its `.md`
+/// through the eviction that exists to remove it. Fail OPEN, on a disclosure
+/// boundary, for any page carrying non-ASCII prose past the cap.
+///
+/// Three paddings, because only one alignment in three splits a 3-byte
+/// character at the cap and the rendered frontmatter's own length is not a
+/// constant this test should have to know. All three must evict.
+#[tokio::test]
+async fn a_page_with_multibyte_prose_past_the_scan_cap_is_still_evicted() {
+    for pad in 0..3 {
+        let (db, _tmp) = db_with_truth_rows().await;
+        let root = tempfile::tempdir().unwrap();
+        let projection = KnowledgeProjectionWrite::new(root.path().to_path_buf(), &db);
+
+        let mut p2 = page("p2");
+        // Far past the 8 KiB cap, so the truncation lands deep inside the CJK
+        // run whatever the header measures.
+        p2.content = "x".repeat(pad) + &"文".repeat(8 * 1024);
+        projection.write_page(&page("p1")).unwrap();
+        projection.write_page(&p2).unwrap();
+        assert_eq!(readable_pages(root.path()), ["p1", "p2"], "pad {pad}: seed");
+
+        db.set_truth_cutover_generation(1).await.unwrap();
+        // The scan has to be the only enumeration path: with `state.json` intact
+        // the id comes back through its keys and the bug stays hidden.
+        std::fs::write(
+            root.path().join(".wenlan/state.json"),
+            r#"{"schema_version":2,"pages":{}}"#,
+        )
+        .unwrap();
+
+        let removed = projection
+            .enforce_projection_directory_invariant(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            readable_pages(root.path()),
+            ["p1"],
+            "pad {pad}: a page with multi-byte prose escaped eviction"
+        );
+        assert_eq!(removed, 1, "pad {pad}");
+    }
+}
+
+/// `knowledge_path` can point at the user's own Obsidian vault, so a top-level
+/// `.md` carrying no `origin_id` is somebody else's note -- not a page this
+/// projection failed to track.
+///
+/// It is skipped: never deleted, and never reported as a stuck eviction either.
+/// The second half matters as much as the first, because at generation >= 1 a
+/// returned error takes the daemon down (section 4) -- so counting a stranger's
+/// file as a failure would turn one unrecognized note into a refusal to start.
+/// Fail closed on the decision, never on the user's data.
+#[tokio::test]
+async fn a_file_with_no_origin_id_is_left_alone() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    let stranger = root.path().join("someone-elses-note.md");
+    std::fs::write(&stranger, "# Just a note\n\nNo frontmatter at all.\n").unwrap();
+
+    let removed = projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .expect("an unattributable file is not a stuck eviction");
+
+    assert_eq!(removed, 2, "only the two unsupported pages are evicted");
+    assert!(
+        stranger.is_file(),
+        "a file the projection cannot attribute must survive untouched"
+    );
 }
 
 /// The pass is idempotent and does not eat what it may not eat: running it

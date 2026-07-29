@@ -16,6 +16,8 @@ use crate::refinery::helpers::{
 };
 use crate::sources::StabilityTier;
 use crate::synthesis::refinement_queue::{resolve_proposal, ResolveStatus};
+use crate::truth_adapter::{filter_page_refs, page_write_permit};
+use crate::truth_contract::TruthGrant;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use wenlan_types::requests::{CreateConceptRequest, UpdatePageRequest};
@@ -95,9 +97,19 @@ pub(crate) async fn build_existing_titles_hint(
     if titles.is_empty() {
         return String::new();
     }
+    // An unsupported page is not a safe wikilink target: the title would ride
+    // into another page's prose, where any Full-visibility reader sees it with
+    // no gate in front of it. `Automatic` because a distill prompt build has no
+    // caller grant to pass, same reasoning as `page_write_permit`.
+    let titles = filter_page_refs(db, &TruthGrant::Automatic, titles, |item| item.0.as_str())
+        .await
+        .unwrap_or_default();
+    if titles.is_empty() {
+        return String::new();
+    }
     let formatted = titles
         .iter()
-        .map(|title| {
+        .map(|(_, title)| {
             let capped: String = title.chars().take(EXISTING_TITLE_CHAR_CAP).collect();
             format!("[[{capped}]]")
         })
@@ -795,8 +807,9 @@ async fn distill_one_cluster_with_tuning(
 
             if let Some(ref projection) = projection {
                 if let Ok(Some(c)) = db.get_page(&page_id).await {
-                    match projection.write_page(&c) {
-                        Ok(p) => log::info!("[distill] wrote page to {p}"),
+                    match projection.write_page_gated(db, &c).await {
+                        Ok(Some(p)) => log::info!("[distill] wrote page to {p}"),
+                        Ok(None) => {}
                         Err(e) => log::warn!("[distill] knowledge write failed: {e}"),
                     }
                 }
@@ -1254,6 +1267,17 @@ pub(crate) async fn refresh_page_with_prompt(
     reason: RefreshReason,
     knowledge_path: Option<&std::path::Path>,
 ) -> Result<RefreshOutcome, WenlanError> {
+    // The ambient sweep (`SourceChanged`) is not an HTTP route, so there is no
+    // caller grant to pass -- it asks the automatic-reader permit directly,
+    // same reasoning as `write_page_gated`. An `Explicit` request already
+    // carries its own wire-level grant and is unaffected.
+    if reason == RefreshReason::SourceChanged && page_write_permit(db, page_id).await?.is_none() {
+        log::info!(
+            "[refresh] not re-distilling page {page_id} — an automatic reader may not see it"
+        );
+        return Ok(RefreshOutcome::default());
+    }
+
     let page = db
         .get_page(page_id)
         .await?
@@ -1461,6 +1485,10 @@ pub(crate) async fn apply_merge_by_tier(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "distill_truth_test.rs"]
+mod distill_truth_test;
 
 #[cfg(test)]
 mod tests {
