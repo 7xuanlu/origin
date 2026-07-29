@@ -15,12 +15,12 @@ async fn brief_migration_creates_fk_backed_tables() {
             "DROP TABLE brief_items;
              DROP TABLE briefs;
              DROP TABLE brief_legacy_imports;
-             PRAGMA user_version=99;",
+             PRAGMA user_version=101;",
         )
         .await
         .unwrap();
     }
-    db.migrate_100_brief(99).await.unwrap();
+    db.migrate_102_brief(101).await.unwrap();
     let conn = db.conn.lock().await;
 
     for table in ["briefs", "brief_items", "brief_legacy_imports"] {

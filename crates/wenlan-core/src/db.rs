@@ -30,9 +30,14 @@ mod page_drafts;
 pub mod page_map;
 mod scoped_entities;
 mod scoped_pages;
+mod truth_exposure;
+
+pub use truth_exposure::{TruthMarkerAudit, TRUTH_CUTOVER_GENERATION_KEY};
 
 #[cfg(test)]
 mod brief_test;
+#[cfg(test)]
+mod claim_edge_lifecycle_test;
 #[cfg(test)]
 mod claim_identity_test;
 #[cfg(test)]
@@ -589,7 +594,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 100;
+pub const SCHEMA_VERSION: u32 = 102;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8540,10 +8545,28 @@ impl MemoryDB {
                 self.migrate_99_page_truth_backfill(version).await?;
             }
 
-            // Migration 100: daemon-authoritative Brief state, keyed by the
-            // stable Space id so renames preserve current work.
+            // Migration 100 (M5 PR-B, F5): the lifecycle triggers that retract
+            // a claim's support and attestation edges when the page or evidence
+            // memory underneath them moves space or is deleted, plus the
+            // `root_kind` immutability rule that closes the fourth path by
+            // prevention. See ensure_claim_edge_lifecycle_triggers.
             if version < 100 {
-                self.migrate_100_brief(version).await?;
+                self.migrate_100_claim_edge_lifecycle(version).await?;
+            }
+
+            // Migration 101 (M5 PR-B): the marker audit log. Nothing writes to
+            // it until a call carries the intent marker, and nothing does that
+            // yet — but the table has to exist before the first one can, and a
+            // compensating control that appears at the same moment as the thing
+            // it compensates for has a window where it does not.
+            if version < 101 {
+                self.migrate_101_truth_exposure(version).await?;
+            }
+
+            // Migration 102: daemon-authoritative Brief state, keyed by the
+            // stable Space id so renames preserve current work.
+            if version < 102 {
+                self.migrate_102_brief(version).await?;
             }
         }
 
@@ -11931,6 +11954,56 @@ impl MemoryDB {
             "[migration] Migration 99 applied: {filled} page(s) backfilled to provisional, \
              unreviewed truth state"
         );
+        Ok(())
+    }
+
+    /// Migration 100 (M5 PR-B, F5): claim-edge lifecycle triggers.
+    ///
+    /// Pure DDL, so no backup and no data pass — the triggers change what
+    /// future writes do, never what any existing row says. Deliberately its own
+    /// migration rather than an amendment to 98: 98 is a table rebuild that
+    /// must not be re-run, and this is `IF NOT EXISTS` DDL that is safe to.
+    async fn migrate_100_claim_edge_lifecycle(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 begin: {error}")))?;
+        Self::ensure_claim_edge_lifecycle_triggers(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 100", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m100 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 100 applied: claim-edge lifecycle triggers \
+             (page move/delete, memory move) + root_kind immutability"
+        );
+        Ok(())
+    }
+
+    /// Migration 101 (M5 PR-B): the truth-marker audit log.
+    ///
+    /// Additive `IF NOT EXISTS` DDL, same shape as 100 and for the same reason.
+    /// The cutover generation needs no DDL — it is an `app_metadata` key, absent
+    /// until someone sets it, and absent reads as off.
+    async fn migrate_101_truth_exposure(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 begin: {error}")))?;
+        Self::ensure_truth_exposure_tables(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 101", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m101 bump: {error}")))?;
+        log::info!("[migration] Migration 101 applied: truth-marker audit log");
         Ok(())
     }
 

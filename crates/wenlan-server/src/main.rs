@@ -1561,6 +1561,29 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                         }
                         Err(e) => tracing::warn!("[reconcile] pass failed: {e}"),
                     }
+
+                    // M5 PR-B: the projection directory is the enforcement
+                    // boundary for `wenlan pages`, which reads Markdown off
+                    // disk and cannot negotiate a truth contract. Inert until
+                    // the PR-C cutover — `page_visibility` answers `Full` for
+                    // every page at generation 0, so this removes nothing and
+                    // there is no generation branch here to weaken. It runs
+                    // anyway, so the pass is live rather than proven-and-
+                    // unwired, and it runs AFTER reconcile so it evicts from a
+                    // directory that is already consistent with the DB.
+                    match projection
+                        .enforce_projection_directory_invariant(&db_arc)
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(removed) => tracing::info!(
+                            "[truth] projection invariant evicted {removed} unsupported page(s)"
+                        ),
+                        // `error!`, not `warn!`: the pass now runs to completion
+                        // and only returns `Err` when a file it was supposed to
+                        // evict is still on disk and still readable.
+                        Err(e) => tracing::error!("[truth] projection invariant pass failed: {e}"),
+                    }
                 }
                 Err(e) => tracing::warn!("[reconcile] list_pages failed: {e}"),
             }

@@ -50,23 +50,23 @@ impl MemoryDB {
             .map_err(|error| WenlanError::VectorDb(format!("brief tables DDL: {error}")))
     }
 
-    pub(super) async fn migrate_100_brief(&self, prior_version: i64) -> Result<(), WenlanError> {
-        self.backup_before_migration(100, prior_version).await?;
+    pub(super) async fn migrate_102_brief(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(102, prior_version).await?;
 
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m100 brief begin: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m102 brief begin: {error}")))?;
         Self::ensure_brief_tables(&tx).await?;
         tx.commit()
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m100 brief commit: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m102 brief commit: {error}")))?;
 
-        conn.execute("PRAGMA user_version = 100", ())
+        conn.execute("PRAGMA user_version = 102", ())
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m100 brief bump: {error}")))?;
-        log::info!("[migration] Migration 100 applied: Space-owned Brief tables");
+            .map_err(|error| WenlanError::VectorDb(format!("m102 brief bump: {error}")))?;
+        log::info!("[migration] Migration 102 applied: Space-owned Brief tables");
         Ok(())
     }
 }
