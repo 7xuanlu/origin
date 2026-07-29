@@ -2698,12 +2698,17 @@ async fn recover_complete_entity_extraction_apply_receipt(
     let parsed = StoredRepairApplyReceipt::from_slice(&pending)
         .ok()
         .and_then(|receipt| verify_stored_apply_receipt(receipt, manifest).ok());
-    let connection = db.conn.lock().await;
-    let (target_now, _) =
-        repair_target_receipt_on_connection(&connection, manifest.target()).await?;
-    drop(connection);
+    let (target_now, _) = db.read_repair_target_receipt(manifest.target()).await?;
     if let Some(receipt) = parsed {
         if target_now == *receipt.after_target_receipt() {
+            #[cfg(test)]
+            assert_complete_entity_recovery_db_unlocked_before_artifact(
+                db,
+                manifest.manifest_id(),
+                CompleteEntityRecoveryArtifactSite::Publish,
+                &pending_path,
+                &final_path,
+            );
             publish_no_replace(&pending_path, &final_path, "repair_already_applied")?;
             return Ok(Some(receipt));
         }
@@ -2713,9 +2718,68 @@ async fn recover_complete_entity_extraction_apply_receipt(
             "repair_apply_recovery_required".to_string(),
         ));
     }
+    #[cfg(test)]
+    assert_complete_entity_recovery_db_unlocked_before_artifact(
+        db,
+        manifest.manifest_id(),
+        CompleteEntityRecoveryArtifactSite::Remove,
+        &pending_path,
+        &final_path,
+    );
     fs::remove_file(&pending_path)?;
     sync_dir(&manifest_dir)?;
     Ok(None)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompleteEntityRecoveryArtifactSite {
+    Publish,
+    Remove,
+}
+
+#[cfg(test)]
+static COMPLETE_ENTITY_RECOVERY_UNLOCKED_CHECKS: std::sync::Mutex<
+    Vec<(String, CompleteEntityRecoveryArtifactSite)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn assert_complete_entity_recovery_db_unlocked_before_artifact(
+    db: &MemoryDB,
+    manifest_id: &str,
+    site: CompleteEntityRecoveryArtifactSite,
+    pending_path: &Path,
+    final_path: &Path,
+) {
+    assert!(
+        pending_path.is_file(),
+        "complete-entity recovery unlocked check must run before pending artifact mutation"
+    );
+    assert!(
+        !final_path.exists(),
+        "complete-entity recovery unlocked check must run before final artifact publication"
+    );
+    let connection = db
+        .conn
+        .try_lock()
+        .expect("complete-entity recovery DB mutex must be released before artifact I/O");
+    drop(connection);
+    COMPLETE_ENTITY_RECOVERY_UNLOCKED_CHECKS
+        .lock()
+        .expect("complete-entity recovery unlocked-check log")
+        .push((manifest_id.to_string(), site));
+}
+
+#[cfg(test)]
+fn complete_entity_recovery_unlocked_check_observed(
+    manifest_id: &str,
+    site: CompleteEntityRecoveryArtifactSite,
+) -> bool {
+    COMPLETE_ENTITY_RECOVERY_UNLOCKED_CHECKS
+        .lock()
+        .expect("complete-entity recovery unlocked-check log")
+        .iter()
+        .any(|(observed_id, observed_site)| observed_id == manifest_id && *observed_site == site)
 }
 
 async fn recover_apply_receipt(

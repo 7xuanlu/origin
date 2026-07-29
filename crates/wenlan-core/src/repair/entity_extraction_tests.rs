@@ -335,6 +335,18 @@ async fn apply_recovers_empty_original_and_valid_committed_pending_receipts() {
     )
     .await
     .expect("an empty marker at the exact original aggregate is retried");
+    let empty_manifest_dir = empty_store
+        .manifest_dir(empty_manifest.manifest_id())
+        .unwrap();
+    assert!(
+        complete_entity_recovery_unlocked_check_observed(
+            empty_manifest.manifest_id(),
+            CompleteEntityRecoveryArtifactSite::Remove,
+        ),
+        "original-state pending removal must run only after the DB mutex is released"
+    );
+    assert!(!empty_manifest_dir.join(APPLY_RECEIPT_PENDING_FILE).exists());
+    assert!(empty_manifest_dir.join(APPLY_RECEIPT_FILE).is_file());
 
     let committed_fixture = entity_extraction_fixture().await;
     let committed_manifest = prepare(&committed_fixture).await;
@@ -387,6 +399,20 @@ async fn apply_recovers_empty_original_and_valid_committed_pending_receipts() {
     .await
     .expect("a committed aggregate with a valid pending receipt is published");
     assert_eq!(Some(recovered), prepared);
+    let committed_manifest_dir = committed_store
+        .manifest_dir(committed_manifest.manifest_id())
+        .unwrap();
+    assert!(
+        complete_entity_recovery_unlocked_check_observed(
+            committed_manifest.manifest_id(),
+            CompleteEntityRecoveryArtifactSite::Publish,
+        ),
+        "committed pending publication must run only after the DB mutex is released"
+    );
+    assert!(!committed_manifest_dir
+        .join(APPLY_RECEIPT_PENDING_FILE)
+        .exists());
+    assert!(committed_manifest_dir.join(APPLY_RECEIPT_FILE).is_file());
 }
 
 #[tokio::test]

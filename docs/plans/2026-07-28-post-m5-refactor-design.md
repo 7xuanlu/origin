@@ -1551,6 +1551,51 @@ Execution evidence:
   production caller plus direct tests. Both reviewers confirmed
   `300 → 299`, `11 → 10`, and tests `289`, with no M5/truth or generation
   change.
+- RED, 2026-07-29: lowering only the `repair.rs` ratchet row `20 → 19`
+  produced the exact expected failure:
+  `repair.rs: direct .conn.lock() access increased 19 -> 20`.
+- IMPLEMENTED, 2026-07-29: `db/repair_receipt.rs` owns the narrow locking
+  method and delegates unchanged to
+  `repair_target_receipt_on_connection`. Only
+  `recover_complete_entity_extraction_apply_receipt` moved to it; the five
+  production helper callers remain the DB child plus the four
+  same-transaction callers. Private test-only assertions at the exact publish
+  and remove sites acquire the DB mutex with `try_lock` before artifact I/O,
+  and the existing recovery control observes both sites by manifest id. No
+  production callback, truth, generation, transaction, or filtering surface
+  changed.
+- GREEN, 2026-07-29: the direct real-entity receipt control passes `1 / 1`
+  with exact helper equality, row count `1`, a non-default digest, and
+  `repair_target_stale` for the wrong scope. The existing recovery control
+  passes `1 / 1` with committed-pending publication, original-state pending
+  removal, final artifact assertions, and both unlocked-site observations.
+  The exact ratchet passes `3 / 3`; external literals are `300 → 299`,
+  production `11 → 10`, and tests remain `289`.
+- ROOT GATE, 2026-07-29: Rust LSP resolves the recovery call to the new DB
+  method, reports exactly one production and two direct-test references plus
+  the declaration, and reports zero error diagnostics in all five changed
+  Rust files. The M5 inventory check and drift control pass with exactly `191`
+  rows, depth `55 / 50 / 86`, and exposure `22`; only mechanical source
+  addresses changed. Formatting, diff checks, and core/server all-target
+  Clippy with `-D warnings` pass.
+- ROOT MUTATION CONTROL, 2026-07-29: the first approved test-only check proved
+  the exact branch and unlocked mutex but would still pass if the whole check
+  moved after artifact I/O. Both sites now also require the pending file to
+  exist and the final file not to exist before `try_lock`. Moving the publish
+  check after publication makes both predicates fail; moving the remove check
+  after removal makes the pending predicate fail. The focused recovery control
+  and all-target Clippy pass after this strengthening.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: the independent auditor returned
+  **APPROVE** for the original eight-file staged diff and **APPROVE** again for
+  the mutation-control delta. It confirmed the typed boundary, exact helper
+  reference set, two artifact branches, UUID-isolated observation log,
+  ratchet, address-only M5 inventory, and unchanged truth/generation surface.
+- REVIEW, 2026-07-29: the independent Sol reviewer returned **APPROVE** with no
+  material finding, then **APPROVE** on the delta. It independently verified
+  the one-lock movement, untouched same-transaction callers, exact direct and
+  recovery controls, parallel-test safety, and that the strengthened
+  pre-artifact predicates make ordering mutations fail deterministically while
+  remaining entirely `#[cfg(test)]`.
 
 #### R4-18 — memory repair CAS transactions
 
