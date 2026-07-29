@@ -438,6 +438,87 @@ Select the next domain by evidence:
 
 One domain per PR. Keep method names and `MemoryDB` call sites unchanged.
 
+#### R3-1 selection — source-sync CRUD method boundary
+
+Selected on 2026-07-29 at `29803914`:
+
+- Move only `upsert_sync_state`, `get_sync_state`,
+  `list_sync_state_paths`, `delete_sync_state`, and
+  `delete_all_sync_state` into `db/source_sync.rs`.
+- Keep `FileSyncState` at the public `db` facade and keep every caller
+  unchanged.
+- The five methods are one contiguous CRUD block, use only `self.conn` plus
+  `FileSyncState`, and have a focused `test_source_sync_state_crud` test.
+  LSP references also reach the real source routes, document-enrichment path,
+  lint endpoint tests, and folder-ingest e2e.
+- This is a method boundary, not exclusive ownership of the
+  `source_sync_state` table. Two transaction-scoped statements intentionally
+  remain in `db.rs`: source deletion removes the receipt alongside every other
+  owned dependency, and document-enrichment completion writes its receipt in
+  the same transaction as the queue transition. Calling the public CRUD
+  methods from either site would re-lock `MemoryDB::conn`; moving those
+  statements alone would break the transaction boundary. Any redesign of
+  those transactions belongs to a separate behavior PR, not this movement.
+- The five method names have no M5 reader-manifest or truth-manifest match.
+  `import_state` was rejected as the first domain because
+  `list_pending_imports` is an M5 page-bearing reader.
+- rust-analyzer resolved workspace symbols and method references. Its document
+  outline request for the 48k-line `db.rs` failed in the client, so the bounded
+  block census used literal discovery followed by LSP references and direct
+  source inspection.
+- A structural test must require the module declaration and file, require
+  exactly those five public async methods without imposing meaningless source
+  order, reject copies left in `db.rs`, and carry a positive control that
+  proves the guard catches missing files or methods, duplicate declarations or
+  definitions, inline bodies, and any extra visible method including
+  `pub fn`, `pub(crate)`, and `pub(super)`.
+
+Execution evidence:
+
+- RED: the structural test failed on the pre-move tree for the missing module,
+  missing declaration, and all five inline method bodies. GREEN: the boundary
+  test and its positive control each pass `1 / 1`.
+- The normalized pre-move block and the new module implementation have the
+  same SHA-256,
+  `db13a794539bceb2eb408073a5eaa78fa5e3078e43ed93bf1c14105217993197`.
+  SQL, error text, ordering, visibility, and callers are unchanged.
+- Focused behavior passed: source-sync CRUD `1 / 1`; sync-receipt failure
+  atomicity `1 / 1`; folder-ingest e2e `2 / 2` with `1` fixture generator
+  ignored; source-route tests `13 / 13`.
+- The direct-connection ratchet passes. The M5 inventory remains exactly
+  `191` rows, depth `55 / 50 / 86`, exposure `22`; only the generated
+  `db.rs` line addresses changed by the new module declaration.
+- rust-analyzer reports no diagnostics in `db.rs` or `db/source_sync.rs`;
+  definition navigation from a server route resolves to the new module, and
+  references span server routes, lint tests, DB tests, and folder-ingest e2e.
+- `db.rs` fell from `48,877` to `48,758` lines; the bounded child module is
+  `130` lines. Repository format and diff checks pass.
+- PR-level verification passes: all-target Clippy with `-D warnings` for
+  `wenlan-core` plus `wenlan-server`, and one uninterrupted
+  `cargo test --workspace --lib`: CLI `32 / 32`; core `3,301` passed with
+  `33` ignored; MCP `178 / 178`; server `339` passed with `2` ignored; types
+  `183 / 183`.
+- REVIEW 1, 2026-07-29: Opus/xhigh returned **FIX-FIRST**. It found the
+  extraction faithful but required the boundary to stop implying exclusive
+  table ownership, the guard to detect visible methods beyond only
+  `pub async fn`, and its positive control to cover the rules it claimed.
+  The section now names the two intentionally retained transactional
+  statements and why moving them would change locking or atomicity. The guard
+  compares an unordered exact visible-method set, while its positive control
+  exercises missing file/method, duplicate module/implementation/method,
+  inline body, and unexpected `pub`, `pub(crate)`, and `pub(super)` methods.
+  The untracked child-file observation is handled by exact staging at commit;
+  temporary working-tree tracking state is not a source-layout invariant.
+- REVIEW 2, 2026-07-29: after those changes, Opus/xhigh returned
+  **APPROVE**, with exact staging of the child file as the commit-time hard
+  gate. It independently confirmed the faithful five-method extraction,
+  generated inventory shift, direct-connection ratchet, and non-vacuous
+  positive control. Cross-reference comments now mark both intentionally
+  retained transaction-local table writers. Its remaining parser-grammar and
+  one-implementation observations are non-blocking for this deliberately
+  bounded contract: one domain module owns exactly the intended visible async
+  CRUD methods, while transactional inline statements remain explicit.
+
 ### R4 — close direct connection access
 
 Replace remaining external connection locks with bounded domain APIs. Make the

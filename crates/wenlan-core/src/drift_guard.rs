@@ -6007,3 +6007,171 @@ fn historical_migration_guard_rejects_inline_sql_and_m5_scope_creep() {
         "positive control must reject M5 migration scope creep"
     );
 }
+
+// ── R3: bounded DB domain modules ──
+
+const SOURCE_SYNC_MODULE_PATH: &str = "crates/wenlan-core/src/db/source_sync.rs";
+const SOURCE_SYNC_METHODS: &[&str] = &[
+    "upsert_sync_state",
+    "get_sync_state",
+    "list_sync_state_paths",
+    "delete_sync_state",
+    "delete_all_sync_state",
+];
+
+fn db_domain_module_layout_violations(
+    db_source: &str,
+    module_source: &str,
+    module_exists: bool,
+    module_name: &str,
+    module_path: &str,
+    methods: &[&str],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if !module_exists {
+        violations.push(format!("DB domain module is missing: {module_path}"));
+    }
+
+    let declaration = format!("mod {module_name};");
+    if db_source.matches(&declaration).count() != 1 {
+        violations.push(format!("db.rs must declare {declaration} exactly once"));
+    }
+    if module_source.matches("impl MemoryDB").count() != 1 {
+        violations.push(format!(
+            "{module_name} must contain exactly one MemoryDB implementation"
+        ));
+    }
+
+    for method in methods {
+        let definition = format!("pub async fn {method}(");
+        if db_source.contains(&definition) {
+            violations.push(format!(
+                "db.rs still contains the {module_name} method body: {method}"
+            ));
+        }
+        if !module_source.contains(&definition) {
+            violations.push(format!("{module_name} module is missing method: {method}"));
+        }
+        if module_source.matches(&definition).count() > 1 {
+            violations.push(format!(
+                "{module_name} module defines {method} more than once"
+            ));
+        }
+    }
+
+    let expected_visible_methods: BTreeSet<String> =
+        methods.iter().map(|method| (*method).to_string()).collect();
+    let actual_visible_methods: BTreeSet<String> = module_source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let after_visibility = if let Some(rest) = line.strip_prefix("pub ") {
+                rest
+            } else if let Some(rest) = line.strip_prefix("pub(") {
+                let close = rest.find(')')?;
+                rest[close + 1..].trim_start()
+            } else {
+                return None;
+            };
+            let after_async = after_visibility
+                .strip_prefix("async ")
+                .unwrap_or(after_visibility);
+            let after_fn = after_async.strip_prefix("fn ")?;
+            let name = after_fn
+                .split(|character: char| {
+                    character == '(' || character == '<' || character.is_whitespace()
+                })
+                .next()?;
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect();
+    if actual_visible_methods != expected_visible_methods {
+        violations.push(format!(
+            "{module_name} visible method set drifted: expected {expected_visible_methods:?}, \
+             found {actual_visible_methods:?}"
+        ));
+    }
+    violations
+}
+
+#[test]
+fn source_sync_methods_live_in_one_bounded_domain_module() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let module_path = root.join(SOURCE_SYNC_MODULE_PATH);
+    let module_source = std::fs::read_to_string(&module_path).unwrap_or_default();
+    let violations = db_domain_module_layout_violations(
+        &db_source,
+        &module_source,
+        module_path.is_file(),
+        "source_sync",
+        SOURCE_SYNC_MODULE_PATH,
+        SOURCE_SYNC_METHODS,
+    );
+
+    assert!(
+        violations.is_empty(),
+        "R3 source-sync boundary drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn db_domain_guard_rejects_missing_duplicate_inline_and_visible_scope_drift() {
+    let db_source = concat!(
+        "mod source_sync;\n",
+        "mod source_sync;\n",
+        "impl MemoryDB { pub async fn upsert_sync_state(&self) {} }\n",
+    );
+    let module_source = concat!(
+        "impl MemoryDB {\n",
+        "pub async fn upsert_sync_state(&self) {}\n",
+        "pub async fn upsert_sync_state(&self) {}\n",
+        "pub async fn get_sync_state(&self) {}\n",
+        "pub async fn list_sync_state_paths(&self) {}\n",
+        "pub async fn delete_sync_state(&self) {}\n",
+        "pub fn unrelated_domain_method(&self) {}\n",
+        "pub(crate) async fn unrelated_crate_method(&self) {}\n",
+        "pub(super) fn unrelated_parent_method(&self) {}\n",
+        "}\n",
+        "impl MemoryDB {}\n",
+    );
+    let violations = db_domain_module_layout_violations(
+        db_source,
+        module_source,
+        false,
+        "source_sync",
+        SOURCE_SYNC_MODULE_PATH,
+        SOURCE_SYNC_METHODS,
+    );
+
+    for expected in [
+        "DB domain module is missing",
+        "must declare mod source_sync; exactly once",
+        "exactly one MemoryDB implementation",
+        "still contains",
+        "missing method: delete_all_sync_state",
+        "defines upsert_sync_state more than once",
+        "visible method set drifted",
+    ] {
+        assert!(
+            violations.iter().any(|item| item.contains(expected)),
+            "positive control did not trigger {expected:?}: {violations:?}"
+        );
+    }
+    let visible_drift = violations
+        .iter()
+        .find(|item| item.contains("visible method set drifted"))
+        .expect("positive control must reject unrelated visible methods");
+    for unexpected in [
+        "unrelated_domain_method",
+        "unrelated_crate_method",
+        "unrelated_parent_method",
+    ] {
+        assert!(
+            visible_drift.contains(unexpected),
+            "positive control did not detect visible method {unexpected}: {visible_drift}"
+        );
+    }
+}
