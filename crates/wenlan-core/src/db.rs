@@ -28,6 +28,7 @@ mod derived_artifact_sweep;
 mod edges_rebuild;
 mod entity_page_adapter;
 mod kg_quality_diagnostics;
+mod kg_quality_vocabulary;
 mod maintenance_duplicate_reads;
 mod maintenance_queue;
 mod maintenance_retro_scan;
@@ -61,6 +62,8 @@ mod edges_rebuild_test;
 mod entity_page_adapter_test;
 #[cfg(test)]
 mod kg_quality_diagnostics_test;
+#[cfg(test)]
+mod kg_quality_vocabulary_test;
 #[cfg(test)]
 mod maintenance_duplicate_reads_test;
 #[cfg(test)]

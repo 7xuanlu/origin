@@ -293,22 +293,7 @@ pub struct VocabHealCounts {
 /// (known aliases + safe transforms), queue everything else as a promote candidate.
 pub async fn heal_relation_vocabulary(db: &MemoryDB) -> Result<VocabHealCounts, WenlanError> {
     // First, read all distinct relation types.
-    let types_to_check: Vec<String> = {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
-            .query("SELECT DISTINCT relation_type FROM relations", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("distinct rel types: {}", e)))?;
-        let mut types = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("rel type row: {}", e)))?
-        {
-            types.push(row.get::<String>(0).unwrap_or_default());
-        }
-        types
-    };
+    let types_to_check = db.distinct_relation_types_for_vocabulary_heal().await?;
 
     let canonicals = db.relation_canonicals().await?;
     let mut counts = VocabHealCounts::default();
@@ -360,22 +345,7 @@ pub async fn heal_relation_vocabulary(db: &MemoryDB) -> Result<VocabHealCounts, 
 /// (known aliases + safe transforms), queue everything else as a promote candidate.
 pub async fn heal_entity_vocabulary(db: &MemoryDB) -> Result<VocabHealCounts, WenlanError> {
     // First, read all distinct entity types.
-    let types_to_check: Vec<String> = {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
-            .query("SELECT DISTINCT entity_type FROM entities", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("distinct entity types: {}", e)))?;
-        let mut types = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("entity type row: {}", e)))?
-        {
-            types.push(row.get::<String>(0).unwrap_or_default());
-        }
-        types
-    };
+    let types_to_check = db.distinct_entity_types_for_vocabulary_heal().await?;
 
     let canonicals = db.entity_canonicals().await?;
     let mut counts = VocabHealCounts::default();

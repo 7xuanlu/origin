@@ -628,10 +628,12 @@ capability escape and is outside R4; banning every internal use of
 
 Every slice removes its old allowlist entries immediately, keeps the external
 set monotonically decreasing, runs the M5 inventories plus affected behavior
-tests, receives an Opus review, and commits before the next slice. R4 is
-complete only when production raw connection access is zero, retained or
-renamed raw handles are also rejected, the named test-support set is exact,
-and a RED mutation control proves the final guard catches a production bypass.
+tests, receives an independent Sol review by default, and commits before the
+next slice. Opus is reserved for an exceptional judgment escalation rather
+than every intermediate slice. R4 is complete only when production raw
+connection access is zero, retained or renamed raw handles are also rejected,
+the named test-support set is exact, and a RED mutation control proves the
+final guard catches a production bypass.
 
 #### R4-1 — Space-context DB implementation
 
@@ -1030,6 +1032,38 @@ Execution evidence:
   multi-row observation fixture uses one transaction, and the typed row derives
   `Debug` consistently with sibling DB transports.
 
+#### R4-9 — knowledge-quality vocabulary inputs
+
+- Add `db/kg_quality_vocabulary.rs` with the purpose-bounded typed reads
+  `distinct_relation_types_for_vocabulary_heal` and
+  `distinct_entity_types_for_vocabulary_heal`. They move only the exact
+  `SELECT DISTINCT` statements, lossy empty-string decoding, and existing
+  error prefixes under `MemoryDB`; neither query gains an `ORDER BY`.
+- Keep every canonical, alias, safe-transform, fold, proposal, log, count, and
+  orchestration decision in `kg_quality.rs`. In particular, the caller still
+  skips the empty string returned by the DB seam.
+- RED lowers the exact `kg_quality.rs` baseline from `24` to `22`; before
+  extraction the guard reports a direct-access increase `22 → 24`. GREEN moves
+  both production locks under `db/**`: external literals `318 → 316`,
+  production `29 → 27`, tests `289` unchanged, and the per-file baseline is
+  `24 → 22`.
+- Direct DB controls pass `2 / 2`, proving duplicate relation and entity types
+  collapse, empty strings remain present, and novel values survive. The two
+  existing vocabulary-heal behavior tests and three `run_rethink` controls
+  pass `5 / 5`; the exact ratchet passes `3 / 3`.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only generated source addresses move. No
+  truth adapter, manifest row, permit, or cutover generation changes.
+- AUDIT, 2026-07-29: the independent R4 auditor returned **APPROVE**. It
+  confirmed the two-lock move, exact SQL and diagnostics, unchanged policy
+  ownership, meaningful duplicate/empty/novel-value controls, the
+  `318 → 316` external and `29 → 27` production decreases, and unchanged M5
+  topology.
+- REVIEW, 2026-07-29: the independent Sol reviewer returned **APPROVE** with no
+  material finding. It independently checked the staged diff against the
+  frozen R4-9 contract and accepted the direct controls, focused behavior
+  tests, ratchet evidence, M5 inventory, and reviewer-policy correction.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
@@ -1076,18 +1110,19 @@ corrections are now incorporated above. Fable explicitly classified them as
 clarifications within the frozen intent and said no second full review was
 needed before R0.
 
-### Intermediate PRs — Opus, not Fable
+### Intermediate PRs — Sol by default, not Fable
 
-Every PR receives a focused Opus opinion or diff review against:
+Every PR receives a focused Sol opinion or diff review against:
 
 - the exact PR scope;
 - the locked decisions above;
 - the relevant SQL/API/transaction/test invariant;
 - verifier evidence and positive controls.
 
-Opus may identify a design-level contradiction. If resolving it would change a
-locked decision or PR sequence, work stops and returns to Fable gate 1. Otherwise
-Fable is not used for intermediate PRs.
+Sol may identify a design-level contradiction. If resolving it would change a
+locked decision or PR sequence, work stops and returns to Fable gate 1. Opus
+may be used for an exceptional escalation, but is not the routine intermediate
+reviewer. Otherwise Fable is not used for intermediate PRs.
 
 ### Fable gate 2 — final whole-refactor review
 
@@ -1110,7 +1145,8 @@ This is a system acceptance review, not another line-by-line code review.
 - **Root/architect:** owns this document, PR boundaries, sequencing, and stop
   decisions.
 - **One implementation worker:** writes the current bounded PR.
-- **Opus reviewer:** provides the intermediate independent opinion/diff review.
+- **Sol reviewer:** provides the routine intermediate independent opinion/diff
+  review; Opus is an exceptional escalation only.
 - **Auditor:** independently runs inventories, positive controls, LSP/AST
   comparisons, and repository gates.
 
@@ -1185,3 +1221,10 @@ structural facade definition and executable contracts above remain the gates.
 - R1 was mechanically replayed from the refreshed main body: `45,687` inline
   test lines moved to `db/main_tests.rs`, with rustfmt-normalized reconstruction
   equality before R2 began.
+
+### 2026-07-29 — intermediate reviewer correction
+
+- User correction supersedes the initial review policy: routine intermediate
+  slices use Sol, not Opus on every slice.
+- Fable remains limited to the frozen-design gate and final whole-system Gate
+  2. Opus is available only for an exceptional judgment escalation.
