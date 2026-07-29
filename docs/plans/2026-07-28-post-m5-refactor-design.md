@@ -938,6 +938,58 @@ Execution evidence:
   clone gate intentionally remains scoped to `run_next_community_grouping_cycle`
   because it guards volatile runtime-state ownership, not DB capability access.
 
+#### R4-7 — duplicate-maintenance typed readers
+
+- Add `db/maintenance_duplicate_reads.rs` with an opaque
+  `NearDuplicateSliceReader<'db>` that privately owns the DB mutex guard. The
+  caller acquires it through `begin_near_duplicate_slice_reader`; it exposes no
+  raw field, constructor, generic SQL callback, or `Deref`.
+- Move the exact bounded pair-window SQL and lossy row decoding into the
+  reader's `scan_near_duplicate_slice`, and the exact per-Page normalized
+  source query into `load_bounded_page_source_ids`. The pure duplicate-policy
+  evaluator in `maintenance/duplicates.rs` still owns eligible-page fanout,
+  normalized-first legacy fallback, cap/truncation accounting, cosine and
+  source overlap, thresholds, candidate selection, cursor, and `more`.
+- Preserve the original lock lifetime explicitly: `maintenance.rs` begins the
+  reader, loads the ordered pair rows, awaits the typed source reads through
+  the evaluator, and calls `drop(reader)` only after policy evaluation. A
+  direct concurrency test proves another DB operation remains pending until
+  that drop.
+- Move the exact embedding-distance query and decode into
+  `MemoryDB::embedding_near_duplicate_pairs`. Its caller still computes the
+  distance threshold, maps distance to similarity, merges source-overlap
+  candidates, sorts them, and applies the final limit. The query deliberately
+  retains its existing `a.space = b.space` predicate rather than changing to
+  effective-workspace semantics.
+- RED removes the complete `maintenance/duplicates.rs` baseline row. GREEN
+  moves both production locks under `db/**`: external literals `322 → 320`,
+  production `33 → 31`, tests `289` unchanged, and raw-access files `56 → 55`.
+- Direct DB seam tests pass `3 / 3`, covering ordered pair limits and keyset
+  resume, raw fallback and normalized-source projections, ineligible rows,
+  scoped lock lifetime, embedding distance order, Overview exclusion, and SQL
+  limit. Affected maintenance controls pass `6 / 6`: the two bounded automatic
+  duplicate tests, dismissed and retro card behavior, and both deterministic
+  survivor-order tests. The exact ratchet passes `3 / 3`.
+- Formatting and core plus server all-target Clippy with `-D warnings` pass.
+  The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`: the two depth-zero reader identities move
+  from `maintenance/duplicates.rs` to the DB child, with no wrapper row added.
+  No truth adapter, manifest row, permit, or cutover generation changes.
+- AUDIT, 2026-07-29: the independent R4 auditor returned **APPROVE**. It
+  confirmed the opaque capability, pair/source split, policy ownership,
+  explicit post-evaluator drop, unchanged SQL/binds/errors/lossy decode,
+  exact M5 topology, ratchet accounting, and positive-control strength.
+- REVIEW 1, 2026-07-29: Opus 4.6 Thinking returned **APPROVE** with no material
+  finding. The normal companion transport twice reached Anthropic but ended in
+  provider `529 Overloaded`; the authorized direct `agy` transport then ran the
+  same read-only staged-diff contract against the same Opus model. It
+  independently verified the opaque reader, intentional lock lifetime,
+  policy split, character-identical SQL/binds/error strings, threshold and
+  result mapping, `191 / 55-50-86 / 22` M5 topology, ratchet, and substantive
+  DB seam controls. Its only notes were non-blocking: the cross-await mutex is
+  intentional movement-only behavior, SQL branch duplication is pre-existing,
+  and the transported field names are clearer.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,

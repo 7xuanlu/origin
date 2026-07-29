@@ -318,12 +318,22 @@ pub async fn run_maintenance_stage_slice(
                     .and_then(|value| {
                         serde_json::from_str::<duplicates::NearDuplicateCursor>(&value).ok()
                     });
-                let slice = duplicates::scan_near_duplicate_slice(
-                    db,
+                let reader = db.begin_near_duplicate_slice_reader().await;
+                let pair_rows = reader
+                    .scan_near_duplicate_slice(
+                        cursor
+                            .as_ref()
+                            .map(|cursor| (cursor.left_id.as_str(), cursor.right_id.as_str())),
+                        duplicates::AUTOMATIC_PAIR_BUDGET,
+                    )
+                    .await?;
+                let slice = duplicates::evaluate_near_duplicate_slice(
+                    &reader,
+                    pair_rows,
                     config.page_match_threshold,
-                    cursor.as_ref(),
                 )
                 .await?;
+                drop(reader);
                 selected = slice.pairs_examined > 0;
                 progressed = selected;
                 more = slice.more;
