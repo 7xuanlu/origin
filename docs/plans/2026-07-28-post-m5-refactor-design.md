@@ -1240,6 +1240,53 @@ Execution evidence:
   same-guard count sequence, accepted materialization lock shrink, exact
   staging, and truth isolation.
 
+#### R4-14 — eval pipeline reads
+
+- Add `db/eval_pipeline_reads.rs` with two purpose-bounded reads. The corpus
+  method returns only raw `Vec<String>` contents; `eval/pipeline.rs` remains
+  the sole owner of BPE `count_tokens` aggregation and the row count. Preserve
+  the exact
+  `SELECT content FROM memories WHERE chunk_index = 0 AND supersede_mode <> 'archive'`
+  SQL, `()` bind, `count_corpus: {e}` query error, and `Generic(e.to_string())`
+  propagation for row iteration and field decoding. Do not add a source
+  predicate, `DISTINCT`, ordering, empty-content filtering, or token policy.
+  Materialize every row under the DB mutex and release it before BPE work.
+- The evidence method returns only raw `Vec<(String, String)>` lineage pairs,
+  including duplicates. Preserve the exact legacy
+  `concept_sources` / `concepts` / `memories` join, `()` bind,
+  `expand_evidence: {e}` query error, per-row `Generic(e.to_string())`
+  propagation, absence of `DISTINCT` and ordering, and the literal
+  `LIKE 'merged_%'` predicate. The caller retains the
+  `HashMap<memory_sid, Vec<concept_sid>>`, `original_evidence.to_vec()`,
+  additions loop, and `HashSet` insertion policy. Materialize every pair under
+  the DB mutex and release it before reverse-map construction or expansion.
+- Direct controls prove corpus head/non-archive selection, chunk and archive
+  exclusion, retention of document and empty rows, and duplicate contents.
+  Evidence controls prove active-only selection plus the merged-prefix,
+  chunk-zero, and same-entity join boundaries; two distinct matching memory
+  rows with the same source id prove that duplicate raw pairs survive the DB
+  seam. A caller control proves that only matched evidence expands, original
+  ids remain, and `HashSet` insertion collapses duplicate additions.
+- RED removes only the `eval/pipeline.rs: 2` baseline row; before extraction
+  the exact guard reports two new direct accesses. GREEN must move exactly
+  those two production locks under `db/**`: external literals `305 → 303`,
+  production `16 → 14`, and tests remain `289`. `eval/paired.rs: 1` retains
+  its fail-soft `Err(_) => 0` fairness contract, and both
+  `eval/longmemeval.rs: 2` event-date write loops remain unchanged. The DB test
+  uses an `_test.rs` suffix.
+- The generated M5 inventory must remain exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only mechanically shifted `db.rs` source
+  addresses may change. No truth adapter, manifest row, permit, or cutover
+  generation changes. This is a movement-only slice: run focused unit and
+  structural controls, not a real LoCoMo/LongMemEval quality benchmark, and
+  make no eval-effect claim.
+- PRE-IMPLEMENTATION PREFLIGHT, 2026-07-29: the independent auditor identified
+  the missing ledger as a **BLOCK** before implementation. The section above
+  records its exact SQL, error, duplicate, lock-lifetime, caller-policy,
+  ratchet, exclusion, and M5 conditions. The worker had made no implementation
+  edit; its only change was the reversible RED baseline removal, which failed
+  with exactly two new direct accesses.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
