@@ -1456,6 +1456,46 @@ Execution evidence:
   the initial candidate until the full-time-versus-midnight distinction and
   non-midnight control were explicit; with those additions, the section above
   is the frozen resolution.
+- IMPLEMENTATION, 2026-07-29: `EvalTemporalSeed` and
+  `MemoryDB::apply_eval_temporal_seeds` move only the ordered lossy update
+  mechanic under one mutex. The method locks even for an empty slice, executes
+  the exact update and params for every supplied seed with an independent
+  ignored result, opens no transaction, and returns no result or count.
+  `t4a_event_date_seeds` remains caller-owned and both temporal runners invoke
+  it immediately after their existing upserts.
+- Direct DB controls pass `3 / 3`: a trigger-aborted middle update is swallowed
+  while earlier and later writes persist; unmatched and unrelated rows remain
+  harmless; both physical rows sharing one source id update; duplicate seeds
+  retain their last successful timestamp. Separate controls prove an empty
+  slice leaves state untouched and a nonempty write against a missing
+  `memories` table returns normally. The caller-helper control passes `1 / 1`,
+  preserving a non-midnight full timestamp, non-natural input order,
+  duplicates, and malformed/missing-date skips.
+- RED reports exactly two new `eval/longmemeval.rs` direct accesses after
+  removing only its baseline row. The exact ratchet passes `3 / 3`: external
+  literals `302 → 300`, production `13 → 11`, tests remain `289`, and
+  longmemeval disappears from the per-file baseline. The generated M5
+  inventory and drift control remain exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only mechanical source addresses move.
+  Focused tests, formatting, diff checks, and core/server all-target Clippy
+  with `-D warnings` pass. No quality benchmark was run and no eval-effect
+  claim is made.
+- ROOT GATE, 2026-07-29: direct DB controls pass `3 / 3`, the caller helper
+  passes `1 / 1`, the exact ratchet passes `3 / 3`, and the M5 drift control
+  passes `1 / 1`. The Rust LSP is active; the new DB module, direct test, and
+  LongMemEval caller have zero error diagnostics, and the method has exactly
+  two production plus three direct-test references.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: the independent auditor returned
+  **APPROVE** for the original staged code and again after the ordered-audit
+  delta. It verified the deterministic one-row-per-statement trigger oracle,
+  all lossy-write controls, ratchet, M5 inventory, truth isolation, and exact
+  seven-file staging.
+- REVIEW 1, 2026-07-29: the independent Sol reviewer returned **FIX-FIRST**
+  because final-state assertions did not reject an implementation that sorted
+  seeds before writing. The direct control now records and asserts the exact
+  successful statement order with deliberately non-sortable inputs; it also
+  proves failed and unmatched seeds emit no audit row. REVIEW 2 returned
+  **APPROVE** with no remaining material finding.
 
 ### R5 — server vertical slices
 

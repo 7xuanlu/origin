@@ -31,6 +31,7 @@ mod eval_lifecycle_integrity;
 mod eval_paired_guard;
 mod eval_pipeline_reads;
 mod eval_substrate_guard;
+mod eval_temporal_seed;
 mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;
 mod kg_quality_embedding_refresh;
@@ -50,6 +51,7 @@ mod space_context;
 mod truth_exposure;
 
 pub(crate) use community_grouping_state::CommunityGroupingLeaseCleanup;
+pub(crate) use eval_temporal_seed::EvalTemporalSeed;
 pub(crate) use kg_quality_diagnostics::ContradictionObservationCount;
 pub(crate) use kg_quality_duplicate_candidates::{DuplicateNameGroup, MinHashEntityInput};
 pub(crate) use kg_quality_embedding_refresh::StaleEntityEmbeddingCandidate;
@@ -76,6 +78,8 @@ mod eval_paired_guard_test;
 mod eval_pipeline_reads_test;
 #[cfg(test)]
 mod eval_substrate_guard_test;
+#[cfg(test)]
+mod eval_temporal_seed_test;
 #[cfg(test)]
 mod kg_quality_diagnostics_test;
 #[cfg(test)]

@@ -19,7 +19,7 @@
 //! Dataset: <https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned>
 //! Paper:   <https://arxiv.org/abs/2410.10813>
 
-use crate::db::MemoryDB;
+use crate::db::{EvalTemporalSeed, MemoryDB};
 use crate::error::WenlanError;
 use crate::eval::fixtures::{EvalCase, SeedMemory};
 use crate::eval::metrics;
@@ -2090,6 +2090,23 @@ fn parse_lme_date(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc))
 }
 
+fn t4a_event_date_seeds(
+    memories: &[LongMemEvalMemory],
+    haystack_dates: &[String],
+) -> Vec<EvalTemporalSeed> {
+    memories
+        .iter()
+        .filter_map(|mem| {
+            let date_str = haystack_dates.get(mem.session_idx)?;
+            let event_date = parse_lme_date(date_str)?.timestamp();
+            Some(EvalTemporalSeed {
+                source_id: memory_source_id(&mem.question_id, mem.session_idx, mem.turn_idx),
+                event_date,
+            })
+        })
+        .collect()
+}
+
 /// LongMemEval temporal eval runner (T4a).
 ///
 /// Clones `run_longmemeval_eval` but adds two T4a-specific steps:
@@ -2153,24 +2170,10 @@ pub async fn run_longmemeval_eval_temporal(path: &Path) -> Result<LongMemEvalRep
 
         // T4a: stamp event_date from haystack_dates (parallel to sessions/memories).
         // Without this, every event_date is NULL and the temporal filter is a no-op.
-        {
-            let conn = db.conn.lock().await;
-            for mem in &memories {
-                // haystack_dates is parallel to haystack_session_ids
-                // (one date per session, indexed by session_idx)
-                if let Some(date_str) = sample.haystack_dates.get(mem.session_idx) {
-                    if let Some(ts) = parse_lme_date(date_str).map(|d| d.timestamp()) {
-                        let sid = memory_source_id(&mem.question_id, mem.session_idx, mem.turn_idx);
-                        let _ = conn
-                            .execute(
-                                "UPDATE memories SET event_date = ? WHERE source_id = ?",
-                                libsql::params![ts, sid.as_str()],
-                            )
-                            .await;
-                    }
-                }
-            }
-        }
+        // haystack_dates is parallel to haystack_session_ids
+        // (one date per session, indexed by session_idx).
+        let event_date_seeds = t4a_event_date_seeds(&memories, &sample.haystack_dates);
+        db.apply_eval_temporal_seeds(&event_date_seeds).await;
 
         // Build relevance judgments
         let relevant_source_ids: HashSet<String> = memories
@@ -2302,22 +2305,8 @@ pub async fn run_longmemeval_eval_temporal_collect(
             .collect();
         db.upsert_documents(docs).await?;
 
-        {
-            let conn = db.conn.lock().await;
-            for mem in &memories {
-                if let Some(date_str) = sample.haystack_dates.get(mem.session_idx) {
-                    if let Some(ts) = parse_lme_date(date_str).map(|d| d.timestamp()) {
-                        let sid = memory_source_id(&mem.question_id, mem.session_idx, mem.turn_idx);
-                        let _ = conn
-                            .execute(
-                                "UPDATE memories SET event_date = ? WHERE source_id = ?",
-                                libsql::params![ts, sid.as_str()],
-                            )
-                            .await;
-                    }
-                }
-            }
-        }
+        let event_date_seeds = t4a_event_date_seeds(&memories, &sample.haystack_dates);
+        db.apply_eval_temporal_seeds(&event_date_seeds).await;
 
         let relevant_source_ids: HashSet<String> = memories
             .iter()
@@ -3346,5 +3335,57 @@ mod tests {
             .timestamp();
         // source_id mirrors the seed builder via memory_source_id: lme_<qid>_<sidx>_t<tidx>.
         assert_eq!(map.get("lme_q1_0_t0"), Some(&expected));
+    }
+
+    #[test]
+    fn t4a_seeds_preserve_full_time_input_order_duplicates_and_skip_bad_dates() {
+        let memory = |question_id: &str, session_idx: usize, turn_idx: usize| LongMemEvalMemory {
+            content: "body".to_string(),
+            role: "user".to_string(),
+            session_id: format!("session-{session_idx}"),
+            session_idx,
+            turn_idx,
+            has_answer: false,
+            question_id: question_id.to_string(),
+        };
+        let memories = vec![
+            memory("later-first", 2, 5),
+            memory("earlier-second", 0, 1),
+            memory("later-first", 2, 5),
+            memory("malformed", 1, 2),
+            memory("missing", 4, 3),
+        ];
+        let dates = vec![
+            "2023/04/10 (Mon) 09:15".to_string(),
+            "not a date".to_string(),
+            "2023/04/12 (Wed) 17:50".to_string(),
+        ];
+        let later = parse_lme_date(&dates[2]).unwrap().timestamp();
+        let earlier = parse_lme_date(&dates[0]).unwrap().timestamp();
+
+        assert_eq!(
+            t4a_event_date_seeds(&memories, &dates),
+            vec![
+                EvalTemporalSeed {
+                    source_id: "lme_later-first_2_t5".to_string(),
+                    event_date: later,
+                },
+                EvalTemporalSeed {
+                    source_id: "lme_earlier-second_0_t1".to_string(),
+                    event_date: earlier,
+                },
+                EvalTemporalSeed {
+                    source_id: "lme_later-first_2_t5".to_string(),
+                    event_date: later,
+                },
+            ]
+        );
+        assert_ne!(
+            later,
+            parse_lme_date("2023/04/12 (Wed) 00:00")
+                .unwrap()
+                .timestamp(),
+            "T4a seeds must retain the parsed 17:50 time rather than truncate to midnight"
+        );
     }
 }
