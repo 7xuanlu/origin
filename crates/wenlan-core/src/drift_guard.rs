@@ -1,6 +1,11 @@
 //! Fail-loud drift guards (test-only). Each `#[test]` here is a CI + pre-push gate
 //! that makes a class of doc/flag/config drift structurally hard. Mirrors the
 //! `seed_contract.rs` teeth pattern. See docs/superpowers/specs/2026-06-19-drift-defense-system-design.md.
+//!
+//! Failure messages teach the fix: each gate's assert states the invariant that
+//! broke, where to fix it, and the escape hatch when the contract itself changed
+//! on purpose (update the `*_violations` fn AND its positive control). New teeth
+//! follow the same form.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -81,7 +86,9 @@ fn version_files_are_in_sync() {
     let mismatched: Vec<&(String, String)> = sources.iter().filter(|(_, v)| v != first).collect();
     assert!(
         mismatched.is_empty(),
-        "version drift across release-please files: {sources:?} (expected all == {first})"
+        "version drift across release-please files: {sources:?} (expected all == {first}). \
+         Fix: set the SAME version string in version.txt, .release-please-manifest.json, and \
+         the workspace Cargo.toml version line — a manual bump must touch all three (teeth #3)"
     );
 }
 
@@ -519,7 +526,10 @@ fn fastembed_ci_artifact_is_prepared_once_before_model_consumers() {
     let violations = fastembed_ci_cache_violations(&workflow);
     assert!(
         violations.is_empty(),
-        "FastEmbed CI distribution contract drift:\n{}",
+        "FastEmbed CI distribution contract drift — ci.yml must prepare the FastEmbed model \
+         cache ONCE and every model-consuming job must download that prepared artifact. Fix \
+         the steps named below in .github/workflows/ci.yml; an intentional contract change \
+         also updates fastembed_ci_cache_violations() and its positive control:\n{}",
         violations.join("\n")
     );
 }
@@ -531,7 +541,10 @@ fn coverage_and_ci_share_the_fastembed_cache_contract() {
     let violations = coverage_fastembed_cache_violations(&workflow);
     assert!(
         violations.is_empty(),
-        "Coverage FastEmbed cache contract drift:\n{}",
+        "Coverage FastEmbed cache contract drift — coverage.yml must share ci.yml's prepared \
+         FastEmbed cache contract instead of downloading models independently. Fix \
+         .github/workflows/coverage.yml; an intentional contract change also updates \
+         coverage_fastembed_cache_violations() and its positive control:\n{}",
         violations.join("\n")
     );
 }
@@ -566,7 +579,10 @@ fn coverage_executes_instrumented_tests_once_then_reports_twice() {
     let violations = coverage_single_test_execution_violations(&workflow);
     assert!(
         violations.is_empty(),
-        "Coverage execution contract drift:\n{}",
+        "Coverage execution contract drift — coverage.yml must run the instrumented test suite \
+         ONCE and derive both reports from that single run (a second pass doubles CI time). \
+         Fix .github/workflows/coverage.yml; an intentional contract change also updates \
+         coverage_single_test_execution_violations() and its positive control:\n{}",
         violations.join("\n")
     );
 }
@@ -600,7 +616,10 @@ fn release_uses_target_cache_without_tag_scoped_sccache_writes() {
     let violations = release_rust_cache_violations(&workflow);
     assert!(
         violations.is_empty(),
-        "Release cache contract drift:\n{}",
+        "Release cache contract drift — release.yml must use the capacity-bounded rust-cache \
+         target cache and must not depend on tag-scoped sccache writes. Fix \
+         .github/workflows/release.yml; an intentional contract change also updates \
+         release_rust_cache_violations() and its positive control:\n{}",
         violations.join("\n")
     );
 }
@@ -642,7 +661,10 @@ fn nextest_does_not_serialize_the_entire_core_package() {
     let violations = nextest_whole_core_serialization_violations(&config);
     assert!(
         violations.is_empty(),
-        "nextest whole-package serialization contract drift:\n{}",
+        "nextest whole-package serialization contract drift — .config/nextest.toml may \
+         serialize named test groups but never the entire wenlan-core package. Fix \
+         .config/nextest.toml; an intentional contract change also updates \
+         nextest_whole_core_serialization_violations() and its positive control:\n{}",
         violations.join("\n")
     );
 }
@@ -955,7 +977,10 @@ fn windows_ort_release_contract_is_dynamic_and_version_matched() {
     let violations = windows_ort_contract_violations(&workspace, &core, &lock, &stage_script);
     assert!(
         violations.is_empty(),
-        "Windows ONNX Runtime release contract drift:\n{}",
+        "Windows ONNX Runtime release contract drift — the Windows ORT dependency stays \
+         dynamic-loading and version-matched to the pinned ort compatibility pair (teeth #7 \
+         header comment). Fix the manifests/workflow named below; an intentional contract \
+         change also updates windows_ort_contract_violations() and its positive control:\n{}",
         violations.join("\n")
     );
 }
@@ -1314,7 +1339,10 @@ fn windows_ort_distribution_stages_packages_and_exercises_exact_dll() {
     let violations = windows_ort_distribution_violations(&ci, &release, &smoke);
     assert!(
         violations.is_empty(),
-        "Windows ORT distribution proof drift:\n{}",
+        "Windows ORT distribution proof drift — the Windows release must stage, package, and \
+         smoke-test the EXACT onnxruntime.dll it ships. Fix .github/workflows/release.yml; an \
+         intentional contract change also updates windows_ort_distribution_violations() and \
+         its positive controls:\n{}",
         violations.join("\n")
     );
 }
@@ -1843,8 +1871,32 @@ fn filter_routes_path(patterns: &BTreeSet<String>, path: &str) -> bool {
     patterns.contains(path)
         || patterns.iter().any(|pattern| {
             pattern
+                .strip_prefix("*.")
+                .filter(|_| !path.contains('/'))
+                .is_some_and(|extension| path.ends_with(&format!(".{extension}")))
+        })
+        || patterns.iter().any(|pattern| {
+            pattern
+                .strip_prefix("**/*.")
+                .is_some_and(|extension| path.ends_with(&format!(".{extension}")))
+        })
+        || patterns.iter().any(|pattern| {
+            pattern
                 .strip_suffix("/**")
                 .is_some_and(|prefix| path.starts_with(&format!("{prefix}/")))
+        })
+        || patterns.iter().any(|pattern| {
+            pattern
+                .split_once("/**/")
+                .and_then(|(prefix, suffix)| {
+                    suffix
+                        .strip_suffix("/**")
+                        .map(|directory| (prefix, directory))
+                })
+                .is_some_and(|(prefix, directory)| {
+                    path.starts_with(&format!("{prefix}/"))
+                        && path.contains(&format!("/{directory}/"))
+                })
         })
         || patterns.iter().any(|pattern| {
             pattern
@@ -2496,8 +2548,65 @@ fn ci_routing_is_fail_closed_and_differential() {
     );
     assert!(
         violations.is_empty(),
-        "CI routing contract drift:\n{}",
+        "CI routing contract drift — differential CI routing stays fail-closed: every tracked \
+         source class routes to a required owner and unknown paths hit a catch-all. Fix the \
+         detect-changes/impact routing in .github/workflows/ci.yml; an intentional contract \
+         change also updates ci_routing_contract_violations() and its positive control:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn documentation_only_changes_take_the_docs_lane_without_runtime_backstops() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse ci.yml");
+    let docs = detect_change_filter_paths(&ci, "docs");
+    let runtime_filters = [
+        "rust",
+        "macos",
+        "windows",
+        "release-preflight",
+        "mcp-platform",
+        "workspace-platform",
+    ]
+    .map(|name| (name, detect_change_filter_paths(&ci, name)));
+
+    for path in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CHANGELOG.md",
+        "README.es-ES.md",
+        "app/eval/AGENTS.md",
+        "crates/wenlan-core/AGENTS.md",
+        "docs/technical-foundations.md",
+    ] {
+        assert!(
+            filter_routes_path(&docs, path),
+            "documentation-only path must schedule docs checks: {path}"
+        );
+        for (filter, patterns) in &runtime_filters {
+            assert!(
+                !filter_routes_path(patterns, path),
+                "documentation-only path must not schedule {filter}: {path}"
+            );
+        }
+    }
+
+    let markdown_test_fixture = "crates/wenlan-core/tests/fixtures/folder/notes/linked.md";
+    assert!(
+        filter_routes_path(&docs, markdown_test_fixture),
+        "Markdown test fixtures must still receive docs checks"
+    );
+    let rust = runtime_filters
+        .iter()
+        .find(|(name, _)| *name == "rust")
+        .map(|(_, patterns)| patterns)
+        .expect("rust routing");
+    assert!(
+        filter_routes_path(rust, markdown_test_fixture),
+        "Markdown under crates/**/tests/** must retain Rust test coverage"
     );
 }
 
@@ -3431,7 +3540,10 @@ fn release_preflight_is_release_gated_and_read_only() {
     let violations = release_preflight_contract_violations(&ci, &release);
     assert!(
         violations.is_empty(),
-        "release-preflight contract drift:\n{}",
+        "release-preflight contract drift — preflight must mirror every shipped release \
+         target without publishing side effects, and run only for release-sensitive changes. \
+         Fix .github/workflows/ci.yml and release.yml; an intentional contract change also \
+         updates release_preflight_contract_violations() and its positive control:\n{}",
         violations.join("\n")
     );
 }
@@ -3754,7 +3866,10 @@ fn canonical_acceptance_is_parallel_required_and_artifact_only() {
     let violations = canonical_acceptance_contract_violations(&ci);
     assert!(
         violations.is_empty(),
-        "Canonical acceptance critical-path contract drift:\n{}",
+        "Canonical acceptance critical-path contract drift — canonical acceptance stays \
+         parallel, required, and artifact-only beside the long workspace-lib lane. Fix \
+         .github/workflows/ci.yml; an intentional contract change also updates \
+         canonical_acceptance_contract_violations() and its positive controls:\n{}",
         violations.join("\n")
     );
 }
@@ -3892,7 +4007,10 @@ fn every_core_integration_target_has_a_required_or_manual_owner() {
     let violations = core_integration_contract_violations(&ci);
     assert!(
         violations.is_empty(),
-        "core integration planner wiring drift:\n{}",
+        "core integration planner wiring drift — every normal core integration target keeps a \
+         required (or explicitly manual) CI owner; no direct-command bypass, no dead text \
+         coverage. Fix .github/workflows/ci.yml; an intentional contract change also updates \
+         core_integration_contract_violations() and its positive controls:\n{}",
         violations.join("\n")
     );
 }
@@ -4146,7 +4264,10 @@ fn main_canary_is_independent_and_read_only() {
     let violations = main_canary_contract_violations(&ci, &canary);
     assert!(
         violations.is_empty(),
-        "main canary contract drift:\n{}",
+        "main canary contract drift — the main eval canary stays an independent, read-only \
+         job off the required CI path. Fix .github/workflows/main-canary.yml (and its ci.yml \
+         references); an intentional contract change also updates \
+         main_canary_contract_violations() and its positive controls:\n{}",
         violations.join("\n")
     );
 }
@@ -4509,7 +4630,10 @@ fn ci_observer_is_out_of_band_read_only_and_never_executes_measured_code() {
     let violations = ci_observer_contract_violations(&ci, &observer);
     assert!(
         violations.is_empty(),
-        "CI observer contract drift:\n{}",
+        "CI observer contract drift — the observer stays out-of-band, read-only, and never \
+         executes the code it measures. Fix .github/workflows/ci-observer.yml; an intentional \
+         contract change also updates ci_observer_contract_violations() and its positive \
+         controls:\n{}",
         violations.join("\n")
     );
 }
@@ -4864,7 +4988,10 @@ fn ci_benchmark_is_manual_restore_only_and_outside_required_ci() {
     let violations = ci_benchmark_contract_violations(&ci, &benchmark);
     assert!(
         violations.is_empty(),
-        "CI benchmark contract drift:\n{}",
+        "CI benchmark contract drift — hosted benchmarks stay manual, restore-only, and \
+         outside required CI. Fix .github/workflows/ci-benchmark.yml; an intentional \
+         contract change also updates ci_benchmark_contract_violations() and its positive \
+         control:\n{}",
         violations.join("\n")
     );
 }
@@ -5055,7 +5182,10 @@ fn ci_evidence_workflows_pin_every_action_by_sha() {
     }
     assert!(
         violations.is_empty(),
-        "CI evidence workflow action pin drift:\n{}",
+        "CI evidence workflow action pin drift — third-party actions in the evidence \
+         workflows must be pinned to immutable commit SHAs. Fix the workflow file named \
+         below; an intentional contract change also updates workflow_action_pin_violations() \
+         and its positive control:\n{}",
         violations.join("\n")
     );
 }

@@ -52,6 +52,12 @@ class UpdateReadmeEvalTests(unittest.TestCase):
         self.assertLess(table.index(oracle), table.index(lme_s))
 
     def test_update_tree_refreshes_all_snapshots_without_locomo(self) -> None:
+        translations = (
+            "README.es-ES.md",
+            "README.fr-FR.md",
+            "README.zh-Hans.md",
+            "README.zh-Hant.md",
+        )
         table = module.build_table(
             {
                 "benchmarks": {
@@ -77,18 +83,19 @@ class UpdateReadmeEvalTests(unittest.TestCase):
             (root / "README.md").write_text(f"English\n\n{old_block}\n", encoding="utf-8")
             digest = module.readme_sync_hash(root)
             marker = f"<!-- README_SYNC: source=README.md sha256={digest} -->"
-            for rel in module.TRANSLATED_READMES:
+            for rel in translations:
                 (root / rel).write_text(f"{marker}\n\nTranslated\n\n{old_block}\n", encoding="utf-8")
 
+            self.assertEqual(module.translated_readmes(root), translations)
             changed = module.update_tree(root, table)
 
-            self.assertEqual(changed, 3)
+            self.assertEqual(changed, 1 + len(translations))
             readme_hash = module.readme_sync_hash(root)
-            for rel in ("README.md", *module.TRANSLATED_READMES):
+            for rel in ("README.md", *translations):
                 text = (root / rel).read_text(encoding="utf-8")
                 self.assertIn(table, text)
                 self.assertNotIn("LoCoMo", text)
-            for rel in module.TRANSLATED_READMES:
+            for rel in translations:
                 self.assertIn(
                     f"<!-- README_SYNC: source=README.md sha256={readme_hash} -->",
                     (root / rel).read_text(encoding="utf-8"),
