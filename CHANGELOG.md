@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.15.1](https://github.com/7xuanlu/wenlan/compare/v0.15.0...v0.15.1) (2026-07-29)
+
+
+### Features
+
+* add CLI Space Brief workflow ([e363754](https://github.com/7xuanlu/wenlan/commit/e363754a82e6dbc596a52934fbaf9df17506f8f5))
+* add daemon Space Brief routes ([d4f842d](https://github.com/7xuanlu/wenlan/commit/d4f842de27de30148fce87b259da9e5c13d1d1a7))
+* add Space Brief storage ([f00a5a6](https://github.com/7xuanlu/wenlan/commit/f00a5a676a44493491d8d7d0c8c50da3292b3100))
+* expose Space Brief workflow ([1178e18](https://github.com/7xuanlu/wenlan/commit/1178e18448feee2f5eef66a13951bbc19f46f55e))
+* replace session-start context with Space Briefs ([f416396](https://github.com/7xuanlu/wenlan/commit/f416396218bccca8b39b983274316d045329b1f3))
+
+
+### Bug Fixes
+
+* add daemon-owned default save space ([#399](https://github.com/7xuanlu/wenlan/issues/399)) ([79eadad](https://github.com/7xuanlu/wenlan/commit/79eadad0dc571457706a879e61be5a070d1ea3c9))
+* consolidate MCP surface and grounded review flows ([#397](https://github.com/7xuanlu/wenlan/issues/397)) ([0534517](https://github.com/7xuanlu/wenlan/commit/053451772de103f96903b88585fbf7096d81d5af))
+* harden Space Brief handoff ([82b63a0](https://github.com/7xuanlu/wenlan/commit/82b63a046fd8f3b38b8a3b06204061f6e852a1db))
+* land the M4 communities rung — durable substrate and reader cutover ([#396](https://github.com/7xuanlu/wenlan/issues/396)) ([5ba8a3b](https://github.com/7xuanlu/wenlan/commit/5ba8a3b43b53267a7d973ef377275a86e93ad01e))
+* land the M5 truth-exposure substrate, inert at generation 0 (PR-B) ([#408](https://github.com/7xuanlu/wenlan/issues/408)) ([f29c2c5](https://github.com/7xuanlu/wenlan/commit/f29c2c5496b2a60b1478e137641a084e29e53a3f))
+* load release-please config (release-type input bypassed it) ([#410](https://github.com/7xuanlu/wenlan/issues/410)) ([48bf0a7](https://github.com/7xuanlu/wenlan/commit/48bf0a798d1931a9c28403862de4483aeb180ff1))
+* M5 PR-A — durable claim identity substrate (schema + shadow derivation) ([#404](https://github.com/7xuanlu/wenlan/issues/404)) ([e4790ce](https://github.com/7xuanlu/wenlan/commit/e4790ce857056050a90a4adeef391375e8ce5f19))
+* wire the M5 truth adapters — the protecting half of the exposure contract (PR-C) ([3932e3d](https://github.com/7xuanlu/wenlan/commit/3932e3d557ec0201324446c7d15b582c605dbe20))
+
 ## [0.15.0](https://github.com/7xuanlu/wenlan/compare/v0.14.1...v0.15.0) (2026-07-26)
 
 
