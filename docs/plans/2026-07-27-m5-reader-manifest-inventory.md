@@ -377,17 +377,28 @@ that does not carry it. A row whose evidence names the wrong field looks
 demotable the moment that field is refactored away, so the cell is load-bearing
 even when the verdict does not move.
 
-- **`GET /api/memory/entities/{entity_id}`**, was `Observation.content`, now
-  `Entity.name = pages.title (M3)`. An observation is a knowledge-graph string,
-  not page prose, so it never justified the verdict. What does: under the M3
-  entity reader cutover, `get_entity_detail_scoped`
-  (`db/scoped_entities.rs:116`) selects `p.title` from `pages` through
-  `entity_page_map` and returns it as the entity's `name`. The page class it
-  reads is `kind = 'entity'` — precisely the class `select_visible_pages`
-  excludes, so the shared visibility helper never sees this path. The cutover is
-  per-consumer and default-OFF (`set_entity_reader_cutover`), so the disclosure
-  is conditional; the manifest records the strongest reason, not the current
-  default.
+- **`GET /api/memory/entities/{entity_id}`** — **DEMOTED in the ceremony PR.**
+  Its evidence moved twice and was wrong both times. It was `Observation.content`
+  (a knowledge-graph string, not page prose, so it never justified the verdict),
+  then `Entity.name = pages.title (M3)` on the observation that under the M3
+  entity reader cutover `get_entity_detail_scoped` (`db/scoped_entities.rs:116`)
+  selects `p.title` from `pages` through `entity_page_map` and returns it as the
+  entity's `name`.
+
+  That second reading is accurate about *which table is read* and stops one step
+  short of *where the bytes came from*. `update_entity_shadow_page`
+  (`db.rs:9952`) maintains the shadow with
+  `title = (SELECT name FROM entities WHERE id = ?1)` — the arrow runs
+  entity → page. So `p.title` is not independently-authored page prose; it is
+  the entity's own name arriving by a longer road. The cutover branch selects
+  `p.title, p.entity_type, p.confidence, p.entity_confirmed` and no page body at
+  all, observations and relations come from their own tables, and the cutover is
+  per-consumer and default-OFF, so the live path reads `entities.name` outright.
+
+  Gating this would lock a door that is not a door and leave the manifest
+  asserting a leak that does not exist. Generalized as
+  "a scan cannot establish provenance": which table a query reads is not the
+  same question as where the bytes originated.
 - **`POST /api/repairs/apply`**, now `RepairTarget.label_key`. The receipt
   flattens to `RepairTarget::PageLink { source_page_id, label_key, scope }`
   (`wenlan-types/src/repair.rs:1701`), and a wikilink label is a page title
@@ -420,7 +431,7 @@ someone deliberately gives it a shape.
 
 | Shape | What the marker grants | Routes |
 |---|---|---|
-| `none` | nothing — **the request is refused**, not silently downgraded | everything not listed below (160 of 167) |
+| `none` | nothing — **the request is refused**, not silently downgraded | everything not listed below (161 of 167) |
 | `collection` | provisional **entries**: page ID + title + both axes per item, never prose | `GET /api/pages`, `POST /api/pages/search` |
 | `named_page` | full prose for the page named in the path, both axes | `GET /api/pages/{id}`, `.../links`, `.../map`, `.../revisions`, `.../sources` |
 
@@ -506,7 +517,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 
 ## HTTP — all 167 registered `(method, path, handler)` triples
 
-60 page-bearing, 107 not.
+59 page-bearing, 108 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -566,7 +577,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `POST` | `/api/memory/entities` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/entities/list` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/memory/entities/search` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/entities/{entity_id}` | main | yes | automatic | `none` | `handle_get_entity_detail` | Entity.name = pages.title (M3) |
+| `GET` | `/api/memory/entities/{entity_id}` | main | no | not_applicable | `none` | — | entity name, not page prose — see demotion note |
 | `POST` | `/api/memory/entities/{entity_id}/observations` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/entities/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/entities/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
@@ -620,7 +631,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `POST` | `/api/pages/{id}/export` | main | yes | automatic | `none` | `handle_export_page` | EFFECT: writes page prose to the requested vault |
 | `GET` | `/api/pages/{id}/links` | main | yes | automatic | **`named_page`** | `handle_get_page_links` | PageLinkInbound.label, PageLinkOutbound.label |
 | `DELETE` | `/api/pages/{id}/map` | main | yes | automatic | `none` | `handle_reset_page_map` | opaque response type — fail-closed |
-| `GET` | `/api/pages/{id}/map` | main | yes | automatic | **`named_page`** | `handle_get_page_map` | PageMapEdge.label, PageMapNode.label |
+| `GET` | `/api/pages/{id}/map` | main | yes | automatic | `none` | `handle_get_page_map` | PageMapEdge.label, PageMapNode.label — refuses, see page-map note |
 | `POST` | `/api/pages/{id}/map/edges` | main | yes | automatic | `none` | `handle_create_map_edge` | PageMapEdge.label |
 | `DELETE` | `/api/pages/{id}/map/edges/{edge_id}` | main | yes | automatic | `none` | `handle_delete_map_edge` | PageMapEdge.label |
 | `PATCH` | `/api/pages/{id}/map/edges/{edge_id}` | main | yes | automatic | `none` | `handle_patch_map_edge` | PageMapEdge.label |
