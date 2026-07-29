@@ -18,7 +18,6 @@ from typing import Final, TypeAlias
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
-TRANSLATED_READMES = ("README.zh-Hans.md", "README.zh-Hant.md", "README.es-ES.md")
 BASELINES_DIR = Path(
     os.environ.get("EVAL_BASELINES_DIR", str(Path.home() / ".cache" / "origin-eval"))
 ).expanduser()
@@ -28,6 +27,10 @@ END = "<!-- EVAL_SNAPSHOT_END -->"
 METRIC_FIELDS: Final = ("recall_at_5", "mrr", "ndcg_at_10")
 JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
+
+
+def translated_readmes(root: Path) -> tuple[str, ...]:
+    return tuple(path.name for path in sorted(root.glob("README.*.md")) if path.is_file())
 
 
 def pct(v: float | None) -> str:
@@ -172,10 +175,8 @@ def readme_sync_hash(root: Path) -> str:
 def update_tree(root: Path, table: str) -> int:
     changed = int(replace_snapshot(root / "README.md", table))
 
-    for rel in TRANSLATED_READMES:
+    for rel in translated_readmes(root):
         path = root / rel
-        if not path.exists():
-            continue
         changed += int(replace_snapshot(path, table))
 
     return changed

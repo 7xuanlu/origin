@@ -20,12 +20,15 @@ import tempfile
 from pathlib import Path
 
 
-TARGETS = ("README.zh-Hans.md", "README.zh-Hant.md", "README.es-ES.md")
 START = "<!-- EVAL_SNAPSHOT_START -->"
 END = "<!-- EVAL_SNAPSHOT_END -->"
 MARKER_RE = re.compile(
     r"<!--\s*README_SYNC:\s*source=README\.md\s+sha256=([a-f0-9]{64})\s*-->"
 )
+
+
+def translated_readmes(root: Path) -> tuple[str, ...]:
+    return tuple(path.name for path in sorted(root.glob("README.*.md")) if path.is_file())
 
 
 def normalize_generated_snapshot(text: str) -> str:
@@ -46,7 +49,7 @@ def readme_hash(root: Path) -> str:
 def check(root: Path) -> list[str]:
     expected = readme_hash(root)
     errors: list[str] = []
-    for rel in TARGETS:
+    for rel in translated_readmes(root):
         path = root / rel
         if not path.exists():
             errors.append(f"{rel}: missing translated README")
@@ -65,7 +68,7 @@ def check(root: Path) -> list[str]:
 def write_markers(root: Path) -> None:
     digest = readme_hash(root)
     marker = f"<!-- README_SYNC: source=README.md sha256={digest} -->"
-    for rel in TARGETS:
+    for rel in translated_readmes(root):
         path = root / rel
         if not path.exists():
             raise SystemExit(f"{rel}: missing translated README")
@@ -79,12 +82,19 @@ def write_markers(root: Path) -> None:
 def run_selftest() -> None:
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
+        targets = (
+            "README.es-ES.md",
+            "README.fr-FR.md",
+            "README.zh-Hans.md",
+            "README.zh-Hant.md",
+        )
         table = START + "\n| Benchmark |\n|---|\n| Old |\n" + END
         (root / "README.md").write_text("English README\n\n" + table + "\n", encoding="utf-8")
         digest = readme_hash(root)
         marker = f"<!-- README_SYNC: source=README.md sha256={digest} -->\n"
-        for rel in TARGETS:
+        for rel in targets:
             (root / rel).write_text(marker + "translated\n", encoding="utf-8")
+        assert translated_readmes(root) == targets
         assert check(root) == []
 
         updated_table = START + "\n| Benchmark |\n|---|\n| New |\n" + END
@@ -93,20 +103,20 @@ def run_selftest() -> None:
 
         (root / "README.md").write_text("English README changed\n\n" + updated_table + "\n", encoding="utf-8")
         stale = check(root)
-        assert len(stale) == len(TARGETS)
+        assert len(stale) == len(targets)
         assert all("stale sync hash" in err for err in stale)
 
         write_markers(root)
         assert check(root) == []
 
         digest = readme_hash(root)
-        (root / TARGETS[0]).write_text(
+        (root / targets[0]).write_text(
             f"<!-- README_SYNC: source=README.md sha256={digest} -->\n",
             encoding="utf-8",
         )
-        (root / TARGETS[1]).write_text("translated without marker\n", encoding="utf-8")
+        (root / targets[1]).write_text("translated without marker\n", encoding="utf-8")
         errors = check(root)
-        assert errors == [f"{TARGETS[1]}: missing README_SYNC marker"]
+        assert errors == [f"{targets[1]}: missing README_SYNC marker"]
 
 
 def main() -> int:

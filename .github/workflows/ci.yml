@@ -138,11 +138,12 @@ jobs:
               - 'scripts/validate-plugin-contract.py'
               - 'scripts/validate-plugin-contract.test.sh'
             docs:
-              - 'README.md'
-              - 'README.zh-Hans.md'
-              - 'README.zh-Hant.md'
-              - 'README.es-ES.md'
-              - 'docs/eval/**'
+              # Documentation is a repository-wide surface, not a fixed README
+              # inventory. Root and nested Markdown (including AGENTS.md and
+              # CLAUDE.md) must take the fast docs lane automatically.
+              - '*.md'
+              - '**/*.md'
+              - 'docs/**'
               - 'scripts/check-readme-translations.py'
               - 'scripts/check-readme-translations.test.sh'
               - 'scripts/update-readme-eval.py'
