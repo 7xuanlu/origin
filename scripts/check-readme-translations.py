@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 
 
-TARGETS = ("README.zh-Hans.md", "README.zh-Hant.md")
+TARGETS = ("README.zh-Hans.md", "README.zh-Hant.md", "README.es-ES.md")
 START = "<!-- EVAL_SNAPSHOT_START -->"
 END = "<!-- EVAL_SNAPSHOT_END -->"
 MARKER_RE = re.compile(
@@ -93,7 +93,7 @@ def run_selftest() -> None:
 
         (root / "README.md").write_text("English README changed\n\n" + updated_table + "\n", encoding="utf-8")
         stale = check(root)
-        assert len(stale) == 2
+        assert len(stale) == len(TARGETS)
         assert all("stale sync hash" in err for err in stale)
 
         write_markers(root)

@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=d2ed67bd1a4b51576c1c33d57e40262cb257bec83b097e8f595d574f3c5e25bf -->
+<!-- README_SYNC: source=README.md sha256=0c3916de21e35f6406098cbd41b562ab98d36eaf06b057081e14b658aa55f6c6 -->
 
 <p align="center">
   <picture>
@@ -10,7 +10,7 @@
 和 AI 聊出的成果，不該在對話結束後消失。Wenlan 會建立真正需要的頁面，並在來源變動時讓它們保持最新；只有需要判斷時才找你。
 
 <p align="center">
-  <a href="./README.md">English</a> | <a href="./README.zh-Hans.md">简体中文</a> | 繁體中文
+  <a href="./README.md">English</a> | <a href="./README.zh-Hans.md">简体中文</a> | 繁體中文 | <a href="./README.es-ES.md">Español</a>
 </p>
 
 <p align="center">

@@ -82,7 +82,7 @@ class UpdateReadmeEvalTests(unittest.TestCase):
 
             changed = module.update_tree(root, table)
 
-            self.assertEqual(changed, 3)
+            self.assertEqual(changed, 1 + len(module.TRANSLATED_READMES))
             readme_hash = module.readme_sync_hash(root)
             for rel in ("README.md", *module.TRANSLATED_READMES):
                 text = (root / rel).read_text(encoding="utf-8")

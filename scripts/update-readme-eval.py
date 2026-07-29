@@ -18,7 +18,7 @@ from typing import Final, TypeAlias
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
-TRANSLATED_READMES = ("README.zh-Hans.md", "README.zh-Hant.md")
+TRANSLATED_READMES = ("README.zh-Hans.md", "README.zh-Hant.md", "README.es-ES.md")
 BASELINES_DIR = Path(
     os.environ.get("EVAL_BASELINES_DIR", str(Path.home() / ".cache" / "origin-eval"))
 ).expanduser()

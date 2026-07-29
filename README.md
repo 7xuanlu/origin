@@ -8,7 +8,7 @@
 Useful work with AI shouldn't disappear when a conversation ends. Wenlan builds the right pages and keeps them current as sources change, asking only when judgment is needed.
 
 <p align="center">
-  English | <a href="./README.zh-Hans.md">简体中文</a> | <a href="./README.zh-Hant.md">繁體中文</a>
+  English | <a href="./README.zh-Hans.md">简体中文</a> | <a href="./README.zh-Hant.md">繁體中文</a> | <a href="./README.es-ES.md">Español</a>
 </p>
 
 <p align="center">

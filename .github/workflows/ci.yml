@@ -141,6 +141,7 @@ jobs:
               - 'README.md'
               - 'README.zh-Hans.md'
               - 'README.zh-Hant.md'
+              - 'README.es-ES.md'
               - 'docs/eval/**'
               - 'scripts/check-readme-translations.py'
               - 'scripts/check-readme-translations.test.sh'
