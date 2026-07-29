@@ -1671,6 +1671,43 @@ Execution evidence:
   M5/truth or generation change. The independently discovered stale R4-17 M5
   addresses were corrected in commit `111d0fc7` before this slice began, so
   R4-18 starts from a green `191 / 55-50-86 / 22` inventory.
+- RED, 2026-07-29: lowering only the `post_write.rs` ratchet row `18 → 16`
+  produced the exact expected failure:
+  `post_write.rs: direct .conn.lock() access increased 16 -> 18`.
+- IMPLEMENTED, 2026-07-29: `db/repair_memory_cas.rs` now owns the complete
+  reclassification and entity-extraction transaction bodies as two
+  purpose-specific `MemoryDB` operations. The existing normal facades each
+  delegate exactly once; their test-only forced-rollback facades delegate to
+  operation-specific `#[cfg(test)]` companions. `RepairWriteProof` retains
+  private fields and gains only `pub(crate) from_parts`; rollback helpers are
+  private to the DB child. SQL, validation/receipt order, normalized change
+  arithmetic, saturation, proof-hook-before-COMMIT order, rollback mapping,
+  and mutex lifetime remain unchanged, with no generic executor or
+  production-callable failure flag.
+- GREEN, 2026-07-29: direct DB controls pass `10 / 10`. For each operation
+  they prove stale/no mutation, successful proof and committed state, hook
+  failure rollback, SQL/mutation failure rollback, exact
+  `repair_apply_recovery_required` on forced rollback failure, and a
+  deterministic scoped-thread `Barrier` control showing `try_lock` blocked
+  during the proof hook then succeeded after return. Focused existing facade
+  success and rollback-uncertainty controls pass `4 / 4`; the exact ratchet
+  passes `3 / 3`. External literals are `299 → 297`, production `10 → 8`,
+  and tests remain `289`.
+- ROOT GATE, 2026-07-29: Rust LSP reports each normal DB method as its
+  declaration, one production facade, and four direct controls; each forced
+  companion is its declaration, the retained test-only facade, and one direct
+  control. The public reclassification facade is declaration plus one
+  production caller; the complete-entity facade is declaration plus one
+  production and two existing direct-test callers. All five changed Rust
+  files have zero error diagnostics. The final generated M5 inventory and
+  Rust drift control pass at exactly `191` rows, depth `55 / 50 / 86`, and
+  exposure `22`; only mechanical addresses changed. Formatting, diff checks,
+  and core/server all-target Clippy with `-D warnings` pass. No truth or
+  generation surface changed.
+- REVIEW GATE, 2026-07-29: the routine Sol architecture/API review returned
+  `APPROVE`; the independent contract and kill-power audit returned `APPROVE`.
+  Both reviewed the exact staged seven-file slice and reported no finding or
+  source conflict.
 
 #### R4-19 — deterministic database repair transaction
 

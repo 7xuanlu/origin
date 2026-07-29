@@ -44,6 +44,7 @@ mod migrations_v004_v009;
 mod onboarding_milestones;
 mod page_drafts;
 pub mod page_map;
+mod repair_memory_cas;
 mod repair_receipt;
 mod scoped_entities;
 mod scoped_pages;
@@ -99,6 +100,8 @@ mod maintenance_retro_scan_test;
 mod memory_point_reads_test;
 #[cfg(test)]
 mod page_drafts_test;
+#[cfg(test)]
+mod repair_memory_cas_test;
 #[cfg(test)]
 mod repair_receipt_test;
 #[cfg(test)]
