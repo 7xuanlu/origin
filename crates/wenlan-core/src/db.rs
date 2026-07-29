@@ -22,6 +22,7 @@ static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 mod brief;
 pub use brief::LegacyBriefItem;
 mod claim_identity;
+mod community_grouping_state;
 mod count;
 mod derived_artifact_sweep;
 mod edges_rebuild;
@@ -39,6 +40,7 @@ mod source_sync;
 mod space_context;
 mod truth_exposure;
 
+pub(crate) use community_grouping_state::CommunityGroupingLeaseCleanup;
 pub(crate) use maintenance_retro_scan::AutomaticRetroPageScan;
 pub(crate) use memory_point_reads::PendingMemoryRevisionPayload;
 pub use truth_exposure::{TruthMarkerAudit, TRUTH_CUTOVER_GENERATION_KEY};
@@ -13659,8 +13661,7 @@ impl MemoryDB {
         let composer_started = std::time::Instant::now();
         let (graph_generation, input_generation, published_generation, token, mut db_mutex_hold) =
             self.acquire_community_grouping_lease(space).await?;
-        let mut lease_cleanup = crate::community_grouping::CommunityGroupingLeaseCleanup::new(
-            Arc::clone(&self.conn),
+        let mut lease_cleanup = self.mint_community_grouping_lease_cleanup(
             space.to_owned(),
             input_generation,
             token.clone(),

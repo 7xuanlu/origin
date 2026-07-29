@@ -3,7 +3,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
     time::Duration,
 };
 
@@ -16,14 +15,12 @@ use crate::{
         IncrementalPartitionRollback, IncrementalPartitionState, PartitionConfig, ProjectionConfig,
         ProjectionInputEdge,
     },
-    db::MemoryDB,
+    db::{CommunityGroupingLeaseCleanup, MemoryDB},
 };
 
 pub(crate) const COMMUNITY_ALGO_VERSION: &str = "leiden-m4-v1";
 pub(crate) const COMMUNITY_PROJECTION_VERSION: &str = "grounded-relates-v1";
 const MIN_COMMUNITY_PARTICIPANTS: usize = 10;
-/// Durable queue position only; advancing it never acknowledges publication.
-const COMMUNITY_GROUPING_SPACE_CURSOR_KEY: &str = "community_grouping_space_cursor";
 
 #[derive(Debug, Error)]
 pub enum CommunityGroupingError {
@@ -67,72 +64,6 @@ impl CommunityGroupingAttempt {
 
     pub(crate) fn disarm_lease_cleanup(&mut self) {
         self.lease_cleanup.disarm();
-    }
-}
-
-pub(crate) struct CommunityGroupingLeaseCleanup {
-    conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
-    space: String,
-    input_generation: i64,
-    token: String,
-    armed: bool,
-}
-
-impl std::fmt::Debug for CommunityGroupingLeaseCleanup {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CommunityGroupingLeaseCleanup")
-            .field("space", &self.space)
-            .field("input_generation", &self.input_generation)
-            .field("armed", &self.armed)
-            .finish_non_exhaustive()
-    }
-}
-
-impl CommunityGroupingLeaseCleanup {
-    pub(crate) fn new(
-        conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
-        space: String,
-        input_generation: i64,
-        token: String,
-    ) -> Self {
-        Self {
-            conn,
-            space,
-            input_generation,
-            token,
-            armed: true,
-        }
-    }
-
-    pub(crate) fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CommunityGroupingLeaseCleanup {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let conn = Arc::clone(&self.conn);
-        let space = self.space.clone();
-        let input_generation = self.input_generation;
-        let token = self.token.clone();
-        runtime.spawn(async move {
-            let conn = conn.lock().await;
-            let _ = conn
-                .execute(
-                    "DELETE FROM grouping_leases
-                     WHERE phase = 'community' AND space = ?1
-                       AND input_generation = ?2 AND token = ?3",
-                    libsql::params![space, input_generation, token],
-                )
-                .await;
-        });
     }
 }
 
@@ -864,56 +795,6 @@ pub(crate) fn detect_community_identity_events(
     events
 }
 
-#[cfg(test)]
-mod identity_event_tests {
-    use super::*;
-
-    #[test]
-    fn split_and_merge_identity_changes_are_explicit_review_events() {
-        let split = detect_community_identity_events(
-            &BTreeMap::from([
-                ("node-a".to_string(), "old-a".to_string()),
-                ("node-b".to_string(), "old-a".to_string()),
-            ]),
-            &[
-                ComputedCommunityMember {
-                    node_id: "node-a".to_string(),
-                    community_id: "old-a".to_string(),
-                    attachment: "core",
-                },
-                ComputedCommunityMember {
-                    node_id: "node-b".to_string(),
-                    community_id: "new-b".to_string(),
-                    attachment: "core",
-                },
-            ],
-        );
-        assert_eq!(split.len(), 1);
-        assert_eq!(split[0].action, "community_split");
-
-        let merge = detect_community_identity_events(
-            &BTreeMap::from([
-                ("node-a".to_string(), "old-a".to_string()),
-                ("node-b".to_string(), "old-b".to_string()),
-            ]),
-            &[
-                ComputedCommunityMember {
-                    node_id: "node-a".to_string(),
-                    community_id: "old-a".to_string(),
-                    attachment: "core",
-                },
-                ComputedCommunityMember {
-                    node_id: "node-b".to_string(),
-                    community_id: "old-a".to_string(),
-                    attachment: "core",
-                },
-            ],
-        );
-        assert_eq!(merge.len(), 1);
-        assert_eq!(merge[0].action, "community_merge");
-    }
-}
-
 fn nearest_centroid(embedding: &[f32], centroids: &BTreeMap<String, Vec<f64>>) -> Option<String> {
     if embedding.is_empty() {
         return None;
@@ -978,58 +859,7 @@ impl MemoryDB {
     pub async fn run_next_community_grouping_cycle(
         &self,
     ) -> Result<Option<CommunityGroupingOutcome>, CommunityGroupingError> {
-        let space = {
-            let conn = self.conn.lock().await;
-            let mut rows = conn
-                .query(
-                    "SELECT space FROM space_graph_state \
-                     WHERE dirty = 1 \
-                     ORDER BY CASE \
-                         WHEN space > ( \
-                             SELECT value FROM app_metadata WHERE key = ?1) \
-                         THEN 0 ELSE 1 \
-                     END, space \
-                     LIMIT 1",
-                    libsql::params![COMMUNITY_GROUPING_SPACE_CURSOR_KEY],
-                )
-                .await
-                .map_err(|error| {
-                    CommunityGroupingError::Database(format!(
-                        "select next dirty community space: {error}"
-                    ))
-                })?;
-            let space = rows
-                .next()
-                .await
-                .map_err(|error| {
-                    CommunityGroupingError::Database(format!(
-                        "read next dirty community space: {error}"
-                    ))
-                })?
-                .map(|row| {
-                    row.get::<String>(0).map_err(|error| {
-                        CommunityGroupingError::Database(format!(
-                            "decode next dirty community space: {error}"
-                        ))
-                    })
-                })
-                .transpose()?;
-            drop(rows);
-            if let Some(selected_space) = space.as_deref() {
-                conn.execute(
-                    "INSERT INTO app_metadata (key, value) VALUES (?1, ?2) \
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    libsql::params![COMMUNITY_GROUPING_SPACE_CURSOR_KEY, selected_space],
-                )
-                .await
-                .map_err(|error| {
-                    CommunityGroupingError::Database(format!(
-                        "advance dirty community space cursor: {error}"
-                    ))
-                })?;
-            }
-            space
-        };
+        let space = self.claim_next_dirty_community_space().await?;
         let Some(space) = space else {
             self.refresh_next_stale_page_community_routes()
                 .await
@@ -1072,32 +902,51 @@ impl MemoryDB {
 }
 
 #[cfg(test)]
-mod tests {
+mod identity_event_tests {
     use super::*;
 
     #[test]
-    fn lease_cleanup_drop_without_tokio_runtime_falls_back_without_panicking() {
-        let directory = tempfile::tempdir().expect("lease cleanup tempdir");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("lease cleanup setup runtime");
-        let (_db, connection) = runtime.block_on(async {
-            let db = libsql::Builder::new_local(directory.path().join("lease-cleanup.db"))
-                .build()
-                .await
-                .expect("lease cleanup database");
-            let connection = db.connect().expect("lease cleanup connection");
-            (db, connection)
-        });
-        drop(runtime);
-
-        let cleanup = CommunityGroupingLeaseCleanup::new(
-            Arc::new(tokio::sync::Mutex::new(connection)),
-            "no-runtime-space".to_owned(),
-            1,
-            "no-runtime-token".to_owned(),
+    fn split_and_merge_identity_changes_are_explicit_review_events() {
+        let split = detect_community_identity_events(
+            &BTreeMap::from([
+                ("node-a".to_string(), "old-a".to_string()),
+                ("node-b".to_string(), "old-a".to_string()),
+            ]),
+            &[
+                ComputedCommunityMember {
+                    node_id: "node-a".to_string(),
+                    community_id: "old-a".to_string(),
+                    attachment: "core",
+                },
+                ComputedCommunityMember {
+                    node_id: "node-b".to_string(),
+                    community_id: "new-b".to_string(),
+                    attachment: "core",
+                },
+            ],
         );
-        drop(cleanup);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].action, "community_split");
+
+        let merge = detect_community_identity_events(
+            &BTreeMap::from([
+                ("node-a".to_string(), "old-a".to_string()),
+                ("node-b".to_string(), "old-b".to_string()),
+            ]),
+            &[
+                ComputedCommunityMember {
+                    node_id: "node-a".to_string(),
+                    community_id: "old-a".to_string(),
+                    attachment: "core",
+                },
+                ComputedCommunityMember {
+                    node_id: "node-b".to_string(),
+                    community_id: "old-a".to_string(),
+                    attachment: "core",
+                },
+            ],
+        );
+        assert_eq!(merge.len(), 1);
+        assert_eq!(merge[0].action, "community_merge");
     }
 }

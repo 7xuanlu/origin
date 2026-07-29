@@ -3426,11 +3426,12 @@ fn assert_m4_job_phase_structure() {
         );
     }
 
-    let job_source = include_str!("../src/community_grouping.rs");
+    let lease_source = include_str!("../src/db/community_grouping_state.rs");
     assert!(
-        job_source.contains("tokio::runtime::Handle::try_current()"),
+        lease_source.contains("tokio::runtime::Handle::try_current()"),
         "attempt-drop lease cleanup must fall back to expiry instead of panicking without a runtime"
     );
+    let job_source = include_str!("../src/community_grouping.rs");
     let composer = rust_function_body(job_source, "pub async fn run_community_grouping_cycle");
     let prepare = composer
         .find("prepare_community_grouping(")

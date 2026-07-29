@@ -890,6 +890,54 @@ Execution evidence:
   `writable_schema` test in favor of nullable `user_edited`, restored the
   movement-only blank line, and narrowed the plan's policy claim.
 
+#### R4-6 — community cursor and opaque lease cleanup
+
+- Add `db/community_grouping_state.rs` for the two DB-owned mechanics that
+  escaped the boundary: the dirty-space cursor operation and the attempt-drop
+  lease cleanup.
+- Move the entire cursor `SELECT` plus `app_metadata` upsert under the same one
+  lock into
+  `claim_next_dirty_community_space`. Keep
+  `run_next_community_grouping_cycle`, runtime ownership, prepare/compute/
+  finalize order, held/not-dirty handling, and Page-route refresh in
+  `community_grouping.rs`.
+- Move `CommunityGroupingLeaseCleanup`, its Debug implementation, armed flag,
+  `disarm`, and Drop into the DB child. Its constructor is private; a
+  `pub(super)` `MemoryDB` factory is the only mint path and the opaque type
+  exposes no raw field or connection constructor outside `db/**`.
+- Preserve Drop semantics exactly: return without panic when no Tokio runtime
+  exists; otherwise spawn the exact token/generation-gated lease delete and
+  swallow cleanup errors. Preserve prepare failure's awaited release then
+  disarm, and finalize's transactional delete/commit then disarm.
+- RED removes the one `community_grouping.rs` ratchet row. GREEN moves the
+  external literal total `323 → 322` and production `34 → 33`, with tests
+  `289` unchanged. The previously uncounted retained
+  `Arc<Mutex<Connection>>` capability also disappears from external production
+  code; its narrowly typed implementation now exists only inside `db/**`.
+- Behavior gates pass: no-runtime Drop `1 / 1`; aborted-finalize cleanup
+  `1 / 1`; durable round-robin/restart `1 / 1`; M4 real-job/source-shape
+  `1 / 1`; exact ratchet `3 / 3`. Removing the old file-tail test exposed a
+  pre-existing Clippy layout constraint, so the existing
+  `identity_event_tests` module moved mechanically to file end and its control
+  passes `1 / 1`.
+- Core plus server all-target Clippy with `-D warnings`, formatting, and staged
+  diff checks pass. The generated M5 inventory remains exactly `191` rows with
+  depth `55 / 50 / 86` and exposure `22`; only addresses move. No truth
+  adapter, manifest row, permit, or cutover generation changes.
+- AUDIT, 2026-07-29: the independent R4 auditor returned **APPROVE**, confirming
+  opaque capability visibility, same-lock cursor atomicity, Drop/no-runtime
+  behavior, prepare/finalize disarm order, M4 gate strength, and exact
+  accounting. Its only commit gate was exact staging of both new files, now
+  satisfied.
+- REVIEW 1, 2026-07-29: Opus/xhigh found no correctness defect and judged the
+  extraction faithful. It independently confirmed same-guard cursor mutation,
+  verbatim Drop cleanup, unchanged prepare/finalize ordering, required ratchet
+  removal, and the mechanical test relocation. Its two naming nits were adopted:
+  the child now describes community grouping state and the mutating cursor
+  operation is named `claim_next_dirty_community_space`. The M4 phase-slot
+  clone gate intentionally remains scoped to `run_next_community_grouping_cycle`
+  because it guards volatile runtime-state ownership, not DB capability access.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
