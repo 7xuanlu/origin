@@ -338,3 +338,55 @@ fn the_cutover_setter_has_no_production_caller() {
          `*_test.rs` module, which is where every other one lives."
     );
 }
+
+/// The projection pass is tested; its **wiring** was not.
+///
+/// `enforce_projection_directory_invariant` has a full test suite, and deleting
+/// the one line in `wenlan-server/src/main.rs` that calls it leaves every one of
+/// those tests green -- the pass would simply never run, and the directory
+/// `wenlan pages` reads would keep every unsupported page's file after the
+/// cutover. A pass nobody calls is a comment.
+///
+/// This is the cheapest possible tooth for that: the call site exists, in
+/// production source, outside a test file. It cannot prove the call is reached
+/// at runtime, and it does not try to -- a source scan is exactly strong enough
+/// to catch a deletion, which is the failure that actually happened to be
+/// invisible.
+#[test]
+fn the_projection_invariant_is_wired_into_the_daemon() {
+    const PASS: &str = "enforce_projection_directory_invariant";
+    let declaration = format!("fn {PASS}");
+
+    let call_sites: Vec<String> = workspace_sources()
+        .into_iter()
+        .filter(|(path, _)| {
+            !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_test.rs"))
+        })
+        .flat_map(|(path, body)| {
+            body.lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let trimmed = line.trim_start();
+                    line.contains(PASS)
+                        && !trimmed.starts_with("//")
+                        && !trimmed.starts_with("///")
+                        && !trimmed.contains(&declaration)
+                })
+                .map(|(offset, _)| format!("{}:{}", path.display(), offset + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    assert!(
+        call_sites.iter().any(|site| site.contains("wenlan-server")),
+        "no production call to {PASS} in wenlan-server: {call_sites:?}. The \
+         projection directory is the whole enforcement for `wenlan pages`, which \
+         reads Markdown off disk where no wire gate can reach it. Without this \
+         call the pass is a comment and every unsupported page stays readable \
+         after the cutover. If the daemon genuinely stopped owning this, move the \
+         call and update this test to name its new home -- do not delete it."
+    );
+}

@@ -2845,6 +2845,7 @@ async fn create_page_impl(
         // `insert_page` never sets `kind` explicitly, so the row lands with the
         // schema DEFAULT ('concept') -- mirror that here for consistency.
         kind: "concept".to_string(),
+        truth: None,
     };
 
     // md-first write (only if a knowledge_path was provided)

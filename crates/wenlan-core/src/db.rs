@@ -44857,6 +44857,7 @@ impl MemoryDB {
             kind: row
                 .get::<String>(20)
                 .unwrap_or_else(|_| "concept".to_string()),
+            truth: None,
         })
     }
 
@@ -54860,6 +54861,7 @@ pub(crate) mod tests {
             workspace: workspace.map(|w| w.to_string()),
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         }
     }
 
@@ -79530,6 +79532,7 @@ pub(crate) mod tests {
             workspace: None,
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         };
         let r = MemoryDB::search_result_from_page(page);
         assert_eq!(r.source, "page");

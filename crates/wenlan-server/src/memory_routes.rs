@@ -3771,6 +3771,7 @@ pub async fn handle_refresh_page(
         // (Global Constraints: stale claim-maps must not survive a content edit).
         citations: Vec::new(),
         kind: existing.kind.clone(),
+        truth: None,
     };
 
     // 1. md-first

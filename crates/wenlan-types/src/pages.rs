@@ -84,6 +84,30 @@ pub struct Page {
     /// stays so inbound JSON (which never carries `kind`) still deserializes.
     #[serde(default = "default_page_kind", skip_serializing)]
     pub kind: String,
+    /// Both M5 truth axes, present only on an entry a truth adapter reduced.
+    ///
+    /// `None` everywhere else, so the wire stays byte-identical for every reader
+    /// that did not ask for it. It is populated exclusively by the
+    /// `CollectionEntries` reduction, whose whole precondition is that an entry
+    /// carries its state: a provisional page listed without both axes is the
+    /// unearned trust the M5 rung exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth: Option<PageTruth>,
+}
+
+/// The two M5 truth axes for one page.
+///
+/// Independent by construction: neither is inferred from the other, and neither
+/// is `review_status` — that is the distillation-faithfulness gate, machine
+/// despite the name. A page can be machine-supported and unreviewed, or
+/// human-reviewed and unsupported, and both facts have to reach the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageTruth {
+    /// The claim-entailment axis: are this page's claims entailed by its
+    /// evidence? Absence of a support record is not evidence of support.
+    pub supported: bool,
+    /// The human axis, bound to a page version + digest.
+    pub human_reviewed: bool,
 }
 
 fn default_creation_kind() -> String {

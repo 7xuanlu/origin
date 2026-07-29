@@ -55,6 +55,7 @@ fn page(id: &str, workspace: Option<&str>) -> Page {
         workspace: workspace.map(str::to_string),
         citations: Vec::new(),
         kind: "concept".to_string(),
+        truth: None,
     }
 }
 

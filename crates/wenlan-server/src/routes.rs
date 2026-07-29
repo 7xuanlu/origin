@@ -1776,6 +1776,7 @@ mod context_page_selection_tests {
             workspace: None,
             citations: Vec::new(),
             kind: "concept".to_string(),
+            truth: None,
         }
     }
 

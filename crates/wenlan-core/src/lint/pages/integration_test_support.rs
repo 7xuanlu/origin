@@ -106,5 +106,6 @@ pub(super) fn page(id: &str) -> Page {
         workspace: None,
         citations: Vec::new(),
         kind: "concept".to_string(),
+        truth: None,
     }
 }
