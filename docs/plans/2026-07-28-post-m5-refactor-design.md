@@ -1514,10 +1514,15 @@ Execution evidence:
 
 #### R4-17 — complete-entity recovery receipt read
 
-- Add one narrow `MemoryDB` receipt-read method for the existing
-  `repair_target_receipt_on_connection` mechanic. It returns the same
-  `(RepairDigest, u64)` and preserves exact errors and lossy decoding without
-  exposing a connection, guard, callback, SQL string, or transaction surface.
+- Add `db/repair_receipt.rs` with one narrow
+  `MemoryDB::read_repair_target_receipt(&RepairTarget)` method for the existing
+  `repair_target_receipt_on_connection` mechanic. It locks, delegates, and
+  returns the same `Result<(RepairDigest, u64), WenlanError>` without exposing
+  a connection, guard, callback, SQL string, transaction, artifact, or
+  target-filtering surface. Keep the target-specific helper in `repair.rs`
+  until its four same-transaction callers move in later slices; do not
+  reimplement its scope, row-count, capture-limit, error, or lossy-decode
+  semantics.
 - Replace only the independent lock in
   `recover_complete_entity_extraction_apply_receipt`. Do not rewrite
   `target_receipt_current`, or replace same-transaction uses in post-write or
@@ -1525,9 +1530,27 @@ Execution evidence:
   that already owns their atomic operation.
 - Preserve the caller's ordering: pending artifact parse, receipt read, guard
   release, then publish/remove/sync filesystem work. A concurrency control
-  must prove the DB mutex is released before the artifact operation.
+  must prove the DB mutex is released immediately before both the publish and
+  remove artifact operations. Use a private `#[cfg(test)]` assertion/hook at
+  those exact sites; do not add a production callback surface.
+- Add `db/repair_receipt_test.rs`. A real
+  `MemoryEntityExtraction` target must return the same non-default digest and
+  row count `1` as the existing on-connection helper, while a wrong scope
+  preserves `repair_target_stale`. The existing entity-recovery control must
+  still prove both original-state pending removal and valid committed-pending
+  publication; both branches exercise the pre-artifact unlocked assertion.
 - GREEN floor: external literals `300 → 299`, production `11 → 10`, tests
-  remain `289`.
+  remain `289`; lower only the `repair.rs` ratchet row `20 → 19`.
+- PRE-IMPLEMENTATION PREFLIGHT, 2026-07-29: the independent auditor returned
+  **APPROVE** and the independent Sol reviewer returned **FIX-FIRST** until
+  the concrete API and non-vacuous controls above were frozen. LSP finds one
+  production caller of `recover_complete_entity_extraction_apply_receipt` and
+  five production uses of `repair_target_receipt_on_connection`; after the
+  move the new DB child replaces only the recovery use, so the connection
+  helper remains at five production callers and the new method has exactly one
+  production caller plus direct tests. Both reviewers confirmed
+  `300 → 299`, `11 → 10`, and tests `289`, with no M5/truth or generation
+  change.
 
 #### R4-18 — memory repair CAS transactions
 
