@@ -1578,6 +1578,27 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                         Err(e) => tracing::warn!("[reconcile] pass failed: {e}"),
                     }
 
+                    // A cutover ceremony that was killed mid-flight left the
+                    // fence at `preparing`, and `preparing` refuses every page
+                    // write. The ceremony cannot run while this daemon is up
+                    // (it takes the data-root lock, probes the port, and
+                    // refuses on a registered service unit), so a fence still
+                    // reading `preparing` here belongs to a process that is
+                    // gone. Release it before the invariant pass, so the pass
+                    // and everything after it can write.
+                    match db_arc.release_stranded_cutover_fence().await {
+                        Ok(false) => {}
+                        Ok(true) => tracing::warn!(
+                            "[truth] a cutover ceremony did not finish; released its fence so \
+                             page writes can proceed. Re-run `wenlan-server truth-cutover` if \
+                             the cutover was intended."
+                        ),
+                        Err(e) => tracing::error!(
+                            "[truth] could not read or release the cutover fence: {e}. Page \
+                             writes may be refused until this is resolved."
+                        ),
+                    }
+
                     // M5 PR-B: the projection directory is the enforcement
                     // boundary for `wenlan pages`, which reads Markdown off
                     // disk and cannot negotiate a truth contract. Inert until

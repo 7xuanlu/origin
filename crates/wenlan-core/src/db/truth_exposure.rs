@@ -417,10 +417,13 @@ impl MemoryDB {
     /// Swap the fence from `observed` to `next`, atomically. `false` means
     /// somebody else moved it first.
     ///
-    /// Both statements run under the connection mutex, so the read-modify-write
-    /// a plain `set_app_metadata` would do is never split. The second statement
-    /// exists only for the first ceremony a database ever runs, where the row is
-    /// absent rather than holding the initial value.
+    /// `set_app_metadata` cannot express this: it is an unconditional upsert,
+    /// with nowhere to put the `WHERE value = ?3` predicate that makes the swap
+    /// a compare-and-set rather than a clobber. The second statement exists only
+    /// for the first ceremony a database ever runs, where the row is absent
+    /// rather than holding the initial value; both run under the same connection
+    /// guard, and `app_metadata.key` is a primary key, so exactly one of two
+    /// racing callers can see `changed == 1`.
     async fn swap_cutover_fence(
         &self,
         observed: CutoverFence,
@@ -534,6 +537,38 @@ impl MemoryDB {
             ));
         }
         Ok(())
+    }
+
+    /// Release a fence stranded at `preparing`, at a new epoch. `true` means one
+    /// was found and released.
+    ///
+    /// [`Self::abort_cutover`] cannot do this: it needs a [`CutoverLease`], and a
+    /// lease dies with the process that minted it. A ceremony killed between
+    /// `begin_cutover` and `commit_cutover` -- SIGINT during the eviction loop,
+    /// a panic, a power cut -- therefore leaves `preparing` on disk with nothing
+    /// alive that can take it back, and `preparing` refuses **every** page write.
+    /// Fail-closed, but permanently, and the only remaining move would be editing
+    /// `app_metadata` by hand against a live WAL.
+    ///
+    /// Only the daemon's startup calls this, and only because a ceremony and a
+    /// running daemon are mutually exclusive by construction: `truth-cutover`
+    /// takes the data-root lock, refuses while the port answers, and refuses
+    /// while the service unit exists. So a fence still reading `preparing` when
+    /// the daemon boots belongs to a ceremony that died -- there is no live lease
+    /// to invalidate.
+    ///
+    /// A lease that somehow survived cannot commit onto the released fence: the
+    /// phase alone already differs, so the tuple compare refuses. The epoch still
+    /// bumps, to keep it monotone the way every other transition does -- not
+    /// because the bump is what closes that case. And `committed` is untouched:
+    /// only `preparing` is releasable, so the forward-only rule still holds.
+    pub async fn release_stranded_cutover_fence(&self) -> Result<bool, WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed.phase != CutoverPhase::Preparing {
+            return Ok(false);
+        }
+        self.swap_cutover_fence(observed, observed.next(CutoverPhase::Off))
+            .await
     }
 }
 

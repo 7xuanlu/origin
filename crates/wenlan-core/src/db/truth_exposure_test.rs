@@ -381,7 +381,19 @@ fn the_cutover_setter_has_one_production_caller() {
 /// week, same reasoning as the setter tooth above.
 #[test]
 fn no_production_code_projects_a_page_without_a_permit() {
-    const UNGATED: &str = ".write_page(";
+    // Every projection-write entry point starts with this. Enumerating the
+    // PERMITTED forms rather than the forbidden ones is the point: the first
+    // draft of this tooth matched the literal `.write_page(`, which let
+    // `.write_page_with_after_target_write(` -- a real, production-reachable,
+    // ungated page write on the repair path -- straight through. A new
+    // `write_page_*` variant is now flagged until someone adds it below, so
+    // widening the writer surface cannot silently widen the hole.
+    const PREFIX: &str = ".write_page";
+    const PERMITTED: [&str; 3] = [
+        ".write_page_gated(",
+        ".write_page_permitted(",
+        ".write_page_with_after_target_write_permitted(",
+    ];
     // The module that owns the writer. Its own internals reach the raw form on
     // purpose -- that is what the gated forms are implemented in terms of.
     const OWNER: &str = "knowledge.rs";
@@ -399,15 +411,29 @@ fn no_production_code_projects_a_page_without_a_permit() {
         if name.ends_with("_test.rs") || name.ends_with("_tests.rs") || name == OWNER {
             continue;
         }
+        // Only the crates that can hold a `KnowledgeWriter`. `wenlan-mcp` and
+        // `wenlan-cli` reach pages over HTTP and never touch the projection --
+        // the crate boundary in AGENTS.md, not a convenience -- so their
+        // `write_page_impl` request wrappers are not projection writes.
+        let owned = path.to_string_lossy().replace('\\', "/");
+        if !owned.contains("/crates/wenlan-core/") && !owned.contains("/crates/wenlan-server/") {
+            continue;
+        }
         for (offset, line) in body.lines().enumerate() {
-            if !line.contains(UNGATED) || line.trim_start().starts_with("//") {
+            if line.trim_start().starts_with("//") {
                 continue;
             }
-            if name == INLINE_TEST_FIXTURE {
-                fixture_hits += 1;
-                continue;
+            for (at, _) in line.match_indices(PREFIX) {
+                let call = &line[at..];
+                if PERMITTED.iter().any(|form| call.starts_with(form)) {
+                    continue;
+                }
+                if name == INLINE_TEST_FIXTURE {
+                    fixture_hits += 1;
+                    continue;
+                }
+                callers.push(format!("{}:{}", path.display(), offset + 1));
             }
-            callers.push(format!("{}:{}", path.display(), offset + 1));
         }
     }
 
@@ -418,7 +444,9 @@ fn no_production_code_projects_a_page_without_a_permit() {
          `write_page_permitted` (takes one already in hand, for paths that hold \
          the connection mutex). The startup projection invariant is the only pass \
          that evicts hidden pages, so an ungated write outlives the cutover \
-         ceremony that was supposed to remove it."
+         ceremony that was supposed to remove it. If you have added a new \
+         permitted `write_page_*` form, add it to PERMITTED above -- this tooth \
+         is deliberately fail-closed on names it does not recognise."
     );
     assert_eq!(
         fixture_hits, 1,
@@ -554,6 +582,74 @@ async fn a_committed_cutover_cannot_be_rolled_back_to_off() {
         db.cutover_fence().await.unwrap().phase,
         CutoverPhase::Committed
     );
+}
+
+/// A ceremony killed between `begin_cutover` and `commit_cutover` strands the
+/// fence at `preparing`, which refuses every page write. The lease died with the
+/// process, so `abort_cutover` cannot be the way out -- the daemon's startup
+/// release is.
+#[tokio::test]
+async fn a_ceremony_killed_mid_flight_does_not_wedge_page_writes_forever() {
+    let (db, _tmp) = test_db().await;
+    let lease = db.begin_cutover().await.unwrap();
+    drop(lease); // the process that held it is gone
+
+    assert!(
+        crate::truth_adapter::page_write_permit(&db, "p1")
+            .await
+            .unwrap()
+            .is_none(),
+        "a stranded fence must refuse writes; that is the state being recovered from"
+    );
+    assert!(
+        db.begin_cutover().await.is_err(),
+        "and it cannot be retried"
+    );
+
+    assert!(db.release_stranded_cutover_fence().await.unwrap());
+    assert_eq!(db.cutover_fence().await.unwrap().phase, CutoverPhase::Off);
+    assert!(crate::truth_adapter::page_write_permit(&db, "p1")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// The release is not a general reset. `committed` is forward-only, and `off`
+/// has nothing to release -- reporting `false` is how the daemon stays quiet on
+/// every ordinary boot.
+#[tokio::test]
+async fn only_a_stranded_preparing_fence_is_releasable() {
+    let (db, _tmp) = test_db().await;
+    assert!(!db.release_stranded_cutover_fence().await.unwrap());
+
+    let lease = db.begin_cutover().await.unwrap();
+    db.commit_cutover(&lease, 1).await.unwrap();
+    assert!(!db.release_stranded_cutover_fence().await.unwrap());
+    assert_eq!(
+        db.cutover_fence().await.unwrap().phase,
+        CutoverPhase::Committed
+    );
+}
+
+/// A released lease cannot come back and commit.
+///
+/// Deliberately NOT claiming the epoch bump is what stops it -- probing that
+/// mutation showed it is not: `commit_cutover` compares the whole `(epoch,
+/// phase)` tuple, and a lease is always `preparing`, so the phase alone already
+/// refuses. The bump is there to keep the epoch monotone, which `next` and the
+/// ABA reasoning for *writers* both assume, and this test pins the behaviour
+/// that actually protects the generation.
+#[tokio::test]
+async fn a_released_fence_invalidates_the_lease_it_took_back() {
+    let (db, _tmp) = test_db().await;
+    let lease = db.begin_cutover().await.unwrap();
+    assert!(db.release_stranded_cutover_fence().await.unwrap());
+
+    assert!(
+        db.commit_cutover(&lease, 1).await.is_err(),
+        "the released lease must not be able to advance the generation"
+    );
+    assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
 }
 
 /// Unlike the generation, an unreadable fence is an error rather than a

@@ -646,8 +646,22 @@ impl KnowledgeWriter {
         generation: i64,
         expected_digest: &str,
     ) -> Result<CutoverPlan, WenlanError> {
-        let plan = self.plan_truth_cutover(database, generation).await?;
+        // Take the lease FIRST, then re-plan under it. Planning first leaves a
+        // window between the plan and the fence in which a page can flip
+        // supported -- and that page's file would then be deleted on the
+        // strength of a plan that predates the flip. Once the fence reads
+        // `preparing` no page write can land, so a plan taken after it cannot
+        // go stale underneath the eviction.
+        let lease = database.begin_cutover().await?;
+        let plan = match self.plan_truth_cutover(database, generation).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = database.abort_cutover(&lease).await;
+                return Err(error);
+            }
+        };
         if plan.digest != expected_digest {
+            let _ = database.abort_cutover(&lease).await;
             return Err(WenlanError::Conflict(format!(
                 "the projection changed since the dry run (planned {expected_digest}, \
                  now {}); re-run the dry run and read it before applying",
@@ -655,7 +669,6 @@ impl KnowledgeWriter {
             )));
         }
 
-        let lease = database.begin_cutover().await?;
         let evict: Vec<String> = plan.evictions.iter().map(|e| e.page_id.clone()).collect();
         let outcome = async {
             if !evict.is_empty() {
@@ -1349,6 +1362,24 @@ impl LockedRepairProjection<'_> {
     ) -> Result<String, WenlanError> {
         check_permit(permit, page)?;
         self.write_page(page)
+    }
+
+    /// The permitted form of [`Self::write_page_with_after_target_write`].
+    ///
+    /// The repair path renames a page's title and rewrites its `.md` in the same
+    /// receipted step, which is a production page-prose write like any other and
+    /// needs the same permit in front of it.
+    pub(crate) fn write_page_with_after_target_write_permitted<F>(
+        &self,
+        permit: &crate::truth_adapter::PagePermit,
+        page: &Page,
+        after_target_write: F,
+    ) -> Result<String, WenlanError>
+    where
+        F: FnOnce() -> Result<(), WenlanError>,
+    {
+        check_permit(permit, page)?;
+        self.write_page_with_after_target_write(page, after_target_write)
     }
 
     pub(crate) fn write_page_with_after_target_write<F>(

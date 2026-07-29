@@ -461,11 +461,20 @@ async fn an_apply_refuses_after_a_support_status_changes() {
         "the refusal must happen before anything is deleted"
     );
     assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
-    assert_eq!(
-        db.cutover_fence().await.unwrap(),
-        crate::db::CutoverFence::INITIAL,
-        "refusing before the lease is taken leaves the fence untouched"
+    // The lease is taken BEFORE the re-plan, so a digest refusal happens with
+    // the fence held and gives it straight back. Off is what matters -- writers
+    // are not left wedged by a refusal -- and the epoch has moved, which is how
+    // a released fence always looks.
+    let fence = db.cutover_fence().await.unwrap();
+    assert_eq!(fence.phase, crate::db::CutoverPhase::Off);
+    assert!(
+        fence.epoch > 0,
+        "the refusal took the lease and returned it, so the epoch cannot be untouched"
     );
+    assert!(crate::truth_adapter::page_write_permit(&db, "p1")
+        .await
+        .unwrap()
+        .is_some());
 }
 
 /// Directory first, then the commit, then the fence. Asserted at the directory,

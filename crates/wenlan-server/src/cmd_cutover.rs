@@ -115,10 +115,13 @@ pub async fn run(generation: i64, apply: bool) -> Result<()> {
 
     let recorded = db.get_app_metadata(DRY_RUN_DIGEST_KEY).await?;
     match recorded.as_deref() {
-        None => {
+        // Blank is the spent marker a completed apply leaves behind. Falling
+        // through to the mismatch arm would report "recorded , now <digest>",
+        // which reads like corruption rather than "you already did this".
+        None | Some("") => {
             return Err(anyhow!(
-                "no dry run on record. Run this command without `--apply` first and \
-                 read the eviction list — it names files that will be deleted from \
+                "no unspent dry run on record. Run this command without `--apply` first \
+                 and read the eviction list — it names files that will be deleted from \
                  the user's vault."
             ))
         }
