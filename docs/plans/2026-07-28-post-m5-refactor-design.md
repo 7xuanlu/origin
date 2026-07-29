@@ -1275,17 +1275,51 @@ Execution evidence:
   `eval/longmemeval.rs: 2` event-date write loops remain unchanged. The DB test
   uses an `_test.rs` suffix.
 - The generated M5 inventory must remain exactly `191` rows with depth
-  `55 / 50 / 86` and exposure `22`; only mechanically shifted `db.rs` source
-  addresses may change. No truth adapter, manifest row, permit, or cutover
-  generation changes. This is a movement-only slice: run focused unit and
-  structural controls, not a real LoCoMo/LongMemEval quality benchmark, and
-  make no eval-effect claim.
+  `55 / 50 / 86` and exposure `22`; only mechanically shifted source addresses
+  may change. No truth adapter, manifest row, permit, or cutover generation
+  changes. This is a movement-only slice: run focused unit and structural
+  controls, not a real LoCoMo/LongMemEval quality benchmark, and make no
+  eval-effect claim.
 - PRE-IMPLEMENTATION PREFLIGHT, 2026-07-29: the independent auditor identified
   the missing ledger as a **BLOCK** before implementation. The section above
   records its exact SQL, error, duplicate, lock-lifetime, caller-policy,
   ratchet, exclusion, and M5 conditions. The worker had made no implementation
   edit; its only change was the reversible RED baseline removal, which failed
   with exactly two new direct accesses.
+- IMPLEMENTATION, 2026-07-29: `eval_pipeline_corpus_contents` materializes only
+  raw contents and `eval_pipeline_evidence_pairs` materializes only raw
+  lineage pairs. `eval/pipeline.rs` retains BPE aggregation, row counting,
+  reverse-map construction, evidence copying, additions, and `HashSet`
+  insertion. The two production guards release before those caller-owned
+  operations.
+- Direct DB controls pass `2 / 2`: corpus selection retains document, empty,
+  and duplicate head rows while excluding archives and non-head chunks; the
+  evidence fixture exercises status, prefix, chunk, and entity negatives,
+  duplicate pairs from distinct matching rows, and a `mergedXwild` positive
+  proving the underscore in `LIKE 'merged_%'` remains a SQL wildcard. Caller
+  controls pass `2 / 2`: BPE totals and raw-row counts include empty and
+  duplicate contents; evidence union preserves originals, ignores unmatched
+  pairs, and collapses duplicate additions.
+- The exact external-access ratchet passes `3 / 3`: external literals
+  `305 → 303`, production `16 → 14`, tests remain `289`, and pipeline
+  disappears from the per-file baseline. The generated M5 inventory and drift
+  control remain exactly `191` rows with depth `55 / 50 / 86` and exposure
+  `22`; only generated source addresses move. Focused tests, formatting,
+  diff checks, and core/server all-target Clippy with `-D warnings` pass. No
+  quality benchmark was run and no eval-effect claim is made.
+- ROOT GATE, 2026-07-29: the relevant pipeline controls pass `4 / 4`, the
+  exact ratchet passes `3 / 3`, and the M5 drift control passes `1 / 1`.
+  Rust-analyzer reports no error in the new DB module or its direct test; each
+  new method has exactly one production caller and one direct test reference.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: the independent auditor initially
+  blocked a false `db.rs`-only inventory-address claim. After the ledger was
+  corrected to permit all and only mechanical source-address shifts, it
+  returned **APPROVE** for the code, controls, ratchet, inventory, exclusions,
+  and exact seven-file staging.
+- REVIEW 1, 2026-07-29: the independent Sol reviewer returned **FIX-FIRST** on
+  the same ledger wording and found no code-level issue. REVIEW 2 returned
+  **APPROVE** after the correction, with the staged scope still exact and
+  clean.
 
 ### R5 — server vertical slices
 
