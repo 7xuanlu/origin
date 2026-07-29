@@ -233,7 +233,7 @@ fn manifest_counts_match_the_spec() {
         .iter()
         .filter(|r| r.page_bearing == PageBearing::Yes)
         .count();
-    assert_eq!(bearing, 48, "page-bearing HTTP routes");
+    assert_eq!(bearing, 60, "page-bearing HTTP routes");
 }
 
 #[test]
@@ -329,10 +329,18 @@ fn only_page_bearing_readers_carry_a_marker_shape() {
 /// there until someone edits this list on purpose.
 #[test]
 fn marker_shape_allowlist_is_fail_closed() {
+    // `/api/pages/recent` and `/api/pages/recent-changes` were `collection`
+    // until PR-C and are deliberately not any more. `Collection` is documented
+    // as being only for item types that can carry a page identity *and* both
+    // axes, never prose -- and `RecentActivityItem` carries a prose `snippet`
+    // with no axes at all, `PageChange` a bare title. The shape promised a
+    // carve-out their wire types cannot honour, which is a trap rather than a
+    // leak: the adapters are Full-only, so nothing over-exposed, but the next
+    // person to "fix" them to honour the promise would reduce a page into a
+    // struct with nowhere to put the axes. `none` is the honest shape until
+    // those types grow them.
     const COLLECTION: &[(ReaderMethod, &str)] = &[
         (ReaderMethod::Get, "/api/pages"),
-        (ReaderMethod::Get, "/api/pages/recent"),
-        (ReaderMethod::Get, "/api/pages/recent-changes"),
         (ReaderMethod::Post, "/api/pages/search"),
     ];
     const NAMED_PAGE: &[(ReaderMethod, &str)] = &[
@@ -366,7 +374,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::Collection)
             .count(),
-        4
+        2
     );
     assert_eq!(
         HTTP_READERS

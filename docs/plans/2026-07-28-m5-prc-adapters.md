@@ -89,10 +89,27 @@ The fix is to enumerate what the reader actually reads: **the directory**. The
 invariant now takes the union of `state.json`'s keys and the page IDs recovered
 from the frontmatter of every `.md` file in the projection directory.
 
-A file that cannot be attributed to a page ID is **never deleted** — the
-projection directory is inside the user's vault and may hold files Wenlan did not
-write. It is reported, and an unattributed file makes the pass fail, which
-section 4 then acts on. Fail-closed on the decision, never on the user's data.
+A file that cannot be attributed to a page ID is **never deleted, and never
+counted as a failure either** — the projection directory can be the user's own
+vault and may hold files Wenlan did not write. The second half matters as much
+as the first: section 4 turns a failed pass into a refusal to start at
+generation ≥ 1, so treating one unrecognized note as a stuck eviction would let
+a stranger's file take the daemon down. It is skipped. Fail closed on the
+decision, never on the user's data. Tooth:
+`a_file_with_no_origin_id_is_left_alone`.
+
+**The scan reads bytes, not a `String`.** The frontmatter probe reads a bounded
+8 KiB prefix, and that bound lands wherever it lands — `read_to_string` fails
+the *entire* read when the cap splits a multi-byte character, which any page
+carrying CJK prose past 8 KiB will eventually do. The failure was swallowed by
+an `.ok()?`, so the file dropped out of the scan: fail **open**, on a disclosure
+boundary, and precisely on the path that exists to catch what `state.json`
+forgot. It now reads to a `Vec<u8>` and decodes with `from_utf8_lossy` — the key
+is ASCII and sits at the head, so a replacement character in the truncated tail
+costs nothing. Tooth:
+`a_page_with_multibyte_prose_past_the_scan_cap_is_still_evicted`, which drives
+three paddings because only one alignment in three splits a 3-byte character at
+the cap.
 
 ## 3. A write-time skip as well as the removal pass
 
@@ -120,6 +137,12 @@ failed invariant aborts startup.** The daemon does not open the door it cannot
 hold. The cutover is a deliberate ceremony with an operator present, which is
 what makes refusing to start an acceptable answer rather than a brick.
 
+An unreadable generation aborts too, same as the guard: `unwrap_or(1)`. The
+pass itself is now tested for the first time — the eviction of a file
+`state.json` has forgotten, the inertness of the whole pass at generation 0, and
+the rule that an unattributable `.md` is skipped rather than deleted or counted
+as a failure that would take the daemon down.
+
 ## 5. Fail-closed audit for grants
 
 The audit row is the only compensating control for the one attack D3 concedes:
@@ -134,18 +157,43 @@ exposure, so failing them closed would trade a real availability loss for no
 control. `caller` stays unverified — it is the same cooperative tier as the
 marker itself, and the row proves a marked call happened, not who made it.
 
+A daemon with no database takes the same branch: it cannot write the row, and it
+cannot be asked what generation it is on either, so unknown resolves to refuse.
+That is the reachable form of the failure in a test — a live database whose
+audit INSERT fails takes the identical branch by construction, but cannot be
+provoked without a fault-injection seam the guard does not have, and is not
+worth building one for.
+
 ## 6. Unsupported pages are not re-distilled
 
-Background re-distillation sends page titles to the configured LLM provider,
-which may be external, with neither gate in the path: `scheduler.rs:2494` →
-`refinery/mod.rs:1583` → `synthesis/distill.rs:1309`, plus other active titles
-pulled as a prompt hint (`:85`).
+Background re-distillation sends page titles and prose to the configured LLM
+provider, which may be external, with neither gate in the path.
 
 It is not an HTTP route, so there is no request to attach a grant to. The permit
 is therefore consumed **inside the refinery**: at generation ≥ 1 a page the
 automatic reader may not see is not re-distilled, and is not offered as a title
 hint for someone else's distillation either. An unsupported page is not a page we
 are willing to spend an external round-trip on.
+
+Two seams, both in `synthesis/distill.rs`:
+
+| seam | what it is | gate |
+|---|---|---|
+| `refresh_page_with_prompt` | the shared re-distill op | `page_write_permit`, scoped to `RefreshReason::SourceChanged` |
+| `build_existing_titles_hint` | other active titles fed to the prompt | `filter_page_refs`, one batched query |
+
+The scoping is the judgment call. `refresh_page_with_prompt` serves both the
+ambient path and `POST /api/distill/{id}` (`RefreshReason::Explicit`), and only
+the ambient one is grantless — the explicit route has a caller and goes through
+the wire guard, so gating it here would apply the automatic verdict to a request
+that legitimately carries its own. Every ambient caller reaches the gate:
+`run_redistill_page_slice`, `re_distill_stale_pages`, both `maintenance.rs`
+callers, and the Overview refresh.
+
+The hint seam needed `list_active_page_titles_scoped` and
+`list_relevant_active_page_titles` widened to return `(id, title)` — the queries
+never selected the page ID, so there was nothing to gate on. The title-only
+public wrapper keeps its signature.
 
 ## 7. A tooth on the projection pass's wiring
 
@@ -154,13 +202,79 @@ every test green today — the pass is tested, its wiring is not. A source-scan
 test asserts the call site exists, the same shape as the F5 scan that proves
 `set_truth_cutover_generation` has no production caller.
 
-## 8. The 26 under-audited demotions
+## 8. The under-audited demotions
 
 The Opus review retracted the premise behind 34 manifest demotions ("no
 production code path writes page prose into `memories`" is false —
-`post_write.rs:3090`). Eight were re-checked; 26 were recorded as under-audited
-rather than known correct. They are re-audited under the provenance question in
-this PR, and the manifest is corrected where the re-audit disagrees.
+`post_write.rs:3090`). Eight were re-checked; the rest were recorded as
+under-audited rather than known correct. They are re-audited under the
+provenance question in this PR, and the manifest is corrected where the
+re-audit disagrees.
+
+The re-audit did not return a clean bill. It found a live asymmetry, verified at
+source: `accept_pending_revision_with_knowledge_path` consumes a page revision
+card (`try_update_page_content(consume_revision_id: …)` →
+`delete_by_source_id_in_transaction`, `db.rs:43320`, in the same transaction as
+the page write), while `dismiss_pending_revision` had no page branch at all and
+fell through to the memory path's `UPDATE memories SET pending_revision = 0,
+supersedes = NULL` — "unstage, not delete". So **dismissing a page revision card
+turned it into a permanent, ordinary, retrievable memory holding a full copy of
+the page's prose**, and cleared the very flag most of the demotion evidence
+relied on to exclude it.
+
+That is a generation-0 bug, not a cutover one — it corrupts data today, with the
+contract entirely inert — so this PR fixes it: page cards delete on dismiss,
+mirroring accept. Memory cards keep their unstage semantics, which are correct
+for a genuine independent capture that merely topic-matched; a page card is
+prose the daemon manufactured from the page itself, so there is no capture to
+preserve. Cards already dismissed in a live database are not retroactively
+cleaned by this PR.
+
+## 9. Two marker shapes the wire types cannot honour
+
+The inventory's stated rule is that a route qualifies for `collection` only if
+its item type can carry a page identity **and both axes**, and it applies that
+rule by name to demote `/api/pages/orphan-links`. Two rows were never held to
+it: `GET /api/pages/recent` and `GET /api/pages/recent-changes`.
+`RecentActivityItem` carries a prose `snippet` and neither axis; `PageChange` is
+a page ID, a title, a kind and a timestamp.
+
+Nothing over-exposed. Both adapters are Full-only, so a provisional page was
+already dropped rather than reduced — which is exactly what made this worth
+fixing while it was still cheap. The defect was not a leak but a **trap**: the
+manifest advertised a carve-out the response types cannot represent, and the
+obvious way to "fix" the adapters to honour it is to reduce a page into a struct
+with nowhere to put the axes it must be reduced *with*. An entry surfacing
+without its state is the unearned trust the whole rung exists to prevent.
+
+Both are `none` until those types grow the axes, and `none` refuses rather than
+downgrades, so a client that sends a marker there finds out. Tooth:
+`truth_guard_test.rs::the_recent_feeds_refuse_a_marker_they_cannot_honour`.
+
+## 10. Four readers the first pass did not gate
+
+Three were missed and one was excused on reasoning that does not hold:
+
+- **`POST /api/distill`** was excused as "a write path, already gated
+  downstream". True of the write, irrelevant to the **response**, which returns
+  stale-page `title`, `summary` and `source_memory_ids`, an
+  `existing_page_title` from the overlap probe, and the orphan-label feed. The
+  suppression stays ungated deliberately — skipping a cluster that overlaps an
+  existing page *uses* the knowledge without disclosing it, and removing that
+  would make the agent mint duplicates — but the disclosure is gated, and where
+  the overlapping page is invisible the reported `new_memory_count` falls back
+  to the full cluster size rather than a figure derived from a hidden page's
+  sources.
+- **`GET /api/pages/orphan-links`** exposes wikilink labels lifted out of page
+  **bodies**. The leak is the *source* page, not the target — an orphan label by
+  definition names no target. The existing query aggregates `source_page_id`
+  away in SQL and applies `HAVING`/`LIMIT` before anything can filter, so
+  post-filtering its output is wrong twice over. It gains an unaggregated twin
+  and folds counts in Rust, after the truth filter.
+- **`GET /api/retrievals/recent`** carries `page_titles` with a `page_ids` list
+  documented 1:1 with it. Where they line up the pairs are filtered; where they
+  do not — legacy rows recorded before `page_ids` existed — nothing attributes a
+  title to a page, and unknown is not permission, so both lists clear.
 
 ## What PR-C does not do
 
@@ -170,6 +284,39 @@ this PR, and the manifest is corrected where the re-audit disagrees.
 - It does not resolve page-map hiding as a graph transformation; incident edges
   are keyed by node IDs, not page IDs, so a hidden page's edges need their own
   pass.
+- **It does not gate `stage_page_revision_card` itself.** While a card is
+  staged, the nurture family reads it with no `pending_revision` filter at all
+  (`db.rs` ~35086 — and `ORDER BY c.pending_revision DESC` sorts staged cards
+  *first*, so this is deliberate product behavior, not an oversight). At
+  generation ≥ 1 that surfaces the title and prose of a page the automatic
+  reader may not see. The fix is one gate at the single producer — refuse to
+  stage a card for a page with no `page_write_permit` — not adapters on the
+  twelve memory readers that can carry one. It is a pure generation-≥ 1
+  concern, so it belongs to the ceremony PR alongside the other three.
+- It does not reconcile `handle_refresh_page`'s md-first rollback with a gated
+  write. That handler restores `existing_md_content` on a later DB failure,
+  which assumes the md write happened; post-cutover `write_page_gated` may
+  return `Ok(None)`. Idempotent and harmless, but the ceremony needs it in view.
+- **It does not gate two page-bearing readers that need a design call first.**
+  Both carry `PageBearing::Yes` and a named adapter that does not filter, and
+  both have carried that since PR-B — unchanged by this PR, and passing
+  `page_bearing_rows_carry_an_adapter_address` because that tooth checks the
+  cell is an address, not that the function behind it enforces. They are the
+  two remaining holes before the generation may advance:
+  - `GET /api/activities` (`handle_list_activities`) — a page title really is
+    copied into `AgentActivityRow.detail` at write time
+    (`post_write.rs` `title={req.title}` into `log_agent_activity`), so the
+    bytes' provenance is the page. But the identity sits inside a formatted
+    free-text `detail` rather than a column, so gating means either parsing
+    that string or giving the activity row a real page reference. A schema
+    question, not a wiring one.
+  - `GET /api/memory/entities/{entity_id}` (`handle_get_entity_detail`) —
+    evidence reads `Entity.name = pages.title (M3)`, and that may have the
+    provenance backwards: the M3 dual-write derives a `kind='entity'` shadow
+    page **from** the entity, and every real page reader excludes
+    `kind='entity'` explicitly. If the bytes originate in `entities`, the row
+    is not page-bearing at all and the correct fix is a demotion rather than an
+    adapter. Settling that is a provenance re-audit of its own.
 
-Those three are the ceremony PR's scope, and none of them is a prerequisite for
-the adapters.
+Those are the ceremony PR's scope, and none of them is a prerequisite for the
+adapters.
