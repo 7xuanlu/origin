@@ -301,3 +301,81 @@ async fn empty_batches_stay_empty_without_asking() {
             .is_empty()
     );
 }
+
+// ---- activity detail, the subject that cannot be named -------------------
+
+fn activity(action: &str, detail: &str) -> wenlan_types::memory::AgentActivityRow {
+    wenlan_types::memory::AgentActivityRow {
+        id: 1,
+        timestamp: 0,
+        agent_name: "claude".into(),
+        action: action.into(),
+        memory_ids: None,
+        query: None,
+        detail: Some(detail.into()),
+        memory_titles: Vec::new(),
+    }
+}
+
+/// Paired like the rest: inert at 0, biting at 1.
+///
+/// The `page_grow` row carries a title in prose with no page id anywhere on the
+/// row, which is the whole reason this adapter refuses instead of ruling. The
+/// `memory_store` row is the control -- refusing every activity detail would
+/// pass a blanket-nulling implementation just as happily.
+#[tokio::test]
+async fn page_activity_detail_survives_at_zero_and_is_refused_at_one() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let rows = || {
+        vec![
+            activity("page_grow", "grew \"Q3 Revenue Plan\""),
+            activity("page_create", "title=Q3 Revenue Plan, sources=4"),
+            activity("memory_store", "stored a capture"),
+        ]
+    };
+
+    db.set_truth_cutover_generation(0).await.unwrap();
+    let kept = crate::truth_adapter::redact_page_activity_detail(&db, rows())
+        .await
+        .unwrap();
+    assert!(
+        kept.iter().all(|r| r.detail.is_some()),
+        "generation 0 must not redact anything"
+    );
+
+    db.set_truth_cutover_generation(1).await.unwrap();
+    let redacted = crate::truth_adapter::redact_page_activity_detail(&db, rows())
+        .await
+        .unwrap();
+    assert_eq!(
+        redacted[0].detail, None,
+        "a page title reached a reader through agent_activity.detail"
+    );
+    assert_eq!(
+        redacted[1].detail, None,
+        "a page title reached a reader through agent_activity.detail"
+    );
+    assert!(
+        redacted[2].detail.is_some(),
+        "a non-page activity lost its detail — the adapter is nulling blindly"
+    );
+}
+
+/// The prefix test, not an enumerated list. A page action added after this ships
+/// is covered by default; the alternative leaks until someone remembers to
+/// extend a match arm.
+#[tokio::test]
+async fn an_unknown_page_action_is_covered_by_the_prefix() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    db.set_truth_cutover_generation(1).await.unwrap();
+    let redacted = crate::truth_adapter::redact_page_activity_detail(
+        &db,
+        vec![activity(
+            "page_something_invented_later",
+            "title=Secret Page",
+        )],
+    )
+    .await
+    .unwrap();
+    assert_eq!(redacted[0].detail, None);
+}

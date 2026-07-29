@@ -2704,6 +2704,13 @@ pub async fn handle_list_activities(
         .list_agent_activity_scoped(limit, agent_name.as_deref(), since, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // Page-bearing through `detail`, which four write sites format a page title
+    // into at write time. The row keeps no page id, so the adapter refuses the
+    // sentence rather than ruling on a subject it cannot name — which is also
+    // why no grant is threaded here.
+    let activities = wenlan_core::truth_adapter::redact_page_activity_detail(&db, activities)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Json(wenlan_types::responses::ActivityResponse {
         activities,
     }))
