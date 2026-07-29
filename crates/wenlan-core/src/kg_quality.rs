@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Knowledge graph quality checks: post-store verification and periodic rethink.
 
-use crate::db::{ContradictionObservationCount, DuplicateNameGroup, MemoryDB, MinHashEntityInput};
+use crate::db::{
+    ContradictionObservationCount, DuplicateNameGroup, MemoryDB, MinHashEntityInput,
+    StaleEntityEmbeddingCandidate,
+};
 use crate::error::WenlanError;
 use crate::llm_provider::LlmProvider;
 use crate::read_scope::ReadScope;
@@ -376,68 +379,36 @@ pub async fn heal_entity_vocabulary(db: &MemoryDB) -> Result<VocabHealCounts, We
 /// since their embedding was last updated.
 pub async fn refresh_stale_entity_embeddings(db: &MemoryDB) -> Result<usize, WenlanError> {
     // Find candidates.
-    let candidates: Vec<(String, String)> = {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT e.id, e.name
-                 FROM entities e
-                 LEFT JOIN observations o ON o.entity_id = e.id
-                    AND o.created_at > COALESCE(e.embedding_updated_at, 0)
-                 GROUP BY e.id, e.name
-                 HAVING COUNT(o.id) >= 5",
-                (),
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("stale entity query: {}", e)))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("stale entity row: {}", e)))?
-        {
-            out.push((
-                row.get::<String>(0).unwrap_or_default(),
-                row.get::<String>(1).unwrap_or_default(),
-            ));
-        }
-        out
-    };
+    let candidates: Vec<StaleEntityEmbeddingCandidate> =
+        db.stale_entity_embedding_candidates_for_refresh().await?;
 
     let mut refreshed = 0usize;
-    for (id, name) in &candidates {
+    for candidate in &candidates {
         // Build text from entity name + top 10 recent observations.
-        let mut parts = vec![name.clone()];
+        let mut parts = vec![candidate.entity_name.clone()];
+        for content in db
+            .recent_entity_observation_contents_for_embedding_refresh(&candidate.entity_id)
+            .await?
         {
-            let conn = db.conn.lock().await;
-            let mut obs_rows = conn
-                .query(
-                    "SELECT content FROM observations WHERE entity_id = ?1 ORDER BY created_at DESC LIMIT 10",
-                    libsql::params![id.clone()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("obs fetch: {}", e)))?;
-            while let Some(row) = obs_rows
-                .next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("obs row: {}", e)))?
-            {
-                let c: String = row.get::<String>(0).unwrap_or_default();
-                if !c.is_empty() {
-                    parts.push(c);
-                }
+            if !content.is_empty() {
+                parts.push(content);
             }
         }
         let combined = parts.join(". ");
-        match db.refresh_entity_embedding(id, &combined).await {
+        match db
+            .refresh_entity_embedding(&candidate.entity_id, &combined)
+            .await
+        {
             Ok(()) => {
                 refreshed += 1;
-                log::info!("[rethink] refreshed embedding for entity '{}'", name);
+                log::info!(
+                    "[rethink] refreshed embedding for entity '{}'",
+                    candidate.entity_name
+                );
             }
             Err(e) => log::warn!(
                 "[rethink] refresh_entity_embedding failed for '{}': {}",
-                name,
+                candidate.entity_name,
                 e
             ),
         }

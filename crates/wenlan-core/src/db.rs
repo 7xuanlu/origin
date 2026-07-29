@@ -29,6 +29,7 @@ mod edges_rebuild;
 mod entity_page_adapter;
 mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;
+mod kg_quality_embedding_refresh;
 mod kg_quality_vocabulary;
 mod maintenance_duplicate_reads;
 mod maintenance_queue;
@@ -47,6 +48,7 @@ mod truth_exposure;
 pub(crate) use community_grouping_state::CommunityGroupingLeaseCleanup;
 pub(crate) use kg_quality_diagnostics::ContradictionObservationCount;
 pub(crate) use kg_quality_duplicate_candidates::{DuplicateNameGroup, MinHashEntityInput};
+pub(crate) use kg_quality_embedding_refresh::StaleEntityEmbeddingCandidate;
 pub(crate) use maintenance_duplicate_reads::{NearDuplicatePairRead, NearDuplicateSliceReader};
 pub(crate) use maintenance_retro_scan::AutomaticRetroPageScan;
 pub(crate) use memory_point_reads::PendingMemoryRevisionPayload;
@@ -66,6 +68,8 @@ mod entity_page_adapter_test;
 mod kg_quality_diagnostics_test;
 #[cfg(test)]
 mod kg_quality_duplicate_candidates_test;
+#[cfg(test)]
+mod kg_quality_embedding_refresh_test;
 #[cfg(test)]
 mod kg_quality_vocabulary_test;
 #[cfg(test)]

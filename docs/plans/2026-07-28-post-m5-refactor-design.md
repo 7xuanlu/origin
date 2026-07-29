@@ -1109,6 +1109,53 @@ Execution evidence:
   decode defaults; policy placement; non-vacuous direct and caller controls;
   ratchet and M5 accounting; and exact staging of both new files.
 
+#### R4-11 — knowledge-quality embedding-refresh inputs
+
+- Add `db/kg_quality_embedding_refresh.rs` with
+  `stale_entity_embedding_candidates_for_refresh` and
+  `recent_entity_observation_contents_for_embedding_refresh`. The exact SQL,
+  bind value, lossy decoding, and existing error prefixes move under
+  `MemoryDB`; the typed candidate carries only entity id and name.
+- Preserve the candidate query's strict
+  `o.created_at > COALESCE(e.embedding_updated_at, 0)`, grouping,
+  `HAVING COUNT(o.id) >= 5`, and absence of ordering. Preserve the observation
+  query's `ORDER BY created_at DESC LIMIT 10` without adding a tie-breaker.
+- Keep the candidate loop, name-first `parts`, empty-content filtering, `. `
+  join, embedding generation/write, refreshed count, and success/failure logs
+  in `kg_quality.rs`. Each bounded read returns before
+  `refresh_entity_embedding`; no DB read lock spans embedding generation or
+  the write transaction.
+- Preserve the two-read race rather than combining candidate and observation
+  reads into a transaction. The observation guard now releases after the raw
+  contents are materialized, before caller-side empty filtering; this accepted
+  materialized-snapshot lock shrink changes no selected row or ordering.
+- RED lowers the exact `kg_quality.rs` baseline from `20` to `18`; before
+  extraction the guard reports a direct-access increase `18 → 20`. GREEN moves
+  both production locks under `db/**`: external literals `314 → 312`,
+  production `25 → 23`, tests `289` unchanged, and the per-file baseline is
+  `20 → 18`.
+- Direct and caller controls pass `3 / 3`: SQL-NULL timestamp plus exactly five
+  observations qualifies; four, and five equal to the refresh timestamp, do
+  not; five newer rows qualify. A twelve-row fixture returns the exact newest
+  ten in descending timestamp order, retains raw empty content, and excludes
+  the two oldest. The caller refreshes one qualifying entity and the existing
+  vector-search distance proves its stored embedding matches exactly
+  `name + nonempty newest-ten` joined with `. `; the same rows do not trigger a
+  second refresh. Existing `test_run_rethink` controls pass `2 / 2`; the exact
+  ratchet passes `3 / 3`.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only generated source addresses move. No
+  truth adapter, manifest row, permit, or cutover generation changes.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: after the missing ledger was added,
+  the independent auditor returned **APPROVE**. It confirmed exact movement,
+  test-enclave placement, preserved race and lock release, and accepted the
+  vector-distance oracle as substantive when combined with the separate
+  strict-timestamp boundary control.
+- REVIEW, 2026-07-29: the independent Sol reviewer returned **APPROVE** with no
+  material finding. It independently verified the two narrow methods, exact
+  SQL/decode/error/order semantics, caller policy, non-vacuous controls,
+  `20 → 18` ratchet, mechanical inventory shifts, and exact staging.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
