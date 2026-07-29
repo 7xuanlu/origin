@@ -163,17 +163,59 @@ impl Config {
     }
 }
 
+/// The real config root: the platform data dir.
+#[cfg(not(any(test, feature = "scratch-config")))]
+fn default_config_root() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("wenlan")
+}
+
+/// A disposable per-process root, used when the crate is compiled for tests.
+///
+/// ~25 tests call `save_config`, and what keeps them off the developer's real
+/// `config.json` today is a *process-global env var*: seven hand-rolled copies
+/// of a `DataDirGuard` set `WENLAN_DATA_DIR` to a tempdir and remove it on drop.
+/// That is a race, not a guarantee — the guard's `remove_var` on one thread can
+/// land between another thread's `set_var` and its `save_config`, and then the
+/// write goes to the real file. `Config::default()` carries no API key and no
+/// reranker mode, so losing that race wipes both. Two holes are already open:
+/// `page_map_routes.rs` uses a guard without taking `TEST_DATA_DIR_LOCK`, and
+/// `spaces.rs` sets the same var raw, which `temp_env`'s lock does not see.
+///
+/// Redirecting the *default* root closes it at the one place that resolves it,
+/// so the env guards become a convenience rather than the safety mechanism.
+/// `WENLAN_DATA_DIR` still wins when set; the rest share one temp dir per
+/// process, which is the same save-then-load semantics they had before.
+#[cfg(any(test, feature = "scratch-config"))]
+fn default_config_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        // Under `cfg(test)` this is the point. Reached from a *binary*, it means
+        // the binary was built with the dev-dependency feature on (`cargo test`
+        // leaves such a `target/debug/wenlan-server` behind), so say so loudly:
+        // the config it reads is empty, not lost.
+        #[cfg(not(test))]
+        eprintln!(
+            "[wenlan] WARNING: built with wenlan-core/scratch-config — config \
+             reads and writes go to a temporary directory, not the real data \
+             dir. This is a test-only feature; rebuild without it."
+        );
+        let root =
+            std::env::temp_dir().join(format!("wenlan-scratch-config-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        root
+    })
+    .clone()
+}
+
 fn config_path() -> PathBuf {
     // Honor the `WENLAN_DATA_DIR` override so a scratch daemon (e.g.
     // `wenlan-server --data-dir /tmp/wenlan-demo`) reads and writes its own
     // config file rather than clobbering the user's real one.
     let root = crate::env_compat::var_compat("WENLAN_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("wenlan")
-        });
+        .unwrap_or_else(default_config_root);
     root.join("config.json")
 }
 
@@ -215,6 +257,33 @@ pub fn save_config(config: &Config) -> Result<(), WenlanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test binary may never resolve the developer's real `config.json`.
+    /// ~25 test call sites reach `save_config`, which writes `Config::default()`
+    /// — no API key, no reranker mode — so a test that lost the env-var race
+    /// described on `default_config_root` wiped both. Unsets the legacy
+    /// `ORIGIN_DATA_DIR` too: `var_compat` falls back to it, so leaving it set
+    /// would mask the real default.
+    #[test]
+    fn config_path_never_resolves_the_real_data_dir_in_tests() {
+        temp_env::with_vars(
+            [
+                ("WENLAN_DATA_DIR", None::<&str>),
+                ("ORIGIN_DATA_DIR", None::<&str>),
+            ],
+            || {
+                let real = dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("wenlan")
+                    .join("config.json");
+                assert_ne!(
+                    config_path(),
+                    real,
+                    "test builds must not read or write the real config"
+                );
+            },
+        );
+    }
 
     #[test]
     fn test_config_default_values() {
