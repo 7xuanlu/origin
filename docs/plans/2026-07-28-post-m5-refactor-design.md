@@ -519,6 +519,59 @@ Execution evidence:
   bounded contract: one domain module owns exactly the intended visible async
   CRUD methods, while transactional inline statements remain explicit.
 
+#### R3-2 selection — onboarding-milestone CRUD boundary
+
+Selected on 2026-07-29 at `4e308a82`:
+
+- Move only `record_milestone`, `list_milestones`,
+  `acknowledge_milestone`, `increment_milestone_shown_count`, and
+  `reset_onboarding_milestones` into `db/onboarding_milestones.rs`.
+- Keep the `MilestoneId` and `MilestoneRecord` public types in
+  `crate::onboarding`, and keep every caller and method signature unchanged.
+- Stop before the adjacent `MilestoneEvaluator` count helpers. Those queries
+  span page, memory, and graph domains; `oldest_active_page` also appears in
+  the frozen M5 reader inventory. Moving them with the milestone CRUD block
+  would widen this movement-only slice.
+- The three HTTP routes are explicitly `page_bearing: No`,
+  `TruthClass::NotApplicable`, with `no prose fields`; this extraction changes
+  no M5 adapter, writer permit, or cutover surface.
+- Extend the generic R3 structural guard with this module's exact unordered
+  five-method set. Reuse the guard's existing positive control rather than
+  creating a weaker domain-specific duplicate.
+
+Execution evidence:
+
+- RED: the new structural test failed on the pre-move tree for the missing
+  module, missing declaration, missing child definitions, and all five inline
+  bodies. GREEN: the domain boundary and generic positive control each pass
+  `1 / 1`.
+- The normalized pre-move block and child implementation are byte-identical
+  with SHA-256
+  `02e494222031da817128166fdff20d1ec795c1a34d536594c6c802a390fe9bf9`.
+  SQL, log and error text, ordering, visibility, and callers are unchanged.
+- Focused behavior passes: milestone storage plus schema `7 / 7`; onboarding
+  evaluator and wire-id behavior `7 / 7`; direct-connection ratchet `1 / 1`.
+- rust-analyzer reports no diagnostics in the child module and no errors in
+  `db.rs`; navigation from the evaluator resolves to the child module, and
+  references span core onboarding, DB tests, and server onboarding routes.
+- `db.rs` fell from `48,758` to `48,560` lines; the bounded child module is
+  `203` lines. The generated M5 inventory remains exactly `191` rows; only
+  line addresses move.
+- PR-level verification passes: all-target Clippy with `-D warnings` for
+  `wenlan-core` plus `wenlan-server`, and one uninterrupted
+  `cargo test --workspace --lib --quiet`: CLI `32 / 32`; core `3,302` passed
+  with `33` ignored; MCP `178 / 178`; server `339` passed with `2` ignored;
+  types `183 / 183`.
+- REVIEW 1, 2026-07-29: Opus/xhigh returned **APPROVE**. It independently
+  confirmed the five methods are byte-identical, no method body remains in
+  `db.rs`, removing its `FromStr` import is safe because the remaining
+  `Vendor` and `ImportStage` parsers are inherent methods, and five sampled
+  M5 inventory addresses shifted by exactly `-198`. It also confirmed
+  milestone SQL cannot enter the reader inventory because it never reads
+  `pages`. Exact staging of the new child file is the only commit-time hard
+  gate; the generic guard's narrow literal matching and future public test
+  helper restriction remain accepted low-risk constraints.
+
 ### R4 — close direct connection access
 
 Replace remaining external connection locks with bounded domain APIs. Make the

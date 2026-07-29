@@ -6018,6 +6018,15 @@ const SOURCE_SYNC_METHODS: &[&str] = &[
     "delete_sync_state",
     "delete_all_sync_state",
 ];
+const ONBOARDING_MILESTONES_MODULE_PATH: &str =
+    "crates/wenlan-core/src/db/onboarding_milestones.rs";
+const ONBOARDING_MILESTONES_METHODS: &[&str] = &[
+    "record_milestone",
+    "list_milestones",
+    "acknowledge_milestone",
+    "increment_milestone_shown_count",
+    "reset_onboarding_milestones",
+];
 
 fn db_domain_module_layout_violations(
     db_source: &str,
@@ -6113,6 +6122,29 @@ fn source_sync_methods_live_in_one_bounded_domain_module() {
     assert!(
         violations.is_empty(),
         "R3 source-sync boundary drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn onboarding_milestone_methods_live_in_one_bounded_domain_module() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let module_path = root.join(ONBOARDING_MILESTONES_MODULE_PATH);
+    let module_source = std::fs::read_to_string(&module_path).unwrap_or_default();
+    let violations = db_domain_module_layout_violations(
+        &db_source,
+        &module_source,
+        module_path.is_file(),
+        "onboarding_milestones",
+        ONBOARDING_MILESTONES_MODULE_PATH,
+        ONBOARDING_MILESTONES_METHODS,
+    );
+
+    assert!(
+        violations.is_empty(),
+        "R3 onboarding-milestones boundary drifted:\n{}",
         violations.join("\n")
     );
 }
