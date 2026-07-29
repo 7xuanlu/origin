@@ -1596,6 +1596,17 @@ Execution evidence:
   recovery controls, parallel-test safety, and that the strengthened
   pre-artifact predicates make ordering mutations fail deterministically while
   remaining entirely `#[cfg(test)]`.
+- POST-COMMIT CORRECTION, 2026-07-29: the root mutation-control delta added
+  fourteen test-only lines in `repair.rs` after the initial inventory
+  regeneration. Focused tests and Clippy were rerun, but the M5 check was not;
+  the committed ROOT GATE sentence above therefore described the pre-delta
+  inventory. R4-18 preflight caught the exact address-only RED:
+  six `repair.rs` reader addresses were stale by `+14`. The generated block is
+  now refreshed, `python3 scripts/m5-reader-sweep.py --check` and the Rust M5
+  drift test pass again at `191 / 55-50-86 / 22`, and no function identity,
+  exposure, truth, or production code changed. This correction lands in a
+  separate commit before R4-18 implementation rather than hiding the missed
+  gate in the next slice.
 
 #### R4-18 — memory repair CAS transactions
 
