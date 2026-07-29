@@ -5687,6 +5687,10 @@ const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ("crates/wenlan-core/src/eval/pipeline.rs", 2),
     ("crates/wenlan-core/src/eval/shared.rs", 3),
     ("crates/wenlan-core/src/eval/signals.rs", 2),
+    (
+        "crates/wenlan-core/src/export/projection_invariant_test.rs",
+        1,
+    ),
     ("crates/wenlan-core/src/importer.rs", 1),
     ("crates/wenlan-core/src/kg/entity_extraction.rs", 1),
     ("crates/wenlan-core/src/kg_quality.rs", 26),
@@ -5762,7 +5766,9 @@ const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ("crates/wenlan-core/src/space_context.rs", 6),
     ("crates/wenlan-core/src/synthesis/detect.rs", 3),
     ("crates/wenlan-core/src/synthesis/distill.rs", 13),
+    ("crates/wenlan-core/src/synthesis/distill_truth_test.rs", 1),
     ("crates/wenlan-core/src/synthesis/refinement_queue.rs", 19),
+    ("crates/wenlan-core/src/truth_adapter_test.rs", 1),
 ];
 
 fn direct_conn_access_count(source: &str) -> usize {
@@ -5860,5 +5866,144 @@ fn external_conn_access_matcher_catches_formatted_await_chains() {
         direct_conn_access_count(source),
         2,
         "the matcher must catch one-line and rustfmt-split access chains"
+    );
+}
+
+// ── R2: bounded historical migration modules ──
+
+const MIGRATIONS_V004_V009_PATH: &str = "crates/wenlan-core/src/db/migrations_v004_v009.rs";
+const MIGRATIONS_V004_V009: &[(i64, &str)] = &[
+    (4, "migrate_4_refinement_pipeline"),
+    (5, "migrate_5_session_tables"),
+    (6, "migrate_6_access_tracking"),
+    (7, "migrate_7_briefing_cache"),
+    (8, "migrate_8_narrative_cache"),
+    (9, "migrate_9_agent_activity"),
+];
+
+fn migrations_v004_v009_layout_violations(
+    db_source: &str,
+    module_source: &str,
+    module_exists: bool,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if !module_exists {
+        violations.push(format!(
+            "historical migration module is missing: {MIGRATIONS_V004_V009_PATH}"
+        ));
+    }
+    if db_source.matches("mod migrations_v004_v009;").count() != 1 {
+        violations.push("db.rs must declare mod migrations_v004_v009 exactly once".into());
+    }
+
+    let dispatcher = db_source
+        .find("// Migration 4:")
+        .zip(db_source.find("// Migration 10:"))
+        .and_then(|(start, end)| (start < end).then_some(&db_source[start..end]));
+    match dispatcher {
+        Some(dispatcher) => {
+            let mut previous = 0;
+            for (version, method) in MIGRATIONS_V004_V009 {
+                let call = format!("self.{method}().await?;");
+                match dispatcher.find(&call) {
+                    Some(position) if position > previous => previous = position,
+                    Some(_) => violations
+                        .push(format!("migration dispatcher call is out of order: {call}")),
+                    None => violations.push(format!(
+                        "migration dispatcher is missing ordered call: {call}"
+                    )),
+                }
+                if !dispatcher.contains(&format!("if version < {version}")) {
+                    violations.push(format!(
+                        "migration dispatcher is missing version guard {version}"
+                    ));
+                }
+            }
+            if dispatcher.contains("conn.execute") || dispatcher.contains("ALTER TABLE") {
+                violations.push(
+                    "run_migrations still contains SQL bodies for migrations 4 through 9".into(),
+                );
+            }
+        }
+        None => violations.push(
+            "could not isolate the run_migrations segment from migration 4 through migration 9"
+                .into(),
+        ),
+    }
+
+    let mut previous = 0;
+    for (version, method) in MIGRATIONS_V004_V009 {
+        let definition = format!("async fn {method}(");
+        match module_source.find(&definition) {
+            Some(position) if position > previous => previous = position,
+            Some(_) => violations.push(format!(
+                "historical migration method is out of order: {method}"
+            )),
+            None => violations.push(format!(
+                "historical migration module is missing method: {method}"
+            )),
+        }
+        if !module_source.contains(&format!("PRAGMA user_version = {version}")) {
+            violations.push(format!(
+                "historical migration {version} lost its user_version stamp"
+            ));
+        }
+    }
+    for protected in [
+        "migrate_98",
+        "migrate_99",
+        "truth_cutover",
+        "page_truth",
+        "claim_identity",
+    ] {
+        if module_source.contains(protected) {
+            violations.push(format!(
+                "historical migration module crossed the M5 boundary: {protected}"
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn migrations_4_through_9_live_in_one_bounded_module() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let module_path = root.join(MIGRATIONS_V004_V009_PATH);
+    let module_source = std::fs::read_to_string(&module_path).unwrap_or_default();
+    let violations =
+        migrations_v004_v009_layout_violations(&db_source, &module_source, module_path.is_file());
+
+    assert!(
+        violations.is_empty(),
+        "R2 historical migration boundary drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn historical_migration_guard_rejects_inline_sql_and_m5_scope_creep() {
+    let db_source = concat!(
+        "mod migrations_v004_v009;\n",
+        "// Migration 4: bad inline body\n",
+        "if version < 4 { conn.execute(\"ALTER TABLE pages\", ()).await?; }\n",
+        "// Migration 10: boundary\n",
+    );
+    let module_source =
+        "impl MemoryDB { async fn migrate_98_claim_identity() {} } // truth_cutover";
+    let violations = migrations_v004_v009_layout_violations(db_source, module_source, true);
+
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("still contains SQL bodies")),
+        "positive control must reject an inline migration body"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("crossed the M5 boundary")),
+        "positive control must reject M5 migration scope creep"
     );
 }

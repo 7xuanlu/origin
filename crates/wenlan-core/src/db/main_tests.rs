@@ -13520,6 +13520,88 @@ async fn test_get_memory_detail() {
 
 // ==================== Migration 4: Refinement Pipeline ====================
 
+async fn assert_migration_user_version(db: &MemoryDB, expected: i64, pass: usize) {
+    let conn = db.conn.lock().await;
+    let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    let actual = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+    assert_eq!(
+        actual, expected,
+        "migration pass {pass} must stamp user_version {expected}"
+    );
+}
+
+#[tokio::test]
+async fn migrations_4_through_9_replay_idempotently_and_stamp_each_version() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 3", ()).await.unwrap();
+    }
+
+    for pass in 1..=2 {
+        db.migrate_4_refinement_pipeline().await.unwrap();
+        assert_migration_user_version(&db, 4, pass).await;
+        db.migrate_5_session_tables().await.unwrap();
+        assert_migration_user_version(&db, 5, pass).await;
+        db.migrate_6_access_tracking().await.unwrap();
+        assert_migration_user_version(&db, 6, pass).await;
+        db.migrate_7_briefing_cache().await.unwrap();
+        assert_migration_user_version(&db, 7, pass).await;
+        db.migrate_8_narrative_cache().await.unwrap();
+        assert_migration_user_version(&db, 8, pass).await;
+        db.migrate_9_agent_activity().await.unwrap();
+        assert_migration_user_version(&db, 9, pass).await;
+    }
+
+    let expected_tables: BTreeSet<String> = [
+        "refinement_queue",
+        "activities",
+        "capture_refs",
+        "session_snapshots",
+        "access_log",
+        "briefing_cache",
+        "narrative_cache",
+        "agent_activity",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let expected_indexes: BTreeSet<String> = [
+        "idx_refinement_status",
+        "idx_captures_activity",
+        "idx_captures_unpackaged",
+        "idx_snapshots_time",
+        "idx_access_log_time",
+        "idx_access_log_source",
+        "idx_activity_time",
+        "idx_activity_agent",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT type, name FROM sqlite_schema WHERE type IN ('table', 'index')",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut tables = BTreeSet::new();
+    let mut indexes = BTreeSet::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        let kind = row.get::<String>(0).unwrap();
+        let name = row.get::<String>(1).unwrap();
+        if kind == "table" && expected_tables.contains(name.as_str()) {
+            tables.insert(name);
+        } else if kind == "index" && expected_indexes.contains(name.as_str()) {
+            indexes.insert(name);
+        }
+    }
+    assert_eq!(tables, expected_tables);
+    assert_eq!(indexes, expected_indexes);
+}
+
 #[tokio::test]
 async fn test_migration_4_refinement_columns() {
     let (db, _dir) = test_db().await;

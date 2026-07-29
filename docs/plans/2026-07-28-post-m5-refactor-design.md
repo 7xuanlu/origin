@@ -374,6 +374,59 @@ Scope:
 Each PR moves one group only and includes upgrade/idempotence tests relevant to
 that group.
 
+Execution record, 2026-07-28 — migrations 4 through 9:
+
+- Baseline refreshed to `origin/main` `07afba7d`, which includes PR-B
+  `f29c2c54`, PR-C `3932e3d5`, release `544965a1`, and the unrelated
+  test-config isolation fix #411; the D5 dependency is therefore clear for
+  this bounded group. The separate PR-D ceremony remains the sole owner of the
+  cutover fence, generation advance, truth manifest changes, and the
+  page-write/cutover files listed in its handoff.
+- RED 1: the structural guard rejected the missing child module, six missing
+  ordered dispatcher calls, six missing `user_version` stamps, and the SQL
+  bodies still embedded in `run_migrations`; its positive control separately
+  rejects inline SQL and M5 scope creep.
+- RED 2: the direct replay test failed to compile on exactly the six migration
+  methods that did not yet exist.
+- GREEN: migrations 4 through 9 now live in
+  `db/migrations_v004_v009.rs`; `run_migrations` retains the six ordered
+  `if version < N` guards and delegates one-for-one.
+- GREEN: regeneration from the pre-move `db.rs`, followed by rustfmt, was
+  byte-identical to the current dispatcher and child module
+  (`sha256=5d584ce2aab38f9027709cf5b2eaa13984298a56b6d8a0b3e8fa3b14e583357d`).
+- GREEN: direct method replay ran the group twice, asserted every
+  `user_version` stamp from 4 through 9, and retained the exact eight tables
+  and eight indexes owned by the group.
+- GREEN: `db.rs` fell from `49,160` to `48,877` lines; the bounded child module
+  is `323` lines after rustfmt. The M5 reader set stayed `191` rows with partition
+  `55 / 50 / 86` and `22` exposure paths after regenerating only its
+  line-address projection.
+- GREEN: rust-analyzer reported zero errors in all four changed Rust files and
+  definition navigation from the migration-4 dispatcher call resolved to the
+  child module. The first definition request timed out while caches primed;
+  the immediate warm retry resolved in six seconds.
+- GREEN: PR-C's three new, explicit test-support connection accesses were
+  reconciled into R0's shrink-only baseline. The current floor is `336`
+  occurrences across `59` tracked files; broad test exclusions remain
+  forbidden.
+- GREEN: on refreshed main `07afba7d`, repository-standard
+  `cargo fmt --all -- --check`, workspace all-targets Clippy with
+  `-D warnings`, and one uninterrupted `cargo test --workspace --lib` passed:
+  CLI `32 / 32`; core `3,299` passed with `33` ignored; MCP `178 / 178`;
+  server `339` passed with `2` ignored; types `183 / 183`.
+- NOTE: an earlier pre-#411 workspace run passed CLI, core, and MCP before one
+  server fixture hit a non-deterministic `online_backup integrity` SQLite
+  API-misuse error. The unchanged test passed alone (`1 / 1`) and the complete
+  server suite passed at normal parallelism before the clean current-main run
+  above. The interruption is retained here rather than erased by the retry.
+- REVIEW, 2026-07-29: Opus/xhigh returned **APPROVE / ship-ready** with no
+  blocking findings. It confirmed the six methods are verbatim moves with
+  unchanged SQL, transaction order, version stamps, errors, and logs; the
+  visibility, structural guard, positive control, and replay test are
+  appropriately bounded. It classified the pre-existing lock gap and
+  no-rollback-on-error migration pattern as follow-up concerns rather than R2
+  regressions. Fable was intentionally not used for this intermediate PR.
+
 ### R3 — DB domain modules
 
 Select the next domain by evidence:
@@ -530,3 +583,18 @@ structural facade definition and executable contracts above remain the gates.
 - Added an executable, shrink-only direct-connection access ratchet to R0.
 - Relabeled two snapshot metrics with their exact textual predicates and added
   concrete before/after agent-impact probes.
+
+### 2026-07-28 — PR-B/PR-C baseline refresh
+
+- Execution baseline advanced from PR-A `e4790ce8` through release main
+  `544965a1` to `07afba7d`, containing PR-B `f29c2c54`, PR-C `3932e3d5`,
+  and the unrelated test-config isolation fix #411.
+- D5 now permits bounded R2-through-R7 work, but the in-flight PR-D ceremony
+  remains a separate hot-file owner and `truth_cutover_generation` stays 0
+  until its fenced command receives explicit user approval.
+- R0 was regenerated rather than hand-merged: `191` reader rows,
+  `55 / 50 / 86`, `22` exposures. Its external connection floor was refreshed
+  to `336 / 59` to include exactly three PR-C test-support files.
+- R1 was mechanically replayed from the refreshed main body: `45,687` inline
+  test lines moved to `db/main_tests.rs`, with rustfmt-normalized reconstruction
+  equality before R2 began.
