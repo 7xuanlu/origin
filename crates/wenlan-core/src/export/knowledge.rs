@@ -843,13 +843,27 @@ impl KnowledgeWriter {
                 crate::export::provenance::StubManifest::load_from(&capabilities.root);
             let mut removed = 0usize;
             let mut stuck: Vec<&str> = Vec::new();
+            // Named in the error too. A partial eviction saves state and moves
+            // files for the pages that succeeded, but the caller aborts the
+            // ceremony and leaves the generation where it was -- so "it failed"
+            // is true and "nothing moved" is not. An operator who is only told
+            // which pages STAYED cannot find the ones that left.
+            let mut evicted: Vec<&str> = Vec::new();
 
+            // Tracked apart from `removed` because a page can need the state
+            // written without any file moving. Gating the save on `removed`
+            // alone discarded the stale-entry cleanup below whenever EVERY
+            // evicted page was file-less -- the one case that branch exists for.
+            let mut state_dirty = false;
             for page_id in page_ids {
                 let files = projected.get(page_id).map(Vec::as_slice).unwrap_or(&[]);
                 if files.is_empty() {
                     // Known to `state.json` a moment ago and to nothing now, or
                     // an entry with no file. Nothing on disk to evict.
-                    state.pages.remove(page_id);
+                    if state.pages.remove(page_id).is_some() {
+                        state_dirty = true;
+                    }
+                    manifest.forget_page(page_id);
                     continue;
                 }
                 // Every file, not the first one that matches. A page with two
@@ -876,13 +890,15 @@ impl KnowledgeWriter {
                     // A retained entry is what makes the next pass retry.
                     state.pages.remove(page_id);
                     manifest.forget_page(page_id);
+                    state_dirty = true;
                     removed += 1;
+                    evicted.push(page_id);
                 } else {
                     stuck.push(page_id);
                 }
             }
 
-            if removed > 0 {
+            if state_dirty {
                 self.save_state_cap(&capabilities.wenlan, &state)?;
                 let _ = manifest.save_to(&capabilities.root);
                 let _ =
@@ -891,9 +907,22 @@ impl KnowledgeWriter {
             if !stuck.is_empty() {
                 // Loud at the caller too, not only in the per-page log lines:
                 // the count is what a health check can act on.
+                //
+                // Both lists, because the caller aborts the ceremony on this
+                // error and leaves the generation unchanged. The pages named in
+                // `evicted` are already in archive/ and already gone from
+                // `state.json`, and at generation 0 nothing re-projects them --
+                // so an error that reported only `stuck` would say the ceremony
+                // did nothing while some of the vault had already moved.
+                let moved = if evicted.is_empty() {
+                    "none".to_string()
+                } else {
+                    evicted.join(", ")
+                };
                 return Err(WenlanError::Conflict(format!(
                     "projection invariant evicted {removed} page(s) but {} could not be removed \
-                     and remain readable on disk: {}",
+                     and remain readable on disk: {}. Already moved into archive/ (the \
+                     generation did NOT advance, so these do not come back on their own): {moved}",
                     stuck.len(),
                     stuck.join(", ")
                 )));
@@ -968,8 +997,16 @@ impl KnowledgeWriter {
                     "page_archive_target_invalid".to_string(),
                 ))
             }
+            // `AlreadyExists` here means something created `archive/` between
+            // the probe above and this call -- the user's sync client, or a
+            // second pass. That is the state we wanted, not a failure; letting
+            // it propagate would strand a page whose file is still readable.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                root.create_dir(ARCHIVE_DIR)?
+                match root.create_dir(ARCHIVE_DIR) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(WenlanError::Io(e)),
+                }
             }
             Err(error) => return Err(WenlanError::Io(error)),
         }

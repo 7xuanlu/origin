@@ -320,9 +320,14 @@ impl MemoryDB {
 
     /// Both truth axes for a batch of pages, in one query.
     ///
-    /// A page with no `page_truth_state` row reads as unsupported and
-    /// unreviewed. The absence of a support record is not evidence of support --
-    /// and post-migration that absence is the normal case, not an anomaly.
+    /// A page with no `page_truth_state` row reads as [`Support::Unevaluated`],
+    /// NOT as unsupported. Absence of a record is absence of a judgement, and a
+    /// judgement that never ran is not a judgement that failed -- post-migration
+    /// that absence is the normal case, so reading it as "unsupported" would
+    /// condemn every page. `evaluated_at` is what separates the two, and it is
+    /// NULL for every row migration 99's backfill wrote.
+    ///
+    /// [`Support::Unevaluated`]: crate::truth_contract::Support::Unevaluated
     pub async fn page_truth_states(
         &self,
         page_ids: &[String],

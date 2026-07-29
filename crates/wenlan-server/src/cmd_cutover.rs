@@ -147,10 +147,16 @@ pub async fn run(generation: i64, apply: bool) -> Result<()> {
     // Say what actually happens. An operator who reads "delete" and types `y`
     // consented to something this no longer does, and one who reads "archive"
     // has to be able to find the files afterwards -- so name the directory.
+    // Count FILES, not pages. One page can hold several files -- a sync-conflict
+    // copy carries the same `origin_id` -- so `evictions.len()` would have
+    // promised to move 2 and then moved 3, and a stale entry with no file on
+    // disk would have promised one that does not exist.
+    let file_count: usize = plan.evictions.iter().map(|e| e.files.len()).sum();
     print!(
-        "\nMove {} file(s) out of {} into archive/ and advance to generation {}? \
-         The generation cannot be rolled back, though the files stay readable \
-         in archive/. (y/N): ",
+        "\nMove {} file(s) across {} page(s) out of {} into archive/ and advance to \
+         generation {}? The generation cannot be rolled back, though the files stay \
+         readable in archive/. (y/N): ",
+        file_count,
         plan.evictions.len(),
         knowledge_path.display(),
         generation

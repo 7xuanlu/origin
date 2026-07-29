@@ -1056,7 +1056,7 @@ enum Command {
         dry_run: bool,
     },
     /// Internal maintenance: advance the M5 truth cutover. Daemon must be stopped
-    /// first. Deletes unsupported pages' Markdown from the projection directory;
+    /// first. Moves judged-unsupported pages' Markdown into `<vault>/archive/`;
     /// `--apply` refuses without a matching dry run.
     #[command(name = "truth-cutover", hide = true)]
     TruthCutover {

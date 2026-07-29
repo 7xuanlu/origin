@@ -822,3 +822,47 @@ async fn every_copy_of_a_page_leaves_the_projection_not_just_one() {
         .join("p2 (conflicted copy).md")
         .is_file());
 }
+
+/// A stale `state.json` entry whose `.md` is already gone must actually be
+/// dropped from the state file, even when it is the ONLY thing being evicted.
+///
+/// The eviction loop gated its `save_state_cap` on `removed > 0`, and the
+/// file-less branch never increments `removed` -- there is no file to move. So
+/// with every evictable page file-less, the `state.pages.remove` calls were
+/// computed and then thrown away with the unsaved state, and the entry came
+/// back on the next pass forever. That is precisely the cleanup the branch
+/// exists to perform, and it was the one case it could not do.
+#[tokio::test]
+async fn a_stale_state_entry_with_no_file_is_dropped_even_when_nothing_moves() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    // Delete the evictable pages' files but leave state.json naming them, so
+    // every page the cutover wants to evict is file-less and `removed` stays 0.
+    for name in ["p2.md", "p3.md"] {
+        let path = root.path().join(name);
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    let removed = projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+    assert_eq!(removed, 0, "no file on disk means nothing to move");
+
+    let state = std::fs::read_to_string(root.path().join(".wenlan/state.json")).unwrap();
+    for gone in ["p2", "p3"] {
+        assert!(
+            !state.contains(&format!("\"{gone}\"")),
+            "stale entry {gone} survived the eviction that exists to remove it: {state}"
+        );
+    }
+    assert!(
+        state.contains("\"p1\""),
+        "the supported page's entry must stay: {state}"
+    );
+}
