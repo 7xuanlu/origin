@@ -653,15 +653,20 @@ impl KnowledgeWriter {
         // `preparing` no page write can land, so a plan taken after it cannot
         // go stale underneath the eviction.
         let lease = database.begin_cutover().await?;
+
+        // The lease is linear, so every path below spends it exactly once. That
+        // is why this reads as a chain of `match` rather than one fallible block:
+        // handing it to `abort_cutover` consumes it, and the compiler will not
+        // let a later line reach for it again.
         let plan = match self.plan_truth_cutover(database, generation).await {
             Ok(plan) => plan,
             Err(error) => {
-                let _ = database.abort_cutover(&lease).await;
+                let _ = database.abort_cutover(lease).await;
                 return Err(error);
             }
         };
         if plan.digest != expected_digest {
-            let _ = database.abort_cutover(&lease).await;
+            let _ = database.abort_cutover(lease).await;
             return Err(WenlanError::Conflict(format!(
                 "the projection changed since the dry run (planned {expected_digest}, \
                  now {}); re-run the dry run and read it before applying",
@@ -670,20 +675,20 @@ impl KnowledgeWriter {
         }
 
         let evict: Vec<String> = plan.evictions.iter().map(|e| e.page_id.clone()).collect();
-        let outcome = async {
-            if !evict.is_empty() {
-                let guard = database.begin_page_projection_write();
-                self.evict_projected_pages(&guard, &evict)?;
+        if !evict.is_empty() {
+            let guard = database.begin_page_projection_write();
+            if let Err(error) = self.evict_projected_pages(&guard, &evict) {
+                // Best effort: if the abort also fails the fence stays
+                // `preparing`, which refuses page writes. That is the safe side
+                // to be stuck on, and the daemon releases it at next startup.
+                let _ = database.abort_cutover(lease).await;
+                return Err(error);
             }
-            database.commit_cutover(&lease, generation).await
         }
-        .await;
-        if let Err(error) = outcome {
-            // Best effort: if the abort also fails the fence stays `preparing`,
-            // which refuses page writes. That is the safe side to be stuck on.
-            let _ = database.abort_cutover(&lease).await;
-            return Err(error);
-        }
+        // Spends the lease. A failure here leaves the fence at `preparing` on
+        // purpose -- there is no lease left to abort with, and the startup
+        // release is the recovery path.
+        database.commit_cutover(lease, generation).await?;
 
         let guard = database.begin_page_projection_write();
         self.enforce_projection_directory_invariant(database, &guard)

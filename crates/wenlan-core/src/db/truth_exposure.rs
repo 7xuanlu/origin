@@ -127,7 +127,16 @@ impl CutoverFence {
 /// it is to hand it back to commit or abort. Same discipline as
 /// [`crate::truth_adapter::PagePermit`], for the same reason -- the ceremony
 /// runs outside the request path, where there is no guard to forget to call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Deliberately **not** `Clone`, and commit/abort take it **by value**, so it is
+/// linear: usable exactly once, checked by the compiler. Borrowing it instead
+/// left a real hole, because the lease check and the generation write are
+/// separate statements under a mutex that serializes statements, not protocols.
+/// Two aliases could both pass the check, then one could write its generation
+/// after the other had already committed and returned success -- leaving the
+/// database at a generation nobody was told about. There is no way to express
+/// that now: the second call does not compile.
+#[derive(Debug, PartialEq, Eq)]
 pub struct CutoverLease {
     fence: CutoverFence,
 }
@@ -484,7 +493,7 @@ impl MemoryDB {
     /// at -- an epoch bump by anyone else means this lease is stale.
     pub async fn commit_cutover(
         &self,
-        lease: &CutoverLease,
+        lease: CutoverLease,
         generation: i64,
     ) -> Result<(), WenlanError> {
         let observed = self.cutover_fence().await?;
@@ -517,7 +526,7 @@ impl MemoryDB {
     /// The new epoch is the point. Returning to the *same* `off` would let a
     /// writer that captured the pre-ceremony fence swap successfully, and that
     /// writer's page is one the aborted ceremony may already have examined.
-    pub async fn abort_cutover(&self, lease: &CutoverLease) -> Result<(), WenlanError> {
+    pub async fn abort_cutover(&self, lease: CutoverLease) -> Result<(), WenlanError> {
         let observed = self.cutover_fence().await?;
         if observed != lease.fence || observed.phase != CutoverPhase::Preparing {
             return Err(WenlanError::VectorDb(format!(

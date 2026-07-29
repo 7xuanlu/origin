@@ -495,7 +495,7 @@ async fn a_page_write_is_refused_while_a_cutover_prepares() {
          examined it"
     );
 
-    db.abort_cutover(&lease).await.unwrap();
+    db.abort_cutover(lease).await.unwrap();
     assert!(
         crate::truth_adapter::page_write_permit(&db, "p1")
             .await
@@ -513,7 +513,7 @@ async fn a_stale_off_capture_fails_against_a_higher_epoch() {
     let stale = db.cutover_fence().await.unwrap();
 
     let lease = db.begin_cutover().await.unwrap();
-    db.abort_cutover(&lease).await.unwrap();
+    db.abort_cutover(lease).await.unwrap();
 
     let now = db.cutover_fence().await.unwrap();
     assert_eq!(now.phase, stale.phase, "the phase really did return to off");
@@ -542,7 +542,7 @@ async fn committing_advances_the_generation_and_then_releases_the_fence() {
         "preparing must not have advanced anything yet"
     );
 
-    db.commit_cutover(&lease, 1).await.unwrap();
+    db.commit_cutover(lease, 1).await.unwrap();
     assert_eq!(db.truth_cutover_generation().await.unwrap(), 1);
     assert_eq!(
         db.cutover_fence().await.unwrap().phase,
@@ -550,20 +550,13 @@ async fn committing_advances_the_generation_and_then_releases_the_fence() {
     );
 }
 
-/// A lease is spent once. Replaying it must not advance a second generation.
-#[tokio::test]
-async fn a_spent_lease_cannot_commit_again() {
-    let (db, _tmp) = test_db().await;
-    let lease = db.begin_cutover().await.unwrap();
-    db.commit_cutover(&lease, 1).await.unwrap();
-
-    assert!(db.commit_cutover(&lease, 2).await.is_err());
-    assert_eq!(
-        db.truth_cutover_generation().await.unwrap(),
-        1,
-        "the replayed commit moved the generation anyway"
-    );
-}
+// `a_spent_lease_cannot_commit_again` used to live here. It cannot be written
+// any more: `commit_cutover` consumes the lease, so replaying it is a borrow
+// error rather than a runtime refusal. The compiler is the stronger tooth, and
+// the runtime fence check it used to exercise is still covered by
+// `a_released_fence_invalidates_the_lease_it_took_back`, where the fence moves
+// underneath a lease that has NOT been spent -- the case a linear type cannot
+// rule out.
 
 /// §6: `committed` is forward-only. Rebuilding the legacy directory would put
 /// every provisional page's prose back at a path `wenlan pages` reads directly.
@@ -571,9 +564,10 @@ async fn a_spent_lease_cannot_commit_again() {
 async fn a_committed_cutover_cannot_be_rolled_back_to_off() {
     let (db, _tmp) = test_db().await;
     let lease = db.begin_cutover().await.unwrap();
-    db.commit_cutover(&lease, 1).await.unwrap();
+    db.commit_cutover(lease, 1).await.unwrap();
 
-    assert!(db.abort_cutover(&lease).await.is_err());
+    // Aborting with the spent lease is not expressible; a fresh ceremony is the
+    // only way anyone could try to walk it back, and it must refuse.
     assert!(
         db.begin_cutover().await.is_err(),
         "a second ceremony must not be able to walk the fence back to off"
@@ -623,7 +617,7 @@ async fn only_a_stranded_preparing_fence_is_releasable() {
     assert!(!db.release_stranded_cutover_fence().await.unwrap());
 
     let lease = db.begin_cutover().await.unwrap();
-    db.commit_cutover(&lease, 1).await.unwrap();
+    db.commit_cutover(lease, 1).await.unwrap();
     assert!(!db.release_stranded_cutover_fence().await.unwrap());
     assert_eq!(
         db.cutover_fence().await.unwrap().phase,
@@ -646,7 +640,7 @@ async fn a_released_fence_invalidates_the_lease_it_took_back() {
     assert!(db.release_stranded_cutover_fence().await.unwrap());
 
     assert!(
-        db.commit_cutover(&lease, 1).await.is_err(),
+        db.commit_cutover(lease, 1).await.is_err(),
         "the released lease must not be able to advance the generation"
     );
     assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
