@@ -312,9 +312,13 @@ pub async fn handle_context(
         space: req.space,
         legacy_context_limit: Some(req.max_chunks),
     };
+    // `/api/context` reaches every page it serves through the Brief handler, so
+    // the grant this route resolved travels with the call rather than being
+    // re-derived there.
     let Json(brief_response) = crate::brief_routes::handle_read_brief(
         State(state),
         crate::space_header::SpaceHeader(header_space),
+        view,
         Json(request),
     )
     .await?;

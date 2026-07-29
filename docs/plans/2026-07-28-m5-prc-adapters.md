@@ -251,9 +251,10 @@ Both are `none` until those types grow the axes, and `none` refuses rather than
 downgrades, so a client that sends a marker there finds out. Tooth:
 `truth_guard_test.rs::the_recent_feeds_refuse_a_marker_they_cannot_honour`.
 
-## 10. Four readers the first pass did not gate
+## 10. Five readers the first pass did not gate
 
-Three were missed and one was excused on reasoning that does not hold:
+Three were missed, one was excused on reasoning that does not hold, and one
+landed on `main` while this branch was open:
 
 - **`POST /api/distill`** was excused as "a write path, already gated
   downstream". True of the write, irrelevant to the **response**, which returns
@@ -275,6 +276,22 @@ Three were missed and one was excused on reasoning that does not hold:
   documented 1:1 with it. Where they line up the pairs are filtered; where they
   do not — legacy rows recorded before `page_ids` existed — nothing attributes a
   title to a page, and unknown is not permission, so both lists clear.
+- **`POST /api/brief`** arrived on `main` mid-branch with the Space Brief
+  feature, already carrying `PageBearing::Yes` and an adapter cell naming
+  `handle_read_brief`, which did not gate. Its `related_context` comes from
+  `search_memory`, which merges the page channel **inline** — a page's prose
+  arrives as a `SearchResult` with `source == "page"` and `source_id` the page
+  id. The channel is default-OFF behind `WENLAN_ENABLE_PAGE_CHANNEL`, but an
+  exposure contract that holds only while a flag is off is not a contract, so
+  the gate is unconditional. Only the `source == "page"` rows go to the
+  adapter: keying a memory row by its memory id would drop a legitimate result,
+  since no page grant covers it. Surviving pages are filtered in place rather
+  than partitioned and re-appended, because `search_memory` has already merged
+  them into RRF order and a page that survives belongs where that merge put it.
+
+  The same change re-gates `/api/context`, which `main` rewrote in the same
+  feature to fetch its pages *through* this handler. The grant travels as a
+  parameter rather than being re-derived, so the two routes cannot disagree.
 
 ## What PR-C does not do
 

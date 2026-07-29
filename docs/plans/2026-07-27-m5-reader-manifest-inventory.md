@@ -420,7 +420,7 @@ someone deliberately gives it a shape.
 
 | Shape | What the marker grants | Routes |
 |---|---|---|
-| `none` | nothing — **the request is refused**, not silently downgraded | everything not listed below (158 of 165) |
+| `none` | nothing — **the request is refused**, not silently downgraded | everything not listed below (160 of 167) |
 | `collection` | provisional **entries**: page ID + title + both axes per item, never prose | `GET /api/pages`, `POST /api/pages/search` |
 | `named_page` | full prose for the page named in the path, both axes | `GET /api/pages/{id}`, `.../links`, `.../map`, `.../revisions`, `.../sources` |
 
