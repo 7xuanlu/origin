@@ -585,8 +585,9 @@ contract. The corrected brace-aware census at R4 entry is 336 literal
 occurrences in 15 files and 289 test-scoped occurrences in 50 files. One
 additional production escape is not counted by that regex:
 `CommunityGroupingLeaseCleanup` retains an `Arc<Mutex<Connection>>` and locks
-it from `Drop`. R4 closes the boundary in bounded, independently reviewed
-slices:
+it from `Drop`. R4-6 has now closed that retained escape behind an opaque
+DB-owned cleanup type. R4 closes the remaining boundary in bounded,
+independently reviewed slices:
 
 1. Move the existing Space-context `MemoryDB` implementation into a DB child
    module without changing its public methods, SQL, transaction boundaries, or
@@ -598,10 +599,15 @@ slices:
    cursor work, and eval integrity reads. Code is moved under `db/**` only when
    it is genuinely a `MemoryDB` implementation; moving orchestration merely to
    disappear from the matcher is forbidden.
-3. Close the repair and post-write CAS/recovery group as its own high-risk
-   slice. Its explicit `BEGIN IMMEDIATE`, receipt checks, commit/rollback, and
-   same-lock ownership semantics must remain one atomic DB-owned operation; a
-   generic `with_conn`, renamed connection accessor, or public transaction
+3. Close the repair and post-write CAS/recovery tail as a sequence of
+   independently reviewed high-risk sub-slices, not one combined move. The
+   remaining operations have three different atomicity shapes: DB-only
+   `BEGIN IMMEDIATE` transactions; projection-lock-before-DB transactions; and
+   DB-lock-before-projection compensation flows. Each named operation must
+   preserve its own existing lock acquisition order, lock lifetime, receipt
+   checks, commit/rollback point, filesystem rollback, journal publication,
+   and hook position. A generic `with_conn`, renamed connection accessor,
+   generic SQL/transaction facade, raw-handle lease, or public transaction
    escape hatch is not an acceptable substitute.
 4. Replace the remaining test fixture access with one `#[cfg(test)]` DB-owned
    support seam and an exact, location-aware manifest. Then make `conn` private
@@ -625,6 +631,15 @@ alternate database handle. A separately created private observer connection
 behind a narrow domain API, such as `LintFreshnessClock`, is not a `MemoryDB`
 capability escape and is outside R4; banning every internal use of
 `libsql::Connection` would conflate DB implementation with DB boundary.
+
+The current repair families also contain a pre-existing cross-family lock-order
+inversion: rename takes projection-session then DB, while regenerate and stale
+projection paths take DB then projection. Per-manifest artifact locking does
+not globally serialize different manifests. These movement slices preserve and
+test each current order without endorsing the inversion or silently attempting
+to repair it. Any topology change requires a separate behavior/concurrency
+design with deadlock and crash-recovery controls; changing only one family
+inside R4 is forbidden.
 
 Every slice removes its old allowlist entries immediately, keeps the external
 set monotonically decreasing, runs the M5 inventories plus affected behavior
@@ -1497,6 +1512,184 @@ Execution evidence:
   proves failed and unmatched seeds emit no audit row. REVIEW 2 returned
   **APPROVE** with no remaining material finding.
 
+#### R4-17 — complete-entity recovery receipt read
+
+- Add one narrow `MemoryDB` receipt-read method for the existing
+  `repair_target_receipt_on_connection` mechanic. It returns the same
+  `(RepairDigest, u64)` and preserves exact errors and lossy decoding without
+  exposing a connection, guard, callback, SQL string, or transaction surface.
+- Replace only the independent lock in
+  `recover_complete_entity_extraction_apply_receipt`. Do not rewrite
+  `target_receipt_current`, or replace same-transaction uses in post-write or
+  verification: those callers must continue to read through the connection
+  that already owns their atomic operation.
+- Preserve the caller's ordering: pending artifact parse, receipt read, guard
+  release, then publish/remove/sync filesystem work. A concurrency control
+  must prove the DB mutex is released before the artifact operation.
+- GREEN floor: external literals `300 → 299`, production `11 → 10`, tests
+  remain `289`.
+
+#### R4-18 — memory repair CAS transactions
+
+- Move the complete transaction bodies of `reclassify_memory_cas_inner` and
+  `complete_entity_extraction_cas_inner` behind two named `MemoryDB` methods in
+  one DB child. Caller facades and test hooks retain their current public or
+  crate-visible paths.
+- Preserve each exact `BEGIN IMMEDIATE`, validation and receipt order,
+  `total_changes` normalization, proof construction, hook-before-commit
+  position, forced rollback-failure path, commit handling, and mutex lifetime.
+  Sharing a private rollback/proof helper is allowed only if normalized moved
+  bodies remain mechanically equivalent; the two operations do not become a
+  generic CAS executor.
+- Direct controls must cover stale target, successful proof, hook failure,
+  ordinary rollback, forced rollback failure, and a blocked concurrent writer
+  across the pre-commit hook.
+- GREEN floor: external literals `299 → 297`, production `10 → 8`, tests
+  remain `289`.
+
+#### R4-19 — deterministic database repair transaction
+
+- Move `apply_deterministic_repair_cas` as one named DB-owned atomic operation.
+  Keep writer dispatch, tag-record validation, route-invalidation accounting,
+  parity/effect guards, receipt reads, proof, callback, rollback, and commit in
+  their current order under one mutex and one `BEGIN IMMEDIATE`.
+- Do not split the mutation match into independently committed methods and do
+  not reuse the new separately locking receipt method from R4-17 inside this
+  transaction.
+- Existing writer-specific behavior tests remain the policy controls. Add a
+  transaction barrier proving no second DB writer crosses between the initial
+  receipt and commit, plus hook-failure rollback and route-invalidation
+  positive controls.
+- GREEN floor: external literals `297 → 296`, production `8 → 7`, tests remain
+  `289`.
+
+#### R4-20 — rename-page apply and recovery transactions
+
+- Move the rename apply CAS and pending-receipt recovery as two named
+  operations in one purpose-specific DB child because they share the same
+  cross-resource contract.
+- Preserve the existing lock order exactly: acquire the owned repair
+  projection session, take its locked projection, then acquire the DB mutex
+  and begin `IMMEDIATE`. Hold both through DB receipt checks, controlled
+  projection scans/write-or-restore, proof or recovery decision, and
+  commit/rollback. Publish or clear pending artifact files only after commit,
+  exactly where the current recovery path does so.
+- Keep `page_on_connection` and rename capture/match helpers private to the DB
+  implementation boundary after the move. No projection object, DB guard, or
+  transaction token may escape the named operation.
+- Existing crash-window and restore tests remain required. Add a barrier that
+  proves a concurrent DB writer cannot enter while the operation is between
+  its DB read and projection write/restore, and an order control that fails if
+  DB locking moves before projection-session locking.
+- GREEN floor: external literals `296 → 294`, production `7 → 5`, tests remain
+  `289`.
+
+#### R4-21 — regenerate-page projection compensation
+
+- Move `regenerate_page_projection_cas` as one named cross-resource operation.
+  It deliberately remains non-transactional.
+- Preserve the opposite lock topology from rename: materialize the existing
+  `get_page` precheck, acquire the DB mutex, read the projection page row and
+  database digest, then acquire the repair projection lock while still
+  holding the DB mutex. Hold it through scan, write, proof hook, and any
+  snapshot restore; release only on the existing return path.
+- Do not collapse this operation into the rename transaction or stale-page
+  quarantine. Direct controls must prove the DB row/digest snapshot remains
+  pinned across projection work, both rollback branches restore, and a
+  concurrent DB writer stays blocked until the projection operation exits.
+- GREEN floor: external literals `294 → 293`, production `5 → 4`, tests remain
+  `289`.
+
+#### R4-22 — stale-projection quarantine and recovery
+
+- Move stale-projection quarantine and its apply-journal recovery together as
+  two named operations. Preserve owner-absence CAS, journal load/persist/clear,
+  pending receipt behavior, `restore_post`, recovery-state mapping, proof hook,
+  and conditional snapshot restore.
+- Preserve the current order and lifetime: acquire the DB mutex before the
+  repair projection lock and retain it across owner check plus every journal
+  and filesystem recovery/apply step. No effort in this movement PR may
+  shorten that lifetime, even where the filesystem work is slow.
+- Required controls cover owner appearing, crash windows before and after
+  journal persistence, `Original`/`Post`/`Unknown` recovery, mutation-not-started
+  versus restore-required failures, and a concurrent writer blocked across the
+  filesystem phase.
+- GREEN floor: external literals `293 → 291`, production `4 → 2`, tests remain
+  `289`.
+
+#### R4-23 — current repair target dispatcher
+
+- Replace the one lock in `target_receipt_current` only after R4-20 through
+  R4-22 provide the purpose-specific projection capture seams. The dispatcher
+  retains target/writer branching, row counts, owner-absence checks, rollback
+  parsing, and errors; DB and projection snapshots still occur under the same
+  mutex lifetime as today.
+- The default branch uses R4-17's receipt read. Projection branches call narrow
+  owned-result methods; they may not receive a connection, guard, generic
+  session, or callback.
+- Branch-complete controls must cover default, ordinary page projection, and
+  stale projection paths, including a barrier for each projection branch.
+- GREEN floor: external literals `291 → 290`, production `2 → 1`, tests remain
+  `289`.
+
+#### R4-24 — repair verification atomic operation
+
+- Move the DB/projection critical section of
+  `record_repair_verification_inner` behind one named DB-owned verification
+  operation. Keep manifest and tag-record locks, artifact loading, report
+  prevalidation, and rename projection-session acquisition in their current
+  caller order; the named operation then acquires the DB mutex, begins
+  `IMMEDIATE`, rechecks DB/tag/target/projection state, persists the
+  verification receipt under the same applicable projection lock, and commits
+  before the caller clears the pending apply receipt.
+- The caller-acquired locked rename projection session and
+  `RepairArtifactStore` are sanctioned inbound parameters of this named
+  operation. They must flow into the critical section so current acquisition
+  order and in-transaction receipt persistence survive. R4-23's prohibition
+  concerns raw or generic capabilities flowing out of `MemoryDB`; it does not
+  forbid these repair-side projection/store capabilities from flowing in.
+- Preserve rename, stale-projection, ordinary-projection, and nonprojection
+  branches independently. Do not route same-transaction reads through R4-17's
+  separately locking method and do not generalize the operation into a
+  transaction callback.
+- Required controls cover every target branch, report/target/non-target
+  conflict before receipt persistence, persistence failure rollback, commit
+  failure, pending-receipt clearing only after commit, and barriers showing
+  both the DB mutex and applicable projection lock remain held across receipt
+  persistence.
+- GREEN floor: external literals `290 → 289`, production `1 → 0`, tests remain
+  `289`. At this point the production raw-capability census is zero and its
+  RED mutation control becomes a zero-baseline prohibition.
+
+#### R4-25 — exact test-support seam and always-private connection
+
+- First classify all remaining test raw-access shapes with AST plus LSP
+  references; a literal count alone is not sufficient because multiline
+  chains and alternate `_db.connect()` handles are part of the contract.
+- Introduce one `#[cfg(test)]` DB-owned opaque test-support session. It may
+  expose a generic test-only execute/query pair plus only the exact
+  transaction-observation operations the fixtures require at R4-25 entry.
+  Those calls are frozen by the exact AST call-site manifest; this is not a
+  production SQL facade. The session never returns or dereferences to
+  `libsql::Connection`, `MutexGuard`, `Database`, a raw transaction, or a
+  callback argument. Its constructor and fields remain private, and the exact
+  call sites are frozen in a location-aware AST manifest rather than admitted
+  by filename or `#[cfg(test)]`.
+- Move fixtures mechanically in bounded file groups. Do not combine fixture
+  cleanup, assertion changes, test splitting, or production refactors with
+  this migration. Each group must reduce the old raw-capability manifest and
+  add only its exact named support calls.
+- Make `MemoryDB::conn` and the alternate database handle private in every
+  build only after all production and test callers compile through named
+  seams. The final guard rejects direct, multiline, retained, renamed,
+  dereferenced, or alternate-handle access outside `db/**`; positive controls
+  must kill every recognized escape shape.
+- Final floor: production raw capability `0`, external direct literals
+  `289 → 0`, and the test-support manifest equals the call-site set measured
+  at R4-25 entry exactly, plus only review-approved call sites added by
+  R4-25's own positive controls. Run the uninterrupted workspace library suite
+  after the last fixture group.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
@@ -1547,6 +1740,17 @@ artifact-ownership handoff, and an executable direct-connection ratchet. Those
 corrections are now incorporated above. Fable explicitly classified them as
 clarifications within the frozen intent and said no second full review was
 needed before R0.
+
+Scoped R4 re-gate, 2026-07-29:
+**APPROVE-WITH-FIXES → APPROVE.** LSP/AST discovery showed that the final
+eleven production locks were not one atomicity shape, so R4-17 through R4-24
+now preserve eight independently testable DB/projection contracts and R4-25
+owns the test seam. Fable verified `300 = 11 production + 289 tests`, every
+slice delta, and the three current lock topologies. Its sole blocker was the
+initially unstated R4-24 inbound capability contract: the caller-acquired
+locked rename projection session and `RepairArtifactStore` must flow into the
+named verification operation. That contract is now explicit above; the narrow
+follow-up returned **APPROVE** with no new blocker.
 
 ### Intermediate PRs — Sol by default, not Fable
 
