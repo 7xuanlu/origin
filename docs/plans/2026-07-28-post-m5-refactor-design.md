@@ -1064,6 +1064,51 @@ Execution evidence:
   frozen R4-9 contract and accepted the direct controls, focused behavior
   tests, ratchet evidence, M5 inventory, and reviewer-policy correction.
 
+#### R4-10 — knowledge-quality duplicate-candidate inputs
+
+- Add `db/kg_quality_duplicate_candidates.rs` with two purpose-bounded typed
+  inputs: case-folded duplicate-name groups for merge-candidate counting and
+  complete entity rows for the MinHash candidate pass. The exact SQL, lossy
+  decoding, and existing error prefixes move under `MemoryDB`; neither query
+  gains an `ORDER BY`.
+- Keep warning logs, N−1 counting, the feature flag, high-entropy filtering,
+  MinHash/LSH buckets, similarity thresholds, proposal identity/payload, and
+  enqueueing in `kg_quality.rs`. The raw MinHash input deliberately includes
+  low-entropy rows so the DB seam cannot become a hidden policy filter.
+- The DB mutex now releases after each complete result is materialized rather
+  than after caller-side logging/counting or entropy filtering. This bounded
+  read-only lock-scope shrink is accepted: both queries still produce one
+  materialized snapshot, while no policy or second DB operation moves under
+  the guard.
+- RED lowers the exact `kg_quality.rs` baseline from `22` to `20`; before
+  extraction the guard reports a direct-access increase `20 → 22`. GREEN moves
+  both production locks under `db/**`: external literals `316 → 314`,
+  production `27 → 25`, tests `289` unchanged, and the per-file baseline is
+  `22 → 20`.
+- Direct DB controls pass `2 / 2`: three case variants form one count-three
+  group, a second duplicate group remains distinct, singletons are excluded,
+  and the raw MinHash read returns low- and high-entropy rows with every
+  id/name/type field. Caller behavior controls pass `4 / 4`: three case-folded
+  duplicates yield exactly N−1=`2` with MinHash off; MinHash on surfaces a
+  true borderline pair but rejects low-entropy collision-like rows; the flag
+  off path creates no band proposal. The exact ratchet passes `3 / 3`.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only generated source addresses move. No
+  truth adapter, manifest row, permit, or cutover generation changes.
+- AUDIT, 2026-07-29: the independent R4 auditor returned **APPROVE**, confirming
+  the two-lock boundary, exact SQL/errors/decoding, policy ownership, and
+  direct controls. Its requested caller N−1 and entropy-negative controls are
+  included above.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: the independent auditor returned
+  **APPROVE** after reconciling the staged implementation with the contract.
+  It confirmed the low-entropy negative is substantive: the cross-type
+  `aaaaaa` / `aaaaaaa` pair shares its sole trigram and would enqueue without
+  the caller-owned entropy guard.
+- REVIEW, 2026-07-29: the independent Sol reviewer returned **APPROVE** with no
+  material finding. It independently confirmed exact SQL, diagnostics and
+  decode defaults; policy placement; non-vacuous direct and caller controls;
+  ratchet and M5 accounting; and exact staging of both new files.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,

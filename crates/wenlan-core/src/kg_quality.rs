@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Knowledge graph quality checks: post-store verification and periodic rethink.
 
-use crate::db::{ContradictionObservationCount, MemoryDB};
+use crate::db::{ContradictionObservationCount, DuplicateNameGroup, MemoryDB, MinHashEntityInput};
 use crate::error::WenlanError;
 use crate::llm_provider::LlmProvider;
 use crate::read_scope::ReadScope;
@@ -148,34 +148,17 @@ pub async fn run_rethink(
 /// Migration 40 deduplicated existing data, but new duplicates can appear when
 /// entities are created via code paths that bypass alias resolution.
 pub async fn find_merge_candidates(db: &MemoryDB) -> Result<usize, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT LOWER(name) as lname, COUNT(*) as cnt FROM entities
-             GROUP BY LOWER(name) HAVING cnt > 1",
-            (),
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("merge candidates query: {}", e)))?;
-
+    let groups: Vec<DuplicateNameGroup> = db.duplicate_name_groups_for_merge_candidates().await?;
     let mut count = 0usize;
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("merge candidates row: {}", e)))?
-    {
-        let name: String = row.get::<String>(0).unwrap_or_default();
-        let cnt: i64 = row.get::<i64>(1).unwrap_or(0);
+    for group in groups {
         log::warn!(
             "[rethink] merge candidate: '{}' has {} entities -- review for dedup",
-            name,
-            cnt
+            group.lower_name,
+            group.entity_count
         );
         // Each group with N > 1 yields N-1 merge candidates.
-        count += (cnt.saturating_sub(1)) as usize;
+        count += (group.entity_count.saturating_sub(1)) as usize;
     }
-    drop(rows);
-    drop(conn);
 
     // T16: surface MinHash/LSH band collisions into the human-review queue.
     // Opt-in (WENLAN_ENABLE_ENTITY_MINHASH). These are the *borderline* pairs
@@ -197,27 +180,22 @@ async fn surface_minhash_merge_candidates(db: &MemoryDB) -> Result<usize, Wenlan
     use std::collections::HashMap;
 
     // Pull every entity once (id, name, entity_type).
-    let entities: Vec<(String, String, String)> = {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
-            .query("SELECT id, name, entity_type FROM entities", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("minhash candidates scan: {e}")))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("minhash candidates row: {e}")))?
-        {
-            let id: String = row.get(0).unwrap_or_default();
-            let name: String = row.get(1).unwrap_or_default();
-            let etype: String = row.get(2).unwrap_or_default();
+    let inputs: Vec<MinHashEntityInput> = db.entities_for_minhash_merge_candidates().await?;
+    let entities: Vec<(String, String, String)> = inputs
+        .into_iter()
+        .filter_map(|input| {
+            let MinHashEntityInput {
+                id,
+                name,
+                entity_type,
+            } = input;
             if dedup::has_high_entropy(&name) {
-                out.push((id, name, etype));
+                Some((id, name, entity_type))
+            } else {
+                None
             }
-        }
-        out
-    };
+        })
+        .collect();
 
     // Bucket entity indices by band key.
     let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -652,44 +630,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_merge_candidates_detects_duplicates() {
-        let (db, _dir) = test_db().await;
+        temp_env::async_with_vars([("WENLAN_ENABLE_ENTITY_MINHASH", None::<&str>)], async {
+            let (db, _dir) = test_db().await;
 
-        // Create two entities with same lowercase name by bypassing alias resolution.
-        // (In practice this shouldn't happen post-migration-40, but we want to know
-        // if it does via the rethink's logging.)
-        {
+            // Create three case-folded duplicates plus a singleton by bypassing
+            // alias resolution. The caller owns the N-1 candidate math.
             let conn = db.conn.lock().await;
             let now = chrono::Utc::now().timestamp();
-            conn.execute(
-                "INSERT INTO entities (id, name, entity_type, source_agent, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                libsql::params![
-                    "dup-1".to_string(),
-                    "Alice".to_string(),
-                    "person".to_string(),
-                    "test".to_string(),
-                    now
-                ],
-            )
-            .await
-            .unwrap();
-            conn.execute(
-                "INSERT INTO entities (id, name, entity_type, source_agent, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                libsql::params![
-                    "dup-2".to_string(),
-                    "alice".to_string(),
-                    "person".to_string(),
-                    "test".to_string(),
-                    now
-                ],
-            )
-            .await
-            .unwrap();
-        }
+            for (id, name) in [
+                ("dup-1", "Alice"),
+                ("dup-2", "alice"),
+                ("dup-3", "ALICE"),
+                ("singleton", "Bob"),
+            ] {
+                conn.execute(
+                    "INSERT INTO entities (id, name, entity_type, source_agent, created_at, updated_at)
+                     VALUES (?1, ?2, 'person', 'test', ?3, ?3)",
+                    libsql::params![id, name, now],
+                )
+                .await
+                .unwrap();
+            }
+            drop(conn);
 
-        let count = find_merge_candidates(&db).await.unwrap();
-        assert_eq!(count, 1, "expected 1 merge candidate (2 entities, 1 extra)");
+            let count = find_merge_candidates(&db).await.unwrap();
+            assert_eq!(
+                count, 2,
+                "three duplicate entities produce N-1 candidates; singleton is excluded"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1255,6 +1225,27 @@ mod tests {
             assert!(
                 !pending.iter().any(|p| p.id.starts_with("minhash_")),
                 "flag OFF must enqueue no minhash proposals"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn find_merge_candidates_minhash_on_skips_low_entropy_collisions() {
+        temp_env::async_with_vars([("WENLAN_ENABLE_ENTITY_MINHASH", Some("1"))], async {
+            let (db, _dir) = test_db().await;
+            for (name, entity_type) in [("aaaaaa", "person"), ("aaaaaaa", "project")] {
+                db.store_entity(name, entity_type, None, Some("test"), None)
+                    .await
+                    .unwrap();
+            }
+
+            let count = find_merge_candidates(&db).await.unwrap();
+            assert_eq!(count, 0);
+            let pending = db.get_pending_refinements().await.unwrap();
+            assert!(
+                !pending.iter().any(|p| p.id.starts_with("minhash_")),
+                "low-entropy rows must be filtered by caller policy even when MinHash is enabled"
             );
         })
         .await;
