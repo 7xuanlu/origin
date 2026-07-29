@@ -1871,8 +1871,32 @@ fn filter_routes_path(patterns: &BTreeSet<String>, path: &str) -> bool {
     patterns.contains(path)
         || patterns.iter().any(|pattern| {
             pattern
+                .strip_prefix("*.")
+                .filter(|_| !path.contains('/'))
+                .is_some_and(|extension| path.ends_with(&format!(".{extension}")))
+        })
+        || patterns.iter().any(|pattern| {
+            pattern
+                .strip_prefix("**/*.")
+                .is_some_and(|extension| path.ends_with(&format!(".{extension}")))
+        })
+        || patterns.iter().any(|pattern| {
+            pattern
                 .strip_suffix("/**")
                 .is_some_and(|prefix| path.starts_with(&format!("{prefix}/")))
+        })
+        || patterns.iter().any(|pattern| {
+            pattern
+                .split_once("/**/")
+                .and_then(|(prefix, suffix)| {
+                    suffix
+                        .strip_suffix("/**")
+                        .map(|directory| (prefix, directory))
+                })
+                .is_some_and(|(prefix, directory)| {
+                    path.starts_with(&format!("{prefix}/"))
+                        && path.contains(&format!("/{directory}/"))
+                })
         })
         || patterns.iter().any(|pattern| {
             pattern
@@ -2529,6 +2553,60 @@ fn ci_routing_is_fail_closed_and_differential() {
          detect-changes/impact routing in .github/workflows/ci.yml; an intentional contract \
          change also updates ci_routing_contract_violations() and its positive control:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn documentation_only_changes_take_the_docs_lane_without_runtime_backstops() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let ci: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse ci.yml");
+    let docs = detect_change_filter_paths(&ci, "docs");
+    let runtime_filters = [
+        "rust",
+        "macos",
+        "windows",
+        "release-preflight",
+        "mcp-platform",
+        "workspace-platform",
+    ]
+    .map(|name| (name, detect_change_filter_paths(&ci, name)));
+
+    for path in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CHANGELOG.md",
+        "README.es-ES.md",
+        "app/eval/AGENTS.md",
+        "crates/wenlan-core/AGENTS.md",
+        "docs/technical-foundations.md",
+    ] {
+        assert!(
+            filter_routes_path(&docs, path),
+            "documentation-only path must schedule docs checks: {path}"
+        );
+        for (filter, patterns) in &runtime_filters {
+            assert!(
+                !filter_routes_path(patterns, path),
+                "documentation-only path must not schedule {filter}: {path}"
+            );
+        }
+    }
+
+    let markdown_test_fixture = "crates/wenlan-core/tests/fixtures/folder/notes/linked.md";
+    assert!(
+        filter_routes_path(&docs, markdown_test_fixture),
+        "Markdown test fixtures must still receive docs checks"
+    );
+    let rust = runtime_filters
+        .iter()
+        .find(|(name, _)| *name == "rust")
+        .map(|(_, patterns)| patterns)
+        .expect("rust routing");
+    assert!(
+        filter_routes_path(rust, markdown_test_fixture),
+        "Markdown under crates/**/tests/** must retain Rust test coverage"
     );
 }
 
