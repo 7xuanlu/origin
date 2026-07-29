@@ -255,7 +255,7 @@ pub async fn run_maintenance_stage_slice(
 
     match stage {
         MaintenanceStage::RetroReview => {
-            if has_pending_retro_review(db).await? {
+            if db.has_pending_retro_review().await? {
                 paused = true;
                 result.retro_paused = true;
             } else if db
@@ -291,7 +291,7 @@ pub async fn run_maintenance_stage_slice(
             }
         }
         MaintenanceStage::NearDuplicate => {
-            if has_pending_retro_review(db).await? {
+            if db.has_pending_retro_review().await? {
                 paused = true;
             } else {
                 let cursor = db
@@ -348,7 +348,7 @@ pub async fn run_maintenance_stage_slice(
             progressed = selected;
         }
         MaintenanceStage::CrossSpaceDiscovery => {
-            if has_pending_cross_space_discovery(db).await? {
+            if db.has_pending_cross_space_discovery().await? {
                 paused = true;
             } else {
                 let cursor = db
@@ -657,43 +657,6 @@ async fn scan_automatic_retro_stub_slice(
         more,
         pages_examined: 1,
         source_rows_examined: source_count,
-    })
-}
-
-async fn has_pending_retro_review(db: &MemoryDB) -> Result<bool, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM refinement_queue \
-             WHERE status IN ('pending', 'awaiting_review') \
-               AND action IN ('page_merge', 'page_keep_or_archive') \
-             LIMIT 1",
-            (),
-        )
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("pending retro probe: {error}")))?;
-    rows.next()
-        .await
-        .map(|row| row.is_some())
-        .map_err(|error| WenlanError::VectorDb(format!("pending retro probe row: {error}")))
-}
-
-async fn has_pending_cross_space_discovery(db: &MemoryDB) -> Result<bool, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM refinement_queue \
-             WHERE status IN ('pending', 'awaiting_review') \
-               AND action = 'cross_space_discovery' \
-             LIMIT 1",
-            (),
-        )
-        .await
-        .map_err(|error| {
-            WenlanError::VectorDb(format!("pending cross-space discovery probe: {error}"))
-        })?;
-    rows.next().await.map(|row| row.is_some()).map_err(|error| {
-        WenlanError::VectorDb(format!("pending cross-space discovery probe row: {error}"))
     })
 }
 
@@ -1918,6 +1881,94 @@ mod tests {
         assert!((1..=8).contains(&report.work.seeds_examined));
         assert!(report.work.neighbor_rows_examined <= 8 * 64);
         assert!(report.result.discovery_cards_emitted <= 1);
+    }
+
+    #[tokio::test]
+    async fn open_review_cards_pause_automatic_stages_before_scan_or_cursor_work() {
+        let (db, _db_dir) = new_test_db().await;
+        let no_sources = Vec::<String>::new();
+        db.insert_refinement_proposal("open-retro-control", "page_merge", &no_sources, None, 1.0)
+            .await
+            .unwrap();
+
+        let retro = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &config(),
+            None,
+            MaintenanceStage::RetroReview,
+        )
+        .await
+        .unwrap();
+        assert!(retro.paused);
+        assert!(retro.result.retro_paused);
+        assert!(!retro.selected && !retro.progressed && !retro.more);
+        assert_eq!(retro.work, MaintenanceSliceWork::default());
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_RETRO_CURSOR_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_RETRO_COMPLETE_KEY)
+                .await
+                .unwrap(),
+            None,
+            "the paused probe must return before the empty scan marks retro complete"
+        );
+
+        let near_duplicate = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &config(),
+            None,
+            MaintenanceStage::NearDuplicate,
+        )
+        .await
+        .unwrap();
+        assert!(near_duplicate.paused);
+        assert!(!near_duplicate.result.retro_paused);
+        assert!(!near_duplicate.selected && !near_duplicate.progressed && !near_duplicate.more);
+        assert_eq!(near_duplicate.work, MaintenanceSliceWork::default());
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_NEAR_DUPLICATE_CURSOR_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+
+        db.insert_refinement_proposal(
+            "open-cross-space-control",
+            "cross_space_discovery",
+            &no_sources,
+            None,
+            1.0,
+        )
+        .await
+        .unwrap();
+        let cross_space = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &discovery_config(),
+            None,
+            MaintenanceStage::CrossSpaceDiscovery,
+        )
+        .await
+        .unwrap();
+        assert!(cross_space.paused);
+        assert!(!cross_space.result.retro_paused);
+        assert!(!cross_space.selected && !cross_space.progressed && !cross_space.more);
+        assert_eq!(cross_space.work, MaintenanceSliceWork::default());
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_CROSS_SPACE_CURSOR_KEY)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

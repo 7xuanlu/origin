@@ -809,6 +809,43 @@ Execution evidence:
   `summary_eligible_predicate`; the existing shared predicate dependency is
   retained rather than widening this movement-only slice.
 
+#### R4-4 — maintenance queue presence probes
+
+- Add `db/maintenance_queue.rs` with exactly two bounded read methods:
+  `has_pending_retro_review` for `page_merge` /
+  `page_keep_or_archive`, and `has_pending_cross_space_discovery` for the
+  exact `cross_space_discovery` action.
+- Preserve `SELECT 1`, `LIMIT 1`, only `pending` / `awaiting_review` statuses,
+  exact error prefixes, and caller short-circuit order. The RetroReview,
+  NearDuplicate, and CrossSpaceDiscovery stages still probe before metadata,
+  Page scans, ANN work, cursor writes, or card emission.
+- Do not fold in `pending_retro_review_count`: the full-tick retro-pause
+  contract counts the already-filtered public refinement list and remains a
+  separate path.
+- RED is the exact `maintenance.rs` baseline reduction `7 → 5` before caller
+  migration. GREEN moves the two production locks into the DB layer: external
+  literals `326 → 324`, production `37 → 35`, tests `289` unchanged.
+- Direct SQL-contract tests pass `2 / 2`, covering both retro actions and the
+  cross-space action across both open statuses, with dismissed, resolved,
+  auto-applied, and open wrong-action controls. A caller-level regression
+  proves all three stages pause with zero scan/ANN work and no cursor advance;
+  only RetroReview sets `retro_paused`.
+- The existing maintenance suite passes `18 / 18`; the exact ratchet passes
+  `3 / 3`; formatting and core all-target Clippy with `-D warnings` pass.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`. The new `_test.rs` module is excluded;
+  generated addresses shift mechanically in `db.rs` and `maintenance.rs`, but
+  the probes read only `refinement_queue` and change no truth or Page contract.
+- REVIEW 1, 2026-07-29: Opus/xhigh returned **clean movement-only refactor**
+  with no correctness findings after independently checking byte-identical SQL
+  and errors, all caller positions, the exact `7 → 5` ratchet, test-module
+  reachability, schema defaults, and generated addresses. Its useful
+  non-blocking notes added the table-level module description and strengthened
+  the RetroReview early-return control to prove the empty scan cannot mark the
+  lane complete. The duplicated two-action vocabulary remains byte-identical
+  in this movement slice; consolidating it would change query construction and
+  is intentionally deferred.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,

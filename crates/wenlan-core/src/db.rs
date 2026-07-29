@@ -26,6 +26,7 @@ mod count;
 mod derived_artifact_sweep;
 mod edges_rebuild;
 mod entity_page_adapter;
+mod maintenance_queue;
 mod memory_point_reads;
 mod migrations_v004_v009;
 mod onboarding_milestones;
@@ -50,6 +51,8 @@ mod claim_identity_test;
 mod edges_rebuild_test;
 #[cfg(test)]
 mod entity_page_adapter_test;
+#[cfg(test)]
+mod maintenance_queue_test;
 #[cfg(test)]
 mod memory_point_reads_test;
 #[cfg(test)]
