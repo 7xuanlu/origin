@@ -5691,7 +5691,7 @@ const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ),
     ("crates/wenlan-core/src/importer.rs", 1),
     ("crates/wenlan-core/src/kg/entity_extraction.rs", 1),
-    ("crates/wenlan-core/src/kg_quality.rs", 26),
+    ("crates/wenlan-core/src/kg_quality.rs", 24),
     ("crates/wenlan-core/src/lint/deep_test.rs", 3),
     ("crates/wenlan-core/src/lint/identity_test.rs", 7),
     ("crates/wenlan-core/src/lint/kg_config_test.rs", 1),

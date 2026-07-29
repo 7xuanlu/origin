@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Knowledge graph quality checks: post-store verification and periodic rethink.
 
-use crate::db::MemoryDB;
+use crate::db::{ContradictionObservationCount, MemoryDB};
 use crate::error::WenlanError;
 use crate::llm_provider::LlmProvider;
 use crate::read_scope::ReadScope;
@@ -501,67 +501,30 @@ pub async fn refresh_stale_entity_embeddings(db: &MemoryDB) -> Result<usize, Wen
 /// existing memory. Logged for visibility; actual pruning is deferred until
 /// relation temporality lands (requires a dedicated `stale` column).
 pub async fn detect_stale_relations(db: &MemoryDB) -> Result<usize, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM relations
-             WHERE source_memory_id IS NOT NULL
-             AND source_memory_id NOT IN (SELECT DISTINCT source_id FROM memories WHERE source_id IS NOT NULL)",
-            (),
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("stale relations: {}", e)))?;
-
-    let count: i64 = match rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("stale relations row: {}", e)))?
-    {
-        Some(row) => row.get::<i64>(0).unwrap_or(0),
-        None => 0,
-    };
-
+    let count = db.count_stale_relation_sources().await?;
     if count > 0 {
         log::warn!(
             "[rethink] {} relations have stale source_memory_id (source memory deleted)",
             count
         );
     }
-    Ok(count as usize)
+    Ok(count)
 }
 
 /// Scan for entities with many observations, logging them for manual review.
 /// A full contradiction detection pass would need LLM; this is a cheap proxy
 /// that highlights entities most likely to contain conflicting information.
 pub async fn scan_contradictions(db: &MemoryDB) -> Result<usize, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT e.name, COUNT(o.id) as obs_count
-             FROM entities e JOIN observations o ON o.entity_id = e.id
-             GROUP BY e.id, e.name HAVING obs_count >= 10
-             ORDER BY obs_count DESC LIMIT 20",
-            (),
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("contradictions scan: {}", e)))?;
-
-    let mut count = 0usize;
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("contradictions row: {}", e)))?
-    {
-        let name: String = row.get::<String>(0).unwrap_or_default();
-        let obs: i64 = row.get::<i64>(1).unwrap_or(0);
+    let counts: Vec<ContradictionObservationCount> =
+        db.list_contradiction_observation_counts().await?;
+    for item in &counts {
         log::info!(
             "[rethink] entity '{}' has {} observations -- review for contradictions",
-            name,
-            obs
+            item.entity_name,
+            item.observation_count
         );
-        count += 1;
     }
-    Ok(count)
+    Ok(counts.len())
 }
 
 /// Embedding-based hallucination check: returns `true` if the body is

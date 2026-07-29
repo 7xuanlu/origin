@@ -990,6 +990,46 @@ Execution evidence:
   intentional movement-only behavior, SQL branch duplication is pre-existing,
   and the transported field names are clearer.
 
+#### R4-8 — knowledge-quality diagnostic readers
+
+- Add `db/kg_quality_diagnostics.rs` with two narrow typed reads:
+  `count_stale_relation_sources` and
+  `list_contradiction_observation_counts`. The exact SQL, row decoding, and
+  existing error prefixes move under `MemoryDB`, including the thresholds that
+  are part of those queries. Threshold interpretation, warning and info logs,
+  `RethinkReport`, and orchestration remain in `kg_quality.rs`.
+- Preserve the stale-source query's matched/missing/SQL-NULL behavior and the
+  contradiction query's `HAVING obs_count >= 10`, descending count order, and
+  `LIMIT 20` without adding another ordering contract.
+- RED lowers the exact `kg_quality.rs` baseline from `26` to `24`; before
+  extraction the guard reports a direct-access increase `24 → 26`. GREEN moves
+  both production locks under `db/**`: external literals `320 → 318`,
+  production `31 → 29`, tests `289` unchanged, and the per-file baseline is
+  `26 → 24`.
+- Direct DB controls cover a matched, missing, and SQL-NULL relation source,
+  plus the contradiction boundary (`9` excluded, `10` included), descending
+  counts, and the twenty-row cap. The two existing `test_run_rethink` controls
+  pass, including the empty-DB report.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only generated source addresses move. No
+  truth adapter, manifest row, permit, or cutover generation changes.
+- AUDIT 1, 2026-07-29: the independent R4 auditor returned **FIX-FIRST** because
+  the original combined threshold/order/cap fixture let `LIMIT 20` hide both
+  the nine- and ten-observation rows. It also questioned the inner
+  `memories.source_id IS NOT NULL` branch. The threshold now has an uncapped
+  `9` excluded / `10` included control. AUDIT 2 returned **APPROVE** after
+  confirming `memories.source_id` is `TEXT NOT NULL` in both production schema
+  paths, so manufacturing an inner SQL NULL would require an invalid schema;
+  the runtime control instead covers the genuinely nullable relation source.
+- REVIEW 1, 2026-07-29: Opus/xhigh independently returned **FIX-FIRST** on the
+  same vacuous threshold control. REVIEW 2 found the corrected extraction
+  clean and movement-only with no blocking finding, confirming byte-preserved
+  SQL/errors/returns, exact ratchet arithmetic, mechanical inventory addresses,
+  and unchanged M5 topology. Its low-severity notes were adopted: the ledger
+  now distinguishes query thresholds from quality interpretation, the
+  multi-row observation fixture uses one transaction, and the typed row derives
+  `Debug` consistently with sibling DB transports.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
