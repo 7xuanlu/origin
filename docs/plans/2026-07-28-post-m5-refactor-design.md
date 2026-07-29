@@ -1156,6 +1156,45 @@ Execution evidence:
   SQL/decode/error/order semantics, caller policy, non-vacuous controls,
   `20 → 18` ratchet, mechanical inventory shifts, and exact staging.
 
+#### R4-12 — eval substrate guards
+
+- Add `db/eval_substrate_guard.rs` with
+  `assert_eval_feature_substrate_live` and
+  `assert_eval_migration_substrates_live`. Each method acquires the DB mutex
+  once and delegates policy, SQL, feature matching, and diagnostics unchanged
+  to `eval::seed_contract::assert_feature_substrate_live`; no raw handle or
+  callback escapes the DB seam.
+- Keep the LoCoMo and LongMemEval per-feature gates in their existing position
+  before fixture loading. Keep the migrate-stale gate after the fully-enriched
+  check and before the shared Phase-1 backfill, as one mutex-held ordered
+  sequence with the exact `temporal → graph → pages` refusal order. It opens no
+  transaction and promises no cross-statement database snapshot.
+- RED lowers the exact baselines before extraction: remove the sole
+  `eval/locomo.rs` entry, lower `eval/longmemeval.rs` from `3` to `2`, and
+  lower `eval/shared.rs` from `3` to `2`. The pre-extraction guard reports
+  exactly those three direct-access violations. GREEN moves the three
+  production locks under `db/**`: external literals `312 → 309`, production
+  `23 → 20`, and tests remain `289`.
+- Direct DB controls pass `2 / 2`: the feature wrapper preserves graph,
+  temporal, and page substring aliases plus the unmodeled-feature pass; the
+  migration wrapper refuses staged fixtures first for temporal, then graph,
+  then pages, and passes only when all three substrates are live. Existing
+  seed-contract controls pass `16 / 16` with the cached-scenario integration
+  control still ignored.
+- The exact external-access ratchet passes `3 / 3`. The generated M5 inventory
+  remains exactly `191` rows with depth `55 / 50 / 86` and exposure `22`;
+  only generated source addresses move. No truth adapter, manifest row,
+  permit, or cutover generation changes.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: the independent auditor returned
+  **APPROVE**, confirming exact forwarding, gate positions and refusal order,
+  non-vacuous staged-substrate controls, ratchet accounting, exact staging,
+  and unchanged M5 topology.
+- REVIEW 1, 2026-07-29: the independent Sol reviewer returned **FIX-FIRST**
+  because “materialized snapshot” overstated a mutex-held sequence of three
+  queries. The ledger now explicitly promises neither a transaction nor a
+  cross-statement snapshot. REVIEW 2 returned **APPROVE** with no remaining
+  material finding.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,

@@ -745,12 +745,7 @@ where
                 mem_count
             )));
         }
-        {
-            let conn = db.conn.lock().await;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "temporal").await?;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "graph").await?;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "pages").await?;
-        }
+        db.assert_eval_migration_substrates_live().await?;
         log::info!(
             "[scenario_db] migrate_stale: schema migrated, substrate live at {} ({} memories) — \
              falling through to shared Phase-1 classification backfill",

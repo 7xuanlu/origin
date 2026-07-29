@@ -1193,10 +1193,7 @@ async fn run_longmemeval_eval_from_db_collect_core(
 
     // No-drift eval gate: a graph/temporal A/B over an empty substrate is a null,
     // not a result. Same contract the seed orchestrator asserts (producer/consumer).
-    {
-        let conn = db.conn.lock().await;
-        crate::eval::seed_contract::assert_feature_substrate_live(&conn, feature).await?;
-    }
+    db.assert_eval_feature_substrate_live(feature).await?;
 
     let mut samples = load_longmemeval(path)?;
     apply_lme_limit(&mut samples);
