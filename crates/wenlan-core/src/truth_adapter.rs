@@ -18,6 +18,7 @@
 //! | [`filter_page`] | `Option<Page>` -> `Option<Page>` | by-id readers |
 //! | [`filter_page_refs`] | `Vec<T>` keyed by page id -> `Vec<T>` | revisions, links, changes, retrievals |
 //! | [`page_write_permit`] | one page id -> [`PagePermit`] | projection writes, exports, re-distillation |
+//! | [`redact_page_activity_detail`] | rows naming a page with no id -> blanked | `/api/activities` |
 //!
 //! **Still inert.** At generation 0 `page_visibility` answers `Full` for every
 //! page, so all four are the identity and this PR changes no behavior — the same
@@ -92,7 +93,7 @@ async fn verdicts(
             (
                 id,
                 wenlan_types::pages::PageTruth {
-                    supported: state.supported,
+                    supported: state.supported(),
                     human_reviewed: state.human_reviewed,
                 },
             )
@@ -216,10 +217,22 @@ impl PagePermit {
 ///
 /// `None` means no. It is not an error -- declining to project an unsupported
 /// page is the contract working, and callers log it and move on.
+///
+/// # The fence
+///
+/// While a cutover is `preparing`, every page write is refused regardless of the
+/// page's truth state. Pages are projected at runtime, so without this a page
+/// written mid-ceremony would land in the vault behind the pass that just
+/// examined it -- the one file nobody ever ruled on. An unreadable fence refuses
+/// too, by propagating: an indeterminate fence is exactly the state where
+/// letting writers through is unsafe.
 pub async fn page_write_permit(
     db: &MemoryDB,
     page_id: &str,
 ) -> Result<Option<PagePermit>, WenlanError> {
+    if db.cutover_fence().await?.phase == crate::db::CutoverPhase::Preparing {
+        return Ok(None);
+    }
     let ids = vec![page_id.to_string()];
     let visibility = db.page_visibility(&TruthGrant::Automatic, &ids).await?;
     Ok(if visibility.get(page_id) == Some(&Visibility::Full) {
@@ -229,6 +242,44 @@ pub async fn page_write_permit(
     } else {
         None
     })
+}
+
+/// Blank activity detail that names a page but carries no page id.
+///
+/// `agent_activity` is `id, timestamp, agent_name, action, memory_ids, query,
+/// detail` -- no page reference anywhere, and `memory_ids` holds memory ids.
+/// Four write sites format a page title straight into the free-text `detail`
+/// (`post_write.rs` x3, `post_ingest.rs` x1), so by the time a reader asks, the
+/// title is a sentence and the identity that would let `page_visibility` rule on
+/// it is gone.
+///
+/// There is nothing to key the decision on, so the only fail-closed answer is to
+/// refuse the whole sentence rather than guess which page it names. The prefix
+/// test is `page_`, not an enumerated list of the four actions, so an action
+/// added later is covered by default rather than leaking until someone
+/// remembers to extend a match arm.
+///
+/// **Coarse on purpose, and it takes no grant.** A reader holding a marker loses
+/// the detail line too, because "which page is this about" is not a question the
+/// row can answer -- no grant can be applied to an unidentified subject. The
+/// alternative considered was a `page_id` column plus a migration nulling
+/// historical `detail`; it was rejected because it destroys existing activity
+/// text and still leaves every row written before it shipped.
+///
+/// Inert at generation 0, like the other four operations.
+pub async fn redact_page_activity_detail(
+    db: &MemoryDB,
+    mut rows: Vec<wenlan_types::memory::AgentActivityRow>,
+) -> Result<Vec<wenlan_types::memory::AgentActivityRow>, WenlanError> {
+    if db.truth_cutover_generation().await? < 1 {
+        return Ok(rows);
+    }
+    for row in &mut rows {
+        if row.action.starts_with("page_") {
+            row.detail = None;
+        }
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]

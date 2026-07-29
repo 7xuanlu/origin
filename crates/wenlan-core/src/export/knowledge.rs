@@ -122,6 +122,13 @@ struct LegacyKnowledgeStateV1 {
     concepts: HashMap<String, PageFileState>,
 }
 
+/// Where a page's markdown goes when the truth gate stops projecting it.
+///
+/// Plain and visible, in the projection root. Not a dotfile: a person looking
+/// for a page that disappeared should be able to find it without being told
+/// where to look.
+const ARCHIVE_DIR: &str = "archive";
+
 pub struct KnowledgeWriter {
     path: PathBuf,
     tracker: std::sync::Arc<crate::page_projection_tracker::PageProjectionTracker>,
@@ -518,14 +525,8 @@ impl KnowledgeWriter {
         guard: &crate::page_projection_tracker::PageProjectionWriteGuard,
     ) -> Result<usize, WenlanError> {
         self.validate_guard(guard)?;
-        let mut projected: Vec<String> = self
-            .load_state()
-            .pages
-            .into_keys()
-            .chain(self.scan_projected_page_ids()?.into_keys())
-            .collect();
+        let mut projected: Vec<String> = self.projected_files()?.into_keys().collect();
         projected.sort();
-        projected.dedup();
         if projected.is_empty() {
             return Ok(0);
         }
@@ -546,6 +547,162 @@ impl KnowledgeWriter {
         self.evict_projected_pages(guard, &evict)
     }
 
+    /// Every page this projection directory would lose at `generation`, without
+    /// losing it.
+    ///
+    /// The point of a dry run is that it is computed the same way the real thing
+    /// is, so this shares the invariant's enumeration exactly: the union of
+    /// `state.json`'s keys and the IDs recovered from the `.md` frontmatter
+    /// actually on disk. A plan built from a different enumeration would be a
+    /// forecast of a different operation.
+    ///
+    /// `generation` is *hypothetical*. The database is still at whatever it is
+    /// at -- typically 0, where `page_visibility` short-circuits everything to
+    /// `Full` -- so the verdict is computed through the pure
+    /// [`crate::truth_contract::visible_at`] rather than through the live gate.
+    /// Asking the live gate would answer "nothing would be evicted" and be
+    /// useless, which is the trap this method exists to avoid.
+    pub async fn plan_truth_cutover(
+        &self,
+        database: &crate::db::MemoryDB,
+        generation: i64,
+    ) -> Result<CutoverPlan, WenlanError> {
+        let on_disk = self.projected_files()?;
+        let mut projected: Vec<String> = on_disk.keys().cloned().collect();
+        projected.sort();
+
+        let states = database.page_truth_states(&projected).await?;
+        let mut evictions = Vec::new();
+        for page_id in &projected {
+            let truth = states.get(page_id).copied().unwrap_or_default();
+            let visibility = crate::truth_contract::visible_at(
+                generation,
+                &crate::truth_contract::TruthGrant::Automatic,
+                page_id,
+                truth.support,
+                truth.human_reviewed,
+            );
+            if visibility != crate::truth_contract::Visibility::Full {
+                evictions.push(CutoverEviction {
+                    page_id: page_id.clone(),
+                    files: on_disk.get(page_id).cloned().unwrap_or_default(),
+                });
+            }
+        }
+
+        // The digest covers everything the decision rests on: which generation,
+        // which pages, whether each is supported, and which file each would cost.
+        // Anything that changes between the dry run and the apply changes this
+        // string, and the apply refuses. It is deliberately not a digest of the
+        // eviction list alone -- a page flipping from unsupported to supported
+        // shortens that list without the operator ever seeing the new plan.
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut hasher, generation.to_string().as_bytes());
+        for page_id in &projected {
+            let truth = states.get(page_id).copied().unwrap_or_default();
+            let file = on_disk
+                .get(page_id)
+                .filter(|files| !files.is_empty())
+                .map(|files| files.join(","))
+                .unwrap_or_else(|| "-".to_string());
+            // Both axes, not just support: a page becoming human-reviewed
+            // shortens the eviction list, and the operator has to see the new
+            // plan rather than apply one taken before the review.
+            sha2::Digest::update(
+                &mut hasher,
+                format!(
+                    "\n{page_id}\t{:?}\t{}\t{file}",
+                    truth.support, truth.human_reviewed
+                )
+                .as_bytes(),
+            );
+        }
+        Ok(CutoverPlan {
+            generation,
+            projected: projected.len(),
+            evictions,
+            digest: hex::encode(sha2::Digest::finalize(hasher)),
+        })
+    }
+
+    /// Advance the cutover, fenced and directory-first.
+    ///
+    /// The order is the whole design:
+    ///
+    /// 1. take the lease, which stops every page writer;
+    /// 2. remove the files the plan named, *before* the database says anything
+    ///    has changed;
+    /// 3. commit the generation, then release the fence;
+    /// 4. reconcile through the ordinary invariant, which now sees the live
+    ///    generation and catches anything the plan missed.
+    ///
+    /// Directory-first is deliberate. A legacy reader may briefly see a page
+    /// missing that the database still calls supported; it must never see stale
+    /// provisional prose after the cutover. Omission is recoverable, false trust
+    /// is not.
+    ///
+    /// `expected_digest` is the operator's dry run. It is re-planned here rather
+    /// than trusted, so an apply that races a distillation cycle refuses instead
+    /// of deleting files nobody reviewed.
+    ///
+    /// Any failure between (1) and (3) aborts the lease, which returns the fence
+    /// to `off` at a **new** epoch and lets writers back in.
+    pub async fn run_truth_cutover(
+        &self,
+        database: &crate::db::MemoryDB,
+        generation: i64,
+        expected_digest: &str,
+    ) -> Result<CutoverPlan, WenlanError> {
+        // Take the lease FIRST, then re-plan under it. Planning first leaves a
+        // window between the plan and the fence in which a page can flip
+        // supported -- and that page's file would then be deleted on the
+        // strength of a plan that predates the flip. Once the fence reads
+        // `preparing` no page write can land, so a plan taken after it cannot
+        // go stale underneath the eviction.
+        let lease = database.begin_cutover().await?;
+
+        // The lease is linear, so every path below spends it exactly once. That
+        // is why this reads as a chain of `match` rather than one fallible block:
+        // handing it to `abort_cutover` consumes it, and the compiler will not
+        // let a later line reach for it again.
+        let plan = match self.plan_truth_cutover(database, generation).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = database.abort_cutover(lease).await;
+                return Err(error);
+            }
+        };
+        if plan.digest != expected_digest {
+            let _ = database.abort_cutover(lease).await;
+            return Err(WenlanError::Conflict(format!(
+                "the projection changed since the dry run (planned {expected_digest}, \
+                 now {}); re-run the dry run and read it before applying",
+                plan.digest
+            )));
+        }
+
+        let evict: Vec<String> = plan.evictions.iter().map(|e| e.page_id.clone()).collect();
+        if !evict.is_empty() {
+            let guard = database.begin_page_projection_write();
+            if let Err(error) = self.evict_projected_pages(&guard, &evict) {
+                // Best effort: if the abort also fails the fence stays
+                // `preparing`, which refuses page writes. That is the safe side
+                // to be stuck on, and the daemon releases it at next startup.
+                let _ = database.abort_cutover(lease).await;
+                return Err(error);
+            }
+        }
+        // Spends the lease. A failure here leaves the fence at `preparing` on
+        // purpose -- there is no lease left to abort with, and the startup
+        // release is the recovery path.
+        database.commit_cutover(lease, generation).await?;
+
+        let guard = database.begin_page_projection_write();
+        self.enforce_projection_directory_invariant(database, &guard)
+            .await?;
+        Ok(plan)
+    }
+
     /// Every page ID this directory actually holds a file for, with its filename.
     ///
     /// Recovered from `origin_id:` in the frontmatter `write_page` renders, which
@@ -558,12 +715,12 @@ impl KnowledgeWriter {
     /// can point at the user's own vault, so an unattributable file is somebody
     /// else's note, not a page this projection failed to track. Fail closed on
     /// the decision, never on the user's data.
-    fn scan_projected_page_ids(&self) -> Result<HashMap<String, String>, WenlanError> {
+    fn scan_projected_page_ids(&self) -> Result<HashMap<String, Vec<String>>, WenlanError> {
         if !self.path.is_dir() {
             return Ok(HashMap::new());
         }
         KnowledgeProjectionWrite::with_projection_capabilities(&self.path, |capabilities| {
-            let mut found = HashMap::new();
+            let mut found: HashMap<String, Vec<String>> = HashMap::new();
             for entry in capabilities.root.entries()? {
                 let entry = entry?;
                 let name = entry.file_name();
@@ -579,10 +736,54 @@ impl KnowledgeWriter {
                 let Some(page_id) = Self::read_origin_id(&capabilities.root, &name) else {
                     continue;
                 };
-                found.insert(page_id, name.to_string_lossy().to_string());
+                found
+                    .entry(page_id)
+                    .or_default()
+                    .push(name.to_string_lossy().to_string());
             }
             Ok(found)
         })
+    }
+
+    /// Every page this projection accounts for, with every file holding it.
+    ///
+    /// The union of two half-truths. `state.json` knows pages whose `.md` the
+    /// scan cannot attribute -- someone edited the `origin_id` out -- and the
+    /// scan knows files `state.json` forgot. A page can appear with no files at
+    /// all: a stale entry, still worth evicting, because the next write would
+    /// resurrect it.
+    ///
+    /// Files are a list, not one name, because nothing on disk enforces one file
+    /// per page. A sync conflict copies the whole `.md`, `origin_id` frontmatter
+    /// and all, so two files can claim the same page. Keeping only one of them
+    /// archived one copy and left the other readable -- exactly the disclosure
+    /// this pass exists to close. Sorted, so the cutover digest is stable across
+    /// passes; `HashMap` iteration order and directory order are both arbitrary.
+    fn projected_files(&self) -> Result<HashMap<String, Vec<String>>, WenlanError> {
+        let mut found = self.scan_projected_page_ids()?;
+        for (page_id, entry) in self.load_state().pages {
+            let slot = found.entry(page_id).or_default();
+            // Only if something is really there. A dry run that promises to move
+            // a file `state.json` merely remembers is a forecast of the wrong
+            // operation, and the operator reads this list to decide.
+            //
+            // Anything, though, not just a regular file: a directory sitting on
+            // a page's projected name is not "nothing to evict", it is an
+            // obstruction, and dropping it here would turn a loud
+            // `page_projection_target_invalid` into a silent state cleanup at a
+            // disclosure boundary. `symlink_metadata` so a dangling symlink is
+            // caught the same way rather than reading as absent.
+            if !entry.file.is_empty()
+                && std::fs::symlink_metadata(self.path.join(&entry.file)).is_ok()
+            {
+                slot.push(entry.file);
+            }
+        }
+        for files in found.values_mut() {
+            files.sort();
+            files.dedup();
+        }
+        Ok(found)
     }
 
     /// The `origin_id` in a projected file's frontmatter, if it has one.
@@ -635,49 +836,69 @@ impl KnowledgeWriter {
         page_ids: &[String],
     ) -> Result<usize, WenlanError> {
         self.validate_guard(guard)?;
-        let scanned = self.scan_projected_page_ids()?;
+        let projected = self.projected_files()?;
         KnowledgeProjectionWrite::with_projection_capabilities(&self.path, |capabilities| {
             let mut state = self.load_state_cap(&capabilities.wenlan);
             let mut manifest =
                 crate::export::provenance::StubManifest::load_from(&capabilities.root);
             let mut removed = 0usize;
             let mut stuck: Vec<&str> = Vec::new();
+            // Named in the error too. A partial eviction saves state and moves
+            // files for the pages that succeeded, but the caller aborts the
+            // ceremony and leaves the generation where it was -- so "it failed"
+            // is true and "nothing moved" is not. An operator who is only told
+            // which pages STAYED cannot find the ones that left.
+            let mut evicted: Vec<&str> = Vec::new();
 
+            // Tracked apart from `removed` because a page can need the state
+            // written without any file moving. Gating the save on `removed`
+            // alone discarded the stale-entry cleanup below whenever EVERY
+            // evicted page was file-less -- the one case that branch exists for.
+            let mut state_dirty = false;
             for page_id in page_ids {
-                let filename = state
-                    .pages
-                    .get(page_id)
-                    .map(|entry| entry.file.clone())
-                    .or_else(|| scanned.get(page_id).cloned());
-                let Some(filename) = filename else {
+                let files = projected.get(page_id).map(Vec::as_slice).unwrap_or(&[]);
+                if files.is_empty() {
                     // Known to `state.json` a moment ago and to nothing now, or
                     // an entry with no file. Nothing on disk to evict.
-                    state.pages.remove(page_id);
+                    if state.pages.remove(page_id).is_some() {
+                        state_dirty = true;
+                    }
+                    manifest.forget_page(page_id);
                     continue;
-                };
-                match Self::unlink_projected_file(&capabilities.root, &filename) {
-                    Ok(()) => {
-                        // Only forget the page once its file is actually gone.
-                        // A retained entry is what makes the next pass retry.
-                        state.pages.remove(page_id);
-                        manifest.forget_page(page_id);
-                        removed += 1;
+                }
+                // Every file, not the first one that matches. A page with two
+                // copies loses both or the eviction did not happen.
+                let mut moved = 0usize;
+                for filename in files {
+                    match Self::archive_projected_file(&capabilities.root, filename) {
+                        Ok(()) => moved += 1,
+                        Err(error) => {
+                            // Do not abort. This is a disclosure boundary, and
+                            // the cost of stopping is that every page after this
+                            // one keeps a file `wenlan pages` can read -- so
+                            // maximum removal beats a clean exit.
+                            log::error!(
+                                "[truth] projection invariant could not archive page {page_id} \
+                                 ({filename}), its file is still readable by `wenlan pages`: \
+                                 {error}"
+                            );
+                        }
                     }
-                    Err(error) => {
-                        // Do not abort. This is a disclosure boundary, and the
-                        // cost of stopping is that every page after this one
-                        // keeps a file `wenlan pages` can read -- so maximum
-                        // removal beats a clean exit.
-                        log::error!(
-                            "[truth] projection invariant could not evict page {page_id} \
-                             ({filename}), its file is still readable by `wenlan pages`: {error}"
-                        );
-                        stuck.push(page_id);
-                    }
+                }
+                if moved == files.len() {
+                    // Only forget the page once its files are actually gone.
+                    // A retained entry is what makes the next pass retry.
+                    state.pages.remove(page_id);
+                    manifest.forget_page(page_id);
+                    state_dirty = true;
+                    removed += 1;
+                    evicted.push(page_id);
+                } else {
+                    stuck.push(page_id);
                 }
             }
 
-            if removed > 0 {
+            if state_dirty {
                 self.save_state_cap(&capabilities.wenlan, &state)?;
                 let _ = manifest.save_to(&capabilities.root);
                 let _ =
@@ -686,9 +907,22 @@ impl KnowledgeWriter {
             if !stuck.is_empty() {
                 // Loud at the caller too, not only in the per-page log lines:
                 // the count is what a health check can act on.
+                //
+                // Both lists, because the caller aborts the ceremony on this
+                // error and leaves the generation unchanged. The pages named in
+                // `evicted` are already in archive/ and already gone from
+                // `state.json`, and at generation 0 nothing re-projects them --
+                // so an error that reported only `stuck` would say the ceremony
+                // did nothing while some of the vault had already moved.
+                let moved = if evicted.is_empty() {
+                    "none".to_string()
+                } else {
+                    evicted.join(", ")
+                };
                 return Err(WenlanError::Conflict(format!(
                     "projection invariant evicted {removed} page(s) but {} could not be removed \
-                     and remain readable on disk: {}",
+                     and remain readable on disk: {}. Already moved into archive/ (the \
+                     generation did NOT advance, so these do not come back on their own): {moved}",
                     stuck.len(),
                     stuck.join(", ")
                 )));
@@ -697,24 +931,86 @@ impl KnowledgeWriter {
         })
     }
 
-    /// Delete one projected file, refusing anything that is not a plain file.
+    /// Move one projected file into `archive/`, refusing anything that is not a
+    /// plain file.
+    ///
+    /// A move, not an unlink. Hiding a page is a retrieval decision -- it says
+    /// the prose is not backed by its evidence -- and that does not license
+    /// destroying a file the person may have edited by hand, in a directory that
+    /// is very often their own vault. The database can rebuild a page; it cannot
+    /// rebuild what someone typed into the projection.
+    ///
+    /// `archive/` sits in the projection root in plain sight, and it works
+    /// because `wenlan pages` reads one directory level and `.md` files only:
+    /// an archived page leaves Wenlan's own reader, which is what the cutover
+    /// is about, while staying somewhere a human can find it. It also keeps
+    /// itself out of [`Self::scan_projected_page_ids`] for the same reason a
+    /// directory has no `.md` extension, so an archived page is not rediscovered
+    /// and re-archived on the next pass.
     ///
     /// Same guarantees `remove_page` gives: no symlink is followed, and a
     /// directory or special file where a page was expected is a conflict rather
-    /// than something to unlink. Already-absent is success -- the invariant cares
-    /// that the file is gone, not that this pass is the one that removed it.
-    fn unlink_projected_file(root: &Dir, filename: &str) -> Result<(), WenlanError> {
+    /// than something to move. Already-absent is success -- the invariant cares
+    /// that the file is gone from the projection root, not that this pass is the
+    /// one that moved it.
+    fn archive_projected_file(root: &Dir, filename: &str) -> Result<(), WenlanError> {
         match root.symlink_metadata(filename) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                root.remove_file(filename)?;
-                Ok(())
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(WenlanError::Conflict(
+                    "page_projection_target_invalid".to_string(),
+                ))
             }
-            Ok(_) => Err(WenlanError::Conflict(
-                "page_projection_target_invalid".to_string(),
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(WenlanError::Io(error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(WenlanError::Io(error)),
         }
+        let archive = Self::open_archive_dir(root)?;
+        // `rename` replaces its destination without a word, and the destination
+        // here is an older archived copy of the same page -- the one thing under
+        // this root that the database cannot reproduce. Suffix until free.
+        let stem = filename.strip_suffix(".md").unwrap_or(filename);
+        let mut target = filename.to_string();
+        let mut attempt = 1;
+        while archive.symlink_metadata(&target).is_ok() {
+            attempt += 1;
+            if attempt > 100 {
+                return Err(WenlanError::Conflict(
+                    "page_archive_target_exhausted".to_string(),
+                ));
+            }
+            target = format!("{stem}-{attempt}.md");
+        }
+        root.rename(filename, &archive, &target)?;
+        Ok(())
+    }
+
+    /// The archive directory inside the projection root, created on demand.
+    ///
+    /// A non-directory, or a symlink, sitting on the name is a conflict rather
+    /// than something to write through: the whole point of the move is that the
+    /// bytes end up somewhere known.
+    fn open_archive_dir(root: &Dir) -> Result<Dir, WenlanError> {
+        match root.symlink_metadata(ARCHIVE_DIR) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(WenlanError::Conflict(
+                    "page_archive_target_invalid".to_string(),
+                ))
+            }
+            // `AlreadyExists` here means something created `archive/` between
+            // the probe above and this call -- the user's sync client, or a
+            // second pass. That is the state we wanted, not a failure; letting
+            // it propagate would strand a page whose file is still readable.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match root.create_dir(ARCHIVE_DIR) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(WenlanError::Io(e)),
+                }
+            }
+            Err(error) => return Err(WenlanError::Io(error)),
+        }
+        Ok(root.open_dir_nofollow(ARCHIVE_DIR)?)
     }
 
     fn validate_guard(
@@ -875,6 +1171,35 @@ fn check_permit(permit: &crate::truth_adapter::PagePermit, page: &Page) -> Resul
         )));
     }
     Ok(())
+}
+
+/// One page the cutover would stop projecting, and the file that costs.
+///
+/// `files` is empty when `state.json` names a page whose `.md` is already gone.
+/// Reporting it anyway is the point: the entry is still there to be resurrected
+/// by the next write, so it is part of what the ceremony cleans up even though
+/// no bytes move.
+///
+/// It is a list rather than one name because nothing on disk enforces one file
+/// per page -- see [`KnowledgeWriter::projected_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverEviction {
+    pub page_id: String,
+    pub files: Vec<String>,
+}
+
+/// What advancing to a generation would do to the projection directory.
+///
+/// Produced by [`KnowledgeWriter::plan_truth_cutover`] and re-produced inside
+/// [`KnowledgeWriter::run_truth_cutover`], which refuses when the two digests
+/// differ. The operator reads the eviction list; the machine reads the digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverPlan {
+    pub generation: i64,
+    /// Every page the directory currently accounts for, evicted or not.
+    pub projected: usize,
+    pub evictions: Vec<CutoverEviction>,
+    pub digest: String,
 }
 
 pub struct KnowledgeProjectionWrite {
@@ -1173,6 +1498,42 @@ impl LockedRepairProjection<'_> {
         self.write
             .writer
             .write_page_with_lock_held(self.capabilities, &self.write.guard, page)
+    }
+
+    /// Project a page against a permit already in hand.
+    ///
+    /// Repair-lock counterpart to the two [`write_page_permitted`] forms above,
+    /// sharing their permit/page check. It exists because the permit cannot be
+    /// taken *here*: the repair path holds the connection mutex around this
+    /// closure, and [`crate::truth_adapter::page_write_permit`] needs that same
+    /// connection. The caller asks first, then hands the answer in.
+    ///
+    /// [`write_page_permitted`]: KnowledgeProjectionWrite::write_page_permitted
+    pub(crate) fn write_page_permitted(
+        &self,
+        permit: &crate::truth_adapter::PagePermit,
+        page: &Page,
+    ) -> Result<String, WenlanError> {
+        check_permit(permit, page)?;
+        self.write_page(page)
+    }
+
+    /// The permitted form of [`Self::write_page_with_after_target_write`].
+    ///
+    /// The repair path renames a page's title and rewrites its `.md` in the same
+    /// receipted step, which is a production page-prose write like any other and
+    /// needs the same permit in front of it.
+    pub(crate) fn write_page_with_after_target_write_permitted<F>(
+        &self,
+        permit: &crate::truth_adapter::PagePermit,
+        page: &Page,
+        after_target_write: F,
+    ) -> Result<String, WenlanError>
+    where
+        F: FnOnce() -> Result<(), WenlanError>,
+    {
+        check_permit(permit, page)?;
+        self.write_page_with_after_target_write(page, after_target_write)
     }
 
     pub(crate) fn write_page_with_after_target_write<F>(

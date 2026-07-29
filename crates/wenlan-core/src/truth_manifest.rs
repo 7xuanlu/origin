@@ -13,6 +13,41 @@
 //! artifact. Neither may drift from the tree.
 //!
 //! Binding spec: `docs/plans/2026-07-27-m5-reader-manifest.md`.
+//!
+//! # Demotion note -- `GET /api/memory/entities/{entity_id}`
+//!
+//! PR-B classified this page-bearing on the evidence `"Entity.name =
+//! pages.title (M3)"`. That conflates M3's shadow-mirror mechanism with an
+//! actual page leak, and the route is demoted here.
+//!
+//! `get_entity_detail_scoped` (`db/scoped_entities.rs:114-131`) reads `pages`
+//! only when the per-consumer `entity_reader_cutover` for `"scoped_entities"`
+//! is on, and that is default OFF -- the live path selects `entities.name`. On
+//! the cutover branch it selects `p.title, p.entity_type, p.confidence,
+//! p.entity_confirmed` and **no page body**, and `p.title` is not authored
+//! prose: `update_entity_shadow_page` (`db.rs:9952`) writes it as
+//! `title = (SELECT name FROM entities WHERE id = ?1)`. The arrow runs
+//! entity -> page, so the title is the entity's own name arriving by a longer
+//! road. Observations and relations come from `observations` / `relations`
+//! (`db/scoped_entities.rs:146-180`), never `pages`. Real page readers already
+//! exclude `kind='entity'` shadows.
+//!
+//! Gating it would lock a door that is not a door, and would leave the manifest
+//! asserting a leak that does not exist.
+//!
+//! # Demotion note -- `GET /api/pages/{id}/map`
+//!
+//! Held to the manifest's own rule that a route qualifies for a carve-out only
+//! if its item type can carry a page identity **and both axes**. `PageMapNode`
+//! and `PageMapEdge` carry a bare `label`, so the `named_page` shape advertised
+//! a carve-out the wire types cannot represent. Demoted to `MarkerShape::None`,
+//! which refuses rather than downgrades -- matching the other eleven page-map
+//! rows, which were already `None`.
+//!
+//! Hiding a page *inside* a map is a graph problem, not a filter: incident
+//! edges are keyed by node ids, not page ids, so removing a node either orphans
+//! its edges or silently rewires the graph. That design is deliberately not
+//! attempted here.
 
 /// Every HTTP method the router can register, not just the two the
 /// scope-sensitivity table needs.
@@ -136,7 +171,7 @@ pub struct CliReader {
 
 /// All 167 registered `(method, path, handler)` triples.
 ///
-/// 60 page-bearing, 107 not. Expands to 171 `(builder, method, path)`
+/// 59 page-bearing, 108 not. Expands to 171 `(builder, method, path)`
 /// runtime entries: 165 in `main`, 6 in `repair`.
 #[rustfmt::skip]
 pub const HTTP_READERS: &[HttpReader] = &[
@@ -196,7 +231,7 @@ pub const HTTP_READERS: &[HttpReader] = &[
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities/list", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities/search", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
-    HttpReader { method: ReaderMethod::Get, path: "/api/memory/entities/{entity_id}", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_get_entity_detail", evidence: "Entity.name = pages.title (M3)" },
+    HttpReader { method: ReaderMethod::Get, path: "/api/memory/entities/{entity_id}", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "entity name, not page prose — see demotion note" },
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities/{entity_id}/observations", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Put, path: "/api/memory/entities/{id}/confirm", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Delete, path: "/api/memory/entities/{id}/delete", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
@@ -250,7 +285,7 @@ pub const HTTP_READERS: &[HttpReader] = &[
     HttpReader { method: ReaderMethod::Post, path: "/api/pages/{id}/export", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_export_page", evidence: "EFFECT: writes page prose to the requested vault" },
     HttpReader { method: ReaderMethod::Get, path: "/api/pages/{id}/links", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::NamedPage, adapter: "handle_get_page_links", evidence: "PageLinkInbound.label, PageLinkOutbound.label" },
     HttpReader { method: ReaderMethod::Delete, path: "/api/pages/{id}/map", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_reset_page_map", evidence: "opaque response type — fail-closed" },
-    HttpReader { method: ReaderMethod::Get, path: "/api/pages/{id}/map", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::NamedPage, adapter: "handle_get_page_map", evidence: "PageMapEdge.label, PageMapNode.label" },
+    HttpReader { method: ReaderMethod::Get, path: "/api/pages/{id}/map", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_get_page_map", evidence: "PageMapEdge.label, PageMapNode.label — refuses, see page-map note" },
     HttpReader { method: ReaderMethod::Post, path: "/api/pages/{id}/map/edges", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_create_map_edge", evidence: "PageMapEdge.label" },
     HttpReader { method: ReaderMethod::Delete, path: "/api/pages/{id}/map/edges/{edge_id}", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_delete_map_edge", evidence: "PageMapEdge.label" },
     HttpReader { method: ReaderMethod::Patch, path: "/api/pages/{id}/map/edges/{edge_id}", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_patch_map_edge", evidence: "PageMapEdge.label" },

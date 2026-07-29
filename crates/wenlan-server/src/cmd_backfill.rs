@@ -165,7 +165,7 @@ fn check_service_unit_absent(unit: &std::path::Path) -> Result<()> {
 
 /// Returns Ok if no service manager has the origin daemon registered.
 /// Returns Err with instructions if a service unit file is present.
-fn check_service_unloaded() -> Result<()> {
+pub(crate) fn check_service_unloaded() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // `sc.exe query <label>` exits 0 when the service is registered with
@@ -193,7 +193,7 @@ fn check_service_unloaded() -> Result<()> {
     }
 }
 
-async fn check_daemon_not_running() -> Result<()> {
+pub(crate) async fn check_daemon_not_running() -> Result<()> {
     // Mirror the port-reading logic from cmd_status in main.rs.
     let port: u16 = std::env::var("WENLAN_PORT")
         .ok()

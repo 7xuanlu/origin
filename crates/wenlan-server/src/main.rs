@@ -2,6 +2,7 @@
 //! Wenlan headless daemon — runs the memory server without Tauri.
 
 mod cmd_backfill;
+mod cmd_cutover;
 
 struct DaemonDataLock {
     _file: std::fs::File,
@@ -1054,6 +1055,19 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Internal maintenance: advance the M5 truth cutover. Daemon must be stopped
+    /// first. Moves judged-unsupported pages' Markdown into `<vault>/archive/`;
+    /// `--apply` refuses without a matching dry run.
+    #[command(name = "truth-cutover", hide = true)]
+    TruthCutover {
+        /// Generation to advance to. 1 is the first live generation.
+        #[arg(long, default_value_t = 1)]
+        generation: i64,
+        /// Carry out the plan. Without it this is a dry run and records nothing
+        /// but the plan digest.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow::Result<()> {
@@ -1562,6 +1576,27 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
                             );
                         }
                         Err(e) => tracing::warn!("[reconcile] pass failed: {e}"),
+                    }
+
+                    // A cutover ceremony that was killed mid-flight left the
+                    // fence at `preparing`, and `preparing` refuses every page
+                    // write. The ceremony cannot run while this daemon is up
+                    // (it takes the data-root lock, probes the port, and
+                    // refuses on a registered service unit), so a fence still
+                    // reading `preparing` here belongs to a process that is
+                    // gone. Release it before the invariant pass, so the pass
+                    // and everything after it can write.
+                    match db_arc.release_stranded_cutover_fence().await {
+                        Ok(false) => {}
+                        Ok(true) => tracing::warn!(
+                            "[truth] a cutover ceremony did not finish; released its fence so \
+                             page writes can proceed. Re-run `wenlan-server truth-cutover` if \
+                             the cutover was intended."
+                        ),
+                        Err(e) => tracing::error!(
+                            "[truth] could not read or release the cutover fence: {e}. Page \
+                             writes may be refused until this is resolved."
+                        ),
                     }
 
                     // M5 PR-B: the projection directory is the enforcement
@@ -2315,6 +2350,9 @@ async fn main() -> anyhow::Result<()> {
 
         match cli.command {
             Some(Command::BackfillStalePages { dry_run }) => cmd_backfill::run(dry_run).await,
+            Some(Command::TruthCutover { generation, apply }) => {
+                cmd_cutover::run(generation, apply).await
+            }
             None => run_daemon(startup_repair_claim).await,
         }
     }

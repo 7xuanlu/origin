@@ -639,6 +639,18 @@ where
     )?;
     let projection = session.locked();
     let excluded_paths = crate::repair::rename_page_title_excluded_paths(rollback)?;
+    // Before the connection lock, because the permit reads the DB through the
+    // same mutex the block below holds. Refusing rather than skipping matches
+    // `regenerate_page_projection_cas`: this is a receipted repair, and handing
+    // back a receipt for a file that was never rewritten is worse than an error.
+    let permit = crate::truth_adapter::page_write_permit(db, page_id)
+        .await?
+        .ok_or_else(|| {
+            WenlanError::Conflict(format!(
+                "page {page_id} may not be projected where an automatic reader would find \
+                 it, so its title cannot be repaired on disk"
+            ))
+        })?;
     let conn = db.conn.lock().await;
     conn.execute("BEGIN IMMEDIATE", ())
         .await
@@ -772,7 +784,11 @@ where
             ));
         }
         projection_written = true;
-        projection.write_page_with_after_target_write(&page, after_target_write)?;
+        projection.write_page_with_after_target_write_permitted(
+            &permit,
+            &page,
+            after_target_write,
+        )?;
 
         let after =
             crate::repair::capture_rename_page_title_on_connection(&conn, &projection, page_id)
@@ -1370,6 +1386,21 @@ where
     {
         return Err(WenlanError::Conflict("repair_target_stale".to_string()));
     }
+    // Asked here, before the connection mutex, because the permit needs the same
+    // connection the closure below holds. Refusing is the right answer rather
+    // than a silent skip: this is an explicit, receipted repair, and a caller
+    // told "done" while the file was never rewritten would be worse than an
+    // error. The startup projection invariant is the ONLY pass that evicts
+    // hidden pages, so a re-projection that slipped through here would sit in
+    // the user's vault until the next daemon restart.
+    let permit = crate::truth_adapter::page_write_permit(db, page_id)
+        .await?
+        .ok_or_else(|| {
+            WenlanError::Conflict(format!(
+                "page {page_id} may not be projected where an automatic reader would \
+                 find it, so its projection cannot be regenerated"
+            ))
+        })?;
     let paths = crate::repair::projection_rollback_paths(rollback)?;
     let target_path = crate::repair::page_projection_target_path(rollback)?;
     let conn = db.conn.lock().await;
@@ -1411,7 +1442,7 @@ where
             )?;
 
             let result = (|| {
-                write.write_page(&page)?;
+                write.write_page_permitted(&permit, &page)?;
                 let after_scan = crate::lint::pages::fs::scan_page_root_controlled(
                     page_root,
                     true,
