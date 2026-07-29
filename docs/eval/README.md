@@ -37,9 +37,9 @@ python3 scripts/check-readme-translations.py
 - LongMemEval rows use `Recall@5`, `MRR`, and `NDCG@10` as headline retrieval fields.
 - Current README retrieval numbers are retrieval-only, single-run local snapshots unless a reproducibility pass is explicitly documented.
 - LME-S 90 retrieval is saved in `docs/eval/results/lme_s_90_bge_base_pool20.summary.json` with raw rows in `docs/eval/results/lme_s_90_bge_base_pool20.jsonl`.
-- `scripts/update-readme-eval.py` updates the generated retrieval block in English, Simplified Chinese, and Traditional Chinese READMEs.
+- `scripts/update-readme-eval.py` updates the generated retrieval block in the English README and every root-level localized `README.*.md`.
 - Rows with `source_summary` are checked against tracked summary artifacts before they are treated as publishable README metrics.
-- `scripts/check-readme-translations.py` fails when translated READMEs do not carry the current English README sync hash.
+- `scripts/check-readme-translations.py` discovers root-level localized `README.*.md` files and fails when any does not carry the current English README sync hash.
 - Name the retrieval mode once in surrounding prose when all rows use the same mode.
 - Keep `notes` in the metrics JSON for maintainer-facing caveats and run metadata; the root README does not render them.
 
