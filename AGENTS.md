@@ -173,9 +173,7 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 | `BREAKING CHANGE` | patch | Breaking |
 | `chore:`, `ci:`, `docs:`, `refactor:`, `test:` | no bump on its own | hidden |
 
-**A deliberate minor or major is a config change, not a commit-message trick.** Add `"release-as": "0.16.0"` under `packages["."]` (or switch `versioning`), merge it to main, let release-please open the PR, then remove the override. Both flags are live and both work.
-
-> Until 2026-07-28 this section claimed `bump-patch-for-minor-pre-major`, `release-as`, and `versioning` "do NOT work with release-please v17 + simple release type", and prescribed a `git filter-branch` rewrite to undo a stray `feat:`. The flags were never broken. `.github/workflows/release-please.yml` passed a `release-type:` input, and a non-empty `release-type` makes release-please-action v4 take the `Manifest.fromConfig` branch (`src/index.ts:92`) and never read `config-file` or `manifest-file` at all. Never rewrite history to steer a version bump.
+**A deliberate minor or major is a config change, not a commit-message trick.** Add `"release-as": "0.16.0"` under `packages["."]` (or switch `versioning`), merge it to main, let release-please open the PR, then remove the override. Never rewrite history to steer a version bump.
 
 **Squash merge commit messages still matter — for the changelog.** When GitHub squash-merges a PR, the commit message defaults to the PR title. The prefix no longer changes the bump size (always patch), but it decides whether and where the change appears in `CHANGELOG.md`, and a title without a conventional `type:` prefix is invisible to release-please entirely. Keep PR titles valid conventional commits.
 
