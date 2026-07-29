@@ -1175,6 +1175,24 @@ impl LockedRepairProjection<'_> {
             .write_page_with_lock_held(self.capabilities, &self.write.guard, page)
     }
 
+    /// Project a page against a permit already in hand.
+    ///
+    /// Repair-lock counterpart to the two [`write_page_permitted`] forms above,
+    /// sharing their permit/page check. It exists because the permit cannot be
+    /// taken *here*: the repair path holds the connection mutex around this
+    /// closure, and [`crate::truth_adapter::page_write_permit`] needs that same
+    /// connection. The caller asks first, then hands the answer in.
+    ///
+    /// [`write_page_permitted`]: KnowledgeProjectionWrite::write_page_permitted
+    pub(crate) fn write_page_permitted(
+        &self,
+        permit: &crate::truth_adapter::PagePermit,
+        page: &Page,
+    ) -> Result<String, WenlanError> {
+        check_permit(permit, page)?;
+        self.write_page(page)
+    }
+
     pub(crate) fn write_page_with_after_target_write<F>(
         &self,
         page: &Page,

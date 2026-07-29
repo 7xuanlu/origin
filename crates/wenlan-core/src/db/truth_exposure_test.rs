@@ -301,18 +301,27 @@ fn workspace_sources() -> Vec<(std::path::PathBuf, String)> {
 /// test evaporating silently. So the rule is coarse and fails CLOSED: a call
 /// from an inline `#[cfg(test)] mod tests { ... }` is reported, and the fix is
 /// to move it to the `*_test.rs` file the rest of the crate uses.
+/// **Amended for PR-D, deliberately, as the PR-B message instructed.** The
+/// ceremony has landed, so the setter now has exactly one production caller:
+/// `commit_cutover`, in this module's own source file, which reaches it only
+/// while holding a [`super::CutoverLease`]. Every other call site in every crate
+/// is still a failure, and a *second* call inside `truth_exposure.rs` is a
+/// failure too -- otherwise the allowance would widen into a hole the moment
+/// someone adds a convenience wrapper next to the one that earned it.
 #[test]
-fn the_cutover_setter_has_no_production_caller() {
+fn the_cutover_setter_has_one_production_caller() {
     const SETTER: &str = "set_truth_cutover_generation";
+    const ALLOWED_FILE: &str = "truth_exposure.rs";
     let declaration = format!("fn {SETTER}");
 
     let mut callers = Vec::new();
+    let mut allowed = Vec::new();
     for (path, body) in workspace_sources() {
-        let is_test_file = path
+        let name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with("_test.rs"));
-        if is_test_file {
+            .unwrap_or_default();
+        if name.ends_with("_test.rs") {
             continue;
         }
         for (offset, line) in body.lines().enumerate() {
@@ -322,20 +331,247 @@ fn the_cutover_setter_has_no_production_caller() {
             {
                 continue;
             }
+            let site = format!("{}:{}", path.display(), offset + 1);
+            if name == ALLOWED_FILE {
+                allowed.push(site);
+            } else {
+                callers.push(site);
+            }
+        }
+    }
+
+    assert!(
+        callers.is_empty(),
+        "{SETTER} has a caller outside `{ALLOWED_FILE}` and outside every \
+         `*_test.rs` file: {callers:?}. Advancing the cutover generation makes \
+         the projection pass delete every unsupported page's file out of the \
+         user's Markdown vault, so the ONE production path is `commit_cutover`, \
+         which requires a `CutoverLease` and releases the writer fence only \
+         after the generation is committed. Route the new caller through the \
+         ceremony rather than widening this allowance. If this is a test caller, \
+         move it into the crate's `*_test.rs` module, which is where every other \
+         one lives."
+    );
+    assert_eq!(
+        allowed.len(),
+        1,
+        "expected exactly one {SETTER} call inside `{ALLOWED_FILE}` -- the one in \
+         `commit_cutover` -- and found {allowed:?}. A second call there is a \
+         second way to advance the generation, and the fence only guards the \
+         first."
+    );
+}
+
+/// Every production page-prose write goes through a permit.
+///
+/// `write_page` is the ungated form -- it renders a page's body to a `.md` in a
+/// directory `wenlan pages` reads with no gate in front of it. The gated forms
+/// (`write_page_gated`, `write_page_permitted`) are what the truth contract
+/// actually covers, and the difference is one word at the call site.
+///
+/// This matters more than it looks because
+/// `enforce_projection_directory_invariant` -- the pass that evicts hidden pages
+/// -- has exactly ONE production caller, at daemon startup (`main.rs`). There is
+/// no sweep behind an ungated write. A page re-projected past the permit sits in
+/// the user's vault until the next restart, which for a daemon is indefinitely.
+///
+/// Scanned by source rather than enforced by visibility because the ungated form
+/// is legitimately `pub(crate)` for the writer's own internals and for test
+/// fixtures; the failure worth catching is the production call site added next
+/// week, same reasoning as the setter tooth above.
+#[test]
+fn no_production_code_projects_a_page_without_a_permit() {
+    const UNGATED: &str = ".write_page(";
+    // The module that owns the writer. Its own internals reach the raw form on
+    // purpose -- that is what the gated forms are implemented in terms of.
+    const OWNER: &str = "knowledge.rs";
+    // Its only hit is a fixture inside an inline `#[cfg(test)] mod tests`. The
+    // count below is the fail-closed half: a second hit here is reported.
+    const INLINE_TEST_FIXTURE: &str = "page_watcher.rs";
+
+    let mut callers = Vec::new();
+    let mut fixture_hits = 0usize;
+    for (path, body) in workspace_sources() {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.ends_with("_test.rs") || name.ends_with("_tests.rs") || name == OWNER {
+            continue;
+        }
+        for (offset, line) in body.lines().enumerate() {
+            if !line.contains(UNGATED) || line.trim_start().starts_with("//") {
+                continue;
+            }
+            if name == INLINE_TEST_FIXTURE {
+                fixture_hits += 1;
+                continue;
+            }
             callers.push(format!("{}:{}", path.display(), offset + 1));
         }
     }
 
     assert!(
         callers.is_empty(),
-        "{SETTER} has a caller outside a `*_test.rs` file: {callers:?}. Advancing \
-         the cutover generation makes the projection pass delete every \
-         unsupported page's file out of the user's Markdown vault, so the setter \
-         is a test-only lever in PR-B. PR-C's two-phase fenced ceremony is the \
-         intended way to advance it -- if you are landing that ceremony, change \
-         this test deliberately to name the one allowed call site rather than \
-         deleting it. If this is a test caller, move it into the crate's \
-         `*_test.rs` module, which is where every other one lives."
+        "production code projects a page without a truth permit: {callers:?}. Use \
+         `write_page_gated` (async, asks for the permit itself) or \
+         `write_page_permitted` (takes one already in hand, for paths that hold \
+         the connection mutex). The startup projection invariant is the only pass \
+         that evicts hidden pages, so an ungated write outlives the cutover \
+         ceremony that was supposed to remove it."
+    );
+    assert_eq!(
+        fixture_hits, 1,
+        "expected exactly one ungated `write_page` in `{INLINE_TEST_FIXTURE}` -- \
+         the `project_page` fixture in its inline test module -- and found \
+         {fixture_hits}. If this is new production code, gate it; if it is a new \
+         fixture, move the test module into a `*_test.rs` file like the rest of \
+         the crate so this allowance can go away."
+    );
+}
+
+// ---- the writer fence ----------------------------------------------------
+
+use super::{CutoverFence, CutoverPhase};
+
+#[tokio::test]
+async fn a_fresh_database_has_no_ceremony_in_flight() {
+    let (db, _tmp) = test_db().await;
+    assert_eq!(db.cutover_fence().await.unwrap(), CutoverFence::INITIAL);
+}
+
+/// The §4.1 mutation check: a writer must not be able to skip the fence.
+///
+/// `page_write_permit` is the one seam every page writer goes through -- the two
+/// `write_page_gated` projection writers and the re-distillation gate. While a
+/// ceremony prepares, all of them get `None`, at generation 0, where the truth
+/// state would otherwise grant every page.
+#[tokio::test]
+async fn a_page_write_is_refused_while_a_cutover_prepares() {
+    let (db, _tmp) = test_db().await;
+    assert!(
+        crate::truth_adapter::page_write_permit(&db, "p1")
+            .await
+            .unwrap()
+            .is_some(),
+        "generation 0 with no ceremony in flight must grant"
+    );
+
+    let lease = db.begin_cutover().await.unwrap();
+    assert!(
+        crate::truth_adapter::page_write_permit(&db, "p1")
+            .await
+            .unwrap()
+            .is_none(),
+        "a page written mid-ceremony lands in the vault behind the pass that just \
+         examined it"
+    );
+
+    db.abort_cutover(&lease).await.unwrap();
+    assert!(
+        crate::truth_adapter::page_write_permit(&db, "p1")
+            .await
+            .unwrap()
+            .is_some(),
+        "aborting must give the writers back"
+    );
+}
+
+/// The ABA test named in §6. `off -> preparing -> off` returns the *phase* to
+/// where it started, and a bare enum could not tell the two apart.
+#[tokio::test]
+async fn a_stale_off_capture_fails_against_a_higher_epoch() {
+    let (db, _tmp) = test_db().await;
+    let stale = db.cutover_fence().await.unwrap();
+
+    let lease = db.begin_cutover().await.unwrap();
+    db.abort_cutover(&lease).await.unwrap();
+
+    let now = db.cutover_fence().await.unwrap();
+    assert_eq!(now.phase, stale.phase, "the phase really did return to off");
+    assert!(now.epoch > stale.epoch, "but the epoch moved");
+    assert_ne!(
+        now, stale,
+        "a writer holding the pre-ceremony capture must not match the fence it \
+         would swap against"
+    );
+    assert!(
+        !db.swap_cutover_fence(stale, stale.next(CutoverPhase::Preparing))
+            .await
+            .unwrap(),
+        "the stale capture won a compare-and-swap it should have lost"
+    );
+}
+
+/// §7.5: the generation is committed first, the fence released second.
+#[tokio::test]
+async fn committing_advances_the_generation_and_then_releases_the_fence() {
+    let (db, _tmp) = test_db().await;
+    let lease = db.begin_cutover().await.unwrap();
+    assert_eq!(
+        db.truth_cutover_generation().await.unwrap(),
+        0,
+        "preparing must not have advanced anything yet"
+    );
+
+    db.commit_cutover(&lease, 1).await.unwrap();
+    assert_eq!(db.truth_cutover_generation().await.unwrap(), 1);
+    assert_eq!(
+        db.cutover_fence().await.unwrap().phase,
+        CutoverPhase::Committed
+    );
+}
+
+/// A lease is spent once. Replaying it must not advance a second generation.
+#[tokio::test]
+async fn a_spent_lease_cannot_commit_again() {
+    let (db, _tmp) = test_db().await;
+    let lease = db.begin_cutover().await.unwrap();
+    db.commit_cutover(&lease, 1).await.unwrap();
+
+    assert!(db.commit_cutover(&lease, 2).await.is_err());
+    assert_eq!(
+        db.truth_cutover_generation().await.unwrap(),
+        1,
+        "the replayed commit moved the generation anyway"
+    );
+}
+
+/// §6: `committed` is forward-only. Rebuilding the legacy directory would put
+/// every provisional page's prose back at a path `wenlan pages` reads directly.
+#[tokio::test]
+async fn a_committed_cutover_cannot_be_rolled_back_to_off() {
+    let (db, _tmp) = test_db().await;
+    let lease = db.begin_cutover().await.unwrap();
+    db.commit_cutover(&lease, 1).await.unwrap();
+
+    assert!(db.abort_cutover(&lease).await.is_err());
+    assert!(
+        db.begin_cutover().await.is_err(),
+        "a second ceremony must not be able to walk the fence back to off"
+    );
+    assert_eq!(
+        db.cutover_fence().await.unwrap().phase,
+        CutoverPhase::Committed
+    );
+}
+
+/// Unlike the generation, an unreadable fence is an error rather than a
+/// default. "Inert" for a fence means letting writers through, which is exactly
+/// what an indeterminate ceremony state must not do.
+#[tokio::test]
+async fn an_unreadable_fence_refuses_writes_instead_of_defaulting_to_off() {
+    let (db, _tmp) = test_db().await;
+    db.set_app_metadata(super::TRUTH_CUTOVER_FENCE_KEY, "soon")
+        .await
+        .unwrap();
+
+    assert!(db.cutover_fence().await.is_err());
+    assert!(
+        crate::truth_adapter::page_write_permit(&db, "p1")
+            .await
+            .is_err(),
+        "an unreadable fence must not read as permission to write"
     );
 }
 

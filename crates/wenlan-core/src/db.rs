@@ -32,7 +32,10 @@ mod scoped_entities;
 mod scoped_pages;
 mod truth_exposure;
 
-pub use truth_exposure::{TruthMarkerAudit, TRUTH_CUTOVER_GENERATION_KEY};
+pub use truth_exposure::{
+    CutoverFence, CutoverLease, CutoverPhase, TruthMarkerAudit, TRUTH_CUTOVER_FENCE_KEY,
+    TRUTH_CUTOVER_GENERATION_KEY,
+};
 
 #[cfg(test)]
 mod brief_test;

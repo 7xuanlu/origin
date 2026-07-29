@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The durable half of the M5 exposure contract: the marker audit log, and the
-//! cutover generation that decides whether any of it is live yet.
+//! The durable half of the M5 exposure contract: the marker audit log, the
+//! cutover generation that decides whether any of it is live yet, and the fence
+//! that keeps page writers from crossing the ceremony.
 //!
-//! Two small things, both here because they are properties of the database
+//! Three small things, all here because they are properties of the database
 //! rather than of a request.
 //!
 //! **The audit log** is the *only* compensating control for the one attack D3
@@ -20,6 +21,13 @@
 //! themselves; in production it stays 0 and every adapter is pass-through. PR-C
 //! advances it once, through the fenced ceremony -- the same shape as the M4
 //! reader cutover, deliberately.
+//!
+//! **The fence** is what makes "advances it once" true rather than aspirational.
+//! Pages are projected at runtime, so a page written while the ceremony is
+//! mid-flight would slip past the pass that just ran and land in the vault
+//! unexamined. [`MemoryDB::begin_cutover`] closes the window, and
+//! [`crate::truth_adapter::page_write_permit`] is where every page writer feels
+//! it.
 
 use super::MemoryDB;
 use crate::truth_contract::{visible_at, MarkerOutcome, TruthGrant, Visibility};
@@ -29,6 +37,108 @@ use std::collections::HashMap;
 /// `app_metadata` key holding the durable cutover generation. Absent or `0`
 /// means every truth adapter is inert.
 pub const TRUTH_CUTOVER_GENERATION_KEY: &str = "truth_cutover_generation";
+
+/// `app_metadata` key holding the durable cutover fence, as `"<epoch>:<phase>"`.
+/// Absent is the initial fence: epoch 0, phase off.
+pub const TRUTH_CUTOVER_FENCE_KEY: &str = "truth_cutover_fence";
+
+/// Where the cutover ceremony currently stands.
+///
+/// `Committed` never returns to `Off`. Rebuilding the full legacy directory is
+/// exactly the flip the rollback contract forbids -- every provisional page's
+/// prose would reappear at a path `wenlan pages` reads directly, with nothing
+/// able to stop it. After commit the only moves are forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoverPhase {
+    Off,
+    Preparing,
+    Committed,
+}
+
+impl CutoverPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Preparing => "preparing",
+            Self::Committed => "committed",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "off" => Some(Self::Off),
+            "preparing" => Some(Self::Preparing),
+            "committed" => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+/// The durable writer fence: an epoch paired with a phase.
+///
+/// # Why the phase alone is not enough
+///
+/// `off -> preparing -> off` on an abort would let a writer that captured `off`
+/// before the ceremony compare-and-swap successfully afterwards -- a textbook
+/// ABA. The phase enum cannot distinguish "the `off` I read" from "a later
+/// `off`", and the writer that wins that CAS is exactly the one whose page the
+/// ceremony never examined.
+///
+/// So every transition bumps the epoch, monotonically, and a writer swaps the
+/// *pair*. A stale `off` capture then fails against a higher epoch even when the
+/// phase matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutoverFence {
+    pub epoch: i64,
+    pub phase: CutoverPhase,
+}
+
+impl CutoverFence {
+    /// What a database with no fence row means: nothing has ever run.
+    pub const INITIAL: Self = Self {
+        epoch: 0,
+        phase: CutoverPhase::Off,
+    };
+
+    fn encode(&self) -> String {
+        format!("{}:{}", self.epoch, self.phase.as_str())
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        let (epoch, phase) = raw.split_once(':')?;
+        Some(Self {
+            epoch: epoch.trim().parse().ok()?,
+            phase: CutoverPhase::parse(phase.trim())?,
+        })
+    }
+
+    fn next(&self, phase: CutoverPhase) -> Self {
+        Self {
+            epoch: self.epoch + 1,
+            phase,
+        }
+    }
+}
+
+/// Proof that this process holds the cutover lease.
+///
+/// The field is private, so a caller cannot fabricate one: the only way to hold
+/// a lease is to have won [`MemoryDB::begin_cutover`], and the only way to spend
+/// it is to hand it back to commit or abort. Same discipline as
+/// [`crate::truth_adapter::PagePermit`], for the same reason -- the ceremony
+/// runs outside the request path, where there is no guard to forget to call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverLease {
+    fence: CutoverFence,
+}
+
+impl CutoverLease {
+    /// The fence this lease was minted at. A commit that finds anything else in
+    /// the database has lost the lease.
+    pub fn fence(&self) -> CutoverFence {
+        self.fence
+    }
+}
 
 /// The two truth axes for one page.
 ///
@@ -280,6 +390,150 @@ impl MemoryDB {
     pub async fn set_truth_cutover_generation(&self, generation: i64) -> Result<(), WenlanError> {
         self.set_app_metadata(TRUTH_CUTOVER_GENERATION_KEY, &generation.to_string())
             .await
+    }
+
+    // ==================== the writer fence ====================
+
+    /// The durable cutover fence. Absent means [`CutoverFence::INITIAL`].
+    ///
+    /// A value that does not parse is an **error**, not a default. Every other
+    /// gate in this module fails toward inert, but "inert" for a fence means
+    /// letting writers through, and an indeterminate fence is precisely the
+    /// state where that is unsafe -- recovery consults durable state, never a
+    /// guess. The error propagates into
+    /// [`crate::truth_adapter::page_write_permit`], which then refuses the write.
+    pub async fn cutover_fence(&self) -> Result<CutoverFence, WenlanError> {
+        let Some(raw) = self.get_app_metadata(TRUTH_CUTOVER_FENCE_KEY).await? else {
+            return Ok(CutoverFence::INITIAL);
+        };
+        CutoverFence::parse(raw.trim()).ok_or_else(|| {
+            WenlanError::VectorDb(format!(
+                "cutover fence is unreadable ({raw:?}); refusing to guess whether a \
+                 ceremony is in flight"
+            ))
+        })
+    }
+
+    /// Swap the fence from `observed` to `next`, atomically. `false` means
+    /// somebody else moved it first.
+    ///
+    /// Both statements run under the connection mutex, so the read-modify-write
+    /// a plain `set_app_metadata` would do is never split. The second statement
+    /// exists only for the first ceremony a database ever runs, where the row is
+    /// absent rather than holding the initial value.
+    async fn swap_cutover_fence(
+        &self,
+        observed: CutoverFence,
+        next: CutoverFence,
+    ) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut changed = conn
+            .execute(
+                "UPDATE app_metadata SET value = ?2 WHERE key = ?1 AND value = ?3",
+                libsql::params![TRUTH_CUTOVER_FENCE_KEY, next.encode(), observed.encode()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("swap_cutover_fence update: {e}")))?;
+        if changed == 0 && observed == CutoverFence::INITIAL {
+            changed = conn
+                .execute(
+                    "INSERT INTO app_metadata (key, value)
+                     SELECT ?1, ?2
+                      WHERE NOT EXISTS (SELECT 1 FROM app_metadata WHERE key = ?1)",
+                    libsql::params![TRUTH_CUTOVER_FENCE_KEY, next.encode()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("swap_cutover_fence insert: {e}")))?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Take the cutover lease: `off` -> `preparing`, at a new epoch.
+    ///
+    /// From here until commit or abort, [`crate::truth_adapter::page_write_permit`]
+    /// refuses every page write, so nothing lands in the vault behind the pass
+    /// the ceremony is about to run.
+    pub async fn begin_cutover(&self) -> Result<CutoverLease, WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed.phase != CutoverPhase::Off {
+            return Err(WenlanError::VectorDb(format!(
+                "cannot begin a cutover: the fence is at epoch {} phase {}",
+                observed.epoch,
+                observed.phase.as_str()
+            )));
+        }
+        let next = observed.next(CutoverPhase::Preparing);
+        if !self.swap_cutover_fence(observed, next).await? {
+            return Err(WenlanError::VectorDb(
+                "cannot begin a cutover: the fence moved underneath us".to_string(),
+            ));
+        }
+        Ok(CutoverLease { fence: next })
+    }
+
+    /// Commit the cutover: write the generation, *then* release the fence.
+    ///
+    /// That order is the §7.5 ordering invariant. Releasing first would reopen
+    /// page writes against a generation that has not been committed yet, which
+    /// is the window the whole fence exists to close.
+    ///
+    /// Refuses unless the fence still reads exactly what the lease was minted
+    /// at -- an epoch bump by anyone else means this lease is stale.
+    pub async fn commit_cutover(
+        &self,
+        lease: &CutoverLease,
+        generation: i64,
+    ) -> Result<(), WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed != lease.fence {
+            return Err(WenlanError::VectorDb(format!(
+                "cannot commit the cutover: lease is epoch {} phase {}, fence is epoch {} phase {}",
+                lease.fence.epoch,
+                lease.fence.phase.as_str(),
+                observed.epoch,
+                observed.phase.as_str()
+            )));
+        }
+        self.set_truth_cutover_generation(generation).await?;
+        if !self
+            .swap_cutover_fence(observed, observed.next(CutoverPhase::Committed))
+            .await?
+        {
+            return Err(WenlanError::VectorDb(
+                "the cutover generation is committed but the fence could not be released; \
+                 the fence moved underneath us"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Give the lease back without committing: `preparing` -> `off`, at a new
+    /// epoch.
+    ///
+    /// The new epoch is the point. Returning to the *same* `off` would let a
+    /// writer that captured the pre-ceremony fence swap successfully, and that
+    /// writer's page is one the aborted ceremony may already have examined.
+    pub async fn abort_cutover(&self, lease: &CutoverLease) -> Result<(), WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed != lease.fence || observed.phase != CutoverPhase::Preparing {
+            return Err(WenlanError::VectorDb(format!(
+                "cannot abort the cutover: lease is epoch {} phase {}, fence is epoch {} phase {}",
+                lease.fence.epoch,
+                lease.fence.phase.as_str(),
+                observed.epoch,
+                observed.phase.as_str()
+            )));
+        }
+        if !self
+            .swap_cutover_fence(observed, observed.next(CutoverPhase::Off))
+            .await?
+        {
+            return Err(WenlanError::VectorDb(
+                "cannot abort the cutover: the fence moved underneath us".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

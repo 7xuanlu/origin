@@ -217,10 +217,22 @@ impl PagePermit {
 ///
 /// `None` means no. It is not an error -- declining to project an unsupported
 /// page is the contract working, and callers log it and move on.
+///
+/// # The fence
+///
+/// While a cutover is `preparing`, every page write is refused regardless of the
+/// page's truth state. Pages are projected at runtime, so without this a page
+/// written mid-ceremony would land in the vault behind the pass that just
+/// examined it -- the one file nobody ever ruled on. An unreadable fence refuses
+/// too, by propagating: an indeterminate fence is exactly the state where
+/// letting writers through is unsafe.
 pub async fn page_write_permit(
     db: &MemoryDB,
     page_id: &str,
 ) -> Result<Option<PagePermit>, WenlanError> {
+    if db.cutover_fence().await?.phase == crate::db::CutoverPhase::Preparing {
+        return Ok(None);
+    }
     let ids = vec![page_id.to_string()];
     let visibility = db.page_visibility(&TruthGrant::Automatic, &ids).await?;
     Ok(if visibility.get(page_id) == Some(&Visibility::Full) {

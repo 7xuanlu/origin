@@ -179,7 +179,25 @@ async fn sync_one_file(
             // pick the canonical file; leave it as-is until a genuine re-distill
             // re-establishes the mapping. The page row is untouched either way.
             if writer.page_filename(&existing.id).is_some() {
-                writer.begin_projection_write().write_page(&existing)?;
+                // The permit is taken before the projection lock, not inside it,
+                // so no await happens while the lock is held. Skipping is right
+                // here — unlike the receipted repair path, this is an ambient
+                // reaction to a file the user touched, and the honest response
+                // to "this page may not be projected" is to leave it alone. The
+                // startup invariant is the only pass that evicts hidden pages,
+                // so an ungated rewrite here would outlive the ceremony.
+                match crate::truth_adapter::page_write_permit(db, &existing.id).await? {
+                    Some(permit) => {
+                        writer
+                            .begin_projection_write()
+                            .write_page_permitted(&permit, &existing)?;
+                    }
+                    None => log::info!(
+                        "[truth] not re-projecting page {} after an edit — an automatic \
+                         reader may not see it",
+                        existing.id
+                    ),
+                }
             }
         }
         return Ok(Outcome::Unchanged);
