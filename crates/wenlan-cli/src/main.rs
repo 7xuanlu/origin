@@ -107,11 +107,13 @@ enum Commands {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
-    /// Recall the working memory bundle for a query.
+    /// Recall memories relevant to a query.
     Recall {
-        /// Query to recall context for.
+        /// Query to recall memories for.
         query: String,
     },
+    /// Read the current Space Brief, optionally with related context.
+    Brief(commands::brief::BriefArgs),
     /// Browse distilled pages, or open one in your editor by title query.
     Pages {
         /// Title/filename substring. Omit to list pages newest-first.
@@ -169,13 +171,21 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
+    if cli.all_spaces && matches!(&cli.command, Commands::Brief(_)) {
+        anyhow::bail!("Brief is owned by one Space; --all-spaces is not supported");
+    }
     let environment_agent = std::env::var("WENLAN_AGENT_NAME").ok();
     let agent_name = resolve_agent_name(cli.agent_name.as_deref(), environment_agent.as_deref());
     let base_client = client::WenlanClient::from_env_with_context(agent_name.as_deref(), None)?;
+    let is_brief_update = matches!(
+        &cli.command,
+        Commands::Brief(args) if args.command.is_some()
+    );
     let operation = match &cli.command {
-        Commands::Search { .. } | Commands::Recall { .. } | Commands::Memories { .. } => {
-            Some(CliSpaceOperation::Read)
-        }
+        Commands::Search { .. }
+        | Commands::Recall { .. }
+        | Commands::Brief(commands::brief::BriefArgs { command: None, .. })
+        | Commands::Memories { .. } => Some(CliSpaceOperation::Read),
         Commands::Capture { .. } => Some(CliSpaceOperation::Write),
         _ => None,
     };
@@ -199,6 +209,14 @@ async fn main() -> anyhow::Result<ExitCode> {
         client::WenlanClient::from_env_with_context(
             agent_name.as_deref(),
             context.space.as_deref(),
+        )?
+    } else if is_brief_update {
+        let strict_space = std::env::var("WENLAN_SPACE").ok();
+        effective_cli_space =
+            resolve_native_read_space(strict_space.as_deref(), cli.space.as_deref(), false)?;
+        client::WenlanClient::from_env_with_context(
+            agent_name.as_deref(),
+            effective_cli_space.as_deref(),
         )?
     } else if is_lint {
         let strict_space = std::env::var("WENLAN_SPACE").ok();
@@ -262,6 +280,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Commands::Recall { query } => {
             commands::recall::run(&client, format, cli.quiet, query).await?
+        }
+        Commands::Brief(args) => {
+            commands::brief::run(&client, format, cli.quiet, args, effective_cli_space).await?
         }
         Commands::Pages {
             query,

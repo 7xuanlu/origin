@@ -134,10 +134,10 @@ pub struct CliReader {
     pub adapter: &'static str,
 }
 
-/// All 165 registered `(method, path, handler)` triples.
+/// All 167 registered `(method, path, handler)` triples.
 ///
-/// 47 page-bearing, 118 not. Expands to 169 `(builder, method, path)`
-/// runtime entries: 163 in `main`, 6 in `repair`.
+/// 48 page-bearing, 119 not. Expands to 171 `(builder, method, path)`
+/// runtime entries: 165 in `main`, 6 in `repair`.
 #[rustfmt::skip]
 pub const HTTP_READERS: &[HttpReader] = &[
     HttpReader { method: ReaderMethod::Get, path: "/api/activities", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_list_activities", evidence: "AgentActivityRow.detail = title={page.title}" },
@@ -145,6 +145,8 @@ pub const HTTP_READERS: &[HttpReader] = &[
     HttpReader { method: ReaderMethod::Delete, path: "/api/agents/{name}", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_delete_agent", evidence: "opaque response type — fail-closed" },
     HttpReader { method: ReaderMethod::Get, path: "/api/agents/{name}", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "DEMOTED — proof in the inventory doc" },
     HttpReader { method: ReaderMethod::Put, path: "/api/agents/{name}", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "DEMOTED — proof in the inventory doc" },
+    HttpReader { method: ReaderMethod::Patch, path: "/api/brief", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "BriefUpdateReceipt carries no page prose" },
+    HttpReader { method: ReaderMethod::Post, path: "/api/brief", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_read_brief", evidence: "Brief.last_session_summary, BriefItem.text, SearchResult.content" },
     HttpReader { method: ReaderMethod::Get, path: "/api/briefing", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "DEMOTED — proof in the inventory doc" },
     HttpReader { method: ReaderMethod::Get, path: "/api/capture-stats", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_capture_stats", evidence: "opaque response type — fail-closed" },
     HttpReader { method: ReaderMethod::Post, path: "/api/chunks/delete-bulk", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
@@ -379,7 +381,7 @@ pub fn http_reader(
 }
 
 /// Every `(builder, method, path)` actually installed -- the `MainAndRepair`
-/// rows expanded into one entry per builder. 169 entries from 165 call sites.
+/// rows expanded into one entry per builder. 171 entries from 167 call sites.
 pub fn runtime_entries() -> impl Iterator<Item = (Builder, ReaderMethod, &'static str)> {
     HTTP_READERS.iter().flat_map(|row| {
         [Builder::Main, Builder::Repair]

@@ -195,12 +195,12 @@ fn cli_table_equals_inventory_document() {
 /// catches a bulk edit.
 #[test]
 fn manifest_counts_match_the_spec() {
-    // 165, not the 162 the Stage 0 document was generated with: PR #399 added
-    // the three `/api/spaces/default` routes after the merge base. The router's
-    // coverage assert is what caught it.
+    // 167, not the 162 the Stage 0 document was generated with: PR #399 added
+    // the three `/api/spaces/default` routes and PR #407 added POST/PATCH
+    // `/api/brief`. The router coverage assertion caught both drifts.
     assert_eq!(
         HTTP_READERS.len(),
-        165,
+        167,
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
@@ -209,7 +209,7 @@ fn manifest_counts_match_the_spec() {
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(
         entries.len(),
-        169,
+        171,
         "(builder, method, path) runtime entries"
     );
     assert_eq!(
@@ -217,7 +217,7 @@ fn manifest_counts_match_the_spec() {
             .iter()
             .filter(|(b, _, _)| *b == Builder::Main)
             .count(),
-        163,
+        165,
         "main builder entries"
     );
     assert_eq!(
@@ -233,7 +233,26 @@ fn manifest_counts_match_the_spec() {
         .iter()
         .filter(|r| r.page_bearing == PageBearing::Yes)
         .count();
-    assert_eq!(bearing, 47, "page-bearing HTTP routes");
+    assert_eq!(bearing, 48, "page-bearing HTTP routes");
+}
+
+#[test]
+fn brief_routes_have_explicit_truth_shapes() {
+    let post = HTTP_READERS
+        .iter()
+        .find(|row| row.method == ReaderMethod::Post && row.path == "/api/brief")
+        .expect("POST /api/brief manifest row");
+    assert_eq!(post.page_bearing, PageBearing::Yes);
+    assert_eq!(post.class, TruthClass::Automatic);
+    assert_eq!(post.marker_shape, MarkerShape::None);
+
+    let patch = HTTP_READERS
+        .iter()
+        .find(|row| row.method == ReaderMethod::Patch && row.path == "/api/brief")
+        .expect("PATCH /api/brief manifest row");
+    assert_eq!(patch.page_bearing, PageBearing::No);
+    assert_eq!(patch.class, TruthClass::NotApplicable);
+    assert_eq!(patch.marker_shape, MarkerShape::None);
 }
 
 /// No runtime identity may be registered twice. `(method, path)` alone collides
@@ -361,7 +380,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        156
+        158
     );
 }
 
@@ -372,6 +391,7 @@ fn marker_shape_allowlist_is_fail_closed() {
 fn context_search_and_exports_refuse_every_marker() {
     for path in [
         "/api/context",
+        "/api/brief",
         "/api/search",
         "/api/memory/search",
         "/api/pages/export",

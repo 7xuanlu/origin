@@ -17,7 +17,7 @@ PLUGIN = ROOT / "plugin-codex"
 REQUIRED_SKILL_INTERFACE = {
     "brief": {
         "display_name": "Wenlan Brief",
-        "short_description": "Load status, relevant memories, and pending Wenlan revisions",
+        "short_description": "Read the Space Brief and optional related context",
     },
     "capture": {
         "display_name": "Wenlan Capture",
@@ -37,7 +37,7 @@ REQUIRED_SKILL_INTERFACE = {
     },
     "handoff": {
         "display_name": "Wenlan Handoff",
-        "short_description": "End a Codex session with Wenlan captures and session status",
+        "short_description": "End a Codex session with captures and a typed Brief update",
     },
     "help": {
         "display_name": "Wenlan Help",

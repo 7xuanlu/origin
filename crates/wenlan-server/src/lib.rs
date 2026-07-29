@@ -4,6 +4,8 @@
 //! Only the modules needed by `tests/` are re-exported here. The binary
 //! entry-point (`main.rs`) continues to own the daemon lifecycle.
 
+pub mod brief_files;
+pub mod brief_routes;
 pub mod community_routes;
 pub mod config_routes;
 pub mod error;
@@ -34,6 +36,10 @@ pub mod space_header;
 pub mod state;
 pub mod truth_guard;
 pub mod websocket;
+
+#[cfg(test)]
+#[path = "brief_files_test.rs"]
+mod brief_files_test;
 
 #[cfg(test)]
 #[path = "lint_endpoint_test.rs"]

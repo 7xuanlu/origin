@@ -2,6 +2,7 @@
 //! Subcommand implementations for the origin CLI.
 
 pub mod agents;
+pub mod brief;
 pub mod curate;
 pub mod ingest;
 pub mod lint;

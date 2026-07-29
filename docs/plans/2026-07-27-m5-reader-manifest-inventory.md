@@ -12,7 +12,7 @@ after this file was generated, so the original 162 was correct at `5ba8a3b4` and
 stale by the time PR-B cut its branch. They were not found by re-reading this
 file -- `TrackedRouter`'s coverage assert failed the first time it ran, which is
 the whole point of keeping the enforcement in the router rather than in a
-second scan. Current count: 165.
+second scan. Current count: 167.
 
 ## Three wrong counts before this one
 
@@ -24,7 +24,7 @@ Recorded because the corrections are the only reason to trust the fourth:
 | 163 | fixed both of those, then counted a route registered **inside a `#[cfg(test)]` block** in `routes.rs` — its handler was an inline closure, which is why the adapter cell read `move` |
 | **162** | current: paren-balanced parse, every file, test modules stripped |
 
-158 in `router.rs`, 5 in `repair_routes.rs`,
+160 in `router.rs`, 5 in `repair_routes.rs`,
 2 in `lint_routes.rs`. `routes.rs` contributes none.
 
 Two rules follow, and both are now part of the contract:
@@ -380,9 +380,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 165 registered `(method, path, handler)` triples
+## HTTP — all 167 registered `(method, path, handler)` triples
 
-47 page-bearing, 118 not.
+48 page-bearing, 119 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -391,6 +391,8 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `DELETE` | `/api/agents/{name}` | main | yes | automatic | `none` | `handle_delete_agent` | opaque response type — fail-closed |
 | `GET` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `PUT` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `PATCH` | `/api/brief` | main | no | not_applicable | `none` | — | BriefUpdateReceipt carries no page prose |
+| `POST` | `/api/brief` | main | yes | automatic | `none` | `handle_read_brief` | Brief.last_session_summary, BriefItem.text, SearchResult.content |
 | `GET` | `/api/briefing` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/capture-stats` | main | yes | automatic | `none` | `handle_capture_stats` | opaque response type — fail-closed |
 | `POST` | `/api/chunks/delete-bulk` | main | no | not_applicable | `none` | — | no prose fields |
@@ -932,8 +934,8 @@ adds a test that:
 
    | Count | Value | What it counts |
    |---|---|---|
-   | call-site triples | **165** | rows in this table: 158 `router.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
-   | runtime builder triples | **169** | `(builder, method, path)` pairs actually installed: 163 `main` + 6 `repair` |
+   | call-site triples | **167** | rows in this table: 160 `router.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
+   | runtime builder triples | **171** | `(builder, method, path)` pairs actually installed: 165 `main` + 6 `repair` |
 
    The +4 is two call sites that each land in **both** builders:
    `lint_routes::register` (2 triples) and `repair_routes::register_execution`

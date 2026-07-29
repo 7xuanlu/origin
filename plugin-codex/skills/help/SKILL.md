@@ -17,7 +17,7 @@ calls no tools.
 Wenlan for Codex
 
   /setup          set up or repair the local runtime and MCP bridge
-  /brief [topic]  load session status, identity, preferences, and memories
+  /brief [topic]  read the Space Brief; topic adds related context
   /capture <x>    save one durable memory
   /recall <q>     search local memory
   /lint [deep|repair] [scope]   diagnose, or resolve all findings safely
@@ -25,7 +25,7 @@ Wenlan for Codex
   /pages [q]      list or open distilled pages in the OS editor
   /curate <s>     review pending captures or revisions (s = captures|revisions)
   /forget <id>    delete one memory by exact id after confirmation
-  /handoff        close a session with captures, session log, and status
+  /handoff        close a session with captures, session log, and a Brief update
   /help           show this card
 
 Import progress: ask explicitly; Wenlan checks `list_pending_imports` on demand.
@@ -33,7 +33,7 @@ Import progress: ask explicitly; Wenlan checks `list_pending_imports` on demand.
 Daily flow:
 
   1. /setup once after install, or when Wenlan looks broken
-  2. /brief at session start
+  2. /brief when resuming a project or asking to catch up
   3. /capture durable decisions, corrections, lessons, or preferences
   4. /recall when you need a specific memory
   5. /handoff before ending the session
@@ -42,7 +42,7 @@ Data lives under ~/.wenlan/:
 
   pages/              source-backed wiki pages
   sessions/           narrative session logs
-  sessions/_status/   current per-project status
+  sessions/_status/   human receipts projected from Space Briefs
   bin/                installed wenlan and wenlan-mcp binaries
 
 Open pages with /pages. Inspect history with:

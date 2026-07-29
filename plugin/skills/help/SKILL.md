@@ -23,7 +23,7 @@ abbreviating, no embellishing. The user is asking for the menu.
 Wenlan plugin — daily verbs
 
   /setup        set up or repair Wenlan (auto-installs local runtime)
-  /brief        load identity + topic context (start of session)
+  /brief [topic] read the current Space Brief; topic adds related context
   /capture <x>  save one durable memory in flow
   /recall <q>   search local memory
   /lint [deep|repair] [scope]   diagnose, or resolve all findings safely
@@ -39,7 +39,7 @@ Import progress: ask explicitly; Wenlan checks `list_pending_imports` on demand.
 Daily flow (~1 min overhead per session):
 
   1. start session  →  hook auto-checks runtime, silent if up
-  2. /brief         →  ~5 s, load context
+  2. /brief         →  resume a project or ask to catch up
   3. work normally  →  Claude proactively /captures durable facts
   4. /recall X      →  as needed for lookups
   5. /handoff       →  ~30 s, narrative session log + captures
@@ -48,7 +48,7 @@ Where your data lives (everything under ~/.wenlan/):
 
   ~/.wenlan/pages/      wiki pages distilled from your memories (md)
   ~/.wenlan/sessions/   session logs by date (md)
-  ~/.wenlan/sessions/_status/  current per-project goals + last-handoff
+  ~/.wenlan/sessions/_status/  human receipts projected from Space Briefs
   ~/.wenlan/db/         memories + knowledge graph (symlink to libSQL)
   ~/.wenlan/bin/        installed binaries
 
