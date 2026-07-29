@@ -1397,6 +1397,66 @@ Execution evidence:
   `191 / 55-50-86`. That cleanup is assigned to R8 rather than widening this
   movement slice.
 
+#### R4-16 — LongMemEval temporal seed writes
+
+- Add `db/eval_temporal_seed.rs` with a crate-visible typed seed carrying
+  `source_id: String` and `event_date: i64`, plus one purpose-bounded
+  `MemoryDB` method returning `()`. The method acquires one DB mutex even for
+  an empty slice, iterates seeds in supplied order, and executes the exact
+  `UPDATE memories SET event_date = ? WHERE source_id = ?` with
+  `libsql::params![seed.event_date, seed.source_id.as_str()]`.
+- Preserve the existing intentionally lossy mutation semantics: apply
+  `let _ = conn.execute(...).await` independently for every seed, continue
+  after a failed statement, open no transaction, perform no rollback,
+  prevalidation, sorting, or deduplication, and return no affected-row count or
+  error. One mutex remains held across the complete ordered loop; no raw handle
+  or callback crosses the DB boundary.
+- Extract one private pure `t4a_event_date_seeds` helper in
+  `eval/longmemeval.rs` and call it from both temporal runners. The helper owns
+  `haystack_dates.get(mem.session_idx)`, `parse_lme_date`, full
+  `DateTime::timestamp()` conversion, and `memory_source_id` construction from
+  `mem.question_id`, `session_idx`, and `turn_idx`. It preserves input order
+  and duplicate seeds and skips missing or malformed dates.
+- Do not reuse `event_date_map`: that separate T11/T20 contract stores seeds in
+  a `HashMap` and deliberately truncates timestamps to midnight. Both T4a
+  loops currently preserve the full parsed time, such as `17:50`; changing
+  them to midnight, reordered, or deduplicated seeds is behavior drift.
+- Keep both calls immediately after `upsert_documents` and before relevance,
+  cue, or search work. The report runner retains `total_memories`; the
+  per-query collector retains its latency and touched-channel policy. No
+  fixture, relevance, temporal-cue, search, scoring, or reporting policy moves
+  under `MemoryDB`.
+- Direct controls install a trigger that aborts one selected update and pass
+  ordered seeds with successful writes before and after it. They prove earlier
+  and later successes persist, the failure is swallowed, no transaction rolls
+  the batch back, and an unmatched source is harmless. Two physical memory rows
+  sharing one matching `source_id` must both update; an existing unrelated row
+  must retain its prior `event_date`; duplicate seeds for the matching
+  `source_id` must apply in input order with the last successful timestamp
+  retained. Separate controls prove an empty slice completes without mutation
+  and an update against a missing `memories` table returns normally after
+  swallowing the SQL error.
+- A caller-helper control uses a non-midnight fixture and asserts the exact
+  full Unix timestamp, non-natural input order, duplicate preservation, and
+  malformed plus missing-session skips. The DB test module uses an `_test.rs`
+  suffix.
+- RED removes only the `eval/longmemeval.rs: 2` baseline row; before
+  extraction the exact guard reports two new direct accesses. GREEN moves
+  both production locks under `db/**`: external literals `302 → 300`,
+  production `13 → 11`, and tests remain `289`. The method/seed re-export and
+  test wiring add four mechanical `db.rs` lines.
+- The generated M5 inventory must remain exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; only mechanically shifted source addresses
+  may change. No truth adapter, manifest row, permit, or cutover generation
+  changes. This is a movement-only eval-seed slice: run focused unit and
+  structural controls, not a real LongMemEval quality benchmark, and make no
+  eval-effect claim.
+- PRE-IMPLEMENTATION PREFLIGHT, 2026-07-29: independent Sol and auditor reviews
+  agree on the ordered typed-seed boundary. The auditor returned **BLOCK** on
+  the initial candidate until the full-time-versus-midnight distinction and
+  non-midnight control were explicit; with those additions, the section above
+  is the frozen resolution.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,
