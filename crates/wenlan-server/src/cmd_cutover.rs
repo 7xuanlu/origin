@@ -2,9 +2,13 @@
 //! `truth-cutover` internal CLI subcommand — the M5 ceremony.
 //!
 //! Advancing the truth cutover generation stops the projection directory
-//! carrying prose no evidence supports. It does that by DELETING those pages'
-//! `.md` files out of the user's vault, so this is the most destructive
-//! operation the daemon owns.
+//! carrying prose no evidence supports. It does that by MOVING those pages'
+//! `.md` files into `<vault>/archive/`, so this is the most invasive operation
+//! the daemon owns: it reaches into a directory the user also edits by hand.
+//!
+//! Archived, not deleted, because the projection directory is usually the
+//! user's own vault. The database can rebuild a page's prose; it cannot rebuild
+//! what a person typed into the file afterwards.
 //!
 //! # Why this is not an HTTP route
 //!
@@ -126,7 +130,7 @@ pub async fn run(generation: i64, apply: bool) -> Result<()> {
         None | Some("") => {
             return Err(anyhow!(
                 "no unspent dry run on record. Run this command without `--apply` first \
-                 and read the eviction list — it names files that will be deleted from \
+                 and read the eviction list — it names files that will be moved out of \
                  the user's vault."
             ))
         }
@@ -140,9 +144,13 @@ pub async fn run(generation: i64, apply: bool) -> Result<()> {
         Some(_) => {}
     }
 
+    // Say what actually happens. An operator who reads "delete" and types `y`
+    // consented to something this no longer does, and one who reads "archive"
+    // has to be able to find the files afterwards -- so name the directory.
     print!(
-        "\nDelete {} file(s) from {} and advance to generation {}? This cannot be \
-         undone by rolling the generation back. (y/N): ",
+        "\nMove {} file(s) out of {} into archive/ and advance to generation {}? \
+         The generation cannot be rolled back, though the files stay readable \
+         in archive/. (y/N): ",
         plan.evictions.len(),
         knowledge_path.display(),
         generation
