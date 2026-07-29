@@ -1361,6 +1361,41 @@ Execution evidence:
   method because error-to-zero is evaluator fairness policy, not a storage
   mechanic; the `Result<i64, WenlanError>` seam and caller fallback above are
   the frozen resolution.
+- IMPLEMENTATION, 2026-07-29:
+  `MemoryDB::eval_paired_summary_node_count` owns only the literal count query,
+  row iteration, and `i64` decode. Missing-table and other query/row/decode
+  failures remain `Err`, while `assert_summary_nodes_empty` alone applies the
+  unchanged `.unwrap_or(0)` fairness fallback and exact assertion diagnostic.
+  Both LoCoMo and LongMemEval call sites remain in their original pre-fixture
+  positions.
+- Direct and caller controls pass `2 / 2`: one isolated fixture proves missing
+  table `Err` plus caller pass, empty table `0`, and one row `1`; a second
+  proves the one-row caller panic retains the required
+  `summary_nodes is non-empty (1 rows): the global-prelude prepend` prefix.
+  Existing paired serialization control passes `1 / 1`.
+- RED reports exactly one new `eval/paired.rs` direct access after removing
+  only its baseline row. The exact ratchet then passes `3 / 3`: external
+  literals `303 → 302`, production `14 → 13`, tests remain `289`, and paired
+  disappears from the per-file baseline. The generated M5 inventory and drift
+  control remain exactly `191` rows with depth `55 / 50 / 86` and exposure
+  `22`; only mechanical source addresses move. Focused tests, formatting, diff
+  checks, and core/server all-target Clippy with `-D warnings` pass. No quality
+  benchmark was run and no eval-effect claim is made.
+- ROOT GATE, 2026-07-29: paired guard controls pass `2 / 2`, the existing
+  paired serialization control passes `1 / 1`, the exact ratchet passes
+  `3 / 3`, and the M5 drift control passes `1 / 1`. Rust-analyzer reports no
+  diagnostic in the new DB module or its direct test; the method has one
+  production caller.
+- POST-IMPLEMENTATION AUDIT, 2026-07-29: the independent auditor returned
+  **APPROVE** for the fail-soft boundary, controls, unchanged call positions,
+  ratchet, M5 inventory, excluded LongMemEval writes and truth scope, and exact
+  seven-file staging.
+- REVIEW, 2026-07-29: the independent Sol reviewer returned **APPROVE** with no
+  material finding. It identified pre-existing prose drift in the M5 inventory
+  document: its historical “Draft 5” narrative still says
+  `190 / 54-50-86`, while the executable generator and frozen ledger say
+  `191 / 55-50-86`. That cleanup is assigned to R8 rather than widening this
+  movement slice.
 
 ### R5 — server vertical slices
 
@@ -1381,6 +1416,11 @@ or scheduling order.
 
 Run after the code boundaries have stabilized so the documentation describes
 the resulting architecture rather than predicting it.
+
+- Reconcile or explicitly mark historical the stale
+  `m5-reader-manifest-inventory.md` “Draft 5” prose/table
+  (`190 / 54-50-86`) against the executable current-tree inventory; never
+  hand-edit the generated reader rows.
 
 ## Review and team protocol
 

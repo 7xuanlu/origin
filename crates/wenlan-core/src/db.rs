@@ -28,6 +28,7 @@ mod derived_artifact_sweep;
 mod edges_rebuild;
 mod entity_page_adapter;
 mod eval_lifecycle_integrity;
+mod eval_paired_guard;
 mod eval_pipeline_reads;
 mod eval_substrate_guard;
 mod kg_quality_diagnostics;
@@ -69,6 +70,8 @@ mod edges_rebuild_test;
 mod entity_page_adapter_test;
 #[cfg(test)]
 mod eval_lifecycle_integrity_test;
+#[cfg(test)]
+mod eval_paired_guard_test;
 #[cfg(test)]
 mod eval_pipeline_reads_test;
 #[cfg(test)]
