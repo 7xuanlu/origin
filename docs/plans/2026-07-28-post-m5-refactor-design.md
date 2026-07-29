@@ -669,6 +669,102 @@ and a RED mutation control proves the final guard catches a production bypass.
   connection retention or renamed access rather than trust the `db/**` path
   exclusion alone.
 
+#### R4-2 — typed memory point reads
+
+Selected after tracing callers, route responses, and M5 write semantics:
+
+- Add one bounded `db/memory_point_reads.rs` child with exactly three typed
+  read methods:
+  `has_active_non_episode_memory_id`,
+  `pending_memory_revision_payload`, and
+  `memory_content_hashes_for_source_ids`.
+- Keep `PageRevisionCard` and all `structured_fields` interpretation in
+  `post_write`. The DB method returns only the selected pending-memory row
+  projection, so deciding whether it is a `page_write` / `page` card remains
+  post-write business logic.
+- Preserve caller ordering: `page_source_reference_exists` first performs its
+  logical `get_memory_detail` lookup and only uses the physical-id fallback for
+  `creation_kind == "source"`; revision accept/dismiss still resolve the card
+  before their existing atomic write/delete path; distillation still sorts,
+  deduplicates, and takes the empty fast path before querying.
+- Preserve exact query semantics: active, non-episode physical ids; exact
+  revision `source_id` before legacy `supersedes`, then newest
+  `last_modified`; and only `source = 'memory'`, `chunk_index = 0` content
+  hashes with SQL `NULL` retained.
+- This slice removes two production locks from `post_write.rs` and one from
+  `synthesis/distill.rs`. RED is the ratchet reduction from `20 → 18` and
+  `13 → 12`; it must fail before the caller migration and pass afterward.
+- Strengthen the migration ratchet to exact per-path counts: an absent baseline
+  row or a current count below its recorded allowance fails until the same diff
+  lowers/removes the baseline. This prevents a successful cleanup from leaving
+  a standing future grant. Globally sort diagnostics and extend the existing
+  positive control with stale-path and reduced-count cases.
+- M5 boundary: revision accept/dismiss HTTP responses remain classified
+  `page_bearing: No` with `no prose fields`; the page revision payload is
+  internal input to the unchanged `try_accept_page_revision` or delete path.
+  No page query, truth adapter, `PagePermit`, manifest row, or cutover
+  generation changes.
+
+Execution evidence:
+
+- RED: after lowering the two exact baselines before caller migration, the
+  guard failed with `post_write.rs` increased `18 → 20` and
+  `synthesis/distill.rs` increased `12 → 13`; its two mutation controls still
+  passed. GREEN: the three caller migrations plus exact baseline counts pass
+  the ratchet and controls `3 / 3`.
+- `db/memory_point_reads.rs` contains exactly the three selected reads. Direct
+  SQL-contract tests pass `3 / 3`: physical-id active/non-episode behavior;
+  exact revision `source_id` precedence plus the newest eligible legacy
+  `supersedes` fallback with raw JSON retained; and chunk-zero content hashes
+  with SQL `NULL` and missing-row semantics.
+- The production child is `112` lines. Its `358` lines of SQL-contract
+  fixtures/tests live in `db/memory_point_reads_test.rs`, declared only under
+  `#[cfg(test)]` and excluded from the M5 sweep by the established `_test.rs`
+  suffix convention. The row projection is re-exported as a nameable
+  `pub(crate)` DB type and explicitly named by its one production caller.
+- The external literal total falls `330 → 327`; production literals fall
+  `41 → 38`, while the explicit test-scoped set remains `289`. The ratchet now
+  rejects increases, decreases without a same-diff baseline update, new files,
+  and stale rows in globally sorted diagnostics.
+- Existing behavior passes: revision accept `11 / 11`; dismiss `6 / 6`;
+  atomic page-revision failure/retry `2 / 2`; document-majority distillation
+  `1 / 1`. Caller order, page-card JSON interpretation, accept/delete writes,
+  and transaction boundaries are unchanged.
+- rust-analyzer reports no errors in the new child, `post_write.rs`,
+  `synthesis/distill.rs`, or the ratchet. Reference lookup resolves every new
+  method to exactly one production caller plus its local contract tests.
+- The generated M5 inventory remains exactly `191` rows with depth
+  `55 / 50 / 86` and exposure `22`; generated line addresses shift in
+  `db.rs`, `post_write.rs`, and `synthesis/distill.rs`, with no row,
+  depth, or exposure change.
+- PR-level verification passes: all-target Clippy with `-D warnings` for
+  `wenlan-core` plus `wenlan-server`, and one uninterrupted
+  `cargo test --workspace --lib --quiet`: CLI `32 / 32`; core `3,305` passed
+  with `33` ignored; MCP `178 / 178`; server `339` passed with `2` ignored;
+  types `183 / 183`.
+- REVIEW 1, 2026-07-29: Opus/xhigh returned **sound, ship-able** and found no
+  semantic drift. Its useful non-blocking findings led to exact-baseline
+  wording and the legacy-`supersedes` fallback assertions. Caller-specific
+  error prefixes were retained deliberately because this movement slice
+  preserves observable error text.
+- REVIEW 2, 2026-07-29: Opus/xhigh caught one **FIX-FIRST** diagnostic bug:
+  an increased count incorrectly told contributors to update the baseline.
+  Increase and decrease remedies are now distinct and mutation-tested. The DB
+  method also handles an empty hash-id slice, and the M5 evidence now names
+  every file whose generated addresses shifted.
+- REVIEW 3, 2026-07-29: Opus/xhigh found the extraction faithful with no
+  correctness finding. Its consistency follow-ups externalized the inline test
+  module, made the row projection nameable, and pinned missing-row plus SQL
+  `NULL` structured-field behavior. The caller's sort/dedup/empty fast path
+  remains intentionally explicit, and original error prefixes remain stable.
+- REVIEW 4, 2026-07-29: Opus/xhigh returned **faithful, ship-able** after
+  independently checking exact SQL text and ordering, error prefixes, caller
+  semantics, lock scope, ratchet counts, test reachability, and inventory
+  addresses. Its remaining findings were non-blocking documentation and
+  positive-control nits: the ratchet heading now names exact matching, an
+  equal-count fixture proves the accept branch, and the three bounded reads
+  document physical-id, legacy precedence, and chunk-zero/`NULL` semantics.
+
 ### R5 — server vertical slices
 
 Move route registration and handlers domain by domain. Preserve route identity,

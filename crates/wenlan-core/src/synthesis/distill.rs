@@ -338,33 +338,7 @@ async fn load_cluster_content_hashes(
         return Ok(HashMap::new());
     }
 
-    let placeholders = source_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT source_id, content_hash FROM memories WHERE source = 'memory' AND chunk_index = 0 AND source_id IN ({placeholders})"
-    );
-    let params: Vec<libsql::Value> = source_ids.into_iter().map(libsql::Value::Text).collect();
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(&sql, libsql::params_from_iter(params))
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("distill content_hash fetch: {e}")))?;
-
-    let mut hashes = HashMap::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("distill content_hash row: {e}")))?
-    {
-        let source_id = row.get::<String>(0).unwrap_or_default();
-        let content_hash = row.get::<Option<String>>(1).unwrap_or(None);
-        hashes.insert(source_id, content_hash);
-    }
-    Ok(hashes)
+    db.memory_content_hashes_for_source_ids(&source_ids).await
 }
 
 fn cap_one_document_majority(

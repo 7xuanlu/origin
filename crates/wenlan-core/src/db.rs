@@ -25,6 +25,7 @@ mod claim_identity;
 mod count;
 mod edges_rebuild;
 mod entity_page_adapter;
+mod memory_point_reads;
 mod migrations_v004_v009;
 mod onboarding_milestones;
 mod page_drafts;
@@ -35,6 +36,7 @@ mod source_sync;
 mod space_context;
 mod truth_exposure;
 
+pub(crate) use memory_point_reads::PendingMemoryRevisionPayload;
 pub use truth_exposure::{TruthMarkerAudit, TRUTH_CUTOVER_GENERATION_KEY};
 
 #[cfg(test)]
@@ -47,6 +49,8 @@ mod claim_identity_test;
 mod edges_rebuild_test;
 #[cfg(test)]
 mod entity_page_adapter_test;
+#[cfg(test)]
+mod memory_point_reads_test;
 #[cfg(test)]
 mod page_drafts_test;
 #[cfg(test)]

@@ -5671,7 +5671,7 @@ fn db_test_module_layout_guard_rejects_inline_and_census_visible_shapes() {
     );
 }
 
-// ── R0: shrink-only direct DB connection access ──
+// ── R0: exact direct DB connection access baseline ──
 
 const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ("crates/wenlan-core/src/citations.rs", 1),
@@ -5749,7 +5749,7 @@ const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ("crates/wenlan-core/src/maintenance/duplicates.rs", 2),
     ("crates/wenlan-core/src/maintenance/survivor_tests.rs", 1),
     ("crates/wenlan-core/src/post_ingest.rs", 2),
-    ("crates/wenlan-core/src/post_write.rs", 20),
+    ("crates/wenlan-core/src/post_write.rs", 18),
     ("crates/wenlan-core/src/refinery/mod.rs", 13),
     ("crates/wenlan-core/src/repair.rs", 20),
     (
@@ -5764,7 +5764,7 @@ const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ("crates/wenlan-core/src/repair_plan_tests.rs", 29),
     ("crates/wenlan-core/src/retrieval/hard_filters.rs", 2),
     ("crates/wenlan-core/src/synthesis/detect.rs", 3),
-    ("crates/wenlan-core/src/synthesis/distill.rs", 13),
+    ("crates/wenlan-core/src/synthesis/distill.rs", 12),
     ("crates/wenlan-core/src/synthesis/distill_truth_test.rs", 1),
     ("crates/wenlan-core/src/synthesis/refinement_queue.rs", 19),
     ("crates/wenlan-core/src/truth_adapter_test.rs", 1),
@@ -5797,23 +5797,40 @@ fn external_conn_access_violations(
     baseline: &BTreeMap<String, usize>,
     current: &BTreeMap<String, usize>,
 ) -> Vec<String> {
-    current
+    let mut violations: Vec<String> = current
         .iter()
         .filter_map(|(path, count)| match baseline.get(path) {
-            Some(allowed) if count <= allowed => None,
+            Some(allowed) if count == allowed => None,
+            Some(allowed) if count > allowed => Some(format!(
+                "{path}: direct .conn.lock() access increased {allowed} -> {count}; \
+                 replace it with a bounded MemoryDB method"
+            )),
             Some(allowed) => Some(format!(
-                "{path}: direct .conn.lock() access increased {allowed} -> {count}"
+                "{path}: direct .conn.lock() access decreased {allowed} -> {count}; \
+                 lower the baseline in this diff"
             )),
             None => Some(format!(
                 "{path}: {count} new direct .conn.lock() access{}",
                 if *count == 1 { "" } else { "es" }
             )),
         })
-        .collect()
+        .collect();
+    violations.extend(
+        baseline
+            .keys()
+            .filter(|path| !current.contains_key(*path))
+            .map(|path| {
+                format!(
+                    "{path}: stale direct .conn.lock() baseline row; remove it from the baseline"
+                )
+            }),
+    );
+    violations.sort();
+    violations
 }
 
 #[test]
-fn external_conn_access_does_not_grow() {
+fn external_conn_access_matches_exact_baseline() {
     let baseline: BTreeMap<String, usize> = EXTERNAL_CONN_ACCESS_BASELINE
         .iter()
         .map(|(path, count)| ((*path).to_string(), *count))
@@ -5823,32 +5840,37 @@ fn external_conn_access_does_not_grow() {
 
     assert!(
         violations.is_empty(),
-        "direct MemoryDB connection access outside db.rs/db/** is shrink-only; \
-         use a MemoryDB method instead of adding a new lock:\n{}",
+        "direct MemoryDB connection access outside db.rs/db/** must match the exact baseline; \
+         replace new locks with bounded MemoryDB methods and update the baseline in the same diff \
+         after removals:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn external_conn_access_ratchet_detects_new_and_increased_files() {
+fn external_conn_access_exact_baseline_rejects_all_drift() {
     let baseline = BTreeMap::from([
         ("crates/wenlan-core/src/a.rs".to_string(), 2),
-        ("crates/wenlan-core/src/shrinking.rs".to_string(), 3),
+        ("crates/wenlan-core/src/middle.rs".to_string(), 3),
+        ("crates/wenlan-core/src/ok.rs".to_string(), 2),
         ("crates/wenlan-core/src/removed.rs".to_string(), 1),
     ]);
     let current = BTreeMap::from([
         ("crates/wenlan-core/src/a.rs".to_string(), 3),
+        ("crates/wenlan-core/src/middle.rs".to_string(), 1),
         ("crates/wenlan-core/src/new.rs".to_string(), 1),
-        ("crates/wenlan-core/src/shrinking.rs".to_string(), 1),
+        ("crates/wenlan-core/src/ok.rs".to_string(), 2),
     ]);
 
     assert_eq!(
         external_conn_access_violations(&baseline, &current),
         vec![
-            "crates/wenlan-core/src/a.rs: direct .conn.lock() access increased 2 -> 3",
+            "crates/wenlan-core/src/a.rs: direct .conn.lock() access increased 2 -> 3; replace it with a bounded MemoryDB method",
+            "crates/wenlan-core/src/middle.rs: direct .conn.lock() access decreased 3 -> 1; lower the baseline in this diff",
             "crates/wenlan-core/src/new.rs: 1 new direct .conn.lock() access",
+            "crates/wenlan-core/src/removed.rs: stale direct .conn.lock() baseline row; remove it from the baseline",
         ],
-        "the ratchet must reject increases and new files while accepting shrinkage"
+        "the ratchet must accept exact matches and reject count drift, new files, and stale baseline rows in deterministic order"
     );
 }
 

@@ -5,7 +5,7 @@
 //! enqueue). Both HTTP route handlers and daemon-internal extractors call
 //! these -- eliminating drift between agent-LLM and daemon-LLM trigger paths.
 
-use crate::db::{MemoryDB, UNFILED_SPACE_ID};
+use crate::db::{MemoryDB, PendingMemoryRevisionPayload, UNFILED_SPACE_ID};
 use crate::error::WenlanError;
 use std::{collections::HashSet, fmt::Write as _, path::Path, str::FromStr};
 use wenlan_types::{
@@ -2664,18 +2664,7 @@ async fn page_source_reference_exists(
     if creation_kind != "source" {
         return Ok(false);
     }
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM memories WHERE id = ?1 AND pending_revision = 0 AND source != 'episode' LIMIT 1",
-            libsql::params![source_id],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("source page chunk lookup: {e}")))?;
-    rows.next()
-        .await
-        .map(|row| row.is_some())
-        .map_err(|e| WenlanError::VectorDb(format!("source page chunk lookup row: {e}")))
+    db.has_active_non_episode_memory_id(source_id).await
 }
 
 struct CreatePageInput<'a> {
@@ -3983,43 +3972,14 @@ async fn resolve_page_revision_card(
     db: &MemoryDB,
     id: &str,
 ) -> Result<Option<PageRevisionCard>, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT source_id, supersedes, content, structured_fields \
-             FROM memories \
-             WHERE pending_revision = 1 \
-               AND source = 'memory' \
-               AND (source_id = ?1 OR supersedes = ?1) \
-             ORDER BY CASE WHEN source_id = ?1 THEN 0 ELSE 1 END, last_modified DESC \
-             LIMIT 1",
-            libsql::params![id.to_string()],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("resolve_page_revision_card: {e}")))?;
-
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("resolve_page_revision_card row: {e}")))?
-    else {
+    let payload: Option<PendingMemoryRevisionPayload> =
+        db.pending_memory_revision_payload(id).await?;
+    let Some(payload) = payload else {
         return Ok(None);
     };
-    let revision_id = row
-        .get::<String>(0)
-        .map_err(|e| WenlanError::VectorDb(format!("revision source_id: {e}")))?;
-    let supersedes = row
-        .get::<String>(1)
-        .map_err(|e| WenlanError::VectorDb(format!("revision supersedes: {e}")))?;
-    let content = row
-        .get::<String>(2)
-        .map_err(|e| WenlanError::VectorDb(format!("revision content: {e}")))?;
-    let structured = row
-        .get::<Option<String>>(3)
-        .unwrap_or(None)
+    let structured = payload
+        .structured_fields
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    drop(rows);
-    drop(conn);
 
     let Some(structured) = structured else {
         return Ok(None);
@@ -4033,7 +3993,7 @@ async fn resolve_page_revision_card(
     let page_id = structured
         .get("revises_page")
         .and_then(|v| v.as_str())
-        .unwrap_or(&supersedes)
+        .unwrap_or(&payload.supersedes)
         .to_string();
     let source_memory_ids = structured
         .get("source_memory_ids")
@@ -4049,9 +4009,9 @@ async fn resolve_page_revision_card(
 
     Ok(Some(PageRevisionCard {
         page_id,
-        revision_id,
+        revision_id: payload.revision_id,
         page_version,
-        content,
+        content: payload.content,
         source_memory_ids,
     }))
 }
