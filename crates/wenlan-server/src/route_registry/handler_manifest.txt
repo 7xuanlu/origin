@@ -55,9 +55,9 @@ main|get|/api/profile/narrative|wenlan_server::profile_narrative_routes::handle_
 main|get|/api/refinery/queue|wenlan_server::refinery_routes::handle_list_refinements
 main|get|/api/retrievals/recent|wenlan_server::routes::handle_recent_retrievals
 main|get|/api/setup/status|wenlan_server::config_routes::handle_get_setup_status
-main|get|/api/snapshots|wenlan_server::memory_routes::handle_list_snapshots
-main|get|/api/snapshots/{id}/captures|wenlan_server::memory_routes::handle_get_snapshot_captures
-main|get|/api/snapshots/{id}/captures-with-content|wenlan_server::memory_routes::handle_get_snapshot_captures_with_content
+main|get|/api/snapshots|wenlan_server::snapshot_routes::handle_list_snapshots
+main|get|/api/snapshots/{id}/captures|wenlan_server::snapshot_routes::handle_get_snapshot_captures
+main|get|/api/snapshots/{id}/captures-with-content|wenlan_server::snapshot_routes::handle_get_snapshot_captures_with_content
 main|get|/api/sources|wenlan_server::source_routes::handle_list_sources
 main|get|/api/spaces|wenlan_server::spaces_routes::handle_list_spaces
 main|get|/api/spaces/default|wenlan_server::spaces_routes::handle_get_default_space
@@ -120,7 +120,7 @@ main|post|/api/repairs/prepare|wenlan_server::repair_routes::handle_prepare
 main|post|/api/repairs/verify|wenlan_server::repair_routes::handle_verify
 main|post|/api/search|wenlan_server::routes::handle_search
 main|post|/api/shutdown|wenlan_server::routes::handle_shutdown
-main|post|/api/snapshots/{id}/delete|wenlan_server::memory_routes::handle_delete_snapshot
+main|post|/api/snapshots/{id}/delete|wenlan_server::snapshot_routes::handle_delete_snapshot
 main|post|/api/sources|wenlan_server::source_routes::handle_add_source
 main|post|/api/sources/{id}/sync|wenlan_server::source_routes::handle_sync_source
 main|post|/api/spaces|wenlan_server::spaces_routes::handle_create_space

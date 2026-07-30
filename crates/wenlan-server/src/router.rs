@@ -10,8 +10,8 @@ use crate::{
     decisions_routes, entity_graph_routes, import_routes, indexed_files_routes, ingest_routes,
     knowledge_routes, lint_routes, memory_detail_routes, memory_revision_routes, memory_routes,
     onboarding_routes, page_map_routes, pinned_memory_routes, profile_agents_routes,
-    profile_narrative_routes, refinery_routes, repair_routes, routes, security, source_routes,
-    spaces_routes, truth_guard, websocket,
+    profile_narrative_routes, refinery_routes, repair_routes, routes, security, snapshot_routes,
+    source_routes, spaces_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -216,25 +216,11 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = profile_narrative_routes::register(router);
     let router = pinned_memory_routes::register(router);
     let router = memory_revision_routes::register_pending(router);
-    let router = router
-        // Working memory (batch 6)
-        .route("/api/snapshots", get(memory_routes::handle_list_snapshots))
-        .route(
-            "/api/snapshots/{id}/captures",
-            get(memory_routes::handle_get_snapshot_captures),
-        )
-        .route(
-            "/api/snapshots/{id}/captures-with-content",
-            get(memory_routes::handle_get_snapshot_captures_with_content),
-        )
-        .route(
-            "/api/snapshots/{id}/delete",
-            post(memory_routes::handle_delete_snapshot),
-        )
-        .route(
-            "/api/memory/{id}/update-page",
-            post(memory_routes::handle_update_page),
-        );
+    let router = snapshot_routes::register(router);
+    let router = router.route(
+        "/api/memory/{id}/update-page",
+        post(memory_routes::handle_update_page),
+    );
     let router = knowledge_routes::register(router);
     let router = onboarding_routes::register(router);
     let router = websocket::register(router);

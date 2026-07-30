@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 11 complete**
+Status: **R4 complete; R5 in progress; handler-movement slice 12 complete**
 
 ## Authority and change control
 
@@ -4340,6 +4340,87 @@ R5 handler-movement slice 11 evidence, 2026-07-30:
   and typed controls, current citations/counts, and complete LSP closure. Its
   focused reruns passed the typed contract, exact handler guard, truth
   manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff hygiene.
+
+R5 handler-movement slice 12 contract, 2026-07-30:
+
+- Move exactly `GET /api/snapshots`,
+  `GET /api/snapshots/{id}/captures`,
+  `GET /api/snapshots/{id}/captures-with-content`, and
+  `POST /api/snapshots/{id}/delete` into `snapshot_routes.rs` through one
+  registrar immediately after pending memory revisions and before
+  `POST /api/memory/{id}/update-page`. Exactly four handler-manifest identities
+  may change.
+- Move `SnapshotsQuery`, its default-limit helper, and all four handlers
+  byte-for-byte. Preserve global snapshot listing and its default/query limit,
+  global idempotent deletion and capture unlinking, header-only Space
+  resolution for both capture readers, parent-collection filtering before
+  content materialization, shared DTO mapping, and every short state snapshot
+  before DB awaits.
+- Typed built-router characterization must use shared `SessionSnapshot`,
+  `SnapshotCapture`, `SnapshotCaptureWithContent`, and `SuccessResponse` plus
+  the established test-local `ErrorEnvelope`. Seed ordered snapshots plus mixed
+  work/personal capture ownership; prove global typed list ordering/limit,
+  scoped metadata and content positives with cross-Space negatives, scoped
+  missing/mismatch `404`, both capture readers' unknown-Space `422`, all four
+  no-DB `503`s and marked `403`s, and typed delete success plus list removal.
+- All four routes remain non-page-bearing
+  `NotApplicable`/`MarkerShape::None`. Truth, sensitive-read, mutation, M5,
+  security, and lifecycle sources stay unchanged. Snapshot DB schema and
+  algorithms, `update-page`, remaining memory handlers, Page handlers, DTO
+  normalization, CLI, and MCP remain out of scope.
+
+R5 handler-movement slice 12 evidence, 2026-07-30:
+
+- Exactly the four frozen snapshot endpoints now execute in
+  `snapshot_routes.rs` through one registrar immediately after pending memory
+  revisions and before `POST /api/memory/{id}/update-page`. The old/new
+  query/helper/handler block has identical SHA-256
+  `4c699093693b9783bad49f6a94d420d5c6bc9b17c4cd67773393dc1d43764069`;
+  list/delete semantics, parent filtering, content materialization order,
+  shared DTO mapping, state snapshots, and DB-await lifetimes are
+  byte-preserved.
+- Before updating expected identities, the production-builder control was RED
+  on precisely four new `snapshot_routes::*` observations versus four old
+  `memory_routes::*` expectations. Updating only those handler-manifest fields
+  made it GREEN. Truth, sensitive-read, mutation, M5, security, and lifecycle
+  sources remain unchanged.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. Shared `SessionSnapshot` proves global ordering, query limit,
+  and post-delete removal; shared `SnapshotCapture` and
+  `SnapshotCaptureWithContent` prove work-only metadata/content with personal
+  negatives. The test-local `ErrorEnvelope` covers scoped mismatch/missing
+  `404`, both capture readers' unknown-Space `422`, all four no-DB `503`s and
+  marked `403`s; shared `SuccessResponse` proves deletion. No
+  `serde_json::Value` response oracle is used.
+- Rust LSP definitions resolve from the registrar to all four moved handlers
+  and from the composition call to the registrar. Each reference set closes on
+  its colocated registration plus definition, while the registrar closes on
+  its one composition call plus definition. Error diagnostics are clean in
+  the new module, old module, router, export, and contract test.
+- `router.rs` falls from `349` to `335` lines; `memory_routes.rs` falls from
+  `4,338` lines and `38` public handlers to `4,233` lines and `34`; the bounded
+  snapshot module is `130` lines with four handlers. The generated M5
+  inventory changes only two displaced Page-handler source addresses and
+  remains `191 / 55-50-86 / exposure 22`. Call-site ownership is
+  `37 router + 4 snapshot_routes + 3 memory_revision_routes +
+  3 pinned_memory_routes + 2 profile_narrative_routes +
+  1 briefing_routes + 2 decisions_routes + 3 memory_detail_routes +
+  5 activity_tag_routes + 5 indexed_files_routes + 13 spaces_routes +
+  14 entity_graph_routes + 75 other = 167`.
+- Focused verification passes after the last code edit: typed contract
+  `1 / 1`; exact handler guard `1 / 1`; exact sensitive-read guards `3 / 3`;
+  truth manifest `16 / 16`; Rust/Python M5 `1 / 1` and
+  `191 / 55-50-86 / exposure 22`; focused Clippy with warnings denied;
+  formatting and diff hygiene.
+- R5 handler-movement slice 12 REVIEW, 2026-07-30: the reused independent Sol
+  lane returned **APPROVE** with zero blocking and zero non-blocking findings.
+  It independently confirmed the four-route boundary and composition
+  position, byte-identical movement hash, exact four-field handler-manifest
+  delta, unchanged protected sources, snapshot/list/delete/scoping semantics
+  and typed controls, current citations/counts, and complete LSP closure. Its
+  focused reruns passed the typed contract, exact handler and sensitive-read
+  guards, truth manifest, Rust/Python M5 gates, focused Clippy, formatting, and
+  diff hygiene.
 
 ### R6 — `post_write` phase decomposition
 
