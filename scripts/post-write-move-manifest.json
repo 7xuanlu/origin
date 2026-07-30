@@ -1,0 +1,340 @@
+{
+  "version": 1,
+  "old_ref": "5b8ffd0e17e64fc3976a69bdf25a087d8ef738e9",
+  "phase_file": "crates/wenlan-core/src/drift_guard/post_write_structure_phase.txt",
+  "items": [
+    {
+      "id": "root:log_activity_best_effort",
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "log_activity_best_effort"}},
+      "new": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "log_activity_best_effort"}}
+    },
+    {
+      "id": "post_write_test_module_body",
+      "phases": ["tests-externalized", "lower-risk-flows", "create-dispatch", "final"],
+      "old": {
+        "path": "crates/wenlan-core/src/post_write.rs",
+        "selector": {"kind": "module_body", "name": "tests"}
+      },
+      "new": {
+        "path": "crates/wenlan-core/src/post_write/post_write_tests.rs",
+        "selector": {"kind": "file", "name": "post_write_tests"}
+      },
+      "dedent_old": true,
+      "substitutions": [
+        {
+          "side": "old",
+          "from": "include_str!(\"post_write.rs\")",
+          "to": "include_str!(\"../post_write.rs\")",
+          "count": 1,
+          "phases": ["tests-externalized", "lower-risk-flows", "create-dispatch"]
+        },
+        {
+          "side": "old",
+          "from": "include_str!(\"post_write.rs\")",
+          "to": "include_str!(\"page_update.rs\")",
+          "count": 1,
+          "phases": ["final"]
+        }
+      ]
+    },
+    {
+      "id": "entity_graph:create_entity",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_entity"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/entity_graph.rs", "selector": {"kind": "fn", "name": "create_entity"}}
+    },
+    {
+      "id": "entity_graph:create_relation",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_relation"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/entity_graph.rs", "selector": {"kind": "fn", "name": "create_relation"}}
+    },
+    {
+      "id": "entity_graph:create_relation_with_span",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_relation_with_span"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/entity_graph.rs", "selector": {"kind": "fn", "name": "create_relation_with_span"}}
+    },
+    {
+      "id": "entity_graph:add_observation",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "add_observation"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/entity_graph.rs", "selector": {"kind": "fn", "name": "add_observation"}}
+    },
+    {
+      "id": "entity_graph:is_valid_snake_case_relation",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "is_valid_snake_case_relation"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/entity_graph.rs", "selector": {"kind": "fn", "name": "is_valid_snake_case_relation"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_revision:PageRevisionCard",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "struct", "name": "PageRevisionCard"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_revision.rs", "selector": {"kind": "struct", "name": "PageRevisionCard"}}
+    },
+    {
+      "id": "page_revision:resolve_page_revision_card",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "resolve_page_revision_card"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_revision.rs", "selector": {"kind": "fn", "name": "resolve_page_revision_card"}}
+    },
+    {
+      "id": "page_revision:accept_page_revision_card",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "accept_page_revision_card"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_revision.rs", "selector": {"kind": "fn", "name": "accept_page_revision_card"}}
+    },
+    {
+      "id": "page_revision:accept_pending_revision",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "accept_pending_revision"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_revision.rs", "selector": {"kind": "fn", "name": "accept_pending_revision"}}
+    },
+    {
+      "id": "page_revision:accept_pending_revision_with_knowledge_path",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "accept_pending_revision_with_knowledge_path"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_revision.rs", "selector": {"kind": "fn", "name": "accept_pending_revision_with_knowledge_path"}}
+    },
+    {
+      "id": "page_revision:dismiss_pending_revision",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "dismiss_pending_revision"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_revision.rs", "selector": {"kind": "fn", "name": "dismiss_pending_revision"}}
+    },
+    {
+      "id": "page_revision:dismiss_contradiction",
+      "phases": ["lower-risk-flows", "create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "dismiss_contradiction"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_revision.rs", "selector": {"kind": "fn", "name": "dismiss_contradiction"}}
+    },
+    {
+      "id": "page_dispatch:PageWrite",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "enum", "name": "PageWrite"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "enum", "name": "PageWrite"}}
+    },
+    {
+      "id": "page_dispatch:page_write",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "page_write"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "page_write"}}
+    },
+    {
+      "id": "page_create:VALID_PAGE_CREATION_KINDS",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "const", "name": "VALID_PAGE_CREATION_KINDS"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "const", "name": "VALID_PAGE_CREATION_KINDS"}}
+    },
+    {
+      "id": "page_create:PAGE_BIRTH_REVIEW_STATUS",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "const", "name": "PAGE_BIRTH_REVIEW_STATUS"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "const", "name": "PAGE_BIRTH_REVIEW_STATUS"}}
+    },
+    {
+      "id": "page_create:write_document_source_page_impl",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "write_document_source_page_impl"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "fn", "name": "write_document_source_page_impl"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_create:replace_source_page_impl",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "replace_source_page_impl"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "fn", "name": "replace_source_page_impl"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_create:attach_page_sources_impl",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "attach_page_sources_impl"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "fn", "name": "attach_page_sources_impl"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_dispatch:create_page",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_page"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "create_page"}}
+    },
+    {
+      "id": "page_dispatch:create_page_with_floor",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_page_with_floor"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "create_page_with_floor"}}
+    },
+    {
+      "id": "page_dispatch:create_page_with_tuning",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_page_with_tuning"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "create_page_with_tuning"}}
+    },
+    {
+      "id": "page_create:page_source_reference_exists",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "page_source_reference_exists"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "fn", "name": "page_source_reference_exists"}}
+    },
+    {
+      "id": "page_create:CreatePageInput",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "struct", "name": "CreatePageInput"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "struct", "name": "CreatePageInput"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_create:create_page_impl",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_page_impl"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "fn", "name": "create_page_impl"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_dispatch:PageGrowthCommit",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "struct", "name": "PageGrowthCommit"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "struct", "name": "PageGrowthCommit"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_update:PipelineStage",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "enum", "name": "PipelineStage"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "enum", "name": "PipelineStage"}}
+    },
+    {
+      "id": "page_update:Writer",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "enum", "name": "Writer"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "enum", "name": "Writer"}}
+    },
+    {
+      "id": "page_update:impl_Writer",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "impl", "name": "Writer"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "impl", "name": "Writer"}}
+    },
+    {
+      "id": "page_update:page_is_human_owned",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "page_is_human_owned"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "page_is_human_owned"}}
+    },
+    {
+      "id": "page_update:stage_page_revision_card",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "stage_page_revision_card"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "stage_page_revision_card"}}
+    },
+    {
+      "id": "page_update:merge_shrink_threshold",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "merge_shrink_threshold"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "merge_shrink_threshold"}}
+    },
+    {
+      "id": "page_dispatch:update_page",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "update_page"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "update_page"}}
+    },
+    {
+      "id": "page_dispatch:update_page_preserving_sources",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "update_page_preserving_sources"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "update_page_preserving_sources"}}
+    },
+    {
+      "id": "page_dispatch:update_page_at_source_revision",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "update_page_at_source_revision"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "update_page_at_source_revision"}}
+    },
+    {
+      "id": "page_dispatch:update_page_growth_at_versions",
+      "phases": ["create-dispatch", "final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "update_page_growth_at_versions"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "fn", "name": "update_page_growth_at_versions"}}
+    },
+    {
+      "id": "page_update:PreWriteGate",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "type", "name": "PreWriteGate"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "type", "name": "PreWriteGate"}}
+    },
+    {
+      "id": "page_update:PRE_WRITE_GATE",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "static", "name": "PRE_WRITE_GATE"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "static", "name": "PRE_WRITE_GATE"}}
+    },
+    {
+      "id": "page_update:pre_write_pause_test",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "pre_write_pause", "ordinal": 1}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "pre_write_pause", "ordinal": 1}}
+    },
+    {
+      "id": "page_update:pre_write_pause_production",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "pre_write_pause", "ordinal": 2}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "pre_write_pause", "ordinal": 2}}
+    },
+    {
+      "id": "page_update:write_warnings",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "write_warnings"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "write_warnings"}}
+    },
+    {
+      "id": "page_update:page_write_digest",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "page_write_digest"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "page_write_digest"}}
+    },
+    {
+      "id": "page_update:RetryIdentity",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "type", "name": "RetryIdentity"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "type", "name": "RetryIdentity"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_update:replay_matching_operation_receipt",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "replay_matching_operation_receipt"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "replay_matching_operation_receipt"}},
+      "allow_pub_super_new": true
+    },
+    {
+      "id": "page_update:terminal_result_with_receipt",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "terminal_result_with_receipt"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "terminal_result_with_receipt"}}
+    },
+    {
+      "id": "page_update:update_page_impl",
+      "phases": ["final"],
+      "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "update_page_impl"}},
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "update_page_impl"}},
+      "allow_pub_super_new": true
+    }
+  ],
+  "imports": {
+    "old_paths": ["crates/wenlan-core/src/post_write.rs"],
+    "new_paths": [
+      "crates/wenlan-core/src/post_write.rs",
+      "crates/wenlan-core/src/post_write/entity_graph.rs",
+      "crates/wenlan-core/src/post_write/page_create.rs",
+      "crates/wenlan-core/src/post_write/page_dispatch.rs",
+      "crates/wenlan-core/src/post_write/page_revision.rs",
+      "crates/wenlan-core/src/post_write/page_update.rs"
+    ],
+    "allow_added": [],
+    "allow_removed": []
+  }
+}

@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 #[path = "drift_guard/r4_test_support_test.rs"]
 mod r4_test_support_test;
 
+#[cfg(test)]
+#[path = "drift_guard/post_write_structure_test.rs"]
+mod post_write_structure_test;
+
 /// Repo root, resolved at compile time from this crate's manifest dir
 /// (crates/wenlan-core -> ../.. == repo root).
 fn repo_root() -> PathBuf {
@@ -5729,6 +5733,27 @@ fn m5_reader_inventory_matches_current_tree() {
     assert!(
         stdout.contains("reader inventory check: ok"),
         "reader sweep check mode did not emit its success receipt.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn m5_reader_summary_and_exposure_set_match_r6_ratchet() {
+    let root = repo_root();
+    let output = std::process::Command::new("python3")
+        .arg("scripts/m5-reader-ratchet.py")
+        .arg("--check")
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/m5-reader-ratchet.py --check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "R6 M5 summary/exposure-set ratchet failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("M5 R6 ratchet: ok (191 rows; depth 55/50/86; exposure 22)"),
+        "R6 M5 ratchet did not emit its exact success receipt.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 

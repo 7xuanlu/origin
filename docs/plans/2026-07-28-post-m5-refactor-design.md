@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R5 complete; R6 design approved; R6-0 next**
+Status: **R5 complete; R6-0 boundary teeth implemented; R6-1 next**
 
 ## Authority and change control
 
@@ -4831,6 +4831,82 @@ projection/rollback ordering, receipt precedence, ownership re-decision,
 serialized API shape, M5 generation/truth state, or any external caller path.
 Those are behavior changes and must not be hidden inside R6.
 
+#### R6-0 execution receipt — 2026-07-30
+
+- Added a standing `drift_guard` structure tooth with an explicit, fail-closed
+  phase marker. The allowed sequence is `monolith` → `tests-externalized` →
+  `lower-risk-flows` → `create-dispatch` → `final`; every phase pins its exact
+  private child/file set and exact direct facade re-export set. The final phase
+  additionally requires the external
+  `#[cfg(test)] #[path = "post_write/post_write_tests.rs"] mod tests`
+  declaration, forbids root private `*_impl` bodies, and scans every current
+  Rust source under `crates/` (including not-yet-tracked files) for callers
+  naming a private child path. Synthetic controls reject a public child,
+  re-export drift, a private root implementation body, an external child-path
+  caller, and an unknown phase.
+- Added a compile/runtime facade contract that keeps representative entity,
+  Page create/update, revision, and `PageWrite` entrypoints reachable only
+  through `crate::post_write`, pins the serialized `WriteResult` envelope, and
+  preserves the legacy missing-`outcome` default.
+- RED:
+  `cargo test -p wenlan-core --lib
+  drift_guard::post_write_structure_test::post_write_structure_matches_expected_phase
+  -- --exact --nocapture` with the marker deliberately set to `final` failed on
+  exactly the absent five children/files, absent external test declaration and
+  file, absent facade re-exports, the inline test body, and the four root
+  `*_impl` bodies. Returning the marker to `monolith` makes R6-0 green without
+  pretending the final decomposition already exists; later slices must advance
+  the marker in the same change that establishes the next exact shape.
+- Added `scripts/post-write-move-check.py` and its 48-entry manifest. The
+  comparator pins the pre-R6 source at `5b8ffd0e`, compares named old/new
+  syntactic items, compares top-level imports as a separate sorted set, and
+  permits only CRLF normalization, one uniform external-test-body dedent, and a
+  leading `pub(super)` on an entry explicitly allowlisted in the manifest. The
+  two reflection-path changes are explicit, phase-scoped manifest
+  substitutions. Its self-test proves a non-allowlisted visibility widening
+  and an ordinary body/token mutation fail.
+- Root review corrected two ownership drifts before movement: every stable
+  create/update `Page` facade wrapper, `PageWrite`, and `PageGrowthCommit` stay
+  together in `page_dispatch`; the cross-flow
+  `log_activity_best_effort` helper stays on the root facade instead of making
+  create depend on revision. The phase tooth and root-to-root movement item
+  encode those corrected homes. The two sibling-owned data types required by
+  the frozen flow graph, `CreatePageInput` and `PageGrowthCommit`, are the only
+  additional type-visibility widenings explicitly allowlisted for
+  `pub(super)`.
+- Independent review found that the first comparator mask mixed UTF-8 byte
+  offsets with Python code-point slicing, so its green receipt was invalid on
+  this Unicode-bearing source. The corrected mask stays code-point-length
+  preserving end to end; a Unicode comment/string before an item and import is
+  now a positive control, and `--self-test` re-extracts all `48` baseline
+  selectors before reporting success. The same review closed the two sibling
+  type visibility allowlists, root activity-helper ownership, and unmatched
+  `pub(super)`/`pub(in ...)` facade re-export gap before any production move.
+- Added `scripts/m5-reader-ratchet.py` plus an R6-scoped drift-guard invocation.
+  It runs the existing live inventory generator check, pins the semantic tuple
+  `191 / 55-50-86 / exposure 22`, pins all 22 exposure identities without line
+  addresses, and supports `--capture ...` followed by `--check --against ...`
+  around source-address regeneration. Synthetic controls independently mutate
+  the summary and exposure identity set and require both to fail. The movement
+  comparator/manifest and this pinned ratchet remain active through R6/R7 only;
+  R8 removes them after recording the final receipts, while the final structure
+  tooth remains standing. Its positive controls also reject an undeclared
+  inline child, so the exact child set cannot be bypassed with `mod x { ... }`.
+- GREEN receipts before movement: structure/facade helper `4 passed`; comparator
+  unit tests `4 passed` (including raw-string delimiter masking and
+  Unicode-before-item/import offsets); all `48` baseline selectors re-extracted;
+  current
+  `monolith` manifest check
+  `post_write movement comparison: ok (48 manifest items)`; M5 ratchet and
+  unchanged generator both report
+  `191 rows; depth 55/50/86; exposure 22`. No production `post_write` item or
+  test body moved in R6-0.
+- Independent Sol closure review returned **APPROVE** with zero remaining
+  findings after reproducing all `48` clean selector boundaries/imports, both
+  explicit sibling widenings, permanent root-helper ownership, visibility and
+  inline-child mutation controls, the exact M5 receipt, and the absence of any
+  production `post_write` diff.
+
 ### R7 — daemon startup and scheduler lanes
 
 Separate orchestration from phase/lane implementations without changing startup
@@ -4841,6 +4917,14 @@ or scheduling order.
 Run after the code boundaries have stabilized so the documentation describes
 the resulting architecture rather than predicting it.
 
+- After the final R6 item/hash, M5 pre/post, and facade receipts are recorded,
+  remove the R6-only movement comparator/manifest and M5 ratchet scripts/tests,
+  including the temporary pinned-summary `drift_guard` invocation. Those tools
+  deliberately reference the branch-local `5b8ffd0e` checkpoint and pin the
+  R6-only `191 / 55-50-86 / 22` no-semantic-drift condition; keeping them after
+  squash would make a legitimate future manifested reader addition fail for
+  the wrong reason. Retain the final-phase `post_write` structure tooth as the
+  permanent architectural guard.
 - Reconcile or explicitly mark historical the stale
   `m5-reader-manifest-inventory.md` “Draft 5” prose/table
   (`190 / 54-50-86`) against the executable current-tree inventory; never
