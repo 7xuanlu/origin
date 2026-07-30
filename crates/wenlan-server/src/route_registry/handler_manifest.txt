@@ -1,7 +1,7 @@
 # Exact route-to-handler bindings, captured from the production builders.
 main|get|/api/activities|wenlan_server::memory_routes::handle_list_activities
-main|get|/api/agents|wenlan_server::memory_routes::handle_list_agents
-main|get|/api/agents/{name}|wenlan_server::memory_routes::handle_get_agent
+main|get|/api/agents|wenlan_server::profile_agents_routes::handle_list_agents
+main|get|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_get_agent
 main|get|/api/briefing|wenlan_server::memory_routes::handle_get_briefing
 main|get|/api/capture-stats|wenlan_server::memory_routes::handle_capture_stats
 main|get|/api/chunks/{source_id}|wenlan_server::memory_routes::handle_get_chunks
@@ -50,7 +50,7 @@ main|get|/api/pages/{id}/map|wenlan_server::page_map_routes::handle_get_page_map
 main|get|/api/pages/{id}/revisions|wenlan_server::memory_routes::handle_get_page_revisions
 main|get|/api/pages/{id}/sources|wenlan_server::memory_routes::handle_get_page_sources
 main|get|/api/ping|wenlan_server::routes::handle_ping
-main|get|/api/profile|wenlan_server::memory_routes::handle_get_profile
+main|get|/api/profile|wenlan_server::profile_agents_routes::handle_get_profile
 main|get|/api/profile/narrative|wenlan_server::memory_routes::handle_get_profile_narrative
 main|get|/api/refinery/queue|wenlan_server::refinery_routes::handle_list_refinements
 main|get|/api/retrievals/recent|wenlan_server::routes::handle_recent_retrievals
@@ -130,7 +130,7 @@ main|post|/api/spaces/{name}/confirm|wenlan_server::memory_routes::handle_confir
 main|post|/api/spaces/{name}/pin|wenlan_server::memory_routes::handle_pin_space
 main|post|/api/spaces/{name}/star|wenlan_server::memory_routes::handle_toggle_space_starred
 main|post|/api/steep|wenlan_server::routes::handle_steep
-main|put|/api/agents/{name}|wenlan_server::memory_routes::handle_update_agent
+main|put|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_update_agent
 main|put|/api/chunks/{id}/update|wenlan_server::memory_routes::handle_update_chunk
 main|put|/api/config|wenlan_server::config_routes::handle_update_config
 main|put|/api/config/skip-apps|wenlan_server::config_routes::handle_update_skip_apps
@@ -142,11 +142,11 @@ main|put|/api/memory/{id}/stability|wenlan_server::memory_routes::handle_set_sta
 main|put|/api/memory/{id}/update|wenlan_server::memory_routes::handle_update_memory
 main|put|/api/pages/{id}|wenlan_server::memory_routes::handle_refresh_page
 main|put|/api/pages/{id}/map/layout|wenlan_server::page_map_routes::handle_put_page_map_layout
-main|put|/api/profile|wenlan_server::memory_routes::handle_update_profile
+main|put|/api/profile|wenlan_server::profile_agents_routes::handle_update_profile
 main|put|/api/setup/anthropic-key|wenlan_server::config_routes::handle_set_anthropic_key
 main|put|/api/spaces/default|wenlan_server::memory_routes::handle_set_default_space
 main|put|/api/spaces/{name}|wenlan_server::memory_routes::handle_update_space
-main|delete|/api/agents/{name}|wenlan_server::memory_routes::handle_delete_agent
+main|delete|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_delete_agent
 main|delete|/api/chunks/time-range|wenlan_server::memory_routes::handle_delete_by_time_range
 main|delete|/api/documents/{source}/{source_id}|wenlan_server::ingest_routes::handle_delete_document
 main|delete|/api/memory/delete/{source_id}|wenlan_server::memory_routes::handle_delete_memory

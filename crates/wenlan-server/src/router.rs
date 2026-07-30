@@ -7,8 +7,8 @@ use crate::route_registry::{delete, get, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
     brief_routes, community_routes, config_routes, import_routes, ingest_routes, knowledge_routes,
-    lint_routes, memory_routes, onboarding_routes, page_map_routes, refinery_routes, repair_routes,
-    routes, security, source_routes, truth_guard, websocket,
+    lint_routes, memory_routes, onboarding_routes, page_map_routes, profile_agents_routes,
+    refinery_routes, repair_routes, routes, security, source_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -122,19 +122,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/memory/link-entity",
             post(memory_routes::handle_link_entity),
-        )
-        // Profile & Agents
-        .route(
-            "/api/profile",
-            get(memory_routes::handle_get_profile).put(memory_routes::handle_update_profile),
-        )
-        .route("/api/agents", get(memory_routes::handle_list_agents))
-        .route(
-            "/api/agents/{name}",
-            get(memory_routes::handle_get_agent)
-                .put(memory_routes::handle_update_agent)
-                .delete(memory_routes::handle_delete_agent),
-        )
+        );
+    let router = profile_agents_routes::register(router);
+    let router = router
         // Knowledge graph retrieval + stats
         .route(
             "/api/memory/entities/list",

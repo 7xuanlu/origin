@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; registration slice 6 APPROVED**
+Status: **R4 complete; R5 in progress; handler-movement slice 1 APPROVED**
 
 ## Authority and change control
 
@@ -3511,6 +3511,68 @@ R5 registration slice 6 evidence, 2026-07-30:
   composition position, D2-clean bodies and CAS behavior, unchanged protected
   manifests, module-local LSP references, full typed route evidence, and that
   the fixture's `knowledge_path=None` cannot write the user's live vault.
+
+R5 handler-movement slice 1 evidence, 2026-07-30:
+
+- The six Profile/Agent bindings now register and execute in
+  `profile_agents_routes.rs`: `GET`/`PUT /api/profile`, `GET /api/agents`, and
+  `GET`/`PUT`/`DELETE /api/agents/{name}`. Their four module-local production
+  DTOs, six handler bodies, and `agent_to_response` helper moved together
+  without body or visibility rewrites. The helper is invoked at the same
+  composition position between memory/entity linking and knowledge-graph
+  retrieval. The old/new type block hashes are identical
+  (`cff20f9a4fae328ca429c6bf102111a7eb146ca64781c02252c7586c7d89249e`);
+  the handler/helper block hashes are also identical
+  (`191e99f907310d0e206a25add294aa16575869012357e04f355d1a798272d66c`).
+  `router.rs` falls from `518` to `508` lines;
+  `memory_routes.rs` falls from `5,732` lines and `95` public handlers to
+  `5,523` lines and `89`; the bounded child is `235` lines with the six moved
+  handlers.
+- Before updating the expected identities, the production-builder control was
+  RED on exactly the six rows above: the observed handlers resolved to
+  `wenlan_server::profile_agents_routes::*` while the manifest still required
+  `wenlan_server::memory_routes::*`. Updating only those six handler fields
+  made the exact `165 + 6` runtime comparison GREEN. The truth and
+  sensitive-read route manifests remain byte-identical.
+- D2 deliberately preserves the pre-existing lifetime of all six
+  `state.read()` guards across their DB awaits. Shortening those guards is a
+  concurrency improvement candidate, not a movement-only change; this slice
+  neither hides nor fixes it.
+- The built-router typed contract passes `1 / 1` and drives all six endpoints.
+  It covers typed Profile get/update, Agent list/get/update/delete success,
+  missing-Agent `404`, the opaque delete route's marker-shape `403`, and a
+  deterministic typed no-DB `503` for every moved binding. Shared
+  `wenlan-types` request/response DTOs are used where available; delete success
+  uses the exact test-local `DeleteAgentResponse` mirror and errors use the
+  established test-local envelope. No `serde_json::Value` response oracle or
+  production test seam was added.
+- Rust LSP reports zero errors in the new module, old module, composition root,
+  module export, and contract test. After a diagnostics refresh, all six
+  handler reference queries contain exactly the colocated registration and
+  definition; neither `router.rs` nor `memory_routes.rs` remains in the
+  reference closure. This semantic result is paired with the exact handler
+  manifest and text/generated census because LSP does not prove route strings,
+  macro token trees, SQL, or a capped whole-workspace enumeration.
+- The generated reader inventory changes only nine source-address rows and
+  remains `191 / 55-50-86 / exposure 22`. The ownership arithmetic is now
+  `92 router + 6 profile_agents_routes + 69 other = 167`; current-contract M5
+  prose citations displaced by the extraction were refreshed. The focused
+  route contract, server library (`347 passed / 2 ignored`), space-scoping
+  integration (`30 / 30`), truth guard (`12 / 12`), truth manifest
+  (`16 / 16`), Rust/Python M5 gates (`1 / 1` and
+  `191 / 55-50-86 / exposure 22`), projection-permit source scan (`1 / 1`),
+  core/server all-target Clippy with warnings denied, formatting, and diff
+  hygiene pass. An initial zero-test M5 invocation used an incomplete
+  `--exact` name; `--list` supplied the full module path and the corrected run
+  passed `1 / 1`, so the zero-test command is not counted as evidence.
+- R5 handler-movement slice 1 REVIEW, 2026-07-30: the fresh Sol reviewer
+  returned **APPROVE** with no blocker or non-blocker. It independently
+  confirmed both byte-identical movement hashes, the unchanged composition
+  point and truth/security layer order, exactly six intentional handler
+  identity changes, zero LSP diagnostics with registration-plus-definition
+  closures, preserved pre-existing read-guard lifetimes, TempDir-backed test
+  isolation with no config/Page/projection/environment mutation, and the
+  focused handler/M5/Clippy/format/diff gates.
 
 ### R6 — `post_write` phase decomposition
 
