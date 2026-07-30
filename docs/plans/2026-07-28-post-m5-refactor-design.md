@@ -2732,32 +2732,124 @@ Frozen slice contract:
 
 #### R4-25 — exact test-support seam and always-private connection
 
-- First classify all remaining test raw-access shapes with AST plus LSP
-  references; a literal count alone is not sufficient because multiline
-  chains and alternate `_db.connect()` handles are part of the contract.
-- Introduce one `#[cfg(test)]` DB-owned opaque test-support session. It may
-  expose a generic test-only execute/query pair plus only the exact
-  transaction-observation operations the fixtures require at R4-25 entry.
-  Those calls are frozen by the exact AST call-site manifest; this is not a
-  production SQL facade. The session never returns or dereferences to
-  `libsql::Connection`, `MutexGuard`, `Database`, a raw transaction, or a
-  callback argument. Its constructor and fields remain private, and the exact
-  call sites are frozen in a location-aware AST manifest rather than admitted
-  by filename or `#[cfg(test)]`.
-- Move fixtures mechanically in bounded file groups. Do not combine fixture
-  cleanup, assertion changes, test splitting, or production refactors with
-  this migration. Each group must reduce the old raw-capability manifest and
-  add only its exact named support calls.
-- Make `MemoryDB::conn` and the alternate database handle private in every
-  build only after all production and test callers compile through named
-  seams. The final guard rejects direct, multiline, retained, renamed,
-  dereferenced, or alternate-handle access outside `db/**`; positive controls
-  must kill every recognized escape shape.
-- Final floor: production raw capability `0`, external direct literals
-  `289 → 0`, and the test-support manifest equals the call-site set measured
-  at R4-25 entry exactly, plus only review-approved call sites added by
-  R4-25's own positive controls. Run the uninterrupted workspace library suite
-  after the last fixture group.
+- PRE-IMPLEMENTATION CENSUS, 2026-07-29: the old ratchet's `289` is only the
+  primary `.conn.lock().await` subset. AST discovery plus source inspection
+  finds `342` current external raw-field occurrences:
+  `289` primary locks, `5` primary `try_lock()` observations, and `48`
+  alternate `_db` references. The `_db` set is `46` test references plus
+  exactly `2` production references in `lint/snapshot.rs`; `21` of the test
+  references open independent secondary connections. There is no external
+  `Arc::clone(&db.conn)` or `Arc::clone(&db._db)` at entry. LSP references for
+  the `_db` field independently corroborate those two production entries,
+  every test reference, and the DB-internal construction sites.
+- R4-25a is a separate production micro-slice before any fixture migration.
+  Move only the existing `MemoryDB::open_lint_snapshot` and
+  `MemoryDB::open_unpinned_lint_snapshot` implementation from
+  `lint/snapshot.rs` into a `db/**` child. Preserve signatures, visibility,
+  freshness-observer cloning, returned snapshot lifetime, errors, and call
+  sites byte-for-byte semantically. This makes the production external
+  `_db` count `2 → 0`; it is not hidden inside a test-support commit.
+- After R4-25a, the exact test-entry universe is `340` raw-field occurrences:
+  `289` primary locks, `5` primary mutex-availability observations, and `46`
+  alternate-handle references. Add a syntax-aware census before migration and
+  ratchet each bounded group down from that exact set. Ordinary Rust
+  expressions are read from the parsed AST; macro invocations receive explicit
+  recursive token-tree traversal. A bare ast-grep rule is insufficient:
+  current `assert!` / `assert_eq!` token trees hide four `try_lock` references
+  and one `_db` handoff from its ordinary expression matches.
+- Implement that CI-local parser with test-only direct dependencies already
+  present in the lockfile: `syn 2.0.117` with `full,visit` and
+  `proc-macro2 1.0.106` with `span-locations`. `syn::Visit` records ordinary
+  field expressions, destructuring, support calls, and raw type paths exposed
+  by a DB-support API signature; a recursive `TokenTree` scan covers macro
+  bodies, which `syn` keeps opaque. Literal and comment lookalikes do not
+  count. A standalone test-created `libsql::Database` that never originates
+  from `MemoryDB` is outside this capability-boundary contract; a future one
+  must have its constructor recorded exactly so origin is explicit, but its
+  raw type alone is not a violation. A tracked Rust file, item, or macro body
+  that the tooth cannot classify is an error rather than a silent exclusion.
+- Introduce one `#[cfg(test)]`, DB-owned, opaque `TestDbSession` type with
+  private state and private raw constructors. Named `MemoryDB` methods create
+  either a primary session that retains the mutex guard or a genuinely
+  independent secondary session. The same opaque type privately tracks the
+  secondary connection's ordinary, immediate-transaction, or read-only-
+  transaction state; `begin_immediate`, `begin_read_only`, `commit`, and
+  `rollback` preserve the existing connection and transaction lifetimes.
+  `ReadOnly` remains literal `libsql::TransactionBehavior::ReadOnly`, and the
+  independent `BEGIN IMMEDIATE` contender remains independent rather than
+  being routed through the primary mutex.
+- The common session surface is limited to the fixture operations actually
+  present at entry: `execute`, `execute_batch`, and `query`. Query results and
+  rows are opaque wrappers with async iteration and typed getters; a lifetime
+  tie keeps the owning session alive while rows are consumed. The wrappers
+  never return, dereference, borrow, or callback-yield a
+  `libsql::Connection`, `Database`, `MutexGuard`, `Rows`, `Row`, transaction,
+  or another raw capability. Input SQL and `IntoParams` remain deliberately
+  generic because this is a test-only fixture seam, not a production SQL
+  facade.
+- The operation census covers all `289` primary locks across `217` enclosing
+  functions: their direct connection calls are only `execute`,
+  `execute_batch`, and `query`. Four repair assertions also pass the held
+  connection to `database_content_digest`, and one eval test passes it to
+  `check_seed_contract`; admit exact typed
+  `repair_database_content_digest` and `check_seed_contract` session
+  operations rather than exposing the connection. The answer-quality feature
+  assertion moves to the existing
+  `MemoryDB::assert_eval_feature_substrate_live` domain method. Local fixture
+  helpers such as `set_truth` accept the opaque session.
+- The only other non-generic operations are primary-mutex availability,
+  structural digest on an opaque secondary session, and
+  `MemoryDB::open_isolated_lint_snapshot_for_test()`. The last operation
+  creates a fresh observer internally on every call. The exact `46` test
+  `_db` census is `21` secondary connections, `18` direct
+  `LintReadSnapshot::open` calls, `3` semantic-fingerprint handoffs,
+  `2` fresh-clock constructions, and `2` matching `open_with_freshness`
+  calls. The isolated operation replaces the `18` direct opens, the `3`
+  fingerprint handoffs after their helper accepts `&MemoryDB`, and each
+  two-field old/new observer pair with one call. Those daemon-lifetime epochs
+  therefore stay distinct without handing `_db` to `LintFreshnessClock` or
+  `LintReadSnapshot`.
+  R4-24b's existing DB-child contender and transaction probes remain separate
+  exact `#[cfg(test)]` operations; they are included in the approved
+  test-support manifest rather than widened into the generic session.
+- Freeze two manifests by syntax identity, not a total count and not a broad
+  filename / `#[cfg(test)]` allowlist. `RAW_CAPABILITY_ENTRY` records
+  `(tracked path, enclosing module/test item, shape, same-shape ordinal)` for
+  the `342` starting references and shrinks to empty.
+  `TEST_SUPPORT_CALLS` records
+  `(tracked path, enclosing test/support item, exact DB-support callee,
+  same-callee ordinal)` for the reviewed replacement source. Source lines are
+  diagnostic metadata only. The two manifests are deliberately independent:
+  one held raw guard may become several opaque `execute` / `query` calls, so
+  replacement cardinality is not inferred from `340`. Adding, duplicating,
+  renaming, retaining, moving between test items, or calling a support
+  operation from production fails even when an aggregate count is unchanged.
+- RED controls must kill single-line and multiline primary access,
+  `try_lock` inside a macro, alternate `.connect()`, raw `_db` handoff,
+  renamed receivers, dereference/borrow forms, and retained/cloned fields.
+  Separate manifest mutations must kill an extra call, a removed call, a
+  same-count move, a changed callee, and a macro-contained call. The parser
+  fails closed on an unparseable tracked Rust file or macro form. Final field
+  privacy is the compiler backstop, not a substitute for the source teeth.
+- Migrate without assertion changes, test splitting, fixture cleanup, or
+  adjacent production refactors, in this order: (1) the production snapshot
+  micro-slice; (2) the opaque seam, exact census/manifest, and RED controls;
+  (3) all alternate-handle and lint-snapshot fixtures; (4) the repair family,
+  whose `107` primary locks include the independent
+  `BEGIN IMMEDIATE`/blocked-CAS control; (5) lint's remaining `70` primary
+  locks; (6) the remaining `112` lower-risk primary locks; (7) make both
+  `MemoryDB::conn` and `_db` private in every build and replace the old
+  `289`-only baseline with the zero raw-capability gate. Each group commits
+  only after its exact raw-set decrease and support-manifest addition agree.
+- Final floor: production external raw capability `0`; test raw capability
+  `340 → 0`; both fields private under normal and test builds; the exact
+  support manifest matches the parsed source; all mutation controls pass; the
+  M5 inventories remain unchanged semantically; and one uninterrupted
+  `cargo test --workspace --lib --quiet` passes after the final fixture group.
+  The two highest-risk focused controls must additionally prove that the
+  independent write transaction still blocks then releases the repair CAS and
+  that the read-only lint snapshot plus replacement freshness observers retain
+  their original lifetime semantics.
 
 ### R5 — server vertical slices
 
@@ -2830,6 +2922,18 @@ one explicit mutex-lifetime change because the existing at-least-once receipt
 state and outer repair locks contain the new window. Re-open the design only
 if that post-commit/pre-clear window proves non-idempotent or R4-24b cannot add
 its `#[cfg(test)]` seam without reordering production statements.
+
+Scoped R4-25 re-gate, 2026-07-29:
+**APPROVE-WITH-FIXES → APPROVE.** AST plus LSP corrected the old
+`289`-literal subset to `342 = 340 test + 2 production` raw-field references.
+Fable independently verified both production `_db` callers, all five external
+`try_lock` observations, fresh-observer and read-only transaction semantics,
+the independent R4-24b contender, and that `syn` / `proc-macro2` are already
+lockfile-resolved. Its required clarifications now state that standalone
+libSQL fixtures not derived from `MemoryDB` are outside this capability
+boundary and reconcile the exact `46` test `_db` shapes. Fable authorized
+R4-25a immediately and the remaining groups after those document fixes, with
+no further re-gate required.
 
 ### Intermediate PRs — Sol by default, not Fable
 
