@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 approved; R0 implemented and verified**
+Status: **Fable gate 1 re-approved through the R4-24 split; R4-24a ready**
 
 ## Authority and change control
 
@@ -1886,9 +1886,11 @@ Frozen slice contract:
   projection scans/write-or-restore, proof or recovery decision, and
   commit/rollback. Publish or clear pending artifact files only after commit,
   exactly where the current recovery path does so.
-- Keep `page_on_connection` and rename capture/match helpers private to the DB
-  implementation boundary after the move. No projection object, DB guard, or
-  transaction token may escape the named operation.
+- Keep `page_on_connection` and the R4-20-only rename match helpers private to
+  its DB child. Keep `capture_rename_page_title_on_connection` as the narrow
+  `pub(crate)` helper shared by `repair_page_rename` and the later
+  `repair_verification` child, as frozen below. No projection object, DB guard,
+  or transaction token may escape the named operation.
 - Existing crash-window and restore tests remain required. Add a barrier that
   proves a concurrent DB writer cannot enter while the operation is between
   its DB read and projection write/restore, and an order control that fails if
@@ -1950,17 +1952,19 @@ Frozen slice contract:
   does not silently repair the existing recovery paths where receipt or
   post-match `?`, or a failed `COMMIT`, can return without an explicit
   rollback; that behavioral correction requires a separate reviewed slice.
-- **Helper ownership has one time-bounded exception.** Move
+- **Helper ownership has one narrow shared exception.** Move
   `page_on_connection`, embedding decode, apply projection restore, recovery
   rollback, and recovery-only database/projection match helpers private to the
   DB child. Keep shared receipt, non-target receipt, excluded-path, effect
-  guard, and DB-digest helpers in `repair.rs`. LSP currently resolves four
-  callers of `capture_rename_page_title_on_connection`: two apply captures,
-  one recovery capture, and the verification transaction. R4-20 removes the
-  first three, but the verification caller intentionally remains until R4-24.
-  Therefore the capture helper stays a narrow `pub(crate)` seam in
-  `repair.rs`; R4-24 must remove its final caller and make it private rather
-  than duplicating it or pulling verification forward.
+  guard, and DB-digest helpers in `repair.rs`. R4-20 moves its three
+  apply/recovery call sites for
+  `capture_rename_page_title_on_connection` into
+  `db/repair_page_rename.rs`; it does not eliminate them. R4-24 moves the
+  remaining verification call site into `db/repair_verification.rs`.
+  Therefore the capture helper remains a narrow `pub(crate)` seam shared by
+  those two DB children. The earlier promise to make it private at R4-24 was
+  stale; LSP reference closure corrected the ownership contract rather than
+  widening R4-24 to duplicate or relocate the shared capture machinery.
 - **RED controls carry the concurrency proof.**
   1. Hold `db.conn` and invoke apply and pending recovery against an invalid
      regular-file projection root under a bounded timeout. Correct
@@ -2536,34 +2540,118 @@ Frozen slice contract:
   `191 / 55-50-86 / exposure 22 / ambiguity 9`, LSP definition/reference and
   file diagnostics, ast-grep topology, formatting, and `git diff --check`.
 
-#### R4-24 — repair verification atomic operation
+#### R4-24a — repair verification atomic-operation movement
 
-- Move the DB/projection critical section of
-  `record_repair_verification_inner` behind one named DB-owned verification
-  operation. Keep manifest and tag-record locks, artifact loading, report
-  prevalidation, and rename projection-session acquisition in their current
-  caller order; the named operation then acquires the DB mutex, begins
-  `IMMEDIATE`, rechecks DB/tag/target/projection state, persists the
-  verification receipt under the same applicable projection lock, and commits
-  before the caller clears the pending apply receipt.
-- The caller-acquired locked rename projection session and
-  `RepairArtifactStore` are sanctioned inbound parameters of this named
-  operation. They must flow into the critical section so current acquisition
-  order and in-transaction receipt persistence survive. R4-23's prohibition
-  concerns raw or generic capabilities flowing out of `MemoryDB`; it does not
-  forbid these repair-side projection/store capabilities from flowing in.
+- Add `db/repair_verification.rs` with one `pub(crate)` free operation,
+  `record_repair_verification_atomic(db, input)`, and no wrapper, re-export,
+  generic executor, transaction callback, or R4-25 capability seam.
+  `RepairVerificationAtomicInput<'a>` is its one typed input boundary. It
+  carries references to the already-loaded `RepairArtifactStore`,
+  `RepairManifest`, `RepairApplyReceipt`, and `VerifyRepairRequest`; prior
+  verified tag targets; optional ordinary and rename rollback values; optional
+  page root; verified-at epoch; and an optional **borrowed**
+  `OwnedRepairProjectionSession`. It carries no connection, mutex guard,
+  transaction, pending path, callback, or arbitrary query capability.
+- Keep the public API, artifact ownership, and preflight in `repair.rs`, in
+  this exact order: support/time and manifest checks; manifest-operation and
+  tag-record locks; prior tag targets; apply receipt plus legacy/already
+  verified branches; typed rollback loads; report and unlocked page
+  prevalidation; rename owned-session acquisition; then the child call.
+  Existing-receipt and legacy recovery remain caller-side and may clear
+  pending without entering the child.
+- The child acquires `db.conn`, executes the literal `BEGIN IMMEDIATE`, and
+  preserves the existing `repair verify begin: ...` mapping. It then preserves
+  the exact recheck order: current DB reports; tag-record set on the held
+  connection; deterministic target; branch-specific target/non-target state;
+  verification draft/digest; final current-page receipt and durable receipt
+  persistence under the applicable projection lock; then the literal
+  `COMMIT` with the existing `repair verify commit: ...` mapping. The child
+  returns only after commit; the caller then clears pending.
+- Moving pending cleanup to the caller intentionally releases the DB mutex
+  before that filesystem cleanup. Manifest/tag locks and the caller-owned
+  rename session remain live through cleanup because the session crosses the
+  child by borrow, not by value. This is the one explicit lock-lifetime
+  boundary change in the slice; SQL, transaction, validation, artifact, and
+  recovery behavior remain unchanged.
+- Preserve the literal best-effort `ROLLBACK` only for pre-commit body errors.
+  Do not introduce `TransactionBehavior`, RAII transaction conversion,
+  cancellation claims, or commit-failure cleanup in this movement slice.
+  Verification receipt persistence still precedes DB commit: a
+  persistence-success/commit-failure may leave the durable receipt plus the
+  pending apply link, and retry loads that receipt then clears pending. A
+  persistence/recheck failure retains pending and reports no completed
+  receipt. This is an at-least-once terminal-receipt model, not a
+  cross-filesystem transaction.
+- Promote exactly the five single-use seams required by the child:
+  `RepairArtifactStore::persist_verification_receipt`,
+  `validate_current_db_receipts`,
+  `validate_deterministic_target_resolved`,
+  `validate_current_page_receipts_locked`, and
+  `validate_current_page_receipts_on_repair_projection`. All other helper
+  locations and visibilities remain as they stand after R4-23, including the
+  shared `pub(crate)` rename capture helper corrected above.
 - Preserve rename, stale-projection, ordinary-projection, and nonprojection
   branches independently. Do not route same-transaction reads through R4-17's
   separately locking method and do not generalize the operation into a
-  transaction callback.
-- Required controls cover every target branch, report/target/non-target
-  conflict before receipt persistence, persistence failure rollback, commit
-  failure, pending-receipt clearing only after commit, and barriers showing
-  both the DB mutex and applicable projection lock remain held across receipt
-  persistence.
+  transaction callback. Rename keeps its one caller-owned session throughout.
+  Ordinary and stale each keep the current first DB-to-projection lock for
+  target/non-target proof, release it, and later take the separate final
+  projection lock for page-receipt validation plus receipt persistence; do not
+  merge or widen those intervals.
+- Preserve the existing caller-side post-session test hook unchanged. Re-run
+  the existing branch and conflict controls, including rename session reuse,
+  pinned-root ancestor swap, stale projection, ordinary projection,
+  nonprojection, crash-window pending cleanup, existing-receipt retry, stale
+  reports, changed target/tag set, and changed projection non-target state.
+  R4-24a adds no fault injection, checkpoint framework, or production behavior
+  beyond the explicit DB-mutex release point above.
+- Source/LSP/AST teeth require one child operation, one production caller, one
+  raw child DB lock, literal
+  `BEGIN IMMEDIATE -> rechecks/persist -> COMMIT`, no RAII transaction,
+  pending cleanup, artifact loading, outer locks, or production callback in
+  the child, and caller order `child return -> clear pending` with no await or
+  session drop between them. The error arm retains best-effort `ROLLBACK`;
+  persistence stays inside the applicable projection lock and before
+  `COMMIT`. LSP must resolve the caller and all five promoted helpers and
+  report zero errors in every changed Rust file.
 - GREEN floor: external literals `290 → 289`, production `1 → 0`, tests remain
-  `289`. At this point the production raw-capability census is zero and its
-  RED mutation control becomes a zero-baseline prohibition.
+  `289`; `repair.rs` is `16 → 15` and `post_write.rs` remains `12`. At this
+  point the production raw-capability census is zero and its RED mutation
+  control becomes a zero-baseline prohibition. Regenerate source addresses
+  only; the M5 inventory remains
+  `191 / 55-50-86 / exposure 22 / ambiguity 9`.
+
+#### R4-24b — verification crash/lock teeth after movement
+
+- Start only from the committed, fully green R4-24a baseline. Write the RED
+  controls before adding their seam; do not mix these changes into the
+  movement commit.
+- Replace the one ad-hoc projection-session test hook with a scoped
+  `#[cfg(test)]` task-local verification control. It has typed, consumed
+  checkpoints after rename-session acquisition, after begin, immediately
+  around receipt persistence while the applicable lock is still held, and
+  after commit/before pending clear, plus one consumed commit-failure mode
+  immediately after successful persistence and before literal `COMMIT`. Test
+  hooks receive no DB/projection/store capability and no callback crosses the
+  production child boundary. Persistence failure is not faked by a fault
+  enum: at the pre-persist checkpoint the test creates a real conflicting
+  final-receipt filesystem object after the caller's earlier receipt lookup,
+  so the unchanged store write itself fails.
+- Direct controls cover all four target branches; report, target, and
+  non-target conflicts before persistence; real receipt-persistence failure
+  and rollback; commit failure with the exact error plus durable
+  receipt/pending retry cleanup; and the post-commit/pre-clear state. At the
+  persistence checkpoint a DB contender remains pending and the applicable
+  rename/stale/ordinary projection lock is contended. At the post-commit
+  checkpoint DB is acquirable while final receipt and pending link both exist,
+  and manifest/tag locks plus the rename session when applicable remain held.
+- Keep production semantics byte-for-byte equivalent to the R4-24a baseline.
+  Test-only commit failure exercises the existing at-least-once hazard; it
+  does not add rollback-on-commit-error, RAII, or cancellation hardening.
+  Source teeth reject test controls outside `#[cfg(test)]`, raw capability
+  escape through a checkpoint, altered production ordering, or an unconsumed
+  configured checkpoint/fault. Raw-capability and M5 counts remain unchanged
+  from R4-24a.
 
 #### R4-25 — exact test-support seam and always-private connection
 
@@ -2655,6 +2743,16 @@ initially unstated R4-24 inbound capability contract: the caller-acquired
 locked rename projection session and `RepairArtifactStore` must flow into the
 named verification operation. That contract is now explicit above; the narrow
 follow-up returned **APPROVE** with no new blocker.
+
+Scoped R4-24 split re-gate, 2026-07-29: **APPROVE.** Sol found that the
+original R4-24 combined movement with new crash/dual-lock controls, contrary
+to D2, and LSP disproved R4-20's promise that the shared rename capture helper
+could become private. Fable independently re-ran the helper reference lookup,
+approved the R4-24a movement / R4-24b RED-first control split, and accepted the
+one explicit mutex-lifetime change because the existing at-least-once receipt
+state and outer repair locks contain the new window. Re-open the design only
+if that post-commit/pre-clear window proves non-idempotent or R4-24b cannot add
+its `#[cfg(test)]` seam without reordering production statements.
 
 ### Intermediate PRs — Sol by default, not Fable
 
@@ -2774,3 +2872,21 @@ structural facade definition and executable contracts above remain the gates.
   slices use Sol, not Opus on every slice.
 - Fable remains limited to the frozen-design gate and final whole-system Gate
   2. Opus is available only for an exceptional judgment escalation.
+
+### 2026-07-29 — R4-24 movement/control split
+
+- LSP reference closure corrected the stale R4-20 promise that
+  `capture_rename_page_title_on_connection` could become private at R4-24:
+  three apply/recovery callers remain in `db/repair_page_rename.rs`, and the
+  verification caller moves into a second DB child. The helper remains a
+  narrow `pub(crate)` seam shared only by those children.
+- Sol review found that R4-24's required new commit-failure and dual-lock
+  checkpoints contradicted D2's movement-only boundary. R4-24 is split into
+  R4-24a mechanical critical-section movement and R4-24b RED-first,
+  `#[cfg(test)]` crash/lock teeth from the committed green movement baseline.
+- R4-24a preserves the manual transaction and at-least-once terminal-receipt
+  model. Its only explicit lock-lifetime change is release of the DB mutex
+  after child commit/return and before caller-owned pending cleanup; outer
+  manifest/tag locks and the borrowed rename session remain live.
+- Fable's narrow gate-1 re-review returned **APPROVE** after independently
+  confirming the LSP reference set and the movement/control boundary.
