@@ -2186,20 +2186,164 @@ Frozen slice contract:
 
 #### R4-22 — stale-projection quarantine and recovery
 
-- Move stale-projection quarantine and its apply-journal recovery together as
-  two named operations. Preserve owner-absence CAS, journal load/persist/clear,
-  pending receipt behavior, `restore_post`, recovery-state mapping, proof hook,
-  and conditional snapshot restore.
-- Preserve the current order and lifetime: acquire the DB mutex before the
-  repair projection lock and retain it across owner check plus every journal
-  and filesystem recovery/apply step. No effort in this movement PR may
-  shorten that lifetime, even where the filesystem work is slow.
-- Required controls cover owner appearing, crash windows before and after
-  journal persistence, `Original`/`Post`/`Unknown` recovery, mutation-not-started
-  versus restore-required failures, and a concurrent writer blocked across the
-  filesystem phase.
-- GREEN floor: external literals `293 → 291`, production `4 → 2`, tests remain
-  `289`.
+##### R4-22 frozen slice contract
+
+- **One protocol module and two production declarations.** Add
+  `db/repair_stale_projection.rs`; the stale-page apply journal, quarantine,
+  and recovery state machine remain one protocol. It owns exactly these
+  production operations:
+  `quarantine_stale_page_projection_cas_with_apply_journal` and
+  `recover_stale_page_projection_apply_receipt`. `post_write` retains the
+  existing apply path through a `pub(crate) use` re-export only. `repair`
+  imports the recovery operation directly and keeps its two existing calls
+  inside generic apply-receipt recovery. No production wrapper, second
+  same-name declaration, inherent `MemoryDB` method, generic connection or
+  projection-session API, or dispatcher bypass.
+- **Test facades move with their owner.** The child also owns the four existing
+  `cfg(test)` facades
+  `quarantine_stale_page_projection_cas`,
+  `quarantine_stale_page_projection_cas_with_before_pin`,
+  `quarantine_stale_page_projection_cas_with_after_pin`, and
+  `quarantine_stale_page_projection_cas_with_before_source_stage`;
+  `post_write` re-exports them only under `cfg(test)`, preserving every caller
+  path and argument list. The `before_pin`, `after_pin`, and
+  `before_source_stage` hook bounds deliberately gain `+ 'static` for safe
+  owned Tokio task-local storage. Convert the four current borrowed callers
+  to owned `PathBuf`/byte captures with `move`. Do not add `'static` to the
+  real journal callback `J` or receipt callback `F`: both production closures
+  intentionally borrow orchestrator state.
+- **Apply validation and lock order are exact.** Preserve: validate the
+  target/writer/global scope/mutation; validate captured source and quarantine
+  paths against the plan rollback; acquire the DB mutex; run the owner-absence
+  query with the exact `repair projection owner CAS` error mapping and return
+  `repair_target_stale` if an owner exists; capture the DB digest; then enter
+  synchronous `KnowledgeProjectionWrite::with_repair_lock` while retaining the
+  DB guard. Under both guards capture the current projection, validate its
+  expected receipt and exact stale ownership, scan non-target state, persist
+  the journal, pin, quarantine, rescan/capture, prove effects, construct
+  `RepairWriteProof::from_parts`, and invoke `before_commit`. Do not await,
+  spawn, switch to an owned session, or drop/reacquire either guard inside the
+  projection phase.
+- **The journal is the locked dynamic snapshot.** The journal payload is the
+  dynamically captured `before` state under both guards, not the plan-time
+  rollback. Invoke `J(&before)` after capture/ownership/non-target validation
+  and before pin or any quarantine mutation. The existing orchestrator closure
+  must durably publish the journal through its `.pending → final` window first,
+  then create the empty pending apply receipt. Only after `J` succeeds may pin
+  begin. This ordering protects a prior repair from the same plan and is not
+  interchangeable with persisting the original rollback.
+- **Mutation-started split and compensation stay distinct.**
+  `pin_stale_page_projection` sets `mutation_started = true` as soon as pin
+  succeeds, even before the first hard link. Its internal compensations may
+  reset the flag to false after restoring their own partial work. An outer
+  error with `mutation_started == false` returns the original error without a
+  second snapshot restore. An outer error with the flag still true restores
+  the dynamic `before`; restore success returns the original error, while
+  restore failure returns
+  `WenlanError::VectorDb("{error}; stale projection rollback failed: {rollback_error}")`.
+  Preserve zero-mutation stale, internally self-cleaned failure, partial
+  mutation, and rollback-required failure as separate states.
+- **Apply artifact boundaries are unchanged.** Journal persistence, pending
+  receipt creation, and pending receipt preparation occur inside both DB and
+  projection guards through `J` and `F`. After the canonical operation returns
+  successfully, both guards are released before the orchestrator publishes
+  the prepared pending receipt and then clears the journal. On apply error,
+  retain an existing pending receipt whenever the journal still exists or the
+  ordinary recovery predicate requires it; abort only otherwise. Never clear
+  the journal before publishing the receipt.
+- **Typed recovery-artifact seam only.** Keep paths and generic filesystem
+  primitives private to `repair`. Add
+  `StalePageProjectionRecoveryJournal::{Absent, Present(StoredRollbackArtifact)}`
+  and
+  `StalePageProjectionRecoveryArtifactUpdate::{ClearPendingOnly,
+  PublishPendingAndClearJournal, ClearPendingAndJournal}` plus two narrow
+  `RepairArtifactStore` methods that inspect/promote the journal and apply one
+  typed update. The two enums and two methods are `pub(crate)`, while their
+  fields, paths, path builders, and filesystem primitives remain private to
+  `repair`; the child receives no `Path` or generic filesystem capability.
+  They preserve the existing pending/final publication, cleanup ordering,
+  sync behavior, and error strings. Do not expose `publish_no_replace`,
+  pending/final paths, or a generic publish/delete API. The sole-use
+  `stale_page_projection_post_target_receipt` helper becomes `pub(crate)`;
+  `capture_stale_page_projection_current` is already `pub(crate)` and no
+  broader repair helper visibility changes.
+- **Recovery lock and pre-classifier behavior are exact.** The child receives
+  typed `&RepairArtifactStore`, manifest, plan rollback, optional page root,
+  and the already parsed `Option<RepairApplyReceipt>`; it does not inspect the
+  raw pending path to decide semantics. Acquire the DB mutex, repeat the
+  owner-absence CAS with `repair database` mapping and return
+  `repair_apply_recovery_required` if an owner exists. While retaining the DB
+  guard, inspect/promote the journal. If it is absent and the current
+  projection exactly equals the plan rollback, apply `ClearPendingOnly` and
+  return retry. Otherwise use the journal rollback when present, falling back
+  to the plan rollback, and set
+  `restore_post = pending_receipt.is_none()` exactly. Enter
+  `with_repair_lock` only around `recover_stale_page_projection`; deliberately
+  convert every error from that projection recovery to `Unknown`. The
+  projection guard ends before artifact publication/cleanup, while the DB
+  guard remains live through the typed update and function return.
+- **Recovery state table is closed.**
+  `Some(valid receipt) + Post + exact post-target digest` publishes pending to
+  final and then clears the journal, returning that receipt.
+  `Original`, with either `Some` or `None`, clears pending first and then the
+  journal, returning retry. `Unknown`, a nonterminal recovery state, a Post
+  digest mismatch, or every other combination returns
+  `repair_apply_recovery_required` and preserves all artifacts. With
+  `pending_receipt == None`, `restore_post = true` restores a recoverable Post
+  state to Original before this table; with `Some`, it remains Post for exact
+  receipt publication. The generic already-final receipt cleanup in
+  `recover_apply_receipt` remains outside this DB critical section and is not
+  moved.
+- **Test controls have teeth without production callbacks.** Use one owned,
+  consumption-checked `cfg(test)` Tokio task-local for
+  `after_db_snapshot_before_projection_lock`,
+  `before_journal_persist`, `after_journal_persist_before_pin`,
+  `after_pin_before_link`, `before_source_stage`,
+  `before_snapshot_restore`, `after_snapshot_restore`,
+  `after_recovery_state_before_artifact`, and
+  `after_recovery_artifact`. The three legacy hook facades map to their exact
+  historical sites. The after-journal checkpoint can inject a test-only error
+  after canonical `J` has durably created the journal and empty pending
+  receipt but before pin. Canonical production parameters remain only the
+  real `J` and `F` callbacks.
+- **RED and mutation floor.** Direct child controls must cover: normal apply
+  with the pinned DB digest and a DB contender `Pending` through journal,
+  quarantine, proof, and return; DB-before-projection lock order; owner
+  appearing after prepare for both apply and recovery; journal failure before
+  publish versus crash after journal publish/before pin; a two-manifest
+  canonical apply in which repair A completes, repair B is interrupted by the
+  after-journal checkpoint after its real journal plus pending receipt exist,
+  and B recovery preserves A; no-mutation and internally self-cleaned errors
+  versus restore-required and restore-failure mappings; journal-absent exact
+  Original retry; the complete
+  `Original`/matching-`Post`/mismatched-`Post`/`Unknown` table; and the
+  `restore_post` split. A recovery contender remains blocked through typed
+  artifact publish/clear and enters only after return. Use a separately opened
+  `.projection.lock` file for lock-order contention; never hold the process
+  mutex in another thread under a Tokio timeout. Required temporary mutations
+  move journal persistence after pin, replace canonical `J(&before)` with
+  `J(rollback)`, remove the owner CAS, remove the `mutation_started` split or
+  snapshot restore, shorten the DB-guard lifetime, move the proof callback,
+  invert `restore_post`, propagate recovery error instead of `Unknown`, or
+  clear artifacts from an unmatched/Unknown arm; each matching control and
+  each deleted checkpoint invocation must fail.
+- **Generic-final boundary has a source tooth.** A narrow source-shape guard
+  requires `recover_apply_receipt` to complete the already-final receipt
+  cleanup branch before either stale-recovery call, and forbids
+  `repair_stale_projection.rs` from loading a final apply receipt or performing
+  that generic pending/journal cleanup. This guards the deliberate outside-DB
+  boundary without exposing a new production callback or raw artifact path.
+- **Existing behavior and topology gates.** Keep all `33`
+  `repair_plan::deterministic::tests::stale_page_projection_*` controls green,
+  plus the exact lower-level export quarantine/recovery/ancestor-swap controls
+  and pending-retention predicate test. Lower only the raw-lock rows
+  `post_write.rs 13 → 12` and `repair.rs 18 → 17`; require external literals
+  `293 → 291`, production `4 → 2`, and tests `289`. Regenerate only moved M5
+  source addresses and retain exactly `191` rows, depth `55 / 50 / 86`,
+  exposure `22`, and ambiguity `9`. Ast-grep must find one production
+  declaration for each operation; LSP must resolve one apply production path,
+  two recovery callers, all six legacy test-facade calls, and zero error
+  diagnostics.
 
 #### R4-23 — current repair target dispatcher
 
