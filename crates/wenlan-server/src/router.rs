@@ -6,9 +6,10 @@ pub use crate::route_registry::AppRouter;
 use crate::route_registry::{delete, get, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
-    brief_routes, community_routes, config_routes, import_routes, ingest_routes, knowledge_routes,
-    lint_routes, memory_routes, onboarding_routes, page_map_routes, profile_agents_routes,
-    refinery_routes, repair_routes, routes, security, source_routes, truth_guard, websocket,
+    brief_routes, community_routes, config_routes, entity_graph_routes, import_routes,
+    ingest_routes, knowledge_routes, lint_routes, memory_routes, onboarding_routes,
+    page_map_routes, profile_agents_routes, refinery_routes, repair_routes, routes, security,
+    source_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -105,49 +106,19 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/memory/contradiction/{source_id}/dismiss",
             post(memory_routes::handle_dismiss_contradiction),
-        )
-        // Knowledge graph
-        .route(
-            "/api/memory/entities",
-            post(memory_routes::handle_create_entity),
-        )
-        .route(
-            "/api/memory/relations",
-            post(memory_routes::handle_create_relation),
-        )
-        .route(
-            "/api/memory/observations",
-            post(memory_routes::handle_add_observation),
-        )
-        .route(
-            "/api/memory/link-entity",
-            post(memory_routes::handle_link_entity),
         );
+    let router = entity_graph_routes::register_writes(router);
     let router = profile_agents_routes::register(router);
+    let router = entity_graph_routes::register_reads(router);
     let router = router
-        // Knowledge graph retrieval + stats
-        .route(
-            "/api/memory/entities/list",
-            post(memory_routes::handle_list_entities),
-        )
-        .route(
-            "/api/memory/entities/search",
-            post(memory_routes::handle_search_entities),
-        )
-        .route(
-            "/api/memory/entities/{entity_id}",
-            get(memory_routes::handle_get_entity_detail),
-        )
+        // Knowledge graph stats
         .route(
             "/api/memory/stats",
             get(memory_routes::handle_get_memory_stats),
         )
-        .route("/api/home-stats", get(memory_routes::handle_get_home_stats))
-        // Entity suggestions
-        .route(
-            "/api/memory/entity-suggestions",
-            get(memory_routes::handle_get_entity_suggestions),
-        )
+        .route("/api/home-stats", get(memory_routes::handle_get_home_stats));
+    let router = entity_graph_routes::register_suggestions(router);
+    let router = router
         // Nurture cards
         .route(
             "/api/memory/nurture",
@@ -257,29 +228,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/chunks/delete-bulk",
             post(memory_routes::handle_delete_bulk),
-        )
-        // Entity/observation CRUD (batch 3)
-        .route(
-            "/api/memory/entities/{id}/confirm",
-            put(memory_routes::handle_confirm_entity),
-        )
-        .route(
-            "/api/memory/entities/{id}/delete",
-            delete(memory_routes::handle_delete_entity),
-        )
-        .route(
-            "/api/memory/entities/{entity_id}/observations",
-            post(memory_routes::handle_add_entity_observation),
-        )
-        .route(
-            "/api/memory/observations/{id}",
-            put(memory_routes::handle_update_observation)
-                .delete(memory_routes::handle_delete_observation),
-        )
-        .route(
-            "/api/memory/observations/{id}/confirm",
-            put(memory_routes::handle_confirm_observation),
-        )
+        );
+    let router = entity_graph_routes::register_crud(router);
+    let router = router
         // Space extended (batch 4)
         .route(
             "/api/spaces/{name}/pin",

@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 1 APPROVED**
+Status: **R4 complete; R5 in progress; handler-movement slice 2 approved**
 
 ## Authority and change control
 
@@ -3573,6 +3573,79 @@ R5 handler-movement slice 1 evidence, 2026-07-30:
   closures, preserved pre-existing read-guard lifetimes, TempDir-backed test
   isolation with no config/Page/projection/environment mutation, and the
   focused handler/M5/Clippy/format/diff gates.
+
+R5 handler-movement slice 2 evidence, 2026-07-30:
+
+- The exact `14` `/api/memory` entity-graph bindings now execute in
+  `entity_graph_routes.rs`: entity/relation/observation creation, memory/entity
+  linking, entity list/search/detail/suggestions, and entity/observation CRUD.
+  Memory/home statistics, nurture, and the existing three `knowledge_routes`
+  bindings remain out of scope. Direct router inspection corrected the
+  pre-implementation map from three helper positions to four: stats/home sit
+  between entity reads and suggestions, so `register_writes`,
+  `register_reads`, `register_suggestions`, and `register_crud` are called at
+  the four original composition points. Combining reads and suggestions would
+  have changed order and violated D2.
+- The local link DTO and four moved production blocks are byte-identical to
+  their `HEAD` source. Their old/new SHA-256 values are respectively
+  `00e141e38fa712792a043f517612de07a65f9d52f83dd866218bd7babd0895f6`
+  (link DTO),
+  `92fca216758ac54c2024222f243809fdcb16fedf7f95c492b8b1bd473475a376`
+  (writes),
+  `a3228664f07c00f7c39c314604e25edc716f7f5c89a16ac7d80dcaf0d4e9bb19`
+  (scoped reads),
+  `524fae3ba683e10a91838b5269daac9fb4bb265bb8868fc34cbec80a3dcca013`
+  (suggestions), and
+  `955a349304376f362a48d4ba308be9ce944a731dd5a1cdbe19e7067cf94e5154`
+  (CRUD). The shared `extract_agent_name` remains in `memory_routes` because
+  unrelated memory and refinery handlers call it.
+- Before updating expected identities, the exact production-builder control
+  was RED on precisely these `14` rows. Updating only their handler fields from
+  `memory_routes::*` to `entity_graph_routes::*` made the same `165 + 6`
+  runtime comparison GREEN. Truth and sensitive-read manifests remain
+  byte-identical. The pre-existing `handle_link_entity` read guard still spans
+  its DB await; the other thirteen handlers retain their existing cloned-DB
+  snapshots.
+- The built-router typed characterization passed before movement and after
+  movement, `1 / 1` each. It drives success for all `14` endpoints, a typed
+  deterministic no-DB `503` for all `14`, and the opaque link route's marked
+  `403` refusal. Shared `wenlan-types` requests/responses are used wherever
+  their shape is exact. The search request uses an exact test-local mirror
+  because the production-local wire includes `space` while the shared request
+  does not; link success uses `LinkEntityResponse`, and errors use the
+  established local envelope. No `serde_json::Value` response oracle or
+  production test seam was added.
+- After refreshing diagnostics, Rust LSP reports zero errors in the new
+  module, old module, composition root, export, and contract test. Each of all
+  `14` moved handler reference queries now contains exactly its colocated
+  registration and definition; no `router.rs` or `memory_routes.rs` semantic
+  reference remains.
+- `router.rs` falls from `508` to `459` lines; `memory_routes.rs` falls from
+  `5,523` lines and `89` public handlers to `5,177` lines and `75`; the bounded
+  entity module is `413` lines with `14` public handlers. The generated reader
+  delta is nine source-address rows: three scoped-entity call edges, their
+  three moved server consumers, and three downstream Page-handler shifts. It
+  remains `191 / 55-50-86 / exposure 22`; call-site ownership is now
+  `78 router + 14 entity_graph_routes + 75 other = 167`, and displaced
+  current-contract M5 prose citations were refreshed.
+- Verification passes: typed family contract `1 / 1`; server library
+  `347 passed / 2 ignored`; route convergence `17 / 17`; space scoping
+  `30 / 30`; default-save-space `5 / 5`; truth manifest `16 / 16`; Rust/Python
+  M5 `1 / 1` and `191 / 55-50-86 / exposure 22`; projection-permit source scan
+  `1 / 1`; core/server all-target Clippy with warnings denied; formatting and
+  diff hygiene.
+- R5 handler-movement slice 2 REVIEW, 2026-07-30: the fresh Sol reviewer
+  returned **APPROVE** with zero blocking and zero non-blocking findings. It
+  confirmed all five byte-identical movement hashes, the four preserved
+  composition positions, exactly fourteen handler-identity-only manifest
+  changes, zero LSP diagnostics with registration-plus-definition closures,
+  unchanged lock/security behavior, and complete typed success/no-DB/refusal
+  coverage. It also traced entity creation through the TempDir-backed database
+  transaction and confirmed that this test path has no config,
+  `knowledge_path`, or projection-directory access. The reviewer independently
+  reran the entity contract, route registry, truth manifest, Python M5 sweep,
+  LSP checks, and diff hygiene; the root-run full server suite and Clippy
+  results remain separately recorded above.
 
 ### R6 — `post_write` phase decomposition
 

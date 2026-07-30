@@ -13,14 +13,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use wenlan_core::sources::compute_effective_confidence;
 use wenlan_types::requests::{
-    AddObservationRequest, ConfirmRequest, CreateConceptRequest, CreateEntityRequest,
-    CreateRelationRequest, ExportPagesRequest, ListMemoriesRequest, SearchMemoryRequest,
-    SearchPagesRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
+    ConfirmRequest, CreateConceptRequest, ExportPagesRequest, ListMemoriesRequest,
+    SearchMemoryRequest, SearchPagesRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
 };
 use wenlan_types::responses::{
-    AddObservationResponse, ConfirmResponse, CreateEntityResponse, CreatePageResponse,
-    CreateRelationResponse, DefaultSpaceResponse, DeleteResponse, ListMemoriesResponse,
-    SearchMemoryResponse, StoreMemoryResponse,
+    ConfirmResponse, CreatePageResponse, DefaultSpaceResponse, DeleteResponse,
+    ListMemoriesResponse, SearchMemoryResponse, StoreMemoryResponse,
 };
 use wenlan_types::sources::{stability_tier, MemoryType, RawDocument, StabilityTier};
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
@@ -48,14 +46,6 @@ pub(crate) async fn registered_request_space(
         }
     }
     Ok(registered)
-}
-
-// ===== Knowledge Graph Types =====
-
-#[derive(Debug, Deserialize)]
-pub struct LinkEntityRequest {
-    pub source_id: String,
-    pub entity_id: String,
 }
 
 // ===== Route Handlers =====
@@ -1114,193 +1104,6 @@ pub async fn handle_delete_memory(
     Ok(Json(DeleteResponse { deleted: true }))
 }
 
-// ===== Knowledge Graph Handlers =====
-
-pub async fn handle_create_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    headers: HeaderMap,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(mut req): Json<CreateEntityRequest>,
-) -> Result<Json<CreateEntityResponse>, ServerError> {
-    let agent = extract_agent_name(&headers, None);
-    let db = {
-        let s = state.read().await;
-        s.db.as_ref()
-            .cloned()
-            .ok_or(ServerError::DbNotInitialized)?
-    };
-    let _space_write_guard = db.lock_space_writes().await;
-    let resolved = db
-        .resolve_write_space(&req.space, header_space.as_deref())
-        .await?;
-    req.space = match resolved.space_name.as_ref() {
-        Some(name) => WriteSpaceTarget::Named(name.clone()),
-        None => WriteSpaceTarget::Uncategorized,
-    };
-    let result = wenlan_core::post_write::create_entity(&db, req, &agent).await?;
-    let persisted_space = db.get_entity_detail(&result.id).await?.entity.space;
-    let (space_source, write_outcome) = if result.wrote {
-        (
-            if persisted_space.is_some() {
-                resolved.source
-            } else {
-                WriteSpaceSource::Uncategorized
-            },
-            WriteOutcome::Created,
-        )
-    } else {
-        (WriteSpaceSource::Existing, WriteOutcome::ResolvedExisting)
-    };
-    Ok(Json(CreateEntityResponse {
-        id: result.id,
-        warnings: result.warnings,
-        space: persisted_space,
-        space_source: Some(space_source),
-        write_outcome: Some(write_outcome),
-    }))
-}
-
-pub async fn handle_create_relation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    headers: axum::http::HeaderMap,
-    Json(mut req): Json<CreateRelationRequest>,
-) -> Result<Json<CreateRelationResponse>, ServerError> {
-    let agent = extract_agent_name(&headers, req.source_agent.as_deref());
-    let db = {
-        let s = state.read().await;
-        s.db.as_ref()
-            .cloned()
-            .ok_or(ServerError::DbNotInitialized)?
-    };
-    // M3g span capture (span/model_version/prompt_version) is daemon-internal
-    // (KG extraction) only -- strip them so an agent-triggered request can
-    // never set them, matching the CreateRelationRequest doc comment.
-    req.span = None;
-    req.model_version = None;
-    req.prompt_version = None;
-    let result = wenlan_core::post_write::create_relation(&db, req, &agent).await?;
-    Ok(Json(CreateRelationResponse {
-        id: result.id,
-        warnings: result.warnings,
-    }))
-}
-
-pub async fn handle_add_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    headers: HeaderMap,
-    Json(req): Json<AddObservationRequest>,
-) -> Result<Json<AddObservationResponse>, ServerError> {
-    let agent = extract_agent_name(&headers, req.source_agent.as_deref());
-    let db = {
-        let s = state.read().await;
-        s.db.as_ref()
-            .cloned()
-            .ok_or(ServerError::DbNotInitialized)?
-    };
-    let result = wenlan_core::post_write::add_observation(&db, req, &agent).await?;
-    Ok(Json(AddObservationResponse {
-        id: result.id,
-        warnings: result.warnings,
-    }))
-}
-
-pub async fn handle_link_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(req): Json<LinkEntityRequest>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    db.update_memory_entity_id(&req.source_id, &req.entity_id)
-        .await
-        .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
-    Ok(Json(serde_json::json!({"linked": true})))
-}
-
-// ===== Knowledge Graph Retrieval Handlers =====
-
-#[derive(Debug, Deserialize)]
-pub struct ListEntitiesRequest {
-    #[serde(default)]
-    pub entity_type: Option<String>,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListEntitiesResponse {
-    pub entities: Vec<wenlan_core::db::Entity>,
-}
-
-pub async fn handle_list_entities(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(req): Json<ListEntitiesRequest>,
-) -> Result<Json<ListEntitiesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope =
-        crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
-            .await?;
-    let entities = db
-        .list_entities_scoped(req.entity_type.as_deref(), &scope)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(ListEntitiesResponse { entities }))
-}
-
-pub async fn handle_get_entity_detail(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(entity_id): Path<String>,
-) -> Result<Json<wenlan_core::db::EntityDetail>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let detail = db.get_entity_detail_scoped(&entity_id, &scope).await?;
-    Ok(Json(detail))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SearchEntitiesRequest {
-    pub query: String,
-    #[serde(default = "default_entity_search_limit")]
-    pub limit: usize,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
-}
-
-fn default_entity_search_limit() -> usize {
-    20
-}
-
-#[derive(Debug, Serialize)]
-pub struct SearchEntitiesResponse {
-    pub results: Vec<wenlan_core::db::EntitySearchResult>,
-}
-
-pub async fn handle_search_entities(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(req): Json<SearchEntitiesRequest>,
-) -> Result<Json<SearchEntitiesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope =
-        crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
-            .await?;
-    let results = db
-        .search_entities_by_vector_scoped(&req.query, req.limit, &scope)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(SearchEntitiesResponse { results }))
-}
-
 #[derive(Debug, Serialize)]
 pub struct MemoryStatsResponse {
     pub stats: wenlan_core::db::MemoryStats,
@@ -1465,48 +1268,6 @@ pub async fn handle_get_enrichment_status(
         .map_err(|e| ServerError::Internal(e.to_string()))?
         .ok_or_else(|| ServerError::NotFound("memory not found".to_string()))?;
     Ok(Json(status))
-}
-
-// ===== Entity Suggestions =====
-
-#[derive(Debug, Serialize)]
-pub struct EntitySuggestion {
-    pub id: String,
-    pub entity_name: Option<String>,
-    pub source_ids: Vec<String>,
-    pub confidence: f64,
-    pub created_at: String,
-}
-
-pub async fn handle_get_entity_suggestions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<Vec<EntitySuggestion>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let pending = db
-        .list_entity_suggestions_scoped(&scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-
-    let suggestions: Vec<EntitySuggestion> = pending
-        .iter()
-        .filter(|p| {
-            p.action == "suggest_entity" && (p.status == "pending" || p.status == "awaiting_review")
-        })
-        .map(|p| EntitySuggestion {
-            id: p.id.clone(),
-            entity_name: p.payload.clone(),
-            source_ids: p.source_ids.clone(),
-            confidence: p.confidence,
-            created_at: p.created_at.clone(),
-        })
-        .collect();
-
-    Ok(Json(suggestions))
 }
 
 // ===== Helpers =====
@@ -2276,113 +2037,6 @@ pub async fn handle_delete_bulk(
     Ok(Json(wenlan_types::responses::DeleteCountResponse {
         deleted,
     }))
-}
-
-// =====================================================================
-// Batch 3 — Entity / Observation CRUD
-// =====================================================================
-
-/// PUT /api/memory/entities/{id}/confirm
-pub async fn handle_confirm_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::ConfirmEntityRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.confirm_entity(&id, req.confirmed)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// DELETE /api/memory/entities/{id}/delete
-pub async fn handle_delete_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.delete_entity(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// POST /api/memory/entities/{entity_id}/observations
-pub async fn handle_add_entity_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(entity_id): Path<String>,
-    Json(req): Json<wenlan_types::requests::AddEntityObservationRequest>,
-) -> Result<Json<wenlan_types::responses::AddObservationResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let id = db
-        .add_observation(
-            &entity_id,
-            &req.content,
-            req.source_agent.as_deref(),
-            req.confidence,
-        )
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::AddObservationResponse {
-        id,
-        warnings: vec![],
-    }))
-}
-
-/// PUT /api/memory/observations/{id}
-pub async fn handle_update_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::UpdateObservationRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.update_observation(&id, &req.content)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// DELETE /api/memory/observations/{id}
-pub async fn handle_delete_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.delete_observation(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// PUT /api/memory/observations/{id}/confirm
-pub async fn handle_confirm_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::ConfirmObservationRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.confirm_observation(&id, req.confirmed)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
 }
 
 // =====================================================================

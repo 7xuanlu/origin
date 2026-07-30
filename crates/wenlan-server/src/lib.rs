@@ -8,6 +8,7 @@ pub mod brief_files;
 pub mod brief_routes;
 pub mod community_routes;
 pub mod config_routes;
+pub mod entity_graph_routes;
 pub mod error;
 mod host_activity;
 pub mod import_routes;
