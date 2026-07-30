@@ -2103,56 +2103,8 @@ pub async fn handle_correct_memory(
 }
 
 // =====================================================================
-// Batch 6 — Decisions, briefing, working memory, profile narrative, pinned
+// Batch 6 — Briefing, working memory, profile narrative, pinned
 // =====================================================================
-
-/// GET /api/decisions
-pub async fn handle_list_decisions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<wenlan_types::responses::DecisionsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let space = params
-        .get("space")
-        .or_else(|| params.get("domain"))
-        .cloned();
-    let scope =
-        crate::read_scope::effective_read_scope(&db, space.as_deref(), header_space.as_deref())
-            .await?;
-    let limit: usize = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
-    let decisions = db
-        .list_memories_scoped(&scope, Some("decision"), None, None, limit)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::DecisionsResponse {
-        decisions,
-    }))
-}
-
-/// GET /api/decisions/domains
-/// (Path kept as "domains" for back-compat; will rename to "spaces" in PR-A+1.)
-pub async fn handle_list_decision_domains(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<wenlan_types::responses::DecisionDomainsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let domains = db
-        .list_decision_spaces()
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::DecisionDomainsResponse {
-        domains,
-    }))
-}
 
 /// GET /api/briefing
 pub async fn handle_get_briefing(

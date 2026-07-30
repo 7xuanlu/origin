@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 6 complete**
+Status: **R4 complete; R5 in progress; handler-movement slice 7 complete**
 
 ## Authority and change control
 
@@ -3974,6 +3974,70 @@ R5 handler-movement slice 6 evidence, 2026-07-30:
   handler hash, identity-only manifest delta, unchanged protected sources,
   capture/detail/by-ids behavior and typed controls, TempDir isolation,
   current counts/citations, and LSP closure. Its focused reruns passed the
+  typed contract, exact handler guard, Python M5 sweep, formatting, and diff
+  hygiene.
+
+R5 handler-movement slice 7 contract, 2026-07-30:
+
+- Move exactly `GET /api/decisions` and `GET /api/decisions/domains` into
+  `decisions_routes.rs`, through one registrar at their existing position
+  after the version/update batch. Exactly two handler-manifest identity fields
+  may change; no helper or production-local DTO moves with them.
+- Preserve both handlers byte-for-byte: decisions keeps query-then-header
+  Space precedence, limit default, `memory_type=decision` filter, and short
+  state snapshot; domains remains a global compatibility response whose wire
+  field is still `domains`.
+- Typed built-router characterization must use shared `DecisionsResponse` and
+  `DecisionDomainsResponse`, plus the established test-local `ErrorEnvelope`.
+  Cover work/personal decision isolation, query-over-header precedence, global
+  domains, unknown-Space `422`, both no-DB `503`s, and marked `403` for both
+  `MarkerShape::None` routes.
+- Briefing, profile narrative, pinned/pending/history revisions, snapshots,
+  versions and memory updates, remaining CRUD/search/enrichment, Pages,
+  CLI/MCP, and DTO normalization remain out of scope. Truth, sensitive-read,
+  mutation, M5, and cross-cutting layer sources stay unchanged.
+
+R5 handler-movement slice 7 evidence, 2026-07-30:
+
+- Exactly the two frozen decision bindings now execute in
+  `decisions_routes.rs`, through one registrar after the version/update batch.
+  The remaining briefing/narrative/pinned routes retain their next position.
+- The normalized old/new handler block has identical SHA-256
+  `94d6a46d95d4bbac1fbc7f1c84780aa3cd9293483866787b460c9e2fe8f97cd2`.
+  Query-then-header precedence, limit/filter behavior, global domains, and
+  lock/await lifetimes remain byte-for-byte.
+- The production-builder control was RED on precisely two new
+  `decisions_routes::*` observations versus two old `memory_routes::*`
+  expectations before the identity-only manifest update, then GREEN.
+  Truth, sensitive-read, mutation, and adapter sources remain byte-identical.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. Shared `DecisionsResponse` and `DecisionDomainsResponse` cover
+  success; the established test-local `ErrorEnvelope` covers unknown-Space
+  `422`, both no-DB `503`s, and both marked `403`s. Work/personal data proves
+  query-over-header precedence and global domain enumeration without an
+  untyped response oracle.
+- Refreshed LSP diagnostics are clean in the new module, old module, router,
+  export, and contract test. Both handlers close on their colocated
+  registration plus definition; the registrar closes on one router call plus
+  definition.
+- `router.rs` falls from `380` to `376` lines; `memory_routes.rs` falls from
+  `4,595` lines and `49` public handlers to `4,547` lines and `47`; the bounded
+  decisions module is `66` lines with `2` handlers. M5 remains
+  `191 / 55-50-86 / exposure 22`; displaced Page addresses and prose
+  citations were refreshed. Call-site ownership is
+  `50 router + 2 decisions_routes + 3 memory_detail_routes +
+  5 activity_tag_routes + 5 indexed_files_routes + 13 spaces_routes +
+  14 entity_graph_routes + 75 other = 167`.
+- Focused verification passes after the last code edit: typed contract `1 / 1`;
+  exact handler guard `1 / 1`; truth manifest `16 / 16`; Rust/Python M5
+  `1 / 1` and `191 / 55-50-86 / exposure 22`; focused Clippy with warnings
+  denied; formatting and diff hygiene.
+- R5 handler-movement slice 7 REVIEW, 2026-07-30: the reused independent Sol
+  lane returned **APPROVE** with zero blocking and zero non-blocking findings.
+  It independently confirmed byte equality, route position/layers, both
+  handler identities, query-over-header and global-domain behavior, typed
+  error/refusal coverage, protected-source equality, TempDir isolation,
+  current citations/counts, and LSP closure. Its focused reruns passed the
   typed contract, exact handler guard, Python M5 sweep, formatting, and diff
   hygiene.
 

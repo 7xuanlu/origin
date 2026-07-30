@@ -13,8 +13,8 @@ main|get|/api/config|wenlan_server::config_routes::handle_get_config
 main|get|/api/config/routing|wenlan_server::config_routes::handle_get_resolved_routing
 main|get|/api/config/skip-apps|wenlan_server::config_routes::handle_get_skip_apps
 main|get|/api/debug/pipeline|wenlan_server::routes::handle_pipeline_status
-main|get|/api/decisions|wenlan_server::memory_routes::handle_list_decisions
-main|get|/api/decisions/domains|wenlan_server::memory_routes::handle_list_decision_domains
+main|get|/api/decisions|wenlan_server::decisions_routes::handle_list_decisions
+main|get|/api/decisions/domains|wenlan_server::decisions_routes::handle_list_decision_domains
 main|get|/api/health|wenlan_server::routes::handle_health
 main|get|/api/home-stats|wenlan_server::memory_routes::handle_get_home_stats
 main|get|/api/import/state|wenlan_server::import_routes::handle_list_pending_imports
