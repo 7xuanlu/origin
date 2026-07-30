@@ -265,7 +265,27 @@
       "id": "page_update:impl_Writer",
       "phases": ["final"],
       "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "impl", "name": "Writer"}},
-      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "impl", "name": "Writer"}}
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "impl", "name": "Writer"}},
+      "substitutions": [
+        {
+          "side": "old",
+          "from": "    fn is_machine(&self) -> bool {",
+          "to": "    pub(super) fn is_machine(&self) -> bool {",
+          "count": 1
+        },
+        {
+          "side": "old",
+          "from": "    fn skips_hallucination_guard(&self) -> bool {",
+          "to": "    pub(super) fn skips_hallucination_guard(&self) -> bool {",
+          "count": 1
+        },
+        {
+          "side": "old",
+          "from": "    fn is_llm_rewrite(&self) -> bool {",
+          "to": "    pub(super) fn is_llm_rewrite(&self) -> bool {",
+          "count": 1
+        }
+      ]
     },
     {
       "id": "page_update:page_is_human_owned",
@@ -356,8 +376,7 @@
       "id": "page_update:replay_matching_operation_receipt",
       "phases": ["final"],
       "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "replay_matching_operation_receipt"}},
-      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "replay_matching_operation_receipt"}},
-      "allow_pub_super_new": true
+      "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "replay_matching_operation_receipt"}}
     },
     {
       "id": "page_update:terminal_result_with_receipt",
@@ -370,7 +389,15 @@
       "phases": ["final"],
       "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "update_page_impl"}},
       "new": {"path": "crates/wenlan-core/src/post_write/page_update.rs", "selector": {"kind": "fn", "name": "update_page_impl"}},
-      "allow_pub_super_new": true
+      "allow_pub_super_new": true,
+      "substitutions": [
+        {
+          "side": "old",
+          "from": "            if let Err(e) = projection.write_page_gated(db, &updated_page).await {\n                log::warn!(\"[update_page] md re-write failed for {page_id}: {e}\");\n            }",
+          "to": "            let projection_result = projection.write_page_gated(db, &updated_page).await;\n            let projection_result =\n                post_commit_projection_pause_and_fail(page_id, projection_result).await;\n            if let Err(e) = projection_result {\n                log::warn!(\"[update_page] md re-write failed for {page_id}: {e}\");\n            }",
+          "count": 1
+        }
+      ]
     }
   ],
   "imports": {
@@ -388,22 +415,26 @@
       "pub use self::page_dispatch::{ create_page, create_page_with_floor, create_page_with_tuning, page_write, update_page, update_page_preserving_sources, PageWrite, };",
       "pub(crate) use self::page_dispatch::{ update_page_at_source_revision, update_page_growth_at_versions, };",
       "pub use self::page_revision::{ accept_pending_revision, accept_pending_revision_with_knowledge_path, dismiss_contradiction, dismiss_pending_revision, };",
+      "pub use self::page_update::{page_is_human_owned, stage_page_revision_card, PipelineStage, Writer};",
+      "pub(crate) use self::page_update::merge_shrink_threshold;",
+      "pub(crate) use self::page_update::PRE_WRITE_GATE;",
       "use crate::db::MemoryDB;",
       "use crate::{ db::{MemoryDB, UNFILED_SPACE_ID}, error::WenlanError, };",
       "use crate::{ db::{MemoryDB, PendingMemoryRevisionPayload}, error::WenlanError, };",
       "use crate::{db::MemoryDB, error::WenlanError};",
-      "use self::page_dispatch::PageGrowthCommit;",
       "use std::{collections::HashSet, path::Path};",
       "use std::{path::Path, str::FromStr};",
       "use std::path::Path;",
       "use super::log_activity_best_effort;",
-      "use super::{ page_create::{ attach_page_sources_impl, create_page_impl, replace_source_page_impl, write_document_source_page_impl, CreatePageInput, }, update_page_impl, WriteResult, };",
+      "use super::{ page_create::{ attach_page_sources_impl, create_page_impl, replace_source_page_impl, write_document_source_page_impl, CreatePageInput, }, page_update::update_page_impl, WriteResult, };",
+      "use super::{page_dispatch::PageGrowthCommit, WriteOutcome, WriteResult};",
       "use super::{log_activity_best_effort, WriteOutcome, WriteResult};",
       "use super::{WriteOutcome, WriteResult};",
       "use wenlan_types::requests::CreateConceptRequest;",
       "use wenlan_types::requests::{CreateConceptRequest, UpdatePageRequest};",
       "use wenlan_types::requests::{AddObservationRequest, CreateEntityRequest, CreateRelationRequest};",
-      "use wenlan_types::{ repair::{RepairDigest, RepairManifest, RepairRollbackPayloadV2}, requests::UpdatePageRequest, MemoryType, RawDocument, };"
+      "use wenlan_types::{ repair::{RepairDigest, RepairManifest, RepairRollbackPayloadV2}, MemoryType, };",
+      "use wenlan_types::{requests::UpdatePageRequest, RawDocument};"
     ],
     "allow_removed": [
       "use crate::db::{MemoryDB, PendingMemoryRevisionPayload, UNFILED_SPACE_ID};",

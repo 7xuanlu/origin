@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R6-3 complete; R6-4 Page update is next**
+Status: **R6 complete; R7 daemon startup and scheduler lanes next**
 
 ## Authority and change control
 
@@ -5088,6 +5088,104 @@ Those are behavior changes and must not be hidden inside R6.
   and production raw-connection ratchet each pass `1/1`.
   `cargo fmt --all -- --check`, `git diff --check`, and the explicit external
   `post_write::page_create` / `post_write::page_dispatch` path scan pass.
+
+#### R6-4 execution receipt — 2026-07-30
+
+- Added
+  `update_projection_failure_after_commit_preserves_db_history_and_receipt_authority`
+  before movement. After correcting a test-only unsupported whole-`Page`
+  equality assertion, the accepted RED failed solely because the new
+  production-site gate did not exist. Its private, test-only, page-id-scoped
+  one-shot seam receives the real `write_page_gated` result, pauses, then
+  injects an error into the existing best-effort branch. While paused, the test
+  proves the DB content/version, newest `page_history` row, operation receipt,
+  and real Markdown projection have all landed. After release, the injected
+  projection error stays swallowed and the returned `WriteResult` remains
+  byte-identical to the committed receipt. The exact test passes `1/1` before
+  and after movement.
+- Mutation proof replaced only the real production
+  `projection.write_page_gated` call with `Ok(None)`. The exact test failed at
+  `the real production projection call must write the page`; restoring the
+  call returned it to `1/1`. Removing/reordering the whole site instead is
+  bounded by the same five-second pause timeout, and propagating the injected
+  error fails the final successful-result assertion.
+- Advanced the structure phase to `final`. The complete writer-policy,
+  ownership/revision-card, shrink/retry/receipt, pre-write CAS seam, exact-base
+  CAS loop, and post-commit projection cluster now live together in private
+  `post_write/page_update.rs`; the root facade is `350` lines and has no private
+  `*_impl` body. `page_dispatch` remains the only sibling caller. Existing
+  public `PipelineStage`, `Writer`, `page_is_human_owned`, and
+  `stage_page_revision_card` paths plus crate-visible
+  `merge_shrink_threshold` and `PRE_WRITE_GATE` paths are direct re-exports.
+  The only movement visibility changes are exact `pub(super)` seams for
+  `update_page_impl`, `RetryIdentity`, and the three `Writer` predicates used
+  by the sibling test module; the comparator records each one explicitly.
+- Retargeted
+  `non_stale_page_write_uses_loaded_version_cas` to sibling
+  `page_update.rs` through its predeclared final-phase substitution. Removing
+  the root's transitive `UpdatePageRequest`/`RawDocument` import required the
+  external test module to import `UpdatePageRequest` directly. The final
+  import manifest records `24` exact additions and `3` removals. Comparator
+  self-test re-extracts `49` selectors, unit tests pass `4/4`, live comparison
+  passes `49/49`, and final structure/facade passes `4/4`.
+- Focused GREEN receipts are update behavior `14/14`, PageWrite
+  receipt/CAS/ownership/history `19/19`, ownership/update conflicts `5/5`, the
+  loaded-version reflection control `1/1`, and the new post-commit projection
+  test `1/1`. The complete `post_write::tests::*` set passes `107/107`; the new
+  characterization is the sole addition to R6-3's `106`, and the ignored
+  inventory remains `0 tests, 0 benchmarks`.
+- M5 regeneration changes only the generated address for
+  `update_page_impl` from the facade to `page_update.rs`, the mechanical
+  one-line shift for `page_dispatch::page_write`, and the two-line root shift
+  for `rename_page_title_cas` after the `#[cfg(test)]` re-export correction.
+  The pre/post ratchet against `/tmp/wenlan-r6-4-m5-before.json`, its self-test,
+  and both Rust M5 gates keep `191 rows; depth 55/50/86; exposure 22` with the
+  same exposure identity set.
+  Truth manifest passes `16/16`; projection-permit source scan, production
+  cutover-setter guard, R4 exact manifest, and production raw-connection
+  ratchet each pass `1/1`.
+- Rust LSP resolves `update_page_impl` from the sibling import to
+  `page_update.rs` and reports exactly its definition, import, and three
+  dispatch calls. The projection helper has its definition/call pair, the
+  gate has exactly its declaration/helper/test references, the public
+  `PipelineStage` reference set includes the root re-export, and diagnostics
+  are empty in the facade, dispatch, update, and test files. The production
+  child-path scan is empty; its sole repo-wide text hit is the structure
+  tooth's intentional rejection fixture. Warnings-denied core all-target
+  Clippy first exposed an unconditional root re-export of test-only
+  `PRE_WRITE_GATE`; splitting it into a `#[cfg(test)]` re-export preserves the
+  old production absence and test facade path, after which Clippy passes.
+  Formatting and diff hygiene pass. Two independent high-risk Sol reviews
+  remain the root closure gate.
+- The independent data-loss review returned **APPROVE** after reproducing the
+  post-commit authority witness, its positive projection control, the exact
+  comparator substitution, the M5 permit/source gates, and the semantic
+  ratchet. The independent concurrency review returned **BLOCK** on one
+  comparator-only fail-open: `replay_matching_operation_receipt` remained
+  private, but its manifest row unnecessarily allowed a future `pub(super)`
+  widening. Removing that allowance makes a temporary visibility widening fail
+  the live comparator with an exact body-hash mismatch; restoring the private
+  helper returns the comparator to `49/49`. Concurrency reviewer closure is
+  **APPROVE** with no remaining concurrency, receipt, CAS, data-loss, or
+  facade-boundary finding.
+- The integrated R6 review returned **BLOCK** on two boundary-proof drifts. The
+  ledger's root-facade count was stale after the test-only re-export correction
+  (`348`, now corrected to the measured `350`), and the live structure tooth
+  still trusted any recognized transitional phase marker. A new `final_phase`
+  gate now hard-requires `final` before the live source scan; its positive
+  control rejects the formerly valid `create-dispatch` marker, so re-inlining a
+  child and downgrading the marker cannot weaken the permanent R6 boundary.
+  The integrated reviewer rechecked both corrections and returned **APPROVE**
+  with no remaining R6 finding.
+- R6 boundary gates pass after the final source correction:
+  `cargo clippy --workspace --all-targets -- -D warnings`;
+  `cargo test -p wenlan-core --lib` with `3,471` passed and `33` ignored; and
+  one uninterrupted `cargo test --workspace --lib` with CLI `32 / 32`, core
+  `3,471` passed with `33` ignored, MCP `178 / 178`, server `347` passed with
+  `2` ignored, and types `183 / 183`. Aggregate: `4,211` passed, `35` ignored,
+  zero failed. The final-phase structure tests pass inside that uninterrupted
+  run, including the downgrade positive control and the new post-commit
+  projection characterization.
 
 ### R7 — daemon startup and scheduler lanes
 

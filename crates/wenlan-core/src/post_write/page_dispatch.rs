@@ -3,7 +3,8 @@ use super::{
         attach_page_sources_impl, create_page_impl, replace_source_page_impl,
         write_document_source_page_impl, CreatePageInput,
     },
-    update_page_impl, WriteResult,
+    page_update::update_page_impl,
+    WriteResult,
 };
 use crate::{db::MemoryDB, error::WenlanError};
 use std::path::Path;

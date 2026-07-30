@@ -111,6 +111,16 @@ impl Phase {
     }
 }
 
+fn final_phase(raw: &str) -> Result<Phase, String> {
+    let phase = Phase::parse(raw)?;
+    if phase != Phase::Final {
+        return Err(format!(
+            "post_write decomposition is finalized; expected \"final\", got {phase:?}"
+        ));
+    }
+    Ok(phase)
+}
+
 fn mask_rust_non_code(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = bytes.to_vec();
@@ -421,7 +431,7 @@ fn structure_violations(
 fn post_write_structure_matches_expected_phase() {
     let root = super::repo_root();
     let phase_source = std::fs::read_to_string(root.join(PHASE_FILE)).expect("read phase marker");
-    let phase = Phase::parse(&phase_source).expect("valid post_write structure phase");
+    let phase = final_phase(&phase_source).expect("permanently finalized post_write structure");
     let source = std::fs::read_to_string(root.join(POST_WRITE_ROOT)).expect("read post_write.rs");
     let post_write_dir = root.join(POST_WRITE_DIR);
     let existing_children: BTreeSet<String> = if post_write_dir.is_dir() {
@@ -477,8 +487,8 @@ fn post_write_structure_matches_expected_phase() {
         structure_violations(&source, phase, &existing_children, external_test, &borrowed);
     assert!(
         violations.is_empty(),
-        "R6 post_write structure drifted at phase {phase:?}; advance \
-         post_write_structure_phase.txt only in the slice that establishes the next exact shape:\n{}",
+        "R6 post_write final structure drifted; keep the phase marker and exact private-child \
+         boundary finalized:\n{}",
         violations.join("\n")
     );
 }
@@ -581,6 +591,11 @@ fn post_write_structure_phase_parser_fails_closed() {
     assert!(
         Phase::parse("almost-final").is_err(),
         "an unknown staged phase must not silently weaken the structure tooth"
+    );
+    assert_eq!(final_phase("final").unwrap(), Phase::Final);
+    assert!(
+        final_phase("create-dispatch").is_err(),
+        "an earlier valid movement phase must not downgrade the permanent final tooth"
     );
 }
 

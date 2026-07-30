@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use wenlan_types::requests::{
     AddObservationRequest, CreateConceptRequest, CreateEntityRequest, CreateRelationRequest,
+    UpdatePageRequest,
 };
 
 // Serialize env-var-sensitive tests to avoid races.
@@ -1645,7 +1646,7 @@ async fn update_page_round_trip() {
 
 #[test]
 fn non_stale_page_write_uses_loaded_version_cas() {
-    let source = include_str!("../post_write.rs");
+    let source = include_str!("page_update.rs");
     let update_impl = source
         .split("async fn update_page_impl")
         .nth(1)
@@ -2928,6 +2929,90 @@ fn retry_req(content: &str, mem_id: &str, operation_id: &str) -> UpdatePageReque
         caller_id: Some("app".to_string()),
         operation_id: Some(operation_id.to_string()),
     }
+}
+
+#[tokio::test]
+async fn update_projection_failure_after_commit_preserves_db_history_and_receipt_authority() {
+    let (db, _dir, page_id, mem_id) =
+        receipt_fixture("page_update_post_commit_projection_failure").await;
+    let knowledge = tempfile::tempdir().unwrap();
+    let before = db.get_page(page_id).await.unwrap().unwrap();
+    let history_before = db.list_page_history(page_id, 10).await.unwrap();
+    let updated_content =
+        "The database, history, and receipt stay authoritative after projection failure";
+    let operation_id = "op-post-commit-projection-failure";
+
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *page_update::POST_COMMIT_PROJECTION_GATE.lock().unwrap() =
+        Some((page_id.to_string(), parked_tx, resume_rx));
+
+    let update = update_page(
+        &db,
+        page_id,
+        retry_req(updated_content, mem_id, operation_id),
+        "re_distill",
+        false,
+        Some(knowledge.path()),
+        None,
+    );
+    let observe_committed_authority = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), parked_rx)
+            .await
+            .expect("production update must reach the post-commit projection pause")
+            .expect("production update dropped the post-commit projection pause");
+
+        let committed = db.get_page(page_id).await.unwrap().unwrap();
+        assert_eq!(
+            committed.content, updated_content,
+            "the DB update must commit before projection can fail"
+        );
+        assert_eq!(committed.version, before.version + 1);
+
+        let history = db.list_page_history(page_id, 10).await.unwrap();
+        assert_eq!(history.len(), history_before.len() + 1);
+        assert_eq!(history[0].version, committed.version);
+        assert_eq!(history[0].content, updated_content);
+        assert_eq!(history[0].edited_by, "re_distill");
+
+        let receipt = db
+            .get_operation_receipt("app", operation_id)
+            .await
+            .unwrap()
+            .expect("the page write receipt must commit with the DB update");
+        let receipt_result: WriteResult = serde_json::from_str(&receipt.response).unwrap();
+        assert!(receipt_result.wrote);
+        assert_eq!(receipt_result.outcome, WriteOutcome::Wrote);
+
+        let writer =
+            crate::export::knowledge::KnowledgeWriter::new(knowledge.path().to_path_buf(), &db);
+        let filename = writer
+            .page_filename(page_id)
+            .expect("the real production projection call must write the page");
+        let markdown = std::fs::read_to_string(knowledge.path().join(filename)).unwrap();
+        assert!(
+            markdown.contains(updated_content),
+            "the production projection site must run before the injected failure"
+        );
+
+        resume_tx
+            .send(())
+            .expect("the production update must still be paused");
+        (committed, history, receipt.response)
+    };
+
+    let (result, (committed, history, receipt_response)) =
+        tokio::join!(update, observe_committed_authority);
+    let result = result.expect("the post-commit projection failure must stay best-effort");
+    assert!(result.wrote);
+    assert_eq!(result.outcome, WriteOutcome::Wrote);
+    assert_eq!(serde_json::to_string(&result).unwrap(), receipt_response);
+    let after = db.get_page(page_id).await.unwrap().unwrap();
+    assert_eq!(after.content, committed.content);
+    assert_eq!(after.version, committed.version);
+    assert_eq!(after.source_memory_ids, committed.source_memory_ids);
+    assert_eq!(after.changelog, committed.changelog);
+    assert_eq!(db.list_page_history(page_id, 10).await.unwrap(), history);
 }
 
 /// The lost-response case: the client never saw the reply and sent the very
