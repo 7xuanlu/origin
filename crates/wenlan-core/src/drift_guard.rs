@@ -5,6 +5,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[path = "drift_guard/r4_test_support_test.rs"]
+mod r4_test_support_test;
+
 /// Repo root, resolved at compile time from this crate's manifest dir
 /// (crates/wenlan-core -> ../.. == repo root).
 fn repo_root() -> PathBuf {

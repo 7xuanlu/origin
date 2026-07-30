@@ -7,7 +7,7 @@ use super::WenlanError;
 /// ON DELETE CASCADE). Single-row lookups only -- the JOIN forms that hydrate
 /// a full `Entity`/`EntityDetail` shape stay in `scoped_entities.rs`, which
 /// this seam does not touch.
-pub(crate) async fn page_id_for_entity(
+pub(super) async fn page_id_for_entity(
     conn: &libsql::Connection,
     entity_id: &str,
 ) -> Result<Option<String>, WenlanError> {
@@ -34,7 +34,7 @@ pub(crate) async fn page_id_for_entity(
 #[allow(dead_code)] // no production call site among this stage's candidate
                     // refactor sites (all are forward-direction); proven by
                     // the round-trip bijection test.
-pub(crate) async fn entity_id_for_page(
+pub(super) async fn entity_id_for_page(
     conn: &libsql::Connection,
     page_id: &str,
 ) -> Result<Option<String>, WenlanError> {

@@ -131,6 +131,9 @@ mod scoped_entities_test;
 mod scoped_pages_test;
 #[cfg(test)]
 mod scoped_records_test;
+#[cfg(test)]
+#[path = "db/test_support_test.rs"]
+pub(crate) mod test_support;
 
 fn push_read_scope_filter(
     scope: &ReadScope,
@@ -2579,7 +2582,7 @@ fn normalized_ddl(sql: &str) -> String {
 /// trigger keeping its name and RAISE text but flipping its WHEN predicate,
 /// timing, or target table would otherwise read as healthy while enforcing
 /// nothing.
-pub(crate) async fn parity_guard_shape_drift(
+async fn parity_guard_shape_drift(
     conn: &libsql::Connection,
 ) -> Result<Option<&'static str>, WenlanError> {
     for (name, canonical) in PARITY_GUARD_TRIGGERS {

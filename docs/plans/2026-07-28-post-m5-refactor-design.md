@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 re-approved through the R4-24 split; R4-24b complete**
+Status: **Fable gate 1 re-approved through the R4-24 split; R4-25b complete**
 
 ## Authority and change control
 
@@ -2874,6 +2874,80 @@ Frozen slice contract:
   visibility/lifetime/observer fidelity, non-vacuous source mutants, the
   address-only inventory refresh, and absence of fixture, support-session, or
   behavior changes.
+- R4-25b RED/GREEN evidence, 2026-07-29: the parser RED returned an empty raw
+  set against six expected ordinary/multiline/macro shapes; the manifest RED
+  accepted an empty manifest; and the API RED failed compilation on the
+  missing `test_primary_session` / `test_secondary_session` methods. GREEN
+  passes `26 / 26` parser, graph, exact-manifest, mutation, DB-child escape,
+  and visible-signature teeth plus `5 / 5` opaque-session behavior tests. The
+  review RED returned `8` parser/tooth failures out of `25`, `2` behavior
+  failures out of `5`, and three `E0599` compile errors when commit/rollback
+  still returned `()`. The frozen manifests carry
+  `347` raw identities (`340` `MemoryDB`-derived plus `7` standalone libSQL
+  Builder origins) and `31` existing R4-24b support-call identities. A live
+  libSQL `0.9.30` probe found that `TransactionBehavior::ReadOnly` emits
+  `BEGIN READONLY` but does not itself reject local DML, so the secondary-only
+  test session now follows lint's established `PRAGMA query_only = ON`
+  pattern, resets it on commit/rollback, and proves the same consumed
+  secondary session is writable afterward. Managed transactions and structural
+  digests are secondary-only; repair digests and seed checks remain on the
+  primary session. Every tracked Rust file must resolve through the module
+  graph; `eval/eval_judge.rs` is retained as a private empty module so both the
+  compiler and the guard classify it. The legacy external-access teeth pass
+  `3 / 3`; M5
+  remains `191 / 55-50-86 / exposure 22` with address-only `db.rs` shifts.
+- R4-25b second-closure RED/GREEN evidence, 2026-07-30: the focused RED passed
+  `26 / 30` and failed exactly four controls: production capability aliases
+  returned no violations, macro UFCS/wrapped receivers returned no calls,
+  ambiguous macro targets returned no errors, and `eval_judge.rs` was absent.
+  GREEN passes `30 / 30`. The DB-child scan resolves exact grouped and renamed
+  imports, rejects public and `pub(crate)` `Database` / `Connection` /
+  `Transaction` capabilities without confusing an unrelated domain
+  `Connection`, and treats a mutex guard as a DB capability only when its
+  generic target contains a libSQL `Connection`. The live scan found four
+  existing exports; reference inspection closed them by making
+  `parity_guard_shape_drift` private and both entity-page adapter functions
+  `pub(super)`, while `lock_space_writes -> MutexGuard<()>` remained public
+  because it carries no DB handle. Macro teeth now classify UFCS,
+  parenthesized/dereferenced typed receivers, and aliased Builder constructors,
+  while unknown target-bearing forms fail through the analysis error channel.
+  A lexical-order regression first left the suite at `29 / 30`; receiver-first
+  visitation restored the exact factory-before-method identity order. Final
+  gates pass the `5 / 5` opaque session suite, `3 / 3` legacy access teeth,
+  `16 / 16` truth manifest, `13 / 13` truth exposure, the Rust M5 guard, the
+  `191 / 55-50-86 / exposure 22` Python sweep, and clippy with warnings denied.
+- R4-25b third-closure RED/GREEN evidence, 2026-07-30: the focused RED passed
+  `30 / 34` and failed exactly four mutants: `db.rs` `pub(super)` plus libSQL
+  module/glob imports were missed, module-level macro UFCS produced no support
+  identity, comma-separated wrapped receivers produced no calls, and a
+  function-local Builder alias produced no standalone origin. GREEN passes
+  `34 / 34`. Visibility is now path-aware: `db.rs` `pub(super)` reaches the
+  crate root and is scanned, while a DB child module's `pub(super)` remains
+  inside the DB boundary; `pub(in crate)` remains crate-visible and
+  `pub(in crate::db)` remains DB-internal. Exact type resolution covers
+  `use libsql as sql; sql::Connection` and `use libsql::*; Connection` without
+  treating an unrelated imported `Connection` as libSQL. Module macro
+  definitions record exact `TestDbSession` UFCS calls; unproven metavariables
+  tied to a known session method fail through the analysis error channel;
+  comma-separated invocations preserve typed receiver flow; and block-local
+  Builder aliases feed the same standalone-origin classifier. An intermediate
+  repository run exposed false positives on ordinary `$start.await` /
+  `$pcn.push` / raw `$db` macros; requiring a known session method (or exact
+  `$session`) as the candidate signal removed them without weakening the
+  mutants. Final gates pass `5 / 5` opaque sessions, `3 / 3` legacy access,
+  `16 / 16` truth manifest, `13 / 13` truth exposure, Rust M5, the
+  `191 / 55-50-86 / exposure 22` Python sweep, clippy with warnings denied,
+  formatting, and diff hygiene.
+- R4-25b REVIEW, 2026-07-30: the final independent Sol review returned
+  **APPROVE** after confirming the path-aware DB visibility rules, direct /
+  module / glob libSQL alias resolution, macro UFCS and fail-closed
+  metavariable handling, comma-separated wrapped receivers, function-local
+  Builder aliases, and the private module-graph wiring for `eval_judge`.
+  Root then re-ran the `34 / 34` parser / manifest teeth, `5 / 5` opaque
+  session behavior tests, `16 / 16` truth manifest tests, `13 / 13` truth
+  exposure tests, the Rust M5 guard, the `191 / 55-50-86 / exposure 22`
+  Python sweep, clippy with warnings denied, formatting, diff hygiene, and LSP
+  diagnostics on every changed Rust seam; all passed.
 
 ### R5 — server vertical slices
 
