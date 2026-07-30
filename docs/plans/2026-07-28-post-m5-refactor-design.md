@@ -2497,6 +2497,44 @@ Frozen slice contract:
   resolve both recovery calls to the child, the default branch to R4-17, and
   zero error diagnostics in child, test sibling, `repair`, `db.rs`, and the
   drift guard.
+- RED, 2026-07-29: the explicit child stub compiled and the qualified filter
+  listed exactly eight direct tests. The direct suite then failed `0 / 8` on
+  the unimplemented dispatcher, unconsumed checkpoints, and retained
+  `target_receipt_current`; lowering only the `repair.rs` ratchet row failed
+  exactly `16 -> 17`.
+- GREEN, 2026-07-29: `db/repair_target_receipt.rs` now owns the sole production
+  dispatcher. Default targets branch before locking and delegate to R4-17;
+  ordinary projection retains DB-only capture and count `1`; stale projection
+  retains owner absence before dynamic DB-to-projection capture and count `0`.
+  `recover_apply_receipt` has exactly two child calls, the old wrapper is gone,
+  the specialized stale recovery dispatch remains earlier, and only
+  `database_error` widened to `pub(crate)`.
+- MUTATION, 2026-07-29: temporary lock-above-dispatch, R4-17 bypass,
+  parser/root-before-lock, DB reacquire-before-capture, deleted checkpoint,
+  ordinary projection-lock addition, stale-owner removal, stale-owner delay,
+  rollback-for-dynamic-stale substitution, R4-22 substitution, and `0 / 1`
+  count-swap mutants each failed its direct behavior or source tooth and were
+  restored. The two contender tests remained bounded; no timeout escaped its
+  stated limit.
+- VERIFIED, 2026-07-29: direct controls pass `8 / 8`; the four frozen existing
+  controls pass `4 / 4`; the exact ratchet plus its two positive controls pass
+  `3 / 3`. External literals are exactly `290`, split into production `1` and
+  tests `289`; `repair.rs` is `16`, `post_write.rs` remains `12`. The generated
+  M5 inventory changed addresses only and passes at exactly
+  `191 / 55-50-86 / exposure 22 / ambiguity 9`. Ast-grep finds one child
+  declaration and no old wrapper; LSP resolves both callers to the child and
+  its default branch to R4-17, with zero error diagnostics in the five frozen
+  Rust files. Core/server all-target Clippy with `-D warnings` passes.
+- FINAL REVIEW GATE, 2026-07-29: Sol and the independent concurrency auditor
+  both returned `APPROVE` against the frozen contract. Root found that the
+  runtime validation-order control covered malformed rollback but not the
+  separately required missing-root case, added ordinary and stale
+  missing-root checkpoints that assert the DB mutex is already held, and
+  reran the exact control plus direct `8 / 8`; both reviewers inspected that
+  final diff. Root also reran the four existing controls `4 / 4`, all three
+  raw-lock teeth `3 / 3`, Rust M5 gate `1 / 1`, reader inventory
+  `191 / 55-50-86 / exposure 22 / ambiguity 9`, LSP definition/reference and
+  file diagnostics, ast-grep topology, formatting, and `git diff --check`.
 
 #### R4-24 — repair verification atomic operation
 

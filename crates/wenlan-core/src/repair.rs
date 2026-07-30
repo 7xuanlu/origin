@@ -7,7 +7,8 @@
 use crate::{
     db::{
         repair_page_rename::recover_rename_page_title_apply_receipt,
-        repair_stale_projection::recover_stale_page_projection_apply_receipt, MemoryDB,
+        repair_stale_projection::recover_stale_page_projection_apply_receipt,
+        repair_target_receipt::read_current_repair_target_receipt, MemoryDB,
     },
     error::WenlanError,
     lint::{
@@ -2679,7 +2680,8 @@ async fn recover_apply_receipt(
         .await;
     }
     if let Some(receipt) = parsed {
-        let (target_now, _) = target_receipt_current(db, manifest, rollback, page_root).await?;
+        let (target_now, _) =
+            read_current_repair_target_receipt(db, manifest, rollback, page_root).await?;
         if target_now == *receipt.after_target_receipt() {
             publish_no_replace(&pending_path, &final_path, "repair_already_applied")?;
             return Ok(Some(receipt));
@@ -2690,7 +2692,8 @@ async fn recover_apply_receipt(
             ));
         }
     } else {
-        let (target_now, _) = target_receipt_current(db, manifest, rollback, page_root).await?;
+        let (target_now, _) =
+            read_current_repair_target_receipt(db, manifest, rollback, page_root).await?;
         if target_now != *manifest.expected_state().canonical_receipt() {
             return Err(WenlanError::Conflict(
                 "repair_apply_recovery_required".to_string(),
@@ -2700,59 +2703,6 @@ async fn recover_apply_receipt(
     fs::remove_file(&pending_path)?;
     sync_dir(&manifest_dir)?;
     Ok(None)
-}
-
-async fn target_receipt_current(
-    db: &MemoryDB,
-    manifest: &RepairManifest,
-    rollback: &StoredRollbackArtifact,
-    page_root: Option<&Path>,
-) -> Result<(RepairDigest, u64), WenlanError> {
-    let connection = db.conn.lock().await;
-    match manifest.target() {
-        RepairTarget::PageProjection { page_id, .. }
-            if manifest.writer() == RepairWriter::QuarantineStalePageProjection =>
-        {
-            let page_root = page_root.ok_or_else(|| {
-                WenlanError::Validation("page projection repair root unavailable".to_string())
-            })?;
-            let mut owner = connection
-                .query(
-                    "SELECT 1 FROM pages WHERE id=?1 LIMIT 1",
-                    libsql::params![page_id.as_str()],
-                )
-                .await
-                .map_err(database_error)?;
-            if owner.next().await.map_err(database_error)?.is_some() {
-                return Err(WenlanError::Conflict("repair_target_stale".to_string()));
-            }
-            drop(owner);
-            let (source_path, quarantine_path) = stale_page_projection_paths(rollback)?;
-            let current = capture_stale_page_projection_current(
-                page_root,
-                page_id,
-                &source_path,
-                &quarantine_path,
-            )?;
-            Ok((target_receipt(&current)?, 0))
-        }
-        RepairTarget::PageProjection { page_id, .. } => {
-            let page_root = page_root.ok_or_else(|| {
-                WenlanError::Validation("page projection repair root unavailable".to_string())
-            })?;
-            let paths = projection_rollback_paths(rollback)?;
-            let current = capture_page_projection_on_connection(
-                &connection,
-                page_root,
-                page_id,
-                &paths,
-                &rollback.table,
-            )
-            .await?;
-            Ok((target_receipt(&current)?, 1))
-        }
-        _ => repair_target_receipt_on_connection(&connection, manifest.target()).await,
-    }
 }
 
 pub async fn record_repair_verification(
@@ -6842,7 +6792,7 @@ fn page_snapshot_error(error: crate::lint::pages::fs::PageFsError) -> WenlanErro
     WenlanError::Conflict(format!("repair_verification_reports_stale: {error}"))
 }
 
-fn database_error(error: libsql::Error) -> WenlanError {
+pub(crate) fn database_error(error: libsql::Error) -> WenlanError {
     WenlanError::VectorDb(format!("repair database: {error}"))
 }
 
