@@ -2072,19 +2072,80 @@ Frozen slice contract:
 
 #### R4-21 — regenerate-page projection compensation
 
-- Move `regenerate_page_projection_cas` as one named cross-resource operation.
-  It deliberately remains non-transactional.
-- Preserve the opposite lock topology from rename: materialize the existing
-  `get_page` precheck, acquire the DB mutex, read the projection page row and
-  database digest, then acquire the repair projection lock while still
-  holding the DB mutex. Hold it through scan, write, proof hook, and any
-  snapshot restore; release only on the existing return path.
-- Do not collapse this operation into the rename transaction or stale-page
-  quarantine. Direct controls must prove the DB row/digest snapshot remains
-  pinned across projection work, both rollback branches restore, and a
-  concurrent DB writer stays blocked until the projection operation exits.
-- GREEN floor: external literals `294 → 293`, production `5 → 4`, tests remain
-  `289`.
+##### R4-21 frozen slice contract
+
+- **One declaration and a path-preserving re-export.** Move the complete
+  `post_write::regenerate_page_projection_cas` body to
+  `db/repair_page_regenerate.rs` as the sole `pub(crate)` declaration of that
+  exact name. Replace the old declaration with a `pub(crate) use` re-export,
+  so `repair::apply_repair_with_pages_inner` keeps its sole production call
+  through `crate::post_write::regenerate_page_projection_cas`. The
+  task-specific module name is deliberate: it may not become a generic home
+  for R4-22's stale-projection protocol. No forwarding wrapper, second
+  same-name declaration, inherent `MemoryDB` method, generic
+  connection/transaction API, or dispatcher bypass.
+- **Exact precheck and split-snapshot behavior.** Preserve this order:
+  manifest target/writer/mutation validation; `db.get_page` precheck and
+  version/scope check; rollback paths and target-path validation; outer
+  `db.conn.lock`; `projection_page_row_on_connection` and
+  `database_content_digest`; then
+  `KnowledgeProjectionWrite::with_repair_lock` while retaining the DB guard.
+  The Page rendered by `write_page` remains the value read before the outer
+  lock, while rollback capture remains based on the later locked page row.
+  This pre-existing split snapshot and the gap between the two reads are
+  preserved, not repaired or revalidated in this movement slice.
+- **Exact lock topology and lifetime.** `get_page` must remain before the outer
+  guard because moving it inside would re-enter the non-reentrant DB mutex.
+  Keep the synchronous `with_repair_lock` closure under the async DB guard;
+  do not use `spawn_blocking`, introduce an await in the closure, replace it
+  with an owned session, or drop/reacquire either guard. The DB guard and
+  process/file-backed repair projection lock remain live through pre-scan,
+  target exclusivity, write, post-scan/capture, both compensation branches,
+  proof construction, `before_commit`, and the operation return. The
+  operation deliberately remains non-transactional: no `BEGIN` or `COMMIT`.
+- **Two distinct compensation branches and exact errors.** Preserve the first
+  restore branch for write/post-scan/capture/non-target errors and the second
+  for after-target-receipt, write-unproven, or `before_commit` errors. A
+  successful restore returns the original error unchanged. A failed restore
+  returns
+  `WenlanError::VectorDb("{original}; repair projection rollback failed: {restore}")`
+  in both branches. Errors before `write_page` do not restore.
+  `before_commit` remains a receipt-preparation hook, runs only after the
+  complete proof exists, and runs under both guards; it is not a database
+  commit. Preserve the caller consequence: only
+  `repair_apply_recovery_required` retains a pending apply receipt, so this
+  operation's ordinary and composed errors continue to abort it. Changing
+  that behavior requires a separately approved semantic slice.
+- **Narrow seams only.** Leave rollback-path, capture, receipt, digest, and
+  restore helpers in `repair`; this slice moves the owning critical section,
+  not those transitional helpers. Import `post_write::RepairWriteProof` and
+  construct it only with `RepairWriteProof::from_parts`. Any direct-test
+  controls are whole-item `#[cfg(test)]`, task-local, owned, and consumption
+  checked. They may not add a production callback parameter or expose the
+  connection, either guard, a generic projection session, or filesystem
+  capabilities.
+- **RED controls that bite.** Add direct child controls with bounded timeouts
+  that prove: the normal path cannot self-deadlock; the DB row/digest snapshot
+  is taken before projection work; DB-before-projection lock order; one DB
+  contender remains `Pending` after the snapshot, through target write and
+  proof preparation, and enters only after operation return; and the proof's
+  `post_apply_db_digest` is the pinned pre-projection digest. Independently
+  force a post-write result-branch error and a `before_commit`
+  completion-branch error, asserting byte-exact target/state/non-target
+  restoration and the unchanged original error. Force restore failure in
+  each branch and assert the exact composed `VectorDb` mapping, plus one
+  apply-level control proving the pending receipt is aborted. Temporary
+  mutations must remove each restore call, shorten the DB-guard lifetime,
+  move the proof callback, and remove a checkpoint invocation; each matching
+  control must fail, including fail-loud unconsumed-checkpoint names.
+- **Behavior and topology gates.** Keep the existing four
+  `page_projection_*` integration tests green. Lower only the
+  `post_write.rs` raw-lock ratchet `14 → 13`; require external literals
+  `294 → 293`, production `5 → 4`, and tests `289`. Regenerate only M5 source
+  addresses and retain exactly `191` rows, depth `55 / 50 / 86`, exposure
+  `22`, and ambiguity `9`. Ast-grep must find one function declaration; LSP
+  definition/references must resolve the sole production path to the DB child
+  with zero error diagnostics.
 
 #### R4-22 — stale-projection quarantine and recovery
 
