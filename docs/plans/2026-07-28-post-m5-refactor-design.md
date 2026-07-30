@@ -2394,18 +2394,109 @@ Frozen slice contract:
 
 #### R4-23 — current repair target dispatcher
 
-- Replace the one lock in `target_receipt_current` only after R4-20 through
-  R4-22 provide the purpose-specific projection capture seams. The dispatcher
-  retains target/writer branching, row counts, owner-absence checks, rollback
-  parsing, and errors; DB and projection snapshots still occur under the same
-  mutex lifetime as today.
-- The default branch uses R4-17's receipt read. Projection branches call narrow
-  owned-result methods; they may not receive a connection, guard, generic
-  session, or callback.
-- Branch-complete controls must cover default, ordinary page projection, and
-  stale projection paths, including a barrier for each projection branch.
-- GREEN floor: external literals `291 → 290`, production `2 → 1`, tests remain
-  `289`.
+##### R4-23 frozen slice contract
+
+- **One new child and one production entry.** Add
+  `db/repair_target_receipt.rs` with the sole public production operation
+  `read_current_repair_target_receipt(db, manifest, rollback, page_root)`.
+  It owns only private projection-branch logic and returns the owned
+  `(RepairDigest, u64)`. `recover_apply_receipt` imports it directly at both
+  existing non-stale call sites; delete `target_receipt_current` rather than
+  retaining a wrapper or same-name declaration in `repair`. Do not add a read
+  operation to the already-frozen R4-21 or R4-22 children.
+- **Branch before locking.** The public dispatcher selects target/writer first.
+  Every non-`PageProjection` target delegates directly to R4-17
+  `db.read_repair_target_receipt(manifest.target()).await`; it must not acquire
+  `db.conn` first, recreate `repair_target_receipt_on_connection`, inspect
+  `page_root`, or parse the supplied rollback. Both projection branches enter
+  private child logic and acquire the DB mutex before any branch-local root
+  validation, rollback parsing, query, or filesystem/projection capture.
+  Moving the DB lock above dispatch would self-deadlock the default branch
+  when R4-17 locks it again.
+- **Ordinary projection order is exact and intentionally has no projection
+  lock.** Preserve DB mutex → require `page_root` with
+  `page projection repair root unavailable` → `projection_rollback_paths` →
+  existing `capture_page_projection_on_connection` (DB page row followed by
+  raw filesystem capture) → `target_receipt(&current)` → count `1`. The DB
+  guard remains live through digest construction and function return. Do not
+  add `with_projection_lock`, `with_repair_lock`, an owned repair session, or
+  split the page-row and filesystem snapshots across guards; the current raw
+  filesystem read is protected only by that DB lifetime, and changing it would
+  alter contention and error behavior.
+- **Stale projection order is exact.** Preserve DB mutex → require the same
+  root → owner-absence `SELECT 1 FROM pages WHERE id=?1 LIMIT 1` using the
+  existing `repair::database_error` mapping → owner returns
+  `repair_target_stale` → drop the query row → `stale_page_projection_paths` →
+  existing `capture_stale_page_projection_current` while still holding DB
+  (therefore DB → projection lock) → `target_receipt(&current)` → count `0`.
+  Promote only `repair::database_error` to `pub(crate)`. Do not substitute an
+  R4-22 apply/recovery operation, repair lock, journal, artifact store, or
+  rollback bytes for the dynamic capture.
+- **Error priority and outer artifact boundaries remain unchanged.** The DB
+  lock precedes missing-root and malformed/unsafe rollback errors in both
+  projection branches. Stale root validation precedes the owner query, and
+  owner presence precedes stale rollback parsing or projection-lock
+  contention. Preserve all current DB, missing-owner, root, unsafe-path,
+  size, UTF-8, and rollback-shape error strings. Both DB guards end when the
+  child returns; generic pending publication/removal and directory sync remain
+  afterward in `recover_apply_receipt`. R4-22's earlier stale-writer dispatch
+  remains before both generic call sites, so the new stale arm stays
+  deliberately unreachable through the current production route and is
+  protected directly rather than replacing specialized recovery.
+- **No raw capability crosses the seam.** The child receives only
+  `MemoryDB`, manifest, rollback, and optional page root; it returns only the
+  owned digest/count pair. No `Connection`, mutex guard, projection session,
+  callback, `RepairArtifactStore`, artifact path, pending receipt, or generic
+  query/transaction capability enters or exits the public operation.
+- **Owned, consumption-checked test checkpoints only.** One `cfg(test)` Tokio
+  task-local checkpoint set may observe immediately after a projection DB
+  lock and before validation, immediately before projection/filesystem
+  capture, and immediately after capture before return. No production
+  callback, static caller bound, global mutable hook, or sleep-based
+  synchronization. A prestarted DB contender released by the first checkpoint
+  must be observed `Pending` before and after capture and may enter only after
+  child return.
+- **Branch-complete direct controls.** The sibling
+  `db/repair_target_receipt_test.rs` covers:
+  default digest/count/error equivalence to R4-17, wrong-scope handling, bogus
+  projection rollback/root inputs being ignored, and a bounded timeout against
+  double-lock self-deadlock; ordinary dynamic digest/count `1`, missing page,
+  missing root, malformed and unsafe rollback, DB-held validation ordering,
+  and the DB contender across page-row plus filesystem capture; stale dynamic
+  digest/count `0`, missing root, malformed rollback, DB-held validation
+  ordering, and the same full-lifetime contender across owner check plus
+  projection capture. Holding a separately opened
+  `.wenlan/.projection.lock` file must not affect ordinary capture; for stale,
+  an existing owner plus that lock must still return `repair_target_stale`
+  before contention, while no owner must fail fast with
+  `page_projection_locked`. Never hold the process-global projection mutex in
+  another thread under a Tokio timeout.
+- **Source and mutation teeth.** A narrow source/AST guard requires exactly
+  one public child dispatcher; its default branch calls R4-17; ordinary and
+  stale branches retain their exact existing capture helpers; the child
+  contains no repair/projection session, artifact store, or generic
+  publish/delete primitive; `repair.rs` retains the earlier specialized stale
+  dispatch and only the two existing non-stale child calls. Temporary
+  mutations must fail for: lifting the DB lock above dispatch; bypassing
+  R4-17; moving either root/parser before the projection DB lock; dropping or
+  reacquiring DB before either capture; deleting a checkpoint; adding an
+  ordinary projection/repair lock; removing or delaying the stale owner CAS;
+  substituting rollback for dynamic stale capture; substituting an R4-22
+  operation; and swapping counts `0 / 1`.
+- **Existing behavior and topology gates.** Keep R4-17
+  `repair_receipt_matches_connection_helper_and_preserves_scope_guard`, both
+  default recovery controls
+  `apply_recovers_committed_receipt_after_unrelated_background_write` and
+  `apply_discards_precommit_partial_receipt_and_retries`, plus
+  `page_projection_invalid_pending_with_changed_target_fails_closed` green.
+  Lower only `repair.rs` raw-lock baseline `17 → 16`; require external
+  literals `291 → 290`, production `2 → 1`, tests `289`, while
+  `post_write.rs` remains `12`. Regenerate M5 source addresses only and retain
+  exactly `191` rows, depth `55 / 50 / 86`, exposure `22`, ambiguity `9`.
+  Ast-grep must find one child declaration and none in `repair`; LSP must
+  resolve both recovery calls to the child, the default branch to R4-17, and
+  zero error diagnostics in child, test sibling, `repair`, `db.rs`, and the
+  drift guard.
 
 #### R4-24 — repair verification atomic operation
 
