@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R5 complete; R6 next**
+Status: **R5 complete; R6 design approved; R6-0 next**
 
 ## Authority and change control
 
@@ -4690,6 +4690,147 @@ R5 boundary verification, 2026-07-30:
 Begin only after the M5 exact-base and truth-state reader/write paths have
 settled. Preserve the one canonical facade.
 
+Current-tree census at the R5 boundary (`84e04d01`):
+
+- `post_write.rs` is `7,578` lines: `2,706` lines of production declarations
+  and implementation followed by one `4,872`-line inline test region
+  (`4,871` module-body lines plus its `#[cfg(test)]` attribute);
+- rust-analyzer reports `104` tests under the stable
+  `post_write::tests::*` path;
+- the public surface is `WriteResult`, `WriteOutcome`, `MemoryUpdate`,
+  `RepairWriteProof`, the repair facades, the entity/relation/observation
+  facades, `PageWrite` plus the Page create/update/revision facades, and the
+  writer-policy types;
+- Page updates couple ownership classification, exact-base checks, idempotency
+  receipt replay, revision-card staging, changelog planning, the version CAS,
+  and retry/re-decision inside one bounded loop. That is a correctness
+  boundary, not accidental adjacency.
+
+#### R6 design correction — flows own phases
+
+The original “validation, planning, storage, and post-commit” wording describes
+the order inside a write flow; it does **not** authorize four cross-cutting
+service modules. A module-per-phase design would make an agent load four files
+to understand one mutation and, more importantly, would tempt a caller to run a
+storage phase without the exact-base ownership/receipt plan that must precede
+it.
+
+Keep `crate::post_write` as the only production entry surface. Its children are
+private implementation modules organized by complete write flow:
+
+| Child | Owns |
+|---|---|
+| `post_write/page_dispatch.rs` | `PageWrite`, the single dispatch, and the stable Page facade functions |
+| `post_write/page_create.rs` | attach, deterministic document/source replacement, create validation/resolution, md-first + DB rollback, and create post-commit work |
+| `post_write/page_update.rs` | writer policy, request/retry validation, human-ownership gating, revision-card staging, exact-base/CAS/receipt update loop, and gated projection rewrite |
+| `post_write/page_revision.rs` | Page revision-card resolution plus accept/dismiss and contradiction curation flows |
+| `post_write/entity_graph.rs` | entity, relation, and observation validation/write/post-commit flows |
+| `post_write/post_write_tests.rs` | the existing `post_write::tests::*` module body; the `_tests.rs` suffix is a second exclusion net in addition to the current inline `#[cfg(test)]` stripper, so neither pre- nor post-move tests enter the M5 production-reader census |
+
+`post_write.rs` retains shared result/proof types, memory-update and repair
+facades, private child declarations, and direct item re-exports. Child
+visibility may widen only to `pub(super)` where sibling orchestration requires
+it. No child module is public, and no production caller names a child path.
+Existing `crate::post_write::<item>` paths, signatures, serialized response
+shape, and test names remain unchanged.
+
+The Page update CAS loop moves as one syntactic unit. R6 does not extract a
+generic planner, repository/storage trait, transaction wrapper, or post-commit
+job framework. Within each child, the existing contiguous
+validation → resolution/decision → storage/transaction → post-commit order
+remains explicit. A later behavior change may extract a helper only from this
+moved baseline and only with its own RED contract; it is not part of R6.
+
+#### R6 slices
+
+1. **R6-0 — executable boundary before movement.** Add a current-tree source
+   contract with positive controls that fails until the private child set,
+   external `_tests.rs` declaration, facade re-export set, and no-external-child
+   rule exist. Add a compile/runtime facade contract for the public result
+   shape and representative entity, create, update, and revision entrypoints.
+   Make this a standing `drift_guard` tooth, so later re-inlining or a public
+   child fails the existing workspace-library gate.
+   Commit `scripts/post-write-move-check.py` before moving code. Its manifest
+   names each old/new syntactic item; its normalizer may only normalize line
+   endings, remove one uniform module-body indent for the externalized test
+   body, and remove a leading `pub(super) ` from an explicitly allowlisted
+   sibling seam. Imports are compared as a separate sorted set and are never
+   deleted from a body hash. The two reflection-test path substitutions below
+   are explicit manifest deltas, not normalization. A synthetic non-allowlisted
+   token/body mutation must make the comparator fail.
+2. **R6-1 — externalize tests only.** Move the inline module byte-for-byte
+   except the required
+   `include_str!("post_write.rs") → include_str!("../post_write.rs")`
+   correction in
+   `non_stale_page_write_uses_loaded_version_cas`; preserve the exact
+   compiler-discovered `104`-test name set and zero-ignored set. Regenerate the
+   R4 test-support API manifest: exactly `55` rows may change only their first
+   path column from `crates/wenlan-core/src/post_write.rs` to
+   `crates/wenlan-core/src/post_write/post_write_tests.rs`; module path,
+   callee, and ordinal cells remain byte-identical. No production item moves,
+   and M5 inventory regeneration is unnecessary because both the old cfg-test
+   region and new `_tests.rs` file are excluded.
+3. **R6-2 — lower-risk flows.** Move entity/relation/observation and
+   memory/Page curation flows. Preserve function bodies and direct re-export
+   every existing facade item. Keep the already-thin repair delegates at the
+   root facade; DB-owned repair implementations are not an R6 target. Before
+   moving `accept_page_revision_card`, add the scratch-projection failure
+   characterization proving its committed DB mutation remains authoritative
+   when the post-commit projection rewrite fails.
+4. **R6-3 — Page create/dispatch.** Move the dispatch plus attach,
+   document/source replacement, and create flow. Preserve md-first ordering,
+   DB-failure projection rollback, truth write permits, source validation,
+   activity detail, and create/attach result envelopes. Retarget
+   `pages::tests::page_embedding_text_is_the_single_source_of_truth` to scan
+   both the facade and `post_write/page_create.rs`, preserving its positive
+   shared-helper assertion and both negative local-definition/cap assertions.
+5. **R6-4 — Page update.** Move the writer policy, revision staging, receipts,
+   and the complete exact-base/CAS loop as a unit. This is the only high-risk
+   R6 slice: it requires two independent Sol reviews focused on concurrency and
+   data loss. Retarget
+   `non_stale_page_write_uses_loaded_version_cas` from the now-empty facade
+   source to sibling `page_update.rs`; this reviewed test-text delta is
+   allowlisted separately and excluded from production-item byte comparison.
+
+#### R6 executable gates
+
+- Capture the pre-move compiler test inventory and require exact
+  `post_write::tests::*` name/ignored-set equality after R6-1.
+- Capture the public and `pub(crate)` facade item set with rust-analyzer; after
+  each production slice, existing callers must continue to name
+  `crate::post_write::<item>` even though `goto_definition` may correctly land
+  on the private child definition behind the re-export. References must contain
+  no child-module path outside the facade/test subtree, and affected-file
+  diagnostics must be empty.
+- For each mechanical block, run the committed R6-0 comparator with its
+  enumerated normalization/allowlist. A mismatch stops movement for inspection;
+  it is never waived by green tests.
+- Run focused RED/GREEN tests for entity validation/resolution/activity,
+  create validation/dedup/projection rollback, Page ownership/revision gating,
+  expected-version/source-revision/page-growth CAS, concurrent receipt replay,
+  projection permits, and accept/dismiss consumption.
+- Before Page-create movement, add a focused characterization that forces a DB
+  insert failure after a scratch projection write and proves the projection
+  rollback. Before Page-update movement, add its own focused post-commit
+  projection-failure characterization. If current behavior cannot satisfy a
+  stated contract, stop and isolate the behavior fix from movement.
+- Before every production slice, capture the exact M5 summary tuple
+  `191 / 55-50-86 / exposure 22` and exposure identity set. Regenerate only
+  source-address projections, then require tuple and exposure-set equality
+  after regeneration; demonstrate once in R6-0 that a synthetic changed
+  summary/reader input fails the ratchet. The truth manifest, permit source
+  scan, and external direct-connection ratchet must also remain exact.
+- R6 boundary: focused `wenlan-core` tests, workspace all-target warnings-denied
+  Clippy, one uninterrupted workspace library run, formatting/diff hygiene,
+  final LSP definition/reference/diagnostic closure, and an integrated Sol
+  review. Do not claim R6 complete if `post_write.rs` still owns a private
+  `*_impl` production flow or an inline test body.
+
+Stop immediately if movement changes SQL, transaction or lock lifetime,
+projection/rollback ordering, receipt precedence, ownership re-decision,
+serialized API shape, M5 generation/truth state, or any external caller path.
+Those are behavior changes and must not be hidden inside R6.
+
 ### R7 — daemon startup and scheduler lanes
 
 Separate orchestration from phase/lane implementations without changing startup
@@ -4955,3 +5096,29 @@ structural facade definition and executable contracts above remain the gates.
 - This adds an executable boundary and PR sequence, so it is a material design
   change. Fable returned `APPROVE-WITH-FIXES`; both required corrections landed,
   and the narrow follow-up returned `APPROVE`, unblocking R5-0.
+
+### 2026-07-30 — R6 flow-owned phase boundary
+
+- Rebaselined `post_write.rs` after R5 at `84e04d01`: `7,578` lines, including
+  `104` compiler-discovered tests in one `4,872`-line inline test region
+  (`4,871` module-body lines).
+- Corrected the skeletal phase wording after source/LSP inspection. Page
+  ownership planning, receipt replay, exact-base checks, CAS storage, and
+  retry/re-decision are one correctness boundary; four cross-cutting phase
+  modules would worsen navigation and create bypassable partial flows.
+- Froze a private, flow-owned child layout behind the sole
+  `crate::post_write` facade, with the Page update CAS loop moving as one unit,
+  exact facade/test inventories, M5 source-address-only regeneration, and dual
+  Sol review for the concurrency/data-loss slice.
+- This changes the previously underspecified R6 architecture and therefore
+  requires a scoped Fable design re-gate before R6-0 implementation.
+- Fable's scoped review returned **APPROVE-WITH-FIXES**. It validated the
+  flow-owned private-child architecture, sole facade, slice order, and the
+  requirement that the Page update cluster move as one syntactic unit. Its six
+  required gate corrections are now incorporated: the `55`-row R4 manifest
+  path-only regeneration, both self-reading-test retargets, the `pages.rs`
+  reflection retarget, a pre/post-regeneration M5 summary ratchet with a
+  can-fail control, the revision projection-failure precondition in R6-2, and
+  an executable allowlisted syntactic comparator with a perturbation control.
+  The narrow Fable closure returned **APPROVE** with no remaining material
+  defect, unblocking R6-0.
