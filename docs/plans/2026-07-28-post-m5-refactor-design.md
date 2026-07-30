@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 executable-boundary re-gate pending after PR-D integration**
+Status: **R4 complete; R5 gate 1 APPROVED; R5-0 ready**
 
 ## Authority and change control
 
@@ -3128,9 +3128,9 @@ Frozen slice contract:
 Move route registration and handlers domain by domain. Preserve route identity,
 typed request/response contracts, and `TrackedRouter` classification.
 
-Current-tree rebaseline at `e5d50255`:
+Current-tree rebaseline at `383a2f5d`:
 
-- `memory_routes.rs` contains `95` public `handle_*` functions across `5,725`
+- `memory_routes.rs` contains `95` public `handle_*` functions across `5,732`
   lines;
 - `router.rs` contains the main composition root across `685` lines;
 - the truth manifest contains `167` static HTTP rows and expands to exactly
@@ -3204,9 +3204,9 @@ module identities only for its named rows; all `(builder, method, path)` sets
 remain byte-for-byte equal, and every untouched handler identity must remain
 equal.
 
-R5 begins only after merging current `main`, which contains PR-D
-`d1fb5d9f`. That commit resolves the stale branch's `GET /api/activities`
-manifest/handler mismatch with
+The R5 baseline merges current main through `22b401da` in `383a2f5d`, including
+PR-D `d1fb5d9f`. PR-D resolves the old
+`GET /api/activities` manifest/handler mismatch with
 `truth_adapter::redact_page_activity_detail`; the activity slice must move that
 call byte-for-byte with the handler. The live production database is already at
 generation `1` with fence `2:committed`, while a freshly migrated database
@@ -3312,6 +3312,25 @@ libSQL fixtures not derived from `MemoryDB` are outside this capability
 boundary and reconcile the exact `46` test `_db` shapes. Fable authorized
 R4-25a immediately and the remaining groups after those document fixes, with
 no further re-gate required.
+
+Scoped R5 re-gate, 2026-07-30:
+**APPROVE-WITH-FIXES → APPROVE.** Fable confirmed that Rust function
+item identity captured by `TrackedMethodRouter` is a real independent oracle,
+that a `#[cfg(test)]` synthetic-router escape cannot weaken production, and that
+the wrong-handler/missing/duplicate/main+repair controls plus the movement
+order satisfy D2/D6/D7. It required exact handler identities to be declared
+toolchain-scoped and the stale generation-0 premise to be corrected.
+
+Both corrections are now in the R5 contract. Current-main verification also
+showed that PR-D had already fixed the branch-local activities mismatch, so
+`383a2f5d` integrates PR-D before R5 and preserves its adapter in the activity
+slice. The merge resolution moved PR-D's two page permits into R4's new repair
+children before the same DB mutexes, removed raw production projection helpers,
+and passed `4195` workspace library tests with `35` ignored, `114` drift guards,
+the projection-permit source scan, core/server warnings-denied Clippy, LSP
+diagnostics, and a fresh Sol **APPROVE**.
+The narrow Fable follow-up verified both corrections against `383a2f5d`,
+confirmed the PR-D activity adapter in code, and authorized R5-0.
 
 ### Intermediate PRs — Sol by default, not Fable
 
@@ -3461,11 +3480,11 @@ structural facade definition and executable contracts above remain the gates.
   arithmetic error only; the lint-family boundary, migration order, protected
   contracts, and review gates are unchanged, so Fable gate 1 remains valid.
 
-### 2026-07-30 — R5 executable handler-boundary candidate
+### 2026-07-30 — R5 executable handler boundary
 
-- Rebaselined the server surface at `e5d50255`: `95` public handlers remain in
-  `memory_routes.rs`; the truth manifest has `167` static HTTP rows expanding
-  to `171` runtime builder/method/path rows.
+- Rebaselined the server surface after current-main integration at `383a2f5d`:
+  `95` public handlers remain in `memory_routes.rs`; the truth manifest has
+  `167` static HTTP rows expanding to `171` runtime builder/method/path rows.
 - Added R5-0 before movement because the existing exact route-set gates cannot
   detect binding the correct route to the wrong handler. The proposed
   `TrackedRouter` handler-identity manifest is an independent set-equality
@@ -3483,5 +3502,5 @@ structural facade definition and executable contracts above remain the gates.
 - Declared exact handler names toolchain-scoped: a toolchain-wide manifest
   refresh stays exact and isolated instead of weakening identity comparison.
 - This adds an executable boundary and PR sequence, so it is a material design
-  change. Production implementation remains blocked until a narrow Fable
-  gate-1 review returns APPROVE.
+  change. Fable returned `APPROVE-WITH-FIXES`; both required corrections landed,
+  and the narrow follow-up returned `APPROVE`, unblocking R5-0.
