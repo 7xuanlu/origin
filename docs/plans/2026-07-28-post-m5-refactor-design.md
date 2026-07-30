@@ -3174,6 +3174,39 @@ change makes every handler row fail at once, refresh the manifest in a
 manifest-only commit after review; never weaken equality to suffix or substring
 matching.
 
+R5-0 implementation evidence, 2026-07-30:
+
+- The first RED failed compilation with nine missing-API errors for the new
+  handler identity, exact coverage assertion, and test-only unbound
+  constructor. After the minimal tracker existed but before the manifest was
+  populated, the production positive control supplied the second RED:
+  `finish()` observed all `165` main bindings and rejected the empty expected
+  set. Building the restricted router independently observed and rejected its
+  `6` bindings.
+- `TrackedMethodRouter` now records the concrete function-item
+  `std::any::type_name::<H>()` beside every top-level and chained method.
+  `TrackedRouter` compares a count-aware observed map against a duplicate-free
+  exact `(builder, method, path, handler)` manifest in both production finish
+  paths. The only opt-out is a private `#[cfg(test)]` constructor used by the
+  synthetic truth-manifest registration tests.
+- The focused guard suite passes `17 / 17`, including chained-method identity,
+  wrong-handler,
+  missing-binding, duplicate-row, malformed-row, and production
+  main-plus-repair controls. The complete server library passes
+  `347 passed / 2 ignored`; truth manifest and exposure pass `16 / 16` and
+  `23 / 23`; the Rust M5 gate passes `1 / 1`; and the Python inventory remains
+  `191 / 55-50-86 / exposure 22`. Core/server all-target Clippy with warnings
+  denied, formatting, diff hygiene, and LSP error diagnostics over the complete
+  route-registry directory pass.
+- R5-0 REVIEW, 2026-07-30: the independent Sol reviewer returned
+  **APPROVE** with no critical, important, or minor finding. It independently
+  verified the exact `165 + 6` manifest, count-aware actual rows, duplicate
+  rejection before builder filtering, chained-method identity pairing, pinned
+  toolchain failure mode, library-target type paths, unchanged truth/security
+  layer order, and the private test-only opt-out's single synthetic caller. Its
+  focused run passed `17 / 17`; LSP reported zero diagnostics and diff hygiene
+  passed.
+
 #### R5 movement sequence
 
 Every following commit is movement-only under D2. One writer owns `router.rs`
