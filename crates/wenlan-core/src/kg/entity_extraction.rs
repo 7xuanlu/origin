@@ -448,7 +448,7 @@ mod tests {
             .await
             .expect("extract_entities_for_content failed");
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT e.payload FROM edges e \

@@ -55,7 +55,7 @@ async fn set_page_selection_fixtures(
     last_modified: &str,
     user_edited: bool,
 ) {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "UPDATE pages SET created_at = ?2, last_modified = ?3, user_edited = ?4 WHERE id = ?1",
         libsql::params![id, created_at, last_modified, i64::from(user_edited)],

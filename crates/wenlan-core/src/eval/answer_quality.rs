@@ -3750,8 +3750,7 @@ mod tests {
         let updated = db.set_event_dates_by_source_id(&updates).await.unwrap();
         assert_eq!(updated, 1, "event_date_map key must match seeded source_id");
 
-        let conn = db.conn.lock().await;
-        crate::eval::seed_contract::assert_feature_substrate_live(&conn, "temporal")
+        db.assert_eval_feature_substrate_live("temporal")
             .await
             .unwrap();
     }

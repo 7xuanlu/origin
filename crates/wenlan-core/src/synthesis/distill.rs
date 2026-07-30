@@ -1662,7 +1662,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'orphaned unregistered space content', 0, 'text', 'fact', 'ghost', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -1810,7 +1810,7 @@ mod tests {
         // Insert a seed memory row directly so get_memory_contents_by_ids
         // returns it. The mock body's [1] marker verifies against this content.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'recompiled body reference material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -1870,7 +1870,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'The target topic should retain the valid wikilink to Related Page when refreshed.', 0, 'text', 'fact', 'work', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -1995,7 +1995,7 @@ mod tests {
         // Seed the cited memory. The synthesized body echoes it so the [1]
         // marker verifies and the citation gate passes.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2154,7 +2154,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2240,7 +2240,7 @@ mod tests {
         let mem_doc = "folder-notes::rust/cluster.md";
         let mem_extra = "mem_cluster_kind_extra";
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Rust ownership rules prevent data races and dangling pointers at compile time without a garbage collector', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2327,7 +2327,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2351,7 +2351,7 @@ mod tests {
         db.set_page_stale("page_h", "source_updated").await.unwrap();
         // Mark the page human-owned so a machine write is gated to a card.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE pages SET user_edited = 1 WHERE id = ?1",
                 libsql::params!["page_h".to_string()],
@@ -2393,7 +2393,7 @@ mod tests {
         );
 
         // The staged card is a pending revision that supersedes the page.
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT supersedes FROM memories WHERE source_id = ?1 AND pending_revision = 1",
@@ -2417,7 +2417,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2701,7 +2701,7 @@ mod tests {
         }
 
         let pages_before = {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut r = conn
                 .query("SELECT COUNT(*) FROM pages WHERE status='active'", ())
                 .await
@@ -2730,7 +2730,7 @@ mod tests {
         );
 
         let pages_after = {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut r = conn
                 .query("SELECT COUNT(*) FROM pages WHERE status='active'", ())
                 .await

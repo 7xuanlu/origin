@@ -3063,6 +3063,42 @@ Frozen slice contract:
   `118` raw / `571` support manifests, unchanged statement/drop ordering, and
   the `71 + 111` census correction. Its parser, seam, legacy, full-lint, truth,
   M5, Clippy, formatting, diff, and per-file LSP checks all passed.
+- R4-25 group 6 RED/GREEN evidence, 2026-07-30: the final fixture-group census
+  RED failed exactly `111 != 0`. Migrating the complete remaining set removed
+  exactly those `111` `PrimaryConnLock` identities and no standalone origin.
+  GREEN leaves only the `7` intentional standalone libSQL Builder origins,
+  with `0` primary locks, `0` try-locks, `0` alternate fields, and `0` field
+  escapes. The legacy external-access baseline independently failed on the
+  exact `21` stale paths and is now empty.
+- The support-manifest RED added exactly `397` identities and removed none:
+  `110` `test_primary_session`, `79` execute, `9` execute-batch, `56` query,
+  `57` next, `85` get, and `1` typed `check_seed_contract`. The preflight's
+  approximate row-flow trace predicted only about `72` gets; the syntax-aware
+  parser's exact `85` identities, including chained opaque-row uses but
+  excluding unrelated JSON `get` calls, are the frozen evidence. GREEN is
+  therefore `571 -> 968`. The one non-session migration routes answer-quality
+  through the existing `MemoryDB::assert_eval_feature_substrate_live` domain
+  method. The projection truth helper now takes `&TestDbSession`; no seam
+  method or raw capability was added.
+- The three implementation lanes pass `431` focused tests. The parser / exact
+  manifests pass `35 / 35`; the opaque seam passes `5 / 5`; the blocked repair
+  CAS, read-only lint snapshot, and replacement freshness-observer controls
+  pass individually; and the required uninterrupted workspace library floor
+  passes `4168` tests with `35` ignored and `0` failures. Truth manifest and
+  exposure pass `16 / 16` and `13 / 13`; Rust M5 passes `1 / 1`; the Python
+  inventory remains `191 / 55-50-86 / exposure 22`; core/server all-target
+  Clippy with warnings denied, formatting, diff hygiene, and LSP error
+  diagnostics across all `23` changed Rust files pass.
+- R4-25 group 6 REVIEW, 2026-07-30: the independent Sol reviewer returned
+  **APPROVE** with no correctness, concurrency, data-loss, security,
+  truth/M5-drift, capability-boundary, or manifest-gaming blocker. It
+  independently reconciled raw `-111/+0` and support `+397/-0`, verified the
+  retained mutex/row lifetimes and explicit releases, inspected trigger
+  cleanup, eval domain/typed routes, truth permits and projection invariants,
+  and confirmed zero LSP errors across all changed Rust files. The
+  workspace-wide LSP reference display capped at `200`, so neither root nor
+  reviewer treated it as the exact census; the syntax-aware manifest remains
+  authoritative.
 
 ### R5 — server vertical slices
 

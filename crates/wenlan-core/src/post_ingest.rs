@@ -1079,7 +1079,7 @@ mod tests {
             .await
             .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE memories SET title=?1 WHERE source_id='mem_title_slice'",
                 libsql::params![content],
@@ -1386,7 +1386,7 @@ mod tests {
         from_name: &str,
         to_name: &str,
     ) -> Option<String> {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT e.payload FROM edges e \

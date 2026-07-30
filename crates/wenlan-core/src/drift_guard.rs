@@ -5677,32 +5677,7 @@ fn db_test_module_layout_guard_rejects_inline_and_census_visible_shapes() {
 
 // ── R0: exact direct DB connection access baseline ──
 
-const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
-    ("crates/wenlan-core/src/citations.rs", 1),
-    ("crates/wenlan-core/src/derived_artifact_state.rs", 2),
-    ("crates/wenlan-core/src/document_enrichment.rs", 12),
-    ("crates/wenlan-core/src/eval/answer_quality.rs", 1),
-    ("crates/wenlan-core/src/eval/shared.rs", 2),
-    ("crates/wenlan-core/src/eval/signals.rs", 2),
-    (
-        "crates/wenlan-core/src/export/projection_invariant_test.rs",
-        1,
-    ),
-    ("crates/wenlan-core/src/importer.rs", 1),
-    ("crates/wenlan-core/src/kg/entity_extraction.rs", 1),
-    ("crates/wenlan-core/src/kg_quality.rs", 18),
-    ("crates/wenlan-core/src/maintenance.rs", 4),
-    ("crates/wenlan-core/src/maintenance/survivor_tests.rs", 1),
-    ("crates/wenlan-core/src/post_ingest.rs", 2),
-    ("crates/wenlan-core/src/post_write.rs", 12),
-    ("crates/wenlan-core/src/refinery/mod.rs", 13),
-    ("crates/wenlan-core/src/retrieval/hard_filters.rs", 2),
-    ("crates/wenlan-core/src/synthesis/detect.rs", 3),
-    ("crates/wenlan-core/src/synthesis/distill.rs", 12),
-    ("crates/wenlan-core/src/synthesis/distill_truth_test.rs", 1),
-    ("crates/wenlan-core/src/synthesis/refinement_queue.rs", 19),
-    ("crates/wenlan-core/src/truth_adapter_test.rs", 1),
-];
+const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[];
 
 fn direct_conn_access_count(source: &str) -> usize {
     regex::Regex::new(r"\.conn\s*\.\s*lock\s*\(\s*\)\s*\.\s*await")

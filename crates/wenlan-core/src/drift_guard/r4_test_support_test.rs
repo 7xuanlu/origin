@@ -3230,7 +3230,7 @@ fn outer() {
 }
 
 #[test]
-fn repository_module_graph_matches_r4_25_group_5_census() {
+fn repository_module_graph_matches_r4_25_group_6_census() {
     let analysis = analyze_repository(&super::repo_root());
     assert!(
         analysis.errors.is_empty(),
@@ -3244,7 +3244,7 @@ fn repository_module_graph_matches_r4_25_group_5_census() {
     }
     assert_eq!(
         counts.get(&RawShape::PrimaryConnLock).copied().unwrap_or(0),
-        111
+        0
     );
     assert_eq!(
         counts
@@ -3291,8 +3291,8 @@ fn repository_module_graph_matches_r4_25_group_5_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        571,
-        "group 5 must expose the frozen 411 support calls plus exactly 160 migrated identities"
+        968,
+        "group 6 must expose the frozen 571 support calls plus exactly 397 migrated identities"
     );
 }
 

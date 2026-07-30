@@ -2971,7 +2971,7 @@ mod tests {
         .unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "DELETE FROM edges
                  WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
@@ -3001,7 +3001,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(second.id, first.id, "upsert must preserve the relation id");
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT source_memory_id FROM relations WHERE id = ?1",
@@ -4892,7 +4892,7 @@ mod tests {
         assert_eq!(card.revision_content, machine_content);
         assert_eq!(card.source_agent.as_deref(), Some("page_write"));
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT source, supersedes, pending_revision, confirmed, stability, \
@@ -5077,7 +5077,7 @@ mod tests {
 
     async fn seed_pending_revision(db: &MemoryDB, target: &str, revision: &str) {
         let now = chrono::Utc::now().timestamp();
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) VALUES (?1, ?1, ?1, 'original content', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
             libsql::params![target.to_string(), now],
@@ -6680,7 +6680,7 @@ mod tests {
         let card_id = card.revision_card_id.unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute_batch(&format!(
                 "CREATE TRIGGER abort_page_revision_consume
                  BEFORE DELETE ON memories
@@ -6702,7 +6702,7 @@ mod tests {
             .iter()
             .any(|revision| revision.revision_source_id == card_id));
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute("DROP TRIGGER abort_page_revision_consume", ())
                 .await
                 .unwrap();
@@ -6748,7 +6748,7 @@ mod tests {
         let card_id = card.revision_card_id.unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute_batch(&format!(
                 "CREATE TRIGGER abort_page_revision_source
                  BEFORE INSERT ON page_sources
@@ -6778,7 +6778,7 @@ mod tests {
             .any(|revision| revision.revision_source_id == card_id));
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute("DROP TRIGGER abort_page_revision_source", ())
                 .await
                 .unwrap();
@@ -6936,7 +6936,7 @@ mod tests {
             .as_deref()
             .expect("staged page card must return an id");
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT structured_fields FROM memories WHERE source_id = ?1",
@@ -7055,7 +7055,7 @@ mod tests {
         dismiss_contradiction(&db, "mem_one", "test-agent")
             .await
             .unwrap();
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM agent_activity WHERE action = 'contradiction_dismiss' AND memory_ids = 'mem_one'",
@@ -7177,7 +7177,7 @@ mod tests {
                 .unwrap();
             // No band rows are written for low-entropy names, regardless of how
             // the vector step resolved them.
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query("SELECT COUNT(*) FROM entity_minhash_bands", ())
                 .await
@@ -7230,7 +7230,7 @@ mod tests {
                 "flag OFF must leave near-dups as distinct entities (byte-identity)"
             );
             assert!(second.wrote, "flag OFF must create a second entity");
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query("SELECT COUNT(*) FROM entity_minhash_bands", ())
                 .await

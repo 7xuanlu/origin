@@ -96,7 +96,7 @@ mod tests {
     #[tokio::test]
     async fn hard_filters_apply_supersession_and_temporal_cue() {
         let (db, _dir) = test_db().await;
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
 
         // Fixed "now" = 2026-05-27T12:00:00Z
         // "yesterday" cue = 2026-05-26 00:00:00Z .. 2026-05-26 23:59:59Z
@@ -169,7 +169,7 @@ mod tests {
         };
         let where_clause = build_where(&filters);
 
-        let conn2 = db.conn.lock().await;
+        let conn2 = db.test_primary_session().await;
         let sql = format!("SELECT source_id FROM memories c WHERE 1=1{where_clause}");
         let mut rows = conn2.query(&sql, ()).await.expect("query");
         let mut got: Vec<String> = Vec::new();

@@ -26,7 +26,7 @@ async fn refresh_page_skips_re_distill_for_a_page_the_automatic_reader_may_not_s
     let now_ts = chrono::Utc::now().timestamp();
 
     {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
              VALUES (?1, ?1, ?1, 'recompiled body reference material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",

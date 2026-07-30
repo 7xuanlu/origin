@@ -548,7 +548,7 @@ mod tests {
         // Bypass create_relation's normalization by inserting directly.
         // This simulates legacy data created before relation vocabulary existed.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -575,7 +575,7 @@ mod tests {
         );
 
         // Verify the relation now has the canonical type
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT relation_type FROM relations WHERE id = ?1",
@@ -606,7 +606,7 @@ mod tests {
 
             // Create three case-folded duplicates plus a singleton by bypassing
             // alias resolution. The caller owns the N-1 candidate math.
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let now = chrono::Utc::now().timestamp();
             for (id, name) in [
                 ("dup-1", "Alice"),
@@ -675,7 +675,7 @@ mod tests {
 
         // Verify normalization happened at insert time
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT relation_type FROM relations WHERE from_entity = ?1",
@@ -770,7 +770,7 @@ mod tests {
 
         // Verify confidence is now 0.9
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT confidence FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
@@ -793,7 +793,7 @@ mod tests {
 
         // Verify confidence is still 0.9
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT confidence, COUNT(*) as cnt FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
@@ -827,7 +827,7 @@ mod tests {
             .unwrap();
         let now = chrono::Utc::now().timestamp();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             // Survivor: canonical works_on, confidence 0.9.
             conn.execute(
                 "INSERT INTO relations (id, from_entity, to_entity, relation_type, confidence, created_at) VALUES ('rel-canon', ?1, ?2, 'works_on', 0.9, ?3)",
@@ -844,7 +844,7 @@ mod tests {
             .unwrap();
         assert_eq!(folded, 1);
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         // Exactly one A->B row survives, canonical, confidence preserved at 0.9,
         // and the loser's explanation was merged in (survivor had none).
         let mut rows = conn.query(
@@ -900,7 +900,7 @@ mod tests {
             .await
             .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO relations
                      (id, from_entity, to_entity, relation_type, confidence, created_at)
@@ -940,7 +940,7 @@ mod tests {
             "unexpected fold error: {error}"
         );
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT id, relation_type, explanation
@@ -1051,7 +1051,7 @@ mod tests {
 
         // Verify source_memory_id was stored
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT source_memory_id FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
@@ -1079,7 +1079,7 @@ mod tests {
         .unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT source_memory_id, confidence FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
@@ -1116,7 +1116,7 @@ mod tests {
 
         // Higher confidence updates the score, but not existing provenance.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT source_memory_id, confidence FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
@@ -1235,7 +1235,7 @@ mod tests {
             .unwrap();
         let now = chrono::Utc::now().timestamp();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             // Known alias -> auto-fold to works_on.
             conn.execute("INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) VALUES ('r1', ?1, ?2, 'working_at', ?3)",
                 libsql::params![e1.clone(), e2.clone(), now]).await.unwrap();
@@ -1253,7 +1253,7 @@ mod tests {
             "design_inspiration must be queued as promote"
         );
         // working_at is gone (folded); design_inspiration still present (awaiting human).
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT relation_type FROM relations ORDER BY relation_type",
@@ -1291,7 +1291,7 @@ mod tests {
         let counts = super::heal_entity_vocabulary(&db).await.unwrap();
         assert!(counts.healed >= 1);
         assert!(counts.queued >= 1);
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query("SELECT entity_type FROM entities ORDER BY entity_type", ())
             .await
@@ -1318,14 +1318,14 @@ mod tests {
             .await
             .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute("INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) VALUES ('r1', ?1, ?2, 'design_inspiration', 0)",
                 libsql::params![e1, e2]).await.unwrap();
         }
         let cfg = crate::tuning::RefineryConfig::default();
         super::run_rethink(&db, None, &cfg).await.unwrap();
         // A vocab-heal receipt activity row exists.
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM agent_activity WHERE action = 'vocab_heal_receipt'",

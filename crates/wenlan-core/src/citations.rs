@@ -797,7 +797,7 @@ mod tests {
         source_agent: &str,
     ) {
         let now_ts = chrono::Utc::now().timestamp();
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, source_agent, created_at, last_modified, confirmed, stability, source) \
              VALUES (?1, ?1, ?1, ?2, 0, 'text', 'fact', ?3, ?4, ?4, 1, 'confirmed', 'memory')",

@@ -929,7 +929,7 @@ mod tests {
     }
 
     async fn memory_inventory(db: &MemoryDB, source_id: &str) -> Vec<MemoryInventoryRow> {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT id, content, title, source, source_id, chunk_index,
@@ -1016,7 +1016,7 @@ mod tests {
         let last_id = expected_inventory.last().unwrap().id.clone();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             match corruption {
                 PreparedGenerationCorruption::BlobContentHash => {
                     conn.execute(
@@ -1426,7 +1426,7 @@ mod tests {
         let new_hash = file_hash(&path);
         assert_ne!(new_hash, queued_hash);
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE document_enrichment_queue
                  SET next_retry_at = ?3
@@ -1543,7 +1543,7 @@ mod tests {
             .unwrap();
         assert!(!stored.is_empty());
         let (stored_spaces, stored_versions) = {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
                     "SELECT space, version FROM memories
@@ -1799,7 +1799,7 @@ mod tests {
         assert_eq!(first_queue.attempt_count, 1);
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE document_enrichment_queue
                  SET next_retry_at = ?3
@@ -1966,7 +1966,7 @@ mod tests {
             run_document_enrichment(&db, &entry, None, None, &PromptRegistry::default()).await;
         let before = db.get_page(&outcome.page_id).await.unwrap().unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE document_enrichment_queue
                  SET status='in_progress', content_hash='old-hash'
@@ -1982,7 +1982,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE document_enrichment_queue SET content_hash='new-hash'
                  WHERE source_id=?1 AND file_path=?2",
@@ -2027,7 +2027,7 @@ mod tests {
         assert!(!evidence_before.is_empty());
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute_batch(&format!(
                 "CREATE TRIGGER abort_source_page_replacement
                  BEFORE UPDATE OF content ON pages
@@ -2053,7 +2053,7 @@ mod tests {
         let evidence_after_failure = db.get_page_evidence(&outcome.page_id).await.unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute("DROP TRIGGER abort_source_page_replacement", ())
                 .await
                 .unwrap();
@@ -2092,7 +2092,7 @@ mod tests {
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute_batch(
                 "CREATE TRIGGER abort_source_sync_receipt
                  BEFORE INSERT ON source_sync_state
@@ -2111,7 +2111,7 @@ mod tests {
         let receipt_after_failure = db.get_sync_state("folder-notes", &file_path).await.unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute("DROP TRIGGER abort_source_sync_receipt", ())
                 .await
                 .unwrap();
@@ -2274,7 +2274,7 @@ mod tests {
 
     /// Count active `creation_kind='source'` pages.
     async fn count_source_pages(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM pages WHERE creation_kind = 'source' AND status = 'active'",

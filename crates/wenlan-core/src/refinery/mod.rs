@@ -1985,8 +1985,7 @@ mod tests {
     #[tokio::test]
     async fn changed_explicit_source_is_enqueued_without_running_an_llm() {
         let (db, _dir) = test_db().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "INSERT INTO memories
@@ -4641,7 +4640,7 @@ mod tests {
         // tokens with the mock body ("refreshed body") so the fail-closed
         // faithfulness gate passes.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'refreshed body reference material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4709,7 +4708,7 @@ mod tests {
 
         // Seed source memory so refresh_page has content to synthesize from.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'refreshed body reference material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4786,7 +4785,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'retryable source material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4838,7 +4837,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'The target topic should retain the valid wikilink to Related Page when refreshed.', 0, 'text', 'fact', 'work', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4947,7 +4946,7 @@ mod tests {
         // Seed the cited memory. The re-distilled body echoes its content so the
         // [1] marker verifies and yields a non-empty citation map.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -5014,7 +5013,7 @@ mod tests {
             ("redistill_slice_mem_b", "redistill_slice_page_b"),
         ] {
             {
-                let conn = db.conn.lock().await;
+                let conn = db.test_primary_session().await;
                 conn.execute(
                     "INSERT INTO memories
                          (id, source_id, title, content, chunk_index, chunk_type,
@@ -5074,7 +5073,7 @@ mod tests {
             let memory_id = format!("redistill_shift_memory_{suffix}");
             let page_id = format!("redistill_shift_page_{suffix}");
             {
-                let conn = db.conn.lock().await;
+                let conn = db.test_primary_session().await;
                 conn.execute(
                     "INSERT INTO memories
                          (id, source_id, title, content, chunk_index, chunk_type,
@@ -5147,7 +5146,7 @@ mod tests {
             .map(|index| format!("redistill_over_cap_mem_{index:02}"))
             .collect::<Vec<_>>();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             for source_id in &source_ids {
                 conn.execute(
                     "INSERT INTO memories
@@ -5207,7 +5206,7 @@ mod tests {
         // Legacy Pages can have only the JSON source list. The same cap must
         // apply when the normalized join table has no rows.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "DELETE FROM page_sources WHERE page_id='redistill_over_cap_page'",
                 (),
@@ -5242,7 +5241,7 @@ mod tests {
             ("redistill_phase_mem_b", "redistill_phase_page_b"),
         ] {
             {
-                let conn = db.conn.lock().await;
+                let conn = db.test_primary_session().await;
                 conn.execute(
                     "INSERT INTO memories
                          (id, source_id, title, content, chunk_index, chunk_type,
@@ -5324,7 +5323,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
         let compiled = chrono::Utc::now().to_rfc3339();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories
                      (id, source_id, title, content, chunk_index, chunk_type,
@@ -5415,7 +5414,7 @@ mod tests {
             let timestamp = (base - chrono::Duration::seconds(index as i64)).timestamp();
             let compiled = (base - chrono::Duration::seconds(index as i64)).to_rfc3339();
             {
-                let conn = db.conn.lock().await;
+                let conn = db.test_primary_session().await;
                 conn.execute(
                     "INSERT INTO memories
                          (id, source_id, title, content, chunk_index, chunk_type,

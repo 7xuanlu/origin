@@ -87,7 +87,7 @@ mod tests {
         record_signal(&db, SignalType::Confirm, "mem_123", None, None, None).await;
 
         // Verify signal was written
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query("SELECT signal_type, memory_id FROM eval_signals", ())
             .await
@@ -110,7 +110,7 @@ mod tests {
         record_signal(&db, SignalType::Pin, "mem_456", None, None, None).await;
         record_signal(&db, SignalType::Pin, "mem_456", None, None, None).await;
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query("SELECT COUNT(*) FROM eval_signals", ())
             .await

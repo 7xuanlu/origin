@@ -1063,7 +1063,7 @@ mod tests {
         last_modified: i64,
     ) {
         let embedding_sql = vec_to_sql(embedding);
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (
                 id, content, source, source_id, title, chunk_index, last_modified,
@@ -1090,7 +1090,7 @@ mod tests {
     }
 
     async fn active_page_count(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query("SELECT COUNT(*) FROM pages WHERE status = 'active'", ())
             .await
@@ -1107,7 +1107,7 @@ mod tests {
     }
 
     async fn page_source_count(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query("SELECT COUNT(*) FROM page_sources", ())
             .await
@@ -1537,7 +1537,7 @@ mod tests {
             )
             .await;
             {
-                let conn = db.conn.lock().await;
+                let conn = db.test_primary_session().await;
                 conn.execute(
                     "UPDATE pages SET last_modified = ?1 WHERE id = ?2",
                     libsql::params![last_modified, page_id.as_str()],

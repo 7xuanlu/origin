@@ -164,7 +164,7 @@ mod tests {
         last_modified: i64,
     ) {
         let embedding_sql = vec_to_sql(embedding);
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (
                 id, content, source, source_id, title, chunk_index, last_modified,
@@ -199,7 +199,7 @@ mod tests {
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         let embedding_sql = vec_to_sql(embedding);
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO pages (
                 id, title, summary, content, space, source_memory_ids, version,
@@ -239,7 +239,7 @@ mod tests {
     }
 
     async fn detect_link_count(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM page_sources WHERE link_reason = 'detect_attach'",

@@ -12,6 +12,7 @@
 //! the section 9 mutation row "leave provisional files in the legacy projection
 //! directory".
 
+use crate::db::test_support::TestDbSession;
 use crate::db::tests::test_db;
 use crate::db::MemoryDB;
 use crate::export::knowledge::KnowledgeProjectionWrite;
@@ -32,14 +33,14 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
             .unwrap();
     }
     {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         set_truth(&conn, "p1", "supported").await;
         set_truth(&conn, "p2", "provisional").await;
     }
     (db, temp)
 }
 
-async fn set_truth(conn: &libsql::Connection, page_id: &str, status: &str) {
+async fn set_truth(conn: &TestDbSession, page_id: &str, status: &str) {
     conn.execute(
         "INSERT INTO page_truth_state
             (page_id,page_version,support_status,human_reviewed,updated_at)
