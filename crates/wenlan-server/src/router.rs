@@ -3,7 +3,7 @@
 
 use crate::lifecycle::ShutdownHandle;
 pub use crate::route_registry::AppRouter;
-use crate::route_registry::{delete, get, post, put, TrackedRouter};
+use crate::route_registry::{get, post, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
     activity_tag_routes, brief_routes, briefing_routes, community_routes, config_routes,
@@ -50,82 +50,13 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = routes::register(router);
     let router = brief_routes::register(router);
     let router = community_routes::register(router);
-
-    let router = router
-        .route(
-            "/api/memory/recent",
-            get(memory_routes::handle_recent_memories),
-        )
-        .route(
-            "/api/memory/unconfirmed",
-            get(memory_routes::handle_list_unconfirmed_memories),
-        );
     let router = ingest_routes::register(router);
     let router = import_routes::register(router);
-
-    let router = router
-        // Memory CRUD
-        .route(
-            "/api/memory/store",
-            post(memory_routes::handle_store_memory),
-        )
-        .route(
-            "/api/memory/search",
-            post(memory_routes::handle_search_memory),
-        )
-        .route(
-            "/api/memory/confirm/{source_id}",
-            post(memory_routes::handle_confirm_memory),
-        )
-        .route(
-            "/api/memory/list",
-            post(memory_routes::handle_list_memories),
-        )
-        .route(
-            "/api/memory/delete/{source_id}",
-            delete(memory_routes::handle_delete_memory),
-        )
-        // Memory reclassify
-        .route(
-            "/api/memory/reclassify/{source_id}",
-            post(memory_routes::handle_reclassify_memory),
-        )
-        // Enrichment status
-        .route(
-            "/api/memory/{source_id}/enrichment-status",
-            get(memory_routes::handle_get_enrichment_status),
-        )
-        // Pending revisions
-        .route(
-            "/api/memory/revision/{id}/accept",
-            post(memory_routes::handle_accept_revision),
-        )
-        .route(
-            "/api/memory/revision/{id}/dismiss",
-            post(memory_routes::handle_dismiss_revision),
-        )
-        // Contradiction flags
-        .route(
-            "/api/memory/contradiction/{source_id}/dismiss",
-            post(memory_routes::handle_dismiss_contradiction),
-        );
+    let router = memory_routes::register_core(router);
     let router = entity_graph_routes::register_writes(router);
     let router = profile_agents_routes::register(router);
     let router = entity_graph_routes::register_reads(router);
-    let router = router
-        // Knowledge graph stats
-        .route(
-            "/api/memory/stats",
-            get(memory_routes::handle_get_memory_stats),
-        )
-        .route("/api/home-stats", get(memory_routes::handle_get_home_stats));
     let router = entity_graph_routes::register_suggestions(router);
-    let router = router
-        // Nurture cards
-        .route(
-            "/api/memory/nurture",
-            get(memory_routes::handle_get_nurture_cards),
-        );
     let router = spaces_routes::register_core(router);
     let router = router
         // Pages (legacy SQL tables still named "concepts" — see db.rs)
@@ -179,12 +110,6 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = page_map_routes::register(router);
 
     let router = memory_revision_routes::register_history(router);
-    let router = router
-        // Rejections
-        .route(
-            "/api/memory/rejections",
-            get(memory_routes::handle_get_rejections),
-        );
     let router = refinery_routes::register(router);
     let router = source_routes::register(router);
     let router = config_routes::register(router);
@@ -193,24 +118,6 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = spaces_routes::register_extended(router);
     let router = activity_tag_routes::register(router);
     let router = memory_detail_routes::register(router);
-    let router = router
-        // Version and memory updates (batch 5)
-        .route(
-            "/api/memory/{id}/versions",
-            get(memory_routes::handle_get_version_chain),
-        )
-        .route(
-            "/api/memory/{id}/update",
-            put(memory_routes::handle_update_memory),
-        )
-        .route(
-            "/api/memory/{id}/stability",
-            put(memory_routes::handle_set_stability),
-        )
-        .route(
-            "/api/memory/{id}/correct",
-            post(memory_routes::handle_correct_memory),
-        );
     let router = decisions_routes::register(router);
     let router = briefing_routes::register(router);
     let router = profile_narrative_routes::register(router);

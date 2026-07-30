@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 12 complete**
+Status: **R4 complete; R5 in progress; registration slice 7 complete**
 
 ## Authority and change control
 
@@ -4421,6 +4421,111 @@ R5 handler-movement slice 12 evidence, 2026-07-30:
   focused reruns passed the typed contract, exact handler and sensitive-read
   guards, truth manifest, Rust/Python M5 gates, focused Clippy, formatting, and
   diff hygiene.
+
+R5 registration slice 7 contract, 2026-07-30:
+
+- Keep `memory_routes.rs` as the bounded memory-core owner. After the final
+  Page extraction it retains exactly `20` coherent CRUD/search/enrichment
+  handlers plus the already-colocated scheduler-handoff, store-lock, rerank,
+  attribution, update, revision, and contradiction tests. Moving those
+  scattered bodies to a new file would add identity churn without creating a
+  stronger boundary.
+- Add one `memory_routes::register_core` call immediately after
+  `import_routes::register`. It owns exactly these existing bindings:
+  `GET /api/memory/recent`, `GET /api/memory/unconfirmed`,
+  `POST /api/memory/store`, `POST /api/memory/search`,
+  `POST /api/memory/confirm/{source_id}`, `POST /api/memory/list`,
+  `DELETE /api/memory/delete/{source_id}`,
+  `POST /api/memory/reclassify/{source_id}`,
+  `GET /api/memory/{source_id}/enrichment-status`,
+  `POST /api/memory/revision/{id}/accept`,
+  `POST /api/memory/revision/{id}/dismiss`,
+  `POST /api/memory/contradiction/{source_id}/dismiss`,
+  `GET /api/memory/stats`, `GET /api/home-stats`,
+  `GET /api/memory/nurture`, `GET /api/memory/rejections`,
+  `GET /api/memory/{id}/versions`, `PUT /api/memory/{id}/update`,
+  `PUT /api/memory/{id}/stability`, and
+  `POST /api/memory/{id}/correct`.
+- This is registration-only. All handler bodies, DTOs, test modules,
+  visibility, handler identities, and exact method/path rows stay
+  byte-identical. Regrouping the disjoint Axum paths must neither create a
+  conflict nor change truth/security/lifecycle layer order; the production
+  builder remains the executable oracle. Deliberately omit
+  `POST /api/memory/{id}/correct` for the RED control, then restore it before
+  GREEN. The exact handler manifest must remain byte-identical.
+- A typed built-router contract must drive all `20` bindings. Use the shared
+  memory request/response types where available, including the existing typed
+  curation mutation coverage; use the established test-local error envelope
+  for deterministic `403`/`404`/`500`/`503` paths. Hermetic successes cover
+  memory store/search/list/confirm/delete/reclassify, enrichment status,
+  stats/home/nurture/rejections, version/update/stability, recent/unconfirmed,
+  revision accept/dismiss, and contradiction dismissal. LLM correction uses
+  the deterministic typed no-provider error because a success requires
+  non-hermetic model generation. No `serde_json::Value` response oracle or
+  production test seam is permitted.
+- Preserve every pre-existing state-lock lifetime byte-for-byte, including the
+  known confirm, search, and memory-stats guards that cross DB awaits; their
+  correction is a behavior slice, not R5. The eight Automatic/None
+  page-bearing memory readers keep their exact adapters, and all remaining
+  core rows stay NotApplicable/None. Sensitive-read, truth, mutation, M5,
+  security, lifecycle, Page, page-map, CLI, and MCP sources remain unchanged.
+
+R5 registration slice 7 evidence, 2026-07-30:
+
+- All `20` frozen memory-core bindings now register through one
+  `memory_routes::register_core` call immediately after import routes.
+  Handler bodies, DTOs, colocated tests, visibility, exact method/path rows,
+  and all handler identities remain byte-identical. Axum accepts the regrouped
+  disjoint paths without conflict and the truth/security/lifecycle layers stay
+  in their original outer position.
+- Deliberately omitting `POST /api/memory/{id}/correct` made the production
+  builder RED on exactly that missing truth-manifest route before handler
+  comparison. Restoring the one binding made the builder GREEN; the exact
+  handler manifest remains byte-identical.
+- The typed built-router characterization passed before and after registration
+  regrouping, `1 / 1` each. It drives hermetic typed successes across
+  store/search/confirm/list/delete/reclassify, enrichment, revision
+  accept/dismiss, contradiction dismissal, stats/home/nurture/rejections,
+  versions/update/stability, and recent/unconfirmed. Correction proves the
+  deterministic typed no-provider `500`; a missing version-chain memory proves
+  typed `404`; all `20` bindings independently prove typed marker `403` and
+  no-DB `503`. Shared wire DTOs are the success oracles and the only test-local
+  response type is `ErrorEnvelope`; no `serde_json::Value` response oracle is
+  used.
+- Rust LSP reports zero errors in the core module, composition root, and
+  contract test. All `20` handlers lost their `router.rs` reference and resolve
+  to their colocated registrar plus definition; store retains only its three
+  pre-existing scheduler-handoff test callers. `register_core` itself resolves
+  to its definition plus the one composition call.
+- `router.rs` falls from `335` to `242` lines. `memory_routes.rs` is
+  `4,282` lines with the same `34` handlers until the final Page extraction.
+  The generated M5 inventory changes only three displaced Page-handler source
+  addresses; all current memory-reader prose citations shifted by the
+  registrar were refreshed. M5 remains
+  `191 / 55-50-86 / exposure 22`. Call-site ownership is
+  `17 router + 20 memory_routes + 4 snapshot_routes +
+  3 memory_revision_routes + 3 pinned_memory_routes +
+  2 profile_narrative_routes + 1 briefing_routes + 2 decisions_routes +
+  3 memory_detail_routes + 5 activity_tag_routes +
+  5 indexed_files_routes + 13 spaces_routes + 14 entity_graph_routes +
+  75 other = 167`.
+- Focused verification passes after the last code edit: typed contract
+  `1 / 1`; exact handler guard `1 / 1`; exact sensitive-read guards `3 / 3`;
+  truth manifest `16 / 16`; Rust/Python M5 `1 / 1` and
+  `191 / 55-50-86 / exposure 22`; focused Clippy with warnings denied;
+  formatting and diff hygiene.
+- R5 registration slice 7 REVIEW, 2026-07-30: the reused independent Sol lane
+  initially returned **BLOCK** on one contract-coverage gap and no other
+  findings: the typed contract proved `403`, `500`, and `503` but not the
+  frozen deterministic `404`. A missing-memory request to
+  `GET /api/memory/{id}/versions` now proves the existing typed
+  `"memory not found"` response without changing production code. The focused
+  contract passes `1 / 1`, warnings-denied Clippy passes, and formatting/diff
+  hygiene are clean after the correction. The same lane's re-review returned
+  **APPROVE** with zero blocking and zero non-blocking findings, confirming
+  the exact typed `404`, unchanged production files, and the byte-identical
+  handler-manifest hash
+  `2b6aca95ec1b9824fb93c2a35688ba6e6c549b2e20c44f7e40c403d28b7c16a7`.
 
 ### R6 — `post_write` phase decomposition
 

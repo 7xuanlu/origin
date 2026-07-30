@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{delete, get, post, put, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -24,6 +25,54 @@ use wenlan_types::sources::{stability_tier, MemoryType, RawDocument, StabilityTi
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 // ===== Route Handlers =====
+
+pub(crate) fn register_core(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/memory/recent", get(handle_recent_memories))
+        .route(
+            "/api/memory/unconfirmed",
+            get(handle_list_unconfirmed_memories),
+        )
+        .route("/api/memory/store", post(handle_store_memory))
+        .route("/api/memory/search", post(handle_search_memory))
+        .route(
+            "/api/memory/confirm/{source_id}",
+            post(handle_confirm_memory),
+        )
+        .route("/api/memory/list", post(handle_list_memories))
+        .route(
+            "/api/memory/delete/{source_id}",
+            delete(handle_delete_memory),
+        )
+        .route(
+            "/api/memory/reclassify/{source_id}",
+            post(handle_reclassify_memory),
+        )
+        .route(
+            "/api/memory/{source_id}/enrichment-status",
+            get(handle_get_enrichment_status),
+        )
+        .route(
+            "/api/memory/revision/{id}/accept",
+            post(handle_accept_revision),
+        )
+        .route(
+            "/api/memory/revision/{id}/dismiss",
+            post(handle_dismiss_revision),
+        )
+        .route(
+            "/api/memory/contradiction/{source_id}/dismiss",
+            post(handle_dismiss_contradiction),
+        )
+        .route("/api/memory/stats", get(handle_get_memory_stats))
+        .route("/api/home-stats", get(handle_get_home_stats))
+        .route("/api/memory/nurture", get(handle_get_nurture_cards))
+        .route("/api/memory/rejections", get(handle_get_rejections))
+        .route("/api/memory/{id}/versions", get(handle_get_version_chain))
+        .route("/api/memory/{id}/update", put(handle_update_memory))
+        .route("/api/memory/{id}/stability", put(handle_set_stability))
+        .route("/api/memory/{id}/correct", post(handle_correct_memory))
+}
 
 /// Compute schema-validation warnings and the extraction method label,
 /// replacing the prior three-branch warnings computation that conflated
