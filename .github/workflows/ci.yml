@@ -138,10 +138,12 @@ jobs:
               - 'scripts/validate-plugin-contract.py'
               - 'scripts/validate-plugin-contract.test.sh'
             docs:
-              - 'README.md'
-              - 'README.zh-Hans.md'
-              - 'README.zh-Hant.md'
-              - 'docs/eval/**'
+              # Documentation is a repository-wide surface, not a fixed README
+              # inventory. Root and nested Markdown (including AGENTS.md and
+              # CLAUDE.md) must take the fast docs lane automatically.
+              - '*.md'
+              - '**/*.md'
+              - 'docs/**'
               - 'scripts/check-readme-translations.py'
               - 'scripts/check-readme-translations.test.sh'
               - 'scripts/update-readme-eval.py'
@@ -164,6 +166,7 @@ jobs:
               - 'crates/wenlan-core/src/drift_guard.rs'
               - 'crates/wenlan-core/src/config.rs'
               - 'crates/wenlan-core/src/export/knowledge.rs'
+              - 'crates/wenlan-core/src/export/projection_invariant_test.rs'
               - 'crates/wenlan-core/src/lint/**'
               - 'crates/wenlan-core/src/llm_provider.rs'
               - 'crates/wenlan-core/src/repair.rs'
@@ -214,6 +217,7 @@ jobs:
               - 'crates/wenlan-core/src/config.rs'
               - 'crates/wenlan-core/src/drift_guard.rs'
               - 'crates/wenlan-core/src/export/knowledge.rs'
+              - 'crates/wenlan-core/src/export/projection_invariant_test.rs'
               - 'crates/wenlan-core/src/repair.rs'
               - 'crates/wenlan-core/src/repair/**'
               - 'crates/wenlan-core/src/repair_plan/**'

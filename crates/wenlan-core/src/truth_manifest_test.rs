@@ -233,7 +233,7 @@ fn manifest_counts_match_the_spec() {
         .iter()
         .filter(|r| r.page_bearing == PageBearing::Yes)
         .count();
-    assert_eq!(bearing, 60, "page-bearing HTTP routes");
+    assert_eq!(bearing, 59, "page-bearing HTTP routes");
 }
 
 #[test]
@@ -339,6 +339,12 @@ fn marker_shape_allowlist_is_fail_closed() {
     // person to "fix" them to honour the promise would reduce a page into a
     // struct with nowhere to put the axes. `none` is the honest shape until
     // those types grow them.
+    //
+    // `GET /api/pages/{id}/map` left `NAMED_PAGE` for the same reason in the
+    // ceremony PR: `PageMapNode`/`PageMapEdge` carry a bare `label` and neither
+    // axis, and hiding a page inside a map is a graph transformation (incident
+    // edges are keyed by node ids) rather than a filter. `none` refuses; it does
+    // not downgrade.
     const COLLECTION: &[(ReaderMethod, &str)] = &[
         (ReaderMethod::Get, "/api/pages"),
         (ReaderMethod::Post, "/api/pages/search"),
@@ -346,7 +352,6 @@ fn marker_shape_allowlist_is_fail_closed() {
     const NAMED_PAGE: &[(ReaderMethod, &str)] = &[
         (ReaderMethod::Get, "/api/pages/{id}"),
         (ReaderMethod::Get, "/api/pages/{id}/links"),
-        (ReaderMethod::Get, "/api/pages/{id}/map"),
         (ReaderMethod::Get, "/api/pages/{id}/revisions"),
         (ReaderMethod::Get, "/api/pages/{id}/sources"),
     ];
@@ -381,14 +386,14 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::NamedPage)
             .count(),
-        5
+        4
     );
     assert_eq!(
         HTTP_READERS
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        160
+        161
     );
 }
 

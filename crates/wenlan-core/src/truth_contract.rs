@@ -194,6 +194,24 @@ pub enum Visibility {
     Hidden,
 }
 
+/// What the evidence says about a page's prose.
+///
+/// Three states, not a bool, because "we looked and the evidence does not back
+/// this" and "nobody has ever looked" are different claims and only the first
+/// is a verdict. A bool collapses them, and the collapse is not neutral: every
+/// page predating claim derivation is backfilled unjudged, so reading unjudged
+/// as unsupported would empty a whole vault on the day the generation advances
+/// -- 511 pages on the author's own machine -- and call it enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// Judged, and the cited evidence backs the prose.
+    Supported,
+    /// Judged, and it does not. The only state that costs a page its file.
+    Unsupported,
+    /// Never judged. Not a verdict, and never treated as one.
+    Unevaluated,
+}
+
 /// The one decision every adapter makes, for one page.
 ///
 /// Pure on purpose: an adapter that has resolved its grant and looked up a
@@ -205,17 +223,29 @@ pub enum Visibility {
 /// adapters are installed and mutation-tested against a generation the tests
 /// advance themselves, while production stays at 0 until PR-C's fenced
 /// ceremony. Any weakening of this line makes PR-B a live cutover.
+///
+/// `human_reviewed` outranks the evidence. It is set only by a person approving
+/// a specific page version against a specific digest, and a machine judgment
+/// does not get to overturn that. The column has existed since migration 98 and
+/// was read into [`crate::db::PageTruth`] and then dropped on the floor -- no
+/// visibility or eviction path consulted it -- so a page its owner had
+/// personally approved was archived exactly like one nobody had ever seen.
 pub fn visible_at(
     generation: i64,
     grant: &TruthGrant,
     page_id: &str,
-    supported: bool,
+    support: Support,
+    human_reviewed: bool,
 ) -> Visibility {
     if generation == 0 {
         return Visibility::Full;
     }
-    if supported {
+    if human_reviewed {
         return Visibility::Full;
+    }
+    match support {
+        Support::Supported | Support::Unevaluated => return Visibility::Full,
+        Support::Unsupported => {}
     }
     match grant {
         TruthGrant::Automatic => Visibility::Hidden,

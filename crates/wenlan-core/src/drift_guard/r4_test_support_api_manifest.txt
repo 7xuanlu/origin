@@ -662,6 +662,11 @@ crates/wenlan-core/src/eval/signals.rs|crate::eval::signals::tests::test_record_
 crates/wenlan-core/src/eval/signals.rs|crate::eval::signals::tests::test_record_signal_writes_to_db|TestDbRows::next|1
 crates/wenlan-core/src/eval/signals.rs|crate::eval::signals::tests::test_record_signal_writes_to_db|TestDbSession::query|1
 crates/wenlan-core/src/eval/signals.rs|crate::eval::signals::tests::test_record_signal_writes_to_db|test_primary_session|1
+crates/wenlan-core/src/export/projection_invariant_test.rs|crate::export::knowledge::projection_invariant_test::a_human_reviewed_page_keeps_its_file_after_a_failed_judgement|TestDbSession::execute|1
+crates/wenlan-core/src/export/projection_invariant_test.rs|crate::export::knowledge::projection_invariant_test::a_human_reviewed_page_keeps_its_file_after_a_failed_judgement|test_primary_session|1
+crates/wenlan-core/src/export/projection_invariant_test.rs|crate::export::knowledge::projection_invariant_test::an_apply_refuses_after_a_support_status_changes|TestDbSession::execute|1
+crates/wenlan-core/src/export/projection_invariant_test.rs|crate::export::knowledge::projection_invariant_test::an_apply_refuses_after_a_support_status_changes|test_primary_session|1
+crates/wenlan-core/src/export/projection_invariant_test.rs|crate::export::knowledge::projection_invariant_test::an_apply_refuses_when_a_page_appeared_that_the_plan_never_covered|test_primary_session|1
 crates/wenlan-core/src/export/projection_invariant_test.rs|crate::export::knowledge::projection_invariant_test::db_with_truth_rows|test_primary_session|1
 crates/wenlan-core/src/export/projection_invariant_test.rs|crate::export::knowledge::projection_invariant_test::set_truth|TestDbSession::execute|1
 crates/wenlan-core/src/importer.rs|crate::importer::tests::test_import_phase3_links_memory_entities|TestDbRow::get|1
@@ -965,4 +970,5 @@ crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinemen
 crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinement_queue::tests::test_document_chunks_excluded_from_resolution_pools|test_primary_session|1
 crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|1
 crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|2
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|3
 crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|test_primary_session|1
