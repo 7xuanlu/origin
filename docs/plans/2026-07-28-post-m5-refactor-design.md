@@ -1728,11 +1728,18 @@ Execution evidence:
 Frozen slice contract:
 
 - Add `db/repair_deterministic.rs` plus its sibling direct-test module. The
-  named inherent operation is `MemoryDB::apply_deterministic_repair_cas`; the
-  existing public `post_write::apply_deterministic_repair_cas` name, signature,
-  visibility, and callers remain unchanged and delegate exactly once. Do not
-  add a generic transaction runner, connection parameter, transaction token,
-  or callback other than the existing synchronous proof hook.
+  child defines the sole canonical
+  `pub async fn apply_deterministic_repair_cas(db: &MemoryDB, ...)` and owns the
+  complete atomic body. `db.rs` exposes only the child module as `pub(crate)`;
+  `post_write.rs` publicly re-exports the function with
+  `pub use crate::db::repair_deterministic::apply_deterministic_repair_cas`.
+  This is an item re-export, not a delegating wrapper or second declaration.
+  The existing public path, signature, visibility, production caller, and
+  policy-test callers remain unchanged. The implementation module stays
+  inaccessible outside the crate, so the only external path remains
+  `post_write::apply_deterministic_repair_cas`. Do not add a generic
+  transaction runner, connection parameter, transaction token, or callback
+  other than the existing synchronous proof hook.
 - Move the complete body, not only its SQL match. Preserve the exact order:
   reject the reclassification/projection writer mismatch before locking; take
   the DB mutex; `BEGIN IMMEDIATE`; validate the tag-record set; read and compare
@@ -1787,15 +1794,17 @@ Frozen slice contract:
   `db.rs`, the two new DB child files, `drift_guard.rs`, `post_write.rs`, the
   generated M5 inventory, and this ledger; no existing policy-test file,
   truth/generation surface, or later R4 slice changes.
-- The new DB method's LSP reference set must be its declaration, exactly one
-  production facade, and the direct controls. For the retained public facade,
-  a syntax-aware census must show exactly one production call plus the same
-  four test call expressions at current `deterministic_tests.rs` lines `941`,
-  `1153`, `1241`, and `3568`; LSP `goto_definition` from every call must resolve
-  to the facade. Do not require `find_references` alone to enumerate the fourth
-  test call: rust-analyzer currently omits line `1241` even though its
-  definition lookup resolves correctly. The moved raw lock disappears from
-  `post_write.rs`; no raw DB capability escapes the child.
+- A source/syntax census must show exactly one
+  `fn apply_deterministic_repair_cas` declaration, in the DB child. The
+  unchanged public-path calls are exactly one production expression at current
+  `repair.rs:2108` plus the same four test expressions at current
+  `deterministic_tests.rs` lines `941`, `1153`, `1241`, and `3568`; direct
+  sibling controls call the canonical function. LSP `goto_definition` from
+  every production/policy-test call must resolve through the re-export to the
+  DB-child definition. Do not require `find_references` alone to enumerate
+  line `1241`: rust-analyzer currently omits it even though definition lookup
+  succeeds. The moved raw lock disappears from `post_write.rs`; no raw DB
+  capability escapes the child.
 - Start from the green R4-18 M5 state `191 / 55-50-86 / exposure 22`.
   Regenerate the inventory only after all code, test, and ledger changes, then
   run both the script and Rust drift gate again after any review delta. Counts
@@ -1805,6 +1814,66 @@ Frozen slice contract:
   both returned `APPROVE` after the dropped-trigger negative control,
   saturating route-generation semantics, and the four-call syntax/LSP split
   were made explicit. No implementation file changed during contract review.
+- PRE-IMPLEMENTATION TOOLING CORRECTION, 2026-07-29: the first inherent-method
+  move demonstrated two scanner-visible topology failures despite green
+  runtime tests. Sharing the facade name increased M5 name ambiguity `9 → 10`
+  and yielded `189 / 55-49-85 / exposure 21`; a distinct inherent name restored
+  `191 / 55-50-86` but still pushed the exposed public repair entry to depth
+  three, yielding exposure `21`. Bypassing the facade would retain that extra
+  definition and yield `192 / 55-51-86 / exposure 22`. The approved topology
+  therefore uses one canonical DB-child free-function definition plus the
+  public `post_write` item re-export. This preserves the original call edges
+  and external path while restoring `191 / 55-50-86 / exposure 22`. Lowering
+  the inventory, adding fake edges, or editing the scanner is forbidden.
+- TOPOLOGY CORRECTION GATE, 2026-07-29: routine Sol and the independent
+  contract auditor both returned `APPROVE` for the canonical DB-child
+  definition plus public item re-export. They rejected both the extra wrapper
+  layer and the direct-dispatcher bypass because those topologies cannot
+  preserve the frozen M5 row/depth/exposure contract.
+- RED, 2026-07-29: lowering only the `post_write.rs` ratchet row `16 → 15`
+  produced the exact expected failure:
+  `post_write.rs: direct .conn.lock() access increased 15 -> 16`.
+- IMPLEMENTED, 2026-07-29: `db/repair_deterministic.rs` now owns the complete
+  deterministic CAS as the canonical `apply_deterministic_repair_cas`;
+  `post_write` retains the public path as a direct item re-export. The mutex,
+  `BEGIN IMMEDIATE`, tag-set validation, receipt and route reads, seven SQL
+  arms and predicates, affected-count proof, route-invalidation accounting,
+  parity/effect normalization, opaque proof construction, synchronous hook,
+  rollback mapping, and commit mapping remain in their original order.
+  `RepairWriteProof::from_parts` is the only construction seam; no generic
+  executor, production failure seam, raw connection, or transaction
+  capability was added.
+- GREEN, 2026-07-29: direct DB controls pass `4 / 4`: simple-writer
+  success/proof/commit with the no-hang scoped-thread `Barrier` mutex control,
+  proof-hook rollback, archive-page route generation/space/proof accounting,
+  and the dropped-`m4_page_community_page_invalidate` exact
+  `repair target page route invalidation unproven` error with active-page
+  rollback. The unchanged deterministic policy module passes `46 / 46`; the
+  exact ratchet passes `3 / 3`. External literals are `297 → 296`,
+  production `8 → 7`, and tests remain `289`. Formatting, diff checks, and
+  core/server all-target Clippy with `-D warnings` pass.
+- LSP GATE, 2026-07-29: source search shows one canonical DB-child function
+  declaration, the unchanged production call, four unchanged policy-test
+  calls, and four direct controls. `goto_definition` from the production and
+  policy-test calls resolves through the `post_write` re-export to the
+  canonical DB-child definition. As documented, rust-analyzer
+  `find_references` omits policy-test line `1241` while its definition lookup
+  succeeds. All five changed Rust files have zero error diagnostics.
+- ROOT GATE, 2026-07-29: a whitespace-insensitive comparison of the old
+  transaction with the DB-child function differs only at opaque proof
+  construction (`RepairWriteProof { ... }` becomes the existing
+  `from_parts(...)` boundary). Root independently reran direct controls `4 / 4`,
+  unchanged policy controls `46 / 46`, ratchet controls `3 / 3`, core/server
+  all-target Clippy, formatting, and diff checks. The final generated M5
+  inventory and Rust drift gate pass at `191` rows, depth `55 / 50 / 86`, and
+  exposure `22`. Ast-grep finds the sole function declaration plus the
+  production and three parsed policy calls; the fourth policy call is inside
+  an `assert!` token tree, so exact text census plus successful LSP definition
+  lookup closes that parser boundary. No truth/generation surface changed.
+- REVIEW GATE, 2026-07-29: the routine Sol architecture/API review returned
+  `APPROVE`; the independent movement, accounting, concurrency, and kill-power
+  audit returned `APPROVE`. Both reviewed the exact staged seven-file slice
+  after topology D and reported no finding or source conflict.
 
 #### R4-20 — rename-page apply and recovery transactions
 
