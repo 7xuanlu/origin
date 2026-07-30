@@ -3,13 +3,13 @@
 
 use crate::lifecycle::ShutdownHandle;
 pub use crate::route_registry::AppRouter;
-use crate::route_registry::{get, post, TrackedRouter};
+use crate::route_registry::{get, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
     activity_tag_routes, brief_routes, briefing_routes, community_routes, config_routes,
     decisions_routes, entity_graph_routes, import_routes, indexed_files_routes, ingest_routes,
     knowledge_routes, lint_routes, memory_detail_routes, memory_revision_routes, memory_routes,
-    onboarding_routes, page_map_routes, pinned_memory_routes, profile_agents_routes,
+    onboarding_routes, page_map_routes, page_routes, pinned_memory_routes, profile_agents_routes,
     profile_narrative_routes, refinery_routes, repair_routes, routes, security, snapshot_routes,
     source_routes, spaces_routes, truth_guard, websocket,
 };
@@ -58,54 +58,7 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = entity_graph_routes::register_reads(router);
     let router = entity_graph_routes::register_suggestions(router);
     let router = spaces_routes::register_core(router);
-    let router = router
-        // Pages (legacy SQL tables still named "concepts" — see db.rs)
-        .route(
-            "/api/pages",
-            get(memory_routes::handle_list_pages).post(memory_routes::handle_create_page),
-        )
-        .route(
-            "/api/pages/search",
-            post(memory_routes::handle_search_pages),
-        )
-        .route(
-            "/api/pages/export",
-            post(memory_routes::handle_export_pages),
-        )
-        .route(
-            "/api/pages/recent-changes",
-            get(routes::handle_recent_page_changes),
-        )
-        .route(
-            "/api/pages/orphan-links",
-            get(memory_routes::handle_list_orphan_links),
-        )
-        .route(
-            "/api/pages/{id}/export",
-            post(memory_routes::handle_export_page),
-        )
-        .route(
-            "/api/pages/{id}",
-            get(memory_routes::handle_get_page)
-                .put(memory_routes::handle_refresh_page)
-                .delete(memory_routes::handle_delete_page),
-        )
-        .route(
-            "/api/pages/{id}/sources",
-            get(memory_routes::handle_get_page_sources),
-        )
-        .route(
-            "/api/pages/{id}/links",
-            get(memory_routes::handle_get_page_links),
-        )
-        .route(
-            "/api/pages/{id}/archive",
-            post(memory_routes::handle_archive_page),
-        )
-        .route(
-            "/api/pages/{id}/revisions",
-            get(memory_routes::handle_get_page_revisions),
-        );
+    let router = page_routes::register(router);
 
     let router = page_map_routes::register(router);
 
@@ -124,10 +77,7 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = pinned_memory_routes::register(router);
     let router = memory_revision_routes::register_pending(router);
     let router = snapshot_routes::register(router);
-    let router = router.route(
-        "/api/memory/{id}/update-page",
-        post(memory_routes::handle_update_page),
-    );
+    let router = page_routes::register_manual_edit(router);
     let router = knowledge_routes::register(router);
     let router = onboarding_routes::register(router);
     let router = websocket::register(router);

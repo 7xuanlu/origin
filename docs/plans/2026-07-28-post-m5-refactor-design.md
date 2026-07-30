@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; registration slice 7 complete**
+Status: **R5 complete; R6 next**
 
 ## Authority and change control
 
@@ -4526,6 +4526,164 @@ R5 registration slice 7 evidence, 2026-07-30:
   the exact typed `404`, unchanged production files, and the byte-identical
   handler-manifest hash
   `2b6aca95ec1b9824fb93c2a35688ba6e6c549b2e20c44f7e40c403d28b7c16a7`.
+
+R5 handler-movement slice 13 contract, 2026-07-30:
+
+- Finish R5 with one protected `page_routes.rs` owner for exactly `14`
+  existing handlers: list, get, sources, archive, delete, search, create,
+  bulk export, by-id export, links, orphan links, manual update, agent refresh,
+  and revisions. Move the private `normalize_page_write_target` helper,
+  `OrphanLinksQuery`, and the complete colocated
+  `create_page_endpoint_tests` module with them. No handler/helper/test body,
+  visibility, DTO, SQL call, truth adapter, PagePermit call, state-lock
+  lifetime, filesystem ordering, rollback path, or error text changes.
+- Add `page_routes::register` at the existing ordinary Page composition
+  position. It owns the same `13` moved-handler bindings plus the unchanged
+  cross-module `routes::handle_recent_page_changes` binding in the same route
+  order. Keep `page_map_routes::register` immediately after it. Add
+  `page_routes::register_manual_edit` at the existing later position, after
+  snapshot registration, for only
+  `POST /api/memory/{id}/update-page`. This preserves the two separated
+  composition positions without inventing a forwarding wrapper.
+- The exact handler manifest must first go RED on precisely the `14` moved
+  module identities, then become GREEN by changing only those identities from
+  `wenlan_server::memory_routes::*` to
+  `wenlan_server::page_routes::*`. Every method/path row and every untouched
+  handler identity remains byte-identical. Truth, sensitive-read, mutation,
+  security, lifecycle, Page-map, CLI, MCP, and core projection sources remain
+  unchanged.
+- Add a typed built-router characterization before movement and run the same
+  test after movement. Every one of the `14` endpoints must deserialize a
+  hermetic success into the existing `wenlan-types` response type where one
+  exists; list/get and archive/delete may use exact test-local
+  `Deserialize` envelopes because production intentionally returns JSON
+  envelopes without shared DTOs. Every endpoint must also traverse the built
+  router with a valid body and deserialize its deterministic no-DB `503` into
+  the established test-local `ErrorEnvelope`. No `serde_json::Value` response
+  oracle or production test seam is allowed.
+- Page create, refresh, delete, and export success cases must be isolated on
+  both filesystem axes: a test-owned `ServerState` Page root and a
+  test-owned `WENLAN_DATA_DIR/config.json` whose `knowledge_path` points at a
+  scratch directory. The test must never resolve the default live vault.
+  Existing focused ownership, projection rollback, entity-shadow, truth,
+  scoping, and manual-edit tests remain the semantic gates; this new contract
+  freezes wire and registration identity rather than replacing them.
+- Record LSP definition/reference closure for all `14` handlers, the helper,
+  query type, and moved test module before movement; after movement require
+  zero diagnostics and no stale production reference to their old module.
+  Compare deterministic exact raw-byte digests of the moved source bodies,
+  refresh the generated M5 inventory, and run the exact handler,
+  sensitive-read, truth, permit/write, Rust/Python M5, focused server,
+  warnings-denied Clippy, formatting, and diff gates. Because archive/delete,
+  refresh, exports, and projection rollback are data-loss-sensitive, two
+  independent Sol reviewers must approve this final R5 lane.
+
+R5 handler-movement slice 13 evidence, 2026-07-30:
+
+- The typed built-router characterization passed `1 / 1` before movement and
+  after the final edit. It deserializes a hermetic success for every one of
+  the `14` moved endpoints, then drives all `14` again against a no-DB router
+  and deserializes the exact `503` error envelope. Existing shared
+  `wenlan-types` DTOs are used everywhere available; only
+  `PageEnvelope`, `StatusEnvelope`, and `ErrorEnvelope` are exact test-local
+  response mirrors. The test asserts its loaded `knowledge_path` equals its
+  scratch directory and supplies a separate scratch `ServerState` Page root,
+  so create, refresh, delete, and export cannot resolve the live vault.
+- Moving the `14` function items made the production-builder handler guard RED
+  with precisely the old `memory_routes` identities on the expected side and
+  the new `page_routes` identities on the observed side. Updating only those
+  `14` manifest rows made it GREEN `1 / 1`; substituting
+  `page_routes` back to `memory_routes` in the final manifest reproduces the
+  pre-move SHA-256
+  `2b6aca95ec1b9824fb93c2a35688ba6e6c549b2e20c44f7e40c403d28b7c16a7`,
+  and the diff contains exactly `14` removed plus `14` added rows.
+- The four moved source blocks are exact byte copies before and after:
+  primary handlers/helper
+  `bceb23af66547710b3c81bff7988a5ca22aabd525bf808680aa5ce79aa4a8b26`;
+  links/orphan/update/refresh
+  `ddd414d18a32916df361f6f3d8ede695459390f4d3f6b110b0ffcbf7c9ce6499`;
+  syntactic create-page test module (from `#[cfg(test)]` through its closing
+  brace, excluding the following separator)
+  `70229dab2836c177c42d02fbaa6bf7d02a424dcd465f40cd4db03f6cc37cc227`;
+  revisions
+  `912dc58d8fddb314c66ff9e9e47f35239c2a3cbcfd943a975d0b231cf9c0edec`.
+  An exploratory whitespace-normalized digest was discarded because it did
+  not reproduce from its stated algorithm. Clippy then caught that the first
+  mechanical test boundary included the next memory-search module's doc
+  comment; returning those exact comment bytes to their owner produced the
+  final test-only digest above and a warnings-clean boundary.
+- `page_routes.rs` now owns exactly `14` public handlers across `1,337` lines;
+  `memory_routes.rs` owns exactly the frozen `20` memory-core handlers across
+  `2,991` lines; `router.rs` is a `192`-line composition root. The ordinary
+  Page registrar remains immediately before Page-map registration, and the
+  one manual-edit registrar remains after snapshots. The runtime handler
+  manifest remains `165` main plus `6` repair rows.
+- Pre-move LSP found every handler at exactly its definition plus the old
+  router registration, with only one local call each for the helper and query.
+  Post-move LSP resolves `13` handlers to definition plus colocated registrar;
+  the revisions reference query timed out twice but its registrar
+  `goto_definition` resolves correctly and the literal source census finds
+  only definition plus registrar. Both registrars have exactly one
+  composition caller, the helper/query remain local, no stale
+  `memory_routes::<moved-symbol>` reference remains, and diagnostics are empty
+  in Page routes, memory routes, router, library root, and the typed contract.
+- Focused semantic gates after handler movement pass: create-page `4 / 4`,
+  sensitive Page/scoping contracts `6 / 6`, refresh/projection rollback
+  `4 / 4`, manual edit/write-gate `9 / 9`, entity-shadow Page behavior
+  `10 / 10`, revisions `2 / 2`, and truth-error seams `4 / 4`. Exact
+  sensitive-read guards pass `3 / 3`, truth manifest `16 / 16`, the
+  projection-permit source scan `1 / 1`, Rust M5 `1 / 1`, and Python M5
+  remains `191 / 55-50-86 / exposure 22`. Focused warnings-denied Clippy and
+  formatting pass. Dual independent data-loss review is pending.
+- R5 handler-movement slice 13 REVIEW, 2026-07-30: both independent Sol lanes
+  returned **APPROVE** with zero blocking findings. The movement/truth reviewer
+  found one non-blocking ledger-only issue—the Page and memory file line counts
+  still described the pre-doc-comment correction—and the counts above are now
+  refreshed to `1,337` and `2,991`. It otherwise independently confirmed all
+  four exact hashes, the exact `14` identity-only manifest delta, registrar
+  order, typed `14 + 14` coverage, scratch-vault isolation, M5 inventory,
+  LSP closure, and focused gates. The high-risk reviewer returned zero
+  non-blocking findings after independently tracing archive lock lifetime,
+  delete order, create/refresh rollback, export permits, manual CAS/source
+  preservation, cross-cutting layer order, and the real-vault isolation.
+
+R5 boundary verification, 2026-07-30:
+
+- A clean, non-overlapping full `wenlan-server` run passed `580` tests with
+  `3` ignored across library, binary, integration, and contract targets.
+  The first attempted run overlapped an earlier detached full-server Cargo
+  process and failed only
+  `data_root_lock_excludes_a_second_daemon_for_the_same_root`; process census
+  proved the older Cargo PID was still alive. After waiting for it to exit,
+  the exact lock test passed `1 / 1` and the clean full-server rerun passed.
+  This was harness interference, not an ignored product failure.
+- One uninterrupted `cargo test --workspace --lib --quiet` passed:
+  CLI `32 / 32`; core `3,463` passed with `33` ignored; MCP `178 / 178`;
+  server `347` passed with `2` ignored; types `183 / 183`. Aggregate:
+  `4,203` passed, `35` ignored, zero failed.
+- The first workspace all-target warnings-denied Clippy run caught one final
+  structural issue: the byte-identical revisions handler block followed the
+  moved `#[cfg(test)]` module and violated `items_after_test_module`. The
+  revisions block was moved before the test module without changing either
+  syntactic item's bytes. The original `30477dea...` test receipt included the
+  separator blank line after the module; at EOF rustfmt removes that separator.
+  The exact syntactic module is `14,439` bytes and hashes to `70229dab...` in
+  both `HEAD`'s old `memory_routes.rs:3089-3469` and the final Page module.
+  After that order-only correction, the typed Page contract and
+  exact production handler guard pass `1 / 1` each, server library passes
+  `347` with `2` ignored, workspace all-target Clippy passes with
+  `-D warnings`, LSP diagnostics are empty, formatting/diff hygiene pass, and
+  Python M5 remains `191 / 55-50-86 / exposure 22`. The full workspace
+  library gate predates only this declaration-order correction; its handler
+  and test bytes are identical, and the affected server library plus
+  workspace all-target compilation were rerun afterward.
+- R5 boundary correction re-review returned **APPROVE** with zero remaining
+  findings. The independent movement reviewer reproduced the exact `14,439`
+  old/new module bytes and `70229dab...` hash, both final file counts, and clean
+  diff hygiene. The earlier high-risk reviewer also retained **APPROVE**:
+  the order-only correction changed no production block, registrar, manifest,
+  truth/security/lifecycle layer, filesystem ordering, lock, permit, CAS, or
+  rollback path.
 
 ### R6 — `post_write` phase decomposition
 

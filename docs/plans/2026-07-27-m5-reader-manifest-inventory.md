@@ -281,7 +281,7 @@ readers carry no `pending_revision` filter, so a card is exposed from the moment
 it is staged.
 
 - **`GET /api/memory/nurture` → `yes`.** `handle_get_nurture_cards`
-  (`server/memory_routes.rs:1381`) → `get_nurture_cards_scoped`
+  (`server/memory_routes.rs:1380`) → `get_nurture_cards_scoped`
   (`db.rs:35061`). The `WHERE` is `source='memory' AND stability='new' AND
   COALESCE(is_recap,0)=0` plus the superseder clause
   (`db.rs:35090`-`db.rs:35093`) — no `pending_revision` filter — and
@@ -289,13 +289,13 @@ it is staged.
   **first**. It selects `c.title`, `c.content` and `c.source_text`, so the queue
   meant for reviewing captures returns the whole page body, top of the list.
 - **`GET /api/memory/recent` → `yes`.** `handle_recent_memories`
-  (`server/memory_routes.rs:2606`) → `list_recent_memories_scoped`
+  (`server/memory_routes.rs:1751`) → `list_recent_memories_scoped`
   (`db.rs:40319`). Its `WHERE` is `source='memory' AND chunk_index=0` plus a
   `supersede_mode` exclusion, no `pending_revision`. `RecentActivityItem.title`
   is the card title verbatim and `snippet` falls back to the first 100 chars of
   content (`db.rs:40432`).
 - **`GET /api/memory/unconfirmed` → `yes`.**
-  `handle_list_unconfirmed_memories` (`server/memory_routes.rs:2629`) →
+  `handle_list_unconfirmed_memories` (`server/memory_routes.rs:1774`) →
   `list_unconfirmed_memories_scoped` (`db.rs:40479`). It filters
   `(confirmed = 0 OR confirmed IS NULL)` (`db.rs:40501`), which a staged card
   satisfies by construction (`post_write.rs:3102`), and carries no
@@ -324,7 +324,7 @@ it is staged.
   (`wenlan-types/src/responses.rs:704`, `:705`). Hand it the card id and it
   answers.
 - **`GET /api/memory/{id}/versions` → `yes`.** `handle_get_version_chain`
-  (`server/memory_routes.rs:1846`) → `get_version_chain_scoped`
+  (`server/memory_routes.rs:1427`) → `get_version_chain_scoped`
   (`db.rs:33928`). No `pending_revision` filter, and the per-item statement
   selects `MAX(title), MAX(content)` into `MemoryVersionItem.title` / `.content`
   (`wenlan-types/src/memory.rs:154`, `:155`) — the full body, not a preview.
@@ -334,9 +334,9 @@ stops a *staged* card and not a dismissed one, because dismiss set that column
 to 0.
 
 - **`POST /api/memory/list` → `yes`.** `handle_list_memories`
-  (`server/memory_routes.rs:1059`) → `list_filtered_confirmed_scoped`
+  (`server/memory_routes.rs:1058`) → `list_filtered_confirmed_scoped`
   (`db.rs:29220`), which pushes `pending_revision = 0` at `db.rs:29274`. The
-  handler forwards `req.confirmed` unchanged (`server/memory_routes.rs:1076`),
+  handler forwards `req.confirmed` unchanged (`server/memory_routes.rs:1075`),
   so a request that omits the field applies no confirmed filter and the row
   comes back with `MAX(title)` and `MAX(content)`.
 - **`GET /api/memory/by-ids` → `yes`.** `handle_get_memories_by_ids`
@@ -359,7 +359,7 @@ to 0.
   card; after a dismiss the surviving gate is `pinned = true`. Pinned, the row
   carries `title`, `content` and `source_text`.
 - **`GET /api/home-stats` → `yes`, and its gate is not the one the tier name
-  suggests.** `handle_get_home_stats` (`server/memory_routes.rs:1153`) →
+  suggests.** `handle_get_home_stats` (`server/memory_routes.rs:1152`) →
   `get_home_stats_scoped` (`db.rs:33631`) / `get_home_stats` (`db.rs:33276`).
   Neither carries a `pending_revision` filter anywhere. `TopMemory.content` is
   `SUBSTR(c.content, 1, 200)` joined through `access_log` (`db.rs:33546`,
@@ -1052,11 +1052,11 @@ carrying the authority of agreement.
 | `core/synthesis/overview.rs:104` | `refresh_overview_page` | `pub` | `ensure_overview_page` |
 | `core/synthesis/refinement_queue.rs:125` | `apply_refinement_with_decision` | `pub` | `accept_page_merge` |
 | `server/main.rs:1073` | `run_daemon` | `private` | `list_pages` |
-| `server/memory_routes.rs:1635` | `handle_create_page` | `pub` | `get_page` |
-| `server/memory_routes.rs:2310` | `handle_update_page` | `pub` | `get_page` |
-| `server/memory_routes.rs:2385` | `handle_refresh_page` | `pub` | `get_page` |
 | `server/page_map_routes.rs:73` | `visible_page` | `private` | `get_page` |
 | `server/page_map_routes.rs:93` | `ensure_page_is_active` | `private` | `get_page` |
+| `server/page_routes.rs:262` | `handle_create_page` | `pub` | `get_page` |
+| `server/page_routes.rs:620` | `handle_update_page` | `pub` | `get_page` |
+| `server/page_routes.rs:695` | `handle_refresh_page` | `pub` | `get_page` |
 | `server/repair_routes.rs:183` | `handle_prepare` | `private` | `prepare_memory_reclassification_with_pages` |
 | `server/routes.rs:1009` | `handle_recent_pages` | `pub` | `list_recent_pages_with_badges_scoped` |
 | `server/scheduler.rs:1974` | `run_ambient_job_safe` | `private` | `run_ambient_job` |

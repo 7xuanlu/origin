@@ -12,7 +12,8 @@ HTTP daemon — owns the Axum router + all routes. All handlers operate on `Arc<
 | `state.rs` | `ServerState` struct with `db: Option<Arc<MemoryDB>>`, `llm`, `prompts`, `tuning`, `quality_gate`, `space_store`, `access_tracker`, `llm_processing_ids`, `watch_paths`. `SharedState = Arc<RwLock<ServerState>>` |
 | `router.rs` | Axum composition root — assembles module-owned registration helpers plus the remaining inline registrations, then applies the truth/security/lifecycle layers |
 | `routes.rs` | General endpoints and their `TrackedRouter` registration helper: health, status, search/context, diagnostics, recent activity, steep/distill |
-| `memory_routes.rs` | Remaining memory CRUD/search/enrichment, classification, statistics, and Page handlers |
+| `memory_routes.rs` | Remaining memory CRUD/search/enrichment, classification, statistics, scheduler-handoff, rerank, attribution, update, revision, and contradiction tests |
+| `page_routes.rs` | Page list/get/search, source/link/revision reads, create/update/refresh/archive/delete, projection export, and their two position-preserving `TrackedRouter` registration helpers |
 | `activity_tag_routes.rs` | Activity feed and tag list/suggestion/mutation handlers plus their `TrackedRouter` registration helper |
 | `briefing_routes.rs` | Scoped daily briefing route plus its `TrackedRouter` registration helper |
 | `memory_detail_routes.rs` | Global capture count and scoped single/batch memory-detail readers plus their `TrackedRouter` registration helper |
