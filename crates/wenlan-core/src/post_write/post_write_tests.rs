@@ -1,6 +1,7 @@
 use super::*;
 use crate::events::NoopEmitter;
 use std::sync::Arc;
+use wenlan_types::requests::{AddObservationRequest, CreateEntityRequest, CreateRelationRequest};
 
 // Serialize env-var-sensitive tests to avoid races.
 // Uses tokio::sync::Mutex so the guard can safely span .await points.
@@ -3832,6 +3833,75 @@ async fn dismiss_pending_revision_deletes_a_page_card_rather_than_unstaging_it()
     assert_eq!(
         page_after.content, human_content,
         "dismissing must leave the human's prose untouched"
+    );
+}
+
+#[tokio::test]
+async fn accept_page_revision_projection_failure_preserves_committed_db_authority() {
+    let (db, dir) = test_db().await;
+    let projection_root = dir.path().join("projection-root");
+    std::fs::write(
+        &projection_root,
+        "a regular file cannot be a projection directory",
+    )
+    .unwrap();
+    let mem_id = "mem_page_accept_projection_failure_original";
+    let new_mem_id = "mem_page_accept_projection_failure_new";
+    let original_content = "original page content before projection failure";
+    let proposed_content = "accepted page content remains authoritative after projection failure";
+
+    seed_memory(&db, mem_id, original_content).await;
+    seed_memory(&db, new_mem_id, proposed_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+
+    let projection =
+        crate::export::knowledge::KnowledgeProjectionWrite::new(projection_root.clone(), &db);
+    projection
+        .write_page_gated(&db, &before)
+        .await
+        .expect_err("a regular file must make the projection write fail");
+    drop(projection);
+
+    let expected_sources = vec![mem_id.to_string(), new_mem_id.to_string()];
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        proposed_content,
+        &expected_sources,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .as_deref()
+        .expect("staged page card must return an id");
+
+    let accepted = accept_pending_revision_with_knowledge_path(
+        &db,
+        card_id,
+        "test-agent",
+        Some(&projection_root),
+    )
+    .await
+    .unwrap();
+    assert!(accepted.wrote);
+    assert_eq!(accepted.target_source_id, page_id);
+    assert_eq!(accepted.revision_source_id, card_id);
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(after.content, proposed_content);
+    assert_eq!(after.version, before.version + 1);
+    assert_eq!(after.source_memory_ids, expected_sources);
+    assert!(
+        db.get_memory_detail(card_id).await.unwrap().is_none(),
+        "the committed accept must consume its transient revision card"
+    );
+    assert!(
+        db.list_pending_revisions(10).await.unwrap().is_empty(),
+        "projection failure must not resurrect the committed card"
     );
 }
 

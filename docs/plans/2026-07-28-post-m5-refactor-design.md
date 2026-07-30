@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R5 complete; R6-0 boundary teeth implemented; R6-1 next**
+Status: **R6-2 complete; R6-3 Page create/dispatch next**
 
 ## Authority and change control
 
@@ -4952,6 +4952,67 @@ Those are behavior changes and must not be hidden inside R6.
   compiler inventory, all `55` path-only manifest rows, the `9` explicit
   formatting rules over `12` occurrences, byte-identical transformed test
   body, M5 exclusion/receipt, LSP resolution, and clean hygiene gates.
+
+#### R6-2 execution receipt — 2026-07-30
+
+- Before movement, added
+  `accept_page_revision_projection_failure_preserves_committed_db_authority`.
+  Its positive control proves that a regular file used as the projection root
+  makes `KnowledgeProjectionWrite::write_page_gated` return `Err`; accepting
+  the staged Page revision through that same failing root still returns
+  `wrote: true`, commits the exact content, sources, and `version + 1`, and
+  consumes the transient card. The direct positive-control projection guard is
+  dropped before the accept call, so the witness does not overlap two cutover
+  tracker lifetimes.
+- Advanced the structure phase to `lower-risk-flows`. Its intentional RED
+  reported exactly the absent private `entity_graph` and `page_revision`
+  children/files plus the eight absent facade re-exports. GREEN moves five
+  exact entity/relation/observation items and seven exact revision/curation
+  items into those private children. `log_activity_best_effort` remains
+  root-owned, `is_valid_snake_case_relation` remains private, callers retain
+  `crate::post_write::<item>`, and no production or test caller names either
+  child path.
+- The movement comparator no longer treats the complete externalized test file
+  as one movement item after R6-1. It now pins only the one reflection-sensitive
+  `non_stale_page_write_uses_loaded_version_cas` test, so R6-2's new
+  characterization is not misclassified as drift. The obsolete external-test
+  formatting substitutions and post-normalization machinery were removed.
+  The manifest still contains `48` selectors and records exactly ten added and
+  two removed top-level import/re-export forms for the split files; the only
+  sibling visibility widenings remain the two R6-0 type allowances.
+- Root inspection corrected three non-semantic omissions that the item
+  comparator intentionally cannot see: it moved the four-line Page-card
+  version comment with `accept_page_revision_card`, restored blank lines
+  between extracted top-level items, and shortened the positive-control
+  projection guard lifetime described above. Canonical formatting and the
+  movement comparator remain green after those corrections.
+- GREEN: structure/facade `4/4`; R4 exact manifest `1/1`; comparator unit
+  `4/4`, self-test `48` baseline selectors, and live comparison `48/48`.
+  Focused behavior groups pass entity `9/9`, relation `8/8`, observation
+  `3/3`, revision accept `9/9`, and dismiss/contradiction `7/7`.
+  The complete `post_write::tests::*` set passes `105/105`; compiler inventory
+  is `105`, with the new characterization as the sole R6-2 addition to the
+  prior `104`, and the ignored inventory remains zero.
+- M5 regeneration changes only seven expected source-address rows: six root
+  line shifts and `accept_page_revision_card` moving to
+  `core/post_write/page_revision.rs`. The pre/post ratchet against
+  `/tmp/wenlan-r6-2-m5-before.json`, generator check, and pinned semantic
+  receipt remain `191 rows; depth 55/50/86; exposure 22`, with the same
+  exposure identity set. The exact truth-manifest suite passes `16/16`; the
+  production cutover-setter and permitted-projection source guards pass `1/1`
+  each, and the external direct-connection ratchet passes `1/1`.
+- Rust LSP diagnostics are empty for the facade, both children, and the
+  external test module. `goto_definition` through the two sampled facade
+  re-exports lands in `entity_graph.rs` and `page_revision.rs`; reference sets
+  retain the facade re-export and external facade callers and contain no child
+  path. `cargo fmt --all -- --check`, `git diff --check`, and the explicit
+  private-child path scan pass.
+- Independent Sol review initially returned **BLOCK** because three
+  inter-item blank separators in `entity_graph.rs` were still absent while the
+  ledger claimed all had been restored. After adding those separators, the
+  reviewer independently scanned every adjacent item, reproduced the live
+  comparator and diff hygiene, and returned **APPROVE** with no remaining
+  finding.
 
 ### R7 — daemon startup and scheduler lanes
 
