@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 7 complete**
+Status: **R4 complete; R5 in progress; handler-movement slice 8 complete**
 
 ## Authority and change control
 
@@ -4039,6 +4039,79 @@ R5 handler-movement slice 7 evidence, 2026-07-30:
   error/refusal coverage, protected-source equality, TempDir isolation,
   current citations/counts, and LSP closure. Its focused reruns passed the
   typed contract, exact handler guard, Python M5 sweep, formatting, and diff
+  hygiene.
+
+R5 handler-movement slice 8 contract, 2026-07-30:
+
+- Move only `GET /api/briefing` into `briefing_routes.rs`, through a registrar
+  immediately after decisions and before profile narrative. Do not fold it
+  into `brief_routes.rs`: `/api/brief` and scoped generated briefing have
+  different contracts and dependencies. Exactly one handler-manifest identity
+  field may change.
+- Move the handler body byte-for-byte, preserving its one state snapshot,
+  header-only Space resolution, scoped generator call, LLM/prompt/tuning
+  inputs, and error propagation. The route remains page-bearing
+  `Automatic`/`MarkerShape::None`; every truth/sensitive/M5 classification and
+  route layer remains unchanged.
+- Typed built-router characterization must use shared `BriefingResponse` and
+  the established test-local `ErrorEnvelope`. With work/personal recent
+  memories and a seeded global cache sentinel, selected work briefing must
+  include only work evidence, neither read nor mutate the global cache, return
+  unknown-Space `422`, no-DB `503`, and marked `403`.
+- Profile narrative, pinned/pending/history revisions, snapshots, versions and
+  updates, remaining CRUD/search/enrichment, Pages, CLI/MCP, and DTO
+  normalization remain out of scope.
+
+R5 handler-movement slice 8 evidence, 2026-07-30:
+
+- Exactly `GET /api/briefing` now executes in `briefing_routes.rs`, through
+  one registrar immediately after decisions and before profile narrative.
+  The existing `/api/brief` module and every other route remain outside the
+  slice.
+- The old/new doc-comment-plus-handler block has identical SHA-256
+  `16eed3ec65445989700e28eb94665d73eabdaa3ebdf7cdebdf12348e7f8d0f14`.
+  The state snapshot, header-only Space resolution, scoped generator,
+  LLM/prompt/tuning inputs, error propagation, and lock/await lifetime are
+  therefore byte-preserved.
+- Before updating expected ownership, the production-builder control was RED
+  on precisely the new `briefing_routes::handle_get_briefing` observation
+  versus the old `memory_routes` expectation. Updating only that exact
+  handler-manifest identity made it GREEN. The M5 truth row correctly retains
+  its short semantic adapter name; truth, sensitive-read, mutation, security,
+  and lifecycle sources remain unchanged.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. Shared `BriefingResponse` proves the selected work response
+  includes work evidence but excludes personal evidence and a seeded global
+  cache sentinel, while the cache value remains unchanged. The established
+  test-local `ErrorEnvelope` covers unknown-Space `422`, no-DB `503`, and
+  marked `403`; no `serde_json::Value` response oracle is used.
+- Refreshed Rust LSP diagnostics are clean in the new module, old module,
+  router, export, and contract test. The handler closes on its colocated
+  registration plus definition, and the registrar closes on one composition
+  call plus definition.
+- `router.rs` remains `376` lines because the inline binding became a registrar
+  call; `memory_routes.rs` falls from `4,547` lines and `47` public handlers to
+  `4,522` lines and `46`; the bounded briefing module is `36` lines with one
+  handler. The generated M5 inventory changes only two displaced Page-handler
+  source addresses and remains `191 / 55-50-86 / exposure 22`; current
+  briefing and displaced memory-route prose citations were refreshed.
+  Call-site ownership is
+  `49 router + 1 briefing_routes + 2 decisions_routes +
+  3 memory_detail_routes + 5 activity_tag_routes +
+  5 indexed_files_routes + 13 spaces_routes + 14 entity_graph_routes +
+  75 other = 167`.
+- Focused verification passes after the last code edit: typed contract
+  `1 / 1`; exact handler guard `1 / 1`; truth manifest `16 / 16`; Rust/Python
+  M5 `1 / 1` and `191 / 55-50-86 / exposure 22`; focused Clippy with warnings
+  denied; formatting and diff hygiene.
+- R5 handler-movement slice 8 REVIEW, 2026-07-30: the reused independent Sol
+  lane returned **APPROVE** with zero blocking and zero non-blocking findings.
+  It independently confirmed the one-route boundary and registrar position,
+  byte-identical movement hash, exact identity-only handler manifest change,
+  unchanged semantic truth row and protected sources, complete typed
+  success/error/refusal/cache controls, current counts/citations, and LSP
+  closure. Its focused reruns passed the typed contract, exact handler guard,
+  truth manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff
   hygiene.
 
 ### R6 — `post_write` phase decomposition

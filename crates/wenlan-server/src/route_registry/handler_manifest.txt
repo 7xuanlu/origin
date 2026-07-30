@@ -2,7 +2,7 @@
 main|get|/api/activities|wenlan_server::activity_tag_routes::handle_list_activities
 main|get|/api/agents|wenlan_server::profile_agents_routes::handle_list_agents
 main|get|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_get_agent
-main|get|/api/briefing|wenlan_server::memory_routes::handle_get_briefing
+main|get|/api/briefing|wenlan_server::briefing_routes::handle_get_briefing
 main|get|/api/capture-stats|wenlan_server::memory_detail_routes::handle_capture_stats
 main|get|/api/chunks/{source_id}|wenlan_server::indexed_files_routes::handle_get_chunks
 main|get|/api/communities|wenlan_server::community_routes::handle_list_communities

@@ -6,11 +6,11 @@ pub use crate::route_registry::AppRouter;
 use crate::route_registry::{delete, get, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
-    activity_tag_routes, brief_routes, community_routes, config_routes, decisions_routes,
-    entity_graph_routes, import_routes, indexed_files_routes, ingest_routes, knowledge_routes,
-    lint_routes, memory_detail_routes, memory_routes, onboarding_routes, page_map_routes,
-    profile_agents_routes, refinery_routes, repair_routes, routes, security, source_routes,
-    spaces_routes, truth_guard, websocket,
+    activity_tag_routes, brief_routes, briefing_routes, community_routes, config_routes,
+    decisions_routes, entity_graph_routes, import_routes, indexed_files_routes, ingest_routes,
+    knowledge_routes, lint_routes, memory_detail_routes, memory_routes, onboarding_routes,
+    page_map_routes, profile_agents_routes, refinery_routes, repair_routes, routes, security,
+    source_routes, spaces_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -214,9 +214,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
             post(memory_routes::handle_correct_memory),
         );
     let router = decisions_routes::register(router);
+    let router = briefing_routes::register(router);
     let router = router
-        // Briefing, working memory, profile narrative, pinned (batch 6)
-        .route("/api/briefing", get(memory_routes::handle_get_briefing))
+        // Working memory, profile narrative, pinned (batch 6)
         .route(
             "/api/profile/narrative",
             get(memory_routes::handle_get_profile_narrative),

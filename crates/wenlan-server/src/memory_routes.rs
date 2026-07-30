@@ -2103,33 +2103,8 @@ pub async fn handle_correct_memory(
 }
 
 // =====================================================================
-// Batch 6 — Briefing, working memory, profile narrative, pinned
+// Batch 6 — Working memory, profile narrative, pinned
 // =====================================================================
-
-/// GET /api/briefing
-pub async fn handle_get_briefing(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<wenlan_core::briefing::BriefingResponse>, ServerError> {
-    let (db, llm, prompts, tuning) = {
-        let s = state.read().await;
-        let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
-        let llm = s.llm.clone();
-        let prompts = s.prompts.clone();
-        let tuning = s.tuning.briefing.clone();
-        (db, llm, prompts, tuning)
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let briefing = wenlan_core::briefing::generate_briefing_scoped(
-        &db,
-        llm.as_deref(),
-        &prompts,
-        &tuning,
-        &scope,
-    )
-    .await?;
-    Ok(Json(briefing))
-}
 
 /// GET /api/profile/narrative
 ///

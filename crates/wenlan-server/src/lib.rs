@@ -7,6 +7,7 @@
 pub mod activity_tag_routes;
 pub mod brief_files;
 pub mod brief_routes;
+pub mod briefing_routes;
 pub mod community_routes;
 pub mod config_routes;
 pub mod decisions_routes;
