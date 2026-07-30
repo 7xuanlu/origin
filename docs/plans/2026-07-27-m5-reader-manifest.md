@@ -231,7 +231,7 @@ names a page, so it is explicit. Live app code disproves it:
 |---|---|---|
 | `GET /api/pages` | explicit (browse) | `SpaceList.tsx:76` polls it every 10 s for sidebar counts |
 | `GET /api/pages/recent-changes` | explicit (browse) | `HomePage.tsx:75` loads it every 30 s |
-| `GET /api/pages/orphan-links` | explicit | feeds candidate generation (`memory_routes.rs:3127`) |
+| `GET /api/pages/orphan-links` | explicit | feeds candidate generation (`memory_routes.rs:2892`) |
 
 A route is not one reader. The same path serves a human who clicked and a timer
 that polls, and a client being *globally* M5-aware proves nothing about whether

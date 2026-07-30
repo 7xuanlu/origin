@@ -9,7 +9,7 @@ use crate::{
     brief_routes, community_routes, config_routes, entity_graph_routes, import_routes,
     ingest_routes, knowledge_routes, lint_routes, memory_routes, onboarding_routes,
     page_map_routes, profile_agents_routes, refinery_routes, repair_routes, routes, security,
-    source_routes, truth_guard, websocket,
+    source_routes, spaces_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -123,26 +123,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/memory/nurture",
             get(memory_routes::handle_get_nurture_cards),
-        )
-        // Spaces
-        .route(
-            "/api/spaces",
-            get(memory_routes::handle_list_spaces).post(memory_routes::handle_create_space),
-        )
-        .route(
-            "/api/spaces/default",
-            get(memory_routes::handle_get_default_space)
-                .put(memory_routes::handle_set_default_space)
-                .delete(memory_routes::handle_clear_default_space),
-        )
-        .route(
-            "/api/spaces/{name}",
-            put(memory_routes::handle_update_space).delete(memory_routes::handle_delete_space),
-        )
-        .route(
-            "/api/spaces/{from}/move-to/{to}",
-            post(memory_routes::handle_move_space),
-        )
+        );
+    let router = spaces_routes::register_core(router);
+    let router = router
         // Pages (legacy SQL tables still named "concepts" — see db.rs)
         .route(
             "/api/pages",
@@ -230,28 +213,8 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
             post(memory_routes::handle_delete_bulk),
         );
     let router = entity_graph_routes::register_crud(router);
+    let router = spaces_routes::register_extended(router);
     let router = router
-        // Space extended (batch 4)
-        .route(
-            "/api/spaces/{name}/pin",
-            post(memory_routes::handle_pin_space),
-        )
-        .route(
-            "/api/spaces/{name}/confirm",
-            post(memory_routes::handle_confirm_space),
-        )
-        .route(
-            "/api/spaces/reorder",
-            post(memory_routes::handle_reorder_space),
-        )
-        .route(
-            "/api/spaces/{name}/star",
-            post(memory_routes::handle_toggle_space_starred),
-        )
-        .route(
-            "/api/documents/{source_id}/space",
-            post(memory_routes::handle_set_document_space),
-        )
         // Activity, tags, capture stats, memory detail (batch 5)
         .route(
             "/api/activities",

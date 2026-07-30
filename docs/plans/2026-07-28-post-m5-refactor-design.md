@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 2 approved**
+Status: **R4 complete; R5 in progress; handler-movement slice 3 approved**
 
 ## Authority and change control
 
@@ -3646,6 +3646,95 @@ R5 handler-movement slice 2 evidence, 2026-07-30:
   reran the entity contract, route registry, truth manifest, Python M5 sweep,
   LSP checks, and diff hygiene; the root-run full server suite and Clippy
   results remain separately recorded above.
+
+R5 handler-movement slice 3 contract, 2026-07-30:
+
+- Move exactly the `13` Space-owned bindings into `spaces_routes.rs`: the
+  eight core routes under `/api/spaces`, the four extended pin/confirm/reorder/
+  star routes, and `POST /api/documents/{source_id}/space`. Keep two
+  registration helpers at the original composition points:
+  `register_core` after nurture and before Pages, and `register_extended`
+  after entity CRUD and before activities.
+- Move the local `CreateSpaceRequest` and `UpdateSpaceRequest` definitions
+  byte-for-byte. Their fields currently match shared wire types, but replacing
+  them is DTO normalization and therefore forbidden by D2 in this movement
+  slice. Move `registered_request_space` with document reassignment only
+  because LSP proves that handler is its sole caller.
+- Preserve all handler bodies and scoped-state snapshot lifetimes. Exactly
+  thirteen handler-manifest identity fields may change. Method/path, truth,
+  sensitive-read, mutation-allowlist, and M5 inventory keys must not change.
+  The opaque move/delete/star responses retain their existing fail-closed
+  `MarkerShape::None` behavior.
+- Typed built-router characterization must cover success and deterministic
+  no-DB `503` for all thirteen routes, empty-body `204` for default clearing,
+  and marked `403` controls for move/delete/star. Existing shared wire types
+  are the oracle wherever exact; the three opaque success responses may use
+  small test-local mirrors. No page vault or config path is involved: the
+  Space mutation paths touch the TempDir-backed database, including shadow
+  Page scope columns, but do not project files.
+- Remain out of scope: decision-domain routes, Page and space-scoped retrieval
+  families, tags, onboarding, CLI/MCP surfaces, DTO deduplication, and response
+  cleanup. Stop on any extra helper caller, handler row, truth/sensitive key,
+  response-shape change, or lock-lifetime change.
+
+R5 handler-movement slice 3 evidence, 2026-07-30:
+
+- Exactly the frozen `13` Space bindings now execute in `spaces_routes.rs`.
+  `register_core` and `register_extended` remain at the two original
+  composition points; Pages still follow the core routes and activities still
+  follow the extended routes. The two local DTOs remain local and unchanged,
+  and `registered_request_space` moved only with its sole document-reassignment
+  caller.
+- The old/new SHA-256 values are identical for all three moved blocks:
+  `0520404bb5c0acc8a5b75798283108a57236345dfa4b534a819c1a01bfb1cf7c`
+  for `registered_request_space`,
+  `bfdf1895791c9f39d3f88c97ad2a206558731fdf1baf55b65ad34bdc7ae43c3f`
+  for core DTOs/handlers, and
+  `4a24653a8e9096a43a58c7b3184ef168088fd85a750eb9df26d46c9f967f2715`
+  for extended handlers. Handler bodies and state-read lifetimes are therefore
+  byte-preserved.
+- Before updating expected identities, the production-builder control was RED
+  on precisely the thirteen new `spaces_routes::*` observations versus the
+  thirteen old `memory_routes::*` expectations. Updating only those handler
+  fields made the exact `165 + 6` runtime comparison GREEN. Truth,
+  sensitive-read, and mutation-allowlist sources remain byte-identical.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. It drives typed success and deterministic no-DB `503` for all
+  thirteen endpoints, exact empty-body `204` for default clearing, and marked
+  `403` controls for the opaque move/delete/star routes. Shared wire types are
+  used wherever exact; only the three opaque success responses use named
+  test-local mirrors. There is no `serde_json::Value` response oracle.
+- Rust LSP began with definition-plus-router-registration closure for all
+  thirteen handlers and definition-plus-one-call closure for the helper.
+  After refreshed diagnostics, all thirteen handlers close on their colocated
+  registration plus definition, the helper closes on its colocated call plus
+  definition, no old-module semantic reference remains, and the new module,
+  old module, router, export, and contract test report zero errors.
+- `router.rs` falls from `459` to `422` lines; `memory_routes.rs` falls from
+  `5,177` lines and `75` public handlers to `4,942` lines and `62`; the bounded
+  Space module is `280` lines with `13` public handlers. The generated M5
+  inventory changes only three displaced Page-handler source addresses and
+  remains `191 / 55-50-86 / exposure 22`. Current-contract prose citations
+  were refreshed; call-site ownership is
+  `65 router + 13 spaces_routes + 14 entity_graph_routes + 75 other = 167`.
+- Verification passes: typed family contract `1 / 1`; server library
+  `347 passed / 2 ignored`; route convergence `17 / 17`; space scoping
+  `30 / 30`; default-save-space `5 / 5`; list-spaces `2 / 2`;
+  space-header-fallback `31 / 31`; truth manifest `16 / 16`; server truth
+  guard `12 / 12`; Rust/Python M5 `1 / 1` and
+  `191 / 55-50-86 / exposure 22`; projection-permit source scan `1 / 1`;
+  core/server all-target Clippy with warnings denied; formatting and diff
+  hygiene.
+- R5 handler-movement slice 3 REVIEW, 2026-07-30: the fresh Sol reviewer
+  returned **APPROVE** with zero blocking and zero non-blocking findings. It
+  independently confirmed the exact thirteen-route boundary, both preserved
+  composition points, all three movement hashes, identity-only manifest
+  changes, unchanged truth/sensitive/mutation classifications, complete LSP
+  closure, typed success/error/refusal coverage, TempDir-only SQL effects, M5
+  address/prose updates, and ownership arithmetic. Its bounded reruns passed
+  the typed contract, exact handler guard, truth manifest, sensitive-read
+  tests, Python M5 sweep, LSP checks, and diff hygiene; the root-run full
+  server suite and Clippy results remain separately recorded above.
 
 ### R6 — `post_write` phase decomposition
 
