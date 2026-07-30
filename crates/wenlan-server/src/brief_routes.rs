@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::route_registry::{post, TrackedRouter};
 use crate::{
     brief_files::project_brief_receipt, error::ServerError, space_header::SpaceHeader,
     state::SharedState,
@@ -11,6 +12,13 @@ use wenlan_types::{
     BriefReadRequest, BriefReadResponse, BriefReadState, BriefRelatedContext, BriefUpdateReceipt,
     BriefUpdateRequest, SearchResult,
 };
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router.route(
+        "/api/brief",
+        post(handle_read_brief).patch(handle_update_brief),
+    )
+}
 
 const RELATED_CONTEXT_LIMIT: usize = 20;
 

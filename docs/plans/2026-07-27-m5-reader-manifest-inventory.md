@@ -22,10 +22,11 @@ Recorded because the corrections are the only reason to trust the fourth:
 |---|---|
 | 151 | scanned a hand-picked file list (`router.rs`, `repair_routes.rs`), missing `lint_routes.rs`; single-line regex truncated chained method routers spanning lines |
 | 163 | fixed both of those, then counted a route registered **inside a `#[cfg(test)]` block** in `routes.rs` — its handler was an inline closure, which is why the adapter cell read `move` |
-| **162** | current: paren-balanced parse, every file, test modules stripped |
+| **162** | correct at the merge base: paren-balanced parse, every file, test modules stripped |
 
-160 in `router.rs`, 5 in `repair_routes.rs`,
-2 in `lint_routes.rs`. `routes.rs` contributes none.
+Current ownership after the first R5 registration slice is 139 in `router.rs`,
+13 in `routes.rs`, 2 in `brief_routes.rs`, 6 in `community_routes.rs`, 5 in
+`repair_routes.rs`, and 2 in `lint_routes.rs`.
 
 Two rules follow, and both are now part of the contract:
 
@@ -859,7 +860,7 @@ carrying the authority of agreement.
 | `core/db.rs:26735` | `rebind_source_page_in_transaction` | `private` | internal-only |
 | `core/db.rs:34374` | `oldest_active_page` | `pub` | internal-only |
 | `core/db.rs:39570` | `list_recent_retrievals` | `pub` | internal-only |
-| `core/db.rs:39710` | `list_recent_retrievals_scoped` | `pub` | **exposure** — `server/routes.rs:910` |
+| `core/db.rs:39710` | `list_recent_retrievals_scoped` | `pub` | **exposure** — `server/routes.rs:928` |
 | `core/db.rs:39916` | `list_recent_changes` | `pub` | internal-only |
 | `core/db.rs:40219` | `list_recent_pages_with_badges` | `pub` | internal-only |
 | `core/db.rs:41132` | `append_page_history` | `private` | internal-only |
@@ -872,7 +873,7 @@ carrying the authority of agreement.
 | `core/db.rs:43073` | `find_matching_page` | `pub` | internal-only |
 | `core/db.rs:43130` | `find_matching_page_scoped` | `pub` | internal-only |
 | `core/db.rs:43497` | `page_merge_row` | `private` | internal-only |
-| `core/db.rs:43546` | `load_page_source_index` | `pub` | **exposure** — `server/routes.rs:655` |
+| `core/db.rs:43546` | `load_page_source_index` | `pub` | **exposure** — `server/routes.rs:673` |
 | `core/db.rs:43680` | `list_active_page_titles_scoped` | `pub` | internal-only |
 | `core/db.rs:43727` | `list_relevant_active_page_titles` | `pub` | internal-only |
 | `core/db.rs:43794` | `find_active_page_id_by_title` | `pub` | internal-only |
@@ -880,7 +881,7 @@ carrying the authority of agreement.
 | `core/db.rs:44380` | `backfill_page_embeddings` | `pub` | internal-only |
 | `core/db.rs:45458` | `get_pages_for_memory` | `pub` | internal-only |
 | `core/db.rs:46357` | `get_stale_page_after` | `pub` | internal-only |
-| `core/db.rs:46394` | `list_stale_pages_scoped` | `pub` | **exposure** — `server/routes.rs:734` |
+| `core/db.rs:46394` | `list_stale_pages_scoped` | `pub` | **exposure** — `server/routes.rs:752` |
 | `core/db.rs:46434` | `find_stale_archived_pages` | `pub` | **exposure** — `server/cmd_backfill.rs:49` |
 | `core/db/maintenance_duplicate_reads.rs:35` | `embedding_near_duplicate_pairs` | `pub(crate)` | internal-only |
 | `core/db/maintenance_duplicate_reads.rs:108` | `scan_near_duplicate_slice` | `pub(crate)` | internal-only |
@@ -892,7 +893,7 @@ carrying the authority of agreement.
 | `core/db/scoped_entities.rs:84` | `get_entity_detail_scoped` | `pub` | **exposure** — `server/memory_routes.rs:1472` |
 | `core/db/scoped_entities.rs:291` | `list_recent_relations_scoped` | `pub` | **exposure** — `server/knowledge_routes.rs:67` |
 | `core/db/scoped_entities.rs:615` | `search_entities_by_vector_scoped` | `pub` | **exposure** — `server/memory_routes.rs:1507` |
-| `core/db/scoped_pages.rs:391` | `list_recent_changes_scoped` | `pub` | **exposure** — `server/routes.rs:974` |
+| `core/db/scoped_pages.rs:391` | `list_recent_changes_scoped` | `pub` | **exposure** — `server/routes.rs:992` |
 | `core/lint/deep.rs:221` | `page_duplicates` | `private` | internal-only |
 | `core/lint/deep.rs:299` | `page_body_result` | `private` | internal-only |
 | `core/lint/pages/db_checks.rs:233` | `load_rows` | `private` | internal-only |
@@ -959,9 +960,9 @@ carrying the authority of agreement.
 | `server/memory_routes.rs:1443` | `handle_list_entities` | `pub` | `list_entities_scoped` |
 | `server/memory_routes.rs:1462` | `handle_get_entity_detail` | `pub` | `get_entity_detail_scoped` |
 | `server/memory_routes.rs:1494` | `handle_search_entities` | `pub` | `search_entities_by_vector_scoped` |
-| `server/routes.rs:501` | `handle_distill` | `pub` | `list_stale_pages_scoped` |
-| `server/routes.rs:896` | `handle_recent_retrievals` | `pub` | `list_recent_retrievals_scoped` |
-| `server/routes.rs:960` | `handle_recent_page_changes` | `pub` | `list_recent_changes_scoped` |
+| `server/routes.rs:519` | `handle_distill` | `pub` | `list_stale_pages_scoped` |
+| `server/routes.rs:914` | `handle_recent_retrievals` | `pub` | `list_recent_retrievals_scoped` |
+| `server/routes.rs:978` | `handle_recent_page_changes` | `pub` | `list_recent_changes_scoped` |
 | `server/scheduler.rs:2025` | `run_ambient_job` | `private` | `reconcile_entity_page_parity` |
 
 ### Depth 2 — consumers
@@ -1051,7 +1052,7 @@ carrying the authority of agreement.
 | `server/page_map_routes.rs:49` | `visible_page` | `private` | `get_page` |
 | `server/page_map_routes.rs:69` | `ensure_page_is_active` | `private` | `get_page` |
 | `server/repair_routes.rs:183` | `handle_prepare` | `private` | `prepare_memory_reclassification_with_pages` |
-| `server/routes.rs:991` | `handle_recent_pages` | `pub` | `list_recent_pages_with_badges_scoped` |
+| `server/routes.rs:1009` | `handle_recent_pages` | `pub` | `list_recent_pages_with_badges_scoped` |
 | `server/scheduler.rs:1974` | `run_ambient_job_safe` | `private` | `run_ambient_job` |
 | `server/scheduler.rs:2326` | `fire_maintenance_stage_safe` | `private` | `run_maintenance_stage_slice` |
 
@@ -1074,7 +1075,7 @@ adds a test that:
 
    | Count | Value | What it counts |
    |---|---|---|
-   | call-site triples | **167** | rows in this table: 160 `router.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
+   | call-site triples | **167** | rows in this table: 139 `router.rs` + 13 `routes.rs` + 2 `brief_routes.rs` + 6 `community_routes.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
    | runtime builder triples | **171** | `(builder, method, path)` pairs actually installed: 165 `main` + 6 `repair` |
 
    The +4 is two call sites that each land in **both** builders:
@@ -1083,8 +1084,9 @@ adds a test that:
    `repair_routes::register` **wraps** `register_execution`
    (`repair_routes.rs:25`), so `main` gets all five repair routes, not three,
    while `build_repair_router` installs `apply`/`verify` again
-   (`router.rs:591`). An arithmetic that reads only the two `register*` call
-   sites in `router.rs` lands on 164 and is wrong.
+   (`router.rs:572`). An arithmetic that reads only the two
+   `repair_routes::register*` call sites in `router.rs` lands on 164 and is
+   wrong.
 
    `/api/health` and `/api/status` do *not* inflate: each is two separate
    `.route()` call sites, one per builder region, so they are already two rows

@@ -3250,8 +3250,10 @@ generation-sensitive behavior and never calls the cutover ceremony or setter.
 
 Each movement commit must show:
 
-- the handler manifest RED before its intentional identity update, then GREEN
-  with only the named rows changed;
+- a handler-movement slice makes the exact handler manifest RED before its
+  intentional identity update, then GREEN with only the named rows changed; a
+  registration-only slice instead leaves that manifest byte-identical and
+  proves a deliberately omitted route fails before completion;
 - exact `171` runtime truth rows and exact sensitive-read set equality;
 - typed success and error response tests for moved HTTP endpoints, using the
   existing `wenlan-types` contracts rather than `serde_json::Value` as the
@@ -3266,6 +3268,38 @@ Each movement commit must show:
 
 The truth guard remains a route layer over the finalized router, and the CORS,
 local-only, shutdown-extension, and state layers retain their current order.
+
+R5 registration slice 1 evidence, 2026-07-30:
+
+- Registration ownership for the `21` main-builder bindings in `routes`,
+  `brief_routes`, and `community_routes` moved into one `register` helper per
+  owning module. No handler body, helper, request/response type, route layer,
+  or exact handler-manifest row changed. The legacy `/api/context` direct call
+  into `handle_read_brief` remains intact.
+- Omitting `GET /api/pages/recent-changes` during the movement made the
+  production-builder control RED on the exact sensitive-route set. Restoring
+  it to its original page lane made the same control GREEN. The general helper
+  groups only disjoint paths; a scoped Sol check against pinned Axum `0.8.8`
+  and matchit `0.8.4` accepted the textual registration regrouping as
+  behavior-equivalent and rejected four artificial historical-order helpers
+  as needless surface.
+- The handler guard passes `17 / 17`, the server library passes
+  `347 passed / 2 ignored`, server truth guard passes `12 / 12`, and focused
+  Brief, context, and search HTTP suites pass `6 / 6`, `4 / 4`, and `3 / 3`.
+  Truth manifest passes `16 / 16`; the Rust M5 gate passes `1 / 1`; the
+  generated Python inventory remains `191 / 55-50-86 / exposure 22`.
+  Generator-owned changes are eight address-only `routes.rs` shifts. LSP
+  definition/reference closure and per-file error diagnostics pass, as do
+  core/server all-target Clippy with warnings denied.
+- R5 registration slice 1 REVIEW, 2026-07-30: the fresh Sol reviewer returned
+  **APPROVE** with no correctness, architecture, security, concurrency,
+  data-loss, regression, truth/M5, or verification blocker. It confirmed the
+  exact `13 + 2 + 6` ownership move, unchanged Brief direct-call and
+  cross-cutting layers, `pages/recent-changes` remaining in the page lane, and
+  byte-identical handler manifest. Its only observed drift was corrected
+  before approval: server `AGENTS.md` now teaches composition/helper ownership,
+  and the inventory prose names the current
+  `139 + 13 + 2 + 6 + 5 + 2 = 167` call-site distribution.
 
 ### R6 — `post_write` phase decomposition
 

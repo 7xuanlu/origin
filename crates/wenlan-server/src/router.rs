@@ -43,24 +43,12 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .allow_methods(Any)
         .allow_headers(Any);
 
-    repair_routes::register(lint_routes::register(TrackedRouter::new(Builder::Main)))
-        // General
-        .route("/api/health", get(routes::handle_health))
-        .route("/api/status", get(routes::handle_status))
-        .route("/api/search", post(routes::handle_search))
-        .route("/api/context", post(routes::handle_context))
-        .route(
-            "/api/brief",
-            post(brief_routes::handle_read_brief).patch(brief_routes::handle_update_brief),
-        )
-        .route("/api/ping", get(routes::handle_ping))
-        .route("/api/llm/test", post(routes::handle_test_llm))
-        .route("/api/shutdown", post(routes::handle_shutdown))
-        .route("/api/debug/pipeline", get(routes::handle_pipeline_status))
-        .route(
-            "/api/retrievals/recent",
-            get(routes::handle_recent_retrievals),
-        )
+    let router = repair_routes::register(lint_routes::register(TrackedRouter::new(Builder::Main)));
+    let router = routes::register(router);
+    let router = brief_routes::register(router);
+    let router = community_routes::register(router);
+
+    router
         .route(
             "/api/memory/recent",
             get(memory_routes::handle_recent_memories),
@@ -69,34 +57,6 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
             "/api/memory/unconfirmed",
             get(memory_routes::handle_list_unconfirmed_memories),
         )
-        .route("/api/pages/recent", get(routes::handle_recent_pages))
-        .route(
-            "/api/communities",
-            get(community_routes::handle_list_communities),
-        )
-        .route(
-            "/api/communities/members",
-            get(community_routes::handle_list_community_members),
-        )
-        .route(
-            "/api/communities/page-assignments",
-            get(community_routes::handle_list_community_page_assignments),
-        )
-        .route(
-            "/api/communities/proposals",
-            get(community_routes::handle_list_community_proposals),
-        )
-        .route(
-            "/api/communities/proposals/{id}/accept",
-            post(community_routes::handle_accept_community_proposal),
-        )
-        .route(
-            "/api/communities/proposals/{id}/reject",
-            post(community_routes::handle_reject_community_proposal),
-        )
-        .route("/api/steep", post(routes::handle_steep))
-        .route("/api/distill", post(routes::handle_distill))
-        .route("/api/distill/{page_id}", post(routes::handle_redistill))
         // Ingest
         .route("/api/ingest/text", post(ingest_routes::handle_ingest_text))
         .route(

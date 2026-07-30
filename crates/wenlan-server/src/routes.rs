@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{get, post, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -15,6 +16,23 @@ use wenlan_types::requests::ChatContextRequest;
 use wenlan_types::responses::{
     ChatContextResponse, KnowledgeContext, ProfileContext, TierTokenEstimates,
 };
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/health", get(handle_health))
+        .route("/api/status", get(handle_status))
+        .route("/api/search", post(handle_search))
+        .route("/api/context", post(handle_context))
+        .route("/api/ping", get(handle_ping))
+        .route("/api/llm/test", post(handle_test_llm))
+        .route("/api/shutdown", post(handle_shutdown))
+        .route("/api/debug/pipeline", get(handle_pipeline_status))
+        .route("/api/retrievals/recent", get(handle_recent_retrievals))
+        .route("/api/pages/recent", get(handle_recent_pages))
+        .route("/api/steep", post(handle_steep))
+        .route("/api/distill", post(handle_distill))
+        .route("/api/distill/{page_id}", post(handle_redistill))
+}
 
 // ===== Request/Response Types =====
 

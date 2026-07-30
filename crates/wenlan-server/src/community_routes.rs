@@ -7,7 +7,37 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{error::ServerError, space_header::SpaceHeader, state::SharedState};
+use crate::{
+    error::ServerError,
+    route_registry::{get, post, TrackedRouter},
+    space_header::SpaceHeader,
+    state::SharedState,
+};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/communities", get(handle_list_communities))
+        .route(
+            "/api/communities/members",
+            get(handle_list_community_members),
+        )
+        .route(
+            "/api/communities/page-assignments",
+            get(handle_list_community_page_assignments),
+        )
+        .route(
+            "/api/communities/proposals",
+            get(handle_list_community_proposals),
+        )
+        .route(
+            "/api/communities/proposals/{id}/accept",
+            post(handle_accept_community_proposal),
+        )
+        .route(
+            "/api/communities/proposals/{id}/reject",
+            post(handle_reject_community_proposal),
+        )
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListCommunitiesQuery {
