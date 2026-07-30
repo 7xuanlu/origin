@@ -2103,57 +2103,8 @@ pub async fn handle_correct_memory(
 }
 
 // =====================================================================
-// Batch 6 — Working memory, pinned
+// Batch 6 — Working memory
 // =====================================================================
-
-/// GET /api/memory/pinned
-pub async fn handle_list_pinned_memories(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<wenlan_types::responses::PinnedMemoriesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let memories = db
-        .list_pinned_memories_scoped(&scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::PinnedMemoriesResponse {
-        memories,
-    }))
-}
-
-/// POST /api/memory/{id}/pin
-pub async fn handle_pin_memory(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.pin_memory(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// POST /api/memory/{id}/unpin
-pub async fn handle_unpin_memory(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.unpin_memory(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
 
 #[derive(Debug, Deserialize)]
 pub struct PendingRevisionsQuery {

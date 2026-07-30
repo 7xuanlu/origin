@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 9 complete**
+Status: **R4 complete; R5 in progress; handler-movement slice 10 complete**
 
 ## Authority and change control
 
@@ -4187,6 +4187,78 @@ R5 handler-movement slice 9 evidence, 2026-07-30:
   closure. Its focused reruns passed the typed contract, exact handler guard,
   truth manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff
   hygiene.
+
+R5 handler-movement slice 10 contract, 2026-07-30:
+
+- Move exactly `GET /api/memory/pinned`,
+  `POST /api/memory/{id}/pin`, and `POST /api/memory/{id}/unpin` into
+  `pinned_memory_routes.rs`, through one registrar immediately after profile
+  narrative and before pending revisions. Exactly three handler-manifest
+  identities may change; no helper or local DTO moves with them.
+- Preserve the three handlers byte-for-byte. The list remains header-only
+  Space-scoped and filters before its fixed limit; pin/unpin remain id-based
+  global mutations that return shared `SuccessResponse { ok: true }`, including
+  their existing success-on-missing-id DB behavior. Every handler retains its
+  short state snapshot before DB awaits.
+- Typed built-router characterization must use shared
+  `PinnedMemoriesResponse` and `SuccessResponse` plus the established
+  test-local `ErrorEnvelope`. Seed work/personal memories, drive both pin
+  mutations, prove work list positive/negative isolation and global listing,
+  drive unpin and prove removal, then cover unknown-Space list `422`, all three
+  no-DB `503`s, and marked `403` for all three methods.
+- The list remains page-bearing `Automatic`/`MarkerShape::None`; both mutations
+  remain non-page-bearing `NotApplicable`/`None`. Truth, sensitive-read,
+  mutation, M5, security, and lifecycle sources stay unchanged. Pending/history
+  revisions, snapshots, remaining memory and Page handlers, DTO normalization,
+  CLI, and MCP remain out of scope.
+
+R5 handler-movement slice 10 evidence, 2026-07-30:
+
+- Exactly the frozen pinned-memory read and two mutations now execute in
+  `pinned_memory_routes.rs`, through one registrar immediately after profile
+  narrative and before pending revisions. No helper or DTO moved.
+- The old/new three-handler block has identical SHA-256
+  `381ce669c28df6aca0a810020f37db2e32754877fd92f7f414ab8edac7434b3c`.
+  Header-only list scoping, filter-before-limit DB call, global id mutations,
+  success-on-missing-id behavior, shared success response, and every
+  state-snapshot/await lifetime are therefore byte-preserved.
+- Before updating expected identities, the production-builder control was RED
+  on precisely three new `pinned_memory_routes::*` observations versus three
+  old `memory_routes::*` expectations. Updating only those handler-manifest
+  fields made it GREEN. Truth, sensitive-read, mutation, M5, security, and
+  lifecycle sources remain unchanged.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. Shared `SuccessResponse` drives both pin mutations, shared
+  `PinnedMemoriesResponse` proves work/personal isolation, global listing, and
+  removal after unpin, and the test-local `ErrorEnvelope` covers unknown-Space
+  `422`, all three no-DB `503`s, and all three marked `403`s. No
+  `serde_json::Value` response oracle is used.
+- Refreshed Rust LSP diagnostics are clean in the new module, old module,
+  router, export, and contract test. All three handlers close on their
+  colocated registrations plus definitions; the registrar closes on one
+  composition call plus definition.
+- `router.rs` falls from `369` to `359` lines; `memory_routes.rs` falls from
+  `4,461` lines and `44` public handlers to `4,412` lines and `41`; the bounded
+  pinned module is `66` lines with three handlers. The generated M5 inventory
+  changes only two displaced Page-handler source addresses and remains
+  `191 / 55-50-86 / exposure 22`; current pinned and displaced memory-route
+  citations were refreshed. Call-site ownership is
+  `44 router + 3 pinned_memory_routes + 2 profile_narrative_routes +
+  1 briefing_routes + 2 decisions_routes + 3 memory_detail_routes +
+  5 activity_tag_routes + 5 indexed_files_routes + 13 spaces_routes +
+  14 entity_graph_routes + 75 other = 167`.
+- Focused verification passes after the last code edit: typed contract
+  `1 / 1`; exact handler guard `1 / 1`; truth manifest `16 / 16`; Rust/Python
+  M5 `1 / 1` and `191 / 55-50-86 / exposure 22`; focused Clippy with warnings
+  denied; formatting and diff hygiene.
+- R5 handler-movement slice 10 REVIEW, 2026-07-30: the reused independent Sol
+  lane returned **APPROVE** with zero blocking and zero non-blocking findings.
+  It independently confirmed the three-route boundary and composition
+  position, byte-identical movement hash, exact three-field handler-manifest
+  delta, unchanged protected sources, scoped-list/global-mutation semantics
+  and typed controls, current citations/counts, and complete LSP closure. Its
+  focused reruns passed the typed contract, exact handler guard, truth
+  manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff hygiene.
 
 ### R6 — `post_write` phase decomposition
 

@@ -21,6 +21,7 @@ HTTP daemon — owns the Axum router + all routes. All handlers operate on `Arc<
 | `indexed_files_routes.rs` | Indexed-file and chunk read/update/delete handlers plus their `TrackedRouter` registration helper |
 | `profile_agents_routes.rs` | Profile and agent CRUD handlers plus their `TrackedRouter` registration helper |
 | `profile_narrative_routes.rs` | Cache-first profile narrative read and forced regeneration plus their `TrackedRouter` registration helper |
+| `pinned_memory_routes.rs` | Scoped pinned-memory listing and pin/unpin mutations plus their `TrackedRouter` registration helper |
 | `spaces_routes.rs` | Space CRUD/default/order/state handlers and document reassignment; core and extended registration helpers preserve their separated composition positions |
 | `ingest_routes.rs` | `/api/ingest/*` — text, webpage, memory |
 | `ingest_batcher.rs` | Request-level coalescer for concurrent `/api/memory/store` — folds QualityGate in-line; async classify/extract; passes enrichment + hint through in the response |

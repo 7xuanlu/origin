@@ -26,6 +26,7 @@ pub mod memory_detail_routes;
 pub mod memory_routes;
 pub mod onboarding_routes;
 pub mod page_map_routes;
+pub mod pinned_memory_routes;
 pub mod profile_agents_routes;
 pub mod profile_narrative_routes;
 pub mod read_scope;

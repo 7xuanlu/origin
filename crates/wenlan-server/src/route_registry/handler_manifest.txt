@@ -29,7 +29,7 @@ main|get|/api/memory/entity-suggestions|wenlan_server::entity_graph_routes::hand
 main|get|/api/memory/nurture|wenlan_server::memory_routes::handle_get_nurture_cards
 main|get|/api/memory/pending-revision/{source_id}|wenlan_server::memory_routes::handle_get_pending_revision
 main|get|/api/memory/pending-revisions|wenlan_server::memory_routes::handle_list_pending_revisions
-main|get|/api/memory/pinned|wenlan_server::memory_routes::handle_list_pinned_memories
+main|get|/api/memory/pinned|wenlan_server::pinned_memory_routes::handle_list_pinned_memories
 main|get|/api/memory/recent|wenlan_server::memory_routes::handle_recent_memories
 main|get|/api/memory/rejections|wenlan_server::memory_routes::handle_get_rejections
 main|get|/api/memory/stats|wenlan_server::memory_routes::handle_get_memory_stats
@@ -96,8 +96,8 @@ main|post|/api/memory/revision/{id}/dismiss|wenlan_server::memory_routes::handle
 main|post|/api/memory/search|wenlan_server::memory_routes::handle_search_memory
 main|post|/api/memory/store|wenlan_server::memory_routes::handle_store_memory
 main|post|/api/memory/{id}/correct|wenlan_server::memory_routes::handle_correct_memory
-main|post|/api/memory/{id}/pin|wenlan_server::memory_routes::handle_pin_memory
-main|post|/api/memory/{id}/unpin|wenlan_server::memory_routes::handle_unpin_memory
+main|post|/api/memory/{id}/pin|wenlan_server::pinned_memory_routes::handle_pin_memory
+main|post|/api/memory/{id}/unpin|wenlan_server::pinned_memory_routes::handle_unpin_memory
 main|post|/api/memory/{id}/update-page|wenlan_server::memory_routes::handle_update_page
 main|post|/api/on-device-model/download|wenlan_server::config_routes::handle_download_on_device_model
 main|post|/api/onboarding/milestones/{id}/acknowledge|wenlan_server::onboarding_routes::handle_acknowledge_milestone

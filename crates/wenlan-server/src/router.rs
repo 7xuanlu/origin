@@ -9,8 +9,9 @@ use crate::{
     activity_tag_routes, brief_routes, briefing_routes, community_routes, config_routes,
     decisions_routes, entity_graph_routes, import_routes, indexed_files_routes, ingest_routes,
     knowledge_routes, lint_routes, memory_detail_routes, memory_routes, onboarding_routes,
-    page_map_routes, profile_agents_routes, profile_narrative_routes, refinery_routes,
-    repair_routes, routes, security, source_routes, spaces_routes, truth_guard, websocket,
+    page_map_routes, pinned_memory_routes, profile_agents_routes, profile_narrative_routes,
+    refinery_routes, repair_routes, routes, security, source_routes, spaces_routes, truth_guard,
+    websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -216,20 +217,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = decisions_routes::register(router);
     let router = briefing_routes::register(router);
     let router = profile_narrative_routes::register(router);
+    let router = pinned_memory_routes::register(router);
     let router = router
-        // Working memory, pinned (batch 6)
-        .route(
-            "/api/memory/pinned",
-            get(memory_routes::handle_list_pinned_memories),
-        )
-        .route(
-            "/api/memory/{id}/pin",
-            post(memory_routes::handle_pin_memory),
-        )
-        .route(
-            "/api/memory/{id}/unpin",
-            post(memory_routes::handle_unpin_memory),
-        )
+        // Working memory (batch 6)
         .route(
             "/api/memory/pending-revisions",
             get(memory_routes::handle_list_pending_revisions),
