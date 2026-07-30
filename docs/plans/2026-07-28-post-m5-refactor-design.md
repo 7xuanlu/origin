@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 re-approved through the R4-24 split; R4-24a ready**
+Status: **Fable gate 1 re-approved through the R4-24 split; R4-24a complete**
 
 ## Authority and change control
 
@@ -2620,6 +2620,35 @@ Frozen slice contract:
   control becomes a zero-baseline prohibition. Regenerate source addresses
   only; the M5 inventory remains
   `191 / 55-50-86 / exposure 22 / ambiguity 9`.
+- RED, 2026-07-29: the exact new source-contract test failed at compile time
+  with exit `101` because `db/repair_verification.rs` did not exist; no test
+  body ran. This proved the required bounded child/module was absent before
+  implementation.
+- GREEN, 2026-07-29: one typed child now owns the sole production raw DB lock,
+  manual transaction, four target branches, applicable final projection lock,
+  receipt persistence, rollback arm, and commit. The caller retains preflight,
+  artifact loading, outer locks, the borrowed rename session, the existing
+  post-session hook, and immediate post-return pending cleanup. Only the five
+  named helper visibilities were promoted; the shared rename capture helper
+  remains `pub(crate)` for its four cross-module callers.
+- Controls and gates: the R4-24a source/mutation teeth pass `3 / 3`, including
+  explicit mutants for persistence outside the page-root lock and persistence
+  before final locked validation in both page branches. The complete
+  verification filter passes `23 / 23`; all external-access teeth pass
+  `3 / 3`; the exact Rust M5 gate passes `1 / 1`; and the generated sweep
+  remains `191 / 55-50-86 / exposure 22`. Core/server all-target Clippy with
+  `-D warnings`, formatting, and `git diff --check` pass.
+- LSP resolves the caller to the child and reports exactly one production
+  call. Its reference closure caught and preserved the three rename-apply
+  callers plus the moved verification caller; error diagnostics are empty for
+  the child, its test, and `repair.rs`. The structural declaration check finds
+  exactly one atomic child operation.
+- FINAL REVIEW GATE, 2026-07-29: both independent Sol reviewers returned
+  **APPROVE** against the final diff. The first confirmed strict
+  `lock -> final validation -> persist -> closure end` teeth plus explicit
+  mutation controls. The concurrency reviewer independently reconciled all
+  three mutants with the production transaction/lock order and found no
+  remaining semantic drift.
 
 #### R4-24b — verification crash/lock teeth after movement
 

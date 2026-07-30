@@ -51,6 +51,7 @@ pub(crate) mod repair_page_rename;
 mod repair_receipt;
 pub(crate) mod repair_stale_projection;
 pub(crate) mod repair_target_receipt;
+pub(crate) mod repair_verification;
 mod scoped_entities;
 mod scoped_pages;
 mod source_sync;
@@ -119,6 +120,8 @@ mod repair_receipt_test;
 mod repair_stale_projection_test;
 #[cfg(test)]
 mod repair_target_receipt_test;
+#[cfg(test)]
+mod repair_verification_test;
 #[cfg(test)]
 mod scoped_entities_test;
 #[cfg(test)]
