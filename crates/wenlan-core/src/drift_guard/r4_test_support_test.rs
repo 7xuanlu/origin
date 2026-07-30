@@ -2276,65 +2276,6 @@ fn db_owned_test_api_violations(
     db_sources: &[(&str, &str, bool)],
     external_sources: &[(&str, &str)],
 ) -> Vec<String> {
-    fn path_names(path: &SynPath) -> Vec<String> {
-        path.segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect()
-    }
-
-    fn exact_memorydb_exception(
-        path: &str,
-        structure: &syn::ItemStruct,
-        field: &syn::Field,
-    ) -> bool {
-        if path != "crates/wenlan-core/src/db.rs" || structure.ident != "MemoryDB" {
-            return false;
-        }
-        let Some(field_name) = field.ident.as_ref().map(ToString::to_string) else {
-            return false;
-        };
-        match field_name.as_str() {
-            "_db" => {
-                let Type::Path(database) = &field.ty else {
-                    return false;
-                };
-                path_names(&database.path) == ["libsql", "Database"]
-            }
-            "conn" => {
-                let Type::Path(arc) = &field.ty else {
-                    return false;
-                };
-                let Some(arc_segment) = arc.path.segments.last() else {
-                    return false;
-                };
-                let syn::PathArguments::AngleBracketed(arc_args) = &arc_segment.arguments else {
-                    return false;
-                };
-                let Some(syn::GenericArgument::Type(Type::Path(mutex))) = arc_args.args.first()
-                else {
-                    return false;
-                };
-                let Some(mutex_segment) = mutex.path.segments.last() else {
-                    return false;
-                };
-                let syn::PathArguments::AngleBracketed(mutex_args) = &mutex_segment.arguments
-                else {
-                    return false;
-                };
-                let Some(syn::GenericArgument::Type(Type::Path(connection))) =
-                    mutex_args.args.first()
-                else {
-                    return false;
-                };
-                arc_segment.ident == "Arc"
-                    && mutex_segment.ident == "Mutex"
-                    && path_names(&connection.path) == ["libsql", "Connection"]
-            }
-            _ => false,
-        }
-    }
-
     fn scan_items(
         path: &str,
         items: &[Item],
@@ -2370,9 +2311,6 @@ fn db_owned_test_api_violations(
                         }
                         let raw = strong_capabilities_in_type(&field.ty, &aliases);
                         if raw.is_empty() {
-                            continue;
-                        }
-                        if exact_memorydb_exception(path, structure, field) {
                             continue;
                         }
                         let field_name = field
@@ -3515,7 +3453,7 @@ impl std::borrow::Borrow<libsql::Connection> for TestDbSession {
 }
 
 #[test]
-fn db_owned_test_api_guard_rejects_raw_exports_and_external_callers() {
+fn db_owned_test_api_guard_rejects_raw_fields_exports_and_external_callers() {
     let db_source = r#"
 pub(crate) struct MemoryDB {
     pub(crate) _db: libsql::Database,
@@ -3572,6 +3510,8 @@ fn external_caller() {
         &[("crates/wenlan-core/src/external_test.rs", external)],
     );
     for expected in [
+        "MemoryDB::_db",
+        "MemoryDB::conn",
         "leak",
         "TestEscape",
         "Into",
@@ -3588,12 +3528,6 @@ fn external_caller() {
             "DB child guard did not reject {expected}: {violations:?}"
         );
     }
-    assert!(
-        !violations.iter().any(|violation| {
-            violation.contains("MemoryDB::_db") || violation.contains("MemoryDB::conn")
-        }),
-        "only the exact transitional MemoryDB fields are exempt: {violations:?}"
-    );
 }
 
 #[test]

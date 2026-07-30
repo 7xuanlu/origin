@@ -3115,8 +3115,8 @@ END;
 // ===== MemoryDB =====
 
 pub struct MemoryDB {
-    pub(crate) _db: libsql::Database,
-    pub(crate) conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
+    _db: libsql::Database,
+    conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
     entity_resolution_lock: tokio::sync::Mutex<()>,
     space_write_lock: tokio::sync::Mutex<()>,
     pub(crate) lint_freshness: Arc<crate::lint::snapshot::LintFreshnessClock>,

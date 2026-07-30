@@ -3099,6 +3099,29 @@ Frozen slice contract:
   workspace-wide LSP reference display capped at `200`, so neither root nor
   reviewer treated it as the exact census; the syntax-aware manifest remains
   authoritative.
+- R4-25 group 7 RED/GREEN evidence, 2026-07-30: removing the parser guard's
+  exact transitional exception failed the repository gate on precisely two
+  visible strong-capability fields: `MemoryDB::_db` exposing
+  `libsql::Database` and `MemoryDB::conn` exposing `libsql::Connection`.
+  Making both fields private turned the same gate GREEN; the synthetic
+  positive control now requires both visible field violations alongside
+  function/enum/trait escapes. The obsolete exception and its type-shape
+  parser were deleted rather than replaced by a new allowlist.
+- Normal and test builds both compile with the private fields. Parser /
+  manifests pass `35 / 35`; the opaque seam passes `5 / 5`; the now-empty
+  legacy external-access baseline passes `3 / 3`; truth manifest and exposure
+  pass `16 / 16` and `13 / 13`; Rust M5 passes `1 / 1`; and the Python
+  inventory remains `191 / 55-50-86 / exposure 22`. LSP resolves the opaque
+  test-support accesses back to the private field declarations and reports
+  zero errors in both changed Rust files. Core/server all-target Clippy with
+  warnings denied, formatting, and diff hygiene pass.
+- R4-25 group 7 REVIEW, 2026-07-30: the independent Sol reviewer returned
+  **APPROVE** with no correctness, architecture, security, concurrency,
+  data-loss, regression, truth/M5, or verification blocker. It confirmed that
+  Rust privacy keeps the test-only DB child seam functional while preventing
+  sibling/external field access, the transitional exception is fully gone,
+  both visible-field positive controls bite, manifests are byte-identical to
+  group 6, and normal/test compilation plus every recorded gate is green.
 
 ### R5 — server vertical slices
 
