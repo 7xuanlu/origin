@@ -24,12 +24,13 @@ Recorded because the corrections are the only reason to trust the fourth:
 | 163 | fixed both of those, then counted a route registered **inside a `#[cfg(test)]` block** in `routes.rs` — its handler was an inline closure, which is why the adapter cell read `move` |
 | **162** | correct at the merge base: paren-balanced parse, every file, test modules stripped |
 
-Current ownership after the first five R5 registration slices is 108 in
+Current ownership after the first six R5 registration slices is 98 in
 `router.rs`, 13 in `routes.rs`, 2 in `brief_routes.rs`, 6 in
 `community_routes.rs`, 4 in `ingest_routes.rs`, 3 in `import_routes.rs`, 4 in
 `source_routes.rs`, 10 in `config_routes.rs`, 3 in `refinery_routes.rs`, 3 in
-`knowledge_routes.rs`, 3 in `onboarding_routes.rs`, 1 in `websocket.rs`, 5 in
-`repair_routes.rs`, and 2 in `lint_routes.rs`.
+`knowledge_routes.rs`, 3 in `onboarding_routes.rs`, 10 in
+`page_map_routes.rs`, 1 in `websocket.rs`, 5 in `repair_routes.rs`, and 2 in
+`lint_routes.rs`.
 
 Two rules follow, and both are now part of the contract:
 
@@ -1052,8 +1053,8 @@ carrying the authority of agreement.
 | `server/memory_routes.rs:2184` | `handle_create_page` | `pub` | `get_page` |
 | `server/memory_routes.rs:3734` | `handle_update_page` | `pub` | `get_page` |
 | `server/memory_routes.rs:3809` | `handle_refresh_page` | `pub` | `get_page` |
-| `server/page_map_routes.rs:49` | `visible_page` | `private` | `get_page` |
-| `server/page_map_routes.rs:69` | `ensure_page_is_active` | `private` | `get_page` |
+| `server/page_map_routes.rs:73` | `visible_page` | `private` | `get_page` |
+| `server/page_map_routes.rs:93` | `ensure_page_is_active` | `private` | `get_page` |
 | `server/repair_routes.rs:183` | `handle_prepare` | `private` | `prepare_memory_reclassification_with_pages` |
 | `server/routes.rs:1009` | `handle_recent_pages` | `pub` | `list_recent_pages_with_badges_scoped` |
 | `server/scheduler.rs:1974` | `run_ambient_job_safe` | `private` | `run_ambient_job` |
@@ -1078,7 +1079,7 @@ adds a test that:
 
    | Count | Value | What it counts |
    |---|---|---|
-   | call-site triples | **167** | rows in this table: 108 `router.rs` + 13 `routes.rs` + 2 `brief_routes.rs` + 6 `community_routes.rs` + 4 `ingest_routes.rs` + 3 `import_routes.rs` + 4 `source_routes.rs` + 10 `config_routes.rs` + 3 `refinery_routes.rs` + 3 `knowledge_routes.rs` + 3 `onboarding_routes.rs` + 1 `websocket.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
+   | call-site triples | **167** | rows in this table: 98 `router.rs` + 13 `routes.rs` + 2 `brief_routes.rs` + 6 `community_routes.rs` + 4 `ingest_routes.rs` + 3 `import_routes.rs` + 4 `source_routes.rs` + 10 `config_routes.rs` + 3 `refinery_routes.rs` + 3 `knowledge_routes.rs` + 3 `onboarding_routes.rs` + 10 `page_map_routes.rs` + 1 `websocket.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
    | runtime builder triples | **171** | `(builder, method, path)` pairs actually installed: 165 `main` + 6 `repair` |
 
    The +4 is two call sites that each land in **both** builders:
@@ -1087,7 +1088,7 @@ adds a test that:
    `repair_routes::register` **wraps** `register_execution`
    (`repair_routes.rs:25`), so `main` gets all five repair routes, not three,
    while `build_repair_router` installs `apply`/`verify` again
-   (`router.rs:473`). An arithmetic that reads only the two
+   (`router.rs:445`). An arithmetic that reads only the two
    `repair_routes::register*` call sites in `router.rs` lands on 164 and is
    wrong.
 

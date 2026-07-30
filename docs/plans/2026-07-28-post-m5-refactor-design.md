@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; registration slice 5 APPROVED**
+Status: **R4 complete; R5 in progress; registration slice 6 APPROVED**
 
 ## Authority and change control
 
@@ -3466,6 +3466,51 @@ R5 registration slice 5 evidence, 2026-07-30:
   independently confirmed production-only exclusion of the test dependency,
   exact handler registration, unchanged layer order, real loopback typed
   success/error behavior, and the protected reader/truth gates.
+
+R5 registration slice 6 evidence, 2026-07-30:
+
+- Registration ownership for all ten Page Map bindings moved from the
+  composition root into `page_map_routes::register` at the same position
+  between ordinary Page routes and memory revisions. Seven `.route` calls
+  expand to the same ten method/path/handler triples. No handler body,
+  request/response type, CAS order, truth grant/adapter, `PagePermit`, route
+  layer, or handler-manifest row changed; `router.rs` is now `518` lines.
+- Deliberately omitting the new helper call made the production-builder
+  control RED on the exact sensitive `GET /api/pages/{id}/map` binding before
+  handler-manifest comparison. Restoring `page_map_routes::register` made the
+  same control GREEN with all `165 + 6` runtime bindings.
+- The built-router typed suite passes `1 / 1` across all ten endpoints. One
+  real DB chain freezes the absent-map `0`, init-plus-first-node `2`, and
+  subsequent CAS revision increments while exercising typed node, layout,
+  edge, reset, and improve successes. Every endpoint also returns a typed
+  deterministic missing-page `404`; the authoritative `MarkerShape::None`
+  path is driven with reader intent and returns a typed `403` refusal.
+  Shared `wenlan-types::page_map` DTOs are used everywhere except reset's
+  exact test-local `ResetMapResponse`, because production still returns
+  `Json<serde_json::Value>`. No production test seam or untyped response oracle
+  was added.
+- LSP reference closure covered all ten handlers. Before movement each
+  resolved to `router.rs`, its definition, and any direct module tests; after
+  refreshing zero-error diagnostics, every `router.rs` reference disappeared
+  and the set contains only the colocated registration, definitions, and
+  existing module tests. Server library passes `347 passed / 2 ignored`; the
+  existing page/entity-shadow integration passes `10 / 10`; truth manifest
+  and Rust M5 pass `16 / 16` and `1 / 1`; Python inventory remains
+  `191 / 55-50-86 / exposure 22`; core/server all-target Clippy with warnings
+  denied passes. The generator-owned inventory delta is exactly the two
+  direct-connection addresses shifted by the new helper:
+  `visible_page :49→:73` and `ensure_page_is_active :69→:93`. The M5 ceremony
+  proof for Page Map response assembly moves from
+  `page_map_routes.rs:160-185` to `page_map_routes.rs:190-214`.
+- R5 registration slice 6 REVIEW, 2026-07-30: the fresh Sol reviewer first
+  returned **BLOCK** because the M5 ceremony still cited the pre-helper Page
+  Map response range. After that citation moved to the exact
+  `build_map_response` body at `page_map_routes.rs:190-214` and the prose-only
+  shift was recorded here, closure review returned **APPROVE** with no
+  remaining finding. It independently confirmed the ten exact bindings and
+  composition position, D2-clean bodies and CAS behavior, unchanged protected
+  manifests, module-local LSP references, full typed route evidence, and that
+  the fixture's `knowledge_path=None` cannot write the user's live vault.
 
 ### R6 — `post_write` phase decomposition
 

@@ -3,7 +3,7 @@
 
 use crate::lifecycle::ShutdownHandle;
 pub use crate::route_registry::AppRouter;
-use crate::route_registry::{delete, get, patch, post, put, TrackedRouter};
+use crate::route_registry::{delete, get, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
     brief_routes, community_routes, config_routes, import_routes, ingest_routes, knowledge_routes,
@@ -228,39 +228,11 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/pages/{id}/revisions",
             get(memory_routes::handle_get_page_revisions),
-        )
-        // Page Map (mind-map v1, stage 2)
-        .route(
-            "/api/pages/{id}/map",
-            get(page_map_routes::handle_get_page_map)
-                .delete(page_map_routes::handle_reset_page_map),
-        )
-        .route(
-            "/api/pages/{id}/map/layout",
-            put(page_map_routes::handle_put_page_map_layout),
-        )
-        .route(
-            "/api/pages/{id}/map/nodes",
-            post(page_map_routes::handle_create_map_node),
-        )
-        .route(
-            "/api/pages/{id}/map/nodes/{node_id}",
-            patch(page_map_routes::handle_patch_map_node)
-                .delete(page_map_routes::handle_delete_map_node),
-        )
-        .route(
-            "/api/pages/{id}/map/edges",
-            post(page_map_routes::handle_create_map_edge),
-        )
-        .route(
-            "/api/pages/{id}/map/edges/{edge_id}",
-            patch(page_map_routes::handle_patch_map_edge)
-                .delete(page_map_routes::handle_delete_map_edge),
-        )
-        .route(
-            "/api/pages/{id}/map/improve",
-            post(page_map_routes::handle_improve_page_map),
-        )
+        );
+
+    let router = page_map_routes::register(router);
+
+    let router = router
         .route(
             "/api/memory/{id}/revisions",
             get(memory_routes::handle_get_memory_revisions),
