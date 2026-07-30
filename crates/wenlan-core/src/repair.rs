@@ -6613,7 +6613,6 @@ mod tests {
         lint::{
             context::{CancellationToken, LintClock},
             runner::LintRunner,
-            snapshot::LintReadSnapshot,
         },
     };
     use wenlan_types::{
@@ -6936,7 +6935,7 @@ mod tests {
     }
 
     async fn fingerprint(db: &MemoryDB) -> [u8; 32] {
-        let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+        let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
         let fingerprint = snapshot.analysis_digest().unwrap().as_bytes();
         snapshot.finish().await.unwrap();
         fingerprint

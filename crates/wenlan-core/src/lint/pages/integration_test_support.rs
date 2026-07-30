@@ -1,7 +1,6 @@
 use crate::db::tests::test_db;
 use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::{LintRunner, TestSyncPoint, TestSynchronization};
-use crate::lint::snapshot::LintReadSnapshot;
 use crate::lint::test_support::DbSemanticFingerprint;
 use crate::pages::Page;
 use std::sync::Arc;
@@ -72,7 +71,7 @@ pub(super) async fn insert_page(db: &crate::db::MemoryDB, id: &str) {
 }
 
 pub(super) async fn semantic_fingerprint(db: &crate::db::MemoryDB) -> DbSemanticFingerprint {
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
     let fingerprint = DbSemanticFingerprint::capture(&snapshot).await.unwrap();
     snapshot.finish().await.unwrap();
     fingerprint

@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn optional_artifacts_are_neutral_but_deterministic_broken_targets_warn() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-active", None, "active").await;
     insert_page(&conn, "page-target", None, "active").await;
     insert_page(&conn, "page-archived-target", None, "archived").await;

@@ -3166,7 +3166,7 @@ fn outer() {
 }
 
 #[test]
-fn repository_module_graph_matches_frozen_r4_25_preflight_census() {
+fn repository_module_graph_matches_r4_25_group_3_census() {
     let analysis = analyze_repository(&super::repo_root());
     assert!(
         analysis.errors.is_empty(),
@@ -3194,7 +3194,7 @@ fn repository_module_graph_matches_frozen_r4_25_preflight_census() {
             .get(&RawShape::AlternateDbField)
             .copied()
             .unwrap_or(0),
-        46
+        0
     );
     assert_eq!(
         counts.get(&RawShape::ConnFieldEscape).copied().unwrap_or(0),

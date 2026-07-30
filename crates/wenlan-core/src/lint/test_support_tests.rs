@@ -182,13 +182,13 @@ fn defect_after_example_cap_still_fails_full_population() {
 async fn telemetry_writer_fails_oracle_and_empty_lint_read_passes() {
     // Given: one isolated migrated database and its semantic fingerprint.
     let (db, _dir) = test_db().await;
-    let before_writer = semantic_fingerprint(&db._db).await;
+    let before_writer = memory_db_semantic_fingerprint(&db).await;
 
     // When: the known search-telemetry writer records an access.
     db.log_accesses(&["mem_telemetry_canary".to_string()])
         .await
         .expect("telemetry writer succeeds");
-    let after_writer = semantic_fingerprint(&db._db).await;
+    let after_writer = memory_db_semantic_fingerprint(&db).await;
 
     // Then: the non-mutation oracle fails the negative control.
     assert_ne!(before_writer, after_writer);
@@ -221,7 +221,19 @@ async fn telemetry_writer_fails_oracle_and_empty_lint_read_passes() {
     snapshot.finish().await.expect("lint snapshot closes");
 
     // Then: the same oracle proves the read changed no user table.
-    assert_eq!(before_read, semantic_fingerprint(&db._db).await);
+    assert_eq!(before_read, memory_db_semantic_fingerprint(&db).await);
+}
+
+async fn memory_db_semantic_fingerprint(db: &crate::db::MemoryDB) -> DbSemanticFingerprint {
+    let snapshot = db
+        .open_isolated_lint_snapshot_for_test()
+        .await
+        .expect("semantic snapshot opens");
+    let fingerprint = DbSemanticFingerprint::capture(&snapshot)
+        .await
+        .expect("semantic fingerprint succeeds");
+    snapshot.finish().await.expect("semantic snapshot closes");
+    fingerprint
 }
 
 async fn semantic_fingerprint(database: &libsql::Database) -> DbSemanticFingerprint {

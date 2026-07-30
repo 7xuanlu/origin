@@ -5,7 +5,6 @@ use crate::lint::context::{
     AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
 };
 use crate::lint::serving::fact_probe::{run_with_ann, AnnTopK, RankedChild};
-use crate::lint::snapshot::LintReadSnapshot;
 use std::cell::Cell;
 use wenlan_types::lint::{LintMetricCode, LintOutcome};
 
@@ -80,7 +79,10 @@ impl AnnTopK for RecordingAnn {
 #[tokio::test]
 async fn fact_probe_passes_three_times_parent_limit_to_ann_query() {
     let (db, _tmp) = exact_ann_limit_fixture().await;
-    let snapshot = LintReadSnapshot::open(&db._db).await.expect("snapshot");
+    let snapshot = db
+        .open_isolated_lint_snapshot_for_test()
+        .await
+        .expect("snapshot");
     let scope = AppliedScope::registered(
         wenlan_types::lint::LintOpaqueId::from_sorted_position(0).expect("opaque scope"),
         "work".to_string(),

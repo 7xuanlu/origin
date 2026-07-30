@@ -9,7 +9,6 @@ mod review_maintenance;
 
 use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::LintRunner;
-use crate::lint::snapshot::LintReadSnapshot;
 use crate::lint::test_support::DbSemanticFingerprint;
 use std::path::PathBuf;
 use wenlan_types::lint::{LintMetricCode, LintMetricValue, LintQuery};
@@ -86,7 +85,7 @@ fn metric(result: &wenlan_types::lint::LintCheckResult, code: LintMetricCode) ->
 }
 
 async fn fingerprint(db: &crate::db::MemoryDB) -> DbSemanticFingerprint {
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
     let fingerprint = DbSemanticFingerprint::capture(&snapshot).await.unwrap();
     snapshot.finish().await.unwrap();
     fingerprint

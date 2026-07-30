@@ -5773,14 +5773,17 @@ fn direct_conn_access_count(source: &str) -> usize {
         .count()
 }
 
+fn is_legacy_conn_census_path(path: &str) -> bool {
+    path != "crates/wenlan-core/src/db.rs"
+        && !path.starts_with("crates/wenlan-core/src/db/")
+        && path != "crates/wenlan-core/src/drift_guard/r4_test_support_test.rs"
+}
+
 fn current_external_conn_access(root: &Path) -> BTreeMap<String, usize> {
     git_ls_files(root, "crates/wenlan-core/src")
         .into_iter()
         .filter(|path| path.ends_with(".rs"))
-        .filter(|path| {
-            path != "crates/wenlan-core/src/db.rs"
-                && !path.starts_with("crates/wenlan-core/src/db/")
-        })
+        .filter(|path| is_legacy_conn_census_path(path))
         .filter_map(|path| {
             let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
             let count = direct_conn_access_count(&source);
@@ -5840,6 +5843,32 @@ fn external_conn_access_matches_exact_baseline() {
          replace new locks with bounded MemoryDB methods and update the baseline in the same diff \
          after removals:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn legacy_conn_census_excludes_only_the_syntax_aware_parser_fixture() {
+    let parser_fixture = "crates/wenlan-core/src/drift_guard/r4_test_support_test.rs";
+    assert!(!is_legacy_conn_census_path(parser_fixture));
+    assert!(is_legacy_conn_census_path(
+        "crates/wenlan-core/src/ordinary_new_test.rs"
+    ));
+
+    let current = current_external_conn_access(&repo_root());
+    assert!(
+        !current.contains_key(parser_fixture),
+        "the syntax-aware R4 parser owns the synthetic raw-access controls in its fixture file"
+    );
+
+    let ordinary_path = "crates/wenlan-core/src/ordinary_new_test.rs".to_string();
+    let violations = external_conn_access_violations(
+        &BTreeMap::new(),
+        &BTreeMap::from([(ordinary_path.clone(), 1)]),
+    );
+    assert_eq!(
+        violations,
+        vec![format!("{ordinary_path}: 1 new direct .conn.lock() access")],
+        "an ordinary new source path must remain inside the legacy census"
     );
 }
 

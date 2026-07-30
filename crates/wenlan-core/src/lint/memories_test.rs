@@ -2,7 +2,6 @@ use super::*;
 use crate::db::tests::test_db;
 use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::LintRunner;
-use crate::lint::snapshot::LintReadSnapshot;
 use crate::lint::test_support::DbSemanticFingerprint;
 use wenlan_types::lint::{LintApplicability, LintMetricCode, LintMetricValue, LintQuery};
 
@@ -233,7 +232,7 @@ async fn selected_scope_anchors_memory_denominators_and_page_off_is_group_local(
 }
 
 async fn semantic_fingerprint(db: &crate::db::MemoryDB) -> DbSemanticFingerprint {
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
     let fingerprint = DbSemanticFingerprint::capture(&snapshot).await.unwrap();
     snapshot.finish().await.unwrap();
     fingerprint

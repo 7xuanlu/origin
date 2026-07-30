@@ -11,7 +11,6 @@ use crate::{
     lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
-        snapshot::LintReadSnapshot,
     },
     repair::RepairArtifactStore,
 };
@@ -618,7 +617,7 @@ async fn stale_projection_resolution_kind(
     page_id: &str,
     scope: RepairLintScope,
 ) -> Option<&'static str> {
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
     let resolutions = resolve_current(&snapshot, &scope, Some(page_root))
         .await
         .unwrap();
@@ -669,7 +668,7 @@ async fn memory_and_tag_predicates_split_exact_repairs_from_review() {
         )
         .await
         .unwrap();
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(&snapshot, &RepairLintScope::global(), None)
         .await
@@ -720,7 +719,7 @@ async fn orphan_revision_is_one_exact_repair_for_both_checks() {
         )
         .await
         .unwrap();
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(&snapshot, &RepairLintScope::global(), None)
         .await
@@ -767,7 +766,7 @@ async fn orphan_memory_entity_link_resolves_to_one_exact_pair_delete() {
         )
         .await
         .unwrap();
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(&snapshot, &RepairLintScope::global(), None)
         .await
@@ -826,7 +825,7 @@ async fn missing_entity_link_uses_memory_scope_and_exact_pair_rollback() {
         )
         .await
         .unwrap();
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(
         &snapshot,
@@ -1175,13 +1174,14 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
         let mut rows = conn.query("PRAGMA busy_timeout=2000", ()).await.unwrap();
         while rows.next().await.unwrap().is_some() {}
     }
-    let concurrent = db._db.connect().unwrap();
+    let concurrent = db.test_secondary_session().unwrap();
     let mut rows = concurrent
         .query("PRAGMA busy_timeout=2000", ())
         .await
         .unwrap();
     while rows.next().await.unwrap().is_some() {}
-    concurrent.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    drop(rows);
+    let concurrent = concurrent.begin_immediate().await.unwrap();
     concurrent
         .execute(
             "INSERT INTO memories
@@ -1220,7 +1220,7 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
             .is_err(),
         "the CAS future must remain pending while the competing lock is held"
     );
-    concurrent.execute("COMMIT", ()).await.unwrap();
+    concurrent.commit().await.unwrap();
     let write_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut cas_task)
         .await
         .expect("the blocked BEGIN IMMEDIATE resumes after the competing commit")
@@ -1303,7 +1303,7 @@ async fn registered_scope_does_not_resolve_global_tag_findings() {
         )
         .await
         .unwrap();
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(
         &snapshot,
@@ -1397,7 +1397,7 @@ async fn orphan_links_bind_only_one_active_same_scope_target() {
         .await
         .unwrap();
     }
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(
         &snapshot,
@@ -1486,7 +1486,7 @@ async fn page_projection_reserved_target_is_blocked() {
     )
     .unwrap();
 
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
     let resolutions = resolve_current(
         &snapshot,
         &RepairLintScope::registered("work".to_string()).unwrap(),
@@ -1532,7 +1532,7 @@ async fn stale_page_projection_owner_is_one_exact_global_repair() {
         b"---\r\norigin_id: page_stale_owner\r\norigin_version: 7\r\n---\r\nbody\r\n",
     )
     .unwrap();
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(
         &snapshot,
@@ -1566,7 +1566,7 @@ async fn stale_page_projection_prepare_rejects_cooperating_writer_contention() {
     const CHILD_ROOT: &str = "WENLAN_STALE_PREPARE_LOCK_CHILD_ROOT";
     if let Some(page_root) = std::env::var_os(CHILD_ROOT) {
         let (db, _dir) = test_db().await;
-        let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+        let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
         let error = capture_stale_page_projection_rollback(
             &snapshot,
             Path::new(&page_root),
@@ -3415,7 +3415,7 @@ async fn only_empty_machine_owned_unconfirmed_source_page_is_exact_archive_targe
                 .unwrap();
         }
     }
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
 
     let resolutions = resolve_current(
         &snapshot,

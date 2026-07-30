@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 re-approved through the R4-24 split; R4-25b complete**
+Status: **Fable gate 1 re-approved through the R4-24 split; R4-25 group 3 complete**
 
 ## Authority and change control
 
@@ -2948,6 +2948,48 @@ Frozen slice contract:
   exposure tests, the Rust M5 guard, the `191 / 55-50-86 / exposure 22`
   Python sweep, clippy with warnings denied, formatting, diff hygiene, and LSP
   diagnostics on every changed Rust seam; all passed.
+- R4-25 group 3 RED/GREEN evidence, 2026-07-30: the focused census RED failed
+  exactly `46 != 0`. After migrating the frozen alternate-handle group, the
+  exact raw-manifest RED reported precisely the `46` expected
+  `AlternateDbField` identities removed and no raw identity added. GREEN
+  leaves `301` raw identities: `289` `PrimaryConnLock`, `5`
+  `PrimaryConnTryLock`, `7` standalone libSQL origins, and `0`
+  `AlternateDbField`. The support manifest grows `31 -> 108`, adding `77`
+  exact call identities, including `21` `test_secondary_session` and `21`
+  `open_isolated_lint_snapshot_for_test` entries. The existing opaque seam
+  expressed every fixture operation; group 3 added no seam method and exposed
+  no raw handle. Standalone local-libSQL semantic-fingerprint coverage remains
+  on its original helper, while the three `MemoryDB` handoffs use a separate
+  `&MemoryDB` helper.
+- The group 3 behavior closure passes snapshot `10 / 10`, lint test-support
+  `7 / 7`, affected lint/pages/serving `66 / 66`, affected repair fingerprint
+  `5 / 5`, and all `15 / 15` affected deterministic repair-plan controls,
+  including the blocked-CAS and subprocess-contention cases. The parser and
+  exact manifests pass `34 / 34`; the opaque seam passes `5 / 5`; the legacy
+  external-access teeth pass `3 / 3`; truth manifest and exposure pass
+  `16 / 16` and `13 / 13`; the Rust M5 gate passes `1 / 1`; and the Python
+  inventory remains `191 / 55-50-86 / exposure 22`. Core/server all-target
+  Clippy with warnings denied, formatting, and diff hygiene pass.
+- Tracking the R4 parser fixture exposed one latent R4-25b guard conflict: the
+  earlier legacy regex census had run while that file was untracked, then
+  counted eight synthetic `.conn.lock().await` strings and macro controls as
+  real external access once it became tracked. Its focused RED reported those
+  exact eight false positives. The legacy census now excludes only
+  `crates/wenlan-core/src/drift_guard/r4_test_support_test.rs` through a pure,
+  exact-path predicate; a direct control proves that path is excluded and an
+  ordinary new source path is still included. The syntax-aware raw/support
+  manifests remain the authoritative guard for real accesses in the parser
+  fixture; the eight synthetic matches were not added to the legacy baseline.
+- R4-25 group 3 REVIEW, 2026-07-30: the independent Sol reviewer returned
+  **APPROVE** with no correctness, capability-boundary, concurrency,
+  data-loss, or manifest-gaming finding. It independently confirmed the
+  `301` raw / `108` support exact sets, all `21` secondary-session and `21`
+  isolated-snapshot call sites, the genuinely independent blocked
+  `BEGIN IMMEDIATE` contender, fresh replacement-observer epochs, preserved
+  standalone libSQL fingerprint helper, and exact-path legacy exclusion.
+  Its focused parser, seam, snapshot, legacy, blocked-CAS, fingerprint,
+  formatting, diff, and LSP checks passed; one guessed zero-test filter was
+  explicitly excluded from its evidence.
 
 ### R5 — server vertical slices
 
