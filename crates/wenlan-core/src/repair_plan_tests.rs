@@ -1429,6 +1429,9 @@ async fn incomplete_tag_source_check_cannot_be_replaced_by_a_ready_manifest() {
 
 #[tokio::test]
 async fn tag_manifests_from_global_plan_verify_sequentially_across_ordinal_shifts() {
+    use crate::db::repair_verification::{
+        with_repair_verification_test_control, RepairVerificationTestControl,
+    };
     use crate::lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
@@ -1537,18 +1540,43 @@ async fn tag_manifests_from_global_plan_verify_sequentially_across_ordinal_shift
         )
         .await
         .unwrap();
-    crate::repair::record_repair_verification(
-        &db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            first.manifest_id().to_string(),
-            first.manifest_digest().clone(),
-            first_apply.receipt_digest().clone(),
-            after_first,
-        )
-        .unwrap(),
-        None,
-        1_721_000_002,
+    let tag_lock_path = store.root().join(format!(
+        ".tag-record-set-{}.lock",
+        first
+            .post_assertions()
+            .target_record_set()
+            .expect("tag record set")
+            .digest()
+            .as_str()
+    ));
+    with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_commit_before_pending_clear: Some(Box::new(move || {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&tag_lock_path)
+                    .unwrap();
+                assert_eq!(
+                    fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            })),
+            ..Default::default()
+        },
+        crate::repair::record_repair_verification(
+            &db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                first.manifest_id().to_string(),
+                first.manifest_digest().clone(),
+                first_apply.receipt_digest().clone(),
+                after_first,
+            )
+            .unwrap(),
+            None,
+            1_721_000_002,
+        ),
     )
     .await
     .unwrap();
@@ -2621,6 +2649,10 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
 
 #[tokio::test]
 async fn page_projection_manifest_repairs_only_the_named_page_projection() {
+    use crate::db::repair_verification::{
+        assert_repair_verification_transaction_reusable, with_repair_verification_test_control,
+        RepairVerificationTestControl,
+    };
     use crate::lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
@@ -2801,35 +2833,55 @@ async fn page_projection_manifest_repairs_only_the_named_page_projection() {
         )
         .await
         .unwrap();
-    let error = crate::repair::record_repair_verification(
-        &db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            manifest.manifest_id().to_string(),
-            manifest.manifest_digest().clone(),
-            apply_receipt.receipt_digest().clone(),
-            general,
-        )
-        .unwrap(),
-        Some(page_root.path()),
-        1_721_000_002,
+    let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+    let verification_receipt = manifest_dir.join("verification-receipt.json");
+    let receipt_at_begin = verification_receipt.clone();
+    let pending = manifest_dir.join(".apply-receipt.json.pending");
+    std::fs::hard_link(manifest_dir.join("apply-receipt.json"), &pending).unwrap();
+    let error = with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_begin: Some(Box::new(move || {
+                assert!(!receipt_at_begin.exists());
+            })),
+            ..Default::default()
+        },
+        crate::repair::record_repair_verification(
+            &db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                manifest.manifest_id().to_string(),
+                manifest.manifest_digest().clone(),
+                apply_receipt.receipt_digest().clone(),
+                general,
+            )
+            .unwrap(),
+            Some(page_root.path()),
+            1_721_000_002,
+        ),
     )
     .await
     .unwrap_err();
     assert!(error
         .to_string()
         .contains("repair_non_target_state_changed"));
+    assert!(!verification_receipt.exists());
+    assert!(pending.is_file());
+    assert_repair_verification_transaction_reusable(&db).await;
 }
 
 #[tokio::test]
 async fn page_projection_manifests_from_one_plan_apply_sequentially() {
+    use crate::db::repair_verification::{
+        with_repair_verification_test_control, RepairVerificationDbContender,
+        RepairVerificationTestControl,
+    };
     use crate::lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
     };
     use wenlan_types::{
         lint::{LintProfile, LintQuery},
-        repair::{ApplyRepairRequest, RepairTarget, RepairWriter},
+        repair::{ApplyRepairRequest, RepairTarget, RepairWriter, VerifyRepairRequest},
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
@@ -2935,7 +2987,7 @@ async fn page_projection_manifests_from_one_plan_apply_sequentially() {
             ),
         )
         .unwrap();
-        crate::repair::apply_repair_with_pages(
+        let receipt = crate::repair::apply_repair_with_pages(
             &db,
             &store,
             request,
@@ -2944,6 +2996,69 @@ async fn page_projection_manifests_from_one_plan_apply_sequentially() {
         )
         .await
         .unwrap();
+        let general = runner()
+            .run(
+                &db,
+                &LintQuery::new(Some(LintProfile::General), None),
+                Some(page_root.path()),
+                true,
+            )
+            .await
+            .unwrap();
+        let projection_lock = page_root.path().join(".wenlan/.projection.lock");
+        let before_lock = projection_lock.clone();
+        let contender = RepairVerificationDbContender::new(&db);
+        let start_contender = contender.clone();
+        let contender_before_persist = contender.clone();
+        let contender_after_persist = contender.clone();
+        with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    start_contender.start_and_observe_pending();
+                })),
+                before_receipt_persist: Some(Box::new(move || {
+                    contender_before_persist.assert_pending();
+                    let lock = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&before_lock)
+                        .unwrap();
+                    assert_eq!(
+                        fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                })),
+                after_receipt_persist: Some(Box::new(move || {
+                    contender_after_persist.assert_pending();
+                    let lock = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&projection_lock)
+                        .unwrap();
+                    assert_eq!(
+                        fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                })),
+                ..Default::default()
+            },
+            crate::repair::record_repair_verification(
+                &db,
+                &store,
+                VerifyRepairRequest::try_new_general_only(
+                    manifest.manifest_id().to_string(),
+                    manifest.manifest_digest().clone(),
+                    receipt.receipt_digest().clone(),
+                    general,
+                )
+                .unwrap(),
+                Some(page_root.path()),
+                1_721_000_003 + i64::try_from(offset).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        contender.assert_entered_after_verification();
     }
 
     for path in ["projection-first.md", "projection-second.md"] {

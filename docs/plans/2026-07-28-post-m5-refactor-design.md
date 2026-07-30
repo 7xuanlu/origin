@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 re-approved through the R4-24 split; R4-24a complete**
+Status: **Fable gate 1 re-approved through the R4-24 split; R4-24b complete**
 
 ## Authority and change control
 
@@ -2681,6 +2681,54 @@ Frozen slice contract:
   escape through a checkpoint, altered production ordering, or an unconsumed
   configured checkpoint/fault. Raw-capability and M5 counts remain unchanged
   from R4-24a.
+- RED, 2026-07-29: the first exact runtime-control test failed to compile with
+  exit `101` and `E0432` because
+  `with_repair_verification_test_control` and
+  `RepairVerificationTestControl` did not exist. The missing imports proved
+  the old ad-hoc hook had no scoped, consumed replacement.
+- GREEN, 2026-07-29: one `#[cfg(test)]` task-local control now consumes five
+  typed checkpoints plus one post-persist/pre-COMMIT fault. The old generic
+  hook parameter/facade is gone; the production atomic input still carries no
+  callback or raw capability. The fault preserves the existing lingering
+  transaction hazard deliberately: durable receipt and pending link survive,
+  retry returns the existing receipt and clears pending, then a DB-owned test
+  helper cleans up the injected transaction.
+- Runtime controls cover rename, stale projection, ordinary projection, and
+  nonprojection. The three page branches start a real DB contender after
+  BEGIN, observe its lock future as `Poll::Pending`, keep it pending while the
+  applicable projection lock is contended before and after receipt
+  persistence, then prove it enters only after verification returns. Pending
+  and completion waits are both bounded to five seconds. Post-COMMIT controls
+  prove the DB mutex is free while the durable receipt and pending link still
+  coexist and the applicable manifest/tag/rename-session locks remain held.
+- Failure controls prove report, target, and non-target conflicts return
+  before persistence, retain pending, and leave the transaction reusable. A
+  real conflicting final-receipt filesystem object exercises the unchanged
+  persistence failure plus rollback. The source teeth fail closed when a
+  marker is absent, require every configured checkpoint/fault to be consumed,
+  and keep the exact DB test helpers under `#[cfg(test)]`.
+- Gates: verification passes `28 / 28`; R4-24a+b source and mutation teeth pass
+  `5 / 5`; exact rename/stale/ordinary/non-target/tag controls pass `5 / 5`;
+  all external-access teeth pass `3 / 3` with no baseline change; and the M5
+  inventory remains `191 / 55-50-86 / exposure 22`. Root's first four guessed
+  fully-qualified `--exact` paths selected zero tests and are not counted;
+  `cargo test -- --list` supplied the canonical paths used for the recorded
+  `5 / 5`.
+- LSP reports zero errors in all six changed Rust files and resolves the
+  contender as the one DB-child test struct. One bulk reference request timed
+  out inside rust-analyzer; literal/source teeth and the exact runtime controls
+  provide the closure evidence instead. Core/server all-target Clippy with
+  `-D warnings`, formatting, `git diff --check`, and the full drift-guard
+  filter pass.
+- FINAL REVIEW GATE, 2026-07-29: the concurrency auditor first returned
+  **BLOCK** because instantaneous `try_lock` samples did not prove a queued
+  contender, conflict tests lacked error-poststate assertions, and one source
+  helper passed vacuously when its marker disappeared. Root then found a
+  second **BLOCK** when those assertions added five external raw connection
+  locks and broke the exact ratchet. The final test-only revision uses an
+  opaque DB-owned contender and exact DB-owned transaction probes without
+  changing the baseline. Both independent Sol reviewers re-read that final
+  diff and returned **APPROVE** with no remaining blocker.
 
 #### R4-25 — exact test-support seam and always-private connection
 

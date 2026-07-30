@@ -1,6 +1,13 @@
 use super::*;
 use crate::{
-    db::{tests::test_db, MemoryDB},
+    db::{
+        repair_verification::{
+            with_repair_verification_test_control, RepairVerificationDbContender,
+            RepairVerificationTestControl,
+        },
+        tests::test_db,
+        MemoryDB,
+    },
     error::WenlanError,
     export::knowledge::KnowledgeProjectionWrite,
     lint::{
@@ -8,6 +15,7 @@ use crate::{
         runner::LintRunner,
     },
 };
+use std::fs::OpenOptions;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -30,6 +38,28 @@ struct RenameFixture {
     repair_root: tempfile::TempDir,
     request: PrepareRepairRequest,
     review_id: String,
+}
+
+fn assert_projection_file_lock_contended(page_root: &Path) {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(page_root.join(".wenlan/.projection.lock"))
+        .unwrap();
+    assert_eq!(
+        lock.try_lock_exclusive().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+fn assert_projection_file_lock_acquirable(page_root: &Path) {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(page_root.join(".wenlan/.projection.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+    lock.unlock().unwrap();
 }
 
 async fn rename_fixture() -> RenameFixture {
@@ -336,19 +366,63 @@ async fn apply_then_verification_reuses_the_owned_projection_session() {
         )
         .await
         .unwrap();
+    let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+    let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+    let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+    std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+    let root_after_session = fixture.page_root.path().to_path_buf();
+    let root_after_begin = root_after_session.clone();
+    let root_before_persist = root_after_session.clone();
+    let root_after_persist = root_after_session.clone();
+    let root_after_commit = root_after_session.clone();
+    let contender = RepairVerificationDbContender::new(&fixture.db);
+    let start_contender = contender.clone();
+    let contender_before_persist = contender.clone();
+    let contender_after_persist = contender.clone();
+    let receipt_before_persist = final_receipt.clone();
+    let receipt_after_persist = final_receipt.clone();
+    let receipt_after_commit = final_receipt.clone();
+    let pending_after_commit = pending.clone();
 
-    let receipt = record_repair_verification(
-        &fixture.db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            manifest.manifest_id().to_string(),
-            manifest.manifest_digest().clone(),
-            apply_receipt.receipt_digest().clone(),
-            general,
-        )
-        .unwrap(),
-        Some(fixture.page_root.path()),
-        1_721_000_003,
+    let receipt = with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_rename_session_acquired: Some(Box::new(move || {
+                assert_projection_file_lock_contended(&root_after_session);
+            })),
+            after_begin: Some(Box::new(move || {
+                start_contender.start_and_observe_pending();
+                assert_projection_file_lock_contended(&root_after_begin);
+            })),
+            before_receipt_persist: Some(Box::new(move || {
+                contender_before_persist.assert_pending();
+                assert_projection_file_lock_contended(&root_before_persist);
+                assert!(!receipt_before_persist.exists());
+            })),
+            after_receipt_persist: Some(Box::new(move || {
+                contender_after_persist.assert_pending();
+                assert_projection_file_lock_contended(&root_after_persist);
+                assert!(receipt_after_persist.is_file());
+            })),
+            after_commit_before_pending_clear: Some(Box::new(move || {
+                assert_projection_file_lock_contended(&root_after_commit);
+                assert!(receipt_after_commit.is_file());
+                assert!(pending_after_commit.is_file());
+            })),
+            ..Default::default()
+        },
+        record_repair_verification(
+            &fixture.db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                manifest.manifest_id().to_string(),
+                manifest.manifest_digest().clone(),
+                apply_receipt.receipt_digest().clone(),
+                general,
+            )
+            .unwrap(),
+            Some(fixture.page_root.path()),
+            1_721_000_003,
+        ),
     )
     .await
     .expect("title rename apply and verification must not contend with its own projection session");
@@ -357,6 +431,9 @@ async fn apply_then_verification_reuses_the_owned_projection_session() {
     assert!(store
         .has_completed_verification(manifest.manifest_id())
         .unwrap());
+    assert!(!pending.exists());
+    contender.assert_entered_after_verification();
+    assert_projection_file_lock_acquirable(fixture.page_root.path());
 }
 
 #[tokio::test]
@@ -385,24 +462,33 @@ async fn verification_page_receipts_stay_on_the_pinned_root_after_ancestor_swap(
     let page_root = fixture.page_root.path().to_path_buf();
     let pinned_root = page_root.with_extension("verification-pinned");
 
-    let result = record_repair_verification_with_projection_session_hook(
-        &fixture.db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            manifest.manifest_id().to_string(),
-            manifest.manifest_digest().clone(),
-            apply_receipt.receipt_digest().clone(),
-            general,
-        )
-        .unwrap(),
-        Some(&page_root),
-        1_721_000_003,
-        || {
-            std::fs::rename(&page_root, &pinned_root)?;
-            std::fs::create_dir(&page_root)?;
-            std::fs::write(page_root.join("replacement-canary.md"), b"replacement")?;
-            Ok(())
+    let result = with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_rename_session_acquired: Some(Box::new({
+                let page_root = page_root.clone();
+                let pinned_root = pinned_root.clone();
+                move || {
+                    std::fs::rename(&page_root, &pinned_root).unwrap();
+                    std::fs::create_dir(&page_root).unwrap();
+                    std::fs::write(page_root.join("replacement-canary.md"), b"replacement")
+                        .unwrap();
+                }
+            })),
+            ..Default::default()
         },
+        record_repair_verification(
+            &fixture.db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                manifest.manifest_id().to_string(),
+                manifest.manifest_digest().clone(),
+                apply_receipt.receipt_digest().clone(),
+                general,
+            )
+            .unwrap(),
+            Some(&page_root),
+            1_721_000_003,
+        ),
     )
     .await;
 

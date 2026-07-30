@@ -23,6 +23,129 @@ use wenlan_types::repair::{
     RepairVerificationReceipt, RepairVerificationReceiptDraft, RepairWriter, VerifyRepairRequest,
 };
 
+#[cfg(test)]
+pub(crate) type RepairVerificationTestCheckpoint = Box<dyn FnOnce() + 'static>;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum RepairVerificationTestCommitFailure {
+    AfterPersistBeforeCommit,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RepairVerificationTestControl {
+    pub(crate) after_rename_session_acquired: Option<RepairVerificationTestCheckpoint>,
+    pub(crate) after_begin: Option<RepairVerificationTestCheckpoint>,
+    pub(crate) before_receipt_persist: Option<RepairVerificationTestCheckpoint>,
+    pub(crate) after_receipt_persist: Option<RepairVerificationTestCheckpoint>,
+    pub(crate) after_commit_before_pending_clear: Option<RepairVerificationTestCheckpoint>,
+    pub(crate) commit_failure_after_persist: Option<RepairVerificationTestCommitFailure>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static REPAIR_VERIFICATION_TEST_CONTROL:
+        std::cell::RefCell<RepairVerificationTestControl>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_repair_verification_test_control<T>(
+    control: RepairVerificationTestControl,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    REPAIR_VERIFICATION_TEST_CONTROL
+        .scope(std::cell::RefCell::new(control), async move {
+            let output = future.await;
+            let remaining = REPAIR_VERIFICATION_TEST_CONTROL.with(|control| {
+                let control = control.borrow();
+                [
+                    (
+                        "after_rename_session_acquired",
+                        control.after_rename_session_acquired.is_some(),
+                    ),
+                    ("after_begin", control.after_begin.is_some()),
+                    (
+                        "before_receipt_persist",
+                        control.before_receipt_persist.is_some(),
+                    ),
+                    (
+                        "after_receipt_persist",
+                        control.after_receipt_persist.is_some(),
+                    ),
+                    (
+                        "after_commit_before_pending_clear",
+                        control.after_commit_before_pending_clear.is_some(),
+                    ),
+                    (
+                        "commit_failure_after_persist",
+                        control.commit_failure_after_persist.is_some(),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(name, present)| present.then_some(name))
+                .collect::<Vec<_>>()
+            });
+            assert!(
+                remaining.is_empty(),
+                "unconsumed repair verification test control: {}",
+                remaining.join(", ")
+            );
+            output
+        })
+        .await
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum RepairVerificationTestCheckpointKind {
+    AfterRenameSessionAcquired,
+    AfterBegin,
+    BeforeReceiptPersist,
+    AfterReceiptPersist,
+    AfterCommitBeforePendingClear,
+}
+
+#[cfg(test)]
+pub(crate) fn run_repair_verification_test_checkpoint(kind: RepairVerificationTestCheckpointKind) {
+    let hook = REPAIR_VERIFICATION_TEST_CONTROL
+        .try_with(|control| {
+            let mut control = control.borrow_mut();
+            match kind {
+                RepairVerificationTestCheckpointKind::AfterRenameSessionAcquired => {
+                    &mut control.after_rename_session_acquired
+                }
+                RepairVerificationTestCheckpointKind::AfterBegin => &mut control.after_begin,
+                RepairVerificationTestCheckpointKind::BeforeReceiptPersist => {
+                    &mut control.before_receipt_persist
+                }
+                RepairVerificationTestCheckpointKind::AfterReceiptPersist => {
+                    &mut control.after_receipt_persist
+                }
+                RepairVerificationTestCheckpointKind::AfterCommitBeforePendingClear => {
+                    &mut control.after_commit_before_pending_clear
+                }
+            }
+            .take()
+        })
+        .unwrap_or(None);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn consume_repair_verification_test_commit_failure() -> bool {
+    REPAIR_VERIFICATION_TEST_CONTROL
+        .try_with(|control| {
+            matches!(
+                control.borrow_mut().commit_failure_after_persist.take(),
+                Some(RepairVerificationTestCommitFailure::AfterPersistBeforeCommit)
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) struct RepairVerificationAtomicInput<'a> {
     pub(crate) store: &'a RepairArtifactStore,
     pub(crate) manifest: &'a RepairManifest,
@@ -58,6 +181,8 @@ pub(crate) async fn record_repair_verification_atomic(
         .execute("BEGIN IMMEDIATE", ())
         .await
         .map_err(|error| WenlanError::VectorDb(format!("repair verify begin: {error}")))?;
+    #[cfg(test)]
+    run_repair_verification_test_checkpoint(RepairVerificationTestCheckpointKind::AfterBegin);
     let result = async {
         validate_current_db_receipts(db, request.general_report(), request.deep_report()).await?;
         // The durable content-addressed apply receipt records an apply-time
@@ -220,7 +345,15 @@ pub(crate) async fn record_repair_verification_atomic(
                 request.deep_report(),
                 &session.locked(),
             )?;
+            #[cfg(test)]
+            run_repair_verification_test_checkpoint(
+                RepairVerificationTestCheckpointKind::BeforeReceiptPersist,
+            );
             store.persist_verification_receipt(&receipt)?;
+            #[cfg(test)]
+            run_repair_verification_test_checkpoint(
+                RepairVerificationTestCheckpointKind::AfterReceiptPersist,
+            );
             Ok(receipt)
         } else if let Some(page_root) = page_root {
             KnowledgeProjectionWrite::with_projection_lock(page_root, |_| {
@@ -229,11 +362,27 @@ pub(crate) async fn record_repair_verification_atomic(
                     request.deep_report(),
                     Some(page_root),
                 )?;
+                #[cfg(test)]
+                run_repair_verification_test_checkpoint(
+                    RepairVerificationTestCheckpointKind::BeforeReceiptPersist,
+                );
                 store.persist_verification_receipt(&receipt)?;
+                #[cfg(test)]
+                run_repair_verification_test_checkpoint(
+                    RepairVerificationTestCheckpointKind::AfterReceiptPersist,
+                );
                 Ok(receipt)
             })
         } else {
+            #[cfg(test)]
+            run_repair_verification_test_checkpoint(
+                RepairVerificationTestCheckpointKind::BeforeReceiptPersist,
+            );
             store.persist_verification_receipt(&receipt)?;
+            #[cfg(test)]
+            run_repair_verification_test_checkpoint(
+                RepairVerificationTestCheckpointKind::AfterReceiptPersist,
+            );
             Ok(receipt)
         }
     }
@@ -245,9 +394,135 @@ pub(crate) async fn record_repair_verification_atomic(
             return Err(error);
         }
     };
+    #[cfg(test)]
+    if consume_repair_verification_test_commit_failure() {
+        return Err(WenlanError::VectorDb(
+            "repair verify commit: injected test failure".to_string(),
+        ));
+    }
     connection
         .execute("COMMIT", ())
         .await
         .map_err(|error| WenlanError::VectorDb(format!("repair verify commit: {error}")))?;
     Ok(receipt)
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RepairVerificationDbContender {
+    connection: std::sync::Arc<tokio::sync::Mutex<libsql::Connection>>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    completion: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+}
+
+#[cfg(test)]
+impl RepairVerificationDbContender {
+    pub(crate) fn new(db: &MemoryDB) -> Self {
+        Self {
+            connection: std::sync::Arc::clone(&db.conn),
+            pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            entered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            thread: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            completion: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn start_and_observe_pending(&self) {
+        use std::future::Future as _;
+
+        let mut thread = self.thread.lock().unwrap();
+        assert!(thread.is_none(), "DB contender started more than once");
+        let connection = std::sync::Arc::clone(&self.connection);
+        let pending = std::sync::Arc::clone(&self.pending);
+        let entered = std::sync::Arc::clone(&self.entered);
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(0);
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let mut completion = self.completion.lock().unwrap();
+        assert!(
+            completion.is_none(),
+            "DB contender completion receiver already exists"
+        );
+        *completion = Some(completion_rx);
+        drop(completion);
+        *thread = Some(std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut lock = Box::pin(connection.lock_owned());
+                    let mut pending_tx = Some(pending_tx);
+                    let guard = std::future::poll_fn(|context| match lock.as_mut().poll(context) {
+                        std::task::Poll::Pending => {
+                            pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(pending_tx) = pending_tx.take() {
+                                pending_tx.send(()).unwrap();
+                            }
+                            std::task::Poll::Pending
+                        }
+                        std::task::Poll::Ready(guard) => {
+                            pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                            std::task::Poll::Ready(guard)
+                        }
+                    })
+                    .await;
+                    drop(guard);
+                    completion_tx.send(()).unwrap();
+                });
+        }));
+        pending_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("DB contender never reached Pending");
+        drop(thread);
+        self.assert_pending();
+    }
+
+    pub(crate) fn assert_pending(&self) {
+        assert!(
+            self.pending.load(std::sync::atomic::Ordering::SeqCst),
+            "DB contender was not observed Pending"
+        );
+        assert!(
+            !self.entered.load(std::sync::atomic::Ordering::SeqCst),
+            "DB contender entered before verification released the connection"
+        );
+    }
+
+    pub(crate) fn assert_entered_after_verification(&self) {
+        let completion = self
+            .completion
+            .lock()
+            .unwrap()
+            .take()
+            .expect("DB contender completion receiver was never created");
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("DB contender did not complete after verification returned");
+        let thread = self
+            .thread
+            .lock()
+            .unwrap()
+            .take()
+            .expect("DB contender was never started");
+        thread.join().unwrap();
+        assert!(
+            self.entered.load(std::sync::atomic::Ordering::SeqCst),
+            "DB contender did not enter after verification returned"
+        );
+        assert!(!self.pending.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_repair_verification_transaction_reusable(db: &MemoryDB) {
+    let connection = db.conn.lock().await;
+    connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    connection.execute("ROLLBACK", ()).await.unwrap();
+}
+
+#[cfg(test)]
+pub(crate) async fn rollback_repair_verification_test_transaction(db: &MemoryDB) {
+    db.conn.lock().await.execute("ROLLBACK", ()).await.unwrap();
 }

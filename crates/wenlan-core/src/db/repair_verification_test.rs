@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::repair_verification::{
+    with_repair_verification_test_control, RepairVerificationTestControl,
+};
+
 const ATOMIC_DECLARATION: &str = "pub(crate) async fn record_repair_verification_atomic(";
 const RESULT_MATCH: &str = "    let receipt = match result {";
 const ATOMIC_END: &str = "\n    Ok(receipt)\n}";
@@ -274,12 +278,12 @@ fn r4_24a_source_contract_is_atomic_bounded_and_caller_ordered() {
     }
 
     let caller_start = repair
-        .find("async fn record_repair_verification_inner<F>(")
+        .find("async fn record_repair_verification_inner(")
         .expect("verification caller");
     let caller_end = repair[caller_start..]
-        .find("#[cfg(test)]\nasync fn record_repair_verification_with_projection_session_hook")
+        .find("\nfn validate_verification_reports(")
         .map(|offset| caller_start + offset)
-        .expect("verification test facade");
+        .expect("verification caller end");
     let caller = &repair[caller_start..caller_end];
     assert!(!caller.contains(".conn.lock().await"));
     let child_call = caller
@@ -319,18 +323,17 @@ fn r4_24a_rejects_persistence_moved_outside_the_final_projection_lock() {
         page_root_persist
     ));
 
-    let inside = concat!(
-        "                store.persist_verification_receipt(&receipt)?;\n",
-        "                Ok(receipt)\n",
-        "            })",
+    let persist = "                store.persist_verification_receipt(&receipt)?;\n";
+    let without_persist = page_root_persist.replacen(persist, "", 1);
+    let mutant = without_persist.replacen(
+        "            })\n",
+        concat!(
+            "            })?;\n",
+            "            store.persist_verification_receipt(&receipt)?;\n",
+            "            Ok(receipt)\n",
+        ),
+        1,
     );
-    let outside = concat!(
-        "                Ok(receipt)\n",
-        "            })?;\n",
-        "            store.persist_verification_receipt(&receipt)?;\n",
-        "            Ok(receipt)",
-    );
-    let mutant = page_root_persist.replacen(inside, outside, 1);
     assert_ne!(
         mutant, page_root_persist,
         "mutation fixture must move persistence"
@@ -370,4 +373,230 @@ fn r4_24a_rejects_persistence_moved_before_final_page_validation() {
         !page_root_persistence_is_inside_projection_lock(&page_root_mutant),
         "source tooth accepted page-root persistence before final validation"
     );
+}
+
+fn checkpoint_is_cfg_test_scoped(source: &str, checkpoint: &str) -> bool {
+    let mut search_from = 0;
+    let mut found = false;
+    while let Some(offset) = source[search_from..].find(checkpoint) {
+        found = true;
+        let position = search_from + offset;
+        let line_start = source[..position].rfind('\n').map_or(0, |index| index + 1);
+        let prefix = source[..line_start].trim_end();
+        if !prefix.ends_with("#[cfg(test)]") {
+            return false;
+        }
+        search_from = position + checkpoint.len();
+    }
+    found
+}
+
+fn declaration_is_cfg_test_scoped(source: &str, declaration: &str) -> bool {
+    let Some(position) = source.find(declaration) else {
+        return false;
+    };
+    let prefix = &source[..position];
+    let Some(cfg) = prefix.rfind("#[cfg(test)]") else {
+        return false;
+    };
+    prefix[cfg + "#[cfg(test)]".len()..]
+        .lines()
+        .all(|line| line.trim().is_empty() || line.trim_start().starts_with("#["))
+}
+
+#[test]
+fn r4_24b_test_control_is_scoped_consumed_capability_free_and_ordered() {
+    let child = include_str!("repair_verification.rs");
+    let repair = include_str!("../repair.rs");
+    let (atomic, precommit, finalization) = bounded_atomic_source(child);
+    let control_start = child
+        .find("#[cfg(test)]\npub(crate) type RepairVerificationTestCheckpoint")
+        .expect("test-control start");
+    let control_end = child
+        .find("pub(crate) struct RepairVerificationAtomicInput")
+        .expect("production input");
+    let control = &child[control_start..control_end];
+
+    assert!(!checkpoint_is_cfg_test_scoped(
+        atomic,
+        "missing_repair_verification_test_checkpoint"
+    ));
+    assert_eq!(
+        child.matches("tokio::task_local!").count(),
+        1,
+        "verification must have one scoped task-local control"
+    );
+    assert!(control.contains(
+        "pub(crate) type RepairVerificationTestCheckpoint = Box<dyn FnOnce() + 'static>;"
+    ));
+    for declaration in [
+        "pub(crate) type RepairVerificationTestCheckpoint",
+        "pub(crate) enum RepairVerificationTestCommitFailure",
+        "pub(crate) struct RepairVerificationTestControl",
+        "tokio::task_local!",
+        "pub(crate) async fn with_repair_verification_test_control",
+        "pub(crate) enum RepairVerificationTestCheckpointKind",
+        "pub(crate) fn run_repair_verification_test_checkpoint",
+        "fn consume_repair_verification_test_commit_failure",
+    ] {
+        assert!(
+            declaration_is_cfg_test_scoped(control, declaration),
+            "test-control declaration escaped #[cfg(test)]: {declaration}"
+        );
+    }
+    for capability in [
+        "MemoryDB",
+        "KnowledgeProjectionWrite",
+        "OwnedRepairProjectionSession",
+        "RepairArtifactStore",
+        "libsql::Connection",
+        "MutexGuard",
+    ] {
+        assert!(
+            !control.contains(capability),
+            "checkpoint gained raw capability {capability}"
+        );
+    }
+    let input = &child[control_end
+        ..child
+            .find(ATOMIC_DECLARATION)
+            .expect("atomic declaration after input")];
+    for forbidden in [
+        "RepairVerificationTestControl",
+        "RepairVerificationTestCheckpoint",
+        "FnOnce",
+        "callback",
+        "hook",
+    ] {
+        assert!(
+            !input.contains(forbidden),
+            "production input gained test callback capability {forbidden}"
+        );
+    }
+    assert!(!repair.contains("record_repair_verification_with_projection_session_hook"));
+    assert!(declaration_is_cfg_test_scoped(
+        child,
+        "pub(crate) struct RepairVerificationDbContender"
+    ));
+    for helper in [
+        "pub(crate) async fn assert_repair_verification_transaction_reusable",
+        "pub(crate) async fn rollback_repair_verification_test_transaction",
+    ] {
+        assert!(
+            declaration_is_cfg_test_scoped(child, helper),
+            "DB-owned verification test helper escaped #[cfg(test)]: {helper}"
+        );
+    }
+
+    for field in [
+        "after_rename_session_acquired",
+        "after_begin",
+        "before_receipt_persist",
+        "after_receipt_persist",
+        "after_commit_before_pending_clear",
+        "commit_failure_after_persist",
+    ] {
+        assert!(
+            control.contains(&format!("control.{field}.is_some()")),
+            "configured test control is not checked for consumption: {field}"
+        );
+    }
+    assert!(control.contains("unconsumed repair verification test control"));
+
+    for dispatch in [
+        "run_repair_verification_test_checkpoint(RepairVerificationTestCheckpointKind::AfterBegin)",
+        "run_repair_verification_test_checkpoint(",
+        "if consume_repair_verification_test_commit_failure()",
+    ] {
+        assert!(
+            checkpoint_is_cfg_test_scoped(atomic, dispatch),
+            "atomic test dispatch escaped #[cfg(test)]: {dispatch}"
+        );
+    }
+    assert_eq!(
+        precommit
+            .matches("RepairVerificationTestCheckpointKind::BeforeReceiptPersist")
+            .count(),
+        3
+    );
+    assert_eq!(
+        precommit
+            .matches("RepairVerificationTestCheckpointKind::AfterReceiptPersist")
+            .count(),
+        3
+    );
+    let (rename, page_root, no_page_root) = persistence_segments(precommit);
+    for segment in [rename, page_root, no_page_root] {
+        let before = segment
+            .find("RepairVerificationTestCheckpointKind::BeforeReceiptPersist")
+            .expect("pre-persist checkpoint");
+        let persist = segment
+            .find("store.persist_verification_receipt(&receipt)?;")
+            .expect("receipt persistence");
+        let after = segment
+            .find("RepairVerificationTestCheckpointKind::AfterReceiptPersist")
+            .expect("post-persist checkpoint");
+        assert!(before < persist && persist < after);
+    }
+    let commit_fault = finalization
+        .find("if consume_repair_verification_test_commit_failure()")
+        .expect("commit failure control");
+    let commit = finalization
+        .find(".execute(\"COMMIT\", ())")
+        .expect("literal commit");
+    assert!(commit_fault < commit);
+
+    let caller_start = repair
+        .find("async fn record_repair_verification_inner(")
+        .expect("verification caller");
+    let caller_end = repair[caller_start..]
+        .find("\nfn validate_verification_reports(")
+        .map(|offset| caller_start + offset)
+        .expect("verification caller end");
+    let caller = &repair[caller_start..caller_end];
+    assert!(checkpoint_is_cfg_test_scoped(
+        caller,
+        "if rename_projection_session.is_some()"
+    ));
+    assert_eq!(caller.matches("#[cfg(test)]").count(), 2);
+    assert_eq!(
+        caller
+            .matches("run_repair_verification_test_checkpoint(")
+            .count(),
+        2
+    );
+    assert!(caller.contains(
+        "#[cfg(test)]\n    run_repair_verification_test_checkpoint(\n        RepairVerificationTestCheckpointKind::AfterCommitBeforePendingClear,"
+    ));
+    let session = caller
+        .find("begin_owned_repair_session(")
+        .expect("rename session acquisition");
+    let after_session = caller
+        .find("RepairVerificationTestCheckpointKind::AfterRenameSessionAcquired")
+        .expect("after-session checkpoint");
+    let child_call = caller
+        .find("record_repair_verification_atomic(")
+        .expect("atomic verification");
+    let after_commit = caller
+        .find("RepairVerificationTestCheckpointKind::AfterCommitBeforePendingClear")
+        .expect("postcommit checkpoint");
+    let clear = caller[child_call..]
+        .find("clear_pending_apply_receipt(")
+        .map(|offset| child_call + offset)
+        .expect("post-atomic pending cleanup");
+    assert!(session < after_session && after_session < child_call);
+    assert!(child_call < after_commit && after_commit < clear);
+}
+
+#[tokio::test]
+#[should_panic(expected = "unconsumed repair verification test control: after_begin")]
+async fn r4_24b_unconsumed_test_control_fails_loud() {
+    with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_begin: Some(Box::new(|| {})),
+            ..Default::default()
+        },
+        async {},
+    )
+    .await;
 }

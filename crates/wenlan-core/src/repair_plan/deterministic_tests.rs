@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 use super::*;
 use crate::{
-    db::tests::test_db,
+    db::{
+        repair_verification::{
+            with_repair_verification_test_control, RepairVerificationDbContender,
+            RepairVerificationTestControl,
+        },
+        tests::test_db,
+    },
     lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
@@ -330,21 +336,60 @@ async fn apply_and_verify_stale_projection_manifest(
         )
         .await
         .unwrap();
-    crate::repair::record_repair_verification(
-        &fixture.db,
-        &fixture.store,
-        wenlan_types::repair::VerifyRepairRequest::try_new_general_only(
-            manifest.manifest_id().to_string(),
-            manifest.manifest_digest().clone(),
-            receipt.receipt_digest().clone(),
-            general,
-        )
-        .unwrap(),
-        Some(fixture.page_root.path()),
-        applied_at + 1,
+    let projection_lock = fixture.page_root.path().join(".wenlan/.projection.lock");
+    let before_lock = projection_lock.clone();
+    let contender = RepairVerificationDbContender::new(&fixture.db);
+    let start_contender = contender.clone();
+    let contender_before_persist = contender.clone();
+    let contender_after_persist = contender.clone();
+    with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_begin: Some(Box::new(move || {
+                start_contender.start_and_observe_pending();
+            })),
+            before_receipt_persist: Some(Box::new(move || {
+                contender_before_persist.assert_pending();
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&before_lock)
+                    .unwrap();
+                assert_eq!(
+                    fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            })),
+            after_receipt_persist: Some(Box::new(move || {
+                contender_after_persist.assert_pending();
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&projection_lock)
+                    .unwrap();
+                assert_eq!(
+                    fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            })),
+            ..Default::default()
+        },
+        crate::repair::record_repair_verification(
+            &fixture.db,
+            &fixture.store,
+            wenlan_types::repair::VerifyRepairRequest::try_new_general_only(
+                manifest.manifest_id().to_string(),
+                manifest.manifest_digest().clone(),
+                receipt.receipt_digest().clone(),
+                general,
+            )
+            .unwrap(),
+            Some(fixture.page_root.path()),
+            applied_at + 1,
+        ),
     )
     .await
     .unwrap_or_else(|error| panic!("verification failed for {:?}: {error:?}", manifest.target()));
+    contender.assert_entered_after_verification();
     receipt
 }
 

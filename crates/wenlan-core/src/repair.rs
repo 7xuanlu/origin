@@ -55,6 +55,11 @@ use wenlan_types::{
     MemoryType,
 };
 
+#[cfg(test)]
+use crate::db::repair_verification::{
+    run_repair_verification_test_checkpoint, RepairVerificationTestCheckpointKind,
+};
+
 const MANIFEST_FILE: &str = "manifest.json";
 const ROLLBACK_FILE: &str = "rollback-v1.json";
 const LEGACY_ROLLBACK_FORMAT_VERSION: u16 = 1;
@@ -2714,20 +2719,16 @@ pub async fn record_repair_verification(
     page_root: Option<&Path>,
     now_epoch: i64,
 ) -> Result<RepairVerificationReceipt, WenlanError> {
-    record_repair_verification_inner(db, store, request, page_root, now_epoch, || Ok(())).await
+    record_repair_verification_inner(db, store, request, page_root, now_epoch).await
 }
 
-async fn record_repair_verification_inner<F>(
+async fn record_repair_verification_inner(
     db: &MemoryDB,
     store: &RepairArtifactStore,
     request: VerifyRepairRequest,
     page_root: Option<&Path>,
     now_epoch: i64,
-    after_projection_session: F,
-) -> Result<RepairVerificationReceipt, WenlanError>
-where
-    F: FnOnce() -> Result<(), WenlanError>,
-{
+) -> Result<RepairVerificationReceipt, WenlanError> {
     ensure_repair_artifacts_supported()?;
     if now_epoch <= 0 {
         return Err(WenlanError::Validation(
@@ -2802,7 +2803,12 @@ where
     } else {
         None
     };
-    after_projection_session()?;
+    #[cfg(test)]
+    if rename_projection_session.is_some() {
+        run_repair_verification_test_checkpoint(
+            RepairVerificationTestCheckpointKind::AfterRenameSessionAcquired,
+        );
+    }
     let receipt = record_repair_verification_atomic(
         db,
         RepairVerificationAtomicInput {
@@ -2819,31 +2825,12 @@ where
         },
     )
     .await?;
+    #[cfg(test)]
+    run_repair_verification_test_checkpoint(
+        RepairVerificationTestCheckpointKind::AfterCommitBeforePendingClear,
+    );
     store.clear_pending_apply_receipt(manifest.manifest_id())?;
     Ok(receipt)
-}
-
-#[cfg(test)]
-async fn record_repair_verification_with_projection_session_hook<F>(
-    db: &MemoryDB,
-    store: &RepairArtifactStore,
-    request: VerifyRepairRequest,
-    page_root: Option<&Path>,
-    now_epoch: i64,
-    after_projection_session: F,
-) -> Result<RepairVerificationReceipt, WenlanError>
-where
-    F: FnOnce() -> Result<(), WenlanError>,
-{
-    record_repair_verification_inner(
-        db,
-        store,
-        request,
-        page_root,
-        now_epoch,
-        after_projection_session,
-    )
-    .await
 }
 
 fn validate_verification_reports(
@@ -6613,7 +6600,16 @@ mod entity_extraction_tests;
 mod tests {
     use super::*;
     use crate::{
-        db::{tests::test_db, MemoryDB},
+        db::{
+            repair_verification::{
+                assert_repair_verification_transaction_reusable,
+                rollback_repair_verification_test_transaction,
+                with_repair_verification_test_control, RepairVerificationTestCommitFailure,
+                RepairVerificationTestControl,
+            },
+            tests::test_db,
+            MemoryDB,
+        },
         lint::{
             context::{CancellationToken, LintClock},
             runner::LintRunner,
@@ -7767,6 +7763,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verification_control_observes_nonprojection_commit_and_cleanup_boundaries() {
+        use fs2::FileExt as _;
+        use std::sync::{Arc, Mutex};
+
+        let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
+        let db = Arc::new(db);
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
+            .await
+            .unwrap();
+        let (general, deep) = verification_reports(&db).await;
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        let operation_lock = manifest_dir.join(OPERATION_LOCK_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        let db_after_begin = Arc::clone(&db);
+        let begin_observed = Arc::clone(&observed);
+        let db_before_persist = Arc::clone(&db);
+        let before_observed = Arc::clone(&observed);
+        let db_after_persist = Arc::clone(&db);
+        let after_observed = Arc::clone(&observed);
+        let pending_after_persist = pending.clone();
+        let db_after_commit = Arc::clone(&db);
+        let postcommit_observed = Arc::clone(&observed);
+        let receipt_after_commit = final_receipt.clone();
+        let pending_after_commit = pending.clone();
+
+        let receipt = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    assert!(db_after_begin.conn.try_lock().is_err());
+                    begin_observed.lock().unwrap().push("after_begin");
+                })),
+                before_receipt_persist: Some(Box::new(move || {
+                    assert!(db_before_persist.conn.try_lock().is_err());
+                    assert!(!final_receipt.exists());
+                    before_observed.lock().unwrap().push("before_persist");
+                })),
+                after_receipt_persist: Some(Box::new(move || {
+                    assert!(db_after_persist.conn.try_lock().is_err());
+                    assert!(pending_after_persist.exists());
+                    after_observed.lock().unwrap().push("after_persist");
+                })),
+                after_commit_before_pending_clear: Some(Box::new(move || {
+                    assert!(db_after_commit.conn.try_lock().is_ok());
+                    assert!(receipt_after_commit.is_file());
+                    assert!(pending_after_commit.is_file());
+                    let operation = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&operation_lock)
+                        .unwrap();
+                    assert_eq!(
+                        operation.try_lock_exclusive().unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    postcommit_observed.lock().unwrap().push("after_commit");
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receipt.manifest_id(), manifest.manifest_id());
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [
+                "after_begin",
+                "before_persist",
+                "after_persist",
+                "after_commit",
+            ]
+        );
+        assert!(!pending.is_file());
+    }
+
+    #[tokio::test]
+    async fn verification_real_receipt_conflict_rolls_back_and_retains_pending() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
+        let db = Arc::new(db);
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
+            .await
+            .unwrap();
+        let (general, deep) = verification_reports(&db).await;
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let after_begin = Arc::new(AtomicBool::new(false));
+        let before_persist = Arc::new(AtomicBool::new(false));
+        let begin_observed = Arc::clone(&after_begin);
+        let persist_observed = Arc::clone(&before_persist);
+        let conflict_path = final_receipt.clone();
+
+        let result = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    begin_observed.store(true, Ordering::SeqCst);
+                })),
+                before_receipt_persist: Some(Box::new(move || {
+                    std::fs::write(&conflict_path, b"real conflicting receipt object").unwrap();
+                    persist_observed.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WenlanError::Conflict(message)) if message == "repair_already_verified"
+        ));
+        assert!(after_begin.load(Ordering::SeqCst));
+        assert!(before_persist.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(&final_receipt).unwrap(),
+            b"real conflicting receipt object"
+        );
+        assert!(pending.is_file());
+        assert_repair_verification_transaction_reusable(&db).await;
+    }
+
+    #[tokio::test]
+    async fn verification_commit_failure_keeps_terminal_receipt_for_retry_cleanup() {
+        let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
+            .await
+            .unwrap();
+        let (general, deep) = verification_reports(&db).await;
+        let request = exact_verify(&manifest, &apply_receipt, general, deep);
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+
+        let error = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                before_receipt_persist: Some(Box::new(|| {})),
+                after_receipt_persist: Some(Box::new(|| {})),
+                commit_failure_after_persist: Some(
+                    RepairVerificationTestCommitFailure::AfterPersistBeforeCommit,
+                ),
+                ..Default::default()
+            },
+            record_repair_verification(&db, &store, request.clone(), None, 1_721_000_002),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Vector DB error: repair verify commit: injected test failure"
+        );
+        assert!(final_receipt.is_file());
+        assert!(pending.is_file());
+        let retried = record_repair_verification(&db, &store, request, None, 1_721_000_003)
+            .await
+            .unwrap();
+        assert_eq!(retried.manifest_id(), manifest.manifest_id());
+        assert!(!pending.exists());
+        rollback_repair_verification_test_transaction(&db).await;
+    }
+
+    #[tokio::test]
     async fn post_repair_general_and_deep_must_share_one_producer() {
         let (db, _db_dir, _repair_root, manifest) = prepared_fixture().await;
         let (general, deep) = verification_reports(&db).await;
@@ -8150,6 +8335,11 @@ mod tests {
 
     #[tokio::test]
     async fn verification_rejects_target_owner_change_after_apply_even_with_fresh_reports() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
         let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
@@ -8166,12 +8356,28 @@ mod tests {
             .unwrap();
         let (general, deep) = verification_reports(&db).await;
 
-        let result = record_repair_verification(
-            &db,
-            &store,
-            exact_verify(&manifest, &apply_receipt, general, deep),
-            None,
-            1_721_000_002,
+        let after_begin = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&after_begin);
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let verification_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let receipt_at_begin = verification_receipt.clone();
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let result = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    assert!(!receipt_at_begin.exists());
+                    observed.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
         )
         .await;
 
@@ -8179,10 +8385,19 @@ mod tests {
             result,
             Err(WenlanError::Conflict(message)) if message == "repair_verification_state_changed"
         ));
+        assert!(after_begin.load(Ordering::SeqCst));
+        assert!(!verification_receipt.exists());
+        assert!(pending.is_file());
+        assert_repair_verification_transaction_reusable(&db).await;
     }
 
     #[tokio::test]
     async fn verification_rejects_reports_that_are_no_longer_current() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
         let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
@@ -8196,12 +8411,28 @@ mod tests {
             .await
             .unwrap();
 
-        let result = record_repair_verification(
-            &db,
-            &store,
-            exact_verify(&manifest, &apply_receipt, general, deep),
-            None,
-            1_721_000_002,
+        let after_begin = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&after_begin);
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let verification_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let receipt_at_begin = verification_receipt.clone();
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let result = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    assert!(!receipt_at_begin.exists());
+                    observed.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
         )
         .await;
 
@@ -8209,6 +8440,10 @@ mod tests {
             result,
             Err(WenlanError::Conflict(message)) if message == "repair_verification_reports_stale"
         ));
+        assert!(after_begin.load(Ordering::SeqCst));
+        assert!(!verification_receipt.exists());
+        assert!(pending.is_file());
+        assert_repair_verification_transaction_reusable(&db).await;
     }
 
     #[tokio::test]
