@@ -1902,11 +1902,15 @@ Frozen slice contract:
   `db/repair_page_rename.rs` owns the canonical
   `rename_page_title_cas_inner` and
   `recover_rename_page_title_apply_receipt` operations. The normal and
-  test-hook `post_write` facades remain wrappers with their current names and
-  signatures. `repair::apply_rename_page_title` remains the recovery/apply
-  orchestrator and calls the DB child for pending recovery. No second
-  transaction implementation, same-name re-export, or direct dispatcher
-  bypass is allowed.
+  test-hook `post_write` facades remain wrappers. The normal facade keeps its
+  current name and signature. The `cfg(test)` facade keeps its current name
+  and argument list, while its `G` hook bound deliberately gains `+ 'static`
+  so the owned callback can be stored safely in the Tokio task-local test
+  control. Its sole existing caller supplies a noncapturing closure; this
+  changes no production surface. `repair::apply_rename_page_title` remains the
+  recovery/apply orchestrator and calls the DB child for pending recovery. No
+  second transaction implementation, same-name re-export, or direct
+  dispatcher bypass is allowed.
 - **Apply lock order and lifetime are byte-for-byte behavior.** Validate the
   manifest shape, review binding, and embedding before acquiring either
   resource. Then acquire the owned repair projection session, derive its
@@ -1996,6 +2000,75 @@ Frozen slice contract:
   depth `55 / 50 / 86`, exposure `22`, and ambiguity `9`. Ast-grep closes the
   declaration/call shape; exact text census covers macro token trees; LSP
   definition/references and zero-error diagnostics close semantic routing.
+- RED, 2026-07-29: the seven direct controls first failed `0 / 7` against the
+  two explicit DB-child stubs. Lowering only the two ratchet rows produced the
+  exact expected failures:
+  `post_write.rs: direct .conn.lock() access increased 14 -> 15` and
+  `repair.rs: direct .conn.lock() access increased 18 -> 19`.
+- IMPLEMENTED, 2026-07-29: `db/repair_page_rename.rs` now owns the canonical
+  apply and pending-recovery transactions. The unchanged `post_write` facades
+  call the child, while `repair::apply_rename_page_title` retains orchestration
+  and crosses the boundary through the three-state typed artifact inspection
+  plus narrow publish/clear methods. Projection-session-before-DB ordering,
+  compensation-before-rollback, post-commit guard lifetimes, classifier
+  branches, error mapping, and the known no-explicit-rollback recovery caveat
+  remain unchanged. Only test builds expose the write, restore-entry,
+  restore-midpoint, and post-commit artifact checkpoints.
+- GREEN, 2026-07-29: direct lock/order, compensation, artifact-lifetime, and
+  split-state controls pass `7 / 7`; the unchanged title-rename policy suite
+  passes `10 / 10`; and the exact external-access ratchet passes `3 / 3`.
+  External literals are `296 → 294`, production `7 → 5`, and tests remain
+  `289`. Core/server all-target Clippy with `-D warnings`, formatting, and the
+  generated inventory check pass.
+- LSP AND TOPOLOGY GATE, 2026-07-29: ast-grep finds exactly one declaration of
+  each canonical operation in the DB child. Exact source census shows only the
+  two unchanged apply facades and one recovery orchestrator production call;
+  direct sibling tests call the canonical operations. LSP definition lookup
+  from both production paths resolves to the DB-child definitions, references
+  enumerate those paths and the direct controls, and all seven changed Rust
+  files have zero error diagnostics. The final M5 inventory remains exactly
+  `191 / 55-50-86 / exposure 22 / ambiguity 9`.
+- REVIEW DELTA, 2026-07-29: Sol and the concurrency auditor correctly blocked
+  the first GREEN because the canonical DB operations still accepted arbitrary
+  checkpoint callbacks in production. The corrected canonical apply API now
+  has only `db`, `manifest`, `rollback`, `page_root`, and `before_commit`; the
+  recovery API has only `db`, `store`, `manifest`, and `page_root`. Whole
+  `#[cfg(test)]` wrappers install owned checkpoints in a Tokio task-local
+  around exactly one canonical future. Statement-level test lookups drive the
+  direct controls, while production uses the normal write and unconditional
+  restore methods. The FTS maintenance rationale remains beside the moved
+  target-change accounting. This delta adds no production callback,
+  same-name implementation, scanner exception, or inventory row.
+- CHECKPOINT CONSUMPTION RED, 2026-07-29: the concurrency auditor found that a
+  supplied checkpoint could remain installed without failing its control.
+  The test-only scope now inspects the task-local `RefCell` after the canonical
+  future returns and before scope exit; any still-`Some` hook panics with its
+  stable field name. Two temporary deletion mutants proved the assertion is
+  load-bearing: removing the restore-midpoint invocation failed the apply
+  compensation control with
+  `unconsumed rename page title test checkpoints: after_target_restore`, and
+  removing the post-commit invocation failed the recovery publish control with
+  `unconsumed rename page title test checkpoints:
+  after_commit_before_artifact`. Each hook is taken before invocation, so an
+  intentional hook error still counts as consumed. Both mutants were restored
+  before the final GREEN rerun.
+- TEST-FACADE ADJUDICATION, 2026-07-29: Sol approved the safe owned-callback
+  option. The frozen contract now records the sole deliberate signature-bound
+  delta: the `cfg(test)` facade keeps its name and argument list, while `G`
+  gains `+ 'static` for Tokio task-local storage; production is unchanged.
+  The existing midpoint-write test remains one test and preserves its original
+  noncapturing invocation. A second independent fixture in that same test uses
+  an owned `move` closure over `Arc<AtomicBool>`, proves the hook fired, and
+  independently proves both the Page row/version and raw projection files
+  were restored. The title-rename suite therefore remains `10 / 10` while
+  exercising both accepted callback shapes.
+- FINAL REVIEW GATE, 2026-07-29: Sol and the independent concurrency auditor
+  both returned `APPROVE` after inspecting the amended contract and current
+  diff. Root independently reran the title suite `10 / 10`, DB-child controls
+  `7 / 7`, external-access ratchet `3 / 3`, Rust M5 gate `1 / 1`, and reader
+  inventory at `191 / 55-50-86 / exposure 22`; LSP resolves both production
+  callers to the DB child and reports zero errors in the child, facade, and
+  amended title test.
 
 #### R4-21 — regenerate-page projection compensation
 

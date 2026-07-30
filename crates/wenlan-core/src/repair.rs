@@ -5,7 +5,7 @@
 //! it is not an authentication boundary against malicious local processes.
 
 use crate::{
-    db::MemoryDB,
+    db::{repair_page_rename::recover_rename_page_title_apply_receipt, MemoryDB},
     error::WenlanError,
     lint::{
         context::ExecutionGate,
@@ -76,6 +76,15 @@ mod title_rename_tests;
 #[derive(Debug, Clone)]
 pub struct RepairArtifactStore {
     root: PathBuf,
+}
+
+pub(crate) enum RenamePageTitleRecoveryArtifact {
+    Completed(RepairApplyReceipt),
+    Absent,
+    Pending {
+        verified_receipt: Option<RepairApplyReceipt>,
+        rollback: RepairRollbackPayloadV2,
+    },
 }
 
 impl RepairArtifactStore {
@@ -779,6 +788,51 @@ impl RepairArtifactStore {
             .join(APPLY_RECEIPT_FILE);
         let receipt = StoredRepairApplyReceipt::from_slice(&fs::read(path)?)?;
         verify_stored_apply_receipt(receipt, manifest)
+    }
+
+    pub(crate) fn inspect_rename_page_title_recovery_artifact(
+        &self,
+        manifest: &RepairManifest,
+    ) -> Result<RenamePageTitleRecoveryArtifact, WenlanError> {
+        let manifest_dir = self.manifest_dir(manifest.manifest_id())?;
+        let final_path = manifest_dir.join(APPLY_RECEIPT_FILE);
+        if final_path.exists() {
+            let receipt = self.load_apply_receipt(manifest)?;
+            self.clear_pending_apply_receipt(manifest.manifest_id())?;
+            return Ok(RenamePageTitleRecoveryArtifact::Completed(receipt));
+        }
+        let pending_path = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        if !pending_path.exists() {
+            return Ok(RenamePageTitleRecoveryArtifact::Absent);
+        }
+        let pending = read_bounded_file(&pending_path, REPAIR_ROLLBACK_ARTIFACT_MAX_BYTES)?;
+        let verified_receipt = StoredRepairApplyReceipt::from_slice(&pending)
+            .ok()
+            .and_then(|receipt| verify_stored_apply_receipt(receipt, manifest).ok());
+        let rollback = self.load_rename_page_title_rollback(manifest)?;
+        Ok(RenamePageTitleRecoveryArtifact::Pending {
+            verified_receipt,
+            rollback,
+        })
+    }
+
+    pub(crate) fn publish_rename_page_title_pending_apply_receipt(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), WenlanError> {
+        let manifest_dir = self.manifest_dir(manifest_id)?;
+        publish_no_replace(
+            &manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
+            &manifest_dir.join(APPLY_RECEIPT_FILE),
+            "repair_already_applied",
+        )
+    }
+
+    pub(crate) fn clear_rename_page_title_pending_apply_receipt(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), WenlanError> {
+        self.clear_pending_apply_receipt(manifest_id)
     }
 
     fn persist_verification_receipt(
@@ -2420,258 +2474,6 @@ fn should_retain_stale_page_projection_pending_receipt(
     apply_journal_exists: bool,
 ) -> bool {
     apply_journal_exists || should_retain_pending_apply_receipt(error)
-}
-
-async fn recover_rename_page_title_apply_receipt(
-    db: &MemoryDB,
-    store: &RepairArtifactStore,
-    manifest: &RepairManifest,
-    page_root: &Path,
-) -> Result<Option<RepairApplyReceipt>, WenlanError> {
-    let manifest_dir = store.manifest_dir(manifest.manifest_id())?;
-    let final_path = manifest_dir.join(APPLY_RECEIPT_FILE);
-    if final_path.exists() {
-        let receipt = store.load_apply_receipt(manifest)?;
-        let pending_path = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
-        if pending_path.exists() {
-            fs::remove_file(pending_path)?;
-            sync_dir(&manifest_dir)?;
-        }
-        return Ok(Some(receipt));
-    }
-    let pending_path = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
-    if !pending_path.exists() {
-        return Ok(None);
-    }
-    let pending = read_bounded_file(&pending_path, REPAIR_ROLLBACK_ARTIFACT_MAX_BYTES)?;
-    let parsed = StoredRepairApplyReceipt::from_slice(&pending)
-        .ok()
-        .and_then(|receipt| verify_stored_apply_receipt(receipt, manifest).ok());
-    let rollback = store.load_rename_page_title_rollback(manifest)?;
-    let page_id = match manifest.target() {
-        RepairTarget::PageProjection { page_id, .. } => page_id,
-        _ => {
-            return Err(WenlanError::Validation(
-                "page title repair target/writer mismatch".to_string(),
-            ))
-        }
-    };
-    let session = crate::export::knowledge::KnowledgeProjectionWrite::begin_owned_repair_session(
-        page_root.to_path_buf(),
-        db,
-    )?;
-    let projection = session.locked();
-    let connection = db.conn.lock().await;
-    connection
-        .execute("BEGIN IMMEDIATE", ())
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("repair recovery begin: {error}")))?;
-    let current =
-        match capture_rename_page_title_on_connection(&connection, &projection, page_id).await {
-            Ok(current) => current,
-            Err(_) => {
-                let _ = connection.execute("ROLLBACK", ()).await;
-                return Err(WenlanError::Conflict(
-                    "repair_apply_recovery_required".to_string(),
-                ));
-            }
-        };
-    #[allow(clippy::large_enum_variant)]
-    enum Recovery {
-        Publish(RepairApplyReceipt),
-        Retry,
-        RestoreRetry,
-    }
-    let recovery = if let Some(receipt) = parsed {
-        if rename_page_title_receipt(&current)? == *receipt.after_target_receipt() {
-            Recovery::Publish(receipt)
-        } else if rename_page_database_matches(&current, &rollback)
-            && rename_page_projection_matches_pre(&current, &rollback)
-        {
-            Recovery::Retry
-        } else if rename_page_database_matches(&current, &rollback)
-            && rename_page_projection_matches_post(&connection, manifest, &rollback, &current)
-                .await?
-        {
-            Recovery::RestoreRetry
-        } else {
-            return recovery_required_with_rollback(&connection).await;
-        }
-    } else if rename_page_database_matches(&current, &rollback)
-        && rename_page_projection_matches_pre(&current, &rollback)
-    {
-        Recovery::Retry
-    } else if rename_page_database_matches(&current, &rollback)
-        && rename_page_projection_matches_post(&connection, manifest, &rollback, &current).await?
-    {
-        Recovery::RestoreRetry
-    } else {
-        return recovery_required_with_rollback(&connection).await;
-    };
-    if matches!(recovery, Recovery::RestoreRetry) {
-        let RepairRollbackPayloadV2::RenamePageTitle {
-            projection_target_path,
-            projection_entries,
-            ..
-        } = &rollback
-        else {
-            unreachable!("typed loader returned title rollback")
-        };
-        if projection
-            .restore_rename_page_projection(projection_target_path, projection_entries)
-            .is_err()
-        {
-            let _ = connection.execute("ROLLBACK", ()).await;
-            return Err(WenlanError::Conflict(
-                "repair_apply_recovery_required".to_string(),
-            ));
-        }
-    }
-    connection
-        .execute("COMMIT", ())
-        .await
-        .map_err(|_| WenlanError::Conflict("repair_apply_recovery_required".to_string()))?;
-    match recovery {
-        Recovery::Publish(receipt) => {
-            publish_no_replace(&pending_path, &final_path, "repair_already_applied")?;
-            Ok(Some(receipt))
-        }
-        Recovery::Retry | Recovery::RestoreRetry => {
-            store.clear_pending_apply_receipt(manifest.manifest_id())?;
-            Ok(None)
-        }
-    }
-}
-
-async fn recovery_required_with_rollback<T>(
-    connection: &libsql::Connection,
-) -> Result<T, WenlanError> {
-    let _ = connection.execute("ROLLBACK", ()).await;
-    Err(WenlanError::Conflict(
-        "repair_apply_recovery_required".to_string(),
-    ))
-}
-
-fn rename_page_database_matches(
-    current: &RepairRollbackPayloadV2,
-    expected: &RepairRollbackPayloadV2,
-) -> bool {
-    matches!(
-        (current, expected),
-        (
-            RepairRollbackPayloadV2::RenamePageTitle {
-                page_id,
-                page_columns,
-                before_page_row,
-                ..
-            },
-            RepairRollbackPayloadV2::RenamePageTitle {
-                page_id: expected_page_id,
-                page_columns: expected_columns,
-                before_page_row: expected_row,
-                ..
-            }
-        ) if page_id == expected_page_id
-            && page_columns == expected_columns
-            && before_page_row == expected_row
-    )
-}
-
-fn rename_page_projection_matches_pre(
-    current: &RepairRollbackPayloadV2,
-    expected: &RepairRollbackPayloadV2,
-) -> bool {
-    matches!(
-        (current, expected),
-        (
-            RepairRollbackPayloadV2::RenamePageTitle {
-                projection_target_path,
-                projection_entries,
-                ..
-            },
-            RepairRollbackPayloadV2::RenamePageTitle {
-                projection_target_path: expected_path,
-                projection_entries: expected_entries,
-                ..
-            }
-        ) if projection_target_path == expected_path
-            && projection_entries == expected_entries
-    )
-}
-
-async fn rename_page_projection_matches_post(
-    connection: &libsql::Connection,
-    manifest: &RepairManifest,
-    rollback: &RepairRollbackPayloadV2,
-    current: &RepairRollbackPayloadV2,
-) -> Result<bool, WenlanError> {
-    let (
-        RepairRollbackPayloadV2::RenamePageTitle {
-            page_id,
-            projection_target_path,
-            projection_entries: before_entries,
-            ..
-        },
-        RepairRollbackPayloadV2::RenamePageTitle {
-            projection_target_path: current_target_path,
-            projection_entries: current_entries,
-            ..
-        },
-        RepairMutation::RenamePageTitle { after_title, .. },
-    ) = (rollback, current, manifest.mutation())
-    else {
-        return Ok(false);
-    };
-    if projection_target_path != current_target_path
-        || before_entries.len() != 2
-        || current_entries.len() != 2
-    {
-        return Ok(false);
-    }
-    let mut after_page = crate::post_write::page_on_connection(connection, page_id).await?;
-    after_page.title = after_title.clone();
-    after_page.version = after_page.version.saturating_add(1);
-    let expected_markdown = crate::export::knowledge::render_markdown_for(&after_page);
-    let current_target = current_entries
-        .iter()
-        .find(|entry| entry.relative_path() == projection_target_path)
-        .and_then(|entry| hex::decode(entry.content_hex()).ok());
-    if current_target.as_deref() != Some(expected_markdown.as_bytes()) {
-        return Ok(false);
-    }
-    let before_state = before_entries
-        .iter()
-        .find(|entry| entry.relative_path() == ".wenlan/state.json")
-        .and_then(|entry| hex::decode(entry.content_hex()).ok())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let current_state = current_entries
-        .iter()
-        .find(|entry| entry.relative_path() == ".wenlan/state.json")
-        .and_then(|entry| hex::decode(entry.content_hex()).ok())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let (Some(mut before_state), Some(mut current_state)) = (before_state, current_state) else {
-        return Ok(false);
-    };
-    let before_page = before_state
-        .get_mut("pages")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|pages| pages.remove(page_id));
-    let current_page = current_state
-        .get_mut("pages")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|pages| pages.remove(page_id));
-    let (Some(before_page), Some(current_page)) = (before_page, current_page) else {
-        return Ok(false);
-    };
-    let expected_current_page = serde_json::json!({
-        "file": projection_target_path,
-        "version": after_page.version,
-        "last_written": after_page.last_modified,
-    });
-    Ok(before_state == current_state
-        && before_page.get("file")
-            == Some(&serde_json::Value::String(projection_target_path.clone()))
-        && current_page == expected_current_page)
 }
 
 async fn recover_complete_entity_extraction_apply_receipt(

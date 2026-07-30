@@ -46,6 +46,7 @@ mod page_drafts;
 pub mod page_map;
 pub(crate) mod repair_deterministic;
 mod repair_memory_cas;
+pub(crate) mod repair_page_rename;
 mod repair_receipt;
 mod scoped_entities;
 mod scoped_pages;
@@ -105,6 +106,8 @@ mod page_drafts_test;
 mod repair_deterministic_test;
 #[cfg(test)]
 mod repair_memory_cas_test;
+#[cfg(test)]
+mod repair_page_rename_test;
 #[cfg(test)]
 mod repair_receipt_test;
 #[cfg(test)]

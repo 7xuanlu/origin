@@ -8,6 +8,10 @@ use crate::{
         runner::LintRunner,
     },
 };
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use wenlan_types::{
     lint::{LintProfile, LintQuery},
     repair::{
@@ -607,6 +611,48 @@ async fn mid_projection_write_failure_restores_target_state_and_database() {
     assert_eq!(
         std::fs::read(fixture.page_root.path().join(filename)).unwrap(),
         file_before
+    );
+
+    let owned = rename_fixture().await;
+    let owned_manifest = prepare(&owned).await;
+    let owned_store = RepairArtifactStore::new(owned.repair_root.path().to_path_buf());
+    let owned_rollback = owned_store
+        .load_rename_page_title_rollback(&owned_manifest)
+        .unwrap();
+    let owned_state_before =
+        std::fs::read(owned.page_root.path().join(".wenlan/state.json")).unwrap();
+    let owned_filename = target_filename(owned.page_root.path(), "page-a");
+    let owned_file_before = std::fs::read(owned.page_root.path().join(&owned_filename)).unwrap();
+    let hook_fired = Arc::new(AtomicBool::new(false));
+    let hook_fired_inside = Arc::clone(&hook_fired);
+
+    let owned_result = crate::post_write::rename_page_title_cas_with_projection_write_hook(
+        &owned.db,
+        &owned_manifest,
+        &owned_rollback,
+        owned.page_root.path(),
+        move || {
+            hook_fired_inside.store(true, Ordering::SeqCst);
+            Err(WenlanError::Io(std::io::Error::other(
+                "forced owned-capture failure after target write before state write",
+            )))
+        },
+        |_| Ok(()),
+    )
+    .await;
+
+    assert!(owned_result.is_err());
+    assert!(hook_fired.load(Ordering::SeqCst));
+    let owned_page = owned.db.get_page("page-a").await.unwrap().unwrap();
+    assert_eq!(owned_page.title, "Origin");
+    assert_eq!(owned_page.version, 4);
+    assert_eq!(
+        std::fs::read(owned.page_root.path().join(".wenlan/state.json")).unwrap(),
+        owned_state_before
+    );
+    assert_eq!(
+        std::fs::read(owned.page_root.path().join(owned_filename)).unwrap(),
+        owned_file_before
     );
 }
 
