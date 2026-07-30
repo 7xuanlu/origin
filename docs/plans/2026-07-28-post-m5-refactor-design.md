@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 8 complete**
+Status: **R4 complete; R5 in progress; handler-movement slice 9 complete**
 
 ## Authority and change control
 
@@ -4110,6 +4110,80 @@ R5 handler-movement slice 8 evidence, 2026-07-30:
   byte-identical movement hash, exact identity-only handler manifest change,
   unchanged semantic truth row and protected sources, complete typed
   success/error/refusal/cache controls, current counts/citations, and LSP
+  closure. Its focused reruns passed the typed contract, exact handler guard,
+  truth manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff
+  hygiene.
+
+R5 handler-movement slice 9 contract, 2026-07-30:
+
+- Move exactly `GET /api/profile/narrative` and
+  `POST /api/profile/narrative/regenerate` into
+  `profile_narrative_routes.rs`, through one registrar immediately after
+  briefing and before pinned memories. Exactly two handler-manifest identities
+  may change; no helper or production-local DTO moves with them.
+- Preserve both handlers byte-for-byte. GET remains cache-first, returns only
+  a non-empty cache row immediately, and falls through to generation on a
+  missing or empty cache. POST always calls generation and never reads the
+  cache first. Both retain the same LLM/prompt/tuning snapshot and error
+  propagation.
+- Typed built-router characterization must use shared `NarrativeResponse` plus
+  the established test-local `ErrorEnvelope`. A seeded non-empty cache proves
+  GET returns its exact content/count even under an unknown Space header,
+  while POST on an otherwise empty database proves regeneration bypasses that
+  cache and returns an empty zero-count response. Cover deterministic no-DB
+  `503` and marked `403` for both methods.
+- Both routes remain global, non-page-bearing `NotApplicable` with
+  `MarkerShape::None`. Truth, sensitive-read, mutation, M5, security, and
+  lifecycle sources stay unchanged. Pinned memories, revisions, snapshots,
+  remaining memory and Page handlers, narrative-core behavior, DTO
+  normalization, CLI, and MCP remain out of scope.
+
+R5 handler-movement slice 9 evidence, 2026-07-30:
+
+- Exactly the two frozen profile-narrative bindings now execute in
+  `profile_narrative_routes.rs`, through one registrar immediately after
+  briefing and before pinned memories. No helper or local DTO moved.
+- The old/new doc-comment-plus-handler block has identical SHA-256
+  `703d41965294fe1ad878e67f6d0384083d7c81c8e6db2023a0613cf355599d8b`.
+  GET's non-empty cache fast path, missing/empty-cache generation fallback,
+  POST's forced generation, both state snapshots, and all error/await
+  lifetimes are byte-preserved.
+- Before updating expected identities, the production-builder control was RED
+  on precisely the two new `profile_narrative_routes::*` observations versus
+  the two old `memory_routes::*` expectations. Updating only those two exact
+  handler-manifest fields made it GREEN. Truth, sensitive-read, mutation, M5,
+  security, and lifecycle sources remain unchanged.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. Shared `NarrativeResponse` proves GET returns exact seeded
+  cache content/count even under an unknown Space header, while POST on the
+  otherwise empty database bypasses that cache and returns empty content with
+  count zero without replacing the cache. The test-local `ErrorEnvelope`
+  covers both no-DB `503`s and both marked `403`s; no
+  `serde_json::Value` response oracle is used.
+- Refreshed Rust LSP diagnostics are clean in the new module, old module,
+  router, export, and contract test. Both handlers close on their colocated
+  registration plus definition; the registrar closes on one composition call
+  plus definition.
+- `router.rs` falls from `376` to `369` lines; `memory_routes.rs` falls from
+  `4,522` lines and `46` public handlers to `4,461` lines and `44`; the bounded
+  narrative module is `77` lines with two handlers. The generated M5 inventory
+  changes only two displaced Page-handler source addresses and remains
+  `191 / 55-50-86 / exposure 22`; current narrative and displaced
+  memory-route citations were refreshed. Call-site ownership is
+  `47 router + 2 profile_narrative_routes + 1 briefing_routes +
+  2 decisions_routes + 3 memory_detail_routes + 5 activity_tag_routes +
+  5 indexed_files_routes + 13 spaces_routes + 14 entity_graph_routes +
+  75 other = 167`.
+- Focused verification passes after the last code edit: typed contract
+  `1 / 1`; exact handler guard `1 / 1`; truth manifest `16 / 16`; Rust/Python
+  M5 `1 / 1` and `191 / 55-50-86 / exposure 22`; focused Clippy with warnings
+  denied; formatting and diff hygiene.
+- R5 handler-movement slice 9 REVIEW, 2026-07-30: the reused independent Sol
+  lane returned **APPROVE** with zero blocking and zero non-blocking findings.
+  It independently confirmed the two-route boundary and composition position,
+  byte-identical movement hash, exact two-field handler-manifest delta,
+  unchanged protected sources, distinct cache-first/forced-generation
+  semantics and typed controls, current citations/counts, and complete LSP
   closure. Its focused reruns passed the typed contract, exact handler guard,
   truth manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff
   hygiene.

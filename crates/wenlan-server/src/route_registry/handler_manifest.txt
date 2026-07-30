@@ -51,7 +51,7 @@ main|get|/api/pages/{id}/revisions|wenlan_server::memory_routes::handle_get_page
 main|get|/api/pages/{id}/sources|wenlan_server::memory_routes::handle_get_page_sources
 main|get|/api/ping|wenlan_server::routes::handle_ping
 main|get|/api/profile|wenlan_server::profile_agents_routes::handle_get_profile
-main|get|/api/profile/narrative|wenlan_server::memory_routes::handle_get_profile_narrative
+main|get|/api/profile/narrative|wenlan_server::profile_narrative_routes::handle_get_profile_narrative
 main|get|/api/refinery/queue|wenlan_server::refinery_routes::handle_list_refinements
 main|get|/api/retrievals/recent|wenlan_server::routes::handle_recent_retrievals
 main|get|/api/setup/status|wenlan_server::config_routes::handle_get_setup_status
@@ -110,7 +110,7 @@ main|post|/api/pages/{id}/export|wenlan_server::memory_routes::handle_export_pag
 main|post|/api/pages/{id}/map/edges|wenlan_server::page_map_routes::handle_create_map_edge
 main|post|/api/pages/{id}/map/improve|wenlan_server::page_map_routes::handle_improve_page_map
 main|post|/api/pages/{id}/map/nodes|wenlan_server::page_map_routes::handle_create_map_node
-main|post|/api/profile/narrative/regenerate|wenlan_server::memory_routes::handle_regenerate_narrative
+main|post|/api/profile/narrative/regenerate|wenlan_server::profile_narrative_routes::handle_regenerate_narrative
 main|post|/api/refinery/queue/{id}/accept|wenlan_server::refinery_routes::handle_accept_refinement
 main|post|/api/refinery/queue/{id}/reject|wenlan_server::refinery_routes::handle_reject_refinement
 main|post|/api/repairs/apply|wenlan_server::repair_routes::handle_apply
