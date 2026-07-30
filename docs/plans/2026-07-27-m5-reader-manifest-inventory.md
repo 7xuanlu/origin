@@ -289,13 +289,13 @@ it is staged.
   **first**. It selects `c.title`, `c.content` and `c.source_text`, so the queue
   meant for reviewing captures returns the whole page body, top of the list.
 - **`GET /api/memory/recent` → `yes`.** `handle_recent_memories`
-  (`server/memory_routes.rs:2710`) → `list_recent_memories_scoped`
+  (`server/memory_routes.rs:2662`) → `list_recent_memories_scoped`
   (`db.rs:40319`). Its `WHERE` is `source='memory' AND chunk_index=0` plus a
   `supersede_mode` exclusion, no `pending_revision`. `RecentActivityItem.title`
   is the card title verbatim and `snippet` falls back to the first 100 chars of
   content (`db.rs:40432`).
 - **`GET /api/memory/unconfirmed` → `yes`.**
-  `handle_list_unconfirmed_memories` (`server/memory_routes.rs:2733`) →
+  `handle_list_unconfirmed_memories` (`server/memory_routes.rs:2685`) →
   `list_unconfirmed_memories_scoped` (`db.rs:40479`). It filters
   `(confirmed = 0 OR confirmed IS NULL)` (`db.rs:40501`), which a staged card
   satisfies by construction (`post_write.rs:3102`), and carries no
@@ -316,7 +316,7 @@ it is staged.
   path the full body becomes the prompt — the same off-machine hop the
   re-distillation section records.
 - **`GET /api/memory/{id}/revisions` → `yes`.** `handle_get_memory_revisions`
-  (`server/memory_routes.rs:4339`) → `walk_supersede_chain_scoped`
+  (`server/memory_revision_routes.rs:83`) → `walk_supersede_chain_scoped`
   (`db.rs:48696`). The recursive CTE anchors on `source_id = ?1` with no
   `pending_revision` filter and returns `memory.title` plus
   `substr(memory.content, 1, 200)` (`db.rs:48758`-`db.rs:48759`) as
@@ -1053,8 +1053,8 @@ carrying the authority of agreement.
 | `core/synthesis/refinement_queue.rs:125` | `apply_refinement_with_decision` | `pub` | `accept_page_merge` |
 | `server/main.rs:1073` | `run_daemon` | `private` | `list_pages` |
 | `server/memory_routes.rs:1586` | `handle_create_page` | `pub` | `get_page` |
-| `server/memory_routes.rs:2414` | `handle_update_page` | `pub` | `get_page` |
-| `server/memory_routes.rs:2489` | `handle_refresh_page` | `pub` | `get_page` |
+| `server/memory_routes.rs:2366` | `handle_update_page` | `pub` | `get_page` |
+| `server/memory_routes.rs:2441` | `handle_refresh_page` | `pub` | `get_page` |
 | `server/page_map_routes.rs:73` | `visible_page` | `private` | `get_page` |
 | `server/page_map_routes.rs:93` | `ensure_page_is_active` | `private` | `get_page` |
 | `server/repair_routes.rs:183` | `handle_prepare` | `private` | `prepare_memory_reclassification_with_pages` |

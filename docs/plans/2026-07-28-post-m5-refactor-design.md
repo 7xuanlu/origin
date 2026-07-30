@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 10 complete**
+Status: **R4 complete; R5 in progress; handler-movement slice 11 complete**
 
 ## Authority and change control
 
@@ -4256,6 +4256,87 @@ R5 handler-movement slice 10 evidence, 2026-07-30:
   It independently confirmed the three-route boundary and composition
   position, byte-identical movement hash, exact three-field handler-manifest
   delta, unchanged protected sources, scoped-list/global-mutation semantics
+  and typed controls, current citations/counts, and complete LSP closure. Its
+  focused reruns passed the typed contract, exact handler guard, truth
+  manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff hygiene.
+
+R5 handler-movement slice 11 contract, 2026-07-30:
+
+- Move exactly `GET /api/memory/{id}/revisions`,
+  `GET /api/memory/pending-revisions`, and
+  `GET /api/memory/pending-revision/{source_id}` into
+  `memory_revision_routes.rs`. Preserve their non-contiguous composition
+  positions with `register_history` immediately after page-map routes and
+  before rejections, plus `register_pending` immediately after pinned memories
+  and before snapshots. Exactly three handler-manifest identities may change.
+- Move `PendingRevisionsQuery` and its default-limit helper with the two
+  pending handlers. Preserve both source blocks byte-for-byte: history's
+  supersede-chain envelope/404 behavior, pending list's default and `1..=500`
+  clamp, pending detail's `Json<Option<PendingRevision>>` success shape and
+  indistinguishable scoped/missing `404`, header-only Space resolution, and
+  every short state snapshot before DB awaits.
+- Typed built-router characterization must use shared
+  `ListMemoryRevisionsResponse`, `PendingRevisionItem`, and `PendingRevision`
+  plus the established test-local `ErrorEnvelope`. Seed work/personal targets,
+  accepted chains, and staged revisions; prove work chain/list/detail positive
+  controls, personal negative controls, target-versus-revision ids, history
+  and pending-detail `404`, all three unknown-Space `422`s, all three no-DB
+  `503`s, and all three marked `403`s.
+- History remains page-bearing `Automatic`/`MarkerShape::None`; both pending
+  reads remain non-page-bearing `NotApplicable`/`None`. Truth, sensitive-read,
+  mutation, M5, security, and lifecycle sources stay unchanged. Revision
+  accept/dismiss mutations, snapshots, remaining memory and Page handlers, DTO
+  normalization, CLI, and MCP remain out of scope.
+
+R5 handler-movement slice 11 evidence, 2026-07-30:
+
+- Exactly the three frozen revision readers now execute in
+  `memory_revision_routes.rs`. `register_history` remains immediately after
+  page-map routes and before rejections; `register_pending` remains immediately
+  after pinned memories and before snapshots. No route crossed the
+  non-contiguous boundary.
+- The old/new pending DTO/helper/handler block has identical SHA-256
+  `46d761d8668a87ec2cdcc071a219a3dad645e1a1678bf2f866a738c0619bfcac`;
+  the old/new history handler block has identical SHA-256
+  `6e6f930e5af055ccee41ba904849e0aed2c4c213cee0ce47af01b26aed7f6d51`.
+  Limit clamping, target/detail and chain envelope behavior, scoped `404`s,
+  state snapshots, and DB-await lifetimes are byte-preserved.
+- Before updating expected identities, the production-builder control was RED
+  on precisely three new `memory_revision_routes::*` observations versus three
+  old `memory_routes::*` expectations. Updating only those handler-manifest
+  fields made it GREEN. Truth, sensitive-read, mutation, M5, security, and
+  lifecycle sources remain unchanged.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. Shared `ListMemoryRevisionsResponse` proves the accepted
+  work-chain order/depth; shared `PendingRevisionItem` and `PendingRevision`
+  prove work-only list/detail plus target-versus-revision ids. Personal and
+  missing rows share typed `404`s, while the test-local `ErrorEnvelope` also
+  covers all three unknown-Space `422`s, no-DB `503`s, and marked `403`s. No
+  `serde_json::Value` response oracle is used.
+- Refreshed Rust LSP diagnostics are clean in the new module, old module,
+  router, export, and contract test. All three handlers close on their
+  colocated registrations plus definitions; both registrars close on their
+  distinct composition calls plus definitions.
+- `router.rs` falls from `359` to `349` lines; `memory_routes.rs` falls from
+  `4,412` lines and `41` public handlers to `4,338` lines and `38`; the bounded
+  revision module is `104` lines with three handlers. The generated M5
+  inventory changes only two displaced Page-handler source addresses and
+  remains `191 / 55-50-86 / exposure 22`; current history and displaced
+  memory-route citations were refreshed. Call-site ownership is
+  `41 router + 3 memory_revision_routes + 3 pinned_memory_routes +
+  2 profile_narrative_routes + 1 briefing_routes + 2 decisions_routes +
+  3 memory_detail_routes + 5 activity_tag_routes +
+  5 indexed_files_routes + 13 spaces_routes + 14 entity_graph_routes +
+  75 other = 167`.
+- Focused verification passes after the last code edit: typed contract
+  `1 / 1`; exact handler guard `1 / 1`; truth manifest `16 / 16`; Rust/Python
+  M5 `1 / 1` and `191 / 55-50-86 / exposure 22`; focused Clippy with warnings
+  denied; formatting and diff hygiene.
+- R5 handler-movement slice 11 REVIEW, 2026-07-30: the reused independent Sol
+  lane returned **APPROVE** with zero blocking and zero non-blocking findings.
+  It independently confirmed the three-route/non-contiguous registrar
+  boundary, both byte-identical movement hashes, exact three-field
+  handler-manifest delta, unchanged protected sources, chain/pending semantics
   and typed controls, current citations/counts, and complete LSP closure. Its
   focused reruns passed the typed contract, exact handler guard, truth
   manifest, Rust/Python M5 gates, focused Clippy, formatting, and diff hygiene.
