@@ -60,7 +60,7 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = ingest_routes::register(router);
     let router = import_routes::register(router);
 
-    router
+    let router = router
         // Memory CRUD
         .route(
             "/api/memory/store",
@@ -282,52 +282,11 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/refinery/queue/{id}/accept",
             post(refinery_routes::handle_accept_refinement),
-        )
-        // Sources
-        .route(
-            "/api/sources",
-            get(source_routes::handle_list_sources).post(source_routes::handle_add_source),
-        )
-        .route(
-            "/api/sources/{id}",
-            delete(source_routes::handle_remove_source),
-        )
-        .route(
-            "/api/sources/{id}/sync",
-            post(source_routes::handle_sync_source),
-        )
-        // Config
-        .route(
-            "/api/config",
-            get(config_routes::handle_get_config).put(config_routes::handle_update_config),
-        )
-        .route(
-            "/api/config/skip-apps",
-            get(config_routes::handle_get_skip_apps).put(config_routes::handle_update_skip_apps),
-        )
-        .route(
-            "/api/config/routing",
-            get(config_routes::handle_get_resolved_routing),
-        )
-        // Setup status + provider key management
-        .route(
-            "/api/setup/status",
-            get(config_routes::handle_get_setup_status),
-        )
-        .route(
-            "/api/setup/anthropic-key",
-            put(config_routes::handle_set_anthropic_key)
-                .delete(config_routes::handle_clear_anthropic_key),
-        )
-        // On-device model (list + download-and-load)
-        .route(
-            "/api/on-device-model",
-            get(config_routes::handle_get_on_device_model),
-        )
-        .route(
-            "/api/on-device-model/download",
-            post(config_routes::handle_download_on_device_model),
-        )
+        );
+    let router = source_routes::register(router);
+    let router = config_routes::register(router);
+
+    router
         // Indexed files / chunks (batch 2)
         .route(
             "/api/indexed-files",

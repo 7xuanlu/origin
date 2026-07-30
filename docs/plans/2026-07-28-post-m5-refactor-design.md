@@ -3255,9 +3255,19 @@ Each movement commit must show:
   registration-only slice instead leaves that manifest byte-identical and
   proves a deliberately omitted route fails before completion;
 - exact `171` runtime truth rows and exact sensitive-read set equality;
-- typed success and error response tests for moved HTTP endpoints, using the
-  existing `wenlan-types` contracts rather than `serde_json::Value` as the
-  contract oracle;
+- at least one typed built-router round-trip per moved HTTP endpoint, using
+  existing `wenlan-types` contracts whenever available, never
+  `serde_json::Value`, as the oracle. When production has no shared
+  deserializable DTO, an exact test-local `Deserialize` mirror is permitted
+  and must be named in the slice evidence; errors use the established
+  test-only envelope. Cover typed success and typed deterministic error where
+  both are hermetically reachable. Where a success path requires non-hermetic work
+  (`POST /api/on-device-model/download`: real model download plus engine
+  initialization), the typed deterministic unknown-model error is sufficient;
+  infallible read handlers cover typed success only. Name every relaxation and
+  its reason in the slice evidence. Adding a production seam solely to make a
+  success path hermetic is outside R5; any such seam is a post-R5
+  behavior-change slice;
 - LSP definition/reference closure before movement and zero error diagnostics
   after movement; LSP's `200`-reference display cap is never treated as the
   complete census;
@@ -3268,6 +3278,15 @@ Each movement commit must show:
 
 The truth guard remains a route layer over the finalized router, and the CORS,
 local-only, shutdown-extension, and state layers retain their current order.
+
+R5 evidence-contract addendum, 2026-07-30:
+
+- Fable selected risk-shaped per-endpoint evidence (**C**) over adding
+  test-only production injection surface (**A**) or leaving the download route
+  behind in `router.rs` (**B**). This is a scoped evidence clarification, not
+  a movement-design change: the handler manifest still pins exact identity,
+  D2 still forbids body edits, and every moved endpoint must traverse the
+  built router with a typed oracle. Sol remains the per-slice reviewer.
 
 R5 registration slice 1 evidence, 2026-07-30:
 
@@ -3330,6 +3349,47 @@ R5 registration slice 2 evidence, 2026-07-30:
   coverage for every moved endpoint, the test-only error envelope as the
   movement-only choice, a hermetic missing-file fixture, and byte-identical
   handler, truth, sensitive, and generated M5 manifests.
+
+R5 registration slice 3 evidence, 2026-07-30:
+
+- Registration ownership for all `4` `source_routes` bindings and all `10`
+  `config_routes` bindings moved from the composition root into their owning
+  modules in original order. No handler body, request/response type, lock
+  scope, route layer, or handler-manifest row changed; `router.rs` is now
+  `581` lines.
+- Deliberately omitting `POST /api/on-device-model/download` made the
+  production-builder control RED on that exact missing route. Restoring
+  `handle_download_on_device_model` in the config helper made the same control
+  GREEN.
+- The built-router typed suite passes `1 / 1` across all `14` bindings. It
+  covers the full Source add/list/sync/delete lifecycle and deterministic
+  errors; typed config update, skip-apps, routing, setup/key, and model-list
+  responses; and typed deterministic validation errors. Per the Fable
+  addendum, the real multi-GB model-download success path is not invoked:
+  unknown model id supplies its typed error round-trip. Pure read handlers
+  have success coverage; the bodyless Source delete success is frozen as
+  `204` plus an empty body. All other hermetically reachable success/error
+  pairs are covered without a `serde_json::Value` response oracle.
+  `SetupStatusResponse` and `ResolvedRoutingResponse` use exact test-local
+  `Deserialize` mirrors because their production-local structs are
+  `Serialize`-only and no shared response DTO exists. A test-local RAII guard
+  binds `WENLAN_DATA_DIR` to a fresh temp root for the whole async test and
+  restores the inherited value on drop; an inherited canary run passed while
+  leaving the inherited directory file-empty.
+- LSP reference closure moves representative Source and model-download
+  handlers from `router.rs` into their owning helpers, with zero diagnostics
+  in both modules, the composition root, and the new contract test. Server
+  library passes `347 passed / 2 ignored`; Rust M5 passes `1 / 1`; Python
+  inventory remains `191 / 55-50-86 / exposure 22`; and core/server
+  all-target Clippy with warnings denied passes.
+- R5 registration slice 3 REVIEW, 2026-07-30: Sol first caught and blocked
+  false `4 + 11 = 15` evidence arithmetic plus an inherited
+  `WENLAN_DATA_DIR` overwrite risk. After correction to exact `4 + 10 = 14`,
+  explicit local-success-mirror wording, and the RAII isolation guard, it
+  returned **APPROVE** with no remaining finding. It independently confirmed
+  all identities/order, mixed-sensitive `/api/sources`, the no-download
+  validation path, typed coverage, untouched canary directory, and
+  byte-identical protected manifests.
 
 ### R6 — `post_write` phase decomposition
 

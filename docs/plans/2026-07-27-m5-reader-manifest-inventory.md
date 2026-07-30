@@ -24,10 +24,11 @@ Recorded because the corrections are the only reason to trust the fourth:
 | 163 | fixed both of those, then counted a route registered **inside a `#[cfg(test)]` block** in `routes.rs` — its handler was an inline closure, which is why the adapter cell read `move` |
 | **162** | correct at the merge base: paren-balanced parse, every file, test modules stripped |
 
-Current ownership after the first two R5 registration slices is 132 in
+Current ownership after the first three R5 registration slices is 118 in
 `router.rs`, 13 in `routes.rs`, 2 in `brief_routes.rs`, 6 in
-`community_routes.rs`, 4 in `ingest_routes.rs`, 3 in `import_routes.rs`, 5 in
-`repair_routes.rs`, and 2 in `lint_routes.rs`.
+`community_routes.rs`, 4 in `ingest_routes.rs`, 3 in `import_routes.rs`, 4 in
+`source_routes.rs`, 10 in `config_routes.rs`, 5 in `repair_routes.rs`, and 2
+in `lint_routes.rs`.
 
 Two rules follow, and both are now part of the contract:
 
@@ -1076,7 +1077,7 @@ adds a test that:
 
    | Count | Value | What it counts |
    |---|---|---|
-   | call-site triples | **167** | rows in this table: 132 `router.rs` + 13 `routes.rs` + 2 `brief_routes.rs` + 6 `community_routes.rs` + 4 `ingest_routes.rs` + 3 `import_routes.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
+   | call-site triples | **167** | rows in this table: 118 `router.rs` + 13 `routes.rs` + 2 `brief_routes.rs` + 6 `community_routes.rs` + 4 `ingest_routes.rs` + 3 `import_routes.rs` + 4 `source_routes.rs` + 10 `config_routes.rs` + 5 `repair_routes.rs` + 2 `lint_routes.rs` |
    | runtime builder triples | **171** | `(builder, method, path)` pairs actually installed: 165 `main` + 6 `repair` |
 
    The +4 is two call sites that each land in **both** builders:
@@ -1085,7 +1086,7 @@ adds a test that:
    `repair_routes::register` **wraps** `register_execution`
    (`repair_routes.rs:25`), so `main` gets all five repair routes, not three,
    while `build_repair_router` installs `apply`/`verify` again
-   (`router.rs:549`). An arithmetic that reads only the two
+   (`router.rs:508`). An arithmetic that reads only the two
    `repair_routes::register*` call sites in `router.rs` lands on 164 and is
    wrong.
 
