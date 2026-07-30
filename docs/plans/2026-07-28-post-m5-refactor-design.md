@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R7 design approved; R7-0 executable teeth next**
+Status: **R7-0 complete; R7-1 external test movement next**
 
 ## Authority and change control
 
@@ -5242,7 +5242,9 @@ or scheduling order.
   `baseline → tests-external → startup-state → runtime → ambient → final`.
   The live check accepts exactly the tracked phase during movement; after R7 it
   hard-requires `final`, as R6 does. Synthetic positive controls delete,
-  duplicate, reorder, make public, and downgrade representative stages.
+  duplicate, reorder, and make representative stages public. During movement
+  the parser rejects unknown vocabulary; phase-history advancement is owned by
+  the clean R checkpoints and diff review, not inferred from one mutable file.
 - The final shape requires a thin ordered `run_daemon` facade; one private
   startup state-preparation item; private runtime-worker and serve/drain items;
   one private scheduler ambient child; one `tokio::spawn` scheduler and one
@@ -5253,6 +5255,125 @@ or scheduling order.
   tests, LSP closure, M5 ratchet, and diff review own those moves. Exact byte
   comparison is permitted only for whole syntactic test modules and
   whole top-level ambient items.
+
+R7-0 receipt, 2026-07-30:
+
+- Added the closed tracked marker
+  `crates/wenlan-server/src/daemon_structure_phase.txt` at `baseline`, plus the
+  server-library tooth `daemon_structure_test.rs` declared directly from
+  `lib.rs`. No production source or dependency changed.
+- The live tooth reads and masks `main.rs`, `scheduler.rs`, and the exact
+  phase-owned private children. Its closed vocabulary is
+  `baseline → tests-external → startup-state → runtime → ambient → final`.
+  It pins the declaration position plus adjacent `cfg`/`path` attributes for
+  the exact `bind_addr_tests` and scheduler-test identities, enumerates every
+  `.rs` file under the R7 child directories, and checks only the named R7
+  production items for test-file ownership. Comments, strings, or an
+  `_tests.rs` suffix cannot spoof those boundaries.
+- The live order witnesses cover the durable repair fence and state, DB open,
+  import/recovery, projection enforcement, config/providers/reranker, legacy
+  imports, ingest batcher, runtime worker order, port stdout/file announcement,
+  serve, and both drain branches. `finish_recovery` is exactly once and
+  immediately before shared-state construction. The config,
+  `reranker_cache_dir`, and `deep_bgebase_pending` declarations have one exact
+  startup owner. `shared.read().await` is fixed at five in baseline/startup,
+  then two in the facade plus three in runtime registration. Scheduler order
+  starts with maintenance fence plus state snapshot before the watcher. The
+  scheduler root retains `AmbientBudgetProvider` and
+  `with_shared_automatic_budget`.
+- Scheduler task locality permits exactly one Tokio spawn plus one poll loop in
+  `spawn_scheduler`, and grandfathers exactly the pre-existing one admission
+  loop in `wait_for_startup_model_admission`. After masking those two exact
+  bodies and the inline test module, the entire scheduler production remainder
+  — including `impl` methods — and the ambient child reject `tokio::spawn`,
+  `tokio::task::spawn`, `loop`, and `while`.
+- The phase parser fails closed only for unknown vocabulary during movement. A
+  single mutable marker cannot prove git history or prevent a deliberate phase
+  skip/downgrade, so the tooth makes no such claim. At the R7 boundary the live
+  entry point will hard-require `final`, matching R6.
+- The final phase rejects implementation anchors left in `run_daemon`;
+  statement movement is deliberately owned by order/behavior/M5/diff gates
+  rather than a false byte-equivalence claim.
+- RED: with only the marker advanced to `tests-external`,
+  `cargo test -p wenlan-server --lib
+  daemon_structure_test::daemon_structure_matches_expected_phase -- --exact`
+  failed `0 passed; 1 failed; 352 filtered out` on all six expected boundaries:
+  both external test files/declarations missing and both inline modules still
+  present. The marker was then restored to `baseline`.
+- The first independent Sol review returned **BLOCK**: the initial witness was
+  too coarse around repair/startup/runtime/drain ordering, did not pin value
+  ownership or read counts, could be spoofed by comment/string module text and
+  suffix-hidden child files, left room for extra scheduler tasks/loops, and
+  overstated what a mutable phase marker proves.
+- Review-fix RED: deleting the live
+  `select_startup_repair_fence(&pending_repairs, ...)` call made
+  `reviewer_mutation_removed_repair_fence_is_rejected` fail
+  `0 passed; 1 failed; 353 filtered out` because the original tooth returned no
+  violation. The enriched witness then made the same mutation GREEN.
+- Review-fix GREEN: `cargo test -p wenlan-server --lib
+  daemon_structure_test:: -- --nocapture` passed `9 passed; 0 failed; 0
+  ignored; 349 filtered out`. Five reviewer-specific mutation tests now cover
+  repair/projection/provider/port/drain removal, recovery/share adjacency,
+  maintenance-fence and snapshot removal, hidden root/ambient tasks and loops,
+  config/cache/deep-flag duplication, facade/runtime read-count drift,
+  comment/string module spoofing, duplicate/wrong attributes, and a
+  suffix-hidden child file. `cargo clippy -p wenlan-server --lib -- -D
+  warnings` passed; rust-analyzer reported zero error diagnostics for
+  `daemon_structure_test.rs` and `lib.rs`;
+  `cargo test --workspace --lib daemon_structure_test:: -- --nocapture`
+  passed the same nine server teeth (`9 passed; 349 filtered out`) while the
+  other library targets selected zero tests (`32 / 3504 / 178 / 183` filtered
+  out); `cargo fmt --all -- --check` and `git diff --check` passed.
+- The second independent Sol closure returned **BLOCK**: count-only
+  `shared.read().await` checks did not prove the identities or order of all five
+  snapshots; retaining the startup producer while adding a runtime config
+  reload/cache recomputation/deep-mode derivation was not rejected; the exact
+  stdout discovery line was only indirectly witnessed; and root-function
+  enumeration missed tasks or loops hidden inside `impl` methods.
+- Second review-fix RED: after retaining the original startup config owner and
+  injecting `wenlan_core::config::load_config()` after shared-state
+  construction, the exact mutation test failed `0 passed; 1 failed; 0 ignored;
+  358 filtered out` because the live tooth returned no violation.
+- Second review-fix GREEN pins the identities and order of the three runtime
+  registration snapshots and two facade snapshots, bans alternate runtime
+  producers for config/cache/deep-mode values, requires exactly one
+  `println!("WENLAN_LISTENING_ON={}", local_addr)`-shape call between
+  `listener.local_addr()` and stdout flush, and scans the masked scheduler
+  production remainder after subtracting the two permitted loop bodies.
+  Mutations retain the original producers while adding each alternate,
+  preserve all five shared-read counts while reordering both snapshot groups,
+  delete the stdout line, and hide `tokio::task::spawn` plus `loop` in an
+  `impl` method.
+- `cargo test -p wenlan-server --lib daemon_structure_test:: -- --nocapture`
+  passed `11 passed; 0 failed; 0 ignored; 349 filtered out`.
+  `cargo clippy -p wenlan-server --lib -- -D warnings` passed.
+  `cargo test --workspace --lib daemon_structure_test:: -- --nocapture`
+  passed the same eleven server teeth (`11 passed; 349 filtered out`) while the
+  other library targets selected zero tests (`32 / 3504 / 178 / 183` filtered
+  out). rust-analyzer resolved the live tooth definition and its `13`
+  declaration-plus-call references and reported zero error diagnostics for
+  `daemon_structure_test.rs` and `lib.rs`.
+- Closure correction: the first producer ban recognized only direct calls, so
+  `use wenlan_core::config::load_config as reload; reload()` escaped. The alias
+  mutation failed `0 passed; 1 failed; 0 ignored; 359 filtered out` with no
+  violation. The live ban now requires zero masked-code identifier occurrences
+  for all four producer identities, covering direct paths, imports, and aliases
+  while comments and strings remain ignored.
+- Future-phase scan correction: truncating scheduler production at the `tests`
+  declaration hid any production suffix once R7-1 changes the inline module to
+  external `mod tests;`. Moving the hidden-`impl` spawn/loop mutation after an
+  external test declaration failed `0 passed; 1 failed; 0 ignored; 359 filtered
+  out`; only the ambient mutation was reported. The locality tooth now scans
+  the full masked scheduler and blanks only the exact parsed inline-module span
+  or external module declaration, so production before and after it remains in
+  scope. Focused GREEN remained `11 passed; 0 failed; 0 ignored; 349 filtered
+  out`; format and diff checks passed.
+- The third independent Sol closure re-review returned **APPROVE**. It
+  reproduced the focused `11 / 11` result and found no remaining false-green in
+  carried-value identity, all five snapshot identities/order, stdout discovery,
+  scheduler task/loop locality, external-test suffix scanning, or the
+  parser/identifier boundaries. Server-lib Clippy with `-D warnings`, format,
+  diff hygiene, and zero-error rust-analyzer diagnostics also passed.
 
 #### R7-1 — externalize binary and scheduler tests
 

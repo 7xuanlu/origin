@@ -66,6 +66,10 @@ mod repair_endpoint_test;
 #[path = "truth_error_seam_test.rs"]
 mod truth_error_seam_test;
 
+#[cfg(test)]
+#[path = "daemon_structure_test.rs"]
+mod daemon_structure_test;
+
 /// Shared mutex for tests that mutate the process-wide `WENLAN_DATA_DIR` env
 /// var. Rust tests run in parallel by default, so any test that swaps this env
 /// var must hold this single crate-level lock for the full guard lifetime.
