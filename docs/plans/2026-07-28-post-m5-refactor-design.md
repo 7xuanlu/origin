@@ -2146,6 +2146,43 @@ Frozen slice contract:
   `22`, and ambiguity `9`. Ast-grep must find one function declaration; LSP
   definition/references must resolve the sole production path to the DB child
   with zero error diagnostics.
+- RED, 2026-07-29: the five direct controls first failed `0 / 5` against the
+  explicit DB-child stub. Four stopped at `R4-21 RED stub`; the apply-level
+  control failed loud with the unconsumed write/restore checkpoint names.
+  Lowering only the ratchet row produced the exact expected
+  `post_write.rs: direct .conn.lock() access increased 13 -> 14` failure.
+- IMPLEMENTED, 2026-07-29: `db/repair_page_regenerate.rs` now owns the sole
+  canonical declaration and complete critical section; `post_write` preserves
+  the old path with a `pub(crate) use`. The split Page/row snapshot, DB-before-
+  projection lock topology, both compensation branches, exact error mapping,
+  and apply receipt behavior are unchanged. `RepairWriteProof::from_parts`
+  replaces field construction, and only test builds expose owned,
+  consumption-checked task-local checkpoints.
+- GREEN, 2026-07-29: the direct child suite passes `5 / 5`; the four named
+  `page_projection_*` integration controls pass; and the exact external-access
+  ratchet passes. External literals are `294 → 293`, production `5 → 4`, and
+  tests remain `289`. Core/server all-target Clippy with `-D warnings`,
+  formatting, and the generated inventory checks pass.
+- MUTATION GATE, 2026-07-29: removing either restore call failed its matching
+  branch with unconsumed restore checkpoints; shortening the DB-guard lifetime
+  let the contender enter before operation return; moving `before_commit`
+  before the target write failed `target_write_seen`; and removing the
+  DB-snapshot checkpoint failed with its exact unconsumed name. Every mutant
+  was restored before the final GREEN rerun. The apply-level composed
+  restore-failure `VectorDb` path independently proves both pending and final
+  receipts remain absent.
+- LSP AND TOPOLOGY GATE, 2026-07-29: ast-grep finds exactly one declaration in
+  the DB child. LSP references enumerate the unchanged sole production call
+  through the `post_write` re-export plus the direct tests; the child, facade,
+  and direct-test files report zero error diagnostics. The regenerated M5
+  inventory remains exactly `191 / 55-50-86 / exposure 22 / ambiguity 9`;
+  only source addresses moved.
+- FINAL REVIEW GATE, 2026-07-29: Sol and the independent concurrency auditor
+  both returned `APPROVE` after inspecting the current diff against the frozen
+  contract. Root independently reran the direct suite `5 / 5`, each of the
+  four named projection integration tests, the external-access ratchet
+  `3 / 3`, Rust M5 gate `1 / 1`, and reader inventory at
+  `191 / 55-50-86 / exposure 22`.
 
 #### R4-22 — stale-projection quarantine and recovery
 
