@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 re-approved through the R4-24 split; R4-25 group 4 complete**
+Status: **R4 complete; R5 executable-boundary re-gate pending after PR-D integration**
 
 ## Authority and change control
 
@@ -3128,6 +3128,112 @@ Frozen slice contract:
 Move route registration and handlers domain by domain. Preserve route identity,
 typed request/response contracts, and `TrackedRouter` classification.
 
+Current-tree rebaseline at `e5d50255`:
+
+- `memory_routes.rs` contains `95` public `handle_*` functions across `5,725`
+  lines;
+- `router.rs` contains the main composition root across `685` lines;
+- the truth manifest contains `167` static HTTP rows and expands to exactly
+  `171` runtime `(builder, method, path)` rows: `165` main and `6` repair;
+- `TrackedRouter` proves exact truth-manifest and sensitive-read route sets, but
+  it does not currently prove that a preserved method/path still points at the
+  same handler.
+
+#### R5-0 — executable route-to-handler boundary
+
+Before moving a registration or handler, extend `TrackedMethodRouter` to retain
+the concrete handler identity captured by Rust's type system. Add a separate,
+current-tree manifest over exact
+`(builder, method, path, handler-identity)` rows and require production
+`finish()` / `finish_restricted()` to match it by set equality.
+
+The new manifest is independent of both existing route contracts:
+
+- `truth_manifest` continues to classify every registered method/path for M5;
+- `sensitive_read_routes` continues to classify the scoped-read subset;
+- the R5 handler manifest proves that movement did not silently bind the right
+  route to the wrong function.
+
+The guard must bite before any movement:
+
+- a production main-router and repair-router positive control pass with all
+  exact handler rows;
+- substituting a different handler at an existing method/path fails;
+- omitting or duplicating one row fails;
+- a test-only unbound constructor, if needed for synthetic classifier tests,
+  remains `#[cfg(test)]` and cannot be called by production builders;
+- no source parser or line-number table is the runtime oracle. A parser may
+  generate/reconcile the static rows, but `TrackedRouter` supplies the observed
+  set at build time.
+
+The initial manifest is a guard-only commit. It changes no route, handler,
+layer order, response, truth adapter, or generation.
+
+Handler identity is exact only within the pinned Rust toolchain. If a toolchain
+change makes every handler row fail at once, refresh the manifest in a
+manifest-only commit after review; never weaken equality to suffix or substring
+matching.
+
+#### R5 movement sequence
+
+Every following commit is movement-only under D2. One writer owns `router.rs`
+and the active domain file under D7. A slice moves its registration helper,
+handlers, private helpers, request/response wrappers, and directly owned tests
+together; it does not rewrite handler bodies or opportunistically consolidate
+types.
+
+1. Existing handler modules gain `register(TrackedRouter<SharedState>)`
+   composition helpers, in small bounded commits: general/brief/community,
+   ingest/import, source/config, and
+   knowledge/onboarding/refinery/page-map/websocket. `router.rs` retains only
+   ordering and cross-cutting layers.
+2. Extract the lowest-coupling `memory_routes` families first:
+   profile/agents, entity graph, spaces, then indexed files/chunks.
+3. Extract activities/tags plus the non-page capture/detail family, followed by
+   decisions/briefing/profile narrative/pinned/revisions/snapshots.
+4. Extract the remaining memory CRUD/search/enrichment family after its
+   scheduler-handoff, rerank, attribution, and update tests move with it.
+5. Move the page family last as one protected lane: page list/get/search,
+   sources, export, archive/delete/create/refresh, links/orphans/revisions, and
+   existing page-map registration. Its truth marker/adapters and
+   `PagePermit` write gates remain unchanged.
+
+The exact handler count and each route-to-handler partition are taken from the
+R5 manifest, not the prose grouping above. Each commit may change handler
+module identities only for its named rows; all `(builder, method, path)` sets
+remain byte-for-byte equal, and every untouched handler identity must remain
+equal.
+
+R5 begins only after merging current `main`, which contains PR-D
+`d1fb5d9f`. That commit resolves the stale branch's `GET /api/activities`
+manifest/handler mismatch with
+`truth_adapter::redact_page_activity_detail`; the activity slice must move that
+call byte-for-byte with the handler. The live production database is already at
+generation `1` with fence `2:committed`, while a freshly migrated database
+still defaults to `0`. R5 does not readjust either state: it preserves PR-D's
+generation-sensitive behavior and never calls the cutover ceremony or setter.
+
+#### Per-slice evidence
+
+Each movement commit must show:
+
+- the handler manifest RED before its intentional identity update, then GREEN
+  with only the named rows changed;
+- exact `171` runtime truth rows and exact sensitive-read set equality;
+- typed success and error response tests for moved HTTP endpoints, using the
+  existing `wenlan-types` contracts rather than `serde_json::Value` as the
+  contract oracle;
+- LSP definition/reference closure before movement and zero error diagnostics
+  after movement; LSP's `200`-reference display cap is never treated as the
+  complete census;
+- affected server tests, M5 truth/reader/write gates, Clippy with warnings
+  denied, formatting, and diff hygiene;
+- a fresh Sol review against D2, route/wire identity, async lock lifetimes, and
+  M5 drift.
+
+The truth guard remains a route layer over the finalized router, and the CORS,
+local-only, shutdown-extension, and state layers retain their current order.
+
 ### R6 — `post_write` phase decomposition
 
 Begin only after the M5 exact-base and truth-state reader/write paths have
@@ -3354,3 +3460,28 @@ structural facade definition and executable contracts above remain the gates.
   (`289 = 107 repair + 71 lint + 111 remaining`). This corrects a prose
   arithmetic error only; the lint-family boundary, migration order, protected
   contracts, and review gates are unchanged, so Fable gate 1 remains valid.
+
+### 2026-07-30 — R5 executable handler-boundary candidate
+
+- Rebaselined the server surface at `e5d50255`: `95` public handlers remain in
+  `memory_routes.rs`; the truth manifest has `167` static HTTP rows expanding
+  to `171` runtime builder/method/path rows.
+- Added R5-0 before movement because the existing exact route-set gates cannot
+  detect binding the correct route to the wrong handler. The proposed
+  `TrackedRouter` handler-identity manifest is an independent set-equality
+  contract with positive and mutation controls.
+- Froze the movement order from existing handler modules through low-coupling
+  memory families, memory core, and finally the M5-protected page lane. One
+  writer owns the hot route and handler files.
+- Found that the branch-local `GET /api/activities` mismatch was stale relative
+  to merged PR-D `d1fb5d9f`, which adds
+  `redact_page_activity_detail`. R5 now requires PR-D integration first and
+  moves that adapter call byte-for-byte with the handler.
+- Corrected the generation premise from the stale plan: the live production DB
+  reads generation `1` and fence `2:committed`; fresh databases still default
+  to `0`. R5 mutates neither state.
+- Declared exact handler names toolchain-scoped: a toolchain-wide manifest
+  refresh stays exact and isolated instead of weakening identity comparison.
+- This adds an executable boundary and PR sequence, so it is a material design
+  change. Production implementation remains blocked until a narrow Fable
+  gate-1 review returns APPROVE.
