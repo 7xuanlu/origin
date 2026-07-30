@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{delete, post, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
     response::Json,
@@ -10,6 +11,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use wenlan_types::sources::RawDocument;
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/ingest/text", post(handle_ingest_text))
+        .route("/api/ingest/webpage", post(handle_ingest_webpage))
+        .route("/api/ingest/memory", post(handle_ingest_memory))
+        .route(
+            "/api/documents/{source}/{source_id}",
+            delete(handle_delete_document),
+        )
+}
 
 // ===== Request/Response Types =====
 

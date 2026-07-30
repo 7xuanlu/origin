@@ -48,7 +48,7 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = brief_routes::register(router);
     let router = community_routes::register(router);
 
-    router
+    let router = router
         .route(
             "/api/memory/recent",
             get(memory_routes::handle_recent_memories),
@@ -56,34 +56,11 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/memory/unconfirmed",
             get(memory_routes::handle_list_unconfirmed_memories),
-        )
-        // Ingest
-        .route("/api/ingest/text", post(ingest_routes::handle_ingest_text))
-        .route(
-            "/api/ingest/webpage",
-            post(ingest_routes::handle_ingest_webpage),
-        )
-        .route(
-            "/api/ingest/memory",
-            post(ingest_routes::handle_ingest_memory),
-        )
-        .route(
-            "/api/documents/{source}/{source_id}",
-            delete(ingest_routes::handle_delete_document),
-        )
-        // Import
-        .route(
-            "/api/import/memories",
-            post(import_routes::handle_import_memories),
-        )
-        .route(
-            "/api/import/chat-export",
-            post(import_routes::handle_chat_export_import),
-        )
-        .route(
-            "/api/import/state",
-            get(import_routes::handle_list_pending_imports),
-        )
+        );
+    let router = ingest_routes::register(router);
+    let router = import_routes::register(router);
+
+    router
         // Memory CRUD
         .route(
             "/api/memory/store",

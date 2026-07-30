@@ -3301,6 +3301,36 @@ R5 registration slice 1 evidence, 2026-07-30:
   and the inventory prose names the current
   `139 + 13 + 2 + 6 + 5 + 2 = 167` call-site distribution.
 
+R5 registration slice 2 evidence, 2026-07-30:
+
+- Registration ownership for all `4` `ingest_routes` bindings and all `3`
+  `import_routes` bindings moved from the composition root into their owning
+  modules without changing registration order. No handler body, request or
+  response type, lock scope, truth classification, or handler-manifest row
+  changed.
+- Omitting `GET /api/import/state` made the production-builder control RED on
+  the exact sensitive-route set; restoring the same
+  `handle_list_pending_imports` binding made it GREEN. The handler guard passes
+  `17 / 17`, server library `347 passed / 2 ignored`, truth guard `12 / 12`,
+  and default-save-space import coverage `5 / 5`. Rust and Python M5 gates pass
+  at `1 / 1` and `191 / 55-50-86 / exposure 22`; no generated inventory row
+  or exact handler/truth/sensitive manifest changed.
+- LSP resolves representative ingest/import handlers only to their colocated
+  registration and definition after movement, with zero error diagnostics in
+  all three changed Rust files and the new contract test. The built-router
+  contract suite passes `2 / 2`: all seven moved endpoints deserialize their
+  success wire into the existing `wenlan-types` response structs, and all
+  seven deterministic failures deserialize into a typed test-only error
+  envelope. It uses no `serde_json::Value` response oracle. Core/server
+  all-target Clippy with warnings denied passes.
+- R5 registration slice 2 REVIEW, 2026-07-30: after first returning **BLOCK**
+  for missing typed built-router coverage, the same independent Sol reviewer
+  returned **APPROVE** with no critical, important, or minor finding. It
+  confirmed exact `4 + 3` route order and identities, typed success and error
+  coverage for every moved endpoint, the test-only error envelope as the
+  movement-only choice, a hermetic missing-file fixture, and byte-identical
+  handler, truth, sensitive, and generated M5 manifests.
+
 ### R6 — `post_write` phase decomposition
 
 Begin only after the M5 exact-base and truth-state reader/write paths have
