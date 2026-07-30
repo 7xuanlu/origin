@@ -53,7 +53,14 @@ fi
 - If the probe cannot run because the runtime is down: continue to bootstrap.
 - If `PLUGIN_JSON` is unreadable or `python3` is missing: continue to doctor;
   Codex will keep using this slice until the plugin cache is updated.
-- If mismatch, repair the runtime:
+- If mismatch, check the direction before repairing. Compare the release part
+  of `daemon=` (strip the `+g<sha>` suffix) against `release=`, numeric per
+  component, not lexicographic. Daemon release equal or newer → the plugin
+  cache is stale, not the runtime: skip the repair below (it would only
+  reinstall the same-or-latest runtime and restart a healthy daemon) and go
+  straight to the stop message in step 4 — update the plugin, restart, rerun.
+- Only if the daemon release is older than the plugin release, repair the
+  runtime:
 
 ```bash
 PLUGIN_JSON="${CODEX_PLUGIN_ROOT:-plugin-codex}/.codex-plugin/plugin.json"
