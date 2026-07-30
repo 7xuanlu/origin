@@ -38,8 +38,7 @@ fn outcome(report: &wenlan_types::lint::LintReport, id: &str) -> LintOutcome {
 #[tokio::test]
 async fn source_text_controls_episode_eligibility_in_sweep_and_runner() {
     let (db, _tmp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memories (
@@ -75,7 +74,7 @@ async fn source_text_controls_episode_eligibility_in_sweep_and_runner() {
 #[tokio::test]
 async fn archive_predecessor_stays_head_while_evicted_memory_is_excluded() {
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO memories (
             id, content, source, source_id, title, chunk_index, last_modified,
@@ -106,7 +105,7 @@ async fn archive_predecessor_stays_head_while_evicted_memory_is_excluded() {
 #[tokio::test]
 async fn pending_reembed_on_one_chunk_does_not_mask_an_unowned_missing_embedding() {
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO memories (
             id, content, source, source_id, title, chunk_index, last_modified,

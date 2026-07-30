@@ -2836,8 +2836,8 @@ Frozen slice contract:
   micro-slice; (2) the opaque seam, exact census/manifest, and RED controls;
   (3) all alternate-handle and lint-snapshot fixtures; (4) the repair family,
   whose `107` primary locks include the independent
-  `BEGIN IMMEDIATE`/blocked-CAS control; (5) lint's remaining `70` primary
-  locks; (6) the remaining `112` lower-risk primary locks; (7) make both
+  `BEGIN IMMEDIATE`/blocked-CAS control; (5) lint's remaining `71` primary
+  locks; (6) the remaining `111` lower-risk primary locks; (7) make both
   `MemoryDB::conn` and `_db` private in every build and replace the old
   `289`-only baseline with the zero raw-capability gate. Each group commits
   only after its exact raw-set decrease and support-manifest addition agree.
@@ -3035,6 +3035,34 @@ Frozen slice contract:
   assertions, and the independent secondary blocked-CAS transaction. Its
   parser, repair, repair-plan, legacy, M5, clippy, formatting, diff, and
   per-file LSP checks all passed.
+- R4-25 group 5 RED/GREEN evidence, 2026-07-30: after correcting the frozen
+  prose census from `70` to the manifest-backed `71`, the focused census RED
+  failed exactly `182 != 111`. Migrating the complete lint family removed
+  exactly those `71` `PrimaryConnLock` identities and no other raw identity.
+  GREEN leaves `118` raw identities: `111` non-lint primary locks, `0`
+  try-locks, `0` alternate fields, and the unchanged `7` standalone libSQL
+  origins. The legacy baseline independently failed on exactly the `24`
+  lint files whose direct-lock counts reached zero.
+- The support-manifest RED added exactly `160` identities and removed none:
+  `71` `test_primary_session`, `55` execute, `27` execute-batch, `2` query,
+  `2` next, and `3` get. GREEN is therefore `411 -> 571`; every fixture fits
+  the existing opaque seam, with no new support method or raw capability.
+  Original explicit drops, isolated snapshots, fresh observers, read-only
+  transactions, and SQL/assertion order remain unchanged.
+- The full lint namespace passes `218 / 218` with `2` ignored. The parser /
+  exact manifests pass `35 / 35`; the opaque seam passes `5 / 5`; legacy
+  access passes `3 / 3`; truth manifest and exposure pass `16 / 16` and
+  `13 / 13`; Rust M5 passes `1 / 1`; and the Python inventory remains
+  `191 / 55-50-86 / exposure 22`. Core/server all-target Clippy with warnings
+  denied, formatting, diff hygiene, and LSP error diagnostics pass.
+- R4-25 group 5 REVIEW, 2026-07-30: the independent Sol reviewer returned
+  **APPROVE** with no correctness, lifetime, concurrency, capability-boundary,
+  freshness, read-only, manifest-gaming, M5, or truth blocker. It independently
+  confirmed all `71` migrations, zero lint references to raw `MemoryDB::conn`,
+  exactly `71` LSP-resolved references to `test_primary_session`, the
+  `118` raw / `571` support manifests, unchanged statement/drop ordering, and
+  the `71 + 111` census correction. Its parser, seam, legacy, full-lint, truth,
+  M5, Clippy, formatting, diff, and per-file LSP checks all passed.
 
 ### R5 — server vertical slices
 
@@ -3256,3 +3284,14 @@ structural facade definition and executable contracts above remain the gates.
   manifest/tag locks and the borrowed rename session remain live.
 - Fable's narrow gate-1 re-review returned **APPROVE** after independently
   confirming the LSP reference set and the movement/control boundary.
+
+### 2026-07-30 — R4-25 lint census correction
+
+- The exact raw manifests at `f8b791f6`, `4e0c9bf7`, and `a4edf9f4` each
+  contain `71`, not `70`, `PrimaryConnLock` identities under
+  `crates/wenlan-core/src/lint/**`. No lint identity was assigned to another
+  fixture group.
+- The final lower-risk group is consequently `111`, not `112`
+  (`289 = 107 repair + 71 lint + 111 remaining`). This corrects a prose
+  arithmetic error only; the lint-family boundary, migration order, protected
+  contracts, and review gates are unchanged, so Fable gate 1 remains valid.

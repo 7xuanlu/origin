@@ -59,8 +59,7 @@ pub(super) fn assert_selective_inconsistency(
 }
 
 pub(super) async fn insert_page(db: &crate::db::MemoryDB, id: &str) {
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO pages (id, title, content, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status) VALUES (?1, ?1, 'body', '[]', 1, 'active', 'now', 'now', 'now', 'distilled', 'confirmed')",

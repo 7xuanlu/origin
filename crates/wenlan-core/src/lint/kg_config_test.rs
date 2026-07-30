@@ -103,8 +103,7 @@ fn check(report: &wenlan_types::lint::LintReport) -> &wenlan_types::lint::LintCh
 }
 
 async fn insert_memory(db: &crate::db::MemoryDB) {
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, stability, supersede_mode, needs_reembed, memory_type) VALUES ('eligible', 'eligible body', 'memory', 'eligible', 'eligible', 0, 1, 'text', 'new', 'hide', 1, 'fact')",

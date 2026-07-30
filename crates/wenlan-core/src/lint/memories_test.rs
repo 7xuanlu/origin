@@ -196,7 +196,7 @@ fn partition_counts_use_full_population_not_sample_cap() {
 #[tokio::test]
 async fn selected_scope_anchors_memory_denominators_and_page_off_is_group_local() {
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute("INSERT INTO spaces (id, name, created_at, updated_at) VALUES ('s-a','alpha',1,1),('s-b','beta',1,1)", ()).await.unwrap();
     for (id, space) in [("mem-a", "alpha"), ("mem-b", "beta")] {
         conn.execute("INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, stability, supersede_mode, space, needs_reembed, memory_type) VALUES (?1,'body','memory',?1,?1,0,1,'text','new','hide',?2,1,'fact')", libsql::params![id, space]).await.unwrap();

@@ -51,8 +51,7 @@ async fn structural_orphans_and_invalid_rows_are_errors_without_mutation() {
 #[tokio::test]
 async fn imported_document_entity_links_have_a_valid_memory_owner() {
     let (db, _tmp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO entities
@@ -135,7 +134,7 @@ async fn duplicate_names_hubs_and_semantic_suspicion_are_advisory_only() {
 #[tokio::test]
 async fn full_population_is_validated_while_opaque_evidence_is_capped() {
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
     for index in 0..101 {
         conn.execute(
@@ -213,7 +212,7 @@ async fn insert_memory(db: &crate::db::MemoryDB, id: &str, space: Option<&str>) 
     // M3 PR-1 stage e: memories.space is NOT NULL as of migration 91, so
     // "no space" must bind the reserved sentinel id, not NULL.
     let space = space.unwrap_or(crate::db::UNFILED_SPACE_ID);
-    db.conn.lock().await.execute(
+    db.test_primary_session().await.execute(
         "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, stability, supersede_mode, needs_reembed, memory_type, space) VALUES (?1, 'eligible body', 'memory', ?1, ?1, 0, 1, 'text', 'new', 'hide', 1, 'fact', ?2)",
         libsql::params![id, space],
     ).await.unwrap();
@@ -221,7 +220,7 @@ async fn insert_memory(db: &crate::db::MemoryDB, id: &str, space: Option<&str>) 
 
 async fn seed_corrupt_graph(db: &crate::db::MemoryDB) {
     insert_memory(db, "memory-ok", None).await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
     conn.execute_batch(
         "INSERT INTO entities (id,name,entity_type,space,confidence,confirmed,created_at,updated_at) VALUES ('entity-ok','Secret Entity','concept',NULL,0.8,0,1,1),('entity-bad',' ','', 'missing-space',1.5,2,1,1);
@@ -232,13 +231,13 @@ async fn seed_corrupt_graph(db: &crate::db::MemoryDB) {
 }
 
 async fn seed_valid_scoped_graph(db: &crate::db::MemoryDB) {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute_batch("INSERT INTO spaces (id,name,created_at,updated_at) VALUES ('s-a','alpha',1,1),('s-b','beta',1,1);").await.unwrap();
     drop(conn);
     insert_memory(db, "mem-alpha", Some("alpha")).await;
     insert_memory(db, "mem-beta", Some("beta")).await;
     insert_memory(db, "mem-none", None).await;
-    db.conn.lock().await.execute_batch(
+    db.test_primary_session().await.execute_batch(
         "INSERT INTO entities (id,name,entity_type,space,confirmed,created_at,updated_at) VALUES ('ent-a','Alpha','concept','alpha',0,1,1),('ent-b','Beta','concept','beta',0,1,1);
          INSERT INTO observations (id,entity_id,content,confirmed,created_at) VALUES ('obs-a','ent-a','a',0,1),('obs-b','ent-b','b',0,1);
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at) VALUES ('rel-a','ent-a','ent-b','related',1);
@@ -247,14 +246,13 @@ async fn seed_valid_scoped_graph(db: &crate::db::MemoryDB) {
 }
 
 async fn seed_advisory_graph(db: &crate::db::MemoryDB) {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute_batch("INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at) VALUES ('hub','Shared','person',0,1,1),('dupe',' shared ','concept',0,1,1);").await.unwrap();
     drop(conn);
     for index in 0..21 {
         let id = format!("mem-{index:02}");
         insert_memory(db, &id, None).await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "INSERT INTO memory_entities (memory_id,entity_id) VALUES (?1,'hub')",

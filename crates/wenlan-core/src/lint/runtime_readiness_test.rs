@@ -34,8 +34,7 @@ async fn equal_readiness_counts_cannot_hide_wrong_provider_model_or_reranker_pat
 #[tokio::test]
 async fn status_mismatch_finds_and_direct_error_stays_incomplete_after_zero_fallback() {
     let (db, _temp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type) VALUES ('status-row', '', 'memory', 'status-row', '', 0, 1, 'text')",

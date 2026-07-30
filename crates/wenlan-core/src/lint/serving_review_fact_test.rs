@@ -139,7 +139,7 @@ async fn insert_children(db: &crate::db::MemoryDB, selected_near: bool) {
             ("d-work", "work-a", work),
         ]
     };
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for (id, parent, embedding) in children {
         conn.execute(
             "INSERT INTO child_vectors (id,parent_kind,parent_id,field,content,embedding) VALUES (?1,'memory',?2,'fact','body',vector32(?3))",
@@ -168,7 +168,7 @@ async fn exact_ann_limit_fixture() -> (crate::db::MemoryDB, tempfile::TempDir) {
         ("c-work", "work-a", vector_pair(0.97, 0.30)),
         ("d-far", "other-far", vector_pair(0.0, 1.0)),
     ];
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for (id, parent, embedding) in children {
         conn.execute(
             "INSERT INTO child_vectors (id,parent_kind,parent_id,field,content,embedding) VALUES (?1,'memory',?2,'fact','body',vector32(?3))",

@@ -113,8 +113,7 @@ async fn snapshot_receipt_detects_same_row_count_update() {
         writer_ready_for_task.wait().await;
         writer_release_for_task.wait().await;
         writer_db
-            .conn
-            .lock()
+            .test_primary_session()
             .await
             .execute(
                 "UPDATE entities SET name = ?1 WHERE id = ?2",
@@ -161,8 +160,7 @@ async fn completed_receipt_is_invalidated_by_a_later_same_row_update() {
 
     // When: a canonical UPDATE commits without changing schema or row counts.
     let changed = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute("UPDATE profiles SET updated_at = updated_at + 1", ())
         .await
@@ -238,8 +236,7 @@ async fn replacing_the_freshness_observer_invalidates_prior_receipts() {
     // When: a same-row canonical write commits and a new daemon lifetime opens
     // a fresh observer connection over the same database.
     let changed = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute("UPDATE profiles SET updated_at = updated_at + 1", ())
         .await

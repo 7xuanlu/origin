@@ -46,7 +46,7 @@ async fn scoped_rows_are_isolated_redacted_and_read_only() {
 #[tokio::test]
 async fn impossible_registry_session_cache_and_tag_rows_are_findings() {
     let (db, _temp) = test_db().await;
-    db.conn.lock().await.execute_batch(
+    db.test_primary_session().await.execute_batch(
         "INSERT INTO agent_connections (id,name,agent_type,enabled,trust_level,memory_count,created_at,updated_at) VALUES ('bad-agent',' ','api',2,'forged',-1,2,1);
          INSERT INTO document_tags (source,source_id,tag) VALUES ('memory','missing-memory','secret-tag');
          INSERT INTO capture_refs (source_id,activity_id,snapshot_id,app_name,window_title,timestamp,source) VALUES ('capture-secret','missing-activity','missing-snapshot','secret app','secret title',10,'/secret/path');
@@ -73,8 +73,7 @@ async fn impossible_registry_session_cache_and_tag_rows_are_findings() {
 #[tokio::test]
 async fn tag_evidence_identity_survives_earlier_row_deletion() {
     let (db, _temp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -99,8 +98,7 @@ async fn tag_evidence_identity_survives_earlier_row_deletion() {
         .iter()
         .all(|evidence| matches!(evidence, LintEvidenceRef::OpaqueDigest { .. })));
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "DELETE FROM document_tags
@@ -116,8 +114,7 @@ async fn tag_evidence_identity_survives_earlier_row_deletion() {
 #[tokio::test]
 async fn importer_unknown_confirmation_and_provenance_agent_are_valid() {
     let (db, _temp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memories
@@ -137,8 +134,7 @@ async fn importer_unknown_confirmation_and_provenance_agent_are_valid() {
 #[tokio::test]
 async fn cross_owner_and_out_of_window_session_rows_are_findings() {
     let (db, _temp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO activities (id,started_at,ended_at) VALUES
@@ -192,7 +188,7 @@ async fn run_lint(db: &crate::db::MemoryDB, space: Option<&str>) -> wenlan_types
 }
 
 async fn seed_spaces(db: &crate::db::MemoryDB) {
-    db.conn.lock().await.execute_batch(
+    db.test_primary_session().await.execute_batch(
         "INSERT INTO spaces (id,name,created_at,updated_at) VALUES ('space-a','alpha',1,1),('space-b','beta',1,1);",
     ).await.unwrap();
 }
@@ -205,7 +201,7 @@ async fn seed_invalid_memory(db: &crate::db::MemoryDB, id: &str, space: &str) {
     } else {
         space
     };
-    db.conn.lock().await.execute(
+    db.test_primary_session().await.execute(
         "INSERT INTO memories (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,confirmed,pinned,pending_revision,stability,supersede_mode,memory_type,space) VALUES (?1,'secret body','memory',?1,'secret title',0,1,'text',0,1,1,'impossible','hide','decision',?2)",
         libsql::params![id, space],
     ).await.unwrap();
