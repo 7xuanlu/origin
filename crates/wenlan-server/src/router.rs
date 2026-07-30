@@ -434,10 +434,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         );
     let router = knowledge_routes::register(router);
     let router = onboarding_routes::register(router);
+    let router = websocket::register(router);
 
     router
-        // WebSocket
-        .route("/ws/updates", get(websocket::handle_ws_upgrade))
         .finish()
         // Innermost of the three, and `route_layer` rather than `layer`: it
         // resolves the route's marker shape from `MatchedPath`, which only

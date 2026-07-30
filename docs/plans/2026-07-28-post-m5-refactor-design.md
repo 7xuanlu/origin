@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 gate 1 APPROVED; R5-0 ready**
+Status: **R4 complete; R5 in progress; registration slice 5 APPROVED**
 
 ## Authority and change control
 
@@ -3425,6 +3425,47 @@ R5 registration slice 4 evidence, 2026-07-30:
   preservation, untouched WebSocket/page-map/layers, isolated page/config
   roots, address-only generated inventory changes, and byte-identical
   protected manifests.
+
+R5 registration slice 5 evidence, 2026-07-30:
+
+- Registration ownership for the one `GET /ws/updates` binding moved from the
+  composition root into `websocket::register` at the same position after
+  onboarding registration. No handler body, protocol type, lock scope, truth
+  demotion, route layer, or handler-manifest row changed; `router.rs` is now
+  `546` lines.
+- Deliberately omitting the helper call made the production-builder control
+  RED on the exact missing `GET /ws/updates` binding. Restoring
+  `websocket::register` made the same control GREEN. The exact handler manifest
+  still observes `165 + 6` runtime bindings.
+- The built-router contract suite uses a real ephemeral loopback TCP listener
+  and WebSocket upgrade rather than an HTTP `oneshot`. It passes `1 / 1`,
+  deserializing the subscription response into an exact test-local
+  `WsServerMessage` mirror and asserting the zero-count `index_progress`
+  payload, then sending malformed text and deserializing the deterministic
+  typed `error` response. `tokio-tungstenite 0.28`, already lockfile-resolved
+  through Axum, is now a direct test-only dependency. No `serde_json::Value`
+  response oracle or production test seam was added.
+- LSP initially exposed its stale-index failure mode by retaining the removed
+  `router.rs` reference. After zero-error diagnostics refreshed the three
+  changed Rust files, the same reference query resolved
+  `handle_ws_upgrade` only to its colocated registration and definition.
+  Server library passes `347 passed / 2 ignored`; truth guard and truth
+  manifest pass `12 / 12` and `16 / 16`; the Rust M5 gate passes `1 / 1`;
+  Python inventory remains `191 / 55-50-86 / exposure 22`; core/server
+  all-target Clippy with warnings denied, formatting, and diff hygiene pass.
+  The generated reader rows remain byte-identical because they carry no source
+  address. The ownership arithmetic above records the `router.rs` to
+  `websocket.rs` move, and both M5 design documents advance their closed-enum
+  demotion proof from `websocket.rs:34` to `websocket.rs:41`.
+- R5 registration slice 5 REVIEW, 2026-07-30: the fresh Sol reviewer first
+  returned **BLOCK** because both M5 design documents still pointed the
+  WebSocket demotion proof at the pre-move `websocket.rs:34`; that line no
+  longer contained `WsServerMessage`. After both citations moved to the exact
+  enum at `websocket.rs:41` and the address-only evidence shift was recorded,
+  its closure review returned **APPROVE** with no remaining finding. It also
+  independently confirmed production-only exclusion of the test dependency,
+  exact handler registration, unchanged layer order, real loopback typed
+  success/error behavior, and the protected reader/truth gates.
 
 ### R6 — `post_write` phase decomposition
 
