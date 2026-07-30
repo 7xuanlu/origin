@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 3 approved**
+Status: **R4 complete; R5 in progress; handler-movement slice 4 approved**
 
 ## Authority and change control
 
@@ -3735,6 +3735,86 @@ R5 handler-movement slice 3 evidence, 2026-07-30:
   the typed contract, exact handler guard, truth manifest, sensitive-read
   tests, Python M5 sweep, LSP checks, and diff hygiene; the root-run full
   server suite and Clippy results remain separately recorded above.
+
+R5 handler-movement slice 4 contract, 2026-07-30:
+
+- Move exactly five bindings into `indexed_files_routes.rs`:
+  `GET /api/indexed-files`, `GET /api/chunks/{source_id}`,
+  `PUT /api/chunks/{id}/update`, `DELETE /api/chunks/time-range`, and
+  `POST /api/chunks/delete-bulk`. One contiguous registrar stays at the
+  original composition point after config registration and before entity CRUD.
+- Move the five-handler block byte-for-byte. It owns no private helper or local
+  DTO; all request and success response contracts already live in
+  `wenlan-types`. Exactly five handler-manifest identity fields may change.
+  Method/path, truth, sensitive-read, mutation-allowlist, and M5 inventory keys
+  must remain unchanged.
+- Preserve both non-obvious behaviors rather than normalizing them: the update
+  route's `{id}` is interpreted by the DB as a logical source id, and bulk
+  delete intentionally performs sequential per-item deletes while suppressing
+  individual failures. Every handler must retain its short state-read snapshot
+  before DB awaits.
+- Typed built-router characterization must cover success and deterministic
+  no-DB `503` for all five routes, plus the chunks route's absent-id `404`.
+  It must also preserve marked `403` refusal for the two page-bearing GETs'
+  `MarkerShape::None`. Shared response types are mandatory; only the
+  established typed test-local error envelope is needed. Existing scoped-read
+  tests remain the authority for indexed-list and chunk-collision isolation.
+- Activity/tag, capture/detail, decision, Page, retrieval, CLI/MCP, and DTO
+  normalization remain out of scope. Stop on any additional semantic caller,
+  extra handler row, response/lock change, truth/sensitive key change, or
+  pressure to substitute the unrelated all-in-one `MemoryDB::delete_bulk`.
+
+R5 handler-movement slice 4 evidence, 2026-07-30:
+
+- Exactly the frozen five indexed-file/chunk bindings now execute in
+  `indexed_files_routes.rs`, through one registrar at their original
+  composition point after config and before entity CRUD. No helper or local
+  DTO moved because the family owns none.
+- The old/new five-handler block has identical SHA-256
+  `2cf898b0a65a9e81cc6d74f483877f9f569d159383b6d67263fabd0491e46fc9`.
+  This preserves the source-id interpretation of the update path, the
+  sequential partial-success bulk-delete loop, and every state-read/DB-await
+  lifetime byte-for-byte.
+- Before updating expected identities, the production-builder control was RED
+  on precisely five new `indexed_files_routes::*` observations versus five old
+  `memory_routes::*` expectations. Updating only those handler fields made the
+  exact runtime comparison GREEN. Truth, sensitive-read, and mutation
+  classification sources remain byte-identical.
+- The typed built-router characterization passed before and after movement,
+  `1 / 1` each. It drives shared-type success and deterministic no-DB `503` for
+  all five routes, the chunks route's typed absent-id `404`, and marked `403`
+  controls for both page-bearing GET routes. No test-local success DTO or
+  `serde_json::Value` response oracle is used.
+- Rust LSP began with definition-plus-router-registration closure for every
+  handler. After refreshed diagnostics, all five close on their colocated
+  registration plus definition, no old-module semantic reference remains, and
+  the new module, old module, router, export, and contract test report zero
+  errors.
+- `router.rs` falls from `422` to `400` lines; `memory_routes.rs` falls from
+  `4,942` lines and `62` public handlers to `4,842` lines and `57`; the bounded
+  module is `122` lines with `5` public handlers. The generated M5 inventory
+  changes only two displaced Page-handler source addresses and remains
+  `191 / 55-50-86 / exposure 22`. Current-contract citations were refreshed,
+  including indexed-file ownership; call-site ownership is
+  `60 router + 5 indexed_files_routes + 13 spaces_routes +
+  14 entity_graph_routes + 75 other = 167`.
+- Verification passes: typed family contract `1 / 1`; server library
+  `347 passed / 2 ignored`; route convergence `17 / 17`; space scoping
+  `30 / 30`; truth manifest `16 / 16`; server truth guard `12 / 12`;
+  sensitive-read guard `9 / 9`; Rust/Python M5 `1 / 1` and
+  `191 / 55-50-86 / exposure 22`; projection-permit source scan `1 / 1`;
+  core/server all-target Clippy with warnings denied; formatting and diff
+  hygiene.
+- R5 handler-movement slice 4 REVIEW, 2026-07-30: the fresh Sol reviewer
+  returned **APPROVE** with zero blocking and zero non-blocking findings. It
+  independently confirmed the five-route boundary and composition point, the
+  byte-identical block hash, identity-only manifest changes, unchanged
+  truth/sensitive sources, preserved source-id update and partial-success bulk
+  semantics, complete typed success/error/refusal coverage, TempDir-only DB
+  effects, M5/prose/ownership accuracy, and LSP closure. Its bounded reruns
+  passed the typed contract, route-registry guard, Python M5 sweep, LSP checks,
+  and diff hygiene; the root-run full server suite, truth/sensitive gates, and
+  Clippy results remain separately recorded above.
 
 ### R6 — `post_write` phase decomposition
 

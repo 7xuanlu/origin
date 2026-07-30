@@ -4,7 +4,7 @@ main|get|/api/agents|wenlan_server::profile_agents_routes::handle_list_agents
 main|get|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_get_agent
 main|get|/api/briefing|wenlan_server::memory_routes::handle_get_briefing
 main|get|/api/capture-stats|wenlan_server::memory_routes::handle_capture_stats
-main|get|/api/chunks/{source_id}|wenlan_server::memory_routes::handle_get_chunks
+main|get|/api/chunks/{source_id}|wenlan_server::indexed_files_routes::handle_get_chunks
 main|get|/api/communities|wenlan_server::community_routes::handle_list_communities
 main|get|/api/communities/members|wenlan_server::community_routes::handle_list_community_members
 main|get|/api/communities/page-assignments|wenlan_server::community_routes::handle_list_community_page_assignments
@@ -18,7 +18,7 @@ main|get|/api/decisions/domains|wenlan_server::memory_routes::handle_list_decisi
 main|get|/api/health|wenlan_server::routes::handle_health
 main|get|/api/home-stats|wenlan_server::memory_routes::handle_get_home_stats
 main|get|/api/import/state|wenlan_server::import_routes::handle_list_pending_imports
-main|get|/api/indexed-files|wenlan_server::memory_routes::handle_list_indexed_files
+main|get|/api/indexed-files|wenlan_server::indexed_files_routes::handle_list_indexed_files
 main|get|/api/knowledge/count|wenlan_server::knowledge_routes::handle_get_knowledge_count
 main|get|/api/knowledge/path|wenlan_server::knowledge_routes::handle_get_knowledge_path
 main|get|/api/knowledge/recent-relations|wenlan_server::knowledge_routes::handle_list_recent_relations
@@ -66,7 +66,7 @@ main|get|/api/suggest-tags|wenlan_server::memory_routes::handle_suggest_tags
 main|get|/api/tags|wenlan_server::memory_routes::handle_list_tags
 main|get|/ws/updates|wenlan_server::websocket::handle_ws_upgrade
 main|post|/api/brief|wenlan_server::brief_routes::handle_read_brief
-main|post|/api/chunks/delete-bulk|wenlan_server::memory_routes::handle_delete_bulk
+main|post|/api/chunks/delete-bulk|wenlan_server::indexed_files_routes::handle_delete_bulk
 main|post|/api/communities/proposals/{id}/accept|wenlan_server::community_routes::handle_accept_community_proposal
 main|post|/api/communities/proposals/{id}/reject|wenlan_server::community_routes::handle_reject_community_proposal
 main|post|/api/context|wenlan_server::routes::handle_context
@@ -131,7 +131,7 @@ main|post|/api/spaces/{name}/pin|wenlan_server::spaces_routes::handle_pin_space
 main|post|/api/spaces/{name}/star|wenlan_server::spaces_routes::handle_toggle_space_starred
 main|post|/api/steep|wenlan_server::routes::handle_steep
 main|put|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_update_agent
-main|put|/api/chunks/{id}/update|wenlan_server::memory_routes::handle_update_chunk
+main|put|/api/chunks/{id}/update|wenlan_server::indexed_files_routes::handle_update_chunk
 main|put|/api/config|wenlan_server::config_routes::handle_update_config
 main|put|/api/config/skip-apps|wenlan_server::config_routes::handle_update_skip_apps
 main|put|/api/documents/{source_id}/tags|wenlan_server::memory_routes::handle_set_document_tags
@@ -147,7 +147,7 @@ main|put|/api/setup/anthropic-key|wenlan_server::config_routes::handle_set_anthr
 main|put|/api/spaces/default|wenlan_server::spaces_routes::handle_set_default_space
 main|put|/api/spaces/{name}|wenlan_server::spaces_routes::handle_update_space
 main|delete|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_delete_agent
-main|delete|/api/chunks/time-range|wenlan_server::memory_routes::handle_delete_by_time_range
+main|delete|/api/chunks/time-range|wenlan_server::indexed_files_routes::handle_delete_by_time_range
 main|delete|/api/documents/{source}/{source_id}|wenlan_server::ingest_routes::handle_delete_document
 main|delete|/api/memory/delete/{source_id}|wenlan_server::memory_routes::handle_delete_memory
 main|delete|/api/memory/entities/{id}/delete|wenlan_server::entity_graph_routes::handle_delete_entity

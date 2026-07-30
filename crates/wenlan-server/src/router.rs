@@ -7,9 +7,9 @@ use crate::route_registry::{delete, get, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
     brief_routes, community_routes, config_routes, entity_graph_routes, import_routes,
-    ingest_routes, knowledge_routes, lint_routes, memory_routes, onboarding_routes,
-    page_map_routes, profile_agents_routes, refinery_routes, repair_routes, routes, security,
-    source_routes, spaces_routes, truth_guard, websocket,
+    indexed_files_routes, ingest_routes, knowledge_routes, lint_routes, memory_routes,
+    onboarding_routes, page_map_routes, profile_agents_routes, refinery_routes, repair_routes,
+    routes, security, source_routes, spaces_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -189,29 +189,7 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = refinery_routes::register(router);
     let router = source_routes::register(router);
     let router = config_routes::register(router);
-
-    let router = router
-        // Indexed files / chunks (batch 2)
-        .route(
-            "/api/indexed-files",
-            get(memory_routes::handle_list_indexed_files),
-        )
-        .route(
-            "/api/chunks/{source_id}",
-            get(memory_routes::handle_get_chunks),
-        )
-        .route(
-            "/api/chunks/{id}/update",
-            put(memory_routes::handle_update_chunk),
-        )
-        .route(
-            "/api/chunks/time-range",
-            delete(memory_routes::handle_delete_by_time_range),
-        )
-        .route(
-            "/api/chunks/delete-bulk",
-            post(memory_routes::handle_delete_bulk),
-        );
+    let router = indexed_files_routes::register(router);
     let router = entity_graph_routes::register_crud(router);
     let router = spaces_routes::register_extended(router);
     let router = router

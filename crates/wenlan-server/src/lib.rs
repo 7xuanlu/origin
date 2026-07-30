@@ -12,6 +12,7 @@ pub mod entity_graph_routes;
 pub mod error;
 mod host_activity;
 pub mod import_routes;
+pub mod indexed_files_routes;
 pub mod ingest_batcher;
 pub mod ingest_routes;
 pub mod knowledge_routes;
