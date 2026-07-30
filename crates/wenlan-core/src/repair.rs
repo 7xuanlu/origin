@@ -5,7 +5,10 @@
 //! it is not an authentication boundary against malicious local processes.
 
 use crate::{
-    db::{repair_page_rename::recover_rename_page_title_apply_receipt, MemoryDB},
+    db::{
+        repair_page_rename::recover_rename_page_title_apply_receipt,
+        repair_stale_projection::recover_stale_page_projection_apply_receipt, MemoryDB,
+    },
     error::WenlanError,
     lint::{
         context::ExecutionGate,
@@ -85,6 +88,17 @@ pub(crate) enum RenamePageTitleRecoveryArtifact {
         verified_receipt: Option<RepairApplyReceipt>,
         rollback: RepairRollbackPayloadV2,
     },
+}
+
+pub(crate) enum StalePageProjectionRecoveryJournal {
+    Absent,
+    Present(StoredRollbackArtifact),
+}
+
+pub(crate) enum StalePageProjectionRecoveryArtifactUpdate {
+    ClearPendingOnly,
+    PublishPendingAndClearJournal,
+    ClearPendingAndJournal,
 }
 
 impl RepairArtifactStore {
@@ -739,6 +753,43 @@ impl RepairArtifactStore {
             sync_dir(&manifest_dir)?;
         }
         Ok(Some(rollback))
+    }
+
+    pub(crate) fn inspect_stale_page_projection_recovery_journal(
+        &self,
+        manifest: &RepairManifest,
+    ) -> Result<StalePageProjectionRecoveryJournal, WenlanError> {
+        Ok(
+            match self.load_stale_page_projection_apply_journal(manifest)? {
+                Some(rollback) => StalePageProjectionRecoveryJournal::Present(rollback),
+                None => StalePageProjectionRecoveryJournal::Absent,
+            },
+        )
+    }
+
+    pub(crate) fn apply_stale_page_projection_recovery_artifact_update(
+        &self,
+        manifest_id: &str,
+        update: StalePageProjectionRecoveryArtifactUpdate,
+    ) -> Result<(), WenlanError> {
+        match update {
+            StalePageProjectionRecoveryArtifactUpdate::ClearPendingOnly => {
+                self.clear_pending_apply_receipt(manifest_id)
+            }
+            StalePageProjectionRecoveryArtifactUpdate::PublishPendingAndClearJournal => {
+                let manifest_dir = self.manifest_dir(manifest_id)?;
+                publish_no_replace(
+                    &manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
+                    &manifest_dir.join(APPLY_RECEIPT_FILE),
+                    "repair_already_applied",
+                )?;
+                self.clear_stale_page_projection_apply_journal(manifest_id)
+            }
+            StalePageProjectionRecoveryArtifactUpdate::ClearPendingAndJournal => {
+                self.clear_pending_apply_receipt(manifest_id)?;
+                self.clear_stale_page_projection_apply_journal(manifest_id)
+            }
+        }
     }
 
     fn stale_page_projection_apply_journal_exists(
@@ -2649,89 +2700,6 @@ async fn recover_apply_receipt(
     fs::remove_file(&pending_path)?;
     sync_dir(&manifest_dir)?;
     Ok(None)
-}
-
-async fn recover_stale_page_projection_apply_receipt(
-    db: &MemoryDB,
-    store: &RepairArtifactStore,
-    manifest: &RepairManifest,
-    rollback: &StoredRollbackArtifact,
-    page_root: Option<&Path>,
-    pending_receipt: Option<RepairApplyReceipt>,
-) -> Result<Option<RepairApplyReceipt>, WenlanError> {
-    let page_root = page_root.ok_or_else(|| {
-        WenlanError::Validation("page projection repair root unavailable".to_string())
-    })?;
-    let page_id = match manifest.target() {
-        RepairTarget::PageProjection { page_id, .. } => page_id,
-        _ => {
-            return Err(WenlanError::Validation(
-                "stale page projection repair target/writer mismatch".to_string(),
-            ))
-        }
-    };
-    let connection = db.conn.lock().await;
-    let mut owner = connection
-        .query(
-            "SELECT 1 FROM pages WHERE id=?1 LIMIT 1",
-            libsql::params![page_id.as_str()],
-        )
-        .await
-        .map_err(database_error)?;
-    if owner.next().await.map_err(database_error)?.is_some() {
-        return Err(WenlanError::Conflict(
-            "repair_apply_recovery_required".to_string(),
-        ));
-    }
-    drop(owner);
-    let apply_journal = store.load_stale_page_projection_apply_journal(manifest)?;
-    if apply_journal.is_none() {
-        let (source_path, quarantine_path) = stale_page_projection_paths(rollback)?;
-        if capture_stale_page_projection_current(page_root, page_id, &source_path, &quarantine_path)
-            .is_ok_and(|current| current == *rollback)
-        {
-            store.clear_pending_apply_receipt(manifest.manifest_id())?;
-            return Ok(None);
-        }
-    }
-    let apply_rollback = apply_journal.unwrap_or_else(|| rollback.clone());
-    let restore_post = pending_receipt.is_none();
-    let recovery = crate::export::knowledge::KnowledgeProjectionWrite::with_repair_lock(
-        page_root.to_path_buf(),
-        db,
-        |write| {
-            write.recover_stale_page_projection(
-                &apply_rollback,
-                manifest.manifest_id(),
-                restore_post,
-            )
-        },
-    )
-    .unwrap_or(crate::export::knowledge::StalePageProjectionRecoveryState::Unknown);
-    use crate::export::knowledge::StalePageProjectionRecoveryState as Recovery;
-    match (pending_receipt, recovery) {
-        (Some(receipt), Recovery::Post)
-            if stale_page_projection_post_target_receipt(&apply_rollback)?
-                == *receipt.after_target_receipt() =>
-        {
-            let manifest_dir = store.manifest_dir(manifest.manifest_id())?;
-            publish_no_replace(
-                &manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
-                &manifest_dir.join(APPLY_RECEIPT_FILE),
-                "repair_already_applied",
-            )?;
-            store.clear_stale_page_projection_apply_journal(manifest.manifest_id())?;
-            Ok(Some(receipt))
-        }
-        (Some(_), Recovery::Original) | (None, Recovery::Original) => {
-            store.clear_pending_apply_receipt(manifest.manifest_id())?;
-            store.clear_stale_page_projection_apply_journal(manifest.manifest_id())?;
-            Ok(None)
-        }
-        _ => Err(WenlanError::Conflict(
-            "repair_apply_recovery_required".to_string(),
-        )),
-    }
 }
 
 async fn target_receipt_current(
@@ -6339,7 +6307,7 @@ fn stale_page_projection_target_receipt(
     Ok(repair_digest(&bytes))
 }
 
-fn stale_page_projection_post_target_receipt(
+pub(crate) fn stale_page_projection_post_target_receipt(
     rollback: &StoredRollbackArtifact,
 ) -> Result<RepairDigest, WenlanError> {
     let (source_path, quarantine_path) = stale_page_projection_paths(rollback)?;

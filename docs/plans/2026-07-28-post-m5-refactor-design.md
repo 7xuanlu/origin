@@ -2344,6 +2344,53 @@ Frozen slice contract:
   declaration for each operation; LSP must resolve one apply production path,
   two recovery callers, all six legacy test-facade calls, and zero error
   diagnostics.
+- RED, 2026-07-29: the direct child suite first produced `1 / 8` green against
+  explicit apply/recovery stubs; only the source-boundary tooth passed, while
+  the seven behavior controls failed at the stub. Lowering only the two
+  raw-lock rows produced the exact expected `post_write.rs 12 -> 13` and
+  `repair.rs 17 -> 18` failures.
+- IMPLEMENTED, 2026-07-29: `db/repair_stale_projection.rs` now owns the two
+  canonical production declarations plus the four test facades and one
+  consumption-checked task-local checkpoint set. `post_write` retains the
+  production apply path and test paths as re-exports; `repair` imports recovery
+  directly and retains both generic-recovery calls. The DB-first critical
+  sections, locked dynamic journal, mutation-started compensation split, and
+  closed recovery table are unchanged. `RepairArtifactStore` exposes only the
+  two typed stale-projection recovery operations and their closed enum inputs.
+- GREEN, 2026-07-29: the direct child suite passes `8 / 8`; the existing
+  stale-projection family passes `33 / 33`; the three lower-level stale
+  projection race controls, duplicate-state rejection, ancestor-swap canary,
+  and pending-retention predicate all pass. The external raw-lock census is
+  exactly `291`, split into production `2` and tests `289`; the exact ratchet
+  passes with only `post_write.rs 13 -> 12` and `repair.rs 18 -> 17`.
+  Core/server all-target Clippy with `-D warnings` and formatting pass.
+- MUTATION GATE, 2026-07-29: direct controls killed and then restored every
+  required temporary mutation: `J(&before) -> J(rollback)`; journal persistence
+  moved after pin; both owner CAS branches removed; both DB guards shortened;
+  the after-journal checkpoint invocation removed; the `mutation_started`
+  split removed; snapshot restore removed; the proof callback moved outside
+  both guards; `restore_post` inverted; projection recovery errors propagated
+  instead of becoming `Unknown`; and unmatched/Unknown arms cleared artifacts.
+  The proof-location control uses a second DB contender released inside the
+  callback, so mutex fairness cannot make an early unlock pass accidentally.
+  No mutant remained for the final direct-suite rerun.
+- LSP AND TOPOLOGY GATE, 2026-07-29: ast-grep finds exactly one production
+  declaration for each operation. LSP resolves the sole apply production call,
+  both recovery calls, and all six legacy facade calls to the child; the child,
+  `repair`, and `post_write` report zero error diagnostics. The regenerated M5
+  inventory changes source addresses only and remains exactly
+  `191 / 55-50-86 / exposure 22 / ambiguity 9`.
+- FINAL REVIEW GATE, 2026-07-29: Sol and the independent concurrency auditor
+  both returned `APPROVE` against the frozen contract. Root found that the
+  generic-final source tooth initially ordered only branch entry before stale
+  dispatch, strengthened it to require
+  `branch entry < return Ok(Some(receipt)) < first stale dispatch`, reran the
+  exact and full direct suites, and received both reviewers' renewed
+  `APPROVE`. Root independently reran direct `8 / 8`, the preflight-confirmed
+  stale family `33 / 33`, the external-access ratchet `1 / 1`, Rust M5 gate
+  `1 / 1`, reader inventory `191 / 55-50-86 / exposure 22 / ambiguity 9`,
+  core/server all-target Clippy with `-D warnings`, formatting, and
+  `git diff --check`.
 
 #### R4-23 — current repair target dispatcher
 

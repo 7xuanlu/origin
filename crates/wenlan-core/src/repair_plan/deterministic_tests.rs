@@ -2448,13 +2448,14 @@ async fn stale_page_projection_target_edit_between_capture_and_pin_is_zero_mutat
     )
     .unwrap();
 
+    let raced_root = page_root.path().to_path_buf();
     let error = crate::post_write::quarantine_stale_page_projection_cas_with_before_pin(
         &db,
         &manifest,
         &rollback,
         page_root.path(),
-        || {
-            std::fs::write(page_root.path().join("race.md"), raced_bytes)?;
+        move || {
+            std::fs::write(raced_root.join("race.md"), raced_bytes)?;
             Ok(())
         },
         |_| Ok(()),
@@ -2508,14 +2509,15 @@ async fn stale_page_projection_orphan_addition_after_pin_is_zero_mutation_stale(
     )
     .unwrap();
 
+    let raced_root = page_root.path().to_path_buf();
     let error = crate::post_write::quarantine_stale_page_projection_cas_with_after_pin(
         &db,
         &manifest,
         &rollback,
         page_root.path(),
-        || {
+        move || {
             std::fs::write(
-                page_root.path().join(".wenlan/orphaned/injected.md"),
+                raced_root.join(".wenlan/orphaned/injected.md"),
                 b"noncooperating orphan",
             )?;
             Ok(())
@@ -2590,15 +2592,16 @@ async fn stale_page_projection_source_replacement_after_pin_is_zero_mutation_sta
     )
     .unwrap();
 
+    let raced_root = page_root.path().to_path_buf();
     let error = crate::post_write::quarantine_stale_page_projection_cas_with_after_pin(
         &db,
         &manifest,
         &rollback,
         page_root.path(),
-        || {
-            let replacement = page_root.path().join("replacement.tmp");
+        move || {
+            let replacement = raced_root.join("replacement.tmp");
             std::fs::write(&replacement, replacement_bytes)?;
-            std::fs::rename(replacement, page_root.path().join("race.md"))?;
+            std::fs::rename(replacement, raced_root.join("race.md"))?;
             Ok(())
         },
         |_| Ok(()),
@@ -2666,15 +2669,16 @@ async fn stale_page_projection_source_replacement_before_unlink_preserves_replac
     )
     .unwrap();
 
+    let raced_root = page_root.path().to_path_buf();
     let error = crate::post_write::quarantine_stale_page_projection_cas_with_before_source_stage(
         &db,
         &manifest,
         &rollback,
         page_root.path(),
-        || {
-            let replacement = page_root.path().join("replacement.tmp");
+        move || {
+            let replacement = raced_root.join("replacement.tmp");
             std::fs::write(&replacement, replacement_bytes)?;
-            std::fs::rename(replacement, page_root.path().join("race.md"))?;
+            std::fs::rename(replacement, raced_root.join("race.md"))?;
             Ok(())
         },
         |_| Ok(()),
