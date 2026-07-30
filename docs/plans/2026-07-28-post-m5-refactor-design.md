@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 4 approved**
+Status: **R4 complete; R5 in progress; handler-movement slice 5 complete**
 
 ## Authority and change control
 
@@ -3815,6 +3815,87 @@ R5 handler-movement slice 4 evidence, 2026-07-30:
   passed the typed contract, route-registry guard, Python M5 sweep, LSP checks,
   and diff hygiene; the root-run full server suite, truth/sensitive gates, and
   Clippy results remain separately recorded above.
+
+R5 handler-movement slice 5 contract, 2026-07-30:
+
+- Split the plan's broad activity/tag plus capture/detail group into two
+  movement commits. The old router batch also contains versions and generic
+  memory mutations, so its textual block is not an authoritative boundary.
+  Slice 5 moves exactly five activity/tag bindings into
+  `activity_tag_routes.rs`: `GET /api/activities`, `GET /api/tags`,
+  `DELETE /api/tags/{name}`, `GET /api/suggest-tags`, and
+  `PUT /api/documents/{source_id}/tags`. Slice 6 will separately own
+  capture-stats/detail/by-ids.
+- Move `SuggestTagsQuery`, `document_tag_source`, and the directly owned
+  tag-route unit tests with these handlers. Registration remains immediately
+  after Space extended routes and before the later capture/detail block.
+  Exactly five handler-manifest identity fields may change.
+- Preserve `handle_list_activities` and its
+  `truth_adapter::redact_page_activity_detail` call byte-for-byte, including
+  list-then-redact ordering and generation-sensitive behavior. All five
+  handlers retain their short state snapshot; method/path, truth,
+  sensitive-read, mutation-allowlist, and M5 keys remain unchanged.
+- Typed built-router characterization must cover success and deterministic
+  no-DB `503` for all five routes, scoped activity/tag/suggestion behavior
+  where hermetic, and marked `403` refusal for each route's
+  `MarkerShape::None`. Use shared success wire types wherever exact; any
+  unavoidable local mirror must be named in the evidence.
+- Capture-stats/detail/by-ids, versions, update/stability/correct, decisions,
+  Pages, revisions, snapshots, CLI/MCP, and DTO normalization remain out of
+  scope. Stop if the activity redactor separates from its handler, any helper
+  has an extra semantic caller, or any additional handler/classification row
+  changes.
+
+R5 handler-movement slice 5 evidence, 2026-07-30:
+
+- Exactly the frozen five activity/tag bindings now execute in
+  `activity_tag_routes.rs`, through one registrar at the original composition
+  point immediately after the extended Space registrar. Capture stats and
+  memory detail remain in the following inline router batch.
+- The moved handlers, query DTO, helper, and directly owned unit tests have
+  identical normalized SHA-256
+  `5697f3538d8e3c3286d677d6571e538869c5d3f8a07bcf529bb4e5d18eae6643`.
+  In particular, activity still performs the scoped list before
+  `redact_page_activity_detail`, with the same state-lock lifetime.
+- Before updating expected identities, the production-builder comparison was
+  RED on precisely five new `activity_tag_routes::*` observations versus the
+  five old `memory_routes::*` expectations. Updating only those five handler
+  fields made it GREEN. Truth, sensitive-read, mutation, and adapter sources
+  are byte-identical to the slice base.
+- The typed built-router characterization passed on the old and moved
+  implementations, `1 / 1` each. It drives shared wire-type success and
+  deterministic no-DB `503` for all five routes, activity detail preservation,
+  cross-Space positive/negative controls for activity, tag listing, and
+  suggestions, tag assignment/delete behavior, and marked `403` controls for
+  every `MarkerShape::None` route. The only test-local response mirror is the
+  established `ErrorEnvelope` for deterministic errors; no
+  `serde_json::Value` success oracle is used.
+- After refreshed diagnostics, Rust LSP reports no diagnostics in the new
+  module, old module, router, export, or contract test. Each moved handler has
+  exactly its colocated registration plus definition; the registrar has its
+  router call plus definition; `document_tag_source` has one production call
+  plus its two directly owned tests.
+- `router.rs` falls from `400` to `390` lines; `memory_routes.rs` falls from
+  `4,842` lines and `57` public handlers to `4,663` lines and `52`; the bounded
+  activity/tag module is `207` lines with `5` public handlers. The generated
+  M5 inventory remains `191 / 55-50-86 / exposure 22`; displaced Page-handler
+  addresses and current-contract prose citations were refreshed. Call-site
+  ownership is
+  `55 router + 5 activity_tag_routes + 5 indexed_files_routes +
+  13 spaces_routes + 14 entity_graph_routes + 75 other = 167`.
+- Focused verification passes after the latest test edit: typed family contract
+  `1 / 1`; exact production route-handler comparison `1 / 1`; truth manifest
+  `16 / 16`; server truth guard `12 / 12`; Rust and Python M5 checks `1 / 1`
+  and `191 / 55-50-86 / exposure 22`; formatting and normalized movement-diff
+  hygiene; focused contract-test Clippy with warnings denied.
+- R5 handler-movement slice 5 REVIEW, 2026-07-30: Sol first returned
+  **BLOCK** because the typed route contract did not independently prove
+  cross-Space activity/tag/suggestion behavior and the receipt did not name
+  its test-local error mirror. After work/personal positive and negative
+  controls plus explicit `ErrorEnvelope` evidence were added, the same
+  reviewer returned **APPROVE** with zero blocking and zero non-blocking
+  findings. Its closure reran the typed contract, LSP diagnostics, formatting,
+  and diff hygiene successfully.
 
 ### R6 — `post_write` phase decomposition
 

@@ -6,10 +6,10 @@ pub use crate::route_registry::AppRouter;
 use crate::route_registry::{delete, get, post, put, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
-    brief_routes, community_routes, config_routes, entity_graph_routes, import_routes,
-    indexed_files_routes, ingest_routes, knowledge_routes, lint_routes, memory_routes,
-    onboarding_routes, page_map_routes, profile_agents_routes, refinery_routes, repair_routes,
-    routes, security, source_routes, spaces_routes, truth_guard, websocket,
+    activity_tag_routes, brief_routes, community_routes, config_routes, entity_graph_routes,
+    import_routes, indexed_files_routes, ingest_routes, knowledge_routes, lint_routes,
+    memory_routes, onboarding_routes, page_map_routes, profile_agents_routes, refinery_routes,
+    repair_routes, routes, security, source_routes, spaces_routes, truth_guard, websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -192,19 +192,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = indexed_files_routes::register(router);
     let router = entity_graph_routes::register_crud(router);
     let router = spaces_routes::register_extended(router);
+    let router = activity_tag_routes::register(router);
     let router = router
-        // Activity, tags, capture stats, memory detail (batch 5)
-        .route(
-            "/api/activities",
-            get(memory_routes::handle_list_activities),
-        )
-        .route("/api/tags", get(memory_routes::handle_list_tags))
-        .route("/api/tags/{name}", delete(memory_routes::handle_delete_tag))
-        .route("/api/suggest-tags", get(memory_routes::handle_suggest_tags))
-        .route(
-            "/api/documents/{source_id}/tags",
-            put(memory_routes::handle_set_document_tags),
-        )
+        // Capture stats and memory detail (batch 5)
         .route(
             "/api/capture-stats",
             get(memory_routes::handle_capture_stats),

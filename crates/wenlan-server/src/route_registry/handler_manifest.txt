@@ -1,5 +1,5 @@
 # Exact route-to-handler bindings, captured from the production builders.
-main|get|/api/activities|wenlan_server::memory_routes::handle_list_activities
+main|get|/api/activities|wenlan_server::activity_tag_routes::handle_list_activities
 main|get|/api/agents|wenlan_server::profile_agents_routes::handle_list_agents
 main|get|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_get_agent
 main|get|/api/briefing|wenlan_server::memory_routes::handle_get_briefing
@@ -62,8 +62,8 @@ main|get|/api/sources|wenlan_server::source_routes::handle_list_sources
 main|get|/api/spaces|wenlan_server::spaces_routes::handle_list_spaces
 main|get|/api/spaces/default|wenlan_server::spaces_routes::handle_get_default_space
 main|get|/api/status|wenlan_server::routes::handle_status
-main|get|/api/suggest-tags|wenlan_server::memory_routes::handle_suggest_tags
-main|get|/api/tags|wenlan_server::memory_routes::handle_list_tags
+main|get|/api/suggest-tags|wenlan_server::activity_tag_routes::handle_suggest_tags
+main|get|/api/tags|wenlan_server::activity_tag_routes::handle_list_tags
 main|get|/ws/updates|wenlan_server::websocket::handle_ws_upgrade
 main|post|/api/brief|wenlan_server::brief_routes::handle_read_brief
 main|post|/api/chunks/delete-bulk|wenlan_server::indexed_files_routes::handle_delete_bulk
@@ -134,7 +134,7 @@ main|put|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_update_
 main|put|/api/chunks/{id}/update|wenlan_server::indexed_files_routes::handle_update_chunk
 main|put|/api/config|wenlan_server::config_routes::handle_update_config
 main|put|/api/config/skip-apps|wenlan_server::config_routes::handle_update_skip_apps
-main|put|/api/documents/{source_id}/tags|wenlan_server::memory_routes::handle_set_document_tags
+main|put|/api/documents/{source_id}/tags|wenlan_server::activity_tag_routes::handle_set_document_tags
 main|put|/api/memory/entities/{id}/confirm|wenlan_server::entity_graph_routes::handle_confirm_entity
 main|put|/api/memory/observations/{id}|wenlan_server::entity_graph_routes::handle_update_observation
 main|put|/api/memory/observations/{id}/confirm|wenlan_server::entity_graph_routes::handle_confirm_observation
@@ -160,7 +160,7 @@ main|delete|/api/setup/anthropic-key|wenlan_server::config_routes::handle_clear_
 main|delete|/api/sources/{id}|wenlan_server::source_routes::handle_remove_source
 main|delete|/api/spaces/default|wenlan_server::spaces_routes::handle_clear_default_space
 main|delete|/api/spaces/{name}|wenlan_server::spaces_routes::handle_delete_space
-main|delete|/api/tags/{name}|wenlan_server::memory_routes::handle_delete_tag
+main|delete|/api/tags/{name}|wenlan_server::activity_tag_routes::handle_delete_tag
 main|patch|/api/brief|wenlan_server::brief_routes::handle_update_brief
 main|patch|/api/pages/{id}/map/edges/{edge_id}|wenlan_server::page_map_routes::handle_patch_map_edge
 main|patch|/api/pages/{id}/map/nodes/{node_id}|wenlan_server::page_map_routes::handle_patch_map_node
