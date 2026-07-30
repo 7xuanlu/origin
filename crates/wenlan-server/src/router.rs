@@ -8,8 +8,9 @@ use crate::state::SharedState;
 use crate::{
     activity_tag_routes, brief_routes, community_routes, config_routes, entity_graph_routes,
     import_routes, indexed_files_routes, ingest_routes, knowledge_routes, lint_routes,
-    memory_routes, onboarding_routes, page_map_routes, profile_agents_routes, refinery_routes,
-    repair_routes, routes, security, source_routes, spaces_routes, truth_guard, websocket,
+    memory_detail_routes, memory_routes, onboarding_routes, page_map_routes, profile_agents_routes,
+    refinery_routes, repair_routes, routes, security, source_routes, spaces_routes, truth_guard,
+    websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -193,20 +194,9 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = entity_graph_routes::register_crud(router);
     let router = spaces_routes::register_extended(router);
     let router = activity_tag_routes::register(router);
+    let router = memory_detail_routes::register(router);
     let router = router
-        // Capture stats and memory detail (batch 5)
-        .route(
-            "/api/capture-stats",
-            get(memory_routes::handle_capture_stats),
-        )
-        .route(
-            "/api/memory/{id}/detail",
-            get(memory_routes::handle_get_memory_detail),
-        )
-        .route(
-            "/api/memory/by-ids",
-            get(memory_routes::handle_get_memories_by_ids),
-        )
+        // Version and memory updates (batch 5)
         .route(
             "/api/memory/{id}/versions",
             get(memory_routes::handle_get_version_chain),

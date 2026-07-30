@@ -14,6 +14,7 @@ HTTP daemon — owns the Axum router + all routes. All handlers operate on `Arc<
 | `routes.rs` | General endpoints and their `TrackedRouter` registration helper: health, status, search/context, diagnostics, recent activity, steep/distill |
 | `memory_routes.rs` | Remaining memory CRUD/search/enrichment, classification, statistics, and Page handlers |
 | `activity_tag_routes.rs` | Activity feed and tag list/suggestion/mutation handlers plus their `TrackedRouter` registration helper |
+| `memory_detail_routes.rs` | Global capture count and scoped single/batch memory-detail readers plus their `TrackedRouter` registration helper |
 | `entity_graph_routes.rs` | `/api/memory` entity, relation, observation, linking, suggestion, and scoped entity-read handlers; four registration helpers preserve their separated composition positions |
 | `indexed_files_routes.rs` | Indexed-file and chunk read/update/delete handlers plus their `TrackedRouter` registration helper |
 | `profile_agents_routes.rs` | Profile and agent CRUD handlers plus their `TrackedRouter` registration helper |

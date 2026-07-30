@@ -3,7 +3,7 @@ main|get|/api/activities|wenlan_server::activity_tag_routes::handle_list_activit
 main|get|/api/agents|wenlan_server::profile_agents_routes::handle_list_agents
 main|get|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_get_agent
 main|get|/api/briefing|wenlan_server::memory_routes::handle_get_briefing
-main|get|/api/capture-stats|wenlan_server::memory_routes::handle_capture_stats
+main|get|/api/capture-stats|wenlan_server::memory_detail_routes::handle_capture_stats
 main|get|/api/chunks/{source_id}|wenlan_server::indexed_files_routes::handle_get_chunks
 main|get|/api/communities|wenlan_server::community_routes::handle_list_communities
 main|get|/api/communities/members|wenlan_server::community_routes::handle_list_community_members
@@ -23,7 +23,7 @@ main|get|/api/knowledge/count|wenlan_server::knowledge_routes::handle_get_knowle
 main|get|/api/knowledge/path|wenlan_server::knowledge_routes::handle_get_knowledge_path
 main|get|/api/knowledge/recent-relations|wenlan_server::knowledge_routes::handle_list_recent_relations
 main|get|/api/lint|wenlan_server::lint_routes::handle_lint
-main|get|/api/memory/by-ids|wenlan_server::memory_routes::handle_get_memories_by_ids
+main|get|/api/memory/by-ids|wenlan_server::memory_detail_routes::handle_get_memories_by_ids
 main|get|/api/memory/entities/{entity_id}|wenlan_server::entity_graph_routes::handle_get_entity_detail
 main|get|/api/memory/entity-suggestions|wenlan_server::entity_graph_routes::handle_get_entity_suggestions
 main|get|/api/memory/nurture|wenlan_server::memory_routes::handle_get_nurture_cards
@@ -34,7 +34,7 @@ main|get|/api/memory/recent|wenlan_server::memory_routes::handle_recent_memories
 main|get|/api/memory/rejections|wenlan_server::memory_routes::handle_get_rejections
 main|get|/api/memory/stats|wenlan_server::memory_routes::handle_get_memory_stats
 main|get|/api/memory/unconfirmed|wenlan_server::memory_routes::handle_list_unconfirmed_memories
-main|get|/api/memory/{id}/detail|wenlan_server::memory_routes::handle_get_memory_detail
+main|get|/api/memory/{id}/detail|wenlan_server::memory_detail_routes::handle_get_memory_detail
 main|get|/api/memory/{id}/revisions|wenlan_server::memory_routes::handle_get_memory_revisions
 main|get|/api/memory/{id}/versions|wenlan_server::memory_routes::handle_get_version_chain
 main|get|/api/memory/{source_id}/enrichment-status|wenlan_server::memory_routes::handle_get_enrichment_status

@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R4 complete; R5 in progress; handler-movement slice 5 complete**
+Status: **R4 complete; R5 in progress; handler-movement slice 6 complete**
 
 ## Authority and change control
 
@@ -3896,6 +3896,86 @@ R5 handler-movement slice 5 evidence, 2026-07-30:
   reviewer returned **APPROVE** with zero blocking and zero non-blocking
   findings. Its closure reran the typed contract, LSP diagnostics, formatting,
   and diff hygiene successfully.
+
+R5 handler-movement slice 6 contract, 2026-07-30:
+
+- Move exactly three bindings into `memory_detail_routes.rs`:
+  `GET /api/capture-stats`, `GET /api/memory/{id}/detail`, and
+  `GET /api/memory/by-ids`. Register them immediately after
+  `activity_tag_routes` and before the remaining version/update block. Exactly
+  three handler-manifest identity fields may change.
+- Move the three handler bodies byte-for-byte. They own no private helper or
+  production-local request/response DTO. Preserve capture count's global
+  behavior and error-to-zero fallback, detail/by-ids header-only Space scope,
+  input-order/omitted-missing behavior, and every state-lock/DB-await lifetime.
+- Typed built-router characterization must use shared
+  `MemoryDetailResponse` and `PinnedMemoriesResponse` plus one exact test-local
+  `CaptureStatsResponse { total_chunks: u64 }` mirror. It must cover success
+  and deterministic no-DB `503` for all three routes; capture's global
+  behavior under an unknown Space header; work/personal positive and negative
+  controls for detail and by-ids; typed detail `404`; and marked `403` for all
+  three `MarkerShape::None` routes. The established test-local
+  `ErrorEnvelope` is permitted for deterministic errors.
+- All three truth rows remain page-bearing `Automatic`/`None`; capture remains
+  the fail-closed opaque aggregate and detail/by-ids retain their dismissed
+  revision-card exposure classification. Truth, sensitive-read,
+  mutation-allowlist, M5 keys, and route layers stay unchanged.
+- Versions, update/stability/correct, decisions, briefing/profile narrative,
+  pinned/revisions/snapshots, remaining CRUD/search/enrichment, Pages,
+  CLI/MCP, and DTO normalization remain out of scope. Stop on any extra
+  handler/caller/classification change or any pressure to fold the adjacent
+  version route into this movement.
+
+R5 handler-movement slice 6 evidence, 2026-07-30:
+
+- Exactly the frozen three bindings now execute in
+  `memory_detail_routes.rs`, through one registrar immediately after
+  `activity_tag_routes`. The adjacent version and update routes remain in the
+  following inline batch.
+- The normalized old/new handler block has identical SHA-256
+  `681d268ceaf2c08d6b18ea64dc4460c99f913cbdee2678075f5ccf1c348f4f9b`.
+  This preserves capture's global count and error-to-zero fallback,
+  detail/by-ids Space resolution and omission behavior, plus every state-lock
+  and DB-await lifetime byte-for-byte.
+- Before updating expected identities, the production-builder comparison was
+  RED on precisely three new `memory_detail_routes::*` observations versus
+  three old `memory_routes::*` expectations. Updating only those handler
+  fields made it GREEN. Truth, sensitive-read, mutation, and adapter sources
+  remain byte-identical.
+- The typed built-router characterization passed on the old and moved
+  implementations, `1 / 1` each. Shared `MemoryDetailResponse` and
+  `PinnedMemoriesResponse` cover typed success; exact test-local
+  `CaptureStatsResponse { total_chunks: u64 }` covers the production-local
+  aggregate; and the established test-local `ErrorEnvelope` covers typed
+  deterministic errors. The test drives all three marked `403` and no-DB
+  `503` paths, capture's unknown-Space global behavior, work/personal
+  detail/by-ids controls, detail `404`, and global by-ids input-order plus
+  missing-id omission. It uses no `serde_json::Value` response oracle.
+- After refreshed diagnostics, Rust LSP reports no diagnostics in the new
+  module, old module, router, export, or contract test. Each handler has
+  exactly its colocated registration plus definition, and the registrar has
+  its one composition-root call plus definition.
+- `router.rs` falls from `390` to `380` lines; `memory_routes.rs` falls from
+  `4,663` lines and `52` public handlers to `4,595` lines and `49`; the bounded
+  module is `89` lines with `3` public handlers. The generated M5 inventory
+  remains `191 / 55-50-86 / exposure 22`; displaced Page-handler addresses and
+  current-contract prose citations were refreshed. Call-site ownership is
+  `52 router + 3 memory_detail_routes + 5 activity_tag_routes +
+  5 indexed_files_routes + 13 spaces_routes + 14 entity_graph_routes +
+  75 other = 167`.
+- Focused verification passes after the last code edit: typed family contract
+  `1 / 1`; exact production route-handler comparison `1 / 1`; truth manifest
+  `16 / 16`; server truth guard `12 / 12`; Rust and Python M5 checks `1 / 1`
+  and `191 / 55-50-86 / exposure 22`; focused contract-test Clippy with
+  warnings denied; formatting and diff hygiene.
+- R5 handler-movement slice 6 REVIEW, 2026-07-30: the reused independent Sol
+  lane returned **APPROVE** with zero blocking and zero non-blocking findings.
+  It independently confirmed the three-route boundary and order, byte-equal
+  handler hash, identity-only manifest delta, unchanged protected sources,
+  capture/detail/by-ids behavior and typed controls, TempDir isolation,
+  current counts/citations, and LSP closure. Its focused reruns passed the
+  typed contract, exact handler guard, Python M5 sweep, formatting, and diff
+  hygiene.
 
 ### R6 — `post_write` phase decomposition
 

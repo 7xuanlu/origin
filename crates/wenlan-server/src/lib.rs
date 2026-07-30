@@ -20,6 +20,7 @@ pub mod knowledge_routes;
 pub mod lifecycle;
 pub mod lint_routes;
 pub mod maintenance_coordinator;
+pub mod memory_detail_routes;
 pub mod memory_routes;
 pub mod onboarding_routes;
 pub mod page_map_routes;
