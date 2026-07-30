@@ -12,6 +12,7 @@
 //! `.await` (see CLAUDE.md).
 
 use crate::error::ServerError;
+use crate::route_registry::{get, post, TrackedRouter};
 use crate::state::SharedState;
 use axum::{
     extract::{Path, State},
@@ -20,6 +21,16 @@ use axum::{
 };
 use std::str::FromStr;
 use wenlan_core::onboarding::{MilestoneId, MilestoneRecord};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/onboarding/milestones", get(handle_list_milestones))
+        .route(
+            "/api/onboarding/milestones/{id}/acknowledge",
+            post(handle_acknowledge_milestone),
+        )
+        .route("/api/onboarding/reset", post(handle_reset_milestones))
+}
 
 pub async fn handle_list_milestones(
     State(state): State<SharedState>,

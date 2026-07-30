@@ -269,24 +269,12 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/memory/rejections",
             get(memory_routes::handle_get_rejections),
-        )
-        // Refinement queue
-        .route(
-            "/api/refinery/queue",
-            get(refinery_routes::handle_list_refinements),
-        )
-        .route(
-            "/api/refinery/queue/{id}/reject",
-            post(refinery_routes::handle_reject_refinement),
-        )
-        .route(
-            "/api/refinery/queue/{id}/accept",
-            post(refinery_routes::handle_accept_refinement),
         );
+    let router = refinery_routes::register(router);
     let router = source_routes::register(router);
     let router = config_routes::register(router);
 
-    router
+    let router = router
         // Indexed files / chunks (batch 2)
         .route(
             "/api/indexed-files",
@@ -443,33 +431,11 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
         .route(
             "/api/memory/{id}/update-page",
             post(memory_routes::handle_update_page),
-        )
-        // Knowledge directory
-        .route(
-            "/api/knowledge/path",
-            get(knowledge_routes::handle_get_knowledge_path),
-        )
-        .route(
-            "/api/knowledge/count",
-            get(knowledge_routes::handle_get_knowledge_count),
-        )
-        .route(
-            "/api/knowledge/recent-relations",
-            get(knowledge_routes::handle_list_recent_relations),
-        )
-        // Onboarding milestones
-        .route(
-            "/api/onboarding/milestones",
-            get(onboarding_routes::handle_list_milestones),
-        )
-        .route(
-            "/api/onboarding/milestones/{id}/acknowledge",
-            post(onboarding_routes::handle_acknowledge_milestone),
-        )
-        .route(
-            "/api/onboarding/reset",
-            post(onboarding_routes::handle_reset_milestones),
-        )
+        );
+    let router = knowledge_routes::register(router);
+    let router = onboarding_routes::register(router);
+
+    router
         // WebSocket
         .route("/ws/updates", get(websocket::handle_ws_upgrade))
         .finish()

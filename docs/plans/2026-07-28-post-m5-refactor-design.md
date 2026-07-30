@@ -3391,6 +3391,41 @@ R5 registration slice 3 evidence, 2026-07-30:
   validation path, typed coverage, untouched canary directory, and
   byte-identical protected manifests.
 
+R5 registration slice 4 evidence, 2026-07-30:
+
+- Registration ownership for the `3 + 3 + 3 = 9` refinery, knowledge, and
+  onboarding bindings moved into their existing modules at the same three
+  composition positions. WebSocket and all ten page-map bindings remain
+  deliberately out of this lower-risk slice. No handler body, request/response
+  type, lock scope, route layer, or handler-manifest row changed;
+  `router.rs` is now `547` lines.
+- Deliberately omitting `POST /api/onboarding/reset` made the
+  production-builder control RED on that exact missing route; restoring the
+  same handler in `onboarding_routes::register` made it GREEN.
+- The built-router typed suite passes `1 / 1` across all nine bindings:
+  isolated knowledge path/count and scoped-relation wires, including the
+  count route's regular-file `500` envelope; milestone list/acknowledge/reset,
+  including typed validation and no-DB errors; and refinement
+  list/reject/accept with real awaiting-review rows plus typed no-DB errors.
+  The two bodyless onboarding successes are frozen as `204` plus empty bodies.
+  No `serde_json::Value` is used as a response oracle.
+- After refreshing diagnostics first, LSP reference closure drops the stale
+  `router.rs` references and resolves the three representative handlers only
+  inside their owning modules; all four changed Rust files and the contract
+  test have zero diagnostics. Server library passes
+  `347 passed / 2 ignored`; Rust M5 and Python inventory pass at `1 / 1` and
+  `191 / 55-50-86 / exposure 22`; generator-owned inventory changes are two
+  `knowledge_routes.rs` address shifts; and core/server all-target Clippy with
+  warnings denied passes.
+- R5 registration slice 4 REVIEW, 2026-07-30: Sol first blocked the missing
+  hermetic `GET /api/knowledge/count` regular-file error leg. After the typed
+  `500` envelope was added and the directory configuration restored, it
+  returned **APPROVE** with no remaining finding. It independently confirmed
+  exact nine-route identity/order and composition positions, D2/lock
+  preservation, untouched WebSocket/page-map/layers, isolated page/config
+  roots, address-only generated inventory changes, and byte-identical
+  protected manifests.
+
 ### R6 — `post_write` phase decomposition
 
 Begin only after the M5 exact-base and truth-state reader/write paths have
