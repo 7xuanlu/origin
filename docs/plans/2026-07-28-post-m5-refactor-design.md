@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R6 complete; R7 daemon startup and scheduler lanes next**
+Status: **R7 design approved; R7-0 executable teeth next**
 
 ## Authority and change control
 
@@ -5191,6 +5191,197 @@ Those are behavior changes and must not be hidden inside R6.
 
 Separate orchestration from phase/lane implementations without changing startup
 or scheduling order.
+
+#### R7 evidence baseline — 2026-07-30
+
+- R6 closes at clean checkpoint `f75940ee`. `main.rs` is `2,368` lines;
+  `run_daemon` alone spans roughly `1,120`. `scheduler.rs` is `6,223` lines,
+  but its inline test module begins at line `2,556` and accounts for roughly
+  `3,667` lines. The first navigation win is therefore test externalization,
+  not a new runtime abstraction.
+- LSP reports no errors in either file. `run_daemon` has only its definition
+  and the `main` dispatch. `spawn_scheduler` has exactly its definition, the
+  daemon launch, and the initial-delay shutdown test. `run_ambient_job_safe`
+  and `sync_directory_sources` additionally have only their existing local
+  test callers. Those reference sets are the visibility ceiling.
+- The executable M5 inventory contains one page-reader row owned by
+  `main::run_daemon` and three scheduler-owned rows. R7 keeps the R6 ratchet
+  active and must retain `191 rows; depth 55/50/86; exposure 22`. Startup state
+  preparation therefore moves as one page-reading item: splitting its direct
+  page reads among multiple helpers would create new readers even if runtime
+  behavior looked unchanged.
+- The current order contracts are load-bearing. Startup is:
+  termination-signal install → bind → logging/barrier → data-root lock and
+  repair fence → DB open → startup recovery/import/projection → config and
+  providers → ingest batcher and `finish_recovery` → optional workers →
+  termination waiter and scheduler → router → announce port → serve/drain.
+  The scheduler poll is: maintenance fence and state snapshot → page watcher →
+  directory sync → automatic steep/maintenance → derived-receipt sweep →
+  ambient lane. Shutdown checks surrounding launches stay in their current
+  positions.
+- `load_last_daily` currently holds the shared-state read guard across
+  `get_app_metadata(...).await`. That conflicts with the repository's general
+  async-lock rule, but it is pre-existing and outside movement-only R7. Preserve
+  it exactly and record it as debt; correcting it requires a separate
+  concurrency RED and is not permission to mix behavior into this extraction.
+- `cargo test --workspace --lib` does not exercise binary-only tests in
+  `main.rs`. Every startup slice therefore adds
+  `cargo test -p wenlan-server --bin wenlan-server` to its focused and boundary
+  gates. Any process test seeds an isolated data root plus an explicit scratch
+  `knowledge_path`; no R7 verifier may touch the real page vault.
+
+#### R7-0 — executable structure and order teeth
+
+- Before production movement, add a server-library structure test and a tracked
+  phase marker. It reads `main.rs`, `scheduler.rs`, and their private children,
+  masks comments/strings, and fails closed on missing, duplicate, public, or
+  out-of-order phase/lane items. Because it is a library test, the permanent
+  tooth runs under the ordinary workspace-library CI gate even though
+  `main.rs` is a binary target.
+- The phase vocabulary is closed:
+  `baseline → tests-external → startup-state → runtime → ambient → final`.
+  The live check accepts exactly the tracked phase during movement; after R7 it
+  hard-requires `final`, as R6 does. Synthetic positive controls delete,
+  duplicate, reorder, make public, and downgrade representative stages.
+- The final shape requires a thin ordered `run_daemon` facade; one private
+  startup state-preparation item; private runtime-worker and serve/drain items;
+  one private scheduler ambient child; one `tokio::spawn` scheduler and one
+  serial poll loop; no production implementation in test files; no public R7
+  child module or helper.
+- Do not pretend an item-body comparator proves extraction of statements from
+  inside `run_daemon` or `spawn_scheduler`. The order tooth, focused behavior
+  tests, LSP closure, M5 ratchet, and diff review own those moves. Exact byte
+  comparison is permitted only for whole syntactic test modules and
+  whole top-level ambient items.
+
+#### R7-1 — externalize binary and scheduler tests
+
+- Move the complete inline `bind_addr_tests` module to a binary-owned sibling
+  test file and the complete scheduler `tests` module to
+  `scheduler/scheduler_tests.rs`, preserving `use super::*`, cfg boundaries,
+  exact item bytes, test names, ignored markers, and environment-lock helpers.
+  Production code does not move.
+- Preserve the exact binary module identity with
+  `#[cfg(test)] #[path = "bind_addr_tests.rs"] mod bind_addr_tests;`. Two child
+  tests re-exec the binary with `bind_addr_tests::...` filters; renaming the
+  module can select zero tests and pass vacuously. The external file keeps the
+  `_tests.rs` suffix so the M5 production sweep excludes it.
+- Leave the small top-level RB01 `#[cfg(test)]` declarations in the scheduler
+  production half. R7-1 moves the complete `mod tests` item only; it does not
+  use “externalize tests” as permission to regroup scattered declarations.
+- RED is the `tests-external` structure phase plus an exact old/new syntactic
+  module digest. GREEN requires unchanged binary/server-lib test inventories,
+  ignored inventories, LSP resolution, and no production import/visibility
+  widening.
+- Stop on any changed test body, changed target ownership, new production
+  reachability from a test helper, or a test count/name delta. This slice is a
+  navigation change, not license to reorganize the 3,600-line fixture body.
+
+#### R7-2 — startup state phase
+
+- Keep termination-signal installation, listener binding, logging, the
+  debug-signal barrier, and `_data_root_lock` acquisition lexically in
+  `run_daemon`. The guard must still live until `run_daemon` exits.
+- Move the contiguous repair-fence/DB-open/startup recovery/import/projection/
+  configuration/provider/ingest-batcher preparation into one private
+  `startup` child item returning a private prepared-state value. It remains one
+  item specifically so the current single M5 `run_daemon` reader moves
+  one-for-one instead of splitting.
+- Preserve exact repair-mode suppression, fence restoration before ordinary
+  writers, page-permit/projection calls, error text, provider selection, and
+  every await/order relationship. `finish_recovery` stays in the facade,
+  immediately before shared-state construction, so the child returns a still
+  sealed `ServerState`.
+  The child may expose only the fields consumed by R7-3; no general
+  `StartupContext`, trait, builder, hook registry, or new configuration surface.
+  The exact loaded `config`, `reranker_cache_dir`, and
+  `deep_bgebase_pending` values cross the boundary by identity. Re-reading or
+  re-deriving any of them is a stop condition because it creates a second disk
+  read and a mid-startup configuration race.
+- RED is the `startup-state` structure phase and a subprocess characterization
+  that observes listener publication only after normal preparation while
+  repair mode suppresses ordinary workers. GREEN includes binary tests,
+  isolated `port_discovery`, the startup-signal process test, projection/repair
+  guards, and an M5 one-row identity substitution with unchanged totals.
+- Stop if `_data_root_lock` moves into a helper, a projection can run before
+  the repair fence, a new page-reader row appears, a test needs the real vault,
+  or the prepared-state carrier becomes a reusable framework.
+
+#### R7-3 — runtime registration and lifecycle phase
+
+- Extract two private items from the remaining facade: optional runtime-worker
+  registration, and router/listen/serve/drain. Preserve the ingest-batcher →
+  `finish_recovery` → shared-state construction → deep-reranker preload →
+  on-device reservation/load → readiness hook → termination waiter →
+  scheduler sequence.
+- Preserve one scheduler task, exact `ShutdownHandle::subscribe()` topology,
+  all five current scoped `shared.read()` snapshots in this region, the
+  non-Tokio readiness hook's captured runtime handle, port stdout/file formats,
+  scheduler join on both exit paths, and the bounded drain/explicit
+  process-exit behavior. The first three snapshots stay with optional-worker
+  registration; the termination and scheduler snapshots stay in the facade.
+- RED is the `runtime` order phase plus an order witness for optional-worker
+  suppression and scheduler/router/serve registration. GREEN is the binary
+  suite, `port_discovery`, all four `graceful_shutdown` process tests, scheduler
+  initial-delay shutdown, LSP reference/diagnostic closure, and M5 invariants.
+- This slice receives independent concurrency and lifecycle/data-loss reviews.
+  Stop on any detached work, newly held state guard across await, launch after
+  sticky shutdown, changed scheduler join, changed exit code, or changed repair
+  router selection.
+
+#### R7-4 — private ambient scheduler child
+
+- Move the existing ambient registry/policy and execution cluster as whole
+  top-level items into private `scheduler/ambient.rs`: `AmbientJob::ALL`,
+  availability, schedule/cooldown bookkeeping, provider resolution, turn
+  report, panic boundary, and the single `run_ambient_job` match. Keep
+  `AmbientBudgetProvider` and `with_shared_automatic_budget` in the scheduler
+  root: despite the stale “Ambient-only” comment, both ambient and automatic
+  lanes consume that shared one-call-budget infrastructure. Keep
+  `spawn_scheduler` and its one serial poll loop in the root. Do not create a
+  trait/dynamic registry or one task per lane.
+- The root poll retains the exact page watcher → directory → automatic →
+  receipt → ambient order and all shutdown/resource/cooldown checks. Adding an
+  ambient job then changes the private ambient child and its registry tests,
+  not the 500-line orchestration loop.
+- RED is the `ambient` phase and exact top-level item ownership. GREEN includes
+  round-robin, automatic priority, directory/document separation, inference
+  budget, provider pinning, cursor persistence, both panic-isolation groups,
+  initial-delay shutdown, and the existing ignored live-daemon contract
+  parsers without running the physical-model profile.
+- This slice receives independent concurrency and provider/data-loss reviews.
+  Stop if a lane becomes concurrent or detached, a shutdown check crosses a
+  launch, a provider pin can fall through, a cursor/cooldown moves, the M5
+  tuple/exposure changes, or a visibility exceeds `pub(super)`.
+
+#### R7 boundary
+
+- Advance the permanent tooth to `final`; record exact root/child/test line
+  counts, function-item/reference sets, test/ignored inventories, and the
+  one-for-one M5 address changes.
+- Required final gates: focused RED/GREEN receipts for every slice; binary
+  tests; server lib and affected process suites; truth/M5/R4/raw-connection
+  guards; warnings-denied server/core all-target Clippy; one uninterrupted
+  workspace-library run; formatting/diff hygiene; LSP diagnostics plus
+  definition/reference closure; one integrated Sol review after the two
+  high-risk slice reviews.
+- Fable reviews this detailed R7 shape before R7-0 production scaffolding.
+  Fable reopens the design only for a material lifecycle/module-boundary
+  correction; ordinary movement findings remain Sol-owned.
+
+Fable gate, 2026-07-30:
+**APPROVE-WITH-FIXES.** Fable independently verified the M5 depth-two
+one-for-one substitution, `_data_root_lock` lifetime, repair-state region,
+worker/lifecycle partition, ambient-child boundary, workspace-lib tooth, and
+named behavior gates. Three required clarifications are now incorporated:
+shared inference-budget infrastructure stays in the scheduler root; carried
+startup configuration/cache/flag values cannot be re-derived; and the
+binary-test module keeps the exact `bind_addr_tests` identity plus an
+M5-excluded `_tests.rs` file. Its non-blocking boundary notes also pin
+`finish_recovery` in the facade, all five runtime-region state snapshots, and
+the top-level RB01 test declarations. A narrow closure confirms only these
+corrections before R7-0 begins. Narrow Fable closure returned **APPROVE** with
+no remaining design blocker.
 
 ### R8 — instruction and verification-surface cleanup
 
