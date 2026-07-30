@@ -73,11 +73,21 @@ def remove_allowlisted_pub_super(text: str, allowed: bool) -> str:
 
 
 def apply_substitutions(
-    text: str, substitutions: list[dict[str, Any]], side: str, phase: str
+    text: str,
+    substitutions: list[dict[str, Any]],
+    side: str,
+    phase: str,
+    *,
+    after_normalization: bool = False,
 ) -> str:
     for substitution in substitutions:
         phases = substitution.get("phases")
-        if substitution["side"] != side or (phases and phase not in phases):
+        if (
+            substitution["side"] != side
+            or bool(substitution.get("after_normalization", False))
+            != after_normalization
+            or (phases and phase not in phases)
+        ):
             continue
         old = substitution["from"]
         count = text.count(old)
@@ -343,6 +353,20 @@ def check_manifest(manifest: dict[str, Any]) -> list[str]:
                 dedent=entry.get("dedent_new", False),
                 allow_pub_super=entry.get("allow_pub_super_new", False),
             )
+            old_normalized = apply_substitutions(
+                old_normalized,
+                substitutions,
+                "old",
+                phase,
+                after_normalization=True,
+            )
+            new_normalized = apply_substitutions(
+                new_normalized,
+                substitutions,
+                "new",
+                phase,
+                after_normalization=True,
+            )
             if old_normalized != new_normalized:
                 old_hash = hashlib.sha256(old_normalized.encode()).hexdigest()
                 new_hash = hashlib.sha256(new_normalized.encode()).hexdigest()
@@ -412,6 +436,43 @@ def selftest() -> None:
         "tests-externalized",
     )
     assert '../post_write.rs' in substituted
+
+    rustfmt_old = 'let value =\n    "stable token";'
+    rustfmt_new = 'let value = "stable token";'
+    rustfmt_rule = [
+        {
+            "side": "old",
+            "from": rustfmt_old,
+            "to": rustfmt_new,
+            "count": 1,
+            "after_normalization": True,
+        }
+    ]
+    assert (
+        apply_substitutions(
+            rustfmt_old,
+            rustfmt_rule,
+            "old",
+            "tests-externalized",
+            after_normalization=True,
+        )
+        == rustfmt_new
+    )
+    nearby_mutation = rustfmt_old.replace("stable token", "changed token")
+    try:
+        _ = apply_substitutions(
+            nearby_mutation,
+            rustfmt_rule,
+            "old",
+            "tests-externalized",
+            after_normalization=True,
+        )
+    except CheckError:
+        pass
+    else:
+        raise AssertionError(
+            "an unenumerated nearby token mutation must not inherit a rustfmt substitution"
+        )
 
     imports = top_level_imports(
         "use crate::{A, B};\nfn body() { use crate::Inside; }\nuse std::path::Path;\n"

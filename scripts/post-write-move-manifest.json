@@ -34,6 +34,69 @@
           "to": "include_str!(\"page_update.rs\")",
           "count": 1,
           "phases": ["final"]
+        },
+        {
+          "side": "old",
+          "from": "\nuse super::*;",
+          "to": "use super::*;",
+          "count": 1,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "        content:\n            \"Rust has ownership, borrowing, lifetimes, reference validity, and memory safety\"\n                .to_string(),",
+          "to": "        content: \"Rust has ownership, borrowing, lifetimes, reference validity, and memory safety\"\n            .to_string(),",
+          "count": 1,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "        content: \"Rust ownership, borrowing, and lifetimes keep references memory safe\"\n            .to_string(),",
+          "to": "        content: \"Rust ownership, borrowing, and lifetimes keep references memory safe\".to_string(),",
+          "count": 1,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "        content:\n            \"Rust workspaces share Cargo lockfiles, inherited metadata, and all-crate checks\"\n                .to_string(),",
+          "to": "        content: \"Rust workspaces share Cargo lockfiles, inherited metadata, and all-crate checks\"\n            .to_string(),",
+          "count": 3,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "        content:\n            \"Rust is a systems language with memory safety features, ownership and borrowing\"\n                .to_string(),",
+          "to": "        content: \"Rust is a systems language with memory safety features, ownership and borrowing\"\n            .to_string(),",
+          "count": 1,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "    let v2 =\n        \"Every version of a page is recorded as its own history row, appended in the write\";",
+          "to": "    let v2 = \"Every version of a page is recorded as its own history row, appended in the write\";",
+          "count": 1,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "            content: \"The editor saved prose after another writer attached a source.\"\n                .to_string(),",
+          "to": "            content: \"The editor saved prose after another writer attached a source.\".to_string(),",
+          "count": 2,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "                content: \"A refused write must not appear in the page timeline at all\"\n                    .to_string(),",
+          "to": "                content: \"A refused write must not appear in the page timeline at all\".to_string(),",
+          "count": 1,
+          "after_normalization": true
+        },
+        {
+          "side": "old",
+          "from": "        let mut structured: serde_json::Value =\n            serde_json::from_str(&structured_fields).unwrap();",
+          "to": "        let mut structured: serde_json::Value = serde_json::from_str(&structured_fields).unwrap();",
+          "count": 1,
+          "after_normalization": true
         }
       ]
     },

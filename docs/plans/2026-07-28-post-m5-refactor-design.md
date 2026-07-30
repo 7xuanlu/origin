@@ -4907,6 +4907,52 @@ Those are behavior changes and must not be hidden inside R6.
   inline-child mutation controls, the exact M5 receipt, and the absence of any
   production `post_write` diff.
 
+#### R6-1 execution receipt — 2026-07-30
+
+- Advanced the structure phase to `tests-externalized` and replaced only the
+  inline `#[cfg(test)] mod tests { ... }` body with the exact external-module
+  declaration
+  `#[cfg(test)] #[path = "post_write/post_write_tests.rs"] mod tests;`.
+  Production declarations and bytes before that boundary are unchanged. The
+  former module body now lives at
+  `crates/wenlan-core/src/post_write/post_write_tests.rs`; the reflection path
+  change
+  `include_str!("post_write.rs")` →
+  `include_str!("../post_write.rs")` remains an explicit comparator
+  substitution.
+- RED: before updating the R4 test-support manifest, its exact gate reported
+  precisely `55` removed rows at the old root path and `55` added rows at the
+  external test path. The replacement changes only each row's first path cell;
+  owner, callee, and ordinal are byte-identical.
+- Canonical `cargo fmt --all -- --check` exposed a real conflict with the
+  initially frozen “uniform dedent only” movement rule: removing one indentation
+  level changes rustfmt's line-width decisions. The resolved contract is that
+  canonical rustfmt wins; no `#[rustfmt::skip]` is added. The comparator now
+  applies `9` exact old-side, post-normalization substitution rules covering the
+  one removed leading blank and `11` enumerated line-wrap occurrences
+  (`12` occurrences total). Its self-test proves an unenumerated nearby token
+  mutation does not inherit an allowlist entry. These formatting-only
+  substitutions and the reflection-path substitution are the complete
+  R6-1 content-delta allowlist.
+- GREEN: the movement comparator self-test and its `4` unit tests pass, and the
+  live comparison reports
+  `post_write movement comparison: ok (48 manifest items)`. The permanent
+  structure/facade gate passes `4/4`; the exact R4 manifest gate passes `1/1`;
+  all externalized `post_write::tests::*` pass `104/104`, with `0` ignored tests
+  and `0` benchmarks. A separate byte comparison pins the complete
+  `97,427`-byte production prefix as identical to `HEAD`.
+- M5 remains unchanged: both the R6 ratchet and live inventory report
+  `191 rows; depth 55/50/86; exposure 22`. `cargo fmt --all -- --check` and
+  `git diff --check` pass. Rust LSP diagnostics are empty for both the facade
+  and external test module; `goto_definition` on `mod tests` resolves to
+  `post_write/post_write_tests.rs:1`, and the sampled test reference query
+  returns only its declaration.
+- Independent Sol review returned **APPROVE** with zero findings after
+  reproducing the `97,427`-byte production-prefix identity, exact `104`/zero
+  compiler inventory, all `55` path-only manifest rows, the `9` explicit
+  formatting rules over `12` occurrences, byte-identical transformed test
+  body, M5 exclusion/receipt, LSP resolution, and clean hygiene gates.
+
 ### R7 — daemon startup and scheduler lanes
 
 Separate orchestration from phase/lane implementations without changing startup
