@@ -1,7 +1,10 @@
 use super::*;
 use crate::events::NoopEmitter;
+use std::collections::HashSet;
 use std::sync::Arc;
-use wenlan_types::requests::{AddObservationRequest, CreateEntityRequest, CreateRelationRequest};
+use wenlan_types::requests::{
+    AddObservationRequest, CreateConceptRequest, CreateEntityRequest, CreateRelationRequest,
+};
 
 // Serialize env-var-sensitive tests to avoid races.
 // Uses tokio::sync::Mutex so the guard can safely span .await points.
@@ -921,6 +924,125 @@ async fn create_page_rejects_reserved_delimiter_before_projection_or_db_mutation
             .is_none(),
         "validation must happen before projection creates any artifact"
     );
+}
+
+#[tokio::test]
+async fn create_page_db_insert_failure_rolls_back_scratch_projection() {
+    let (db, _dir) = test_db().await;
+    let knowledge = tempfile::tempdir().unwrap();
+    let page_id = "page_create_projection_rollback";
+    let existing_content = "the existing database page remains authoritative";
+    let candidate_content = "the duplicate candidate reaches projection before DB rejection";
+
+    let existing_req = CreateConceptRequest {
+        title: "Existing authoritative page".to_string(),
+        content: existing_content.to_string(),
+        summary: None,
+        entity_id: None,
+        space: (None).into(),
+        source_memory_ids: Vec::new(),
+        creation_kind: Some("authored".to_string()),
+        workspace: None,
+    };
+    page_write(
+        &db,
+        PageWrite::Create {
+            page_id: Some(page_id),
+            req: existing_req,
+            agent: "test",
+            knowledge_path: None,
+            page_min_cluster_size: 3,
+            page_match_threshold: 0.86,
+            citations_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    let existing = db.get_page(page_id).await.unwrap().unwrap();
+
+    let mut projected_candidate = existing.clone();
+    projected_candidate.title = "Duplicate projected candidate".to_string();
+    projected_candidate.content = candidate_content.to_string();
+    let projection = crate::export::knowledge::KnowledgeProjectionWrite::new(
+        knowledge.path().to_path_buf(),
+        &db,
+    );
+    let filename = projection
+        .write_page_gated(&db, &projected_candidate)
+        .await
+        .expect("scratch projection write must be valid")
+        .expect("generation zero must permit the positive-control projection");
+    let projected_path = knowledge.path().join(filename);
+    assert!(
+        projected_path.is_file(),
+        "positive control: the same scratch projection must be writable"
+    );
+    projection.remove_page(page_id).unwrap();
+    assert!(
+        !projected_path.exists(),
+        "positive control cleanup must establish an empty pre-trigger path"
+    );
+    drop(projection);
+
+    let duplicate_req = CreateConceptRequest {
+        title: projected_candidate.title.clone(),
+        content: candidate_content.to_string(),
+        summary: None,
+        entity_id: None,
+        space: (None).into(),
+        source_memory_ids: Vec::new(),
+        creation_kind: Some("authored".to_string()),
+        workspace: None,
+    };
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *page_create::CREATE_PAGE_PRE_DB_GATE.lock().unwrap() =
+        Some((page_id.to_string(), parked_tx, resume_rx));
+
+    let create = page_write(
+        &db,
+        PageWrite::Create {
+            page_id: Some(page_id),
+            req: duplicate_req,
+            agent: "test",
+            knowledge_path: Some(knowledge.path()),
+            page_min_cluster_size: 3,
+            page_match_threshold: 0.86,
+            citations_json: None,
+        },
+    );
+    let observe_projection = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), parked_rx)
+            .await
+            .expect("production create must reach the post-projection pause")
+            .expect("production create dropped the post-projection pause");
+        let markdown = std::fs::read_to_string(&projected_path)
+            .expect("production create must have written its candidate projection");
+        assert!(
+            markdown.contains(candidate_content),
+            "paused production projection must contain the duplicate candidate"
+        );
+        resume_tx
+            .send(())
+            .expect("paused production create must still be waiting");
+    };
+    let (result, ()) = tokio::join!(create, observe_projection);
+    let error = result.expect_err("the duplicate page id must fail after the projection write");
+    assert!(
+        matches!(error, WenlanError::VectorDb(_)),
+        "duplicate DB insert must surface its storage error, got {error:?}"
+    );
+    assert!(
+        !projected_path.exists(),
+        "DB failure must roll back the just-written markdown projection"
+    );
+
+    let after = db.get_page(page_id).await.unwrap().unwrap();
+    assert_eq!(after.title, existing.title);
+    assert_eq!(after.content, existing_content);
+    assert_eq!(after.version, existing.version);
+    assert_eq!(after.source_memory_ids, existing.source_memory_ids);
+    assert_eq!(db.list_pages("active", 10, 0).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

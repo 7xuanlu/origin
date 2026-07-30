@@ -60,7 +60,7 @@ def dedent_one_uniform_body(text: str) -> str:
 
 def remove_allowlisted_pub_super(text: str, allowed: bool) -> str:
     pattern = re.compile(
-        r"(?m)^(\s*(?:#\[[^\n]+\]\s*\n\s*)*)(pub\(super\)\s+)"
+        r"\A(\s*(?:#\[[^\n]+\]\s*\n\s*)*)(pub\(super\)\s+)"
     )
     found = list(pattern.finditer(text))
     if not found:
@@ -240,6 +240,14 @@ def extract_selector(text: str, selector: dict[str, Any]) -> str:
         if depth:
             raise CheckError(f"unclosed module body: {selector['name']}")
         return text[body_start : cursor - 1]
+    if selector["kind"] in {"const", "static"}:
+        equals = declaration.find("=")
+        if equals < 0:
+            raise CheckError(f"{selector['kind']} {selector['name']} has no initializer")
+        terminator = declaration.find(";", equals)
+        if terminator < 0:
+            raise CheckError(f"unclosed {selector['kind']}: {selector['name']}")
+        return text[start : match.start() + terminator + 1]
     if semicolon >= 0 and (brace < 0 or semicolon < brace):
         return text[start : match.start() + semicolon + 1]
     if brace < 0:
@@ -390,6 +398,10 @@ def selftest() -> None:
     )
     widened = "pub(super) async fn moved() {}\n"
     assert remove_allowlisted_pub_super(widened, True) == "async fn moved() {}\n"
+    widened_struct = "pub(super) struct Moved {\n    pub(super) field: i64,\n}\n"
+    assert remove_allowlisted_pub_super(widened_struct, True) == (
+        "struct Moved {\n    pub(super) field: i64,\n}\n"
+    )
     try:
         remove_allowlisted_pub_super(widened, False)
     except CheckError:
@@ -417,6 +429,10 @@ def selftest() -> None:
         "use crate::{A, B};\nfn body() { use crate::Inside; }\nuse std::path::Path;\n"
     )
     assert imports == {"use crate::{A, B};", "use std::path::Path;"}
+    array_const = 'const KINDS: [&str; 2] = ["one", "two"];\nfn after() {}\n'
+    assert extract_selector(
+        array_const, {"kind": "const", "name": "KINDS"}
+    ) == 'const KINDS: [&str; 2] = ["one", "two"];'
     assert normalize_item(
         "fn body() {\n    use crate::Inside;\n}\n",
         dedent=False,

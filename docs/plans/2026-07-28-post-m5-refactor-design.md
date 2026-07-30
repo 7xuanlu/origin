@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R6-2 complete; R6-3 Page create/dispatch next**
+Status: **R6-3 complete; R6-4 Page update is next**
 
 ## Authority and change control
 
@@ -5013,6 +5013,81 @@ Those are behavior changes and must not be hidden inside R6.
   reviewer independently scanned every adjacent item, reproduced the live
   comparator and diff hygiene, and returned **APPROVE** with no remaining
   finding.
+
+#### R6-3 execution receipt — 2026-07-30
+
+- Before movement, added
+  `create_page_db_insert_failure_rolls_back_scratch_projection`. It creates one
+  authoritative Page at an explicit id, directly writes a different Page with
+  that same id through `KnowledgeProjectionWrite::write_page_gated` into a
+  scratch vault and proves the file exists, then removes that positive-control
+  artifact. The first independent Sol review returned **BLOCK**: that direct
+  control did not observe the production create between its projection write
+  and duplicate-id DB insert, so deleting both the production write and
+  rollback would leave the test falsely green. Closure adds a private,
+  test-only, page-id-scoped one-shot pause immediately after the real
+  `write_page_gated` succeeds. A bounded observer now proves that production's
+  candidate Markdown exists and contains the candidate content before releasing
+  the DB insert; after the duplicate-id failure it proves the file is gone while
+  the original DB title, content, version, sources, and sole-row count remain
+  unchanged. With only the production rollback temporarily removed, the exact
+  test fails at `DB failure must roll back the just-written markdown
+  projection`; restoring the rollback returns it to `1/1`. Rust LSP resolves
+  the pause call to its private definition, finds exactly its definition/call
+  pair and the gate's declaration/helper/test references, and reports no errors
+  in either edited Rust file. The next Sol pass accepted this rollback proof as
+  sound but returned **BLOCK** because the ledger still carried the pre-cleanup
+  import counts. After correcting the receipt to `20/3` and recording the
+  explicit test-owned import, the same reviewer returned **APPROVE**.
+- Advanced the structure phase to `create-dispatch`. Its intentional RED
+  reported exactly the absent private `page_create` and `page_dispatch`
+  children/files plus the seven public and two crate-visible facade items not
+  yet re-exported. Movement puts the manifest-owned constants, source helper,
+  `CreatePageInput`, and four create/attach/replace implementations in
+  `page_create`; `PageWrite`, `page_write`, `PageGrowthCommit`, and all stable
+  create/update facade wrappers move to `page_dispatch`. The root continues to
+  own the complete Page-update implementation cluster.
+- Retargeted
+  `pages::tests::page_embedding_text_is_the_single_source_of_truth` to scan the
+  facade and `post_write/page_create.rs` together. Its shared-helper positive
+  assertion and both local-definition/cap negative assertions remain intact.
+  A dedicated manifest selector records the exact two reflection-text
+  substitutions, increasing the movement inventory from `48` to `49` items.
+- Activating the first array-typed constant exposed a fail-open selector bug:
+  the comparator treated the semicolon inside `[&str; 5]` as the declaration
+  terminator. Const/static extraction now requires the terminator after `=`,
+  with an array-const positive control. The `pub(super)` normalizer is also
+  anchored to the item declaration rather than arbitrary body lines.
+  `CreatePageInput`'s seven fields and `PageGrowthCommit`'s four fields require
+  sibling/parent access after the split; their field-level widenings are encoded
+  as two exact block substitutions rather than broad normalization. Every moved
+  top-level item boundary has an explicit blank separator, and canonical format
+  removes the root movement holes.
+- Current GREEN receipts: comparator self-test re-extracts `49` selectors,
+  comparator unit tests pass `4/4`, live comparison passes `49/49`,
+  structure/facade passes `4/4`, and the retargeted pages reflection test passes
+  `1/1`. M5 regeneration changes only the expected source-address rows; the
+  pre/post ratchet against `/tmp/wenlan-r6-3-m5-before.json` remains
+  `191 rows; depth 55/50/86; exposure 22` with the same exposure identity set.
+- The final import/re-export manifest records `20` exact additions and `3`
+  exact removals relative to the frozen monolith. Removing the root's now
+  production-unused short `HashSet` import first produced a compile RED because
+  the externalized tests had inherited that name through `use super::*`; the
+  test module now imports `std::collections::HashSet` explicitly, leaving the
+  production facade clean without relying on a transitive test namespace.
+  Focused behavior passes
+  create `16/16`, PageWrite/dispatch `19/19`, and source replacement `3/3`.
+  The complete `post_write::tests::*` set passes `106/106`; the rollback
+  characterization is the sole addition to R6-2's `105`, and the ignored
+  inventory remains `0 tests, 0 benchmarks`.
+- M5 regeneration changes exactly six generated address rows: root line shifts,
+  `create_page_impl`, `write_document_source_page_impl`, and
+  `replace_source_page_impl` move to `page_create.rs`, while `page_write` moves
+  to `page_dispatch.rs`. Truth-manifest tests pass `16/16`; the permitted
+  projection source guard, production cutover-setter guard, R4 exact manifest,
+  and production raw-connection ratchet each pass `1/1`.
+  `cargo fmt --all -- --check`, `git diff --check`, and the explicit external
+  `post_write::page_create` / `post_write::page_dispatch` path scan pass.
 
 ### R7 — daemon startup and scheduler lanes
 

@@ -38,6 +38,32 @@
       ]
     },
     {
+      "id": "pages_test:page_embedding_text_is_the_single_source_of_truth",
+      "phases": ["create-dispatch", "final"],
+      "old": {
+        "path": "crates/wenlan-core/src/pages.rs",
+        "selector": {"kind": "fn", "name": "page_embedding_text_is_the_single_source_of_truth"}
+      },
+      "new": {
+        "path": "crates/wenlan-core/src/pages.rs",
+        "selector": {"kind": "fn", "name": "page_embedding_text_is_the_single_source_of_truth"}
+      },
+      "substitutions": [
+        {
+          "side": "old",
+          "from": "let post_write_source = include_str!(\"post_write.rs\");",
+          "to": "let post_write_sources = [\n            include_str!(\"post_write.rs\"),\n            include_str!(\"post_write/page_create.rs\"),\n        ]\n        .join(\"\\n\");",
+          "count": 1
+        },
+        {
+          "side": "old",
+          "from": "post_write_source.contains",
+          "to": "post_write_sources.contains",
+          "count": 3
+        }
+      ]
+    },
+    {
       "id": "entity_graph:create_entity",
       "phases": ["lower-risk-flows", "create-dispatch", "final"],
       "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_entity"}},
@@ -183,21 +209,45 @@
       "phases": ["create-dispatch", "final"],
       "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "struct", "name": "CreatePageInput"}},
       "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "struct", "name": "CreatePageInput"}},
-      "allow_pub_super_new": true
+      "allow_pub_super_new": true,
+      "substitutions": [
+        {
+          "side": "old",
+          "from": "    page_id: Option<&'a str>,\n    req: CreateConceptRequest,\n    agent: &'a str,\n    knowledge_path: Option<&'a Path>,\n    page_min_cluster_size: usize,\n    page_match_threshold: f64,\n    citations_json: Option<&'a str>,",
+          "to": "    pub(super) page_id: Option<&'a str>,\n    pub(super) req: CreateConceptRequest,\n    pub(super) agent: &'a str,\n    pub(super) knowledge_path: Option<&'a Path>,\n    pub(super) page_min_cluster_size: usize,\n    pub(super) page_match_threshold: f64,\n    pub(super) citations_json: Option<&'a str>,",
+          "count": 1
+        }
+      ]
     },
     {
       "id": "page_create:create_page_impl",
       "phases": ["create-dispatch", "final"],
       "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "fn", "name": "create_page_impl"}},
       "new": {"path": "crates/wenlan-core/src/post_write/page_create.rs", "selector": {"kind": "fn", "name": "create_page_impl"}},
-      "allow_pub_super_new": true
+      "allow_pub_super_new": true,
+      "substitutions": [
+        {
+          "side": "old",
+          "from": "    }\n\n    // DB index",
+          "to": "    }\n\n    #[cfg(test)]\n    create_page_pre_db_pause(&id).await;\n\n    // DB index",
+          "count": 1
+        }
+      ]
     },
     {
       "id": "page_dispatch:PageGrowthCommit",
       "phases": ["create-dispatch", "final"],
       "old": {"path": "crates/wenlan-core/src/post_write.rs", "selector": {"kind": "struct", "name": "PageGrowthCommit"}},
       "new": {"path": "crates/wenlan-core/src/post_write/page_dispatch.rs", "selector": {"kind": "struct", "name": "PageGrowthCommit"}},
-      "allow_pub_super_new": true
+      "allow_pub_super_new": true,
+      "substitutions": [
+        {
+          "side": "old",
+          "from": "    source_id: &'a str,\n    expected_memory_version: i64,\n    expected_page_version: i64,\n    expected_source_revision: i64,",
+          "to": "    pub(super) source_id: &'a str,\n    pub(super) expected_memory_version: i64,\n    pub(super) expected_page_version: i64,\n    pub(super) expected_source_revision: i64,",
+          "count": 1
+        }
+      ]
     },
     {
       "id": "page_update:PipelineStage",
@@ -335,18 +385,29 @@
     ],
     "allow_added": [
       "pub use self::entity_graph::{ add_observation, create_entity, create_relation, create_relation_with_span, };",
+      "pub use self::page_dispatch::{ create_page, create_page_with_floor, create_page_with_tuning, page_write, update_page, update_page_preserving_sources, PageWrite, };",
+      "pub(crate) use self::page_dispatch::{ update_page_at_source_revision, update_page_growth_at_versions, };",
       "pub use self::page_revision::{ accept_pending_revision, accept_pending_revision_with_knowledge_path, dismiss_contradiction, dismiss_pending_revision, };",
-      "use crate::db::{MemoryDB, UNFILED_SPACE_ID};",
+      "use crate::db::MemoryDB;",
+      "use crate::{ db::{MemoryDB, UNFILED_SPACE_ID}, error::WenlanError, };",
       "use crate::{ db::{MemoryDB, PendingMemoryRevisionPayload}, error::WenlanError, };",
       "use crate::{db::MemoryDB, error::WenlanError};",
+      "use self::page_dispatch::PageGrowthCommit;",
+      "use std::{collections::HashSet, path::Path};",
+      "use std::{path::Path, str::FromStr};",
       "use std::path::Path;",
       "use super::log_activity_best_effort;",
+      "use super::{ page_create::{ attach_page_sources_impl, create_page_impl, replace_source_page_impl, write_document_source_page_impl, CreatePageInput, }, update_page_impl, WriteResult, };",
+      "use super::{log_activity_best_effort, WriteOutcome, WriteResult};",
       "use super::{WriteOutcome, WriteResult};",
+      "use wenlan_types::requests::CreateConceptRequest;",
+      "use wenlan_types::requests::{CreateConceptRequest, UpdatePageRequest};",
       "use wenlan_types::requests::{AddObservationRequest, CreateEntityRequest, CreateRelationRequest};",
-      "use wenlan_types::{ repair::{RepairDigest, RepairManifest, RepairRollbackPayloadV2}, requests::{CreateConceptRequest, UpdatePageRequest}, MemoryType, RawDocument, };"
+      "use wenlan_types::{ repair::{RepairDigest, RepairManifest, RepairRollbackPayloadV2}, requests::UpdatePageRequest, MemoryType, RawDocument, };"
     ],
     "allow_removed": [
       "use crate::db::{MemoryDB, PendingMemoryRevisionPayload, UNFILED_SPACE_ID};",
+      "use std::{collections::HashSet, path::Path, str::FromStr};",
       "use wenlan_types::{ repair::{RepairDigest, RepairManifest, RepairRollbackPayloadV2}, requests::{ AddObservationRequest, CreateConceptRequest, CreateEntityRequest, CreateRelationRequest, UpdatePageRequest, }, MemoryType, RawDocument, };"
     ]
   }
