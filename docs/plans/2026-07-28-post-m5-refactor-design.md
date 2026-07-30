@@ -1896,6 +1896,107 @@ Frozen slice contract:
 - GREEN floor: external literals `296 → 294`, production `7 → 5`, tests remain
   `289`.
 
+##### R4-20 frozen slice contract
+
+- **One child, two operations, unchanged facade graph.**
+  `db/repair_page_rename.rs` owns the canonical
+  `rename_page_title_cas_inner` and
+  `recover_rename_page_title_apply_receipt` operations. The normal and
+  test-hook `post_write` facades remain wrappers with their current names and
+  signatures. `repair::apply_rename_page_title` remains the recovery/apply
+  orchestrator and calls the DB child for pending recovery. No second
+  transaction implementation, same-name re-export, or direct dispatcher
+  bypass is allowed.
+- **Apply lock order and lifetime are byte-for-byte behavior.** Validate the
+  manifest shape, review binding, and embedding before acquiring either
+  resource. Then acquire the owned repair projection session, derive its
+  locked projection, compute excluded paths, acquire `db.conn`, and execute
+  `BEGIN IMMEDIATE`, in that order. Retain the projection session, projection
+  handle, and DB guard through every target/collision/review read, projection
+  scan and write, proof hook, restore, and `COMMIT`/`ROLLBACK`. Projection
+  compensation remains before DB rollback. The existing error mapping remains
+  exact: an original operation/hook error is returned only when projection
+  restore and DB rollback both succeed; a commit error remains a vector DB
+  error only when both compensations succeed; every compensation failure is
+  `repair_apply_recovery_required`.
+- **Recovery lock order and post-commit lifetime are also behavior.** Inspect
+  the final/pending artifact and load the typed rollback before either lock.
+  Then acquire the owned projection session and locked projection, acquire
+  `db.conn`, and execute `BEGIN IMMEDIATE`. Retain both resource guards through
+  capture, classification, optional restore, and `COMMIT`. Preserve the
+  current lexical lifetime after `COMMIT`: publishing a committed pending
+  receipt or clearing a retryable pending receipt occurs while both guards are
+  still alive. The advisory projection acquisition stays fail-fast through
+  `try_lock_exclusive`; this slice must not replace it with a blocking lock.
+- **Artifact I/O crosses the boundary only as a typed domain seam.**
+  `RepairArtifactStore` gains a narrow rename-recovery inspection result with
+  exactly three states: completed final receipt, no recovery artifact, or
+  pending with an optional verified receipt plus the typed rename rollback.
+  The inspection method preserves final-receipt cleanup and bounded pending
+  read/parse/verification. Two narrow store operations publish the rename
+  pending receipt or clear it after commit. The DB child does not receive raw
+  artifact paths, and generic `read_bounded_file`, `publish_no_replace`, or
+  `sync_dir` do not become cross-module APIs.
+- **Classifier behavior is unchanged.** Exact committed post publishes;
+  database-pre plus projection-pre clears and retries; database-pre plus
+  projection-post restores, clears, and retries; every other state rolls back,
+  retains pending, and returns `repair_apply_recovery_required`. Both
+  split-projection states—target-post/state-pre and
+  state-post/target-pre—are explicitly unknown. This movement records but
+  does not silently repair the existing recovery paths where receipt or
+  post-match `?`, or a failed `COMMIT`, can return without an explicit
+  rollback; that behavioral correction requires a separate reviewed slice.
+- **Helper ownership has one time-bounded exception.** Move
+  `page_on_connection`, embedding decode, apply projection restore, recovery
+  rollback, and recovery-only database/projection match helpers private to the
+  DB child. Keep shared receipt, non-target receipt, excluded-path, effect
+  guard, and DB-digest helpers in `repair.rs`. LSP currently resolves four
+  callers of `capture_rename_page_title_on_connection`: two apply captures,
+  one recovery capture, and the verification transaction. R4-20 removes the
+  first three, but the verification caller intentionally remains until R4-24.
+  Therefore the capture helper stays a narrow `pub(crate)` seam in
+  `repair.rs`; R4-24 must remove its final caller and make it private rather
+  than duplicating it or pulling verification forward.
+- **RED controls carry the concurrency proof.**
+  1. Hold `db.conn` and invoke apply and pending recovery against an invalid
+     regular-file projection root under a bounded timeout. Correct
+     projection-first order returns the projection-root error without waiting
+     for DB; a DB-first mutation times out.
+  2. A narrowly named `cfg(test)` checkpoint immediately before the apply
+     projection write releases a prestarted contender on a multi-thread Tokio
+     runtime. The checkpoint waits with a finite bound until that same
+     contender has polled `db.conn.lock()` and observed it Pending; it must not
+     merely spawn or schedule the contender. The existing after-target-write
+     hook proves the contender still has not entered, then fails so the
+     unchanged projection and DB compensation path is also exercised. After
+     the operation returns and releases the guard, the test awaits the same
+     contender and proves that it then enters. This paired interval kills a
+     release-before-write and reacquire-after-write mutant without joining a
+     blocked thread inside a synchronous hook.
+  3. Restore has two narrowly named `cfg(test)` checkpoints: one immediately
+     before the first target restore and one after the target has been restored
+     but before state restoration. Apply compensation and recovery
+     `RestoreRetry` tests use the same pending-future handshake at entry, prove
+     the contender still has not entered at the midpoint, then prove it enters
+     only after the operation returns. The production restore method remains a
+     no-hook wrapper.
+  4. A narrowly named `cfg(test)` recovery hook fires after `COMMIT` and before
+     artifact publish/clear on both Publish and Clear paths. At that point the
+     test first confirms the pending artifact still exists and the final
+     artifact does not, then proves `db.conn.try_lock()` is blocked and a
+     second owned repair projection session fails fast with
+     `page_projection_locked`.
+  5. Target-post/state-pre and state-post/target-pre fixtures both return
+     `repair_apply_recovery_required` and retain the pending artifact.
+  Existing title-rename controls remain unchanged and green.
+- **Mechanical and topology gates.** Lower only the exact ratchet rows
+  `post_write.rs: 15 → 14` and `repair.rs: 19 → 18`; no production raw lock
+  appears outside `db/**`. The expected external census is `296 → 294`,
+  production `7 → 5`, tests `289`. Preserve the M5 inventory at `191` rows,
+  depth `55 / 50 / 86`, exposure `22`, and ambiguity `9`. Ast-grep closes the
+  declaration/call shape; exact text census covers macro token trees; LSP
+  definition/references and zero-error diagnostics close semantic routing.
+
 #### R4-21 — regenerate-page projection compensation
 
 - Move `regenerate_page_projection_cas` as one named cross-resource operation.
