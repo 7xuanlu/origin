@@ -595,8 +595,7 @@ async fn current_schema_diagnostic_distinguishes_old_and_future_versions() {
         ),
     ] {
         let (db, _dir) = crate::db::tests::test_db().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(&format!("PRAGMA user_version={version}"), ())
             .await
@@ -647,8 +646,7 @@ async fn missing_search_object_selects_the_canonical_rebuild_action() {
     use wenlan_types::lint::LintQuery;
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute("DROP TRIGGER memories_fts_update", ())
         .await
@@ -708,8 +706,7 @@ async fn general_only_plan_refuses_a_stale_source_report() {
         )
         .await
         .unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO spaces (id,name,created_at,updated_at) VALUES ('stale','stale',1,1)",
@@ -815,8 +812,7 @@ async fn lint_review_enqueue_is_idempotent_and_does_not_resurrect_terminal_items
         .insert_lint_review_if_absent(&review_id, &source_ids, &payload)
         .await
         .unwrap());
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE refinement_queue SET status = 'dismissed' WHERE id = ?1",
@@ -847,8 +843,7 @@ async fn prepare_plan_emits_exact_manifest_without_mutating_canonical_memory() {
     use wenlan_types::lint::{LintProfile, LintQuery};
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -898,8 +893,7 @@ async fn prepare_plan_emits_exact_manifest_without_mutating_canonical_memory() {
             if manifest.writer() == wenlan_types::repair::RepairWriter::NormalizeMemorySourceAgent
     )));
     let source_agent = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT source_agent FROM memories WHERE source_id='mem_exact'",
@@ -928,8 +922,7 @@ async fn deep_plan_keeps_deterministic_manifest_general_only_and_pageable() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -1021,8 +1014,7 @@ async fn deep_only_deterministic_finding_is_visible_but_not_general_only_ready()
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -1096,9 +1088,7 @@ async fn approved_general_only_deterministic_manifest_applies_and_verifies_exact
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
-        .await
+    db.test_primary_session().await
         .execute_batch(
             "INSERT INTO memories
                  (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
@@ -1241,10 +1231,8 @@ async fn approved_general_only_deterministic_manifest_applies_and_verifies_exact
         .await
         .unwrap();
 
-    let mut rows = db
-        .conn
-        .lock()
-        .await
+    let session = db.test_primary_session().await;
+    let mut rows = session
         .query(
             "SELECT content,title,last_modified,memory_type,source_agent
              FROM memories WHERE source_id='mem_apply'",
@@ -1259,6 +1247,7 @@ async fn approved_general_only_deterministic_manifest_applies_and_verifies_exact
     assert_eq!(row.get::<String>(3).unwrap(), "fact");
     assert_eq!(row.get::<Option<String>>(4).unwrap(), None);
     drop(rows);
+    drop(session);
 
     assert_eq!(
         manifest.post_assertions().target_check_id(),
@@ -1369,8 +1358,7 @@ async fn incomplete_tag_source_check_cannot_be_replaced_by_a_ready_manifest() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO document_tags(source,source_id,tag)
@@ -1442,8 +1430,7 @@ async fn tag_manifests_from_global_plan_verify_sequentially_across_ordinal_shift
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -1641,8 +1628,7 @@ async fn verify_large_tag_window_repair(
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "WITH RECURSIVE sequence(value) AS (
@@ -1696,8 +1682,7 @@ async fn verify_large_tag_window_repair(
         .unwrap();
 
     if matches!(drift, TagDriftAfterPrepare::Replace) {
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "DELETE FROM document_tags
@@ -1708,8 +1693,7 @@ async fn verify_large_tag_window_repair(
             .unwrap();
     }
     if !matches!(drift, TagDriftAfterPrepare::None) {
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "INSERT INTO document_tags(source,source_id,tag)
@@ -1738,7 +1722,7 @@ async fn verify_large_tag_window_repair(
     let apply = match apply_result {
         Ok(apply) => apply,
         Err(error) => {
-            let connection = db.conn.lock().await;
+            let connection = db.test_primary_session().await;
             let mut rows = connection
                 .query(
                     "SELECT COUNT(*) FROM document_tags
@@ -1832,8 +1816,7 @@ async fn semantic_finding_becomes_one_stable_review_item() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -1938,8 +1921,7 @@ async fn semantic_finding_becomes_one_stable_review_item() {
             .unwrap()
     );
     let count = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT COUNT(*) FROM refinement_queue WHERE id=?1",
@@ -1975,8 +1957,7 @@ async fn review_item_contract_reclassification_prepare_requires_plan_item() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -2049,8 +2030,7 @@ async fn review_item_contract_reclassification_prepare_requires_plan_item() {
             _ => None,
         })
         .expect("classification Review Item");
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "DELETE FROM refinement_queue WHERE id=?1",
@@ -2320,8 +2300,7 @@ async fn review_item_contract_failed_entity_plan_can_prepare_manifest() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -2424,8 +2403,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
 
     let (db, _dir) = crate::db::tests::test_db().await;
     let page_root = tempfile::tempdir().unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -2574,8 +2552,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
             .unwrap();
     }
     let supersedes = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT supersedes FROM memories WHERE source_id='mem_self'",
@@ -2591,8 +2568,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
         .unwrap();
     assert_eq!(supersedes, None);
     let tag_count = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT COUNT(*) FROM document_tags
@@ -2628,8 +2604,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
             .unwrap_err();
     assert!(error.to_string().contains("repair_target_stale"));
     let target = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT target_page_id FROM page_links
@@ -2688,8 +2663,7 @@ async fn page_projection_manifest_repairs_only_the_named_page_projection() {
     let projected_path = page_root.path().join("projection-repair.md");
     let before_projection = std::fs::read(&projected_path).unwrap();
     std::fs::write(page_root.path().join("unrelated.txt"), b"leave me alone").unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1 WHERE id='page_projection_repair'",
@@ -2917,8 +2891,7 @@ async fn page_projection_manifests_from_one_plan_apply_sequentially() {
         .join("_sources")
         .join("mem_projection_shared.md");
     std::fs::write(&shared_stub, b"shared provenance canary").unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1
@@ -3109,8 +3082,7 @@ async fn page_projection_apply_preserves_non_target_shared_state_on_effect_escap
         .write_page(&page)
         .unwrap();
     }
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1 WHERE id='page_projection_target'",
@@ -3243,8 +3215,7 @@ async fn page_projection_invalid_pending_with_changed_target_fails_closed() {
         .write_page(&page)
         .unwrap();
     }
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1

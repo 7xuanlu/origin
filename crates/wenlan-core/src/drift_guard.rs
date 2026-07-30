@@ -5747,17 +5747,6 @@ const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[
     ("crates/wenlan-core/src/post_ingest.rs", 2),
     ("crates/wenlan-core/src/post_write.rs", 12),
     ("crates/wenlan-core/src/refinery/mod.rs", 13),
-    ("crates/wenlan-core/src/repair.rs", 15),
-    (
-        "crates/wenlan-core/src/repair/entity_extraction_tests.rs",
-        17,
-    ),
-    ("crates/wenlan-core/src/repair/title_rename_tests.rs", 8),
-    (
-        "crates/wenlan-core/src/repair_plan/deterministic_tests.rs",
-        38,
-    ),
-    ("crates/wenlan-core/src/repair_plan_tests.rs", 29),
     ("crates/wenlan-core/src/retrieval/hard_filters.rs", 2),
     ("crates/wenlan-core/src/synthesis/detect.rs", 3),
     ("crates/wenlan-core/src/synthesis/distill.rs", 12),

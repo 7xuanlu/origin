@@ -2620,11 +2620,10 @@ fn assert_complete_entity_recovery_db_unlocked_before_artifact(
         !final_path.exists(),
         "complete-entity recovery unlocked check must run before final artifact publication"
     );
-    let connection = db
-        .conn
-        .try_lock()
-        .expect("complete-entity recovery DB mutex must be released before artifact I/O");
-    drop(connection);
+    assert!(
+        db.primary_mutex_available(),
+        "complete-entity recovery DB mutex must be released before artifact I/O"
+    );
     COMPLETE_ENTITY_RECOVERY_UNLOCKED_CHECKS
         .lock()
         .expect("complete-entity recovery unlocked-check log")
@@ -6706,8 +6705,7 @@ mod tests {
 
     async fn fixture() -> (MemoryDB, tempfile::TempDir) {
         let (db, dir) = test_db().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -7102,8 +7100,7 @@ mod tests {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
         let request = request(&db).await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='changed' WHERE source_id='mem_other'",
@@ -7235,8 +7232,8 @@ mod tests {
     }
 
     async fn target_memory_types(db: &MemoryDB) -> Vec<Option<String>> {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
+        let session = db.test_primary_session().await;
+        let mut rows = session
             .query(
                 "SELECT memory_type FROM memories
                  WHERE source='memory' AND source_id='mem_target'
@@ -7266,8 +7263,8 @@ mod tests {
     /// The escaped write the parity-laundering regressions plant on a second,
     /// non-target row. Read directly so rollback is asserted, not inferred.
     async fn escaped_confidence(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
+        let session = db.test_primary_session().await;
+        let mut rows = session
             .query(
                 "SELECT COALESCE(SUM(COALESCE(confidence,0)),0) FROM memories
                  WHERE source_id='mem_other'",
@@ -7432,8 +7429,7 @@ mod tests {
             .is_err());
         assert_eq!(before, fingerprint(&db).await);
 
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='stale' WHERE id='row-target'",
@@ -7467,14 +7463,14 @@ mod tests {
             target_memory_types(&db).await,
             vec![Some("decision".to_string()), Some("decision".to_string())]
         );
-        let conn = db.conn.lock().await;
-        let mut rows = conn
+        let session = db.test_primary_session().await;
+        let mut rows = session
             .query("SELECT memory_type FROM memories WHERE id='row-other'", ())
             .await
             .unwrap();
         let other: Option<String> = rows.next().await.unwrap().unwrap().get(0).unwrap();
         drop(rows);
-        drop(conn);
+        drop(session);
         assert_eq!(other.as_deref(), Some("fact"));
         assert_eq!(receipt.manifest_digest(), manifest.manifest_digest());
         assert!(store
@@ -7507,7 +7503,11 @@ mod tests {
         let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
         assert!(manifest_dir.join(APPLY_RECEIPT_PENDING_FILE).is_file());
         assert!(!manifest_dir.join(APPLY_RECEIPT_FILE).exists());
-        db.conn.lock().await.execute("ROLLBACK", ()).await.unwrap();
+        db.test_primary_session()
+            .await
+            .execute("ROLLBACK", ())
+            .await
+            .unwrap();
         assert_eq!(target_memory_types(&db).await, vec![None, None]);
     }
 
@@ -7524,8 +7524,7 @@ mod tests {
             manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
         )
         .unwrap();
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='background' WHERE id='row-other'",
@@ -7590,8 +7589,7 @@ mod tests {
     #[tokio::test]
     async fn effect_escape_rolls_back_target_and_trigger_side_effect() {
         let (db, _db_dir) = fixture().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "CREATE TABLE repair_escape (value TEXT NOT NULL);
@@ -7620,8 +7618,7 @@ mod tests {
         // The fingerprint covers known tables only, so assert the escape's own
         // table directly rather than inferring rollback from the checks above.
         let escaped: i64 = db
-            .conn
-            .lock()
+            .test_primary_session()
             .await
             .query("SELECT COUNT(*) FROM repair_escape", ())
             .await
@@ -7644,8 +7641,7 @@ mod tests {
     #[tokio::test]
     async fn effect_escape_cannot_hide_behind_an_inflated_parity_generation() {
         let (db, _db_dir) = fixture().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "CREATE TRIGGER repair_escape_inflate AFTER UPDATE OF memory_type ON memories
@@ -7692,8 +7688,7 @@ mod tests {
     #[tokio::test]
     async fn effect_escape_cannot_hide_behind_a_replaced_parity_row() {
         let (db, _db_dir) = fixture().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "CREATE TRIGGER repair_escape_replace AFTER UPDATE OF memory_type ON memories
@@ -7795,21 +7790,21 @@ mod tests {
         let receipt = with_repair_verification_test_control(
             RepairVerificationTestControl {
                 after_begin: Some(Box::new(move || {
-                    assert!(db_after_begin.conn.try_lock().is_err());
+                    assert!(!db_after_begin.primary_mutex_available());
                     begin_observed.lock().unwrap().push("after_begin");
                 })),
                 before_receipt_persist: Some(Box::new(move || {
-                    assert!(db_before_persist.conn.try_lock().is_err());
+                    assert!(!db_before_persist.primary_mutex_available());
                     assert!(!final_receipt.exists());
                     before_observed.lock().unwrap().push("before_persist");
                 })),
                 after_receipt_persist: Some(Box::new(move || {
-                    assert!(db_after_persist.conn.try_lock().is_err());
+                    assert!(!db_after_persist.primary_mutex_available());
                     assert!(pending_after_persist.exists());
                     after_observed.lock().unwrap().push("after_persist");
                 })),
                 after_commit_before_pending_clear: Some(Box::new(move || {
-                    assert!(db_after_commit.conn.try_lock().is_ok());
+                    assert!(db_after_commit.primary_mutex_available());
                     assert!(receipt_after_commit.is_file());
                     assert!(pending_after_commit.is_file());
                     let operation = OpenOptions::new()
@@ -8274,8 +8269,7 @@ mod tests {
         let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
             .await
             .unwrap();
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='changed' WHERE id='row-other'",
@@ -8344,8 +8338,7 @@ mod tests {
         let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
             .await
             .unwrap();
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='changed' WHERE id='row-target'",
@@ -8403,8 +8396,7 @@ mod tests {
             .await
             .unwrap();
         let (general, deep) = verification_reports(&db).await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute("UPDATE memories SET title='later' WHERE id='row-other'", ())
             .await

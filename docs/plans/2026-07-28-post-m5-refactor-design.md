@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **Fable gate 1 re-approved through the R4-24 split; R4-25 group 3 complete**
+Status: **Fable gate 1 re-approved through the R4-24 split; R4-25 group 4 complete**
 
 ## Authority and change control
 
@@ -2990,6 +2990,51 @@ Frozen slice contract:
   Its focused parser, seam, snapshot, legacy, blocked-CAS, fingerprint,
   formatting, diff, and LSP checks passed; one guessed zero-test filter was
   explicitly excluded from its evidence.
+- R4-25 group 4 RED/GREEN evidence, 2026-07-30: the focused census RED failed
+  exactly `289 != 182`. The exact raw-manifest RED then reported only the
+  frozen repair family removed: `107` `PrimaryConnLock` identities
+  (`15 + 17 + 8 + 29 + 38`) and all `5` repair
+  `PrimaryConnTryLock` identities. The legacy baseline independently failed
+  on exactly the same five now-stale repair paths. GREEN leaves `189` raw
+  identities: `182` non-repair primary locks, `0` try-locks, `0` alternate
+  fields, and the unchanged `7` standalone libSQL origins.
+- The first support-manifest RED found `292`, not the preflight's expected
+  `303`, replacement identities. Every category agreed except
+  `TestDbRow::get`, where `11` calls inside `while let
+  Some(row) = rows.next().await...` were missing. A focused parser RED
+  resolved only `[query, next, next]` instead of
+  `[query, next, get, next, get]`, while an unrelated `next/get` remained
+  unclassified. The syntax-aware visitor now carries a proven Rows initializer
+  into only that loop body and classifies its bound pattern as Row. GREEN
+  records the exact `303`: `107` `test_primary_session`, `61` execute, `29`
+  execute-batch, `27` query, `27` next, `43` get, `5`
+  `primary_mutex_available`, and `4`
+  `repair_database_content_digest`. The support manifest is therefore
+  `108 -> 411`; no seam method or raw capability was added.
+- The two disjoint implementation lanes pass all affected repair modules:
+  `18 / 18` entity extraction, `10 / 10` title rename, `45 / 45`
+  `repair::tests`, `34 / 34` repair-plan tests, and `46 / 46` deterministic
+  repair-plan tests. Focused root controls pass the four availability
+  checkpoints, owned projection-session reuse, aggregate-CAS zero mutation,
+  and the independent secondary `BEGIN IMMEDIATE` blocked-CAS release. The
+  parser / exact manifests pass `35 / 35`; the opaque seam passes `5 / 5`;
+  legacy access passes `3 / 3` plus the exact parser-fixture exclusion control;
+  truth manifest and exposure pass `16 / 16` and `13 / 13`; Rust M5 passes
+  `1 / 1`; and the Python inventory remains
+  `191 / 55-50-86 / exposure 22`. Eight generated inventory addresses in
+  later `repair.rs` functions moved by exactly `-1`, with names, visibility,
+  classification, and exposure unchanged. Core/server all-target Clippy with
+  warnings denied passes. The uninterrupted workspace library floor remains
+  reserved for the final R4-25 fixture group.
+- R4-25 group 4 REVIEW, 2026-07-30: the independent Sol reviewer returned
+  **APPROVE** with no correctness, concurrency, data-loss, security,
+  regression, or manifest-gaming blocker. It independently confirmed the
+  exact `107`-lock and `5`-availability migration, `189` raw / `411` support
+  manifests, bounded while-let propagation with an unrelated-get negative
+  control, raw primary rollback semantics, equivalent mutex-timing
+  assertions, and the independent secondary blocked-CAS transaction. Its
+  parser, repair, repair-plan, legacy, M5, clippy, formatting, diff, and
+  per-file LSP checks all passed.
 
 ### R5 — server vertical slices
 

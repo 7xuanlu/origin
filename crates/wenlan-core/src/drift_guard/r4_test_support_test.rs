@@ -1836,6 +1836,29 @@ impl<'ast> Visit<'ast> for NestedSupportBlockVisitor<'_> {
         };
         scanner.scan_block(node);
     }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.visit_expr(&node.cond);
+
+        let mut inherited = self.inherited.clone();
+        if let Expr::Let(let_expression) = node.cond.as_ref() {
+            if let Some(kind) = expression_local_kind(&let_expression.expr, self.inherited) {
+                let mut names = Vec::new();
+                pattern_bindings(&let_expression.pat, &mut names);
+                for name in names {
+                    inherited.insert(name, kind);
+                }
+            }
+        }
+        let mut scanner = SupportDataflow {
+            owner: self.owner,
+            test_only: self.test_only,
+            locals: inherited,
+            pending: self.pending,
+            errors: self.errors,
+        };
+        scanner.scan_block(&node.body);
+    }
 }
 
 fn support_params(signature: &syn::Signature) -> BTreeMap<String, LocalKind> {
@@ -2808,6 +2831,47 @@ async fn exercise(db: &MemoryDB, typed: TestDbSession) {
 }
 
 #[test]
+fn support_parser_tracks_while_let_row_flow_without_counting_unrelated_get() {
+    let calls = support_calls_in_source(
+        r#"
+async fn chained(session: TestDbSession) {
+    let mut rows = session.query("SELECT 1", ()).await.unwrap();
+    while let Some(direct_row) = rows.next().await.unwrap() {
+        let _ = direct_row.get::<i64>(0).unwrap();
+    }
+    while let Some(multiline_row) = rows
+        .next()
+        .await
+        .expect("step")
+    {
+        let _ = multiline_row
+            .get::<i64>(0)
+            .expect("value");
+    }
+    while let Some(unrelated_row) = unrelated.next().await.unwrap() {
+        let _ = unrelated_row.get::<i64>(0).unwrap();
+    }
+}
+"#,
+        true,
+    );
+    let callees: Vec<&str> = calls
+        .iter()
+        .map(|call| call.identity.callee.as_str())
+        .collect();
+    assert_eq!(
+        callees,
+        vec![
+            "TestDbSession::query",
+            "TestDbRows::next",
+            "TestDbRow::get",
+            "TestDbRows::next",
+            "TestDbRow::get",
+        ]
+    );
+}
+
+#[test]
 fn macro_chained_factory_call_is_exact_and_trips_manifest_drift() {
     let calls = support_calls_in_source(
         r#"
@@ -3166,7 +3230,7 @@ fn outer() {
 }
 
 #[test]
-fn repository_module_graph_matches_r4_25_group_3_census() {
+fn repository_module_graph_matches_r4_25_group_4_census() {
     let analysis = analyze_repository(&super::repo_root());
     assert!(
         analysis.errors.is_empty(),
@@ -3180,14 +3244,14 @@ fn repository_module_graph_matches_r4_25_group_3_census() {
     }
     assert_eq!(
         counts.get(&RawShape::PrimaryConnLock).copied().unwrap_or(0),
-        289
+        182
     );
     assert_eq!(
         counts
             .get(&RawShape::PrimaryConnTryLock)
             .copied()
             .unwrap_or(0),
-        5
+        0
     );
     assert_eq!(
         counts
@@ -3224,6 +3288,11 @@ fn repository_module_graph_matches_r4_25_group_3_census() {
             .iter()
             .filter(|call| !call.test_only)
             .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        analysis.support_calls.len(),
+        411,
+        "group 4 must expose the frozen 108 support calls plus exactly 303 migrated identities"
     );
 }
 

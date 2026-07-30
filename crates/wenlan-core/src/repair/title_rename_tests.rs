@@ -64,8 +64,7 @@ fn assert_projection_file_lock_acquirable(page_root: &Path) {
 
 async fn rename_fixture() -> RenameFixture {
     let (db, db_dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -516,8 +515,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "same_scope_collision" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute(
                         // Single-axis (spec §1): a raw INSERT bypassing the
@@ -540,8 +538,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "page_changed" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute("UPDATE pages SET summary='changed' WHERE id='page-a'", ())
                     .await
@@ -564,8 +561,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "version" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute("UPDATE pages SET version=version+1 WHERE id='page-a'", ())
                     .await
@@ -574,8 +570,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "title" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute("UPDATE pages SET title='changed' WHERE id='page-a'", ())
                     .await
@@ -584,8 +579,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "review" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute(
                         "UPDATE refinement_queue SET status='dismissed' WHERE id=?1",
@@ -597,8 +591,8 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             _ => unreachable!(),
         }
         let db_before = {
-            let conn = fixture.db.conn.lock().await;
-            database_content_digest(&conn).await.unwrap()
+            let session = fixture.db.test_primary_session().await;
+            session.repair_database_content_digest().await.unwrap()
         };
         let tree_before = crate::lint::pages::fs::scan_page_root(fixture.page_root.path()).unwrap();
         let result = apply_repair_with_pages(
@@ -613,9 +607,12 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             matches!(result, Err(WenlanError::Conflict(ref message)) if message == "repair_target_stale"),
             "unexpected {stale_case}: {result:?}"
         );
-        let conn = fixture.db.conn.lock().await;
-        assert_eq!(database_content_digest(&conn).await.unwrap(), db_before);
-        drop(conn);
+        let session = fixture.db.test_primary_session().await;
+        assert_eq!(
+            session.repair_database_content_digest().await.unwrap(),
+            db_before
+        );
+        drop(session);
         assert_eq!(
             crate::lint::pages::fs::scan_page_root(fixture.page_root.path())
                 .unwrap()

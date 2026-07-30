@@ -29,8 +29,7 @@ struct EntityExtractionFixture {
 
 async fn entity_extraction_fixture() -> EntityExtractionFixture {
     let (db, db_dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -129,8 +128,8 @@ async fn prepare(fixture: &EntityExtractionFixture) -> RepairManifest {
 }
 
 async fn entity_state(db: &MemoryDB) -> (Vec<String>, (String, Option<String>, i64, i64)) {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
+    let session = db.test_primary_session().await;
+    let mut rows = session
         .query(
             "SELECT entity_id FROM memory_entities
              WHERE memory_id='mem-entity' ORDER BY entity_id",
@@ -143,7 +142,7 @@ async fn entity_state(db: &MemoryDB) -> (Vec<String>, (String, Option<String>, i
         entity_ids.push(row.get::<String>(0).unwrap());
     }
     drop(rows);
-    let mut rows = conn
+    let mut rows = session
         .query(
             "SELECT status,error,attempts,updated_at FROM enrichment_steps
              WHERE source_id='mem-entity' AND step_name='entity_extract'",
@@ -215,8 +214,7 @@ async fn apply_preserves_existing_link_adds_approved_link_and_completes_only_sel
     let manifest = prepare(&fixture).await;
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute(
             "INSERT INTO enrichment_steps
@@ -243,8 +241,8 @@ async fn apply_preserves_existing_link_adds_approved_link_and_completes_only_sel
             ("ok".to_string(), None, 2, 1_721_000_000)
         )
     );
-    let conn = fixture.db.conn.lock().await;
-    let mut rows = conn
+    let session = fixture.db.test_primary_session().await;
+    let mut rows = session
         .query(
             "SELECT status,error,attempts,updated_at FROM enrichment_steps
              WHERE source_id='mem-entity' AND step_name='classify'",
@@ -296,8 +294,7 @@ async fn entity_rollback_uncertainty_retains_pending_receipt() {
     assert!(!manifest_dir.join(APPLY_RECEIPT_FILE).exists());
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute("ROLLBACK", ())
         .await
@@ -455,70 +452,77 @@ async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation()
     ] {
         let fixture = entity_extraction_fixture().await;
         let manifest = prepare(&fixture).await;
-        let conn = fixture.db.conn.lock().await;
+        let session = fixture.db.test_primary_session().await;
         match stale_case {
             "link_set" => {
-                conn.execute(
-                    "INSERT INTO memory_entities(memory_id,entity_id)
+                session
+                    .execute(
+                        "INSERT INTO memory_entities(memory_id,entity_id)
                      VALUES ('mem-entity','ent-extra')",
-                    (),
-                )
-                .await
-                .unwrap();
+                        (),
+                    )
+                    .await
+                    .unwrap();
             }
             "step_changed" => {
-                conn.execute(
-                    "UPDATE enrichment_steps SET attempts=3
+                session
+                    .execute(
+                        "UPDATE enrichment_steps SET attempts=3
                      WHERE source_id='mem-entity' AND step_name='entity_extract'",
-                    (),
-                )
-                .await
-                .unwrap();
+                        (),
+                    )
+                    .await
+                    .unwrap();
             }
             "step_absent" => {
-                conn.execute(
-                    "DELETE FROM enrichment_steps
+                session
+                    .execute(
+                        "DELETE FROM enrichment_steps
                      WHERE source_id='mem-entity' AND step_name='entity_extract'",
-                    (),
-                )
-                .await
-                .unwrap();
+                        (),
+                    )
+                    .await
+                    .unwrap();
             }
             "memory" => {
-                conn.execute(
-                    "UPDATE memories SET title='changed' WHERE source_id='mem-entity'",
-                    (),
-                )
-                .await
-                .unwrap();
+                session
+                    .execute(
+                        "UPDATE memories SET title='changed' WHERE source_id='mem-entity'",
+                        (),
+                    )
+                    .await
+                    .unwrap();
             }
             "entity_absent" => {
-                conn.execute("DELETE FROM entities WHERE id='ent-new'", ())
+                session
+                    .execute("DELETE FROM entities WHERE id='ent-new'", ())
                     .await
                     .unwrap();
             }
             "entity_scope" => {
-                conn.execute(
-                    "UPDATE entities SET space='personal' WHERE id='ent-new'",
-                    (),
-                )
-                .await
-                .unwrap();
+                session
+                    .execute(
+                        "UPDATE entities SET space='personal' WHERE id='ent-new'",
+                        (),
+                    )
+                    .await
+                    .unwrap();
             }
             "review_binding" => {
-                conn.execute(
-                    "UPDATE refinement_queue
+                session
+                    .execute(
+                        "UPDATE refinement_queue
                      SET source_ids='[\"ent-new\",\"mem-entity\"]'
                      WHERE id=?1",
-                    libsql::params![fixture.review_id.clone()],
-                )
-                .await
-                .unwrap();
+                        libsql::params![fixture.review_id.clone()],
+                    )
+                    .await
+                    .unwrap();
             }
             _ => unreachable!(),
         }
-        let before = database_content_digest(&conn).await.unwrap();
-        drop(conn);
+        let before = session.repair_database_content_digest().await.unwrap();
+        drop(session);
 
         let result = apply_repair(
             &fixture.db,
@@ -532,9 +536,9 @@ async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation()
             matches!(result, Err(WenlanError::Conflict(ref message)) if message == "repair_target_stale"),
             "unexpected {stale_case} result: {result:?}"
         );
-        let conn = fixture.db.conn.lock().await;
+        let session = fixture.db.test_primary_session().await;
         assert_eq!(
-            database_content_digest(&conn).await.unwrap(),
+            session.repair_database_content_digest().await.unwrap(),
             before,
             "stale case {stale_case} mutated the database"
         );
@@ -566,8 +570,7 @@ async fn insert_update_and_receipt_failures_roll_back_links_and_step_together() 
             };
             fixture
                 .db
-                .conn
-                .lock()
+                .test_primary_session()
                 .await
                 .execute_batch(sql)
                 .await
@@ -660,8 +663,7 @@ async fn complete_entity_extraction_verifies_end_to_end_with_unrelated_failure_r
     let mut fixture = entity_extraction_fixture().await;
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -792,8 +794,7 @@ async fn suppressed_approved_link_insert_rolls_back_step_completion() {
     let manifest = prepare(&fixture).await;
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute_batch(
             "CREATE TRIGGER suppress_approved_entity_link
@@ -829,8 +830,7 @@ async fn aggregate_memory_receipt_distinguishes_null_blob_and_embedded_nul_text(
     let vector = serde_json::to_string(&vec![0.25_f32; 768]).unwrap();
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute(
             "UPDATE memories
@@ -889,8 +889,7 @@ async fn prepare_rejects_oversized_memory_receipt_without_persisting_manifest() 
     let fixture = entity_extraction_fixture().await;
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute(
             "UPDATE memories SET source_text=zeroblob(?1)
@@ -927,8 +926,7 @@ async fn prepare_rejects_oversized_link_receipt_without_persisting_manifest() {
     let raw_bytes = (REPAIR_ROLLBACK_ARTIFACT_MAX_BYTES / 2) + 1;
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute_batch(&format!(
             "INSERT INTO entities(id,name,entity_type,space,created_at,updated_at)
@@ -963,16 +961,17 @@ async fn prepare_rejects_oversized_link_receipt_without_persisting_manifest() {
 #[tokio::test]
 async fn memory_preflight_counts_multibyte_and_embedded_nul_text_bytes() {
     let fixture = entity_extraction_fixture().await;
-    let conn = fixture.db.conn.lock().await;
-    conn.execute(
-        "UPDATE memories SET structured_fields=CAST(X'e7958c0078' AS TEXT)
+    let session = fixture.db.test_primary_session().await;
+    session
+        .execute(
+            "UPDATE memories SET structured_fields=CAST(X'e7958c0078' AS TEXT)
          WHERE source_id='mem-entity'",
-        (),
-    )
-    .await
-    .unwrap();
+            (),
+        )
+        .await
+        .unwrap();
     let expression = entity_extraction_encoded_length_expression("structured_fields");
-    let mut rows = conn
+    let mut rows = session
         .query(
             &format!("SELECT {expression} FROM memories WHERE source_id='mem-entity'"),
             (),
@@ -990,8 +989,7 @@ async fn link_preflight_counts_multibyte_and_embedded_nul_id_bytes() {
     let entity_id = "界\0x";
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO entities(id,name,entity_type,space,created_at,updated_at)
@@ -1034,8 +1032,7 @@ async fn prepare_rejects_oversized_multibyte_and_nul_text_without_manifest() {
         let fixture = entity_extraction_fixture().await;
         fixture
             .db
-            .conn
-            .lock()
+            .test_primary_session()
             .await
             .execute(
                 &format!(
@@ -1074,8 +1071,7 @@ async fn prepare_rejects_oversized_step_error_before_materializing_it() {
     let fixture = entity_extraction_fixture().await;
     fixture
         .db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute(
             "UPDATE enrichment_steps SET error=CAST(zeroblob(?1) AS TEXT)

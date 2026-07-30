@@ -93,7 +93,7 @@ async fn memory_row_state(
     db: &crate::db::MemoryDB,
     source_id: &str,
 ) -> Vec<(String, String, i64, Option<String>, Option<String>, i64)> {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     let mut rows = conn
         .query(
             "SELECT id,content,pending_revision,supersedes,space,version
@@ -120,7 +120,7 @@ async fn complete_memory_rollback_snapshot(
     db: &crate::db::MemoryDB,
     source_id: &str,
 ) -> (Vec<String>, Vec<Vec<String>>) {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     let mut column_rows = conn.query("PRAGMA table_info(memories)", ()).await.unwrap();
     let mut columns = Vec::new();
     while let Some(row) = column_rows.next().await.unwrap() {
@@ -650,8 +650,7 @@ async fn stale_projection_resolution_kind(
 #[tokio::test]
 async fn memory_and_tag_predicates_split_exact_repairs_from_review() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -701,8 +700,7 @@ async fn memory_and_tag_predicates_split_exact_repairs_from_review() {
 #[tokio::test]
 async fn orphan_revision_is_one_exact_repair_for_both_checks() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces(id,name,created_at,updated_at)
@@ -752,8 +750,7 @@ async fn orphan_revision_is_one_exact_repair_for_both_checks() {
 #[tokio::test]
 async fn orphan_memory_entity_link_resolves_to_one_exact_pair_delete() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
@@ -805,8 +802,7 @@ async fn orphan_memory_entity_link_resolves_to_one_exact_pair_delete() {
 #[tokio::test]
 async fn missing_entity_link_uses_memory_scope_and_exact_pair_rollback() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces(id,name,created_at,updated_at)
@@ -869,8 +865,7 @@ async fn missing_entity_link_uses_memory_scope_and_exact_pair_rollback() {
 #[tokio::test]
 async fn imported_document_owner_with_missing_entity_prepares_and_applies_in_scope() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -901,7 +896,7 @@ async fn imported_document_owner_with_missing_entity_prepares_and_applies_in_sco
             .await
             .expect("an imported document row is a legitimate junction owner");
     assert_eq!(receipt.writer(), RepairWriter::DeleteMemoryEntityLink);
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     let link_count = conn
         .query(
             "SELECT COUNT(*) FROM memory_entities
@@ -937,8 +932,7 @@ async fn imported_document_owner_with_missing_entity_prepares_and_applies_in_sco
 #[tokio::test]
 async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pending_revision() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces(id,name,created_at,updated_at)
@@ -985,8 +979,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
         crate::post_write::apply_deterministic_repair_cas(&db, &manifest, &[], |_| Ok(())).await
     };
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET space='other' WHERE source_id='mem_orphan'",
@@ -999,8 +992,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET space='wenlan' WHERE source_id='mem_orphan'",
@@ -1009,8 +1001,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
         .await
         .unwrap();
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET supersedes='mem_missing' WHERE source_id='mem_orphan'",
@@ -1023,8 +1014,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET supersedes=NULL WHERE source_id='mem_orphan'",
@@ -1033,8 +1023,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
         .await
         .unwrap();
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET pending_revision=0 WHERE source_id='mem_orphan'",
@@ -1047,8 +1036,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET pending_revision=1 WHERE source_id='mem_orphan'",
@@ -1075,7 +1063,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
         assert_eq!(before.2, 1);
         assert_eq!(after.2, 0);
     }
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     let orphan_pending = conn
         .query(
             "SELECT pending_revision FROM memories
@@ -1121,8 +1109,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
 async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pair() {
     let (db, _dir) = test_db().await;
     let db = std::sync::Arc::new(db);
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
@@ -1170,7 +1157,7 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
     );
 
     {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn.query("PRAGMA busy_timeout=2000", ()).await.unwrap();
         while rows.next().await.unwrap().is_some() {}
     }
@@ -1227,8 +1214,7 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
         .unwrap();
     let error = write_result.unwrap_err();
     assert!(error.to_string().contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "DELETE FROM memories WHERE source_id=?1",
@@ -1243,7 +1229,7 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
             .unwrap();
     assert_eq!(receipt.writer(), RepairWriter::DeleteMemoryEntityLink);
     assert_eq!(receipt.actual_effects(), manifest.allowed_effects());
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     let target_count = conn
         .query(
             "SELECT COUNT(*) FROM memory_entities
@@ -1294,8 +1280,7 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
 #[tokio::test]
 async fn registered_scope_does_not_resolve_global_tag_findings() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO document_tags(source,source_id,tag)
@@ -1464,8 +1449,7 @@ async fn page_projection_reserved_target_is_blocked() {
     crate::export::knowledge::KnowledgeProjectionWrite::new(page_root.path().to_path_buf(), &db)
         .write_page(&page)
         .unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1 WHERE id=?1",
@@ -3404,8 +3388,7 @@ async fn only_empty_machine_owned_unconfirmed_source_page_is_exact_archive_targe
         .await
         .unwrap();
         if user_edited != 0 {
-            db.conn
-                .lock()
+            db.test_primary_session()
                 .await
                 .execute(
                     "UPDATE pages SET user_edited=1 WHERE id=?1",
@@ -3474,8 +3457,7 @@ async fn source_page_archive_accepts_rust_whitespace_persisted_below_ingress() {
     .await
     .unwrap();
     let persisted_whitespace = "\t\n\u{2003}";
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET content=?1 WHERE id='source_whitespace'",
@@ -3562,8 +3544,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .await
         .unwrap();
     }
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET status='archived' WHERE id='source_canary'",
@@ -3597,7 +3578,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
     )
     .unwrap();
     let page_column_count = {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn.query("PRAGMA table_info(pages)", ()).await.unwrap();
         let mut count = 0;
         while rows.next().await.unwrap().is_some() {
@@ -3617,8 +3598,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         crate::post_write::apply_deterministic_repair_cas(&db, &manifest, &[], |_| Ok(())).await
     };
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute("UPDATE pages SET version=2 WHERE id='source_target'", ())
         .await
@@ -3628,15 +3608,13 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute("UPDATE pages SET version=1 WHERE id='source_target'", ())
         .await
         .unwrap();
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET workspace='other' WHERE id='source_target'",
@@ -3649,8 +3627,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET workspace='work' WHERE id='source_target'",
@@ -3659,8 +3636,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .await
         .unwrap();
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET source_memory_ids='[\"restored-json\"]'
@@ -3674,8 +3650,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET source_memory_ids='[]' WHERE id='source_target'",
@@ -3684,8 +3659,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .await
         .unwrap();
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO page_sources(page_id,memory_source_id,linked_at,link_reason)
@@ -3699,15 +3673,13 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute("DELETE FROM page_sources WHERE page_id='source_target'", ())
         .await
         .unwrap();
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO page_evidence(page_id,source_kind,locator,linked_at,link_reason)
@@ -3721,8 +3693,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "DELETE FROM page_evidence WHERE page_id='source_target'",
@@ -3731,8 +3702,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .await
         .unwrap();
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET status='archived' WHERE id='source_target'",
@@ -3745,8 +3715,7 @@ async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() 
         .unwrap_err()
         .to_string()
         .contains("repair_target_stale"));
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET status='active' WHERE id='source_target'",
