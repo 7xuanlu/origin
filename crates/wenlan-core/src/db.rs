@@ -36,6 +36,7 @@ mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;
 mod kg_quality_embedding_refresh;
 mod kg_quality_vocabulary;
+mod lint_snapshot;
 mod maintenance_duplicate_reads;
 mod maintenance_queue;
 mod maintenance_retro_scan;
@@ -96,6 +97,8 @@ mod kg_quality_duplicate_candidates_test;
 mod kg_quality_embedding_refresh_test;
 #[cfg(test)]
 mod kg_quality_vocabulary_test;
+#[cfg(test)]
+mod lint_snapshot_test;
 #[cfg(test)]
 mod maintenance_duplicate_reads_test;
 #[cfg(test)]

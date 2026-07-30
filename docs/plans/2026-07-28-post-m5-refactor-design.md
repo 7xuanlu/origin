@@ -2850,6 +2850,30 @@ Frozen slice contract:
   independent write transaction still blocks then releases the repair CAS and
   that the read-only lint snapshot plus replacement freshness observers retain
   their original lifetime semantics.
+- R4-25a RED, 2026-07-29: the new ownership tooth failed with exit `101`,
+  reporting `lint/snapshot.rs` still contained `2` external `self._db`
+  references instead of `0`.
+- R4-25a GREEN, 2026-07-29: only the two existing snapshot entrypoints moved
+  into `db/lint_snapshot.rs`; `db.rs` gained production/test module wiring and
+  `lint/snapshot.rs` lost only its `MemoryDB` import and impl. The source tooth
+  passes `1 / 1`, locks both complete forwarding expressions, and rejects
+  changed receiver and observer mutants. Snapshot behavior passes `10 / 10`;
+  the fixed-clock runner control that exercises the unpinned facade passes
+  `1 / 1`; and external-access teeth pass `3 / 3`.
+- The M5 sweep remains exactly `191 / 55-50-86 / exposure 22`; all `65`
+  changed `core/db.rs` inventory addresses move by exactly `+3`, with names,
+  visibility, classification, and exposure unchanged. LSP reports zero errors
+  in the three changed production Rust files and resolves the pinned facade to
+  `35` callers plus its declaration and the unpinned facade to its sole runner
+  caller plus declaration. Formatting and `git diff --check` pass. Root's
+  first guessed `lint::snapshot_tests` filter selected zero tests and is not
+  counted; `cargo test -- --list` supplied the canonical
+  `lint::snapshot::tests` path used for the recorded `10 / 10`.
+- R4-25a REVIEW, 2026-07-29: the independent Sol reviewer returned
+  **APPROVE** after inspecting the final diff. It confirmed exact movement,
+  visibility/lifetime/observer fidelity, non-vacuous source mutants, the
+  address-only inventory refresh, and absence of fixture, support-session, or
+  behavior changes.
 
 ### R5 — server vertical slices
 
