@@ -198,13 +198,17 @@ impl Default for OnDeviceInferenceStatus {
 /// keeps its `page_bearing: no` classification in the reader manifest. It
 /// describes the daemon, not anything the daemon stores.
 ///
-/// Additive on both sides of the wire. A daemon that predates this omits the
-/// field, and `None` is the fail-closed reading: a client that cannot confirm
-/// the cutover is live must behave as though it is not.
+/// Additive on both sides of the wire, and **present only when the cutover is
+/// live**. A daemon that predates the field omits it, a daemon at generation 0
+/// omits it, and a daemon that could not read its own generation omits it —
+/// three situations with one honest reading, which is why they share one
+/// spelling. `None` is that reading: a client that cannot confirm the cutover is
+/// live must behave as though it is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruthStatus {
-    /// The durable cutover generation. `0` means every truth adapter is
-    /// pass-through and no enforcement is in force.
+    /// The durable cutover generation, always `> 0` as served by this daemon —
+    /// `0` means every truth adapter is pass-through, and that state is reported
+    /// by omitting the whole object rather than by sending a zero.
     pub cutover_generation: i64,
     /// The newest truth-contract version this daemon serves. A client declaring
     /// a higher version is treated as legacy, so a client that reads this can
@@ -214,6 +218,9 @@ pub struct TruthStatus {
 
 impl TruthStatus {
     /// Is fail-closed provisional enforcement live?
+    ///
+    /// Presence of the object is the signal; this is the redundant floor for a
+    /// client holding a `TruthStatus` from somewhere that did send a zero.
     pub const fn cutover_live(&self) -> bool {
         self.cutover_generation > 0
     }

@@ -124,17 +124,22 @@ pub async fn handle_status(
         )
     };
 
-    // Reported only when it can actually be read. A compiled-in `0` would be a
-    // claim that enforcement is off, made by a daemon that just failed to look
-    // — and a client is contracted to read an absent field as "not live", which
-    // is the same conclusion arrived at honestly.
+    // Present only when the cutover is actually live. There is one contract —
+    // "absent means not live" — and reporting generation 0 would give a client a
+    // second way to spell it, so a client that checks for the field without also
+    // checking its value would conclude enforcement is on. A generation that
+    // cannot be read is absent for the same reason: a daemon that just failed to
+    // look has no standing to report a state.
     let truth = match &db {
-        Some(db) => db.truth_cutover_generation().await.ok().map(|generation| {
-            wenlan_types::responses::TruthStatus {
+        Some(db) => db
+            .truth_cutover_generation()
+            .await
+            .ok()
+            .filter(|generation| *generation > 0)
+            .map(|generation| wenlan_types::responses::TruthStatus {
                 cutover_generation: generation,
                 contract_version: wenlan_core::truth_contract::TRUTH_CONTRACT_VERSION,
-            }
-        }),
+            }),
         None => None,
     };
 

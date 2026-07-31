@@ -63,21 +63,21 @@ async fn get_status(state: Arc<RwLock<ServerState>>) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-/// The question the app could not ask. A pass-through daemon says so in the
-/// same shape an enforcing one does, so a client reads one field rather than
-/// inferring enforcement from the absence of evidence.
+/// The question the app could not ask, answered in exactly one shape.
+///
+/// There is only one contract worth having here, and it is "absent means not
+/// live". A daemon that reports `cutover_generation: 0` gives a client a second
+/// way to spell the same fact, and a client that reads the field without also
+/// checking its value concludes enforcement is on. Generation 0 is therefore
+/// reported the same way an old daemon reports it: not at all.
 #[tokio::test]
-async fn status_reports_the_durable_cutover_generation() {
+async fn status_omits_truth_until_the_cutover_is_live() {
     let (state, db, _tmp) = db_state().await;
 
     let before = get_status(state.clone()).await;
-    assert_eq!(
-        before["truth"]["cutover_generation"], 0,
-        "a daemon at generation 0 must say so, not omit the field"
-    );
-    assert_eq!(
-        before["truth"]["contract_version"], TRUTH_CONTRACT_VERSION,
-        "the contract version a client should declare is the one the daemon serves"
+    assert!(
+        before["truth"].is_null(),
+        "generation 0 is not live, so it must be absent exactly like an old daemon: {before}"
     );
 
     db.set_truth_cutover_generation(7)
@@ -88,6 +88,10 @@ async fn status_reports_the_durable_cutover_generation() {
     assert_eq!(
         after["truth"]["cutover_generation"], 7,
         "status must report the live generation, not a compiled-in constant"
+    );
+    assert_eq!(
+        after["truth"]["contract_version"], TRUTH_CONTRACT_VERSION,
+        "the contract version a client should declare is the one the daemon serves"
     );
 }
 
