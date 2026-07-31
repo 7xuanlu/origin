@@ -1594,6 +1594,11 @@ fn daemon_structure_matches_expected_phase() {
     let phase_source =
         std::fs::read_to_string(root.join(PHASE_FILE)).expect("read R7 phase marker");
     let phase = Phase::parse(&phase_source).expect("closed R7 phase vocabulary");
+    assert_eq!(
+        phase,
+        Phase::Final,
+        "R7 daemon decomposition is finalized; expected \"final\", got {phase:?}"
+    );
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
     let violations = structure_violations(&root, phase, &main, &scheduler);

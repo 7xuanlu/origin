@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R8 complete; final aggregate and agent-impact gates next**
+Status: **complete; Fable gate 2 APPROVE**
 
 ## Authority and change control
 
@@ -1692,7 +1692,11 @@ Execution evidence:
   during the proof hook then succeeded after return. Focused existing facade
   success and rollback-uncertainty controls pass `4 / 4`; the exact ratchet
   passes `3 / 3`. External literals are `299 → 297`, production `10 → 8`,
-  and tests remain `289`.
+  and tests remain `289`. The baseline test
+  `rollback_failure_is_a_typed_recovery_required_error` is superseded by the
+  two exact per-operation recovery-required controls in
+  `db/repair_memory_cas_test.rs`; this is the sole refactor-owned baseline test
+  name removal and does not change the ignored inventory.
 - ROOT GATE, 2026-07-29: Rust LSP reports each normal DB method as its
   declaration, one production facade, and four direct controls; each forced
   companion is its declaration, the retained test-only facade, and one direct
@@ -5597,8 +5601,9 @@ R7 boundary execution receipt, 2026-07-30:
   `20 / 20`, server truth guard `12 / 12`, and the exact R4 manifest,
   raw-connection, permit-source, and cutover-setter guards `1 / 1` each. The
   generated M5 check remains exactly
-  `191 rows; depth 55/50/86; exposure 22`; production generation remains `0`
-  and no truth-cutover command was run or applied.
+  `191 rows; depth 55/50/86; exposure 22`. No truth-cutover command was run or
+  applied by this refactor; the shipped default and every verification
+  database remain generation `0`.
 - The corrected uninterrupted `cargo test --workspace --lib --quiet` passes
   CLI `32 / 32`, core `3,471` passed with `33` ignored, MCP `178 / 178`,
   server `358` passed with `2` ignored, and types `183 / 183`: aggregate
@@ -5699,6 +5704,71 @@ R8 execution receipt, 2026-07-30:
   verification, and review; reviewer child tokens and Codex credits were not
   surfaced, so a defensible credit-denominated cost per accepted slice is
   unavailable rather than estimated.
+
+### Final aggregate receipt — 2026-07-30
+
+- Final production/refactor checkpoint before the gate-only closure is
+  `bc3477d7`. One uninterrupted
+  `cargo test --workspace --lib --quiet` passes CLI `32 / 32`, core `3,470`
+  with `33` ignored, MCP `178 / 178`, server `358` with `2` ignored, and types
+  `183 / 183`: aggregate `4,221` passed, `35` ignored, zero failed. The one-test
+  reduction from the R7 aggregate is exactly the R8-only ratchet removal.
+- Exact compatibility gates pass: core truth `77 / 77`, projection invariant
+  `20 / 20`, server truth guard `12 / 12`, and the R4 test-support manifest,
+  raw-connection census, projection-permit source, and cutover-setter owner
+  tests each select and pass one test. The final daemon-structure suite passes
+  all `11` live and positive controls.
+- Binary and process boundaries remain green: binary `27 / 27`, port discovery
+  `3 / 3`, and graceful shutdown `4 / 4`. Both binary self-reexec filters
+  select one child test; the startup-bind SIGTERM characterization still
+  exercises the cooperative drain path.
+- The generated M5 inventory remains exactly
+  `191 rows; depth 55/50/86; exposure 22`. No truth-cutover command was run or
+  applied by this refactor; the shipped default and every verification
+  database remain generation `0`. R0 current-tree inventory and exact
+  external-connection set-equality teeth pass.
+- Workspace all-target Clippy with warnings denied, workspace build, format,
+  diff hygiene, and rust-analyzer diagnostics pass after R8. The complete
+  workspace library run also exercises the route registry, shared wire types,
+  and all `178` typed MCP tests.
+
+### Agent-impact before/after — same machine and tools
+
+Both checkouts were measured on the same machine with rust-analyzer
+`1.95.0 (59807616 2026-04-14)` and the same Lean Dev Tools LSP surface:
+baseline `e4790ce8` in a detached read-only worktree and final `bc3477d7`.
+These are navigation observations, not correctness gates.
+
+| Probe | Baseline `e4790ce8` | Final `bc3477d7` | Read |
+|---|---|---|---|
+| `db.rs` size | `94,744` lines | `48,685` lines | facade is `48.6%` smaller |
+| document-symbol enumeration, same `limit=1000` request | raw payload `2,424` flattened symbol lines | tool reports `225` top-level symbols, returns the first `200` as `377` flattened lines | final payload is much smaller, but its explicit cap prevents claiming a complete flattened total |
+| child `claim_identity.rs` `MemoryDB` definition | resolves to `db.rs:3026` in `4.111s` | resolves to `db.rs:3120` in `6.904s` | both navigate correctly; this single run is slower final |
+| whole-workspace `MemoryDB` references | timeout in `17.507s` | timeout in `17.531s` | no whole-workspace supernode improvement |
+
+The two representative bounded-change traces use the same literal-discovery
+then LSP-definition/reference method:
+
+| Representative change | Baseline files / named items | Final files / named items | What actually improved |
+|---|---:|---:|---|
+| safely change historical migration 6 SQL and find its direct verification seam | `1 / 2` | `3 / 4` | numeric count increases, but production SQL moves from the `94,744`-line supernode into the `323`-line `migrations_v004_v009.rs`; the final direct replay/idempotence seam is explicitly named |
+| change one response field for `GET /api/memory/{id}/detail`, following router → handler → DB → wire → direct typed consumers | `6 / 7` | `6 / 8` | file count is unchanged and one explicit `register` item is added; the handler moves from `5,560`-line `memory_routes.rs` to `89`-line `memory_detail_routes.rs`, while the two DB reads remain in the DB facade |
+
+For migration 6 the final minimum trace is the dispatcher in `db.rs`, the
+production item `migrate_6_access_tracking` in the `323`-line migration child,
+and the direct replay helper/test in `db/main_tests.rs`; baseline had only the
+inline migration body plus a fresh-schema assertion in `db.rs`. For the detail
+endpoint, both traces include the exact route, handler, two scoped DB reads,
+`MemoryDetailResponse`, the CLI client, and the MCP typed consumer; the final
+router has an additional explicit module `register` item.
+
+The counts therefore do not prove “fewer things to inspect.” The measurable
+gain is a much smaller and more purpose-specific file around each production
+change, while the unchanged whole-workspace reference timeout and DB methods
+left in the facade remain honest residual costs. The baseline also predates
+later feature work and lacks the final direct migration replay seam, so these
+probes support the navigation judgment but cannot attribute every difference
+to extraction alone.
 
 ## Review and team protocol
 
@@ -5807,6 +5877,33 @@ Fable compares the delivered system with this frozen design:
 - whether any PR-local compromise undermined the whole.
 
 This is a system acceptance review, not another line-by-line code review.
+
+Gate result, 2026-07-30:
+**APPROVE-WITH-FIXES → APPROVE.** Fable independently reproduced the
+workspace-library aggregate, truth and structure filters, M5 inventory,
+movement comparators, ignored inventory, and the R7 lifecycle and concurrency
+boundaries. It found no behavior, API, SQL, visibility, generation-default, or
+truth-contract drift and accepted the branch as the completed frozen refactor
+without truth-cutover, subject to three gate-only corrections:
+
+- the permanent daemon structure tooth now rejects every tracked phase other
+  than `Final` before scanning source; temporarily downgrading the marker to
+  `tests-external` produces the exact focused RED, restoring `final` returns
+  the complete structure filter to `11 / 11`;
+- the R7 and final receipts state only what this refactor proves: it ran or
+  applied no truth-cutover, and the shipped default plus every verification
+  database remain generation `0`;
+- the R4-18 receipt explicitly names
+  `rollback_failure_is_a_typed_recovery_required_error` as superseded by the
+  two exact per-operation recovery-required controls, without an ignored-test
+  change.
+
+After those corrections, one uninterrupted workspace-library run again passes
+`4,221` tests with `35` ignored and zero failed. The structure suite, M5 sweep,
+workspace all-target Clippy with warnings denied, workspace build, format,
+diff hygiene, and Rust LSP error diagnostics all pass. A narrow Fable closure
+then returned **APPROVE**, confirmed all three findings closed, and declared
+gate 2 final-APPROVE.
 
 ### Team shape
 
