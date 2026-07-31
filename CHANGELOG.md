@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.2](https://github.com/7xuanlu/wenlan/compare/v0.15.1...v0.15.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* skip the setup runtime repair when the daemon is newer than the plugin ([#415](https://github.com/7xuanlu/wenlan/issues/415)) ([22b401d](https://github.com/7xuanlu/wenlan/commit/22b401da132a975e58db047639f3eac35f3efd75))
+* stop test builds resolving the developer's real config.json ([#411](https://github.com/7xuanlu/wenlan/issues/411)) ([07afba7](https://github.com/7xuanlu/wenlan/commit/07afba7df820ab4d9a6cd3e4a6f89b8506a23a43))
+
 ## [0.15.1](https://github.com/7xuanlu/wenlan/compare/v0.15.0...v0.15.1) (2026-07-29)
 
 
