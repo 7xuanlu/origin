@@ -186,6 +186,39 @@ impl Default for OnDeviceInferenceStatus {
     }
 }
 
+/// Where this daemon stands on the M5 truth cutover.
+///
+/// The one thing a client cannot otherwise ask. Until this shipped, the durable
+/// cutover generation was reachable only from the daemon's own maintenance
+/// subcommand, so an app had no way to tell an enforcing daemon from a
+/// pass-through one — and the M5 review action, whose whole precondition is
+/// "the cutover is live", had nothing to gate itself on.
+///
+/// Carries no page identity, no title and no prose, which is why `/api/status`
+/// keeps its `page_bearing: no` classification in the reader manifest. It
+/// describes the daemon, not anything the daemon stores.
+///
+/// Additive on both sides of the wire. A daemon that predates this omits the
+/// field, and `None` is the fail-closed reading: a client that cannot confirm
+/// the cutover is live must behave as though it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruthStatus {
+    /// The durable cutover generation. `0` means every truth adapter is
+    /// pass-through and no enforcement is in force.
+    pub cutover_generation: i64,
+    /// The newest truth-contract version this daemon serves. A client declaring
+    /// a higher version is treated as legacy, so a client that reads this can
+    /// declare what the daemon actually understands instead of guessing.
+    pub contract_version: u32,
+}
+
+impl TruthStatus {
+    /// Is fail-closed provisional enforcement live?
+    pub const fn cutover_live(&self) -> bool {
+        self.cutover_generation > 0
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub is_running: bool,
@@ -225,6 +258,10 @@ pub struct StatusResponse {
     /// instead of inferring support from a version string.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// M5 truth-cutover state. Absent on daemons that predate it, which a
+    /// client must read as "not live" rather than "unknown, proceed anyway".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth: Option<TruthStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

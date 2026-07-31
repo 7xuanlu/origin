@@ -124,6 +124,20 @@ pub async fn handle_status(
         )
     };
 
+    // Reported only when it can actually be read. A compiled-in `0` would be a
+    // claim that enforcement is off, made by a daemon that just failed to look
+    // — and a client is contracted to read an absent field as "not live", which
+    // is the same conclusion arrived at honestly.
+    let truth = match &db {
+        Some(db) => db.truth_cutover_generation().await.ok().map(|generation| {
+            wenlan_types::responses::TruthStatus {
+                cutover_generation: generation,
+                contract_version: wenlan_core::truth_contract::TRUTH_CONTRACT_VERSION,
+            }
+        }),
+        None => None,
+    };
+
     let (files_indexed, queue, compile_queue) = if let Some(db) = &db {
         let files_indexed = db.count().await.unwrap_or(0);
         let queue = db
@@ -158,6 +172,7 @@ pub async fn handle_status(
         reranker_mode,
         on_device_inference,
         capabilities: vec!["default_save_space".to_string()],
+        truth,
     }))
 }
 
