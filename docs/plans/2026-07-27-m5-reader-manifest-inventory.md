@@ -794,7 +794,7 @@ was still wrong — because nothing checked the generator.
 | 2 | 76 call sites | bodies delimited by the next `fn` match, so neighbours merged; `pages` and prose matched anywhere in the body, so `list_tags_scoped` and `tally` counted |
 | 3 | 54 SQL-bearing definitions | correct as far as it went, and **the wrong set** — see below |
 | 4 | 186 readers / 28 exposure, from `scripts/m5-reader-sweep.py` | the generator's `#[cfg(test)]` stripper armed its brace scan on `#[cfg(test)] mod foo;` — an attribute over an item that never opens a brace — and blanked forward to the next unrelated `{`, hiding real code from the sweep |
-| 5 | this one, 190 / 22, from the same script with a self-check | the number is whatever the script prints, and the script now proves it can see |
+| 5 | this one, 191 / 22, from the same script with a self-check | the number is whatever the script prints, and the script now proves it can see |
 
 **Draft 4's error is the one that matters most**, because it was invisible.
 Drafts 1-3 were wrong in ways a careful reader could argue with; draft 4 was
@@ -823,10 +823,10 @@ being flattened into one number:
 
 | Depth | What it is | Count |
 |---|---|---|
-| 0 | SQL-bearing definitions — where prose is materialized | 54 |
+| 0 | SQL-bearing definitions — where prose is materialized | 55 |
 | 1 | wrapper layer — `get_page` over `get_page_inner` | 50 |
 | 2 | consumers — what the spec asks for | 86 |
-| | **total** | **190** |
+| | **total** | **191** |
 
 Of these, **22** are exposure paths (`pub` and called from outside
 `wenlan-core`) and **9** are name-ambiguous, excluded from the exposure set

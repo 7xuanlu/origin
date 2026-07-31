@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R7 complete; R8 verification-surface cleanup next**
+Status: **R8 complete; final aggregate and agent-impact gates next**
 
 ## Authority and change control
 
@@ -5646,6 +5646,59 @@ the resulting architecture rather than predicting it.
   `m5-reader-manifest-inventory.md` “Draft 5” prose/table
   (`190 / 54-50-86`) against the executable current-tree inventory; never
   hand-edit the generated reader rows.
+
+R8 execution receipt, 2026-07-30:
+
+- R8 started from clean R7 checkpoint `88f361bc`. Before deletion, the
+  post-write movement comparator passed all `49` manifested items and its four
+  self-tests; the M5 R6 ratchet and its two self-tests passed at
+  `191 rows; depth 55/50/86; exposure 22`.
+- RED deleted only `scripts/m5-reader-ratchet.py`, then ran the exact
+  `m5_reader_summary_and_exposure_set_match_r6_ratchet` Rust test. It selected
+  one test and failed with exit `101` because Python could not open the deleted
+  script; the test reported `0 passed; 1 failed`, so the subprocess filter was
+  non-vacuous.
+- GREEN removes exactly the temporary R6 test plus five temporary artifacts:
+  `m5-reader-ratchet.py`, `m5-reader-ratchet.test.py`,
+  `post-write-move-check.py`, `post-write-move-check.test.py`, and
+  `post-write-move-manifest.json`. It retains `m5-reader-sweep.py`, the
+  current-tree M5 tooth, and the permanent final-phase post-write structure
+  module with its live, positive, fail-closed, and facade controls.
+- The historical inventory prose now says Draft 5 `191 / 22` and depth
+  `55 / 50 / 86`, total `191`. Bytes between the
+  `m5-reader-sweep:begin/end` markers are identical to the R7 checkpoint.
+  The executable sweep and exact current-tree tooth both pass at
+  `191 rows; depth 55/50/86; exposure 22`.
+- Both named post-write live/positive exact filters initially selected zero
+  because the tests live in the nested
+  `drift_guard::post_write_structure_test` module. The executor did not accept
+  that vacuous result: the fully qualified filters each selected and passed one
+  test. Independent review then passed all four permanent post-write controls
+  `4 / 4`.
+- The full core library passes `3,470` with `33` ignored and zero failed. Its
+  compiler inventory falls exactly `3,504 → 3,503`; the only removed Rust test
+  is the allowed temporary ratchet. Workspace all-target Clippy with warnings
+  denied, workspace build, format, diff hygiene, M5 self-test/check,
+  `truth_ 77 / 77`, and rust-analyzer diagnostics all pass.
+- The independent Sol/xhigh blind review returned **APPROVE** with zero
+  correctness blocker, zero security blocker, and zero scope or receipt
+  mismatch. It verified the exact allowlist, deleted and retained surfaces,
+  generated-row byte identity, remaining references, test-inventory delta, and
+  absence of production/API/migration/security changes.
+- Luna pilot slice 2 remains promoted only for this frozen mechanical cleanup
+  task class. The executor was `gpt-5.6-luna / high`, launched ephemerally with
+  no inherited implementation answer. The first sandboxed boot produced no
+  model turn because the outer sandbox could not write the Codex state DB; the
+  same bounded child then launched under the approved control path.
+
+  | model / effort | task class | executor tokens | credits | wall | first pass | blockers | repairs | result |
+  |---|---|---:|---:|---:|---|---:|---|---|
+  | `gpt-5.6-luna / high` | frozen verifier-surface cleanup | `899,491` input (`841,216` cached; `58,275` uncached), `8,723` output, `4,050` reasoning | unavailable | executor `~229s`; end-to-acceptance `~20m50s` | no — one shell-wrapper variable collision and two vacuous unqualified filters, all caught before acceptance | `0` correctness/security | `0` substantive; verifier harness rerun only | accepted after Sol review; no fallback/revert |
+
+  Root token snapshot moved from `1,122,095` to `1,252,164` during execution,
+  verification, and review; reviewer child tokens and Codex credits were not
+  surfaced, so a defensible credit-denominated cost per accepted slice is
+  unavailable rather than estimated.
 
 ## Review and team protocol
 
