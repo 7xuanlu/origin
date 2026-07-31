@@ -98,8 +98,7 @@ impl LlmProvider for FakeProvider {
 
 async fn fixture() -> (crate::db::MemoryDB, tempfile::TempDir) {
     let (db, dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -245,8 +244,7 @@ async fn provider_cannot_change_reason_or_self_supply_second_judge() {
 #[tokio::test]
 async fn candidate_generation_distinguishes_missing_wrong_and_cross_space_links() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -291,8 +289,7 @@ async fn candidate_generation_distinguishes_missing_wrong_and_cross_space_links(
 #[tokio::test]
 async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -361,8 +358,7 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
 #[tokio::test]
 async fn approved_link_repair_removes_candidate_on_rerun() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -387,8 +383,7 @@ async fn approved_link_repair_removes_candidate_on_rerun() {
         1
     );
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memory_entities (memory_id,entity_id) VALUES (?1,?2)",
@@ -408,8 +403,7 @@ async fn approved_link_repair_removes_candidate_on_rerun() {
 #[tokio::test]
 async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -463,8 +457,7 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
 #[tokio::test]
 async fn candidate_generator_failure_is_incomplete() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch("DROP TABLE page_evidence;")
         .await
@@ -482,7 +475,7 @@ async fn candidate_generator_failure_is_incomplete() {
 #[tokio::test]
 async fn candidate_truncation_completes_after_bounded_adjudication() {
     let (db, _dir) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute_batch(
         "INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at)
          VALUES ('entity-atlas','Project Atlas','concept',1,1,1);",
@@ -536,7 +529,7 @@ async fn candidate_truncation_completes_after_bounded_adjudication() {
 #[tokio::test]
 async fn page_evidence_candidates_ignore_high_frequency_token_noise() {
     let (db, _dir) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for index in 0..100 {
         conn.execute(
             "INSERT INTO memories
@@ -645,8 +638,7 @@ async fn disagreement_and_missing_second_judge_remain_incomplete() {
 #[tokio::test]
 async fn temporal_evolution_and_related_page_can_be_cleared_without_fabricating_links() {
     let (db, _dir) = fixture().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute("DELETE FROM page_evidence", libsql::params::Params::None)
         .await
@@ -776,8 +768,7 @@ async fn stale_work_is_rejected_and_general_never_calls_a_model() {
 #[tokio::test]
 async fn work_digest_binds_scope_and_records_outside_the_packet() {
     let (db, _dir) = fixture().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -797,8 +788,7 @@ async fn work_digest_binds_scope_and_records_outside_the_packet() {
         .iter()
         .all(|record| !record.excerpt().contains("outside packet")));
     let submission = submission_for(work, None, false);
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET content='outside packet bravo' WHERE source_id='zz-hidden'",
@@ -816,8 +806,7 @@ async fn work_digest_binds_scope_and_records_outside_the_packet() {
 
     let prepared = prepare(&db, None).await;
     let submission = submission_for(prepared.agent_work().unwrap(), None, false);
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET content='zzzz hidden chunk bravo' WHERE id='zz-hidden-row-1'",
@@ -847,8 +836,7 @@ async fn work_digest_binds_scope_and_records_outside_the_packet() {
 #[tokio::test]
 async fn zero_heuristic_candidates_are_clean_after_full_candidate_generation() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memories
@@ -882,8 +870,7 @@ async fn empty_semantic_population_is_clean() {
 #[tokio::test]
 async fn duplicate_pair_paths_consume_one_candidate_slot() {
     let (db, _dir) = fixture().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at)
@@ -907,7 +894,7 @@ async fn duplicate_pair_paths_consume_one_candidate_slot() {
 #[tokio::test]
 async fn contradiction_cap_keeps_highest_signal_pair_not_first_ids() {
     let (db, _dir) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute_batch(
         "INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at)
          VALUES ('entity-atlas','Project Atlas','concept',1,1,1);",

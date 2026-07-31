@@ -1438,6 +1438,40 @@ impl LockedProjection<'_> {
         target_path: &str,
         entries: &[wenlan_types::repair::RepairRollbackFileEntry],
     ) -> Result<(), WenlanError> {
+        self.restore_rename_page_projection_inner(target_path, entries, || Ok(()), || Ok(()))
+    }
+
+    #[cfg(test)]
+    fn restore_rename_page_projection_with_checkpoints<F, G>(
+        &self,
+        target_path: &str,
+        entries: &[wenlan_types::repair::RepairRollbackFileEntry],
+        before_target_restore: F,
+        after_target_restore: G,
+    ) -> Result<(), WenlanError>
+    where
+        F: FnOnce() -> Result<(), WenlanError>,
+        G: FnOnce() -> Result<(), WenlanError>,
+    {
+        self.restore_rename_page_projection_inner(
+            target_path,
+            entries,
+            before_target_restore,
+            after_target_restore,
+        )
+    }
+
+    fn restore_rename_page_projection_inner<F, G>(
+        &self,
+        target_path: &str,
+        entries: &[wenlan_types::repair::RepairRollbackFileEntry],
+        before_target_restore: F,
+        after_target_restore: G,
+    ) -> Result<(), WenlanError>
+    where
+        F: FnOnce() -> Result<(), WenlanError>,
+        G: FnOnce() -> Result<(), WenlanError>,
+    {
         if entries.len() != 2
             || entries[0].relative_path() != ".wenlan/state.json"
             || entries[1].relative_path() != target_path
@@ -1455,7 +1489,9 @@ impl LockedProjection<'_> {
         let target_bytes = hex::decode(entries[1].content_hex()).map_err(|_| {
             WenlanError::Validation("repair_projection_rollback_invalid".to_string())
         })?;
+        before_target_restore()?;
         write_regular_nofollow(&self.capabilities.root, target_path, &target_bytes)?;
+        after_target_restore()?;
         let mut budget = RepairReadBudget::new();
         let (_, state_mode) = read_state_nofollow(&self.capabilities.wenlan, &mut budget)?;
         write_state_atomically(&self.capabilities.wenlan, &state_bytes, state_mode)?;
@@ -1494,12 +1530,6 @@ impl LockedRepairProjection<'_> {
             .capture_stale_page_projection_current(page_id, source_path, quarantine_path)
     }
 
-    pub(crate) fn write_page(&self, page: &Page) -> Result<String, WenlanError> {
-        self.write
-            .writer
-            .write_page_with_lock_held(self.capabilities, &self.write.guard, page)
-    }
-
     /// Project a page against a permit already in hand.
     ///
     /// Repair-lock counterpart to the two [`write_page_permitted`] forms above,
@@ -1515,7 +1545,9 @@ impl LockedRepairProjection<'_> {
         page: &Page,
     ) -> Result<String, WenlanError> {
         check_permit(permit, page)?;
-        self.write_page(page)
+        self.write
+            .writer
+            .write_page_with_lock_held(self.capabilities, &self.write.guard, page)
     }
 
     /// The permitted form of [`Self::write_page_with_after_target_write`].
@@ -1523,6 +1555,7 @@ impl LockedRepairProjection<'_> {
     /// The repair path renames a page's title and rewrites its `.md` in the same
     /// receipted step, which is a production page-prose write like any other and
     /// needs the same permit in front of it.
+    #[cfg(test)]
     pub(crate) fn write_page_with_after_target_write_permitted<F>(
         &self,
         permit: &crate::truth_adapter::PagePermit,
@@ -1533,17 +1566,6 @@ impl LockedRepairProjection<'_> {
         F: FnOnce() -> Result<(), WenlanError>,
     {
         check_permit(permit, page)?;
-        self.write_page_with_after_target_write(page, after_target_write)
-    }
-
-    pub(crate) fn write_page_with_after_target_write<F>(
-        &self,
-        page: &Page,
-        after_target_write: F,
-    ) -> Result<String, WenlanError>
-    where
-        F: FnOnce() -> Result<(), WenlanError>,
-    {
         self.write.writer.write_page_with_lock_held_and_hook(
             self.capabilities,
             &self.write.guard,
@@ -1567,6 +1589,27 @@ impl LockedRepairProjection<'_> {
     ) -> Result<(), WenlanError> {
         self.locked_projection()
             .restore_rename_page_projection(target_path, entries)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_rename_page_projection_with_checkpoints<F, G>(
+        &self,
+        target_path: &str,
+        entries: &[wenlan_types::repair::RepairRollbackFileEntry],
+        before_target_restore: F,
+        after_target_restore: G,
+    ) -> Result<(), WenlanError>
+    where
+        F: FnOnce() -> Result<(), WenlanError>,
+        G: FnOnce() -> Result<(), WenlanError>,
+    {
+        self.locked_projection()
+            .restore_rename_page_projection_with_checkpoints(
+                target_path,
+                entries,
+                before_target_restore,
+                after_target_restore,
+            )
     }
 
     #[cfg(test)]

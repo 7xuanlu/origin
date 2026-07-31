@@ -2,8 +2,6 @@ use crate::db::MemoryDB;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-mod sweep;
-
 pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     let minimum = crate::refinery::summary::min_bucket_members();
     let durable_gate = crate::db::community_reader_durable_gate_sql(
@@ -163,7 +161,7 @@ mod tests {
               WHERE m.source='memory' AND ({})",
             summary_eligible_predicate("m")
         );
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn.query(&sql, ()).await.unwrap();
         let mut details = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
@@ -178,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn summary_eligibility_requires_a_qualifying_community_and_candidate() {
         let (db, _tmp) = test_db().await;
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute_batch(
             "INSERT INTO entities
                (id,name,entity_type,confirmed,created_at,updated_at,community_id)

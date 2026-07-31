@@ -27,7 +27,31 @@ use wenlan_types::page_map::{
 };
 
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{get, patch, post, put, TrackedRouter};
+use crate::state::{ServerState, SharedState};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route(
+            "/api/pages/{id}/map",
+            get(handle_get_page_map).delete(handle_reset_page_map),
+        )
+        .route(
+            "/api/pages/{id}/map/layout",
+            put(handle_put_page_map_layout),
+        )
+        .route("/api/pages/{id}/map/nodes", post(handle_create_map_node))
+        .route(
+            "/api/pages/{id}/map/nodes/{node_id}",
+            patch(handle_patch_map_node).delete(handle_delete_map_node),
+        )
+        .route("/api/pages/{id}/map/edges", post(handle_create_map_edge))
+        .route(
+            "/api/pages/{id}/map/edges/{edge_id}",
+            patch(handle_patch_map_edge).delete(handle_delete_map_edge),
+        )
+        .route("/api/pages/{id}/map/improve", post(handle_improve_page_map))
+}
 
 /// The grant every *mutation* route in this module resolves to.
 ///

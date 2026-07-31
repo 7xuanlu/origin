@@ -40,45 +40,140 @@ are resolved by NAME, which over-matches on generic names; rows whose name is
 ambiguous are flagged rather than given a caller list. PR-B replaces this with
 language-server resolution.
 
-Usage: python3 scripts/m5-reader-sweep.py [--json]
+Usage:
+  python3 scripts/m5-reader-sweep.py [--json]
+  python3 scripts/m5-reader-sweep.py --check
+  python3 scripts/m5-reader-sweep.py --update-inventory
 """
-import os, re, sys, json
+import difflib
+import json
+import os
+import re
+import sys
+from collections import Counter
 
 MAX_FN_LINES = 12000
 TRUNCATED = []
+INVENTORY = 'docs/plans/2026-07-27-m5-reader-manifest-inventory.md'
+INVENTORY_BEGIN = '<!-- m5-reader-sweep:begin -->'
+INVENTORY_END = '<!-- m5-reader-sweep:end -->'
 
 FN = re.compile(
     r'^(\s*)(pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+(\w+)'
 )
 PROSE = re.compile(r'\b(content|title|summary|excerpt|body|snippet)\b')
 SQLBLK = re.compile(r'"[^"]*(?:FROM|JOIN)\s+pages\b[^"]*"', re.I | re.S)
+RAW_STRING_START = re.compile(r'r(#{0,255})"')
+CHAR_LITERAL = re.compile(
+    r"""'(?:\\(?:[nrt0\\'"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]{1,6}\})|[^'\\])'"""
+)
 CRATES = ['crates/wenlan-core/src', 'crates/wenlan-server/src',
           'crates/wenlan-cli/src', 'crates/wenlan-mcp/src']
 CORE = 'crates/wenlan-core/src'
 
 
+def rust_structure(lines):
+    """Mask comments and literals while preserving structural Rust tokens."""
+    out = []
+    block_depth = 0
+    normal_string = False
+    escaped = False
+    raw_end = None
+
+    for line in lines:
+        masked = [' '] * len(line)
+        i = 0
+        while i < len(line):
+            if raw_end is not None:
+                end = line.find(raw_end, i)
+                if end < 0:
+                    i = len(line)
+                else:
+                    i = end + len(raw_end)
+                    raw_end = None
+                continue
+
+            if normal_string:
+                ch = line[i]
+                if escaped:
+                    escaped = False
+                elif ch == '\\':
+                    escaped = True
+                elif ch == '"':
+                    normal_string = False
+                i += 1
+                continue
+
+            if block_depth:
+                if line.startswith('/*', i):
+                    block_depth += 1
+                    i += 2
+                elif line.startswith('*/', i):
+                    block_depth -= 1
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if line.startswith('//', i):
+                break
+            if line.startswith('/*', i):
+                block_depth = 1
+                i += 2
+                continue
+
+            raw = RAW_STRING_START.match(line, i)
+            if raw:
+                raw_end = '"' + raw.group(1)
+                i = raw.end()
+                continue
+
+            if line[i] == '"':
+                normal_string = True
+                escaped = False
+                i += 1
+                continue
+
+            if line[i] == "'":
+                char = CHAR_LITERAL.match(line, i)
+                if char:
+                    i = char.end()
+                    continue
+
+            masked[i] = line[i]
+            i += 1
+        out.append(''.join(masked))
+
+    return out
+
+
 def strip_test(lines):
     """Blank out #[cfg(test)] blocks by brace tracking, preserving line numbers."""
     out, skip, depth, armed = [], 0, 0, False
-    for l in lines:
-        if not skip and re.match(r'\s*#\[cfg\(test\)\]', l):
+    structure = rust_structure(lines)
+    for l, structural in zip(lines, structure):
+        if not skip and re.match(r'\s*#\[cfg\(test\)\]', structural):
             armed = True; out.append(''); continue
         if armed and not skip:
-            if '{' not in l and l.strip().endswith(';'):
+            if '{' not in structural and structural.strip().endswith(';'):
                 # `#[cfg(test)] mod foo;` / `use ...;` / a test-only const.
                 # The attribute governs an item that never opens a brace, so
                 # arming the brace scan here would blank forward until the NEXT
                 # unrelated `{` and swallow real code -- 45% of db.rs, in the
                 # version that shipped. Blank the item, disarm, move on.
                 out.append(''); armed = False; continue
-            if '{' in l:
-                skip, depth, armed = 1, l.count('{') - l.count('}'), False
+            if '{' in structural:
+                skip, depth, armed = (
+                    1,
+                    structural.count('{') - structural.count('}'),
+                    False,
+                )
                 out.append('')
                 if depth <= 0: skip = 0
                 continue
             out.append(''); continue
         if skip:
-            depth += l.count('{') - l.count('}')
+            depth += structural.count('{') - structural.count('}')
             out.append('')
             if depth <= 0: skip = 0
             continue
@@ -89,23 +184,25 @@ def strip_test(lines):
 def bodies(lines):
     """Yield (line_no, name, visibility, body) with brace-matched bodies."""
     i, n = 0, len(lines)
+    structure = rust_structure(lines)
     while i < n:
-        m = FN.match(lines[i])
+        m = FN.match(structure[i])
         if not m:
             i += 1; continue
         name_hint = m.group(3)
         j, depth, started = i, 0, False
         while j < n:
-            for ch in lines[j]:
+            for ch in structure[j]:
                 if ch == '{': depth += 1; started = True
                 elif ch == '}': depth -= 1
             if started and depth <= 0: break
             j += 1
             if j - i > MAX_FN_LINES:
-                # The longest real function in this tree is db.rs::run_migrations
-                # at 8819 lines. Past the cap the brace scan has lost sync (an
-                # unbalanced brace inside a string or macro), so report it rather
-                # than silently truncating a body.
+                # run_migrations is a known multi-thousand-line function. Past
+                # this cap the brace scan has lost sync (an unbalanced brace
+                # inside a string or macro), so report it rather than silently
+                # truncating a body. Avoid pinning its fast-moving line count in
+                # this comment: the executable inventory checks the real extent.
                 t = '%s:%d' % (name_hint, i + 1)
                 if t not in TRUNCATED: TRUNCATED.append(t)
                 break
@@ -123,10 +220,11 @@ def rust_files():
 
 
 def sweep():
-    readers, texts = [], {}
+    readers, texts, code_texts = [], {}, {}
     for p in rust_files():
         lines = strip_test(open(p, errors='ignore').read().split('\n'))
         texts[p] = '\n'.join(lines)
+        code_texts[p] = '\n'.join(rust_structure(lines))
         for ln, name, vis, body in bodies(lines):
             sqls = SQLBLK.findall(body)
             if sqls and any(PROSE.search(q) for q in sqls):
@@ -135,7 +233,7 @@ def sweep():
     # A name is ambiguous when more than one distinct function in the tree
     # declares it; a name-keyed caller scan cannot attribute edges then.
     declared = {}
-    for p, t in texts.items():
+    for p, t in code_texts.items():
         for m in re.finditer(r'\bfn\s+(\w+)', t):
             declared.setdefault(m.group(1), set()).add(p + ':' + str(t[:m.start()].count('\n') + 1))
 
@@ -144,7 +242,7 @@ def sweep():
         ext = []
         if not r['ambiguous']:
             pat = re.compile(r'\b' + re.escape(r['fn']) + r'\s*\(')
-            for p, t in texts.items():
+            for p, t in code_texts.items():
                 if p.startswith(CORE): continue
                 for m in pat.finditer(t):
                     ln = t[:m.start()].count('\n') + 1
@@ -162,19 +260,24 @@ def sweep():
     for p, t in texts.items():
         for ln, name, vis, body in bodies(t.split('\n')):
             all_fns.setdefault((p, ln), {'file': p, 'line': ln, 'fn': name,
-                                         'vis': vis, 'body': body})
+                                         'vis': vis, 'body': body,
+                                         'code': '\n'.join(
+                                             rust_structure(body.split('\n'))
+                                         )})
     known = {(r['file'], r['line']) for r in readers}
     frontier = {r['fn'] for r in readers}
     out = list(readers)
     for depth in (1, 2):
-        pats = [(n, re.compile(r'\b' + re.escape(n) + r'\s*\(')) for n in frontier
+        pats = [(n, re.compile(r'\b' + re.escape(n) + r'\s*\(')) for n in sorted(frontier)
                 if len(declared.get(n, ())) == 1]
         nxt = set()
         for key, f in all_fns.items():
             if key in known: continue
             for n, pat in pats:
-                if pat.search(f['body']):
-                    f = dict(f); f.pop('body', None)
+                if pat.search(f['code']):
+                    f = dict(f)
+                    f.pop('body', None)
+                    f.pop('code', None)
                     f['depth'] = depth; f['via'] = n
                     f['ambiguous'] = len(declared.get(f['fn'], ())) > 1
                     f['ext'] = []
@@ -186,7 +289,7 @@ def sweep():
         if r['depth'] and not r['ambiguous']:
             pat = re.compile(r'\b' + re.escape(r['fn']) + r'\s*\(')
             ext = []
-            for p, t in texts.items():
+            for p, t in code_texts.items():
                 if p.startswith(CORE): continue
                 for m in pat.finditer(t):
                     ln = t[:m.start()].count('\n') + 1
@@ -198,15 +301,118 @@ def sweep():
     return out
 
 
-def selftest():
-    """Assert the two predicates that decide what this script can even see.
+def short_path(path):
+    prefixes = {
+        'crates/wenlan-core/src/': 'core/',
+        'crates/wenlan-server/src/': 'server/',
+        'crates/wenlan-cli/src/': 'cli/',
+        'crates/wenlan-mcp/src/': 'mcp/',
+    }
+    for prefix, short in prefixes.items():
+        if path.startswith(prefix):
+            return short + path[len(prefix):]
+    return path
 
-    Both bugs these cover shipped once. `strip_test` armed the brace scan on
+
+def render_inventory(rows):
+    """Render the canonical, generated reader rows embedded in the M5 inventory."""
+    sections = [INVENTORY_BEGIN]
+    for depth, title, last_column in (
+        (0, 'SQL-bearing definitions', 'Exposure'),
+        (1, 'wrapper layer', 'Reaches prose via'),
+        (2, 'consumers', 'Reaches prose via'),
+    ):
+        sections.extend([
+            '',
+            '### Depth %d — %s' % (depth, title),
+            '',
+            '| Address | Function | Visibility | %s |' % last_column,
+            '|---|---|---|---|',
+        ])
+        for row in (r for r in rows if r['depth'] == depth):
+            address = '%s:%d' % (short_path(row['file']), row['line'])
+            if depth == 0:
+                if row['ambiguous']:
+                    tail = 'name-ambiguous'
+                elif row['exposure']:
+                    callers = ', '.join('`%s`' % short_path(c) for c in row['ext'])
+                    tail = '**exposure** — ' + callers
+                else:
+                    tail = 'internal-only'
+            else:
+                tail = '`%s`' % row['via']
+            sections.append(
+                '| `%s` | `%s` | `%s` | %s |'
+                % (address, row['fn'], row['vis'], tail)
+            )
+    sections.extend(['', INVENTORY_END])
+    return '\n'.join(sections)
+
+
+def inventory_block(document):
+    start = document.find(INVENTORY_BEGIN)
+    end = document.find(INVENTORY_END)
+    if start < 0 or end < 0 or end < start:
+        raise ValueError(
+            '%s must contain one ordered %s / %s marker pair'
+            % (INVENTORY, INVENTORY_BEGIN, INVENTORY_END)
+        )
+    if document.find(INVENTORY_BEGIN, start + 1) >= 0 \
+            or document.find(INVENTORY_END, end + 1) >= 0:
+        raise ValueError('%s contains duplicate reader inventory markers' % INVENTORY)
+    return document[start:end + len(INVENTORY_END)]
+
+
+def replace_inventory_block(document, generated):
+    current = inventory_block(document)
+    return document.replace(current, generated, 1)
+
+
+def check_inventory(rows):
+    generated = render_inventory(rows)
+    document = open(INVENTORY, encoding='utf-8').read()
+    current = inventory_block(document)
+    if current != generated:
+        diff = difflib.unified_diff(
+            current.splitlines(),
+            generated.splitlines(),
+            fromfile=INVENTORY + ' (committed)',
+            tofile=INVENTORY + ' (current tree)',
+            lineterm='',
+        )
+        print('\n'.join(diff), file=sys.stderr)
+        return False
+
+    depths = Counter(r['depth'] for r in rows)
+    exposure = sum(r['exposure'] for r in rows)
+    print(
+        'reader inventory check: ok '
+        '(%d rows; depth %d/%d/%d; exposure %d)'
+        % (len(rows), depths[0], depths[1], depths[2], exposure)
+    )
+    return True
+
+
+def update_inventory(rows):
+    generated = render_inventory(rows)
+    document = open(INVENTORY, encoding='utf-8').read()
+    updated = replace_inventory_block(document, generated)
+    with open(INVENTORY, 'w', encoding='utf-8') as f:
+        f.write(updated)
+    print('updated %s (%d rows)' % (INVENTORY, len(rows)))
+
+
+def selftest():
+    """Assert the structural predicates that decide what this script can see.
+
+    These bugs all shipped once. `strip_test` armed the brace scan on
     `#[cfg(test)] mod foo;` -- an attribute over an item with no brace -- and
     then blanked forward to the next unrelated `{`, hiding real code from the
     whole sweep; five HTTP route handlers went uncounted. The `ext` scan
     reported a function's own definition line as an external caller of itself,
-    which reads as an exposure path in the output table.
+    which reads as an exposure path in the output table. The body scanner also
+    counted braces inside strings and comments, making `run_migrations` swallow
+    later sibling methods and hiding a page-prose reader.
     """
     src = """#[cfg(test)]
 mod claim_identity_test;
@@ -235,10 +441,69 @@ pub async fn also_real(&self) {
     assert 'hidden_by_design' not in kept, 'a real #[cfg(test)] block was not stripped'
     assert len(kept.split('\n')) == len(src.split('\n')), 'line numbers must survive stripping'
 
+    brace_fixture = '''fn stringy() {
+    let normal = "}";
+    let raw = r##"{
+        still a string
+    }"##;
+    /* a comment with a closing brace: } */
+}
+
+fn after_stringy() {}'''
+    parsed = list(bodies(brace_fixture.split('\n')))
+    assert [row[1] for row in parsed] == ['stringy', 'after_stringy'], \
+        'braces inside Rust strings/comments changed function boundaries'
+    assert 'let raw' in parsed[0][3], 'a brace in a string truncated the function body'
+
+    db_lines = strip_test(open('crates/wenlan-core/src/db.rs').read().split('\n'))
+    db_bodies = {name: body for _, name, _, body in bodies(db_lines)}
+    assert 'migrate_80_page_scope_fold' in db_bodies, \
+        'run_migrations swallowed the next sibling method'
+    assert 'fn migrate_80_page_scope_fold' not in db_bodies['run_migrations'], \
+        'run_migrations body overran its LSP-resolved end'
+
     # A definition is not a call site of itself.
     for r in sweep():
         assert '%s:%d' % (r['file'], r['line']) not in r['ext'], \
             '%s counts its own definition as an external caller' % r['fn']
+
+    # Positive control for exact set equality: either an added or a missing
+    # reader must change the generated block. This is deliberately independent
+    # of the current inventory so a stale snapshot cannot make the self-test
+    # agree with itself.
+    fixture_rows = [
+        {
+            'file': 'crates/wenlan-core/src/db.rs',
+            'line': 10,
+            'fn': 'read_one',
+            'vis': 'pub',
+            'depth': 0,
+            'ambiguous': False,
+            'exposure': False,
+            'ext': [],
+        },
+        {
+            'file': 'crates/wenlan-server/src/routes.rs',
+            'line': 20,
+            'fn': 'handle_one',
+            'vis': 'pub',
+            'depth': 1,
+            'via': 'read_one',
+            'ambiguous': False,
+            'exposure': False,
+            'ext': [],
+        },
+    ]
+    fixture = 'before\n%s\nafter\n' % render_inventory(fixture_rows)
+    expected = inventory_block(fixture)
+    added = fixture_rows + [
+        dict(fixture_rows[1], line=21, fn='handle_two')
+    ]
+    assert expected != render_inventory(added), 'an added reader must fail exact equality'
+    assert expected != render_inventory(fixture_rows[:-1]), \
+        'a missing reader must fail exact equality'
+    assert replace_inventory_block(fixture, expected) == fixture, \
+        'replacing an unchanged generated block must be stable'
     print('selftest: ok')
 
 
@@ -247,12 +512,31 @@ if __name__ == '__main__':
         selftest()
         sys.exit(0)
     rows = sweep()
+    if TRUNCATED:
+        print(
+            'BRACE SCAN LOST SYNC in: %s' % ', '.join(TRUNCATED),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if '--check' in sys.argv:
+        try:
+            ok = check_inventory(rows)
+        except (OSError, ValueError) as error:
+            print('reader inventory check failed: %s' % error, file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0 if ok else 1)
+    if '--update-inventory' in sys.argv:
+        try:
+            update_inventory(rows)
+        except (OSError, ValueError) as error:
+            print('reader inventory update failed: %s' % error, file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     if '--json' in sys.argv:
         json.dump(rows, sys.stdout, indent=1)
         sys.exit(0)
     exp = [r for r in rows if r['exposure']]
     amb = [r for r in rows if r['ambiguous']]
-    from collections import Counter
     d = Counter(r['depth'] for r in rows)
     print('internal page-prose readers: %d' % len(rows))
     print('  depth 0 (SQL-bearing definitions): %d' % d[0])

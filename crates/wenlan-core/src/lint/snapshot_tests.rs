@@ -5,11 +5,12 @@ use tokio::sync::Barrier;
 
 #[tokio::test]
 async fn lint_snapshot_baseline_primary_connection_answers_independently() {
-    // Given: a separate read-only libSQL transaction is open.
+    // Given: a separate read-only test session is open.
     let (db, _dir) = test_db().await;
-    let secondary = db._db.connect().expect("secondary connection opens");
-    let transaction = secondary
-        .transaction_with_behavior(libsql::TransactionBehavior::ReadOnly)
+    let transaction = db
+        .test_secondary_session()
+        .expect("secondary connection opens")
+        .begin_read_only()
         .await
         .expect("read-only transaction starts");
 
@@ -112,8 +113,7 @@ async fn snapshot_receipt_detects_same_row_count_update() {
         writer_ready_for_task.wait().await;
         writer_release_for_task.wait().await;
         writer_db
-            .conn
-            .lock()
+            .test_primary_session()
             .await
             .execute(
                 "UPDATE entities SET name = ?1 WHERE id = ?2",
@@ -160,8 +160,7 @@ async fn completed_receipt_is_invalidated_by_a_later_same_row_update() {
 
     // When: a canonical UPDATE commits without changing schema or row counts.
     let changed = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute("UPDATE profiles SET updated_at = updated_at + 1", ())
         .await
@@ -186,7 +185,9 @@ async fn completed_receipt_is_invalidated_by_a_later_same_row_update() {
 async fn structural_snapshot_work_is_independent_of_table_payload_bytes() {
     // Given: an ordinary table whose schema is fixed before the receipt work starts.
     let (db, _dir) = test_db().await;
-    let connection = db._db.connect().expect("receipt probe connection opens");
+    let connection = db
+        .test_secondary_session()
+        .expect("receipt probe connection opens");
     connection
         .execute(
             "CREATE TABLE lint_payload_probe (payload BLOB NOT NULL)",
@@ -194,7 +195,8 @@ async fn structural_snapshot_work_is_independent_of_table_payload_bytes() {
         )
         .await
         .expect("receipt probe table is created");
-    let before = super::structural_digest(&connection)
+    let before = connection
+        .structural_digest()
         .await
         .expect("pre-payload structural digest succeeds");
 
@@ -206,7 +208,8 @@ async fn structural_snapshot_work_is_independent_of_table_payload_bytes() {
         )
         .await
         .expect("large payload is inserted");
-    let after = super::structural_digest(&connection)
+    let after = connection
+        .structural_digest()
         .await
         .expect("post-payload structural digest succeeds");
 
@@ -222,9 +225,8 @@ async fn replacing_the_freshness_observer_invalidates_prior_receipts() {
     db.bootstrap_profile()
         .await
         .expect("profile fixture exists");
-    let old_clock =
-        Arc::new(super::LintFreshnessClock::new(&db._db).expect("old freshness observer opens"));
-    let old = super::LintReadSnapshot::open_with_freshness(&db._db, old_clock)
+    let old = db
+        .open_isolated_lint_snapshot_for_test()
         .await
         .expect("old snapshot opens")
         .finish()
@@ -234,8 +236,7 @@ async fn replacing_the_freshness_observer_invalidates_prior_receipts() {
     // When: a same-row canonical write commits and a new daemon lifetime opens
     // a fresh observer connection over the same database.
     let changed = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute("UPDATE profiles SET updated_at = updated_at + 1", ())
         .await
@@ -244,9 +245,8 @@ async fn replacing_the_freshness_observer_invalidates_prior_receipts() {
         changed, 1,
         "the probe must update exactly one canonical row"
     );
-    let new_clock =
-        Arc::new(super::LintFreshnessClock::new(&db._db).expect("new freshness observer opens"));
-    let new = super::LintReadSnapshot::open_with_freshness(&db._db, new_clock)
+    let new = db
+        .open_isolated_lint_snapshot_for_test()
         .await
         .expect("new snapshot opens")
         .finish()

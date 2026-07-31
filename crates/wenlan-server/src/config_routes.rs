@@ -2,6 +2,7 @@
 //! Config endpoints — read/write the daemon's persistent Config.
 
 use crate::error::ServerError;
+use crate::route_registry::{get, post, put, TrackedRouter};
 use crate::state::SharedState;
 use axum::extract::State;
 use axum::response::Json;
@@ -11,6 +12,29 @@ use wenlan_core::config;
 use wenlan_core::on_device_models::{self, OnDeviceModel};
 use wenlan_types::requests::{OnDeviceModelRequest, UpdateConfigRequest};
 use wenlan_types::responses::{ConfigResponse, OnDeviceModelEntry, OnDeviceModelResponse};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route(
+            "/api/config",
+            get(handle_get_config).put(handle_update_config),
+        )
+        .route(
+            "/api/config/skip-apps",
+            get(handle_get_skip_apps).put(handle_update_skip_apps),
+        )
+        .route("/api/config/routing", get(handle_get_resolved_routing))
+        .route("/api/setup/status", get(handle_get_setup_status))
+        .route(
+            "/api/setup/anthropic-key",
+            put(handle_set_anthropic_key).delete(handle_clear_anthropic_key),
+        )
+        .route("/api/on-device-model", get(handle_get_on_device_model))
+        .route(
+            "/api/on-device-model/download",
+            post(handle_download_on_device_model),
+        )
+}
 
 fn config_to_response(cfg: &config::Config) -> ConfigResponse {
     ConfigResponse {

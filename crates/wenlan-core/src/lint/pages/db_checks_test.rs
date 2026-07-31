@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::test_support::TestDbSession;
 use crate::db::tests::test_db;
 use crate::lint::context::{
     AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
@@ -86,7 +87,7 @@ fn active_duplicates_warn_but_archived_rows_remain_inventory() {
 #[tokio::test]
 async fn cross_effective_scope_active_duplicate_titles_pass() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page_with_scope(
         &conn,
         "page-a",
@@ -126,7 +127,7 @@ async fn cross_effective_scope_active_duplicate_titles_pass() {
 #[tokio::test]
 async fn same_effective_scope_active_duplicate_titles_warn() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page_with_scope(
         &conn,
         "page-a",
@@ -171,7 +172,7 @@ async fn same_effective_scope_active_duplicate_titles_warn() {
 // still partition correctly now that both pages carry `space` directly.
 async fn selected_duplicate_scope_filters_registered_and_uncategorized() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page_with_scope(
         &conn,
         "page-current",
@@ -233,7 +234,7 @@ async fn selected_duplicate_scope_filters_registered_and_uncategorized() {
 // `None` means unfiled/uncategorized, matching the migration's own
 // sentinel rather than binding a literal NULL a NOT NULL column rejects.
 async fn insert_page_with_scope(
-    conn: &libsql::Connection,
+    conn: &TestDbSession,
     id: &str,
     title: &str,
     status: &str,
@@ -251,7 +252,7 @@ async fn insert_page_with_scope(
 #[tokio::test]
 async fn source_page_integrity_accepts_any_canonical_or_legacy_provenance_representation() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     conn.execute_batch(
         "INSERT INTO pages
              (id,title,content,source_memory_ids,version,status,created_at,last_compiled,
@@ -305,8 +306,7 @@ async fn source_page_integrity_accepts_any_canonical_or_legacy_provenance_repres
 #[tokio::test]
 async fn source_page_integrity_runs_without_page_projection_or_page_root() {
     let (db, _tmp) = test_db().await;
-    db._db
-        .connect()
+    db.test_secondary_session()
         .unwrap()
         .execute_batch(
             "INSERT INTO pages

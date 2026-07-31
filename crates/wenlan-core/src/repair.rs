@@ -5,7 +5,13 @@
 //! it is not an authentication boundary against malicious local processes.
 
 use crate::{
-    db::MemoryDB,
+    db::{
+        repair_page_rename::recover_rename_page_title_apply_receipt,
+        repair_stale_projection::recover_stale_page_projection_apply_receipt,
+        repair_target_receipt::read_current_repair_target_receipt,
+        repair_verification::{record_repair_verification_atomic, RepairVerificationAtomicInput},
+        MemoryDB,
+    },
     error::WenlanError,
     lint::{
         context::ExecutionGate,
@@ -37,16 +43,21 @@ use wenlan_types::{
         RepairDigest, RepairEnrichmentStep, RepairExpectedState, RepairLintScope, RepairManifest,
         RepairManifestDraft, RepairMutation, RepairPostAssertions, RepairRecordSetBaseline,
         RepairReviewBinding, RepairRollbackArtifact, RepairRollbackPayloadV2, RepairRollbackV2,
-        RepairScope, RepairSource, RepairTarget, RepairVerificationReceipt,
-        RepairVerificationReceiptDraft, RepairWriter, StoredRepairApplyReceipt,
-        StoredRepairManifest, StoredRepairRollbackArtifact, StoredRepairVerificationReceipt,
-        VerifyRepairRequest, REPAIR_CLASSIFICATION_CHECK_ID, REPAIR_ROLLBACK_FORMAT_VERSION,
+        RepairScope, RepairSource, RepairTarget, RepairVerificationReceipt, RepairWriter,
+        StoredRepairApplyReceipt, StoredRepairManifest, StoredRepairRollbackArtifact,
+        StoredRepairVerificationReceipt, VerifyRepairRequest, REPAIR_CLASSIFICATION_CHECK_ID,
+        REPAIR_ROLLBACK_FORMAT_VERSION,
     },
     repair_plan::{
         RepairAffectedRecord, RepairAffectedRecordKind, RepairPlan, RepairPlanEntriesPage,
         RepairPlanEntriesRequest, RepairPlanEntry, StoredRepairPlan,
     },
     MemoryType,
+};
+
+#[cfg(test)]
+use crate::db::repair_verification::{
+    run_repair_verification_test_checkpoint, RepairVerificationTestCheckpointKind,
 };
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -76,6 +87,26 @@ mod title_rename_tests;
 #[derive(Debug, Clone)]
 pub struct RepairArtifactStore {
     root: PathBuf,
+}
+
+pub(crate) enum RenamePageTitleRecoveryArtifact {
+    Completed(RepairApplyReceipt),
+    Absent,
+    Pending {
+        verified_receipt: Option<RepairApplyReceipt>,
+        rollback: RepairRollbackPayloadV2,
+    },
+}
+
+pub(crate) enum StalePageProjectionRecoveryJournal {
+    Absent,
+    Present(StoredRollbackArtifact),
+}
+
+pub(crate) enum StalePageProjectionRecoveryArtifactUpdate {
+    ClearPendingOnly,
+    PublishPendingAndClearJournal,
+    ClearPendingAndJournal,
 }
 
 impl RepairArtifactStore {
@@ -732,6 +763,43 @@ impl RepairArtifactStore {
         Ok(Some(rollback))
     }
 
+    pub(crate) fn inspect_stale_page_projection_recovery_journal(
+        &self,
+        manifest: &RepairManifest,
+    ) -> Result<StalePageProjectionRecoveryJournal, WenlanError> {
+        Ok(
+            match self.load_stale_page_projection_apply_journal(manifest)? {
+                Some(rollback) => StalePageProjectionRecoveryJournal::Present(rollback),
+                None => StalePageProjectionRecoveryJournal::Absent,
+            },
+        )
+    }
+
+    pub(crate) fn apply_stale_page_projection_recovery_artifact_update(
+        &self,
+        manifest_id: &str,
+        update: StalePageProjectionRecoveryArtifactUpdate,
+    ) -> Result<(), WenlanError> {
+        match update {
+            StalePageProjectionRecoveryArtifactUpdate::ClearPendingOnly => {
+                self.clear_pending_apply_receipt(manifest_id)
+            }
+            StalePageProjectionRecoveryArtifactUpdate::PublishPendingAndClearJournal => {
+                let manifest_dir = self.manifest_dir(manifest_id)?;
+                publish_no_replace(
+                    &manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
+                    &manifest_dir.join(APPLY_RECEIPT_FILE),
+                    "repair_already_applied",
+                )?;
+                self.clear_stale_page_projection_apply_journal(manifest_id)
+            }
+            StalePageProjectionRecoveryArtifactUpdate::ClearPendingAndJournal => {
+                self.clear_pending_apply_receipt(manifest_id)?;
+                self.clear_stale_page_projection_apply_journal(manifest_id)
+            }
+        }
+    }
+
     fn stale_page_projection_apply_journal_exists(
         &self,
         manifest_id: &str,
@@ -781,7 +849,52 @@ impl RepairArtifactStore {
         verify_stored_apply_receipt(receipt, manifest)
     }
 
-    fn persist_verification_receipt(
+    pub(crate) fn inspect_rename_page_title_recovery_artifact(
+        &self,
+        manifest: &RepairManifest,
+    ) -> Result<RenamePageTitleRecoveryArtifact, WenlanError> {
+        let manifest_dir = self.manifest_dir(manifest.manifest_id())?;
+        let final_path = manifest_dir.join(APPLY_RECEIPT_FILE);
+        if final_path.exists() {
+            let receipt = self.load_apply_receipt(manifest)?;
+            self.clear_pending_apply_receipt(manifest.manifest_id())?;
+            return Ok(RenamePageTitleRecoveryArtifact::Completed(receipt));
+        }
+        let pending_path = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        if !pending_path.exists() {
+            return Ok(RenamePageTitleRecoveryArtifact::Absent);
+        }
+        let pending = read_bounded_file(&pending_path, REPAIR_ROLLBACK_ARTIFACT_MAX_BYTES)?;
+        let verified_receipt = StoredRepairApplyReceipt::from_slice(&pending)
+            .ok()
+            .and_then(|receipt| verify_stored_apply_receipt(receipt, manifest).ok());
+        let rollback = self.load_rename_page_title_rollback(manifest)?;
+        Ok(RenamePageTitleRecoveryArtifact::Pending {
+            verified_receipt,
+            rollback,
+        })
+    }
+
+    pub(crate) fn publish_rename_page_title_pending_apply_receipt(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), WenlanError> {
+        let manifest_dir = self.manifest_dir(manifest_id)?;
+        publish_no_replace(
+            &manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
+            &manifest_dir.join(APPLY_RECEIPT_FILE),
+            "repair_already_applied",
+        )
+    }
+
+    pub(crate) fn clear_rename_page_title_pending_apply_receipt(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), WenlanError> {
+        self.clear_pending_apply_receipt(manifest_id)
+    }
+
+    pub(crate) fn persist_verification_receipt(
         &self,
         receipt: &RepairVerificationReceipt,
     ) -> Result<(), WenlanError> {
@@ -2422,258 +2535,6 @@ fn should_retain_stale_page_projection_pending_receipt(
     apply_journal_exists || should_retain_pending_apply_receipt(error)
 }
 
-async fn recover_rename_page_title_apply_receipt(
-    db: &MemoryDB,
-    store: &RepairArtifactStore,
-    manifest: &RepairManifest,
-    page_root: &Path,
-) -> Result<Option<RepairApplyReceipt>, WenlanError> {
-    let manifest_dir = store.manifest_dir(manifest.manifest_id())?;
-    let final_path = manifest_dir.join(APPLY_RECEIPT_FILE);
-    if final_path.exists() {
-        let receipt = store.load_apply_receipt(manifest)?;
-        let pending_path = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
-        if pending_path.exists() {
-            fs::remove_file(pending_path)?;
-            sync_dir(&manifest_dir)?;
-        }
-        return Ok(Some(receipt));
-    }
-    let pending_path = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
-    if !pending_path.exists() {
-        return Ok(None);
-    }
-    let pending = read_bounded_file(&pending_path, REPAIR_ROLLBACK_ARTIFACT_MAX_BYTES)?;
-    let parsed = StoredRepairApplyReceipt::from_slice(&pending)
-        .ok()
-        .and_then(|receipt| verify_stored_apply_receipt(receipt, manifest).ok());
-    let rollback = store.load_rename_page_title_rollback(manifest)?;
-    let page_id = match manifest.target() {
-        RepairTarget::PageProjection { page_id, .. } => page_id,
-        _ => {
-            return Err(WenlanError::Validation(
-                "page title repair target/writer mismatch".to_string(),
-            ))
-        }
-    };
-    let session = crate::export::knowledge::KnowledgeProjectionWrite::begin_owned_repair_session(
-        page_root.to_path_buf(),
-        db,
-    )?;
-    let projection = session.locked();
-    let connection = db.conn.lock().await;
-    connection
-        .execute("BEGIN IMMEDIATE", ())
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("repair recovery begin: {error}")))?;
-    let current =
-        match capture_rename_page_title_on_connection(&connection, &projection, page_id).await {
-            Ok(current) => current,
-            Err(_) => {
-                let _ = connection.execute("ROLLBACK", ()).await;
-                return Err(WenlanError::Conflict(
-                    "repair_apply_recovery_required".to_string(),
-                ));
-            }
-        };
-    #[allow(clippy::large_enum_variant)]
-    enum Recovery {
-        Publish(RepairApplyReceipt),
-        Retry,
-        RestoreRetry,
-    }
-    let recovery = if let Some(receipt) = parsed {
-        if rename_page_title_receipt(&current)? == *receipt.after_target_receipt() {
-            Recovery::Publish(receipt)
-        } else if rename_page_database_matches(&current, &rollback)
-            && rename_page_projection_matches_pre(&current, &rollback)
-        {
-            Recovery::Retry
-        } else if rename_page_database_matches(&current, &rollback)
-            && rename_page_projection_matches_post(&connection, manifest, &rollback, &current)
-                .await?
-        {
-            Recovery::RestoreRetry
-        } else {
-            return recovery_required_with_rollback(&connection).await;
-        }
-    } else if rename_page_database_matches(&current, &rollback)
-        && rename_page_projection_matches_pre(&current, &rollback)
-    {
-        Recovery::Retry
-    } else if rename_page_database_matches(&current, &rollback)
-        && rename_page_projection_matches_post(&connection, manifest, &rollback, &current).await?
-    {
-        Recovery::RestoreRetry
-    } else {
-        return recovery_required_with_rollback(&connection).await;
-    };
-    if matches!(recovery, Recovery::RestoreRetry) {
-        let RepairRollbackPayloadV2::RenamePageTitle {
-            projection_target_path,
-            projection_entries,
-            ..
-        } = &rollback
-        else {
-            unreachable!("typed loader returned title rollback")
-        };
-        if projection
-            .restore_rename_page_projection(projection_target_path, projection_entries)
-            .is_err()
-        {
-            let _ = connection.execute("ROLLBACK", ()).await;
-            return Err(WenlanError::Conflict(
-                "repair_apply_recovery_required".to_string(),
-            ));
-        }
-    }
-    connection
-        .execute("COMMIT", ())
-        .await
-        .map_err(|_| WenlanError::Conflict("repair_apply_recovery_required".to_string()))?;
-    match recovery {
-        Recovery::Publish(receipt) => {
-            publish_no_replace(&pending_path, &final_path, "repair_already_applied")?;
-            Ok(Some(receipt))
-        }
-        Recovery::Retry | Recovery::RestoreRetry => {
-            store.clear_pending_apply_receipt(manifest.manifest_id())?;
-            Ok(None)
-        }
-    }
-}
-
-async fn recovery_required_with_rollback<T>(
-    connection: &libsql::Connection,
-) -> Result<T, WenlanError> {
-    let _ = connection.execute("ROLLBACK", ()).await;
-    Err(WenlanError::Conflict(
-        "repair_apply_recovery_required".to_string(),
-    ))
-}
-
-fn rename_page_database_matches(
-    current: &RepairRollbackPayloadV2,
-    expected: &RepairRollbackPayloadV2,
-) -> bool {
-    matches!(
-        (current, expected),
-        (
-            RepairRollbackPayloadV2::RenamePageTitle {
-                page_id,
-                page_columns,
-                before_page_row,
-                ..
-            },
-            RepairRollbackPayloadV2::RenamePageTitle {
-                page_id: expected_page_id,
-                page_columns: expected_columns,
-                before_page_row: expected_row,
-                ..
-            }
-        ) if page_id == expected_page_id
-            && page_columns == expected_columns
-            && before_page_row == expected_row
-    )
-}
-
-fn rename_page_projection_matches_pre(
-    current: &RepairRollbackPayloadV2,
-    expected: &RepairRollbackPayloadV2,
-) -> bool {
-    matches!(
-        (current, expected),
-        (
-            RepairRollbackPayloadV2::RenamePageTitle {
-                projection_target_path,
-                projection_entries,
-                ..
-            },
-            RepairRollbackPayloadV2::RenamePageTitle {
-                projection_target_path: expected_path,
-                projection_entries: expected_entries,
-                ..
-            }
-        ) if projection_target_path == expected_path
-            && projection_entries == expected_entries
-    )
-}
-
-async fn rename_page_projection_matches_post(
-    connection: &libsql::Connection,
-    manifest: &RepairManifest,
-    rollback: &RepairRollbackPayloadV2,
-    current: &RepairRollbackPayloadV2,
-) -> Result<bool, WenlanError> {
-    let (
-        RepairRollbackPayloadV2::RenamePageTitle {
-            page_id,
-            projection_target_path,
-            projection_entries: before_entries,
-            ..
-        },
-        RepairRollbackPayloadV2::RenamePageTitle {
-            projection_target_path: current_target_path,
-            projection_entries: current_entries,
-            ..
-        },
-        RepairMutation::RenamePageTitle { after_title, .. },
-    ) = (rollback, current, manifest.mutation())
-    else {
-        return Ok(false);
-    };
-    if projection_target_path != current_target_path
-        || before_entries.len() != 2
-        || current_entries.len() != 2
-    {
-        return Ok(false);
-    }
-    let mut after_page = crate::post_write::page_on_connection(connection, page_id).await?;
-    after_page.title = after_title.clone();
-    after_page.version = after_page.version.saturating_add(1);
-    let expected_markdown = crate::export::knowledge::render_markdown_for(&after_page);
-    let current_target = current_entries
-        .iter()
-        .find(|entry| entry.relative_path() == projection_target_path)
-        .and_then(|entry| hex::decode(entry.content_hex()).ok());
-    if current_target.as_deref() != Some(expected_markdown.as_bytes()) {
-        return Ok(false);
-    }
-    let before_state = before_entries
-        .iter()
-        .find(|entry| entry.relative_path() == ".wenlan/state.json")
-        .and_then(|entry| hex::decode(entry.content_hex()).ok())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let current_state = current_entries
-        .iter()
-        .find(|entry| entry.relative_path() == ".wenlan/state.json")
-        .and_then(|entry| hex::decode(entry.content_hex()).ok())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let (Some(mut before_state), Some(mut current_state)) = (before_state, current_state) else {
-        return Ok(false);
-    };
-    let before_page = before_state
-        .get_mut("pages")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|pages| pages.remove(page_id));
-    let current_page = current_state
-        .get_mut("pages")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|pages| pages.remove(page_id));
-    let (Some(before_page), Some(current_page)) = (before_page, current_page) else {
-        return Ok(false);
-    };
-    let expected_current_page = serde_json::json!({
-        "file": projection_target_path,
-        "version": after_page.version,
-        "last_written": after_page.last_modified,
-    });
-    Ok(before_state == current_state
-        && before_page.get("file")
-            == Some(&serde_json::Value::String(projection_target_path.clone()))
-        && current_page == expected_current_page)
-}
-
 async fn recover_complete_entity_extraction_apply_receipt(
     db: &MemoryDB,
     store: &RepairArtifactStore,
@@ -2698,12 +2559,17 @@ async fn recover_complete_entity_extraction_apply_receipt(
     let parsed = StoredRepairApplyReceipt::from_slice(&pending)
         .ok()
         .and_then(|receipt| verify_stored_apply_receipt(receipt, manifest).ok());
-    let connection = db.conn.lock().await;
-    let (target_now, _) =
-        repair_target_receipt_on_connection(&connection, manifest.target()).await?;
-    drop(connection);
+    let (target_now, _) = db.read_repair_target_receipt(manifest.target()).await?;
     if let Some(receipt) = parsed {
         if target_now == *receipt.after_target_receipt() {
+            #[cfg(test)]
+            assert_complete_entity_recovery_db_unlocked_before_artifact(
+                db,
+                manifest.manifest_id(),
+                CompleteEntityRecoveryArtifactSite::Publish,
+                &pending_path,
+                &final_path,
+            );
             publish_no_replace(&pending_path, &final_path, "repair_already_applied")?;
             return Ok(Some(receipt));
         }
@@ -2713,9 +2579,67 @@ async fn recover_complete_entity_extraction_apply_receipt(
             "repair_apply_recovery_required".to_string(),
         ));
     }
+    #[cfg(test)]
+    assert_complete_entity_recovery_db_unlocked_before_artifact(
+        db,
+        manifest.manifest_id(),
+        CompleteEntityRecoveryArtifactSite::Remove,
+        &pending_path,
+        &final_path,
+    );
     fs::remove_file(&pending_path)?;
     sync_dir(&manifest_dir)?;
     Ok(None)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompleteEntityRecoveryArtifactSite {
+    Publish,
+    Remove,
+}
+
+#[cfg(test)]
+static COMPLETE_ENTITY_RECOVERY_UNLOCKED_CHECKS: std::sync::Mutex<
+    Vec<(String, CompleteEntityRecoveryArtifactSite)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn assert_complete_entity_recovery_db_unlocked_before_artifact(
+    db: &MemoryDB,
+    manifest_id: &str,
+    site: CompleteEntityRecoveryArtifactSite,
+    pending_path: &Path,
+    final_path: &Path,
+) {
+    assert!(
+        pending_path.is_file(),
+        "complete-entity recovery unlocked check must run before pending artifact mutation"
+    );
+    assert!(
+        !final_path.exists(),
+        "complete-entity recovery unlocked check must run before final artifact publication"
+    );
+    assert!(
+        db.primary_mutex_available(),
+        "complete-entity recovery DB mutex must be released before artifact I/O"
+    );
+    COMPLETE_ENTITY_RECOVERY_UNLOCKED_CHECKS
+        .lock()
+        .expect("complete-entity recovery unlocked-check log")
+        .push((manifest_id.to_string(), site));
+}
+
+#[cfg(test)]
+fn complete_entity_recovery_unlocked_check_observed(
+    manifest_id: &str,
+    site: CompleteEntityRecoveryArtifactSite,
+) -> bool {
+    COMPLETE_ENTITY_RECOVERY_UNLOCKED_CHECKS
+        .lock()
+        .expect("complete-entity recovery unlocked-check log")
+        .iter()
+        .any(|(observed_id, observed_site)| observed_id == manifest_id && *observed_site == site)
 }
 
 async fn recover_apply_receipt(
@@ -2762,7 +2686,8 @@ async fn recover_apply_receipt(
         .await;
     }
     if let Some(receipt) = parsed {
-        let (target_now, _) = target_receipt_current(db, manifest, rollback, page_root).await?;
+        let (target_now, _) =
+            read_current_repair_target_receipt(db, manifest, rollback, page_root).await?;
         if target_now == *receipt.after_target_receipt() {
             publish_no_replace(&pending_path, &final_path, "repair_already_applied")?;
             return Ok(Some(receipt));
@@ -2773,7 +2698,8 @@ async fn recover_apply_receipt(
             ));
         }
     } else {
-        let (target_now, _) = target_receipt_current(db, manifest, rollback, page_root).await?;
+        let (target_now, _) =
+            read_current_repair_target_receipt(db, manifest, rollback, page_root).await?;
         if target_now != *manifest.expected_state().canonical_receipt() {
             return Err(WenlanError::Conflict(
                 "repair_apply_recovery_required".to_string(),
@@ -2785,142 +2711,6 @@ async fn recover_apply_receipt(
     Ok(None)
 }
 
-async fn recover_stale_page_projection_apply_receipt(
-    db: &MemoryDB,
-    store: &RepairArtifactStore,
-    manifest: &RepairManifest,
-    rollback: &StoredRollbackArtifact,
-    page_root: Option<&Path>,
-    pending_receipt: Option<RepairApplyReceipt>,
-) -> Result<Option<RepairApplyReceipt>, WenlanError> {
-    let page_root = page_root.ok_or_else(|| {
-        WenlanError::Validation("page projection repair root unavailable".to_string())
-    })?;
-    let page_id = match manifest.target() {
-        RepairTarget::PageProjection { page_id, .. } => page_id,
-        _ => {
-            return Err(WenlanError::Validation(
-                "stale page projection repair target/writer mismatch".to_string(),
-            ))
-        }
-    };
-    let connection = db.conn.lock().await;
-    let mut owner = connection
-        .query(
-            "SELECT 1 FROM pages WHERE id=?1 LIMIT 1",
-            libsql::params![page_id.as_str()],
-        )
-        .await
-        .map_err(database_error)?;
-    if owner.next().await.map_err(database_error)?.is_some() {
-        return Err(WenlanError::Conflict(
-            "repair_apply_recovery_required".to_string(),
-        ));
-    }
-    drop(owner);
-    let apply_journal = store.load_stale_page_projection_apply_journal(manifest)?;
-    if apply_journal.is_none() {
-        let (source_path, quarantine_path) = stale_page_projection_paths(rollback)?;
-        if capture_stale_page_projection_current(page_root, page_id, &source_path, &quarantine_path)
-            .is_ok_and(|current| current == *rollback)
-        {
-            store.clear_pending_apply_receipt(manifest.manifest_id())?;
-            return Ok(None);
-        }
-    }
-    let apply_rollback = apply_journal.unwrap_or_else(|| rollback.clone());
-    let restore_post = pending_receipt.is_none();
-    let recovery = crate::export::knowledge::KnowledgeProjectionWrite::with_repair_lock(
-        page_root.to_path_buf(),
-        db,
-        |write| {
-            write.recover_stale_page_projection(
-                &apply_rollback,
-                manifest.manifest_id(),
-                restore_post,
-            )
-        },
-    )
-    .unwrap_or(crate::export::knowledge::StalePageProjectionRecoveryState::Unknown);
-    use crate::export::knowledge::StalePageProjectionRecoveryState as Recovery;
-    match (pending_receipt, recovery) {
-        (Some(receipt), Recovery::Post)
-            if stale_page_projection_post_target_receipt(&apply_rollback)?
-                == *receipt.after_target_receipt() =>
-        {
-            let manifest_dir = store.manifest_dir(manifest.manifest_id())?;
-            publish_no_replace(
-                &manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
-                &manifest_dir.join(APPLY_RECEIPT_FILE),
-                "repair_already_applied",
-            )?;
-            store.clear_stale_page_projection_apply_journal(manifest.manifest_id())?;
-            Ok(Some(receipt))
-        }
-        (Some(_), Recovery::Original) | (None, Recovery::Original) => {
-            store.clear_pending_apply_receipt(manifest.manifest_id())?;
-            store.clear_stale_page_projection_apply_journal(manifest.manifest_id())?;
-            Ok(None)
-        }
-        _ => Err(WenlanError::Conflict(
-            "repair_apply_recovery_required".to_string(),
-        )),
-    }
-}
-
-async fn target_receipt_current(
-    db: &MemoryDB,
-    manifest: &RepairManifest,
-    rollback: &StoredRollbackArtifact,
-    page_root: Option<&Path>,
-) -> Result<(RepairDigest, u64), WenlanError> {
-    let connection = db.conn.lock().await;
-    match manifest.target() {
-        RepairTarget::PageProjection { page_id, .. }
-            if manifest.writer() == RepairWriter::QuarantineStalePageProjection =>
-        {
-            let page_root = page_root.ok_or_else(|| {
-                WenlanError::Validation("page projection repair root unavailable".to_string())
-            })?;
-            let mut owner = connection
-                .query(
-                    "SELECT 1 FROM pages WHERE id=?1 LIMIT 1",
-                    libsql::params![page_id.as_str()],
-                )
-                .await
-                .map_err(database_error)?;
-            if owner.next().await.map_err(database_error)?.is_some() {
-                return Err(WenlanError::Conflict("repair_target_stale".to_string()));
-            }
-            drop(owner);
-            let (source_path, quarantine_path) = stale_page_projection_paths(rollback)?;
-            let current = capture_stale_page_projection_current(
-                page_root,
-                page_id,
-                &source_path,
-                &quarantine_path,
-            )?;
-            Ok((target_receipt(&current)?, 0))
-        }
-        RepairTarget::PageProjection { page_id, .. } => {
-            let page_root = page_root.ok_or_else(|| {
-                WenlanError::Validation("page projection repair root unavailable".to_string())
-            })?;
-            let paths = projection_rollback_paths(rollback)?;
-            let current = capture_page_projection_on_connection(
-                &connection,
-                page_root,
-                page_id,
-                &paths,
-                &rollback.table,
-            )
-            .await?;
-            Ok((target_receipt(&current)?, 1))
-        }
-        _ => repair_target_receipt_on_connection(&connection, manifest.target()).await,
-    }
-}
-
 pub async fn record_repair_verification(
     db: &MemoryDB,
     store: &RepairArtifactStore,
@@ -2928,20 +2718,16 @@ pub async fn record_repair_verification(
     page_root: Option<&Path>,
     now_epoch: i64,
 ) -> Result<RepairVerificationReceipt, WenlanError> {
-    record_repair_verification_inner(db, store, request, page_root, now_epoch, || Ok(())).await
+    record_repair_verification_inner(db, store, request, page_root, now_epoch).await
 }
 
-async fn record_repair_verification_inner<F>(
+async fn record_repair_verification_inner(
     db: &MemoryDB,
     store: &RepairArtifactStore,
     request: VerifyRepairRequest,
     page_root: Option<&Path>,
     now_epoch: i64,
-    after_projection_session: F,
-) -> Result<RepairVerificationReceipt, WenlanError>
-where
-    F: FnOnce() -> Result<(), WenlanError>,
-{
+) -> Result<RepairVerificationReceipt, WenlanError> {
     ensure_repair_artifacts_supported()?;
     if now_epoch <= 0 {
         return Err(WenlanError::Validation(
@@ -3016,241 +2802,34 @@ where
     } else {
         None
     };
-    after_projection_session()?;
-    let connection = db.conn.lock().await;
-    connection
-        .execute("BEGIN IMMEDIATE", ())
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("repair verify begin: {error}")))?;
-    let result = async {
-        validate_current_db_receipts(db, request.general_report(), request.deep_report()).await?;
-        // The durable content-addressed apply receipt records an apply-time
-        // effect guard and rejects unequal non_target_before/non_target_after
-        // values. Verification binds a fresh report to the current DB snapshot
-        // and rechecks the target receipt below. Unrelated writes after that
-        // completed apply transaction must not strand an otherwise valid
-        // receipt.
-        validate_tag_record_set_on_connection(
-            &connection,
-            &manifest,
-            &prior_verified_tag_targets,
-            true,
-        )
-        .await?;
-        validate_deterministic_target_resolved(db, &manifest, page_root).await?;
-        let (target_now, _) = match manifest.target() {
-            RepairTarget::PageProjection { page_id, .. }
-                if manifest.writer() == RepairWriter::RenamePageTitle =>
-            {
-                let rollback = rename_rollback.as_ref().ok_or_else(|| {
-                    WenlanError::Validation("repair_rollback_writer_mismatch".to_string())
-                })?;
-                let projection = rename_projection_session
-                    .as_ref()
-                    .ok_or_else(|| {
-                        WenlanError::Validation(
-                            "page projection repair root unavailable".to_string(),
-                        )
-                    })?
-                    .locked();
-                let current =
-                    capture_rename_page_title_on_connection(&connection, &projection, page_id)
-                        .await?;
-                let scan = projection.scan_page_root_controlled(
-                    true,
-                    &PageScanControl::with_timeout(std::time::Duration::from_secs(30)),
-                )?;
-                let excluded = rename_page_title_excluded_paths(rollback)?;
-                let non_target_now = rename_page_title_non_target_receipt(
-                    &effect_guard_receipt(0),
-                    scan.non_target_digest(&excluded),
-                    &current,
-                )?;
-                if non_target_now != *apply_receipt.non_target_after() {
-                    return Err(WenlanError::Conflict(
-                        "repair_non_target_state_changed".to_string(),
-                    ));
-                }
-                (rename_page_title_receipt(&current)?, 1)
-            }
-            RepairTarget::PageProjection { page_id, .. }
-                if manifest.writer() == RepairWriter::QuarantineStalePageProjection =>
-            {
-                let rollback = rollback.as_ref().ok_or_else(|| {
-                    WenlanError::Validation("repair_rollback_writer_mismatch".to_string())
-                })?;
-                let page_root = page_root.ok_or_else(|| {
-                    WenlanError::Validation("page projection repair root unavailable".to_string())
-                })?;
-                let (source_path, quarantine_path) = stale_page_projection_paths(rollback)?;
-                let target_now =
-                    crate::export::knowledge::KnowledgeProjectionWrite::with_projection_lock(
-                        page_root,
-                        |projection| {
-                            let excluded = BTreeSet::from([
-                                ".wenlan".to_string(),
-                                ".wenlan/state.json".to_string(),
-                                ".wenlan/orphaned".to_string(),
-                                source_path.clone(),
-                                quarantine_path.clone(),
-                            ]);
-                            let scan = projection.scan_page_root_controlled(
-                                true,
-                                &PageScanControl::with_timeout(std::time::Duration::from_secs(30)),
-                            )?;
-                            let current = projection.capture_stale_page_projection_current(
-                                page_id,
-                                &source_path,
-                                &quarantine_path,
-                            )?;
-                            let non_target_now = page_projection_non_target_receipt(
-                                scan.non_target_digest(&excluded),
-                                &current,
-                            )?;
-                            if non_target_now != *apply_receipt.non_target_after() {
-                                return Err(WenlanError::Conflict(
-                                    "repair_non_target_state_changed".to_string(),
-                                ));
-                            }
-                            target_receipt(&current)
-                        },
-                    )?;
-                (target_now, 0)
-            }
-            RepairTarget::PageProjection { page_id, .. } => {
-                let rollback = rollback.as_ref().ok_or_else(|| {
-                    WenlanError::Validation("repair_rollback_writer_mismatch".to_string())
-                })?;
-                let page_root = page_root.ok_or_else(|| {
-                    WenlanError::Validation("page projection repair root unavailable".to_string())
-                })?;
-                let paths = projection_rollback_paths(rollback)?;
-                let page_row = projection_page_row_on_connection(&connection, page_id).await?;
-                let target_now =
-                    crate::export::knowledge::KnowledgeProjectionWrite::with_projection_lock(
-                        page_root,
-                        |_| {
-                            let scan = crate::lint::pages::fs::scan_page_root_controlled(
-                                page_root,
-                                true,
-                                &crate::lint::pages::fs::PageScanControl::with_timeout(
-                                    std::time::Duration::from_secs(30),
-                                ),
-                            )
-                            .map_err(|error| {
-                                WenlanError::Validation(format!("repair projection scan: {error}"))
-                            })?;
-                            let current = capture_page_projection_from_row(
-                                page_root,
-                                page_id,
-                                page_row,
-                                &paths,
-                                &rollback.table,
-                            )?;
-                            let non_target_now = page_projection_non_target_receipt(
-                                scan.non_target_digest(&paths),
-                                &current,
-                            )?;
-                            if non_target_now != *apply_receipt.non_target_after() {
-                                return Err(WenlanError::Conflict(
-                                    "repair_non_target_state_changed".to_string(),
-                                ));
-                            }
-                            target_receipt(&current)
-                        },
-                    )?;
-                (target_now, 1)
-            }
-            _ => repair_target_receipt_on_connection(&connection, manifest.target()).await?,
-        };
-        if target_now != *apply_receipt.after_target_receipt() {
-            return Err(WenlanError::Conflict(
-                "repair_verification_state_changed".to_string(),
-            ));
-        }
-        let draft = match request.deep_report() {
-            Some(deep) => RepairVerificationReceiptDraft::try_new(
-                manifest.manifest_id().to_string(),
-                manifest.manifest_digest().clone(),
-                apply_receipt.receipt_digest().clone(),
-                now_epoch,
-                request.general_report().snapshots().clone(),
-                deep.snapshots().clone(),
-            ),
-            None => RepairVerificationReceiptDraft::try_new_general_only(
-                manifest.manifest_id().to_string(),
-                manifest.manifest_digest().clone(),
-                apply_receipt.receipt_digest().clone(),
-                now_epoch,
-                request.general_report().snapshots().clone(),
-            ),
-        }
-        .map_err(|error| WenlanError::Validation(error.to_string()))?;
-        let receipt_digest = repair_digest(&draft.canonical_bytes()?);
-        let receipt = RepairVerificationReceipt::from_draft(draft, receipt_digest);
-        if let Some(session) = rename_projection_session.as_ref() {
-            validate_current_page_receipts_on_repair_projection(
-                request.general_report(),
-                request.deep_report(),
-                &session.locked(),
-            )?;
-            store.persist_verification_receipt(&receipt)?;
-            Ok(receipt)
-        } else if let Some(page_root) = page_root {
-            crate::export::knowledge::KnowledgeProjectionWrite::with_projection_lock(
-                page_root,
-                |_| {
-                    validate_current_page_receipts_locked(
-                        request.general_report(),
-                        request.deep_report(),
-                        Some(page_root),
-                    )?;
-                    store.persist_verification_receipt(&receipt)?;
-                    Ok(receipt)
-                },
-            )
-        } else {
-            store.persist_verification_receipt(&receipt)?;
-            Ok(receipt)
-        }
+    #[cfg(test)]
+    if rename_projection_session.is_some() {
+        run_repair_verification_test_checkpoint(
+            RepairVerificationTestCheckpointKind::AfterRenameSessionAcquired,
+        );
     }
-    .await;
-    let receipt = match result {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            let _ = connection.execute("ROLLBACK", ()).await;
-            return Err(error);
-        }
-    };
-    connection
-        .execute("COMMIT", ())
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("repair verify commit: {error}")))?;
+    let receipt = record_repair_verification_atomic(
+        db,
+        RepairVerificationAtomicInput {
+            store,
+            manifest: &manifest,
+            apply_receipt: &apply_receipt,
+            request: &request,
+            prior_verified_tag_targets: &prior_verified_tag_targets,
+            rollback: rollback.as_ref(),
+            rename_rollback: rename_rollback.as_ref(),
+            page_root,
+            verified_at: now_epoch,
+            rename_projection_session: rename_projection_session.as_ref(),
+        },
+    )
+    .await?;
+    #[cfg(test)]
+    run_repair_verification_test_checkpoint(
+        RepairVerificationTestCheckpointKind::AfterCommitBeforePendingClear,
+    );
     store.clear_pending_apply_receipt(manifest.manifest_id())?;
     Ok(receipt)
-}
-
-#[cfg(test)]
-async fn record_repair_verification_with_projection_session_hook<F>(
-    db: &MemoryDB,
-    store: &RepairArtifactStore,
-    request: VerifyRepairRequest,
-    page_root: Option<&Path>,
-    now_epoch: i64,
-    after_projection_session: F,
-) -> Result<RepairVerificationReceipt, WenlanError>
-where
-    F: FnOnce() -> Result<(), WenlanError>,
-{
-    record_repair_verification_inner(
-        db,
-        store,
-        request,
-        page_root,
-        now_epoch,
-        after_projection_session,
-    )
-    .await
 }
 
 fn validate_verification_reports(
@@ -3457,7 +3036,7 @@ pub(crate) fn deterministic_target_assertion_supported(manifest: &RepairManifest
     )
 }
 
-async fn validate_deterministic_target_resolved(
+pub(crate) async fn validate_deterministic_target_resolved(
     db: &MemoryDB,
     manifest: &RepairManifest,
     page_root: Option<&Path>,
@@ -3494,7 +3073,7 @@ fn stable_report_snapshot(report: &LintReport) -> bool {
             == Some(report.snapshots().pages().before_scan_digest())
 }
 
-fn validate_current_page_receipts_locked(
+pub(crate) fn validate_current_page_receipts_locked(
     general: &LintReport,
     deep: Option<&LintReport>,
     page_root: Option<&Path>,
@@ -3506,7 +3085,7 @@ fn validate_current_page_receipts_locked(
     Ok(())
 }
 
-fn validate_current_page_receipts_on_repair_projection(
+pub(crate) fn validate_current_page_receipts_on_repair_projection(
     general: &LintReport,
     deep: Option<&LintReport>,
     projection: &crate::export::knowledge::LockedRepairProjection<'_>,
@@ -3617,7 +3196,7 @@ pub(crate) async fn validate_current_page_report_receipt(
     Ok(())
 }
 
-async fn validate_current_db_receipts(
+pub(crate) async fn validate_current_db_receipts(
     db: &MemoryDB,
     general: &LintReport,
     deep: Option<&LintReport>,
@@ -6473,7 +6052,7 @@ fn stale_page_projection_target_receipt(
     Ok(repair_digest(&bytes))
 }
 
-fn stale_page_projection_post_target_receipt(
+pub(crate) fn stale_page_projection_post_target_receipt(
     rollback: &StoredRollbackArtifact,
 ) -> Result<RepairDigest, WenlanError> {
     let (source_path, quarantine_path) = stale_page_projection_paths(rollback)?;
@@ -7008,7 +6587,7 @@ fn page_snapshot_error(error: crate::lint::pages::fs::PageFsError) -> WenlanErro
     WenlanError::Conflict(format!("repair_verification_reports_stale: {error}"))
 }
 
-fn database_error(error: libsql::Error) -> WenlanError {
+pub(crate) fn database_error(error: libsql::Error) -> WenlanError {
     WenlanError::VectorDb(format!("repair database: {error}"))
 }
 
@@ -7020,11 +6599,19 @@ mod entity_extraction_tests;
 mod tests {
     use super::*;
     use crate::{
-        db::{tests::test_db, MemoryDB},
+        db::{
+            repair_verification::{
+                assert_repair_verification_transaction_reusable,
+                rollback_repair_verification_test_transaction,
+                with_repair_verification_test_control, RepairVerificationTestCommitFailure,
+                RepairVerificationTestControl,
+            },
+            tests::test_db,
+            MemoryDB,
+        },
         lint::{
             context::{CancellationToken, LintClock},
             runner::LintRunner,
-            snapshot::LintReadSnapshot,
         },
     };
     use wenlan_types::{
@@ -7118,8 +6705,7 @@ mod tests {
 
     async fn fixture() -> (MemoryDB, tempfile::TempDir) {
         let (db, dir) = test_db().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -7347,7 +6933,7 @@ mod tests {
     }
 
     async fn fingerprint(db: &MemoryDB) -> [u8; 32] {
-        let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+        let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
         let fingerprint = snapshot.analysis_digest().unwrap().as_bytes();
         snapshot.finish().await.unwrap();
         fingerprint
@@ -7514,8 +7100,7 @@ mod tests {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
         let request = request(&db).await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='changed' WHERE source_id='mem_other'",
@@ -7647,8 +7232,8 @@ mod tests {
     }
 
     async fn target_memory_types(db: &MemoryDB) -> Vec<Option<String>> {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
+        let session = db.test_primary_session().await;
+        let mut rows = session
             .query(
                 "SELECT memory_type FROM memories
                  WHERE source='memory' AND source_id='mem_target'
@@ -7678,8 +7263,8 @@ mod tests {
     /// The escaped write the parity-laundering regressions plant on a second,
     /// non-target row. Read directly so rollback is asserted, not inferred.
     async fn escaped_confidence(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
+        let session = db.test_primary_session().await;
+        let mut rows = session
             .query(
                 "SELECT COALESCE(SUM(COALESCE(confidence,0)),0) FROM memories
                  WHERE source_id='mem_other'",
@@ -7844,8 +7429,7 @@ mod tests {
             .is_err());
         assert_eq!(before, fingerprint(&db).await);
 
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='stale' WHERE id='row-target'",
@@ -7879,14 +7463,14 @@ mod tests {
             target_memory_types(&db).await,
             vec![Some("decision".to_string()), Some("decision".to_string())]
         );
-        let conn = db.conn.lock().await;
-        let mut rows = conn
+        let session = db.test_primary_session().await;
+        let mut rows = session
             .query("SELECT memory_type FROM memories WHERE id='row-other'", ())
             .await
             .unwrap();
         let other: Option<String> = rows.next().await.unwrap().unwrap().get(0).unwrap();
         drop(rows);
-        drop(conn);
+        drop(session);
         assert_eq!(other.as_deref(), Some("fact"));
         assert_eq!(receipt.manifest_digest(), manifest.manifest_digest());
         assert!(store
@@ -7919,7 +7503,11 @@ mod tests {
         let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
         assert!(manifest_dir.join(APPLY_RECEIPT_PENDING_FILE).is_file());
         assert!(!manifest_dir.join(APPLY_RECEIPT_FILE).exists());
-        db.conn.lock().await.execute("ROLLBACK", ()).await.unwrap();
+        db.test_primary_session()
+            .await
+            .execute("ROLLBACK", ())
+            .await
+            .unwrap();
         assert_eq!(target_memory_types(&db).await, vec![None, None]);
     }
 
@@ -7936,8 +7524,7 @@ mod tests {
             manifest_dir.join(APPLY_RECEIPT_PENDING_FILE),
         )
         .unwrap();
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='background' WHERE id='row-other'",
@@ -8002,8 +7589,7 @@ mod tests {
     #[tokio::test]
     async fn effect_escape_rolls_back_target_and_trigger_side_effect() {
         let (db, _db_dir) = fixture().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "CREATE TABLE repair_escape (value TEXT NOT NULL);
@@ -8032,8 +7618,7 @@ mod tests {
         // The fingerprint covers known tables only, so assert the escape's own
         // table directly rather than inferring rollback from the checks above.
         let escaped: i64 = db
-            .conn
-            .lock()
+            .test_primary_session()
             .await
             .query("SELECT COUNT(*) FROM repair_escape", ())
             .await
@@ -8056,8 +7641,7 @@ mod tests {
     #[tokio::test]
     async fn effect_escape_cannot_hide_behind_an_inflated_parity_generation() {
         let (db, _db_dir) = fixture().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "CREATE TRIGGER repair_escape_inflate AFTER UPDATE OF memory_type ON memories
@@ -8104,8 +7688,7 @@ mod tests {
     #[tokio::test]
     async fn effect_escape_cannot_hide_behind_a_replaced_parity_row() {
         let (db, _db_dir) = fixture().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute_batch(
                 "CREATE TRIGGER repair_escape_replace AFTER UPDATE OF memory_type ON memories
@@ -8171,6 +7754,195 @@ mod tests {
             .unwrap()
             .join("verification-receipt.json")
             .is_file());
+    }
+
+    #[tokio::test]
+    async fn verification_control_observes_nonprojection_commit_and_cleanup_boundaries() {
+        use fs2::FileExt as _;
+        use std::sync::{Arc, Mutex};
+
+        let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
+        let db = Arc::new(db);
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
+            .await
+            .unwrap();
+        let (general, deep) = verification_reports(&db).await;
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        let operation_lock = manifest_dir.join(OPERATION_LOCK_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        let db_after_begin = Arc::clone(&db);
+        let begin_observed = Arc::clone(&observed);
+        let db_before_persist = Arc::clone(&db);
+        let before_observed = Arc::clone(&observed);
+        let db_after_persist = Arc::clone(&db);
+        let after_observed = Arc::clone(&observed);
+        let pending_after_persist = pending.clone();
+        let db_after_commit = Arc::clone(&db);
+        let postcommit_observed = Arc::clone(&observed);
+        let receipt_after_commit = final_receipt.clone();
+        let pending_after_commit = pending.clone();
+
+        let receipt = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    assert!(!db_after_begin.primary_mutex_available());
+                    begin_observed.lock().unwrap().push("after_begin");
+                })),
+                before_receipt_persist: Some(Box::new(move || {
+                    assert!(!db_before_persist.primary_mutex_available());
+                    assert!(!final_receipt.exists());
+                    before_observed.lock().unwrap().push("before_persist");
+                })),
+                after_receipt_persist: Some(Box::new(move || {
+                    assert!(!db_after_persist.primary_mutex_available());
+                    assert!(pending_after_persist.exists());
+                    after_observed.lock().unwrap().push("after_persist");
+                })),
+                after_commit_before_pending_clear: Some(Box::new(move || {
+                    assert!(db_after_commit.primary_mutex_available());
+                    assert!(receipt_after_commit.is_file());
+                    assert!(pending_after_commit.is_file());
+                    let operation = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&operation_lock)
+                        .unwrap();
+                    assert_eq!(
+                        operation.try_lock_exclusive().unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    postcommit_observed.lock().unwrap().push("after_commit");
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receipt.manifest_id(), manifest.manifest_id());
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [
+                "after_begin",
+                "before_persist",
+                "after_persist",
+                "after_commit",
+            ]
+        );
+        assert!(!pending.is_file());
+    }
+
+    #[tokio::test]
+    async fn verification_real_receipt_conflict_rolls_back_and_retains_pending() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
+        let db = Arc::new(db);
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
+            .await
+            .unwrap();
+        let (general, deep) = verification_reports(&db).await;
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let after_begin = Arc::new(AtomicBool::new(false));
+        let before_persist = Arc::new(AtomicBool::new(false));
+        let begin_observed = Arc::clone(&after_begin);
+        let persist_observed = Arc::clone(&before_persist);
+        let conflict_path = final_receipt.clone();
+
+        let result = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    begin_observed.store(true, Ordering::SeqCst);
+                })),
+                before_receipt_persist: Some(Box::new(move || {
+                    std::fs::write(&conflict_path, b"real conflicting receipt object").unwrap();
+                    persist_observed.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WenlanError::Conflict(message)) if message == "repair_already_verified"
+        ));
+        assert!(after_begin.load(Ordering::SeqCst));
+        assert!(before_persist.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(&final_receipt).unwrap(),
+            b"real conflicting receipt object"
+        );
+        assert!(pending.is_file());
+        assert_repair_verification_transaction_reusable(&db).await;
+    }
+
+    #[tokio::test]
+    async fn verification_commit_failure_keeps_terminal_receipt_for_retry_cleanup() {
+        let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
+        let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+        let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
+            .await
+            .unwrap();
+        let (general, deep) = verification_reports(&db).await;
+        let request = exact_verify(&manifest, &apply_receipt, general, deep);
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+
+        let error = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                before_receipt_persist: Some(Box::new(|| {})),
+                after_receipt_persist: Some(Box::new(|| {})),
+                commit_failure_after_persist: Some(
+                    RepairVerificationTestCommitFailure::AfterPersistBeforeCommit,
+                ),
+                ..Default::default()
+            },
+            record_repair_verification(&db, &store, request.clone(), None, 1_721_000_002),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Vector DB error: repair verify commit: injected test failure"
+        );
+        assert!(final_receipt.is_file());
+        assert!(pending.is_file());
+        let retried = record_repair_verification(&db, &store, request, None, 1_721_000_003)
+            .await
+            .unwrap();
+        assert_eq!(retried.manifest_id(), manifest.manifest_id());
+        assert!(!pending.exists());
+        rollback_repair_verification_test_transaction(&db).await;
     }
 
     #[tokio::test]
@@ -8497,8 +8269,7 @@ mod tests {
         let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
             .await
             .unwrap();
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='changed' WHERE id='row-other'",
@@ -8557,13 +8328,17 @@ mod tests {
 
     #[tokio::test]
     async fn verification_rejects_target_owner_change_after_apply_even_with_fresh_reports() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
         let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
             .await
             .unwrap();
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE memories SET title='changed' WHERE id='row-target'",
@@ -8573,12 +8348,28 @@ mod tests {
             .unwrap();
         let (general, deep) = verification_reports(&db).await;
 
-        let result = record_repair_verification(
-            &db,
-            &store,
-            exact_verify(&manifest, &apply_receipt, general, deep),
-            None,
-            1_721_000_002,
+        let after_begin = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&after_begin);
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let verification_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let receipt_at_begin = verification_receipt.clone();
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let result = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    assert!(!receipt_at_begin.exists());
+                    observed.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
         )
         .await;
 
@@ -8586,29 +8377,53 @@ mod tests {
             result,
             Err(WenlanError::Conflict(message)) if message == "repair_verification_state_changed"
         ));
+        assert!(after_begin.load(Ordering::SeqCst));
+        assert!(!verification_receipt.exists());
+        assert!(pending.is_file());
+        assert_repair_verification_transaction_reusable(&db).await;
     }
 
     #[tokio::test]
     async fn verification_rejects_reports_that_are_no_longer_current() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
         let apply_receipt = apply_repair(&db, &store, exact_apply(&manifest), 1_721_000_001)
             .await
             .unwrap();
         let (general, deep) = verification_reports(&db).await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute("UPDATE memories SET title='later' WHERE id='row-other'", ())
             .await
             .unwrap();
 
-        let result = record_repair_verification(
-            &db,
-            &store,
-            exact_verify(&manifest, &apply_receipt, general, deep),
-            None,
-            1_721_000_002,
+        let after_begin = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&after_begin);
+        let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+        let verification_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+        let receipt_at_begin = verification_receipt.clone();
+        let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+        std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+        let result = with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    assert!(!receipt_at_begin.exists());
+                    observed.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            record_repair_verification(
+                &db,
+                &store,
+                exact_verify(&manifest, &apply_receipt, general, deep),
+                None,
+                1_721_000_002,
+            ),
         )
         .await;
 
@@ -8616,6 +8431,10 @@ mod tests {
             result,
             Err(WenlanError::Conflict(message)) if message == "repair_verification_reports_stale"
         ));
+        assert!(after_begin.load(Ordering::SeqCst));
+        assert!(!verification_receipt.exists());
+        assert!(pending.is_file());
+        assert_repair_verification_transaction_reusable(&db).await;
     }
 
     #[tokio::test]

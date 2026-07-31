@@ -95,7 +95,7 @@ the response types instead of reasoning from the route name:
 
 - `/ws/updates` is **not** page-bearing. `WsServerMessage` carries only
   index progress (`files_indexed`/`files_total`), ingest completion
-  (`document_id`, `chunks`), and an error string (`websocket.rs:34`). The draft
+  (`document_id`, `chunks`), and an error string (`websocket.rs:41`). The draft
   called it "a reader nobody requested" and made it the headline example.
 - `/api/knowledge/path` returns a **filesystem path string**
   (`knowledge_routes.rs:11`), not a graph traversal. Its exposure risk is the
@@ -231,7 +231,7 @@ names a page, so it is explicit. Live app code disproves it:
 |---|---|---|
 | `GET /api/pages` | explicit (browse) | `SpaceList.tsx:76` polls it every 10 s for sidebar counts |
 | `GET /api/pages/recent-changes` | explicit (browse) | `HomePage.tsx:75` loads it every 30 s |
-| `GET /api/pages/orphan-links` | explicit | feeds candidate generation (`memory_routes.rs:3464`) |
+| `GET /api/pages/orphan-links` | explicit | feeds candidate generation (`memory_routes.rs:2792`) |
 
 A route is not one reader. The same path serves a human who clicked and a timer
 that polls, and a client being *globally* M5-aware proves nothing about whether

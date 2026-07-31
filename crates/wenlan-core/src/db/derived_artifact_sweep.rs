@@ -1,5 +1,5 @@
-use super::summary_eligible_predicate;
-use crate::db::MemoryDB;
+use super::MemoryDB;
+use crate::derived_artifact_state::summary_eligible_predicate;
 use crate::error::WenlanError;
 
 mod population;

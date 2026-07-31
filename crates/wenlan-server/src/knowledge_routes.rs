@@ -2,11 +2,22 @@
 //! Knowledge directory inspection endpoints.
 
 use crate::error::ServerError;
+use crate::route_registry::{get, TrackedRouter};
 use crate::state::SharedState;
 use axum::extract::{Query, State};
 use axum::response::Json;
 use serde::Deserialize;
 use wenlan_types::responses::{KnowledgeCountResponse, KnowledgePathResponse};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/knowledge/path", get(handle_get_knowledge_path))
+        .route("/api/knowledge/count", get(handle_get_knowledge_count))
+        .route(
+            "/api/knowledge/recent-relations",
+            get(handle_list_recent_relations),
+        )
+}
 
 /// GET /api/knowledge/path
 pub async fn handle_get_knowledge_path() -> Result<Json<KnowledgePathResponse>, ServerError> {

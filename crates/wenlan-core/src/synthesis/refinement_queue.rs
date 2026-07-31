@@ -819,7 +819,7 @@ mod tests {
     }
 
     async fn insert_page_source_memory(db: &MemoryDB, source_id: &str, content: &str, space: &str) {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (
                 id, content, source, source_id, title, chunk_index, last_modified,
@@ -1061,7 +1061,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE refinement_queue SET status = 'awaiting_review' WHERE id = ?1",
                 libsql::params![id],
@@ -1082,7 +1082,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.action_applied, "entity_merge");
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM entities WHERE id = ?1",
@@ -1130,7 +1130,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE refinement_queue SET status = 'awaiting_review' WHERE id = ?1",
                 libsql::params!["ref_rc_1"],
@@ -1144,7 +1144,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.action_applied, "relation_conflict");
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM relations WHERE id = ?1",
@@ -1172,7 +1172,7 @@ mod tests {
         let new_mem = format!("mem_{}", uuid::Uuid::new_v4().simple());
         let existing_mem = format!("mem_{}", uuid::Uuid::new_v4().simple());
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             for sid in &[new_mem.clone(), existing_mem.clone()] {
                 conn.execute(
                     "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
@@ -1195,7 +1195,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE refinement_queue SET status = 'awaiting_review' WHERE id = ?1",
                 libsql::params!["ref_dc_1"],
@@ -1209,7 +1209,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.action_applied, "detect_contradiction");
 
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT pending_revision FROM memories WHERE source_id = ?1",
@@ -1292,7 +1292,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE refinement_queue SET status = 'awaiting_review' WHERE id = ?1",
                 libsql::params!["ref_page_merge_1"],
@@ -1333,7 +1333,7 @@ mod tests {
             "archive must advance the absorbed Page"
         );
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query("SELECT citations FROM pages WHERE id = 'page_survivor'", ())
                 .await
@@ -1413,7 +1413,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE refinement_queue SET status = 'awaiting_review' WHERE id = ?1",
                 libsql::params!["ref_cross_space_discovery_1"],
@@ -1635,7 +1635,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE refinement_queue SET status = 'resolved' WHERE id = ?1",
                 libsql::params!["ref_term_1"],
@@ -1788,8 +1788,7 @@ mod tests {
             .await
             .unwrap();
         }
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "UPDATE refinement_queue
@@ -1839,7 +1838,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE refinement_queue SET status = 'awaiting_review' WHERE id = ?1",
                 libsql::params!["ref_aw_em"],
@@ -1968,7 +1967,7 @@ mod tests {
         db.upsert_documents(vec![doc]).await.unwrap();
         // confirmed=1 is needed for build_resolution_pools; upsert may store the
         // caller-supplied confirmed but force it deterministically here.
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "UPDATE memories SET confirmed = 1, pinned = ?1, event_date = ?2 \
              WHERE source_id = ?3 AND source = 'memory'",
@@ -1979,7 +1978,7 @@ mod tests {
     }
 
     async fn confirmed_of(db: &MemoryDB, source_id: &str) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT confirmed FROM memories WHERE source_id = ?1 AND source = 'memory' LIMIT 1",
@@ -1992,7 +1991,7 @@ mod tests {
     }
 
     async fn supersedes_of(db: &MemoryDB, source_id: &str) -> Option<String> {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT supersedes FROM memories WHERE source_id = ?1 AND source = 'memory' LIMIT 1",
@@ -2005,7 +2004,7 @@ mod tests {
     }
 
     async fn row_count(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM memories WHERE source = 'memory'",
@@ -3083,7 +3082,7 @@ mod tests {
         .unwrap();
 
         // Verify preconditions: folder document chunks exist and are ALL unconfirmed.
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND source_id = ?1",

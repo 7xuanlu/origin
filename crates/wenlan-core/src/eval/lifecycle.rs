@@ -230,34 +230,20 @@ impl SupersedesTracker {
         merged_before: &HashSet<String>,
     ) -> Result<(), WenlanError> {
         // Find all merged_* memories that exist now but didn't before
-        let conn = db.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT DISTINCT source_id, supersedes FROM memories \
-             WHERE source_id LIKE 'merged_%' AND source = 'memory'",
-                libsql::params![],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("supersedes scan: {e}")))?;
-
-        let mut new_merged: Vec<(String, Option<String>)> = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let source_id: String = row.get(0).unwrap_or_default();
-            if !merged_before.contains(&source_id) {
-                let supersedes: Option<String> = row.get(1).unwrap_or(None);
-                new_merged.push((source_id, supersedes));
-            }
-        }
-        drop(rows);
-        drop(conn);
+        let new_merged: Vec<_> = db
+            .eval_lifecycle_supersedes_inputs()
+            .await?
+            .into_iter()
+            .filter(|input| !merged_before.contains(&input.source_id))
+            .collect();
 
         // Match each new merged memory to its cluster via supersedes field
-        for (merged_id, supersedes) in &new_merged {
-            if let Some(sup_id) = supersedes {
+        for input in &new_merged {
+            if let Some(sup_id) = &input.supersedes {
                 // Find the cluster containing this superseded ID
                 if let Some(cluster) = pre_clusters.iter().find(|c| c.contains(sup_id)) {
                     self.merged_to_originals
-                        .insert(merged_id.clone(), cluster.clone());
+                        .insert(input.source_id.clone(), cluster.clone());
                 }
             }
         }
@@ -491,83 +477,18 @@ async fn measure_phase(
 
 /// Count memories, archived memories, entities, and concepts in the DB.
 async fn count_db_state(db: &MemoryDB) -> Result<(usize, usize, usize, usize), WenlanError> {
-    let conn = db.conn.lock().await;
-
-    let memory_count = {
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM memories WHERE source = 'memory'",
-                libsql::params![],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("count memories: {e}")))?;
-        if let Ok(Some(row)) = rows.next().await {
-            row.get::<i64>(0).unwrap_or(0) as usize
-        } else {
-            0
-        }
-    };
-
-    let archived_count = {
-        let mut rows = conn.query(
-            "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND supersede_mode = 'archive'",
-            libsql::params![],
-        ).await.map_err(|e| WenlanError::VectorDb(format!("count archived: {e}")))?;
-        if let Ok(Some(row)) = rows.next().await {
-            row.get::<i64>(0).unwrap_or(0) as usize
-        } else {
-            0
-        }
-    };
-
-    let entity_count = {
-        let mut rows = conn
-            .query("SELECT COUNT(*) FROM entities", libsql::params![])
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("count entities: {e}")))?;
-        if let Ok(Some(row)) = rows.next().await {
-            row.get::<i64>(0).unwrap_or(0) as usize
-        } else {
-            0
-        }
-    };
-
-    let concept_count = {
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM concepts WHERE status = 'active'",
-                libsql::params![],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("count concepts: {e}")))?;
-        if let Ok(Some(row)) = rows.next().await {
-            row.get::<i64>(0).unwrap_or(0) as usize
-        } else {
-            0
-        }
-    };
-
-    drop(conn);
-    Ok((memory_count, archived_count, entity_count, concept_count))
+    let counts = db.eval_lifecycle_state_counts().await?;
+    Ok((
+        counts.memory_count,
+        counts.archived_count,
+        counts.entity_count,
+        counts.concept_count,
+    ))
 }
 
 /// Get all merged_* source_ids currently in the DB.
 async fn get_merged_ids(db: &MemoryDB) -> Result<HashSet<String>, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn.query(
-        "SELECT DISTINCT source_id FROM memories WHERE source_id LIKE 'merged_%' AND source = 'memory'",
-        libsql::params![],
-    ).await.map_err(|e| WenlanError::VectorDb(format!("merged ids: {e}")))?;
-
-    let mut ids = HashSet::new();
-    while let Ok(Some(row)) = rows.next().await {
-        if let Ok(id) = row.get::<String>(0) {
-            ids.insert(id);
-        }
-    }
-    drop(rows);
-    drop(conn);
-    Ok(ids)
+    db.eval_lifecycle_merged_ids().await
 }
 
 // ---------------------------------------------------------------------------
@@ -745,36 +666,33 @@ async fn run_lifecycle_phases(
 
     // --- Forgetting check: do archived memories still appear in search? ---
     let archive_leakage_result = if llm.is_some() {
-        let conn = db.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT source_id, content FROM memories \
-             WHERE supersede_mode = 'archive' AND source = 'memory' AND chunk_index = 0",
-                libsql::params![],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("archive scan: {e}")))?;
-
-        let mut archived: Vec<(String, String)> = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let sid: String = row.get(0).unwrap_or_default();
-            let content: String = row.get(1).unwrap_or_default();
-            archived.push((sid, content));
-        }
-        drop(rows);
-        drop(conn);
+        let archived = db.eval_lifecycle_archived_inputs().await?;
 
         if !archived.is_empty() {
-            let archived_ids: std::collections::HashSet<String> =
-                archived.iter().map(|(id, _)| id.clone()).collect();
+            let archived_ids: std::collections::HashSet<String> = archived
+                .iter()
+                .map(|input| input.source_id.clone())
+                .collect();
             let mut leaked_ids: Vec<String> = Vec::new();
 
-            for (sid, content) in &archived {
+            for input in &archived {
                 let results = db
-                    .search_memory(content, 5, None, &ReadScope::Global, None, None, None, None)
+                    .search_memory(
+                        &input.content,
+                        5,
+                        None,
+                        &ReadScope::Global,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
                     .await?;
-                if results.iter().any(|r| r.source_id == *sid) {
-                    leaked_ids.push(sid.clone());
+                if results
+                    .iter()
+                    .any(|result| result.source_id == input.source_id)
+                {
+                    leaked_ids.push(input.source_id.clone());
                 }
             }
 
@@ -1716,6 +1634,49 @@ mod tests {
         assert!(extended.contains("merged_abc")); // seed_1 is relevant
         assert!(!extended.contains("merged_xyz")); // seed_5/6 not relevant
         assert!(extended.contains("seed_1")); // original preserved
+    }
+
+    #[tokio::test]
+    async fn test_supersedes_tracker_build_filters_preexisting_and_matches_cluster() {
+        let (db, _tmp) = crate::db::tests::test_db().await;
+        let merged_doc = |source_id: &str, supersedes: &str| RawDocument {
+            content: format!("{source_id} content"),
+            source_id: source_id.to_string(),
+            source: "memory".to_string(),
+            title: source_id.to_string(),
+            supersedes: Some(supersedes.to_string()),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![
+            merged_doc("merged_old", "seed_old"),
+            merged_doc("merged_new", "seed_new"),
+            merged_doc("merged_unmatched", "seed_outside"),
+        ])
+        .await
+        .unwrap();
+
+        let pre_clusters = vec![
+            vec!["seed_old".to_string(), "seed_old_peer".to_string()],
+            vec!["seed_new".to_string(), "seed_new_peer".to_string()],
+        ];
+        let merged_before = HashSet::from(["merged_old".to_string()]);
+        let mut tracker = SupersedesTracker::new();
+        tracker
+            .build(&db, &pre_clusters, &merged_before)
+            .await
+            .unwrap();
+
+        let grades = HashMap::from([("seed_old".to_string(), 3), ("seed_new".to_string(), 2)]);
+        let extended_grades = tracker.extend_grades(&grades);
+        assert_eq!(extended_grades.get("merged_new"), Some(&2));
+        assert!(!extended_grades.contains_key("merged_old"));
+        assert!(!extended_grades.contains_key("merged_unmatched"));
+
+        let relevant = HashSet::from(["seed_new".to_string()]);
+        let extended_relevant = tracker.extend_relevant(&relevant);
+        assert!(extended_relevant.contains("merged_new"));
+        assert!(!extended_relevant.contains("merged_old"));
+        assert!(!extended_relevant.contains("merged_unmatched"));
     }
 
     #[test]

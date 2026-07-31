@@ -1239,7 +1239,7 @@ mod tests {
 
         // Verify memory_entities rows exist for both memories.
         let batch_id = &result.batch_id;
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         for idx in [0usize, 1usize] {
             let mem_source_id = format!("import_{}_{}", batch_id, idx);
             let mut rows = conn

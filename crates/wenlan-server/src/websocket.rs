@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-use crate::state::ServerState;
+use crate::route_registry::{get, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -11,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use wenlan_types::sources::RawDocument;
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router.route("/ws/updates", get(handle_ws_upgrade))
+}
 
 // ===== WebSocket Message Types =====
 

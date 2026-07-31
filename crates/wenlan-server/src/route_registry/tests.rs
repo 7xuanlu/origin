@@ -4,6 +4,94 @@ use axum::http::{Request, StatusCode};
 use std::collections::BTreeMap;
 use tower::ServiceExt;
 
+fn expected_handler(
+    method: ReaderMethod,
+    path: &'static str,
+    handler: &'static str,
+) -> HandlerBinding {
+    HandlerBinding {
+        builder: Builder::Main,
+        method,
+        path,
+        handler,
+    }
+}
+
+#[test]
+fn tracked_methods_capture_the_concrete_function_item_identity() {
+    let route: TrackedMethodRouter<crate::state::SharedState> =
+        super::get(crate::routes::handle_health);
+    assert_eq!(route.handlers.len(), 1);
+    assert_eq!(route.handlers[0].method, RegisteredMethod::Get);
+    assert_eq!(
+        route.handlers[0].handler,
+        "wenlan_server::routes::handle_health"
+    );
+}
+
+#[test]
+fn chained_methods_keep_each_identity_aligned_with_its_method() {
+    let route: TrackedMethodRouter<crate::state::SharedState> =
+        super::get(crate::routes::handle_health).post(crate::routes::handle_status);
+    assert_eq!(
+        route.handlers,
+        [
+            RegisteredHandler {
+                method: RegisteredMethod::Get,
+                handler: "wenlan_server::routes::handle_health",
+            },
+            RegisteredHandler {
+                method: RegisteredMethod::Post,
+                handler: "wenlan_server::routes::handle_status",
+            },
+        ]
+    );
+}
+
+#[test]
+#[should_panic(expected = "route handler binding drift")]
+fn the_right_route_bound_to_the_wrong_handler_fails_loud() {
+    let router = TrackedRouter::<crate::state::SharedState>::new(Builder::Main)
+        .route("/api/health", super::get(crate::routes::handle_status));
+    router.assert_handler_coverage_against([expected_handler(
+        ReaderMethod::Get,
+        "/api/health",
+        "wenlan_server::routes::handle_health",
+    )]);
+}
+
+#[test]
+#[should_panic(expected = "route handler binding drift")]
+fn a_missing_handler_binding_fails_loud() {
+    let router = TrackedRouter::<crate::state::SharedState>::new(Builder::Main)
+        .route("/api/health", super::get(crate::routes::handle_health));
+    router.assert_handler_coverage_against([
+        expected_handler(
+            ReaderMethod::Get,
+            "/api/health",
+            "wenlan_server::routes::handle_health",
+        ),
+        expected_handler(
+            ReaderMethod::Get,
+            "/api/status",
+            "wenlan_server::routes::handle_status",
+        ),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "duplicate handler manifest row")]
+fn a_duplicate_expected_handler_binding_fails_before_set_comparison() {
+    let router = TrackedRouter::<crate::state::SharedState>::new(Builder::Main)
+        .route("/api/health", super::get(crate::routes::handle_health));
+    let row = expected_handler(
+        ReaderMethod::Get,
+        "/api/health",
+        "wenlan_server::routes::handle_health",
+    );
+    router.assert_handler_coverage_against([row, row]);
+}
+
 #[test]
 #[should_panic(expected = "unclassified router path")]
 fn helper_registration_cannot_bypass_classification() {
@@ -69,7 +157,7 @@ fn register_builder(builder: Builder) -> TrackedRouter<()> {
         }
     }
 
-    let mut router = TrackedRouter::<()>::new(builder);
+    let mut router = TrackedRouter::<()>::new_unbound_for_test(builder);
     for (path, mut methods) in by_path {
         let opener = |m: &ReaderMethod| !matches!(m, ReaderMethod::Get | ReaderMethod::Patch);
         methods.sort_by_key(opener);
@@ -124,6 +212,13 @@ async fn manifest_registers_and_seals_the_main_builder() {
 #[test]
 fn manifest_registers_and_seals_the_repair_builder() {
     let _ = register_builder(Builder::Repair).finish_restricted();
+}
+
+#[test]
+fn production_builders_match_the_exact_handler_manifest() {
+    let state = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::ServerState::new()));
+    let _ = crate::router::build_router(state.clone());
+    let _ = crate::router::build_repair_router(state);
 }
 
 /// Dropping a single manifest row must fail `finish()`. Without this the

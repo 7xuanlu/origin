@@ -24,8 +24,7 @@ async fn schema_and_index_fixtures_fail_loud_without_status_rescue() {
     assert_eq!(check(&baseline, SCHEMA).outcome(), LintOutcome::Pass);
     assert_eq!(check(&baseline, INDEXES).outcome(), LintOutcome::Pass);
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch("DROP TRIGGER memories_fts_insert; DROP INDEX child_vectors_vec_idx;")
         .await
@@ -53,8 +52,7 @@ async fn schema_and_index_fixtures_fail_loud_without_status_rescue() {
 #[tokio::test]
 async fn missing_fts_and_malformed_same_name_search_objects_are_findings() {
     let (db, _temp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "DROP TABLE pages_fts;
@@ -74,8 +72,7 @@ async fn missing_fts_and_malformed_same_name_search_objects_are_findings() {
 #[tokio::test]
 async fn missing_memories_is_schema_finding_with_only_dependent_status_incomplete() {
     let (db, _temp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch("DROP TABLE memories;")
         .await

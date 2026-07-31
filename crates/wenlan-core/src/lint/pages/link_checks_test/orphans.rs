@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn missing_same_scope_target_occurrence_is_inventory_not_a_finding() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-source", Some("workspace-a"), "active").await;
     insert_page(&conn, "page-other-scope", Some("workspace-b"), "active").await;
     set_page_title(&conn, "page-other-scope", "topic").await;
@@ -21,7 +21,7 @@ async fn missing_same_scope_target_occurrence_is_inventory_not_a_finding() {
 #[tokio::test]
 async fn unique_but_unbound_occurrence_remains_a_finding() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-source", Some("workspace-a"), "active").await;
     insert_page(&conn, "page-target", Some("workspace-a"), "active").await;
     set_page_title(&conn, "page-target", "topic").await;
@@ -38,7 +38,7 @@ async fn unique_but_unbound_occurrence_remains_a_finding() {
 #[tokio::test]
 async fn missing_target_occurrence_does_not_add_evidence_to_an_actionable_finding() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-missing-source", Some("workspace-a"), "active").await;
     insert_page(&conn, "page-unbound-source", Some("workspace-a"), "active").await;
     insert_page(&conn, "page-target", Some("workspace-a"), "active").await;
@@ -56,7 +56,7 @@ async fn missing_target_occurrence_does_not_add_evidence_to_an_actionable_findin
 #[tokio::test]
 async fn ambiguous_unbound_occurrence_remains_a_finding() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-source", Some("workspace-a"), "active").await;
     for target in ["page-target-a", "page-target-b"] {
         insert_page(&conn, target, Some("workspace-a"), "active").await;
@@ -75,7 +75,7 @@ async fn ambiguous_unbound_occurrence_remains_a_finding() {
 #[tokio::test]
 async fn coverage_counts_occurrences_while_metric_counts_distinct_labels() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     for source in ["page-source-a", "page-source-b", "page-source-c"] {
         insert_page(&conn, source, Some("workspace-a"), "active").await;
     }
@@ -94,7 +94,7 @@ async fn coverage_counts_occurrences_while_metric_counts_distinct_labels() {
 async fn totals_and_truncation_are_exact_at_zero_hundred_and_101() {
     for (count, truncated) in [(0_u64, false), (100, false), (101, true)] {
         let (db, _tmp) = test_db().await;
-        let conn = db._db.connect().unwrap();
+        let conn = db.test_secondary_session().unwrap();
         insert_page(&conn, "page-source", Some("workspace-a"), "active").await;
         for ordinal in 0..count {
             let label = format!("private-label-{ordinal:03}");
@@ -158,7 +158,7 @@ async fn totals_and_truncation_are_exact_at_zero_hundred_and_101() {
 #[tokio::test]
 async fn scope_is_anchored_to_active_source_workspace() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-a", Some("workspace-a"), "active").await;
     insert_page(&conn, "page-b", Some("workspace-b"), "active").await;
     insert_page(&conn, "page-archived", Some("workspace-a"), "archived").await;
@@ -201,7 +201,7 @@ async fn scope_is_anchored_to_active_source_workspace() {
 #[tokio::test]
 async fn selected_orphan_scope_uses_legacy_space_fallback() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-legacy-source", None, "active").await;
     set_page_legacy_space(&conn, "page-legacy-source", "workspace-a").await;
     insert_page(&conn, "page-target", Some("workspace-a"), "active").await;
@@ -279,7 +279,7 @@ async fn scoped_orphan_result(db: &crate::db::MemoryDB, scope: &AppliedScope) ->
         .unwrap()
 }
 
-async fn set_page_legacy_space(conn: &libsql::Connection, page_id: &str, space: &str) {
+async fn set_page_legacy_space(conn: &TestDbSession, page_id: &str, space: &str) {
     conn.execute(
         "UPDATE pages SET space = ?2 WHERE id = ?1",
         libsql::params![page_id, space],
@@ -288,7 +288,7 @@ async fn set_page_legacy_space(conn: &libsql::Connection, page_id: &str, space: 
     .unwrap();
 }
 
-async fn insert_orphan(conn: &libsql::Connection, source_page_id: &str, label: &str) {
+async fn insert_orphan(conn: &TestDbSession, source_page_id: &str, label: &str) {
     conn.execute(
         "INSERT INTO page_links (source_page_id, target_page_id, label_key, label) \
          VALUES (?1, NULL, ?2, ?2)",
@@ -298,7 +298,7 @@ async fn insert_orphan(conn: &libsql::Connection, source_page_id: &str, label: &
     .unwrap();
 }
 
-async fn set_page_title(conn: &libsql::Connection, page_id: &str, title: &str) {
+async fn set_page_title(conn: &TestDbSession, page_id: &str, title: &str) {
     conn.execute(
         "UPDATE pages SET title = ?2 WHERE id = ?1",
         libsql::params![page_id, title],

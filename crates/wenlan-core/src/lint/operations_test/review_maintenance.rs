@@ -21,7 +21,7 @@ fn owner_binding_digest(digest: &str, source_ids: &[String]) -> String {
 async fn terminal_imports_and_every_review_state_are_inventory_or_findings() {
     // Given
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for (index, stage) in ["parsing", "stage_a", "stage_b", "done", "error"]
         .iter()
         .enumerate()
@@ -107,7 +107,7 @@ async fn terminal_imports_and_every_review_state_are_inventory_or_findings() {
 #[tokio::test]
 async fn refinement_actions_enforce_closed_set_and_source_id_shape() {
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for (id, action, source_ids, status) in [
         (
             "valid-binary",
@@ -213,7 +213,7 @@ async fn refinement_actions_enforce_closed_set_and_source_id_shape() {
 #[tokio::test]
 async fn import_affected_records_count_unique_rows() {
     let (db, _tmp) = test_db().await;
-    db.conn.lock().await.execute(
+    db.test_primary_session().await.execute(
         "INSERT INTO import_state
          (id,vendor,source_path,processed_conversations,stage,error_message,started_at,updated_at)
          VALUES ('one','invalid-vendor','opaque',-1,'error','failure','2023-11-14T22:13:20Z','2023-11-14T22:13:20Z')",
@@ -235,7 +235,7 @@ async fn durable_failure_oracle_finds_no_progress_and_absence_is_a_limitation() 
 
     // When
     let limited = run(&db, &[]).await;
-    db.conn.lock().await.execute_batch(
+    db.test_primary_session().await.execute_batch(
         "INSERT INTO app_metadata(key,value) VALUES
          ('reconcile_frontier_docs','{\"ts\":1,\"id\":\"opaque\",\"chunk\":0,\"stuck_id\":\"private-host-7f31.invalid\",\"failures\":2}'),
          ('compile_queue_depth_v1','7'),

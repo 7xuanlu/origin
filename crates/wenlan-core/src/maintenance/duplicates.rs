@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::db::MemoryDB;
+use crate::db::{MemoryDB, NearDuplicatePairRead, NearDuplicateSliceReader};
 use crate::error::WenlanError;
 use crate::pages::Page;
 
@@ -44,88 +44,16 @@ pub(super) struct NearDuplicateSlice {
     pub(super) truncated: bool,
 }
 
-#[derive(Debug)]
-struct BoundedPairRow {
-    left_id: String,
-    right_id: String,
-    left_embedding: Vec<f32>,
-    right_embedding: Vec<f32>,
-    left_fallback_sources: Vec<String>,
-    right_fallback_sources: Vec<String>,
-    eligible: bool,
-}
-
 /// Scan a stable keyset window of Page pairs. Unlike the foreground ranking
 /// query below, distance is computed only after the pair window has been
 /// bounded. Source evidence is independently capped per Page; an overflow is
 /// never treated as partial overlap because that could create false-positive
 /// merge cards.
-pub(super) async fn scan_near_duplicate_slice(
-    db: &MemoryDB,
+pub(super) async fn evaluate_near_duplicate_slice(
+    reader: &NearDuplicateSliceReader<'_>,
+    pair_rows: Vec<NearDuplicatePairRead>,
     page_match_threshold: f64,
-    cursor: Option<&NearDuplicateCursor>,
 ) -> Result<NearDuplicateSlice, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut sql = String::from(
-        "SELECT a.id, b.id, a.embedding, b.embedding, \
-                a.source_memory_ids, b.source_memory_ids, \
-                CASE WHEN a.status = 'active' \
-                           AND b.status = 'active' \
-                           AND COALESCE(a.review_status, 'confirmed') = 'confirmed' \
-                           AND COALESCE(b.review_status, 'confirmed') = 'confirmed' \
-                           AND COALESCE(a.workspace, a.space, '') = COALESCE(b.workspace, b.space, '') \
-                           AND lower(a.title) != 'overview' \
-                           AND lower(b.title) != 'overview' \
-                     THEN 1 ELSE 0 END AS eligible \
-         FROM pages a \
-         JOIN pages b ON a.id < b.id \
-         WHERE 1 = 1",
-    );
-    let mut bind = Vec::<libsql::Value>::new();
-    if let Some(cursor) = cursor {
-        sql.push_str(" AND (a.id > ? OR (a.id = ? AND b.id > ?))");
-        bind.push(libsql::Value::Text(cursor.left_id.clone()));
-        bind.push(libsql::Value::Text(cursor.left_id.clone()));
-        bind.push(libsql::Value::Text(cursor.right_id.clone()));
-    }
-    sql.push_str(" ORDER BY a.id, b.id LIMIT ?");
-    bind.push(libsql::Value::Integer(AUTOMATIC_PAIR_BUDGET as i64));
-
-    let mut rows = conn
-        .query(&sql, libsql::params_from_iter(bind))
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("bounded Page pair scan: {error}")))?;
-    let mut pair_rows = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("bounded Page pair row: {error}")))?
-    {
-        let decode_embedding = |index| {
-            row.get::<Vec<u8>>(index)
-                .unwrap_or_default()
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                .collect::<Vec<_>>()
-        };
-        let decode_sources = |index| {
-            row.get::<String>(index)
-                .ok()
-                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
-                .unwrap_or_default()
-        };
-        pair_rows.push(BoundedPairRow {
-            left_id: row.get::<String>(0).unwrap_or_default(),
-            right_id: row.get::<String>(1).unwrap_or_default(),
-            left_embedding: decode_embedding(2),
-            right_embedding: decode_embedding(3),
-            left_fallback_sources: decode_sources(4),
-            right_fallback_sources: decode_sources(5),
-            eligible: row.get::<i64>(6).unwrap_or(0) != 0,
-        });
-    }
-    drop(rows);
-
     let mut fallback_sources = HashMap::<String, Vec<String>>::new();
     for pair in &pair_rows {
         if !pair.eligible {
@@ -143,22 +71,9 @@ pub(super) async fn scan_near_duplicate_slice(
     let mut source_rows_examined = 0usize;
     let mut truncated = false;
     for (page_id, fallback) in fallback_sources {
-        let mut source_rows = conn
-            .query(
-                "SELECT memory_source_id FROM page_sources \
-                 WHERE page_id = ?1 ORDER BY memory_source_id LIMIT ?2",
-                libsql::params![page_id.as_str(), (AUTOMATIC_SOURCE_CAP + 1) as i64],
-            )
-            .await
-            .map_err(|error| {
-                WenlanError::VectorDb(format!("bounded Page sources for '{page_id}': {error}"))
-            })?;
-        let mut source_ids = Vec::new();
-        while let Some(row) = source_rows.next().await.map_err(|error| {
-            WenlanError::VectorDb(format!("bounded Page source row for '{page_id}': {error}"))
-        })? {
-            source_ids.push(row.get::<String>(0).unwrap_or_default());
-        }
+        let mut source_ids = reader
+            .load_bounded_page_source_ids(&page_id, AUTOMATIC_SOURCE_CAP + 1)
+            .await?;
         if source_ids.is_empty() {
             source_ids.extend(fallback.into_iter().take(AUTOMATIC_SOURCE_CAP + 1));
         }
@@ -251,7 +166,15 @@ async fn detect_near_duplicate_pages_inner(
     limit: Option<usize>,
 ) -> Result<Vec<NearDuplicatePair>, WenlanError> {
     let mut pairs: HashMap<(String, String), NearDuplicatePair> = HashMap::new();
-    for pair in embedding_near_duplicate_pairs(db, page_match_threshold, limit).await? {
+    let threshold = (1.0 - page_match_threshold).max(0.0);
+    for row in db.embedding_near_duplicate_pairs(threshold, limit).await? {
+        let pair = NearDuplicatePair {
+            left_id: row.left_id,
+            right_id: row.right_id,
+            similarity: Some(1.0 - row.distance),
+            source_overlap: 0,
+            source_overlap_ratio: 0.0,
+        };
         pairs.insert((pair.left_id.clone(), pair.right_id.clone()), pair);
     }
 
@@ -274,81 +197,6 @@ async fn detect_near_duplicate_pages_inner(
     });
     if let Some(limit) = limit {
         out.truncate(limit);
-    }
-    Ok(out)
-}
-
-async fn embedding_near_duplicate_pairs(
-    db: &MemoryDB,
-    page_match_threshold: f64,
-    limit: Option<usize>,
-) -> Result<Vec<NearDuplicatePair>, WenlanError> {
-    let conn = db.conn.lock().await;
-    let sql = match limit {
-        Some(_) => {
-            "SELECT a.id, b.id, vector_distance_cos(a.embedding, b.embedding) AS dist \
-             FROM pages a \
-             JOIN pages b ON a.id < b.id \
-             WHERE a.status = 'active' \
-               AND b.status = 'active' \
-               AND a.embedding IS NOT NULL \
-               AND b.embedding IS NOT NULL \
-               AND COALESCE(a.review_status, 'confirmed') = 'confirmed' \
-               AND COALESCE(b.review_status, 'confirmed') = 'confirmed' \
-               AND a.space = b.space \
-               AND lower(a.title) != 'overview' \
-               AND lower(b.title) != 'overview' \
-               AND vector_distance_cos(a.embedding, b.embedding) <= ?1 \
-             ORDER BY dist ASC \
-             LIMIT ?2"
-        }
-        None => {
-            "SELECT a.id, b.id, vector_distance_cos(a.embedding, b.embedding) AS dist \
-             FROM pages a \
-             JOIN pages b ON a.id < b.id \
-             WHERE a.status = 'active' \
-               AND b.status = 'active' \
-               AND a.embedding IS NOT NULL \
-               AND b.embedding IS NOT NULL \
-               AND COALESCE(a.review_status, 'confirmed') = 'confirmed' \
-               AND COALESCE(b.review_status, 'confirmed') = 'confirmed' \
-               AND a.space = b.space \
-               AND lower(a.title) != 'overview' \
-               AND lower(b.title) != 'overview' \
-               AND vector_distance_cos(a.embedding, b.embedding) <= ?1 \
-             ORDER BY dist ASC"
-        }
-    };
-    let threshold = (1.0 - page_match_threshold).max(0.0);
-    let mut rows = match limit {
-        Some(limit) => {
-            conn.query(sql, libsql::params![threshold, limit as i64])
-                .await
-        }
-        None => conn.query(sql, libsql::params![threshold]).await,
-    }
-    .map_err(|e| WenlanError::VectorDb(format!("page near-duplicate query: {e}")))?;
-
-    let mut out = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("page near-duplicate row: {e}")))?
-    {
-        let left: String = row
-            .get(0)
-            .map_err(|e| WenlanError::VectorDb(format!("near-dup left id: {e}")))?;
-        let right: String = row
-            .get(1)
-            .map_err(|e| WenlanError::VectorDb(format!("near-dup right id: {e}")))?;
-        let dist: f64 = row.get(2).unwrap_or(1.0);
-        out.push(NearDuplicatePair {
-            left_id: left,
-            right_id: right,
-            similarity: Some(1.0 - dist),
-            source_overlap: 0,
-            source_overlap_ratio: 0.0,
-        });
     }
     Ok(out)
 }

@@ -2,7 +2,8 @@
 //! REST API endpoints for source management.
 
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{delete, get, post, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -17,6 +18,16 @@ use wenlan_core::sources::directory::{is_reserved_ingest_root, scan_directory};
 use wenlan_core::sources::obsidian::{has_any_markdown, note_to_documents, scan_vault};
 use wenlan_core::sources::Source;
 use wenlan_types::sources::{SourceType, SyncStatus};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route(
+            "/api/sources",
+            get(handle_list_sources).post(handle_add_source),
+        )
+        .route("/api/sources/{id}", delete(handle_remove_source))
+        .route("/api/sources/{id}/sync", post(handle_sync_source))
+}
 
 // ===== Request/Response Types =====
 

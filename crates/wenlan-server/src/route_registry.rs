@@ -4,6 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::MethodRouter;
 use axum::routing::Route;
 use axum::Router;
+use std::any::type_name;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use tower::{Layer, Service};
@@ -12,6 +13,8 @@ use wenlan_core::truth_manifest::{self, Builder, ReaderMethod};
 
 #[path = "route_registry/app.rs"]
 mod app;
+#[path = "route_registry/handler_manifest.rs"]
+mod handler_manifest;
 pub use app::AppRouter;
 
 pub(crate) struct TrackedRouter<S = ()> {
@@ -27,18 +30,23 @@ pub(crate) struct TrackedRouter<S = ()> {
     /// deriving truth coverage from `reads` would leave the opt-out lists
     /// unclassified. Truth classification is total over the router.
     truth: BTreeSet<(ReaderMethod, &'static str)>,
+    /// Exact route-to-handler bindings. This is deliberately independent of
+    /// the truth and scope manifests: those classify response behavior, while
+    /// this catches a valid route being wired to the wrong function.
+    handlers: BTreeMap<(ReaderMethod, &'static str, &'static str), usize>,
+    check_handlers: bool,
 }
 
 pub(crate) struct TrackedMethodRouter<S = ()> {
     inner: MethodRouter<S>,
-    methods: Vec<RegisteredMethod>,
+    handlers: Vec<RegisteredHandler>,
 }
 
 pub(crate) struct FinalizedRouter<S = ()> {
     inner: Router<S>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegisteredMethod {
     Get,
     Post,
@@ -70,6 +78,20 @@ impl RegisteredMethod {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegisteredHandler {
+    method: RegisteredMethod,
+    handler: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HandlerBinding {
+    builder: Builder,
+    method: ReaderMethod,
+    path: &'static str,
+    handler: &'static str,
+}
+
 macro_rules! top_level_method {
     ($name:ident, $method:ident) => {
         pub(crate) fn $name<H, T, S>(handler: H) -> TrackedMethodRouter<S>
@@ -78,9 +100,13 @@ macro_rules! top_level_method {
             T: 'static,
             S: Clone + Send + Sync + 'static,
         {
+            let handler_name = type_name::<H>();
             TrackedMethodRouter {
                 inner: axum::routing::$name(handler),
-                methods: vec![RegisteredMethod::$method],
+                handlers: vec![RegisteredHandler {
+                    method: RegisteredMethod::$method,
+                    handler: handler_name,
+                }],
             }
         }
     };
@@ -101,8 +127,12 @@ where
         H: Handler<T, S>,
         T: 'static,
     {
+        let handler_name = type_name::<H>();
         self.inner = self.inner.post(handler);
-        self.methods.push(RegisteredMethod::Post);
+        self.handlers.push(RegisteredHandler {
+            method: RegisteredMethod::Post,
+            handler: handler_name,
+        });
         self
     }
 
@@ -111,8 +141,12 @@ where
         H: Handler<T, S>,
         T: 'static,
     {
+        let handler_name = type_name::<H>();
         self.inner = self.inner.put(handler);
-        self.methods.push(RegisteredMethod::Put);
+        self.handlers.push(RegisteredHandler {
+            method: RegisteredMethod::Put,
+            handler: handler_name,
+        });
         self
     }
 
@@ -121,8 +155,12 @@ where
         H: Handler<T, S>,
         T: 'static,
     {
+        let handler_name = type_name::<H>();
         self.inner = self.inner.delete(handler);
-        self.methods.push(RegisteredMethod::Delete);
+        self.handlers.push(RegisteredHandler {
+            method: RegisteredMethod::Delete,
+            handler: handler_name,
+        });
         self
     }
 
@@ -131,8 +169,12 @@ where
         H: Handler<T, S>,
         T: 'static,
     {
+        let handler_name = type_name::<H>();
         self.inner = self.inner.patch(handler);
-        self.methods.push(RegisteredMethod::Patch);
+        self.handlers.push(RegisteredHandler {
+            method: RegisteredMethod::Patch,
+            handler: handler_name,
+        });
         self
     }
 }
@@ -147,25 +189,37 @@ where
             reads: BTreeMap::new(),
             builder,
             truth: BTreeSet::new(),
+            handlers: BTreeMap::new(),
+            check_handlers: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_unbound_for_test(builder: Builder) -> Self {
+        Self {
+            check_handlers: false,
+            ..Self::new(builder)
         }
     }
 
     pub(crate) fn route(mut self, path: &'static str, route: TrackedMethodRouter<S>) -> Self {
         let rows = route
-            .methods
+            .handlers
             .iter()
-            .filter_map(|method| {
-                method
+            .filter_map(|registered| {
+                registered
+                    .method
                     .sensitive()
                     .and_then(|method| routes::route(method, path))
             })
             .collect::<Vec<_>>();
         assert!(
-            rows.len() == route.methods.len()
+            rows.len() == route.handlers.len()
                 || NON_SENSITIVE_PATHS.contains(&path)
-                || route.methods.iter().all(|method| {
-                    NON_SENSITIVE_MIXED_ROUTES.contains(&(*method, path))
-                        || method
+                || route.handlers.iter().all(|registered| {
+                    NON_SENSITIVE_MIXED_ROUTES.contains(&(registered.method, path))
+                        || registered
+                            .method
                             .sensitive()
                             .is_some_and(|method| routes::route(method, path).is_some())
                 }),
@@ -182,8 +236,8 @@ where
         // are all in `NON_SENSITIVE_PATHS` and all page-bearing), so deriving
         // truth coverage from that opt-out list would leave the page-bearing
         // half of it silently unclassified.
-        for method in &route.methods {
-            let method = method.truth();
+        for registered in &route.handlers {
+            let method = registered.method.truth();
             assert!(
                 truth_manifest::http_reader(self.builder, method, path).is_some(),
                 "unclassified reader path: {method:?} {path} in {:?}. Add a row to \
@@ -193,6 +247,10 @@ where
                 self.builder
             );
             self.truth.insert((method, path));
+            *self
+                .handlers
+                .entry((method, path, registered.handler))
+                .or_default() += 1;
         }
 
         self.inner = self.inner.route(path, route.inner);
@@ -217,12 +275,37 @@ where
         );
     }
 
+    fn assert_handler_coverage_against(&self, expected: impl IntoIterator<Item = HandlerBinding>) {
+        let mut seen = BTreeSet::new();
+        let mut expected_counts = BTreeMap::new();
+        for row in expected {
+            assert!(seen.insert(row), "duplicate handler manifest row: {row:?}");
+            if row.builder == self.builder {
+                *expected_counts
+                    .entry((row.method, row.path, row.handler))
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(
+            self.handlers, expected_counts,
+            "route handler binding drift in {:?}",
+            self.builder
+        );
+    }
+
+    fn assert_handler_coverage(&self) {
+        if self.check_handlers {
+            self.assert_handler_coverage_against(handler_manifest::bindings());
+        }
+    }
+
     pub(crate) fn finish(self) -> FinalizedRouter<S> {
         let expected = routes::sensitive_read_routes()
             .map(|row| ((row.method, row.path), 1usize))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(self.reads, expected, "sensitive route registration drift");
         self.assert_truth_coverage();
+        self.assert_handler_coverage();
         FinalizedRouter { inner: self.inner }
     }
 
@@ -241,6 +324,7 @@ where
         // subset of them, but the manifest enumerates the repair builder's six
         // entries exactly, so there is no reason to accept less.
         self.assert_truth_coverage();
+        self.assert_handler_coverage();
         FinalizedRouter { inner: self.inner }
     }
 }

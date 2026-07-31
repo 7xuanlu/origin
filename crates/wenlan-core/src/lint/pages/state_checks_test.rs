@@ -487,7 +487,7 @@ async fn runner_uses_pages_workspace_and_keeps_other_workspace_out_of_output() {
         "private.md",
         "---\norigin_id: page_CANARY_OTHER\norigin_version: 8\n---\nprivate\n",
     );
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO spaces (id, name, created_at, updated_at) VALUES ('space-alpha', 'alpha', 1, 1), ('space-beta', 'beta', 1, 1)",
         (),
@@ -534,7 +534,7 @@ async fn runner_uses_pages_workspace_and_keeps_other_workspace_out_of_output() {
 #[tokio::test]
 async fn uncategorized_scope_load_pages_finds_unfiled_workspace_and_excludes_registered() {
     let (db, _db_dir) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO pages (id, title, content, source_memory_ids, version, status, created_at, last_compiled, last_modified, workspace) VALUES          ('page-unfiled', 'unfiled', 'body', '[]', 1, 'active', '1', '1', '1', '00000000-0000-4000-8000-000000000001'),          ('page-CANARY-alpha', 'alpha', 'body', '[]', 1, 'active', '1', '1', '1', 'alpha')",
         (),

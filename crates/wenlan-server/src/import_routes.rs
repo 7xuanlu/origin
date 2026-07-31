@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{get, post, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{extract::State, response::Json};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -9,6 +10,13 @@ use wenlan_types::import::{ImportChatExportRequest, ImportChatExportResponse};
 use wenlan_types::requests::ImportMemoriesRequest;
 use wenlan_types::responses::ImportMemoriesResponse;
 use wenlan_types::WriteSpaceSource;
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/import/memories", post(handle_import_memories))
+        .route("/api/import/chat-export", post(handle_chat_export_import))
+        .route("/api/import/state", get(handle_list_pending_imports))
+}
 
 /// POST /api/import/memories
 pub async fn handle_import_memories(

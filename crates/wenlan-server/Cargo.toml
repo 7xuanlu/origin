@@ -59,5 +59,6 @@ async-trait = { workspace = true }
 libsql = { workspace = true }
 temp-env = { version = "0.3" }
 tempfile = { workspace = true }
+tokio-tungstenite = "0.28"
 tower = { workspace = true }
 zip = { workspace = true }

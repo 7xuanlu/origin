@@ -266,7 +266,11 @@ mod tests {
         // near-duplicate pages stop matching — the exact bug this dedup path
         // exists to prevent. Guard it at compile-inlined source level.
         let db_source = include_str!("db.rs");
-        let post_write_source = include_str!("post_write.rs");
+        let post_write_sources = [
+            include_str!("post_write.rs"),
+            include_str!("post_write/page_create.rs"),
+        ]
+        .join("\n");
 
         // Both call sites route through the shared helper.
         assert!(
@@ -274,12 +278,12 @@ mod tests {
             "insert_page_with_kind must call the shared page_embedding_text helper"
         );
         assert!(
-            post_write_source.contains("page_embedding_text("),
+            post_write_sources.contains("page_embedding_text("),
             "PageWrite dedup must call the shared page_embedding_text helper"
         );
         // Neither call site redefines the helper or its cap locally.
         assert!(
-            !post_write_source.contains("fn page_embedding_text"),
+            !post_write_sources.contains("fn page_embedding_text"),
             "PageWrite must not carry its own page_embedding_text definition"
         );
         assert!(
@@ -287,7 +291,7 @@ mod tests {
             "insert_page_with_kind must not carry a private page embedding cap"
         );
         assert!(
-            !post_write_source.contains("PAGE_EMBED_CONTENT_CAP"),
+            !post_write_sources.contains("PAGE_EMBED_CONTENT_CAP"),
             "PageWrite dedup must not carry a private page embedding cap"
         );
     }

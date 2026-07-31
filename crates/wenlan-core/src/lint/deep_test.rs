@@ -33,8 +33,7 @@ async fn deep_report(
 #[tokio::test]
 async fn deep_profile_detects_structural_and_advisory_counterexamples() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO entities
@@ -96,8 +95,7 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
 #[tokio::test]
 async fn duplicate_inventory_compares_memory_heads_not_shared_later_chunks() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -130,8 +128,7 @@ async fn duplicate_inventory_compares_memory_heads_not_shared_later_chunks() {
 #[tokio::test]
 async fn deep_page_body_alignment_uses_state_mapping_and_canonical_body() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO pages

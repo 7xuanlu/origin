@@ -90,7 +90,7 @@ async fn source_snapshot_identity_is_canonical_and_semantically_complete() {
 async fn retry_boundary_and_queue_ages_use_closed_buckets() {
     // Given
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for (id, retry_at, enqueued_at) in
         [("active", NOW + 1, NOW - 10), ("expired", NOW, NOW - 3_600)]
     {
@@ -133,7 +133,7 @@ async fn retry_boundary_and_queue_ages_use_closed_buckets() {
 #[tokio::test]
 async fn queue_affected_records_count_unique_rows() {
     let (db, _tmp) = test_db().await;
-    db.conn.lock().await.execute(
+    db.test_primary_session().await.execute(
         "INSERT INTO document_enrichment_queue
          (source_id,file_path,status,last_completed_chunk,attempt_count,next_retry_at,error_detail,enqueued_at,updated_at)
          VALUES ('one','one','paused',-2,1,?1,'error',?2,?2)",

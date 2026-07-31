@@ -745,12 +745,7 @@ where
                 mem_count
             )));
         }
-        {
-            let conn = db.conn.lock().await;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "temporal").await?;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "graph").await?;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "pages").await?;
-        }
+        db.assert_eval_migration_substrates_live().await?;
         log::info!(
             "[scenario_db] migrate_stale: schema migrated, substrate live at {} ({} memories) — \
              falling through to shared Phase-1 classification backfill",
@@ -3153,7 +3148,7 @@ mod tests {
     }
 
     async fn collect_fingerprint(db: &MemoryDB) -> SubstrateFingerprint {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
 
         // 1. Entities — (name, entity_type) sorted.
         let mut entities = Vec::new();
@@ -3529,7 +3524,7 @@ mod tests {
     /// graph channel would ship starved.
     #[tokio::test]
     async fn batched_path_meets_graph_contract() {
-        use crate::eval::seed_contract::{check_seed_contract, SeedExpectations};
+        use crate::eval::seed_contract::SeedExpectations;
         use crate::llm_provider::{CannedLlmProvider, LlmProvider};
         use crate::prompts::PromptRegistry;
         use crate::tuning::{DistillationConfig, RefineryConfig};
@@ -3579,8 +3574,9 @@ mod tests {
             expect_fixture_sha256: None,
         };
 
-        let conn = db.conn.lock().await;
-        let report = check_seed_contract(&conn, &expect)
+        let conn = db.test_primary_session().await;
+        let report = conn
+            .check_seed_contract(&expect)
             .await
             .expect("check_seed_contract should not error");
 

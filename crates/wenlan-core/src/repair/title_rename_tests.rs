@@ -1,12 +1,24 @@
 use super::*;
 use crate::{
-    db::{tests::test_db, MemoryDB},
+    db::{
+        repair_verification::{
+            with_repair_verification_test_control, RepairVerificationDbContender,
+            RepairVerificationTestControl,
+        },
+        tests::test_db,
+        MemoryDB,
+    },
     error::WenlanError,
     export::knowledge::KnowledgeProjectionWrite,
     lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
     },
+};
+use std::fs::OpenOptions;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use wenlan_types::{
     lint::{LintProfile, LintQuery},
@@ -28,10 +40,31 @@ struct RenameFixture {
     review_id: String,
 }
 
+fn assert_projection_file_lock_contended(page_root: &Path) {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(page_root.join(".wenlan/.projection.lock"))
+        .unwrap();
+    assert_eq!(
+        lock.try_lock_exclusive().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+fn assert_projection_file_lock_acquirable(page_root: &Path) {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(page_root.join(".wenlan/.projection.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+    lock.unlock().unwrap();
+}
+
 async fn rename_fixture() -> RenameFixture {
     let (db, db_dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -332,19 +365,63 @@ async fn apply_then_verification_reuses_the_owned_projection_session() {
         )
         .await
         .unwrap();
+    let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+    let final_receipt = manifest_dir.join(VERIFICATION_RECEIPT_FILE);
+    let pending = manifest_dir.join(APPLY_RECEIPT_PENDING_FILE);
+    std::fs::hard_link(manifest_dir.join(APPLY_RECEIPT_FILE), &pending).unwrap();
+    let root_after_session = fixture.page_root.path().to_path_buf();
+    let root_after_begin = root_after_session.clone();
+    let root_before_persist = root_after_session.clone();
+    let root_after_persist = root_after_session.clone();
+    let root_after_commit = root_after_session.clone();
+    let contender = RepairVerificationDbContender::new(&fixture.db);
+    let start_contender = contender.clone();
+    let contender_before_persist = contender.clone();
+    let contender_after_persist = contender.clone();
+    let receipt_before_persist = final_receipt.clone();
+    let receipt_after_persist = final_receipt.clone();
+    let receipt_after_commit = final_receipt.clone();
+    let pending_after_commit = pending.clone();
 
-    let receipt = record_repair_verification(
-        &fixture.db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            manifest.manifest_id().to_string(),
-            manifest.manifest_digest().clone(),
-            apply_receipt.receipt_digest().clone(),
-            general,
-        )
-        .unwrap(),
-        Some(fixture.page_root.path()),
-        1_721_000_003,
+    let receipt = with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_rename_session_acquired: Some(Box::new(move || {
+                assert_projection_file_lock_contended(&root_after_session);
+            })),
+            after_begin: Some(Box::new(move || {
+                start_contender.start_and_observe_pending();
+                assert_projection_file_lock_contended(&root_after_begin);
+            })),
+            before_receipt_persist: Some(Box::new(move || {
+                contender_before_persist.assert_pending();
+                assert_projection_file_lock_contended(&root_before_persist);
+                assert!(!receipt_before_persist.exists());
+            })),
+            after_receipt_persist: Some(Box::new(move || {
+                contender_after_persist.assert_pending();
+                assert_projection_file_lock_contended(&root_after_persist);
+                assert!(receipt_after_persist.is_file());
+            })),
+            after_commit_before_pending_clear: Some(Box::new(move || {
+                assert_projection_file_lock_contended(&root_after_commit);
+                assert!(receipt_after_commit.is_file());
+                assert!(pending_after_commit.is_file());
+            })),
+            ..Default::default()
+        },
+        record_repair_verification(
+            &fixture.db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                manifest.manifest_id().to_string(),
+                manifest.manifest_digest().clone(),
+                apply_receipt.receipt_digest().clone(),
+                general,
+            )
+            .unwrap(),
+            Some(fixture.page_root.path()),
+            1_721_000_003,
+        ),
     )
     .await
     .expect("title rename apply and verification must not contend with its own projection session");
@@ -353,6 +430,9 @@ async fn apply_then_verification_reuses_the_owned_projection_session() {
     assert!(store
         .has_completed_verification(manifest.manifest_id())
         .unwrap());
+    assert!(!pending.exists());
+    contender.assert_entered_after_verification();
+    assert_projection_file_lock_acquirable(fixture.page_root.path());
 }
 
 #[tokio::test]
@@ -381,24 +461,33 @@ async fn verification_page_receipts_stay_on_the_pinned_root_after_ancestor_swap(
     let page_root = fixture.page_root.path().to_path_buf();
     let pinned_root = page_root.with_extension("verification-pinned");
 
-    let result = record_repair_verification_with_projection_session_hook(
-        &fixture.db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            manifest.manifest_id().to_string(),
-            manifest.manifest_digest().clone(),
-            apply_receipt.receipt_digest().clone(),
-            general,
-        )
-        .unwrap(),
-        Some(&page_root),
-        1_721_000_003,
-        || {
-            std::fs::rename(&page_root, &pinned_root)?;
-            std::fs::create_dir(&page_root)?;
-            std::fs::write(page_root.join("replacement-canary.md"), b"replacement")?;
-            Ok(())
+    let result = with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_rename_session_acquired: Some(Box::new({
+                let page_root = page_root.clone();
+                let pinned_root = pinned_root.clone();
+                move || {
+                    std::fs::rename(&page_root, &pinned_root).unwrap();
+                    std::fs::create_dir(&page_root).unwrap();
+                    std::fs::write(page_root.join("replacement-canary.md"), b"replacement")
+                        .unwrap();
+                }
+            })),
+            ..Default::default()
         },
+        record_repair_verification(
+            &fixture.db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                manifest.manifest_id().to_string(),
+                manifest.manifest_digest().clone(),
+                apply_receipt.receipt_digest().clone(),
+                general,
+            )
+            .unwrap(),
+            Some(&page_root),
+            1_721_000_003,
+        ),
     )
     .await;
 
@@ -426,8 +515,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "same_scope_collision" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute(
                         // Single-axis (spec §1): a raw INSERT bypassing the
@@ -450,8 +538,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "page_changed" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute("UPDATE pages SET summary='changed' WHERE id='page-a'", ())
                     .await
@@ -474,8 +561,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "version" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute("UPDATE pages SET version=version+1 WHERE id='page-a'", ())
                     .await
@@ -484,8 +570,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "title" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute("UPDATE pages SET title='changed' WHERE id='page-a'", ())
                     .await
@@ -494,8 +579,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             "review" => {
                 fixture
                     .db
-                    .conn
-                    .lock()
+                    .test_primary_session()
                     .await
                     .execute(
                         "UPDATE refinement_queue SET status='dismissed' WHERE id=?1",
@@ -507,8 +591,8 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             _ => unreachable!(),
         }
         let db_before = {
-            let conn = fixture.db.conn.lock().await;
-            database_content_digest(&conn).await.unwrap()
+            let session = fixture.db.test_primary_session().await;
+            session.repair_database_content_digest().await.unwrap()
         };
         let tree_before = crate::lint::pages::fs::scan_page_root(fixture.page_root.path()).unwrap();
         let result = apply_repair_with_pages(
@@ -523,9 +607,12 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
             matches!(result, Err(WenlanError::Conflict(ref message)) if message == "repair_target_stale"),
             "unexpected {stale_case}: {result:?}"
         );
-        let conn = fixture.db.conn.lock().await;
-        assert_eq!(database_content_digest(&conn).await.unwrap(), db_before);
-        drop(conn);
+        let session = fixture.db.test_primary_session().await;
+        assert_eq!(
+            session.repair_database_content_digest().await.unwrap(),
+            db_before
+        );
+        drop(session);
         assert_eq!(
             crate::lint::pages::fs::scan_page_root(fixture.page_root.path())
                 .unwrap()
@@ -607,6 +694,48 @@ async fn mid_projection_write_failure_restores_target_state_and_database() {
     assert_eq!(
         std::fs::read(fixture.page_root.path().join(filename)).unwrap(),
         file_before
+    );
+
+    let owned = rename_fixture().await;
+    let owned_manifest = prepare(&owned).await;
+    let owned_store = RepairArtifactStore::new(owned.repair_root.path().to_path_buf());
+    let owned_rollback = owned_store
+        .load_rename_page_title_rollback(&owned_manifest)
+        .unwrap();
+    let owned_state_before =
+        std::fs::read(owned.page_root.path().join(".wenlan/state.json")).unwrap();
+    let owned_filename = target_filename(owned.page_root.path(), "page-a");
+    let owned_file_before = std::fs::read(owned.page_root.path().join(&owned_filename)).unwrap();
+    let hook_fired = Arc::new(AtomicBool::new(false));
+    let hook_fired_inside = Arc::clone(&hook_fired);
+
+    let owned_result = crate::post_write::rename_page_title_cas_with_projection_write_hook(
+        &owned.db,
+        &owned_manifest,
+        &owned_rollback,
+        owned.page_root.path(),
+        move || {
+            hook_fired_inside.store(true, Ordering::SeqCst);
+            Err(WenlanError::Io(std::io::Error::other(
+                "forced owned-capture failure after target write before state write",
+            )))
+        },
+        |_| Ok(()),
+    )
+    .await;
+
+    assert!(owned_result.is_err());
+    assert!(hook_fired.load(Ordering::SeqCst));
+    let owned_page = owned.db.get_page("page-a").await.unwrap().unwrap();
+    assert_eq!(owned_page.title, "Origin");
+    assert_eq!(owned_page.version, 4);
+    assert_eq!(
+        std::fs::read(owned.page_root.path().join(".wenlan/state.json")).unwrap(),
+        owned_state_before
+    );
+    assert_eq!(
+        std::fs::read(owned.page_root.path().join(owned_filename)).unwrap(),
+        owned_file_before
     );
 }
 

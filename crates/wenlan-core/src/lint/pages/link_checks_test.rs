@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::test_support::TestDbSession;
 use crate::db::tests::test_db;
 use crate::lint::context::{
     AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
@@ -27,7 +28,7 @@ mod orphans;
 // mirrored (migration 80), so this writes one scope value into both --
 // `None` seeds the reserved sentinel id rather than a NULL a NOT NULL
 // column now rejects.
-async fn insert_page(conn: &libsql::Connection, id: &str, workspace: Option<&str>, status: &str) {
+async fn insert_page(conn: &TestDbSession, id: &str, workspace: Option<&str>, status: &str) {
     let scope = workspace.unwrap_or(crate::db::UNFILED_SPACE_ID);
     conn.execute(
         "INSERT INTO pages (id, title, content, source_memory_ids, version, status, created_at, last_compiled, last_modified, workspace, space, creation_kind, review_status) \
@@ -38,7 +39,7 @@ async fn insert_page(conn: &libsql::Connection, id: &str, workspace: Option<&str
     .unwrap();
 }
 
-async fn link_row_count(conn: &libsql::Connection) -> i64 {
+async fn link_row_count(conn: &TestDbSession) -> i64 {
     let mut rows = conn
         .query("SELECT COUNT(*) FROM page_links", ())
         .await

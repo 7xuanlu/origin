@@ -9,7 +9,7 @@ mod survivor_tests;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::db::{MemoryDB, StalePageCursor};
+use crate::db::{AutomaticRetroPageScan, MemoryDB, StalePageCursor};
 use crate::error::WenlanError;
 use crate::llm_provider::LlmProvider;
 use crate::post_write::page_is_human_owned;
@@ -255,7 +255,7 @@ pub async fn run_maintenance_stage_slice(
 
     match stage {
         MaintenanceStage::RetroReview => {
-            if has_pending_retro_review(db).await? {
+            if db.has_pending_retro_review().await? {
                 paused = true;
                 result.retro_paused = true;
             } else if db
@@ -264,13 +264,30 @@ pub async fn run_maintenance_stage_slice(
                 .as_deref()
                 != Some("1")
             {
-                let slice = scan_automatic_retro_stub_slice(db).await?;
-                selected = slice.pages_examined > 0;
+                // The automatic retro lane audits one machine Page at a time.
+                // Near-duplicate history belongs to the following recurring
+                // stage, so this one-time backfill does not repeat that scan.
+                let cursor = db
+                    .get_app_metadata(AUTOMATIC_RETRO_CURSOR_KEY)
+                    .await?
+                    .filter(|value| !value.is_empty());
+                let slice: AutomaticRetroPageScan = db
+                    .scan_automatic_retro_stub_slice(cursor.as_deref(), STUB_PAGE_SOURCE_FLOOR)
+                    .await?;
+                selected = slice.next_cursor.is_some();
                 progressed = selected;
                 more = slice.more;
-                work.pages_examined = slice.pages_examined;
-                work.source_rows_examined = slice.source_rows_examined;
-                if let Some(candidate) = slice.candidate {
+                work.pages_examined = usize::from(selected);
+                work.source_rows_examined = slice.eligible_source_count.unwrap_or(0);
+                let candidate = slice
+                    .eligible_source_count
+                    .filter(|source_count| *source_count < STUB_PAGE_SOURCE_FLOOR)
+                    .zip(slice.next_cursor.as_ref())
+                    .map(|(source_count, page_id)| StubPageCandidate {
+                        page_id: page_id.clone(),
+                        source_count,
+                    });
+                if let Some(candidate) = candidate {
                     result.retro_expected_card_volume = 1;
                     let emitted =
                         emit_keep_or_archive_card(db, &candidate.page_id, candidate.source_count)
@@ -291,7 +308,7 @@ pub async fn run_maintenance_stage_slice(
             }
         }
         MaintenanceStage::NearDuplicate => {
-            if has_pending_retro_review(db).await? {
+            if db.has_pending_retro_review().await? {
                 paused = true;
             } else {
                 let cursor = db
@@ -301,12 +318,22 @@ pub async fn run_maintenance_stage_slice(
                     .and_then(|value| {
                         serde_json::from_str::<duplicates::NearDuplicateCursor>(&value).ok()
                     });
-                let slice = duplicates::scan_near_duplicate_slice(
-                    db,
+                let reader = db.begin_near_duplicate_slice_reader().await;
+                let pair_rows = reader
+                    .scan_near_duplicate_slice(
+                        cursor
+                            .as_ref()
+                            .map(|cursor| (cursor.left_id.as_str(), cursor.right_id.as_str())),
+                        duplicates::AUTOMATIC_PAIR_BUDGET,
+                    )
+                    .await?;
+                let slice = duplicates::evaluate_near_duplicate_slice(
+                    &reader,
+                    pair_rows,
                     config.page_match_threshold,
-                    cursor.as_ref(),
                 )
                 .await?;
+                drop(reader);
                 selected = slice.pairs_examined > 0;
                 progressed = selected;
                 more = slice.more;
@@ -348,7 +375,7 @@ pub async fn run_maintenance_stage_slice(
             progressed = selected;
         }
         MaintenanceStage::CrossSpaceDiscovery => {
-            if has_pending_cross_space_discovery(db).await? {
+            if db.has_pending_cross_space_discovery().await? {
                 paused = true;
             } else {
                 let cursor = db
@@ -540,161 +567,6 @@ enum RetroCardCandidate {
 struct StubPageCandidate {
     page_id: String,
     source_count: usize,
-}
-
-#[derive(Debug)]
-struct AutomaticRetroStubSlice {
-    candidate: Option<StubPageCandidate>,
-    next_cursor: Option<String>,
-    more: bool,
-    pages_examined: usize,
-    source_rows_examined: usize,
-}
-
-/// The automatic retro lane audits one machine Page at a time. Near-duplicate
-/// history is owned by the following recurring `NearDuplicate` stage, so this
-/// one-time backfill does not repeat the pair scan.
-async fn scan_automatic_retro_stub_slice(
-    db: &MemoryDB,
-) -> Result<AutomaticRetroStubSlice, WenlanError> {
-    let cursor = db
-        .get_app_metadata(AUTOMATIC_RETRO_CURSOR_KEY)
-        .await?
-        .filter(|value| !value.is_empty());
-    let conn = db.conn.lock().await;
-    let mut sql = String::from(
-        "SELECT id, source_memory_ids, \
-                CASE WHEN status = 'active' \
-                           AND COALESCE(creation_kind, 'distilled') = 'distilled' \
-                           AND COALESCE(user_edited, 0) = 0 \
-                           AND lower(title) != 'overview' \
-                     THEN 1 ELSE 0 END AS eligible \
-         FROM pages WHERE 1 = 1",
-    );
-    let mut bind = Vec::<libsql::Value>::new();
-    if let Some(cursor) = cursor.as_deref() {
-        sql.push_str(" AND id > ?");
-        bind.push(libsql::Value::Text(cursor.to_string()));
-    }
-    sql.push_str(" ORDER BY id LIMIT 2");
-    let mut rows = conn
-        .query(&sql, libsql::params_from_iter(bind))
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("bounded retro Page scan: {error}")))?;
-    let mut pages = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("bounded retro Page row: {error}")))?
-    {
-        pages.push((
-            row.get::<String>(0).unwrap_or_default(),
-            row.get::<String>(1)
-                .ok()
-                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
-                .unwrap_or_default(),
-            row.get::<i64>(2).unwrap_or(0) != 0,
-        ));
-    }
-    drop(rows);
-    let more = pages.len() > 1;
-    let Some((page_id, fallback_sources, eligible)) = pages.into_iter().next() else {
-        return Ok(AutomaticRetroStubSlice {
-            candidate: None,
-            next_cursor: None,
-            more: false,
-            pages_examined: 0,
-            source_rows_examined: 0,
-        });
-    };
-
-    if !eligible {
-        return Ok(AutomaticRetroStubSlice {
-            candidate: None,
-            next_cursor: Some(page_id),
-            more,
-            pages_examined: 1,
-            source_rows_examined: 0,
-        });
-    }
-
-    // Three rows are sufficient to prove this is not a <3-source stub. No
-    // exact count or full source-list materialization is needed.
-    let mut source_rows = conn
-        .query(
-            "SELECT memory_source_id FROM page_sources \
-             WHERE page_id = ?1 ORDER BY memory_source_id LIMIT ?2",
-            libsql::params![page_id.as_str(), STUB_PAGE_SOURCE_FLOOR as i64],
-        )
-        .await
-        .map_err(|error| {
-            WenlanError::VectorDb(format!("bounded retro sources for '{page_id}': {error}"))
-        })?;
-    let mut source_count = 0usize;
-    while source_rows
-        .next()
-        .await
-        .map_err(|error| {
-            WenlanError::VectorDb(format!("bounded retro source row for '{page_id}': {error}"))
-        })?
-        .is_some()
-    {
-        source_count += 1;
-    }
-    if source_count == 0 {
-        source_count = fallback_sources
-            .into_iter()
-            .take(STUB_PAGE_SOURCE_FLOOR)
-            .count();
-    }
-    let candidate = (source_count < STUB_PAGE_SOURCE_FLOOR).then(|| StubPageCandidate {
-        page_id: page_id.clone(),
-        source_count,
-    });
-    Ok(AutomaticRetroStubSlice {
-        candidate,
-        next_cursor: Some(page_id),
-        more,
-        pages_examined: 1,
-        source_rows_examined: source_count,
-    })
-}
-
-async fn has_pending_retro_review(db: &MemoryDB) -> Result<bool, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM refinement_queue \
-             WHERE status IN ('pending', 'awaiting_review') \
-               AND action IN ('page_merge', 'page_keep_or_archive') \
-             LIMIT 1",
-            (),
-        )
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("pending retro probe: {error}")))?;
-    rows.next()
-        .await
-        .map(|row| row.is_some())
-        .map_err(|error| WenlanError::VectorDb(format!("pending retro probe row: {error}")))
-}
-
-async fn has_pending_cross_space_discovery(db: &MemoryDB) -> Result<bool, WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM refinement_queue \
-             WHERE status IN ('pending', 'awaiting_review') \
-               AND action = 'cross_space_discovery' \
-             LIMIT 1",
-            (),
-        )
-        .await
-        .map_err(|error| {
-            WenlanError::VectorDb(format!("pending cross-space discovery probe: {error}"))
-        })?;
-    rows.next().await.map(|row| row.is_some()).map_err(|error| {
-        WenlanError::VectorDb(format!("pending cross-space discovery probe row: {error}"))
-    })
 }
 
 async fn run_retro_sweep(
@@ -1191,7 +1063,7 @@ mod tests {
         last_modified: i64,
     ) {
         let embedding_sql = vec_to_sql(embedding);
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (
                 id, content, source, source_id, title, chunk_index, last_modified,
@@ -1218,7 +1090,7 @@ mod tests {
     }
 
     async fn active_page_count(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query("SELECT COUNT(*) FROM pages WHERE status = 'active'", ())
             .await
@@ -1235,7 +1107,7 @@ mod tests {
     }
 
     async fn page_source_count(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query("SELECT COUNT(*) FROM page_sources", ())
             .await
@@ -1665,7 +1537,7 @@ mod tests {
             )
             .await;
             {
-                let conn = db.conn.lock().await;
+                let conn = db.test_primary_session().await;
                 conn.execute(
                     "UPDATE pages SET last_modified = ?1 WHERE id = ?2",
                     libsql::params![last_modified, page_id.as_str()],
@@ -1845,6 +1717,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_retro_ineligible_page_advances_cursor_without_emitting_card() {
+        let (db, _db_dir) = new_test_db().await;
+        insert_test_page(&db, "a_ineligible", "authored control", &[]).await;
+        insert_distilled_test_page(&db, "b_eligible", "thin machine page", &[]).await;
+
+        let report = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &config(),
+            None,
+            MaintenanceStage::RetroReview,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.selected);
+        assert!(report.progressed);
+        assert!(report.more);
+        assert_eq!(report.work.pages_examined, 1);
+        assert_eq!(report.work.source_rows_examined, 0);
+        assert_eq!(report.result.retro_cards_emitted, 0);
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_RETRO_CURSOR_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a_ineligible")
+        );
+        assert!(db.get_pending_refinements().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn automatic_near_duplicate_slice_reports_bounded_pair_and_source_work() {
         let (db, _db_dir) = new_test_db().await;
         let source = "bounded duplicate source";
@@ -1918,6 +1823,94 @@ mod tests {
         assert!((1..=8).contains(&report.work.seeds_examined));
         assert!(report.work.neighbor_rows_examined <= 8 * 64);
         assert!(report.result.discovery_cards_emitted <= 1);
+    }
+
+    #[tokio::test]
+    async fn open_review_cards_pause_automatic_stages_before_scan_or_cursor_work() {
+        let (db, _db_dir) = new_test_db().await;
+        let no_sources = Vec::<String>::new();
+        db.insert_refinement_proposal("open-retro-control", "page_merge", &no_sources, None, 1.0)
+            .await
+            .unwrap();
+
+        let retro = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &config(),
+            None,
+            MaintenanceStage::RetroReview,
+        )
+        .await
+        .unwrap();
+        assert!(retro.paused);
+        assert!(retro.result.retro_paused);
+        assert!(!retro.selected && !retro.progressed && !retro.more);
+        assert_eq!(retro.work, MaintenanceSliceWork::default());
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_RETRO_CURSOR_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_RETRO_COMPLETE_KEY)
+                .await
+                .unwrap(),
+            None,
+            "the paused probe must return before the empty scan marks retro complete"
+        );
+
+        let near_duplicate = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &config(),
+            None,
+            MaintenanceStage::NearDuplicate,
+        )
+        .await
+        .unwrap();
+        assert!(near_duplicate.paused);
+        assert!(!near_duplicate.result.retro_paused);
+        assert!(!near_duplicate.selected && !near_duplicate.progressed && !near_duplicate.more);
+        assert_eq!(near_duplicate.work, MaintenanceSliceWork::default());
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_NEAR_DUPLICATE_CURSOR_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+
+        db.insert_refinement_proposal(
+            "open-cross-space-control",
+            "cross_space_discovery",
+            &no_sources,
+            None,
+            1.0,
+        )
+        .await
+        .unwrap();
+        let cross_space = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &discovery_config(),
+            None,
+            MaintenanceStage::CrossSpaceDiscovery,
+        )
+        .await
+        .unwrap();
+        assert!(cross_space.paused);
+        assert!(!cross_space.result.retro_paused);
+        assert!(!cross_space.selected && !cross_space.progressed && !cross_space.more);
+        assert_eq!(cross_space.work, MaintenanceSliceWork::default());
+        assert_eq!(
+            db.get_app_metadata(AUTOMATIC_CROSS_SPACE_CURSOR_KEY)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[path = "drift_guard/r4_test_support_test.rs"]
+mod r4_test_support_test;
+
+#[cfg(test)]
+#[path = "drift_guard/post_write_structure_test.rs"]
+mod post_write_structure_test;
+
 /// Repo root, resolved at compile time from this crate's manifest dir
 /// (crates/wenlan-core -> ../.. == repo root).
 fn repo_root() -> PathBuf {
@@ -5704,4 +5712,591 @@ fn section_resolver_detects_moved_heading() {
             .any(|h| h.to_lowercase() == "present section"),
         "resolver must accept a heading present in the target"
     );
+}
+
+#[test]
+fn m5_reader_inventory_matches_current_tree() {
+    let root = repo_root();
+    let output = std::process::Command::new("python3")
+        .arg("scripts/m5-reader-sweep.py")
+        .arg("--check")
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/m5-reader-sweep.py --check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "M5 reader inventory drifted from the current source tree.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("reader inventory check: ok"),
+        "reader sweep check mode did not emit its success receipt.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+// ── R1: keep the giant DB test module external and census-invisible ──
+
+const DB_TEST_MODULE_PATH: &str = "db/main_tests.rs";
+
+fn db_test_module_layout_violations(
+    db_source: &str,
+    external_path: &str,
+    external_exists: bool,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let declaration = format!("#[cfg(test)]\n#[path = \"{external_path}\"]\npub(crate) mod tests;");
+    if db_source.matches(&declaration).count() != 1 {
+        violations.push(format!(
+            "db.rs must declare its test module exactly once through {external_path:?}"
+        ));
+    }
+    if regex::Regex::new(r"(?m)^\s*pub\(crate\)\s+mod\s+tests\s*\{")
+        .unwrap()
+        .is_match(db_source)
+    {
+        violations.push("db.rs still contains an inline pub(crate) mod tests body".into());
+    }
+    if !external_path.ends_with("_test.rs") && !external_path.ends_with("_tests.rs") {
+        violations.push(format!(
+            "{external_path} is visible to scripts/m5-reader-sweep.py; use an _test.rs or _tests.rs suffix"
+        ));
+    }
+    if !external_exists {
+        violations.push(format!(
+            "external DB test module is missing: {external_path}"
+        ));
+    }
+    violations
+}
+
+#[test]
+fn db_main_tests_live_outside_db_rs() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let external = Path::new("crates/wenlan-core/src").join(DB_TEST_MODULE_PATH);
+    let violations = db_test_module_layout_violations(
+        &db_source,
+        DB_TEST_MODULE_PATH,
+        root.join(external).is_file(),
+    );
+
+    assert!(
+        violations.is_empty(),
+        "R1 DB test-module layout drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn db_test_module_layout_guard_rejects_inline_and_census_visible_shapes() {
+    let violations = db_test_module_layout_violations(
+        "#[cfg(test)]\npub(crate) mod tests {\n    #[test]\n    fn still_inline() {}\n}\n",
+        "db/tests.rs",
+        false,
+    );
+    assert_eq!(
+        violations,
+        vec![
+            "db.rs must declare its test module exactly once through \"db/tests.rs\"",
+            "db.rs still contains an inline pub(crate) mod tests body",
+            "db/tests.rs is visible to scripts/m5-reader-sweep.py; use an _test.rs or _tests.rs suffix",
+            "external DB test module is missing: db/tests.rs",
+        ],
+        "the guard must reject the pre-R1 inline shape and the natural but census-visible filename"
+    );
+}
+
+// ── R0: exact direct DB connection access baseline ──
+
+const EXTERNAL_CONN_ACCESS_BASELINE: &[(&str, usize)] = &[];
+
+fn direct_conn_access_count(source: &str) -> usize {
+    regex::Regex::new(r"\.conn\s*\.\s*lock\s*\(\s*\)\s*\.\s*await")
+        .unwrap()
+        .find_iter(source)
+        .count()
+}
+
+fn is_legacy_conn_census_path(path: &str) -> bool {
+    path != "crates/wenlan-core/src/db.rs"
+        && !path.starts_with("crates/wenlan-core/src/db/")
+        && path != "crates/wenlan-core/src/drift_guard/r4_test_support_test.rs"
+}
+
+fn current_external_conn_access(root: &Path) -> BTreeMap<String, usize> {
+    git_ls_files(root, "crates/wenlan-core/src")
+        .into_iter()
+        .filter(|path| path.ends_with(".rs"))
+        .filter(|path| is_legacy_conn_census_path(path))
+        .filter_map(|path| {
+            let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
+            let count = direct_conn_access_count(&source);
+            (count > 0).then_some((path, count))
+        })
+        .collect()
+}
+
+fn external_conn_access_violations(
+    baseline: &BTreeMap<String, usize>,
+    current: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    let mut violations: Vec<String> = current
+        .iter()
+        .filter_map(|(path, count)| match baseline.get(path) {
+            Some(allowed) if count == allowed => None,
+            Some(allowed) if count > allowed => Some(format!(
+                "{path}: direct .conn.lock() access increased {allowed} -> {count}; \
+                 replace it with a bounded MemoryDB method"
+            )),
+            Some(allowed) => Some(format!(
+                "{path}: direct .conn.lock() access decreased {allowed} -> {count}; \
+                 lower the baseline in this diff"
+            )),
+            None => Some(format!(
+                "{path}: {count} new direct .conn.lock() access{}",
+                if *count == 1 { "" } else { "es" }
+            )),
+        })
+        .collect();
+    violations.extend(
+        baseline
+            .keys()
+            .filter(|path| !current.contains_key(*path))
+            .map(|path| {
+                format!(
+                    "{path}: stale direct .conn.lock() baseline row; remove it from the baseline"
+                )
+            }),
+    );
+    violations.sort();
+    violations
+}
+
+#[test]
+fn external_conn_access_matches_exact_baseline() {
+    let baseline: BTreeMap<String, usize> = EXTERNAL_CONN_ACCESS_BASELINE
+        .iter()
+        .map(|(path, count)| ((*path).to_string(), *count))
+        .collect();
+    let current = current_external_conn_access(&repo_root());
+    let violations = external_conn_access_violations(&baseline, &current);
+
+    assert!(
+        violations.is_empty(),
+        "direct MemoryDB connection access outside db.rs/db/** must match the exact baseline; \
+         replace new locks with bounded MemoryDB methods and update the baseline in the same diff \
+         after removals:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn legacy_conn_census_excludes_only_the_syntax_aware_parser_fixture() {
+    let parser_fixture = "crates/wenlan-core/src/drift_guard/r4_test_support_test.rs";
+    assert!(!is_legacy_conn_census_path(parser_fixture));
+    assert!(is_legacy_conn_census_path(
+        "crates/wenlan-core/src/ordinary_new_test.rs"
+    ));
+
+    let current = current_external_conn_access(&repo_root());
+    assert!(
+        !current.contains_key(parser_fixture),
+        "the syntax-aware R4 parser owns the synthetic raw-access controls in its fixture file"
+    );
+
+    let ordinary_path = "crates/wenlan-core/src/ordinary_new_test.rs".to_string();
+    let violations = external_conn_access_violations(
+        &BTreeMap::new(),
+        &BTreeMap::from([(ordinary_path.clone(), 1)]),
+    );
+    assert_eq!(
+        violations,
+        vec![format!("{ordinary_path}: 1 new direct .conn.lock() access")],
+        "an ordinary new source path must remain inside the legacy census"
+    );
+}
+
+#[test]
+fn external_conn_access_exact_baseline_rejects_all_drift() {
+    let baseline = BTreeMap::from([
+        ("crates/wenlan-core/src/a.rs".to_string(), 2),
+        ("crates/wenlan-core/src/middle.rs".to_string(), 3),
+        ("crates/wenlan-core/src/ok.rs".to_string(), 2),
+        ("crates/wenlan-core/src/removed.rs".to_string(), 1),
+    ]);
+    let current = BTreeMap::from([
+        ("crates/wenlan-core/src/a.rs".to_string(), 3),
+        ("crates/wenlan-core/src/middle.rs".to_string(), 1),
+        ("crates/wenlan-core/src/new.rs".to_string(), 1),
+        ("crates/wenlan-core/src/ok.rs".to_string(), 2),
+    ]);
+
+    assert_eq!(
+        external_conn_access_violations(&baseline, &current),
+        vec![
+            "crates/wenlan-core/src/a.rs: direct .conn.lock() access increased 2 -> 3; replace it with a bounded MemoryDB method",
+            "crates/wenlan-core/src/middle.rs: direct .conn.lock() access decreased 3 -> 1; lower the baseline in this diff",
+            "crates/wenlan-core/src/new.rs: 1 new direct .conn.lock() access",
+            "crates/wenlan-core/src/removed.rs: stale direct .conn.lock() baseline row; remove it from the baseline",
+        ],
+        "the ratchet must accept exact matches and reject count drift, new files, and stale baseline rows in deterministic order"
+    );
+}
+
+#[test]
+fn external_conn_access_matcher_catches_formatted_await_chains() {
+    let source = concat!(
+        "let one = db.",
+        "conn.lock().await;\n",
+        "let two = db\n    .",
+        "conn\n    .lock()\n    .await;\n",
+        "let not_an_access = \".conn.lock()\";\n",
+    );
+    assert_eq!(
+        direct_conn_access_count(source),
+        2,
+        "the matcher must catch one-line and rustfmt-split access chains"
+    );
+}
+
+// ── R2: bounded historical migration modules ──
+
+const MIGRATIONS_V004_V009_PATH: &str = "crates/wenlan-core/src/db/migrations_v004_v009.rs";
+const MIGRATIONS_V004_V009: &[(i64, &str)] = &[
+    (4, "migrate_4_refinement_pipeline"),
+    (5, "migrate_5_session_tables"),
+    (6, "migrate_6_access_tracking"),
+    (7, "migrate_7_briefing_cache"),
+    (8, "migrate_8_narrative_cache"),
+    (9, "migrate_9_agent_activity"),
+];
+
+fn migrations_v004_v009_layout_violations(
+    db_source: &str,
+    module_source: &str,
+    module_exists: bool,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if !module_exists {
+        violations.push(format!(
+            "historical migration module is missing: {MIGRATIONS_V004_V009_PATH}"
+        ));
+    }
+    if db_source.matches("mod migrations_v004_v009;").count() != 1 {
+        violations.push("db.rs must declare mod migrations_v004_v009 exactly once".into());
+    }
+
+    let dispatcher = db_source
+        .find("// Migration 4:")
+        .zip(db_source.find("// Migration 10:"))
+        .and_then(|(start, end)| (start < end).then_some(&db_source[start..end]));
+    match dispatcher {
+        Some(dispatcher) => {
+            let mut previous = 0;
+            for (version, method) in MIGRATIONS_V004_V009 {
+                let call = format!("self.{method}().await?;");
+                match dispatcher.find(&call) {
+                    Some(position) if position > previous => previous = position,
+                    Some(_) => violations
+                        .push(format!("migration dispatcher call is out of order: {call}")),
+                    None => violations.push(format!(
+                        "migration dispatcher is missing ordered call: {call}"
+                    )),
+                }
+                if !dispatcher.contains(&format!("if version < {version}")) {
+                    violations.push(format!(
+                        "migration dispatcher is missing version guard {version}"
+                    ));
+                }
+            }
+            if dispatcher.contains("conn.execute") || dispatcher.contains("ALTER TABLE") {
+                violations.push(
+                    "run_migrations still contains SQL bodies for migrations 4 through 9".into(),
+                );
+            }
+        }
+        None => violations.push(
+            "could not isolate the run_migrations segment from migration 4 through migration 9"
+                .into(),
+        ),
+    }
+
+    let mut previous = 0;
+    for (version, method) in MIGRATIONS_V004_V009 {
+        let definition = format!("async fn {method}(");
+        match module_source.find(&definition) {
+            Some(position) if position > previous => previous = position,
+            Some(_) => violations.push(format!(
+                "historical migration method is out of order: {method}"
+            )),
+            None => violations.push(format!(
+                "historical migration module is missing method: {method}"
+            )),
+        }
+        if !module_source.contains(&format!("PRAGMA user_version = {version}")) {
+            violations.push(format!(
+                "historical migration {version} lost its user_version stamp"
+            ));
+        }
+    }
+    for protected in [
+        "migrate_98",
+        "migrate_99",
+        "truth_cutover",
+        "page_truth",
+        "claim_identity",
+    ] {
+        if module_source.contains(protected) {
+            violations.push(format!(
+                "historical migration module crossed the M5 boundary: {protected}"
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn migrations_4_through_9_live_in_one_bounded_module() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let module_path = root.join(MIGRATIONS_V004_V009_PATH);
+    let module_source = std::fs::read_to_string(&module_path).unwrap_or_default();
+    let violations =
+        migrations_v004_v009_layout_violations(&db_source, &module_source, module_path.is_file());
+
+    assert!(
+        violations.is_empty(),
+        "R2 historical migration boundary drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn historical_migration_guard_rejects_inline_sql_and_m5_scope_creep() {
+    let db_source = concat!(
+        "mod migrations_v004_v009;\n",
+        "// Migration 4: bad inline body\n",
+        "if version < 4 { conn.execute(\"ALTER TABLE pages\", ()).await?; }\n",
+        "// Migration 10: boundary\n",
+    );
+    let module_source =
+        "impl MemoryDB { async fn migrate_98_claim_identity() {} } // truth_cutover";
+    let violations = migrations_v004_v009_layout_violations(db_source, module_source, true);
+
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("still contains SQL bodies")),
+        "positive control must reject an inline migration body"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("crossed the M5 boundary")),
+        "positive control must reject M5 migration scope creep"
+    );
+}
+
+// ── R3: bounded DB domain modules ──
+
+const SOURCE_SYNC_MODULE_PATH: &str = "crates/wenlan-core/src/db/source_sync.rs";
+const SOURCE_SYNC_METHODS: &[&str] = &[
+    "upsert_sync_state",
+    "get_sync_state",
+    "list_sync_state_paths",
+    "delete_sync_state",
+    "delete_all_sync_state",
+];
+const ONBOARDING_MILESTONES_MODULE_PATH: &str =
+    "crates/wenlan-core/src/db/onboarding_milestones.rs";
+const ONBOARDING_MILESTONES_METHODS: &[&str] = &[
+    "record_milestone",
+    "list_milestones",
+    "acknowledge_milestone",
+    "increment_milestone_shown_count",
+    "reset_onboarding_milestones",
+];
+
+fn db_domain_module_layout_violations(
+    db_source: &str,
+    module_source: &str,
+    module_exists: bool,
+    module_name: &str,
+    module_path: &str,
+    methods: &[&str],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if !module_exists {
+        violations.push(format!("DB domain module is missing: {module_path}"));
+    }
+
+    let declaration = format!("mod {module_name};");
+    if db_source.matches(&declaration).count() != 1 {
+        violations.push(format!("db.rs must declare {declaration} exactly once"));
+    }
+    if module_source.matches("impl MemoryDB").count() != 1 {
+        violations.push(format!(
+            "{module_name} must contain exactly one MemoryDB implementation"
+        ));
+    }
+
+    for method in methods {
+        let definition = format!("pub async fn {method}(");
+        if db_source.contains(&definition) {
+            violations.push(format!(
+                "db.rs still contains the {module_name} method body: {method}"
+            ));
+        }
+        if !module_source.contains(&definition) {
+            violations.push(format!("{module_name} module is missing method: {method}"));
+        }
+        if module_source.matches(&definition).count() > 1 {
+            violations.push(format!(
+                "{module_name} module defines {method} more than once"
+            ));
+        }
+    }
+
+    let expected_visible_methods: BTreeSet<String> =
+        methods.iter().map(|method| (*method).to_string()).collect();
+    let actual_visible_methods: BTreeSet<String> = module_source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let after_visibility = if let Some(rest) = line.strip_prefix("pub ") {
+                rest
+            } else if let Some(rest) = line.strip_prefix("pub(") {
+                let close = rest.find(')')?;
+                rest[close + 1..].trim_start()
+            } else {
+                return None;
+            };
+            let after_async = after_visibility
+                .strip_prefix("async ")
+                .unwrap_or(after_visibility);
+            let after_fn = after_async.strip_prefix("fn ")?;
+            let name = after_fn
+                .split(|character: char| {
+                    character == '(' || character == '<' || character.is_whitespace()
+                })
+                .next()?;
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect();
+    if actual_visible_methods != expected_visible_methods {
+        violations.push(format!(
+            "{module_name} visible method set drifted: expected {expected_visible_methods:?}, \
+             found {actual_visible_methods:?}"
+        ));
+    }
+    violations
+}
+
+#[test]
+fn source_sync_methods_live_in_one_bounded_domain_module() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let module_path = root.join(SOURCE_SYNC_MODULE_PATH);
+    let module_source = std::fs::read_to_string(&module_path).unwrap_or_default();
+    let violations = db_domain_module_layout_violations(
+        &db_source,
+        &module_source,
+        module_path.is_file(),
+        "source_sync",
+        SOURCE_SYNC_MODULE_PATH,
+        SOURCE_SYNC_METHODS,
+    );
+
+    assert!(
+        violations.is_empty(),
+        "R3 source-sync boundary drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn onboarding_milestone_methods_live_in_one_bounded_domain_module() {
+    let root = repo_root();
+    let db_source =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/db.rs")).expect("read db.rs");
+    let module_path = root.join(ONBOARDING_MILESTONES_MODULE_PATH);
+    let module_source = std::fs::read_to_string(&module_path).unwrap_or_default();
+    let violations = db_domain_module_layout_violations(
+        &db_source,
+        &module_source,
+        module_path.is_file(),
+        "onboarding_milestones",
+        ONBOARDING_MILESTONES_MODULE_PATH,
+        ONBOARDING_MILESTONES_METHODS,
+    );
+
+    assert!(
+        violations.is_empty(),
+        "R3 onboarding-milestones boundary drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn db_domain_guard_rejects_missing_duplicate_inline_and_visible_scope_drift() {
+    let db_source = concat!(
+        "mod source_sync;\n",
+        "mod source_sync;\n",
+        "impl MemoryDB { pub async fn upsert_sync_state(&self) {} }\n",
+    );
+    let module_source = concat!(
+        "impl MemoryDB {\n",
+        "pub async fn upsert_sync_state(&self) {}\n",
+        "pub async fn upsert_sync_state(&self) {}\n",
+        "pub async fn get_sync_state(&self) {}\n",
+        "pub async fn list_sync_state_paths(&self) {}\n",
+        "pub async fn delete_sync_state(&self) {}\n",
+        "pub fn unrelated_domain_method(&self) {}\n",
+        "pub(crate) async fn unrelated_crate_method(&self) {}\n",
+        "pub(super) fn unrelated_parent_method(&self) {}\n",
+        "}\n",
+        "impl MemoryDB {}\n",
+    );
+    let violations = db_domain_module_layout_violations(
+        db_source,
+        module_source,
+        false,
+        "source_sync",
+        SOURCE_SYNC_MODULE_PATH,
+        SOURCE_SYNC_METHODS,
+    );
+
+    for expected in [
+        "DB domain module is missing",
+        "must declare mod source_sync; exactly once",
+        "exactly one MemoryDB implementation",
+        "still contains",
+        "missing method: delete_all_sync_state",
+        "defines upsert_sync_state more than once",
+        "visible method set drifted",
+    ] {
+        assert!(
+            violations.iter().any(|item| item.contains(expected)),
+            "positive control did not trigger {expected:?}: {violations:?}"
+        );
+    }
+    let visible_drift = violations
+        .iter()
+        .find(|item| item.contains("visible method set drifted"))
+        .expect("positive control must reject unrelated visible methods");
+    for unexpected in [
+        "unrelated_domain_method",
+        "unrelated_crate_method",
+        "unrelated_parent_method",
+    ] {
+        assert!(
+            visible_drift.contains(unexpected),
+            "positive control did not detect visible method {unexpected}: {visible_drift}"
+        );
+    }
 }

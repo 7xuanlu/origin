@@ -269,30 +269,15 @@ async fn evaluate_condition<Q: AsRef<str>>(
 
 /// Count corpus tokens from all memories in a DB.
 async fn count_corpus_tokens(db: &MemoryDB) -> Result<(usize, usize), WenlanError> {
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT content FROM memories WHERE chunk_index = 0 \
-             AND supersede_mode <> 'archive'",
-            (),
-        )
-        .await
-        .map_err(|e| WenlanError::Generic(format!("count_corpus: {e}")))?;
+    let contents = db.eval_pipeline_corpus_contents().await?;
+    Ok(summarize_corpus_contents(&contents))
+}
 
-    let mut total_tokens = 0usize;
-    let mut count = 0usize;
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::Generic(e.to_string()))?
-    {
-        let content: String = row
-            .get(0)
-            .map_err(|e| WenlanError::Generic(e.to_string()))?;
-        total_tokens += count_tokens(&content);
-        count += 1;
-    }
-    Ok((total_tokens, count))
+fn summarize_corpus_contents(contents: &[String]) -> (usize, usize) {
+    (
+        contents.iter().map(|content| count_tokens(content)).sum(),
+        contents.len(),
+    )
 }
 
 /// Expand evidence sets to include merged/distilled source_ids.
@@ -306,43 +291,23 @@ async fn expand_evidence_for_distillation(
     db: &MemoryDB,
     original_evidence: &[HashSet<String>],
 ) -> Result<Vec<HashSet<String>>, WenlanError> {
-    let conn = db.conn.lock().await;
+    let pairs = db.eval_pipeline_evidence_pairs().await?;
+    Ok(expand_evidence_with_pairs(original_evidence, pairs))
+}
 
+fn expand_evidence_with_pairs(
+    original_evidence: &[HashSet<String>],
+    pairs: Vec<(String, String)>,
+) -> Vec<HashSet<String>> {
     // Build reverse map: memory_source_id -> [concept merged source_ids]
     // Uses the concept_sources join table (PR4) for precise lineage tracking.
-    let mut rows = conn
-        .query(
-            "SELECT cs.memory_source_id, m.source_id AS concept_mem_sid \
-             FROM concept_sources cs \
-             JOIN concepts c ON cs.concept_id = c.id \
-             JOIN memories m ON m.source_id LIKE 'merged_%' \
-               AND m.chunk_index = 0 \
-               AND m.entity_id = c.entity_id \
-             WHERE c.status = 'active'",
-            (),
-        )
-        .await
-        .map_err(|e| WenlanError::Generic(format!("expand_evidence: {e}")))?;
-
     let mut mem_to_concepts: HashMap<String, Vec<String>> = HashMap::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::Generic(e.to_string()))?
-    {
-        let memory_sid: String = row
-            .get(0)
-            .map_err(|e| WenlanError::Generic(e.to_string()))?;
-        let concept_sid: String = row
-            .get(1)
-            .map_err(|e| WenlanError::Generic(e.to_string()))?;
+    for (memory_sid, concept_sid) in pairs {
         mem_to_concepts
             .entry(memory_sid)
             .or_default()
             .push(concept_sid);
     }
-    drop(rows);
-    drop(conn);
 
     let mut expanded: Vec<HashSet<String>> = original_evidence.to_vec();
     for evidence_set in &mut expanded {
@@ -357,7 +322,7 @@ async fn expand_evidence_for_distillation(
         }
     }
 
-    Ok(expanded)
+    expanded
 }
 
 /// Run LoCoMo through Wenlan's full pipeline: flat, enriched, distilled.
@@ -961,4 +926,52 @@ pub async fn run_longmemeval_pipeline_eval(
         aggregate,
         per_conversation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_summary_counts_bpe_tokens_and_every_raw_row() {
+        let contents = vec![
+            "alpha beta".to_string(),
+            String::new(),
+            "alpha beta".to_string(),
+        ];
+        let expected_tokens: usize = contents.iter().map(|content| count_tokens(content)).sum();
+
+        assert_eq!(
+            summarize_corpus_contents(&contents),
+            (expected_tokens, 3),
+            "empty and duplicate raw rows still contribute to the caller-owned row count"
+        );
+        assert!(expected_tokens > 0);
+    }
+
+    #[test]
+    fn evidence_expansion_keeps_originals_matches_only_and_collapses_duplicate_additions() {
+        let original = vec![
+            HashSet::from(["evidence-good".to_string(), "untouched".to_string()]),
+            HashSet::from(["other".to_string()]),
+        ];
+        let expanded = expand_evidence_with_pairs(
+            &original,
+            vec![
+                ("evidence-good".to_string(), "merged-good".to_string()),
+                ("evidence-good".to_string(), "merged-good".to_string()),
+                ("not-present".to_string(), "merged-unused".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            expanded[0],
+            HashSet::from([
+                "evidence-good".to_string(),
+                "untouched".to_string(),
+                "merged-good".to_string(),
+            ])
+        );
+        assert_eq!(expanded[1], original[1]);
+    }
 }

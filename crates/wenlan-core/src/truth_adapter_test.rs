@@ -28,7 +28,7 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
             .unwrap();
     }
     {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         // `human_reviewed = 1` is CHECK-bound to the version + digest it was
         // reviewed at, so a review cannot outlive the prose it approved.
         conn.execute(

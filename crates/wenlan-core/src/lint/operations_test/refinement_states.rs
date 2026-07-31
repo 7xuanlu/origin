@@ -216,7 +216,7 @@ async fn malformed_lint_repair_review_contracts_are_findings() {
             lint_review_payload(&format!("{:064x}", 19), &one_owner),
         ),
     ];
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for (id, source_ids, payload) in rows {
         conn.execute(
             "INSERT INTO refinement_queue

@@ -76,8 +76,7 @@ async fn selected_runner_keeps_global_errors_without_evidence() {
     use std::os::unix::fs::symlink;
 
     let (db, _tmp) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO spaces (id, name, created_at, updated_at) \
