@@ -930,10 +930,20 @@ fn test_module_contract_violations(
     violations
 }
 
-fn read_if_present(root: &Path, path: &str) -> Option<String> {
+fn normalize_source_newlines(source: String) -> String {
+    source.replace("\r\n", "\n")
+}
+
+fn read_source(root: &Path, path: &str) -> String {
     let path = root.join(path);
-    path.is_file()
-        .then(|| std::fs::read_to_string(path).expect("read daemon child source"))
+    normalize_source_newlines(
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+    )
+}
+
+fn read_if_present(root: &Path, path: &str) -> Option<String> {
+    root.join(path).is_file().then(|| read_source(root, path))
 }
 
 fn declarations_named<'a>(
@@ -1592,16 +1602,15 @@ fn repo_root() -> PathBuf {
 #[test]
 fn daemon_structure_matches_expected_phase() {
     let root = repo_root();
-    let phase_source =
-        std::fs::read_to_string(root.join(PHASE_FILE)).expect("read R7 phase marker");
+    let phase_source = read_source(&root, PHASE_FILE);
     let phase = Phase::parse(&phase_source).expect("closed R7 phase vocabulary");
     assert_eq!(
         phase,
         Phase::Final,
         "R7 daemon decomposition is finalized; expected \"final\", got {phase:?}"
     );
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
-    let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+    let main = read_source(&root, MAIN_ROOT);
+    let scheduler = read_source(&root, SCHEDULER_ROOT);
     let violations = structure_violations(&root, phase, &main, &scheduler);
     assert!(
         violations.is_empty(),
@@ -1704,8 +1713,8 @@ fn daemon_structure_visibility_guard_rejects_public_or_duplicate_items() {
 #[test]
 fn reviewer_mutation_removed_repair_fence_is_rejected() {
     let root = repo_root();
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
-    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
+    let main = read_source(&root, MAIN_ROOT);
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
     let mutated_startup = startup.replacen(
         "select_startup_repair_fence(&pending_repairs",
         "removed_startup_repair_fence(&pending_repairs",
@@ -1715,8 +1724,8 @@ fn reviewer_mutation_removed_repair_fence_is_rejected() {
         mutated_startup, startup,
         "startup repair-fence mutation needle must exist"
     );
-    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
-    let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let scheduler = read_source(&root, SCHEDULER_ROOT);
     let violations = structure_violations_with_children(
         &root,
         Phase::Runtime,
@@ -1737,12 +1746,17 @@ fn reviewer_mutation_removed_repair_fence_is_rejected() {
 #[test]
 fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
     let root = repo_root();
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
-    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
-    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
-    let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+    let main = read_source(&root, MAIN_ROOT);
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let scheduler = read_source(&root, SCHEDULER_ROOT);
 
-    let crlf_runtime = runtime.replace("\r\n", "\n").replace('\n', "\r\n");
+    let crlf_runtime = runtime.replace('\n', "\r\n");
+    assert_eq!(
+        normalize_source_newlines(crlf_runtime.clone()),
+        runtime,
+        "structure fixtures must canonicalize Windows CRLF before mutation"
+    );
     let violations = runtime_carried_value_violations(&crlf_runtime, MAIN_RUNTIME_CHILD);
     assert!(
         violations.is_empty(),
@@ -1960,10 +1974,10 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
 #[test]
 fn reviewer_mutations_reject_scheduler_fence_snapshot_and_hidden_tasks() {
     let root = repo_root();
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
-    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
-    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
-    let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+    let main = read_source(&root, MAIN_ROOT);
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let scheduler = read_source(&root, SCHEDULER_ROOT);
     let without_snapshot = scheduler.replacen("let snapshot = {", "let omitted_snapshot = {", 1);
     let violations = structure_violations_with_children(
         &root,
@@ -2045,10 +2059,10 @@ fn hidden_ambient_task() {
 #[test]
 fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
     let root = repo_root();
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
-    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
-    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
-    let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+    let main = read_source(&root, MAIN_ROOT);
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let scheduler = read_source(&root, SCHEDULER_ROOT);
 
     for anchor in [
         "let config = wenlan_core::config::load_config(",
@@ -2106,10 +2120,10 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
 #[test]
 fn second_review_mutation_runtime_config_reload_is_rejected() {
     let root = repo_root();
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
-    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
-    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
-    let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+    let main = read_source(&root, MAIN_ROOT);
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let scheduler = read_source(&root, SCHEDULER_ROOT);
     for (injected, expected) in [
         (
             "let runtime_config = wenlan_core::config::load_config();",
@@ -2157,10 +2171,10 @@ fn second_review_mutation_runtime_config_reload_is_rejected() {
 #[test]
 fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
     let root = repo_root();
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
-    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
-    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
-    let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+    let main = read_source(&root, MAIN_ROOT);
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let scheduler = read_source(&root, SCHEDULER_ROOT);
 
     let reservation = r#"                let reservation = {
                     let state = shared.read().await;
