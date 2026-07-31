@@ -3,6 +3,15 @@
 #
 # https://nexte.st/docs/configuration/
 
+# Full-daemon process tests synchronously initialize FastEmbed before the
+# child publishes its port. The cross-process model-cache lock prevents
+# corruption, but under nextest concurrency it can also make these children
+# queue behind unrelated DB tests. Reserve the complete runner pool so startup
+# readiness is measured without artificial lock contention.
+[[profile.default.overrides]]
+filter = 'binary(=graceful_shutdown) | binary(=port_discovery)'
+threads-required = "num-test-threads"
+
 # The folder-ingest pipeline is normally well under a minute (23s in the
 # focused local run). If its queue stops making progress, fail with evidence
 # instead of occupying a CI runner for an hour.

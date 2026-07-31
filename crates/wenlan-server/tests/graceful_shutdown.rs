@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -44,6 +46,27 @@ fn prepare_isolated_data_dir(root: &Path) -> PathBuf {
     data_dir
 }
 
+fn read_daemon_logs(stdout_path: &Path, stderr_path: &Path) -> String {
+    let stdout = std::fs::read_to_string(stdout_path)
+        .unwrap_or_else(|error| format!("<failed to read stdout: {error}>"));
+    let stderr = std::fs::read_to_string(stderr_path)
+        .unwrap_or_else(|error| format!("<failed to read stderr: {error}>"));
+    format!("stdout:\n{stdout}\nstderr:\n{stderr}")
+}
+
+fn panic_startup_timeout(child: &mut ChildGuard, stdout_path: &Path, stderr_path: &Path) -> ! {
+    let status_before_cleanup = child.0.try_wait().expect("poll daemon child");
+    if status_before_cleanup.is_none() {
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+    }
+    panic!(
+        "daemon port discovery timed out after {STARTUP_READY_TIMEOUT:?}; \
+         status before cleanup: {status_before_cleanup:?}\n{}",
+        read_daemon_logs(stdout_path, stderr_path)
+    );
+}
+
 async fn start_mock_provider(
     delay: Duration,
 ) -> (SocketAddr, Arc<Notify>, tokio::task::JoinHandle<()>) {
@@ -74,6 +97,8 @@ async fn start_daemon() -> RunningDaemon {
     let tempdir = tempfile::tempdir().unwrap();
     let data_dir = prepare_isolated_data_dir(tempdir.path());
     let port_file = tempdir.path().join("port");
+    let stdout_path = tempdir.path().join("daemon.stdout.log");
+    let stderr_path = tempdir.path().join("daemon.stderr.log");
     let child = Command::new(binary_path())
         .env("WENLAN_BIND_ADDR", "127.0.0.1:0")
         // Keep the child isolated from both durable user config and data. The
@@ -85,16 +110,23 @@ async fn start_daemon() -> RunningDaemon {
         // or eagerly load a reranker before announcing its port.
         .env_remove("WENLAN_RERANKER_MODE")
         .env_remove("WENLAN_RERANKER_ENABLED")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(
+            std::fs::File::create(&stdout_path).expect("create daemon stdout log"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create daemon stderr log"),
+        ))
         .spawn()
         .expect("spawn wenlan-server");
     let mut child = ChildGuard(child);
 
-    let port = tokio::time::timeout(Duration::from_secs(30), async {
+    let port = tokio::time::timeout(STARTUP_READY_TIMEOUT, async {
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
-                panic!("daemon exited before announcing its port: {status}");
+                panic!(
+                    "daemon exited before announcing its port: {status}\n{}",
+                    read_daemon_logs(&stdout_path, &stderr_path)
+                );
             }
             if let Ok(contents) = std::fs::read_to_string(&port_file) {
                 break contents.trim().parse::<u16>().expect("valid daemon port");
@@ -103,7 +135,7 @@ async fn start_daemon() -> RunningDaemon {
         }
     })
     .await
-    .expect("daemon port discovery timed out");
+    .unwrap_or_else(|_| panic_startup_timeout(&mut child, &stdout_path, &stderr_path));
 
     RunningDaemon {
         child,
