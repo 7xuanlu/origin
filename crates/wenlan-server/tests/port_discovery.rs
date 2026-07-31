@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn binary_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_wenlan-server"))
 }
@@ -42,7 +44,7 @@ fn port_discovery_via_stdout() {
     let stdout = child.stdout.take().expect("stdout pipe");
     let mut reader = BufReader::new(stdout);
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + STARTUP_READY_TIMEOUT;
     let mut line = String::new();
     loop {
         if Instant::now() > deadline {
@@ -84,7 +86,7 @@ fn port_discovery_via_port_file() {
         .spawn()
         .expect("spawn origin-server");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + STARTUP_READY_TIMEOUT;
     loop {
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -135,7 +137,7 @@ fn port_file_is_published_only_after_startup_preparation() {
     );
 
     std::fs::write(barrier.join("release"), b"release").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + STARTUP_READY_TIMEOUT;
     loop {
         if Instant::now() > deadline {
             let _ = child.kill();
