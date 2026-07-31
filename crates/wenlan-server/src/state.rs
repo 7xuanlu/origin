@@ -145,6 +145,12 @@ pub struct ServerState {
     /// Core rejects repair operations on platforms without the required
     /// owner-only permissions and directory-sync durability.
     pub repair_root: Option<PathBuf>,
+    /// Where the app's per-install presence secret lives — the same data
+    /// directory the app passes this process as `WENLAN_DATA_DIR`. The daemon
+    /// only ever reads it. `None`, or a directory with no secret in it, means
+    /// presence cannot be checked, which refuses every presence-requiring
+    /// mutation rather than waving it through (threat model §5).
+    pub presence_root: Option<PathBuf>,
     /// True only while startup recovery intentionally suppresses optional
     /// providers, rerankers, and background runtime workers.
     pub optional_runtime_workers_suspended: bool,
@@ -180,6 +186,7 @@ impl Default for ServerState {
             reflection_debouncer: ReflectionDebouncer::new(),
             ingest_batcher: None,
             repair_root: None,
+            presence_root: None,
             optional_runtime_workers_suspended: false,
             lint_config: LintServerConfig::default(),
             lint_observer: Arc::new(NoopLintRunObserver),

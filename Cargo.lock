@@ -5795,6 +5795,8 @@ dependencies = [
  "file-rotate",
  "fs2",
  "futures",
+ "hex",
+ "hmac",
  "libsql",
  "openssl-sys",
  "reqwest",

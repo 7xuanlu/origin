@@ -60,6 +60,7 @@ pub(super) async fn prepare_startup_state(
     server_state.brief_status_root = Some(brief_status_root.clone());
     server_state.optional_runtime_workers_suspended = repair_recovery_pending;
     server_state.repair_root = Some(repair_store.root().to_path_buf());
+    server_state.presence_root = Some(wenlan_root.clone());
     let startup_repair_authority = match startup_repair_claim.as_ref() {
         Some(claim) => Some(claim.apply_request()?),
         None => startup_repair_fence
