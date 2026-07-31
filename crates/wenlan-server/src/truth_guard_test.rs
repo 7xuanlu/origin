@@ -306,3 +306,84 @@ async fn the_cutover_is_off_on_a_freshly_migrated_database() {
     let (_state, db, _tmp) = db_state().await;
     assert_eq!(db.truth_cutover_generation().await.unwrap(), 0);
 }
+
+// ---- both axes reaching the wire on a named-page read ----------------------
+
+/// Page ids are validated against `page_<uuid-v4>`, so the short `pg1` the
+/// shape tests above use cannot name a row that actually exists.
+const NAMED_PAGE_ID: &str = "page_00000000-0000-4000-8000-000000000001";
+
+/// End to end, through the real router: header to grant to adapter to JSON.
+///
+/// `truth_adapter` proves the axes are attached; only this proves they arrive.
+/// Three seams sit between the two — the guard resolving the grant, the handler
+/// asking for `TruthView`, and the handler passing that grant to `filter_page`
+/// — and a break in any of them leaves the adapter correct and the client blind.
+#[tokio::test]
+async fn a_named_page_read_returns_both_axes_after_the_cutover() {
+    let (state, db, _tmp) = db_state().await;
+    db.create_page_draft_with_id(NAMED_PAGE_ID, "Page One", "body", None, None)
+        .await
+        .unwrap();
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    let response = crate::router::build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/pages/{NAMED_PAGE_ID}"))
+                .header("x-agent-name", "test-agent")
+                .header(INTENT_HEADER, "explicit")
+                .header(CONTRACT_HEADER, "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+        .await
+        .unwrap();
+    let decoded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        decoded["page"]["content"], "body",
+        "the page the call named opens in full"
+    );
+    assert_eq!(
+        decoded["page"]["truth"],
+        serde_json::json!({ "supported": false, "human_reviewed": false }),
+        "and arrives with the state the client is contracted to render: {decoded}"
+    );
+}
+
+/// The same read from a caller that neither declared the contract nor gestured.
+/// It renders no axes, so it is handed none, and its wire stays the pre-M5
+/// shape byte for byte.
+#[tokio::test]
+async fn an_automatic_page_read_carries_no_axes() {
+    let (state, db, _tmp) = db_state().await;
+    db.create_page_draft_with_id(NAMED_PAGE_ID, "Page One", "body", None, None)
+        .await
+        .unwrap();
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    let response = crate::router::build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/pages/{NAMED_PAGE_ID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+        .await
+        .unwrap();
+    let decoded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        decoded["page"]["truth"].is_null(),
+        "an automatic reader must see the pre-M5 page shape: {decoded}"
+    );
+}
