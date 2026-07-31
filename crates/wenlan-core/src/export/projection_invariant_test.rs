@@ -32,12 +32,27 @@ use std::path::Path;
 ///
 /// The cutover stays at 0 here; each test advances it itself, so the inert case
 /// and the live case are seeded identically and differ in one value.
+/// The body every fixture page is stored with. Named because a review has to be
+/// stamped with the digest the page actually hashes to -- a placeholder digest
+/// is a review of text that is not there, and `page_truth_states` will not count
+/// it.
+const FIXTURE_PAGE_BODY: &str = "the page body";
+
 async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
     let (db, temp) = test_db().await;
     for id in ["p1", "p2", "p3"] {
-        db.insert_page(id, id, None, "", None, None, &[], "2026-07-27T00:00:00Z")
-            .await
-            .unwrap();
+        db.insert_page(
+            id,
+            id,
+            None,
+            FIXTURE_PAGE_BODY,
+            None,
+            None,
+            &[],
+            "2026-07-27T00:00:00Z",
+        )
+        .await
+        .unwrap();
     }
     {
         let conn = db.test_primary_session().await;
@@ -707,12 +722,13 @@ async fn a_human_reviewed_page_keeps_its_file_after_a_failed_judgement() {
     let (db, _tmp) = db_with_truth_rows().await;
     {
         let conn = db.test_primary_session().await;
+        let digest = crate::provenance::revision_content_digest(FIXTURE_PAGE_BODY);
         conn.execute(
             "UPDATE page_truth_state
                 SET human_reviewed=1, reviewed_page_version=1,
-                    reviewed_page_digest='deadbeef'
+                    reviewed_page_digest=?1
               WHERE page_id='p2'",
-            (),
+            libsql::params![digest],
         )
         .await
         .unwrap();
