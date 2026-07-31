@@ -98,11 +98,10 @@ fn valid() -> wenlan_types::requests::PresenceCapability {
     )
 }
 
-fn demand<'a>(targets: &'a [String], base_digest: &'a str) -> PresenceDemand<'a> {
+fn demand(targets: &[String]) -> PresenceDemand<'_> {
     PresenceDemand {
         action: PresenceAction::ReviewPage,
         target_ids: targets,
-        base_digest,
     }
 }
 
@@ -174,7 +173,7 @@ fn the_action_strings_are_the_ones_the_app_signs() {
 #[test]
 fn a_capability_the_app_minted_verifies() {
     let targets = targets();
-    let verified = verify(&valid(), SECRET, 1_010, &demand(&targets, "digest-a"))
+    let verified = verify(&valid(), SECRET, 1_010, &demand(&targets))
         .expect("a well-formed capability inside its window verifies");
     assert_eq!(verified.caller_id, "app");
     assert_eq!(verified.operation_id, "op-1");
@@ -198,7 +197,7 @@ fn a_capability_for_the_other_action_is_refused() {
     );
     let targets = targets();
     assert_eq!(
-        verify(&attest, SECRET, 1_010, &demand(&targets, "digest-a")),
+        verify(&attest, SECRET, 1_010, &demand(&targets)),
         Err(PresenceRefusal::Invalid)
     );
 }
@@ -208,19 +207,34 @@ fn a_capability_for_the_other_action_is_refused() {
 fn a_capability_for_a_different_page_is_refused() {
     let elsewhere = vec!["page-2".to_string()];
     assert_eq!(
-        verify(&valid(), SECRET, 1_010, &demand(&elsewhere, "digest-a")),
+        verify(&valid(), SECRET, 1_010, &demand(&elsewhere)),
         Err(PresenceRefusal::Invalid)
     );
 }
 
-/// T6: the page changed between the gesture and the submit, so the human
-/// approved text that is no longer there.
+/// T6's half that belongs here: the content digest is signed, so it is not a
+/// field a caller can adjust to fit whatever the page says now.
+///
+/// Whether the digest still matches the live page is the *other* half, and it
+/// is not asked here — answering it needs a page read, and this function runs
+/// before the daemon has verified it is talking to anyone at all. That check
+/// lives beside the mutation, where the refusal is `presence_conflict`.
 #[test]
-fn a_capability_bound_to_content_that_has_since_changed_is_refused() {
+fn the_content_binding_cannot_be_edited_to_fit_the_page() {
     let targets = targets();
+    let mut retargeted = valid();
+    retargeted.base_digest = "digest-b".to_string();
     assert_eq!(
-        verify(&valid(), SECRET, 1_010, &demand(&targets, "digest-b")),
-        Err(PresenceRefusal::Invalid)
+        verify(&retargeted, SECRET, 1_010, &demand(&targets)),
+        Err(PresenceRefusal::Invalid),
+        "the base digest is signed; rewriting it breaks the MAC"
+    );
+    assert_eq!(
+        verify(&valid(), SECRET, 1_010, &demand(&targets))
+            .expect("the untouched capability verifies")
+            .base_digest,
+        "digest-a",
+        "and the signed digest is handed to the caller to check against the page"
     );
 }
 
@@ -229,9 +243,9 @@ fn a_capability_bound_to_content_that_has_since_changed_is_refused() {
 #[test]
 fn a_capability_is_dead_the_instant_its_window_closes() {
     let targets = targets();
-    assert!(verify(&valid(), SECRET, 1_059, &demand(&targets, "digest-a")).is_ok());
+    assert!(verify(&valid(), SECRET, 1_059, &demand(&targets)).is_ok());
     assert_eq!(
-        verify(&valid(), SECRET, 1_060, &demand(&targets, "digest-a")),
+        verify(&valid(), SECRET, 1_060, &demand(&targets)),
         Err(PresenceRefusal::Expired)
     );
 }
@@ -253,7 +267,7 @@ fn a_capability_minted_against_a_different_secret_is_refused() {
     );
     let targets = targets();
     assert_eq!(
-        verify(&forged, SECRET, 1_010, &demand(&targets, "digest-a")),
+        verify(&forged, SECRET, 1_010, &demand(&targets)),
         Err(PresenceRefusal::Invalid)
     );
 }
@@ -269,16 +283,11 @@ fn a_tampered_mac_is_refused_as_bluntly_as_anything_else() {
     let targets = targets();
 
     assert_eq!(
-        verify(&tampered, SECRET, 1_010, &demand(&targets, "digest-a")),
+        verify(&tampered, SECRET, 1_010, &demand(&targets)),
         Err(PresenceRefusal::Invalid)
     );
     assert_eq!(
-        verify(
-            &unknown_action,
-            SECRET,
-            1_010,
-            &demand(&targets, "digest-a")
-        ),
+        verify(&unknown_action, SECRET, 1_010, &demand(&targets)),
         Err(PresenceRefusal::Invalid)
     );
 }
@@ -292,7 +301,7 @@ fn a_capability_from_a_later_protocol_version_is_refused() {
     newer.protocol_version = PROTOCOL_VERSION + 1;
     let targets = targets();
     assert_eq!(
-        verify(&newer, SECRET, 1_010, &demand(&targets, "digest-a")),
+        verify(&newer, SECRET, 1_010, &demand(&targets)),
         Err(PresenceRefusal::Invalid)
     );
 }
@@ -409,7 +418,7 @@ fn a_capability_whose_window_is_far_longer_than_the_protocol_allows_is_refused()
     );
     let targets = targets();
     assert_eq!(
-        verify(&submitted, SECRET, 1_000, &demand(&targets, "digest-a")),
+        verify(&submitted, SECRET, 1_000, &demand(&targets)),
         Err(PresenceRefusal::Invalid),
         "a ten-year presence capability is a standing forgery licence, not a gesture"
     );
@@ -425,7 +434,7 @@ fn the_apps_own_sixty_second_window_verifies_at_both_ends() {
     assert_eq!(submitted.expires_at - submitted.minted_at, 60);
     for now in [1_000, 1_059] {
         assert!(
-            verify(&submitted, SECRET, now, &demand(&targets, "digest-a")).is_ok(),
+            verify(&submitted, SECRET, now, &demand(&targets)).is_ok(),
             "the app's real 60-second window must verify at now={now}"
         );
     }
@@ -450,7 +459,7 @@ fn a_capability_that_expires_no_later_than_it_was_minted_is_refused() {
             SECRET,
         );
         assert_eq!(
-            verify(&submitted, SECRET, 900, &demand(&targets, "digest-a")),
+            verify(&submitted, SECRET, 900, &demand(&targets)),
             Err(PresenceRefusal::Invalid),
             "expires_at {expires_at} is not after minted_at 1000"
         );
@@ -467,12 +476,12 @@ fn a_capability_minted_further_ahead_than_clock_skew_explains_is_refused() {
     let targets = targets();
     let submitted = valid(); // minted_at 1_000
     assert_eq!(
-        verify(&submitted, SECRET, 990, &demand(&targets, "digest-a")),
+        verify(&submitted, SECRET, 990, &demand(&targets)),
         Err(PresenceRefusal::Invalid),
         "minted ten seconds in the daemon's future is a clock nobody should trust"
     );
     assert!(
-        verify(&submitted, SECRET, 996, &demand(&targets, "digest-a")).is_ok(),
+        verify(&submitted, SECRET, 996, &demand(&targets)).is_ok(),
         "four seconds of skew is the ordinary case and must still verify"
     );
 }

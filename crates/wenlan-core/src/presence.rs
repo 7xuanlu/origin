@@ -247,21 +247,29 @@ pub struct VerifiedPresence {
 /// What the caller is asking the capability to authorize. Every field is
 /// checked against the signed capability, so a mismatch is a refusal rather
 /// than a downgrade.
+///
+/// Deliberately holds nothing the daemon has to read a page to know. The
+/// content binding (T6) is checked by the caller, against the row it reads
+/// *after* the MAC verifies — otherwise a caller with a junk MAC could tell a
+/// missing page from an existing one by which refusal came back, and probe the
+/// page table without ever holding a capability.
 pub struct PresenceDemand<'a> {
     pub action: PresenceAction,
     /// Exactly the targets, in order. A capability naming more is not a
     /// capability for fewer.
     pub target_ids: &'a [String],
-    /// The digest of the content the daemon can actually see right now (T6).
-    pub base_digest: &'a str,
 }
 
 /// Check a submitted capability against the secret and the demand.
 ///
-/// Order matters only in that expiry is cheap and the MAC is not; both are
-/// checked, and a capability that fails either is refused. It does **not**
-/// touch the nonce store — replay is a database question, answered by the
-/// caller inside the mutation transaction (D7 §4, §6).
+/// Pure computation over the request and the secret: it reads no page, touches
+/// no nonce store, and cannot fail for any reason that depends on what is in the
+/// database. That is what lets the caller run it before touching a single row,
+/// so a caller holding a junk MAC learns nothing but `presence_invalid`.
+///
+/// The content binding it does not check is [`VerifiedPresence::base_digest`] —
+/// covered by the MAC, so it cannot be altered, but only the caller can say
+/// whether it still matches the page (D7 §4, §6).
 pub fn verify(
     submitted: &wenlan_types::requests::PresenceCapability,
     secret: &[u8],
@@ -276,10 +284,7 @@ pub fn verify(
         "review_page" => PresenceAction::ReviewPage,
         _ => return Err(PresenceRefusal::Invalid),
     };
-    if action != demand.action
-        || submitted.target_ids != demand.target_ids
-        || submitted.base_digest != demand.base_digest
-    {
+    if action != demand.action || submitted.target_ids != demand.target_ids {
         return Err(PresenceRefusal::Invalid);
     }
     // The window's shape, before its end. `now >= expires_at` can only refuse a

@@ -216,23 +216,47 @@ async fn a_client_that_cannot_read_the_secret_is_refused() {
     assert_eq!(body["error"], "presence_invalid");
 }
 
-/// T6 over the wire. The refusal says only that presence did not check out —
-/// not which digest was expected, which would hand a caller the exact value it
-/// needs to re-mint against content it never saw.
+/// T6 over the wire. A conflict, because the capability is genuine and the page
+/// moved under it — and the refusal says only that, never which digest was
+/// expected, which would hand a caller the exact value it needs to re-mint
+/// against content it never saw.
 #[tokio::test]
-async fn a_stale_gesture_is_refused_without_naming_the_live_digest() {
+async fn a_stale_gesture_conflicts_without_naming_the_live_digest() {
     let (state, _db, _tmp) = wired().await;
     let (status, body) = review(
         state,
         mint("op-1", "a digest of some older text", &[0xb1; 16], SECRET),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], "presence_invalid");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "presence_conflict");
     assert!(
         !body.to_string().contains(&body_digest()),
         "the live digest must not appear in a refusal: {body}"
     );
+}
+
+/// F3 at the route it was found in: the handler used to resolve the install
+/// secret and refuse before the request ever reached the ordering. A client
+/// whose response was dropped, retrying after the secret was replaced, was told
+/// 503 over a write that had already landed.
+#[tokio::test]
+async fn a_retry_after_the_secret_was_replaced_still_returns_the_stored_receipt() {
+    let (state, _db, tmp) = wired().await;
+    let cap = mint("op-1", &body_digest(), &[0xb1; 16], SECRET);
+
+    let (first_status, first) = review(state.clone(), cap.clone()).await;
+    assert_eq!(first_status, StatusCode::OK);
+
+    std::fs::remove_file(wenlan_core::presence::secret_path(tmp.path())).unwrap();
+
+    let (retry_status, retry) = review(state, cap).await;
+    assert_eq!(
+        retry_status,
+        StatusCode::OK,
+        "a retry of a mutation that already happened must not be answered 503: {retry}"
+    );
+    assert_eq!(retry, first, "and it must be the same receipt, unchanged");
 }
 
 /// T7 over the wire: the retry gets the same 200 and the same receipt.

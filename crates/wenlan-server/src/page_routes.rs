@@ -975,7 +975,6 @@ pub async fn handle_review_page(
     Json(request): Json<wenlan_types::requests::ReviewPageRequest>,
 ) -> Result<axum::response::Response, ServerError> {
     use axum::response::IntoResponse;
-    use wenlan_core::presence::PresenceRefusal;
 
     let (db, presence_root) = {
         let s = state.read().await;
@@ -987,20 +986,15 @@ pub async fn handle_review_page(
         )
     };
 
-    // No configured root is the same answer as no secret in it: presence cannot
-    // be checked, so the mutation is refused (§5). It never degrades to trusting
-    // the caller.
-    let secret = match presence_root
-        .as_deref()
-        .map(wenlan_core::presence::load_secret)
-    {
-        Some(Ok(secret)) => secret,
-        _ => return Ok(refusal_response(PresenceRefusal::Unavailable)),
-    };
-
+    // The root is handed over unresolved. Reading the secret here and refusing
+    // early would put `presence_unavailable` in front of the replay lookup, so a
+    // client retrying a dropped response after the secret was rotated would be
+    // told its write failed when it had already succeeded — the exact T7 case
+    // the ordering exists to prevent. No configured root is the same answer as
+    // no secret in it, and both are reached at the one place that answers them.
     let now = chrono::Utc::now().timestamp();
     let outcome = db
-        .review_page_with_presence(&request.presence, &id, &secret, now)
+        .review_page_with_presence(&request.presence, &id, presence_root.as_deref(), now)
         .await
         .map_err(ServerError::from)?;
 

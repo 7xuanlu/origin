@@ -17,6 +17,8 @@ const SECRET: &[u8; 32] = b"01234567890123456789012345678901";
 const PAGE: &str = "page_00000000-0000-4000-8000-0000000000a1";
 const BODY: &str = "the prose a human read";
 
+/// The daemon's data root, holding both the database and the install secret —
+/// the same directory the app writes the secret into.
 async fn db() -> (MemoryDB, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let emitter: std::sync::Arc<dyn crate::events::EventEmitter> =
@@ -25,7 +27,21 @@ async fn db() -> (MemoryDB, tempfile::TempDir) {
     db.create_page_draft_with_id(PAGE, "A Page", BODY, None, None)
         .await
         .expect("page");
+    plant_secret(tmp.path());
     (db, tmp)
+}
+
+/// Writes the secret with the mode the app writes. The default depends on the
+/// umask of whoever runs the tests, and a secret other users can read is
+/// refused.
+fn plant_secret(root: &std::path::Path) {
+    let path = presence::secret_path(root);
+    std::fs::write(&path, SECRET).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 /// The app's minting, reproduced independently of the encoder under test. If
@@ -114,11 +130,11 @@ async fn count(db: &MemoryDB, table: &str) -> i64 {
 
 #[tokio::test]
 async fn a_gesture_marks_the_page_and_leaves_a_receipt() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     assert!(!reviewed(&db).await, "nothing has reviewed this page yet");
 
     let outcome = db
-        .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, SECRET, 1_010)
+        .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     let super::ReviewOutcome::Applied(receipt) = outcome else {
@@ -138,14 +154,14 @@ async fn a_gesture_marks_the_page_and_leaves_a_receipt() {
 /// UPDATE would silently mark nothing for.
 #[tokio::test]
 async fn a_page_with_no_truth_row_yet_still_gets_marked() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     {
         let conn = db.conn.lock().await;
         conn.execute("DELETE FROM page_truth_state", ())
             .await
             .unwrap();
     }
-    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, SECRET, 1_010)
+    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     assert!(reviewed(&db).await);
@@ -156,14 +172,14 @@ async fn a_page_with_no_truth_row_yet_still_gets_marked() {
 /// supported or unsupported.
 #[tokio::test]
 async fn reviewing_a_page_says_nothing_about_its_support() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     {
         let conn = db.conn.lock().await;
         conn.execute("DELETE FROM page_truth_state", ())
             .await
             .unwrap();
     }
-    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, SECRET, 1_010)
+    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     let states = db.page_truth_states(&[PAGE.to_string()]).await.unwrap();
@@ -183,10 +199,10 @@ async fn reviewing_a_page_says_nothing_about_its_support() {
 /// that already got its write concludes it failed.
 #[tokio::test]
 async fn a_retry_after_the_capability_expired_replays_the_stored_answer() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     let cap = gesture("op-1", 0xa1);
     let first = db
-        .review_page_with_presence(&cap, PAGE, SECRET, 1_010)
+        .review_page_with_presence(&cap, PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     let super::ReviewOutcome::Applied(applied) = first else {
@@ -194,7 +210,7 @@ async fn a_retry_after_the_capability_expired_replays_the_stored_answer() {
     };
 
     let retry = db
-        .review_page_with_presence(&cap, PAGE, SECRET, 9_999)
+        .review_page_with_presence(&cap, PAGE, Some(root.path()), 9_999)
         .await
         .unwrap();
     let super::ReviewOutcome::Replayed(replayed) = retry else {
@@ -214,8 +230,8 @@ async fn a_retry_after_the_capability_expired_replays_the_stored_answer() {
 /// second under the first's authority.
 #[tokio::test]
 async fn reusing_an_operation_id_for_different_content_is_a_conflict() {
-    let (db, _tmp) = db().await;
-    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, SECRET, 1_010)
+    let (db, root) = db().await;
+    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
 
@@ -230,7 +246,7 @@ async fn reusing_an_operation_id_for_different_content_is_a_conflict() {
         SECRET,
     );
     let outcome = db
-        .review_page_with_presence(&elsewhere, PAGE, SECRET, 1_010)
+        .review_page_with_presence(&elsewhere, PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     assert!(
@@ -252,8 +268,8 @@ async fn reusing_an_operation_id_for_different_content_is_a_conflict() {
 /// the same failure T7 names by a different route.
 #[tokio::test]
 async fn a_re_minted_retry_of_the_same_intent_still_replays() {
-    let (db, _tmp) = db().await;
-    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, SECRET, 1_010)
+    let (db, root) = db().await;
+    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     let re_minted = mint(
@@ -267,7 +283,7 @@ async fn a_re_minted_retry_of_the_same_intent_still_replays() {
         SECRET,
     );
     let outcome = db
-        .review_page_with_presence(&re_minted, PAGE, SECRET, 2_010)
+        .review_page_with_presence(&re_minted, PAGE, Some(root.path()), 2_010)
         .await
         .unwrap();
     assert!(
@@ -281,8 +297,8 @@ async fn a_re_minted_retry_of_the_same_intent_still_replays() {
 /// lookup finds nothing.
 #[tokio::test]
 async fn one_nonce_cannot_be_spent_twice() {
-    let (db, _tmp) = db().await;
-    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, SECRET, 1_010)
+    let (db, root) = db().await;
+    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
 
@@ -297,7 +313,7 @@ async fn one_nonce_cannot_be_spent_twice() {
         SECRET,
     );
     let outcome = db
-        .review_page_with_presence(&same_nonce, PAGE, SECRET, 1_010)
+        .review_page_with_presence(&same_nonce, PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     assert!(
@@ -317,14 +333,21 @@ async fn one_nonce_cannot_be_spent_twice() {
 /// The crash-injection row of §8: consumption must share the mutation's
 /// transaction.
 ///
-/// The nonce is inserted first and the mark fails afterwards — an unknown page
-/// violates `page_truth_state`'s foreign key. If the two were separate
-/// transactions the nonce would be spent against no mutation, and the user's
-/// gesture would be gone with nothing to show for it. Here the rollback puts it
-/// back, and the same capability still works.
+/// Two things have to hold, and they are checked separately because only one of
+/// them is still reachable through the public entry point.
+///
+/// *Statement order:* the nonce goes in before the mark, and a failing mark
+/// propagates as an error rather than being swallowed. Driven directly here,
+/// with an unknown page violating `page_truth_state`'s foreign key — the
+/// entry point now reads the page inside the transaction and refuses a missing
+/// one before any insert, so this failure cannot be reached through it.
+///
+/// *Rollback:* the entry point's only non-`Applied` path is a `ROLLBACK`, so an
+/// error at that statement un-consumes the nonce. Checked below by rolling back
+/// and showing the same capability still applies.
 #[tokio::test]
 async fn a_failed_mark_leaves_the_nonce_unspent() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     let missing = "page_00000000-0000-4000-8000-0000000000ff";
     let doomed = mint(
         "review_page",
@@ -336,8 +359,6 @@ async fn a_failed_mark_leaves_the_nonce_unspent() {
         1_000,
         SECRET,
     );
-    // The page lookup refuses before the transaction, so drive the transaction
-    // directly to reach the failure this test is about.
     let verified = presence::verify(
         &doomed,
         SECRET,
@@ -345,15 +366,25 @@ async fn a_failed_mark_leaves_the_nonce_unspent() {
         &presence::PresenceDemand {
             action: PresenceAction::ReviewPage,
             target_ids: &[missing.to_string()],
-            base_digest: "whatever digest",
         },
     )
     .expect("the capability itself is well-formed");
 
-    let failed = db
-        .commit_page_review(&verified, missing, 1, "whatever digest", 1_010)
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        let failed = super::presence_review::apply_review_in_txn(
+            &conn,
+            &verified,
+            missing,
+            1,
+            "whatever digest",
+            1_010,
+        )
         .await;
-    assert!(failed.is_err(), "marking an unknown page must fail");
+        assert!(failed.is_err(), "marking an unknown page must fail");
+        conn.execute("ROLLBACK", ()).await.unwrap();
+    }
     assert_eq!(
         count(&db, "presence_nonces").await,
         0,
@@ -364,7 +395,7 @@ async fn a_failed_mark_leaves_the_nonce_unspent() {
     // And the proof that it is really unspent: the same nonce still works.
     let retry = gesture("op-1", 0xa1);
     assert!(matches!(
-        db.review_page_with_presence(&retry, PAGE, SECRET, 1_010)
+        db.review_page_with_presence(&retry, PAGE, Some(root.path()), 1_010)
             .await
             .unwrap(),
         super::ReviewOutcome::Applied(_)
@@ -373,9 +404,13 @@ async fn a_failed_mark_leaves_the_nonce_unspent() {
 
 /// T6, end to end: the page changed between the gesture and the submit, so the
 /// human approved text that is no longer there.
+///
+/// A conflict rather than an invalid. The capability is genuine and its digest
+/// is intact — what moved is the page — so the app's move is to show the human
+/// what is there now and ask again, not to go looking for a binding bug.
 #[tokio::test]
-async fn a_gesture_against_stale_content_is_refused() {
-    let (db, _tmp) = db().await;
+async fn a_gesture_against_stale_content_conflicts() {
+    let (db, root) = db().await;
     let stale = mint(
         "review_page",
         &[PAGE],
@@ -387,15 +422,15 @@ async fn a_gesture_against_stale_content_is_refused() {
         SECRET,
     );
     let outcome = db
-        .review_page_with_presence(&stale, PAGE, SECRET, 1_010)
+        .review_page_with_presence(&stale, PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     assert!(
         matches!(
             outcome,
-            super::ReviewOutcome::Refused(PresenceRefusal::Invalid)
+            super::ReviewOutcome::Refused(PresenceRefusal::Conflict)
         ),
-        "expected a refusal, got {outcome:?}"
+        "expected a conflict, got {outcome:?}"
     );
     assert!(!reviewed(&db).await);
 }
@@ -404,7 +439,7 @@ async fn a_gesture_against_stale_content_is_refused() {
 /// well-formed that does not verify, and nothing is written.
 #[tokio::test]
 async fn a_forged_capability_writes_nothing() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     let forged = mint(
         "review_page",
         &[PAGE],
@@ -416,7 +451,7 @@ async fn a_forged_capability_writes_nothing() {
         b"not the install secret, thirty-two",
     );
     let outcome = db
-        .review_page_with_presence(&forged, PAGE, SECRET, 1_010)
+        .review_page_with_presence(&forged, PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     assert!(
@@ -433,9 +468,9 @@ async fn a_forged_capability_writes_nothing() {
 /// §7: what lands in the tables is the digest, never the nonce.
 #[tokio::test]
 async fn the_stored_nonce_is_only_ever_a_digest() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     let cap = gesture("op-1", 0xa1);
-    db.review_page_with_presence(&cap, PAGE, SECRET, 1_010)
+    db.review_page_with_presence(&cap, PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
 
@@ -456,7 +491,7 @@ async fn the_stored_nonce_is_only_ever_a_digest() {
 /// the capability it belonged to is refused by expiry alone.
 #[tokio::test]
 async fn expired_nonces_are_reaped_by_the_next_write() {
-    let (db, _tmp) = db().await;
+    let (db, root) = db().await;
     {
         let conn = db.conn.lock().await;
         conn.execute(
@@ -470,7 +505,7 @@ async fn expired_nonces_are_reaped_by_the_next_write() {
     }
     assert_eq!(count(&db, "presence_nonces").await, 1);
 
-    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, SECRET, 1_010)
+    db.review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await
         .unwrap();
     assert_eq!(
@@ -485,7 +520,7 @@ async fn expired_nonces_are_reaped_by_the_next_write() {
 /// stays true is that a support write cannot reach it.
 #[tokio::test]
 async fn a_machine_verdict_never_sets_the_human_axis() {
-    let (db, _tmp) = db().await;
+    let (db, _root) = db().await;
     {
         let conn = db.conn.lock().await;
         // Written as an insert rather than an update because a page distilled
@@ -508,5 +543,226 @@ async fn a_machine_verdict_never_sets_the_human_axis() {
     assert!(
         !truth.human_reviewed,
         "a machine verdict must not confer human review"
+    );
+}
+
+/// T7, the case that made the ordering a finding rather than a preference: the
+/// install secret was replaced between the write and the retry.
+///
+/// A rotated secret is worse than an expired capability. Expiry lets the client
+/// re-mint; rotation means *nothing* it is holding can ever verify again. If the
+/// secret is resolved before the receipt lookup, the retry of a mutation that
+/// already succeeded is answered `presence_unavailable`, and the client
+/// correctly reads that as "my write did not happen".
+#[tokio::test]
+async fn a_retry_after_the_secret_was_replaced_still_replays() {
+    let (db, root) = db().await;
+    let cap = gesture("op-1", 0xa1);
+    let super::ReviewOutcome::Applied(applied) = db
+        .review_page_with_presence(&cap, PAGE, Some(root.path()), 1_010)
+        .await
+        .unwrap()
+    else {
+        panic!("first execution must apply");
+    };
+
+    std::fs::remove_file(presence::secret_path(root.path())).unwrap();
+
+    let retry = db
+        .review_page_with_presence(&cap, PAGE, Some(root.path()), 1_020)
+        .await
+        .unwrap();
+    let super::ReviewOutcome::Replayed(replayed) = retry else {
+        panic!("a retry of an applied mutation must replay, not refuse: {retry:?}");
+    };
+    assert_eq!(replayed.nonce_digest, applied.nonce_digest);
+    assert_eq!(replayed.verified_at, applied.verified_at);
+}
+
+/// The same, one step earlier: with no secret at all and no receipt on file,
+/// the answer is still `presence_unavailable`. The reordering must not turn a
+/// daemon that cannot check into one that waves the caller through.
+#[tokio::test]
+async fn a_first_attempt_without_a_secret_is_still_refused() {
+    let (db, root) = db().await;
+    std::fs::remove_file(presence::secret_path(root.path())).unwrap();
+    let outcome = db
+        .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            super::ReviewOutcome::Refused(PresenceRefusal::Unavailable)
+        ),
+        "expected unavailable, got {outcome:?}"
+    );
+    assert!(!reviewed(&db).await);
+    assert_eq!(count(&db, "presence_nonces").await, 0);
+}
+
+/// Idempotency has to be linearizable, not merely eventual.
+///
+/// Two deliveries of one request — the client retried, or a proxy duplicated it
+/// — race. With the lookup and the insert in separate transactions both see "no
+/// receipt", and the loser is told `presence_replayed` for a mutation it never
+/// performed: a refusal that a client is entitled to read as "somebody replayed
+/// my capability", over a write that succeeded. Every caller must come away
+/// with the same receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_deliveries_of_one_request_all_end_with_the_same_receipt() {
+    let (db, root) = db().await;
+    let db = std::sync::Arc::new(db);
+    let cap = std::sync::Arc::new(gesture("op-1", 0xa1));
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let db = db.clone();
+        let cap = cap.clone();
+        let path = root.path().to_path_buf();
+        handles.push(tokio::spawn(async move {
+            db.review_page_with_presence(&cap, PAGE, Some(&path), 1_010)
+                .await
+                .unwrap()
+        }));
+    }
+
+    let mut applied = Vec::new();
+    let mut replayed = Vec::new();
+    for handle in handles {
+        match handle.await.unwrap() {
+            super::ReviewOutcome::Applied(receipt) => applied.push(receipt),
+            super::ReviewOutcome::Replayed(receipt) => replayed.push(receipt),
+            other => panic!("a concurrent delivery must never be refused: {other:?}"),
+        }
+    }
+
+    assert_eq!(applied.len(), 1, "exactly one delivery may do the work");
+    assert_eq!(replayed.len(), 3, "the rest must replay the stored answer");
+    for receipt in &replayed {
+        assert_eq!(receipt.nonce_digest, applied[0].nonce_digest);
+        assert_eq!(receipt.verified_at, applied[0].verified_at);
+    }
+    assert_eq!(count(&db, "presence_receipts").await, 1);
+    assert_eq!(count(&db, "presence_nonces").await, 1);
+}
+
+/// A caller who is not going to be authorized must not learn which pages exist.
+///
+/// The discriminator is an *expired* capability, because that is where the two
+/// paths used to diverge: reading the page first, a missing one came back
+/// `presence_invalid` before expiry was ever considered, while an existing one
+/// got as far as the expiry check and came back `presence_expired`. Two answers,
+/// no capability required, and the page table is walkable one id at a time. A
+/// junk MAC alone never showed this — both cases answered `presence_invalid`
+/// either way — which is why the probe here is a capability that is well-formed
+/// and simply too old.
+#[tokio::test]
+async fn a_caller_who_will_be_refused_cannot_tell_which_pages_exist() {
+    let (db, root) = db().await;
+    let missing = "page_00000000-0000-4000-8000-0000000000ff";
+
+    let code = |outcome: &super::ReviewOutcome| match outcome {
+        super::ReviewOutcome::Refused(refusal) => refusal.code().to_string(),
+        other => panic!("this probe must be refused: {other:?}"),
+    };
+
+    // Well-formed, correctly signed, and long past its window.
+    let expired_here = gesture("op-1", 0xc3);
+    let expired_there = mint(
+        "review_page",
+        &[missing],
+        &body_digest(),
+        "app",
+        "op-2",
+        &[0xc4; 16],
+        1_000,
+        SECRET,
+    );
+    let against_existing = db
+        .review_page_with_presence(&expired_here, PAGE, Some(root.path()), 9_999)
+        .await
+        .unwrap();
+    let against_missing = db
+        .review_page_with_presence(&expired_there, missing, Some(root.path()), 9_999)
+        .await
+        .unwrap();
+    assert_eq!(
+        code(&against_existing),
+        code(&against_missing),
+        "an expired capability must not report whether the page exists"
+    );
+    assert_eq!(code(&against_existing), "presence_expired");
+
+    // And the same for a forgery, which was already indistinguishable and has
+    // to stay that way.
+    let forge = |target: &str, op: &str| {
+        mint(
+            "review_page",
+            &[target],
+            &body_digest(),
+            "prober",
+            op,
+            &[0xc5; 16],
+            1_000,
+            b"not the install secret, thirty-two",
+        )
+    };
+    let forged_existing = db
+        .review_page_with_presence(&forge(PAGE, "op-3"), PAGE, Some(root.path()), 1_010)
+        .await
+        .unwrap();
+    let forged_missing = db
+        .review_page_with_presence(&forge(missing, "op-4"), missing, Some(root.path()), 1_010)
+        .await
+        .unwrap();
+    assert_eq!(code(&forged_existing), code(&forged_missing));
+    assert_eq!(code(&forged_existing), "presence_invalid");
+
+    assert_eq!(count(&db, "presence_nonces").await, 0);
+    assert_eq!(count(&db, "presence_receipts").await, 0);
+}
+
+/// F1(a): the receipt has to describe what was actually marked.
+///
+/// Reading the page's version and digest before opening the transaction leaves
+/// a window for an edit to land in between, after which the stored receipt
+/// attests to content that was never the content marked. Reading inside the
+/// transaction closes it structurally — this pins the property the structure
+/// provides, so a later refactor that hoists the read back out fails here.
+#[tokio::test]
+async fn the_receipt_records_the_version_and_digest_that_were_marked() {
+    let (db, root) = db().await;
+    let super::ReviewOutcome::Applied(receipt) = db
+        .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
+        .await
+        .unwrap()
+    else {
+        panic!("must apply");
+    };
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT t.reviewed_page_version, t.reviewed_page_digest, p.version, p.content
+               FROM page_truth_state t JOIN pages p ON p.id = t.page_id
+              WHERE t.page_id = ?1",
+            libsql::params![PAGE],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let marked_version: i64 = row.get(0).unwrap();
+    let marked_digest: String = row.get(1).unwrap();
+    let live_version: i64 = row.get(2).unwrap();
+    let live_content: String = row.get(3).unwrap();
+
+    assert_eq!(receipt.reviewed_page_version, marked_version);
+    assert_eq!(receipt.reviewed_page_digest, marked_digest);
+    assert_eq!(marked_version, live_version);
+    assert_eq!(
+        marked_digest,
+        crate::provenance::revision_content_digest(&live_content),
+        "the mark must describe the row the transaction actually saw"
     );
 }
