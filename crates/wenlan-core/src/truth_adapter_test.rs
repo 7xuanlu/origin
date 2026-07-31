@@ -23,19 +23,34 @@ use crate::truth_contract::TruthGrant;
 async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
     let (db, temp) = test_db().await;
     for id in ["p1", "p2", "p3"] {
-        db.insert_page(id, id, None, "", None, None, &[], "2026-07-28T00:00:00Z")
-            .await
-            .unwrap();
+        db.insert_page(
+            id,
+            id,
+            None,
+            "the body prose",
+            None,
+            None,
+            &[],
+            "2026-07-28T00:00:00Z",
+        )
+        .await
+        .unwrap();
     }
     {
         let conn = db.test_primary_session().await;
         // `human_reviewed = 1` is CHECK-bound to the version + digest it was
-        // reviewed at, so a review cannot outlive the prose it approved.
+        // reviewed at, so a review cannot outlive the prose it approved. The
+        // digest here has to be the real one for the page's real body -- a
+        // review of anything else is a review of text that is not on the page,
+        // and `page_truth_states` will not count it.
+        let digest = crate::provenance::revision_content_digest("the body prose");
         conn.execute(
-            "INSERT INTO page_truth_state
-                (page_id,page_version,support_status,human_reviewed,
-                 reviewed_page_version,reviewed_page_digest,updated_at)
-             VALUES ('p1',1,'supported',1,1,'digest-of-p1-v1',1)",
+            &format!(
+                "INSERT INTO page_truth_state
+                    (page_id,page_version,support_status,human_reviewed,
+                     reviewed_page_version,reviewed_page_digest,updated_at)
+                 VALUES ('p1',1,'supported',1,1,'{digest}',1)"
+            ),
             (),
         )
         .await
