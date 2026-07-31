@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 Baseline: `origin/main@e4790ce857056050a90a4adeef391375e8ce5f19`
-Status: **R7-0 complete; R7-1 external test movement next**
+Status: **R7 complete; R8 verification-surface cleanup next**
 
 ## Authority and change control
 
@@ -5380,8 +5380,11 @@ R7-0 receipt, 2026-07-30:
 - Move the complete inline `bind_addr_tests` module to a binary-owned sibling
   test file and the complete scheduler `tests` module to
   `scheduler/scheduler_tests.rs`, preserving `use super::*`, cfg boundaries,
-  exact item bytes, test names, ignored markers, and environment-lock helpers.
-  Production code does not move.
+  normalized exact item bytes, test names, ignored markers, and
+  environment-lock helpers. The only path relocation normalization is the
+  scheduler test's two workspace-root `include_str!` paths gaining one `../`
+  after their file moves one directory deeper; both still select the same
+  root `Cargo.toml` and `Cargo.lock`. Production code does not move.
 - Preserve the exact binary module identity with
   `#[cfg(test)] #[path = "bind_addr_tests.rs"] mod bind_addr_tests;`. Two child
   tests re-exec the binary with `bind_addr_tests::...` filters; renaming the
@@ -5475,6 +5478,75 @@ R7-0 receipt, 2026-07-30:
   launch, a provider pin can fall through, a cursor/cooldown moves, the M5
   tuple/exposure changes, or a visibility exceeds `pub(super)`.
 
+#### R7 execution receipts — 2026-07-30
+
+- R7-1 committed as `42905548`. The complete binary test module moved to
+  `bind_addr_tests.rs` and the complete scheduler test module moved to
+  `scheduler/scheduler_tests.rs` with their module identities, names, ignored
+  attributes, and `use super::*` imports unchanged. A fresh syntactic
+  comparator de-indents the two old inline module bodies, applies canonical
+  rustfmt, and permits only the two required scheduler-test path relocations
+  `../../../Cargo.{toml,lock} → ../../../../Cargo.{toml,lock}`. It then matches
+  both external files byte-for-byte: binary SHA-256
+  `a0ac91751200e3db24a207a9dadc5ce6055851a94cbc605e744e1c6dc3b3dd83`,
+  scheduler SHA-256
+  `bd8f963a3edf6400770040a8240af5dbfba670a80ab065449bc866d20eec1209`.
+  The RED phase selected exactly one structure test and rejected both missing
+  child files plus both remaining inline modules. GREEN passed all `11`
+  structure controls, binary `27 / 27`, and scheduler `88` passed with the
+  same `2` ignored tests. The compiler inventories and ignored-name sets were
+  byte-identical before and after; M5 remained
+  `191 rows; depth 55/50/86; exposure 22`.
+- R7-2 committed as `7d628874`. One `734`-line startup body moved to the
+  private `startup::prepare_startup_state`; `_data_root_lock`,
+  `finish_recovery`, and shared-state construction stayed in the facade.
+  The carried `config`, reranker cache path, and deep-mode flag have one
+  producer and were not re-read. The focused RED rejected the absent child and
+  owner. GREEN passed structure `11 / 11`, binary `27 / 27`, isolated
+  port-discovery `3 / 3`, and the startup SIGTERM process characterization
+  `1 / 1`. The single startup reader moved one-for-one with unchanged M5
+  totals and exposure identities.
+- R7-3 committed as `b89f1b32`. The `166`-line optional-worker registration
+  body and `104`-line serve/drain body moved byte-for-byte to
+  `main/runtime.rs`; `finish_recovery`, the two facade snapshots, termination
+  waiter, and scheduler launch remained in `run_daemon`. The runtime child
+  owns the other three snapshots. GREEN passed structure `11 / 11`, binary
+  `27 / 27`, port discovery `3 / 3`, graceful shutdown `4 / 4`, and the exact
+  scheduler initial-delay test `1 / 1`. Binary and server-library inventories
+  remained `27 / 0 ignored` and `360 / 2 ignored`. Independent concurrency
+  and lifecycle/data-loss review returned **APPROVE / APPROVE** with no
+  blocker.
+- A test-only warnings-denied cleanup between R7-3 and R7-4 committed as
+  `785acfd2`. It changed only `daemon_structure_test.rs`: ten equivalent
+  `if/else` rewrites and nine redundant `Option<&str>::as_deref()` removals.
+  Sol blind review returned **APPROVE** and the final hard gates passed.
+  The Luna cost pilot receipt is deliberately task-class scoped:
+
+  | model / effort | task class | executor tokens | credits | wall | first pass | blockers | repairs | result |
+  |---|---|---:|---:|---:|---|---:|---|---|
+  | `gpt-5.6-luna / high` | test-only mechanical Clippy normalization | `1,314,809` input (`1,246,464` cached), `10,084` output, `3,961` reasoning | unavailable | `~77s` | no — one canonical rustfmt line wrap | `0` | `0` substantive; `1` formatter-only | accepted as `785acfd2`; no fallback/revert |
+
+  This single accepted slice is not evidence of global model equivalence.
+- R7-4 committed as `a35582f4`. The eleven ambient registry, scheduling,
+  provider, report, panic-boundary, execution, and document-slice items moved
+  to private `scheduler/ambient.rs`. Normalizing only required `pub(super)`
+  boundaries and canonical formatting reproduces the old item bytes. The root
+  retains `AmbientBudgetProvider`, `with_shared_automatic_budget`,
+  `spawn_scheduler`, its sole task and serial loop, maintenance provider
+  resolution, and maintenance panic boundary. The focused RED executed one
+  test and rejected the missing child, module declaration, and all eleven
+  wrong owners. GREEN passed all `11` structure controls, all `13` named exact
+  scheduler tests with `running 1 test`, full server lib `358 passed / 2
+  ignored`, binary `27 / 27`, all-target server Clippy, format, and diff
+  hygiene. Independent concurrency and provider/data-loss review returned
+  **APPROVE / APPROVE** with zero blocker.
+- The R7-4 generated M5 change contains three reader-identity relocations:
+  `reconcile_entity_page_parity` now points into the ambient match,
+  `run_ambient_job` moves to the child at `pub(super)`, and
+  `run_ambient_job_safe` moves to the child at `pub(super)`. The retained
+  root `fire_maintenance_stage_safe` row changes line number only. Regeneration
+  and check remain exactly `191 rows; depth 55/50/86; exposure 22`.
+
 #### R7 boundary
 
 - Advance the permanent tooth to `final`; record exact root/child/test line
@@ -5489,6 +5561,59 @@ R7-0 receipt, 2026-07-30:
 - Fable reviews this detailed R7 shape before R7-0 production scaffolding.
   Fable reopens the design only for a material lifecycle/module-boundary
   correction; ordinary movement findings remain Sol-owned.
+
+R7 boundary execution receipt, 2026-07-30:
+
+- The permanent phase marker is `final`; the exact live final-phase test and
+  all `11` structure controls pass. Final line counts are `main.rs 954`,
+  `main/startup.rs 763`, `main/runtime.rs 292`, `bind_addr_tests.rs 438`,
+  `scheduler.rs 1,943`, `scheduler/ambient.rs 619`, and
+  `scheduler/scheduler_tests.rs 3,647`.
+- The final definition/reference sets remain closed:
+  `run_daemon` is its definition plus the main dispatch;
+  `prepare_startup_state` is its definition plus one facade call;
+  `register_optional_runtime_workers` and `serve_and_drain` are each their
+  definition plus one facade call; `spawn_scheduler` is its definition, the
+  facade launch, and the existing initial-delay test;
+  `run_ambient_job_safe` is its child definition, one root-loop call, and four
+  tests; `run_ambient_job` is its child definition, the safe wrapper, and five
+  tests. No helper exceeds the frozen visibility ceiling.
+- The final binary inventory remains `27 / 27` with no ignored test. The
+  server-library inventory is `360` tests: `358` passed and the same two
+  ignored names,
+  `rb01_daemon_off_resource_baseline_can_open_gate` and
+  `rb01_profile_real_on_device_slice`. The external process suites pass
+  port discovery `3 / 3` and graceful shutdown `4 / 4`, including the
+  bind-during-startup SIGTERM characterization.
+- The first uninterrupted boundary workspace-library run correctly failed two
+  CI-routing teeth after the new platform-conditioned test owners moved. The
+  minimal fail-closed correction adds exactly five ownership rows:
+  `bind_addr_tests.rs` to macOS and Windows, `main/startup.rs` to macOS and
+  Windows, and `scheduler/scheduler_tests.rs` to macOS. `runtime.rs` and
+  `scheduler/ambient.rs` have no platform marker and remain absent. Both
+  formerly failing live teeth and the fail-open fixture positive control then
+  pass exactly one selected test each.
+- Compatibility gates pass: core `truth_ 77 / 77`, projection invariant
+  `20 / 20`, server truth guard `12 / 12`, and the exact R4 manifest,
+  raw-connection, permit-source, and cutover-setter guards `1 / 1` each. The
+  generated M5 check remains exactly
+  `191 rows; depth 55/50/86; exposure 22`; production generation remains `0`
+  and no truth-cutover command was run or applied.
+- The corrected uninterrupted `cargo test --workspace --lib --quiet` passes
+  CLI `32 / 32`, core `3,471` passed with `33` ignored, MCP `178 / 178`,
+  server `358` passed with `2` ignored, and types `183 / 183`: aggregate
+  `4,222` passed, `35` ignored, zero failed. Warnings-denied workspace
+  all-target Clippy, format check, and diff hygiene pass.
+- rust-analyzer reports no errors or warnings in the seven R7 root, child, and
+  tooth files; the only messages are expected inactive-platform hints in
+  `main.rs` and `main/startup.rs`. The earlier definition/reference checks and
+  ast-grep ownership controls agree with the exact sets above.
+- The final independent Sol/xhigh integrated review returned **APPROVE** with
+  zero correctness blocker, zero security blocker, and zero remaining evidence
+  mismatch. It independently replayed the normalized R7-1 comparator and
+  subprocess filters, exact R7-2/R7-3 body comparators, R7-4 item ownership,
+  lifecycle/concurrency/provider boundaries, all compatibility gates, the
+  minimal CI routing diff, visibility ceilings, and final reference sets.
 
 Fable gate, 2026-07-30:
 **APPROVE-WITH-FIXES.** Fable independently verified the M5 depth-two
