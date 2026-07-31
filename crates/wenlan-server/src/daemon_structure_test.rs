@@ -133,6 +133,12 @@ const RUNTIME_WORKER_ORDER: &[&str] = &[
     "LLM_READINESS_HOOK.set(",
 ];
 
+const RUNTIME_OPTIONAL_WORKER_SCOPES: &[&str] = &[
+    "if optional_runtime_workers_allowed(repair_recovery_pending) && deep_bgebase_pending {\n        let shared_for_deep = shared.clone();",
+    "if optional_runtime_workers_allowed(repair_recovery_pending) {\n        let selected_model = config",
+    "if optional_runtime_workers_allowed(repair_recovery_pending) {\n        let db_for_ready = db_arc.clone();",
+];
+
 const RUNTIME_SERVE_ORDER: &[&str] = &[
     "router::build_repair_router(",
     "listener.local_addr(",
@@ -721,6 +727,16 @@ fn suffix_after_unique<'a>(source: &'a str, anchor: &str, owner: &str) -> Result
 fn runtime_carried_value_violations(source: &str, owner: &str) -> Vec<String> {
     let code = mask_rust_non_code(source);
     let mut violations = unique_order_violations(&code, RUNTIME_WORKER_ORDER, owner);
+    for scope in RUNTIME_OPTIONAL_WORKER_SCOPES {
+        violations.extend(exact_token_count_violations(&code, scope, 1, owner));
+    }
+    violations.extend(runtime_recompute_violations(&code, owner));
+    violations
+}
+
+fn runtime_recompute_violations(source: &str, owner: &str) -> Vec<String> {
+    let code = mask_rust_non_code(source);
+    let mut violations = Vec::new();
     for path in [
         "load_config",
         "resolve_fastembed_cache_dir",
@@ -1446,6 +1462,10 @@ fn structure_violations_with_children(
         if let Some(source) = runtime.as_deref() {
             violations.extend(runtime_carried_value_violations(source, MAIN_RUNTIME_CHILD));
         }
+        violations.extend(runtime_recompute_violations(
+            &run_daemon,
+            "run_daemon runtime facade",
+        ));
     } else {
         match suffix_after_unique(&run_daemon, "let shared: SharedState", "run_daemon") {
             Ok(runtime_suffix) => violations.extend(runtime_carried_value_violations(
@@ -1688,14 +1708,15 @@ fn reviewer_mutation_removed_repair_fence_is_rejected() {
         mutated_startup, startup,
         "startup repair-fence mutation needle must exist"
     );
+    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
+        Phase::Runtime,
         &main,
         &scheduler,
         Some(&mutated_startup),
-        None,
+        Some(&runtime),
         None,
     );
     assert!(
@@ -1711,6 +1732,7 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
     let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
+    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
 
     let mutated_startup = startup.replacen(
@@ -1724,11 +1746,11 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
     );
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
+        Phase::Runtime,
         &main,
         &scheduler,
         Some(&mutated_startup),
-        None,
+        Some(&runtime),
         None,
     );
     assert!(
@@ -1736,6 +1758,60 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
             .iter()
             .any(|violation| violation.contains("enforce_projection_directory_invariant")),
         "live startup projection mutation must be rejected: {violations:?}"
+    );
+
+    let removed_optional_guard = runtime.replacen(
+        "if optional_runtime_workers_allowed(repair_recovery_pending) && deep_bgebase_pending {",
+        "if deep_bgebase_pending {",
+        1,
+    );
+    assert_ne!(
+        removed_optional_guard, runtime,
+        "deep-reranker optional-worker guard must exist"
+    );
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::Runtime,
+        &main,
+        &scheduler,
+        Some(&startup),
+        Some(&removed_optional_guard),
+        None,
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("optional_runtime_workers_allowed")
+                && violation.contains("register_optional_runtime_workers")
+        }),
+        "optional-worker guard removal must be rejected by the live runtime tooth: {violations:?}"
+    );
+
+    let scope_anchor =
+        "if optional_runtime_workers_allowed(repair_recovery_pending) {\n        let selected_model = config";
+    let drifted_scope = runtime.replacen(
+        scope_anchor,
+        "let selected_model = config;\n    if optional_runtime_workers_allowed(repair_recovery_pending) {",
+        1,
+    );
+    assert_ne!(
+        drifted_scope, runtime,
+        "on-device optional-worker scope must exist"
+    );
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::Runtime,
+        &main,
+        &scheduler,
+        Some(&startup),
+        Some(&drifted_scope),
+        None,
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("let selected_model = config")
+                && violation.contains("exactly 1 times, found 0")
+        }),
+        "optional-worker scope drift must be rejected by the live runtime tooth: {violations:?}"
     );
 
     for (needle, replacement, expected) in [
@@ -1760,15 +1836,18 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
             "let drained = tokio::time::timeout",
         ),
     ] {
-        let mutated = main.replacen(needle, replacement, 1);
-        assert_ne!(mutated, main, "mutation needle must exist: {needle}");
+        let mutated_runtime = runtime.replacen(needle, replacement, 1);
+        assert_ne!(
+            mutated_runtime, runtime,
+            "runtime mutation needle must exist: {needle}"
+        );
         let violations = structure_violations_with_children(
             &root,
-            Phase::StartupState,
-            &mutated,
+            Phase::Runtime,
+            &main,
             &scheduler,
             Some(&startup),
-            None,
+            Some(&mutated_runtime),
             None,
         );
         assert!(
@@ -1779,6 +1858,68 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
         );
     }
 
+    let scheduler_serve_reordered = main
+        .replacen("runtime::serve_and_drain(", "removed_serve_and_drain(", 1)
+        .replacen(
+            "scheduler::spawn_scheduler(",
+            "runtime::serve_and_drain(); scheduler::spawn_scheduler(",
+            1,
+        );
+    assert_ne!(
+        scheduler_serve_reordered, main,
+        "scheduler/serve order anchors must exist"
+    );
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::Runtime,
+        &scheduler_serve_reordered,
+        &scheduler,
+        Some(&startup),
+        Some(&runtime),
+        None,
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("run_daemon")
+                && violation.contains("runtime::serve_and_drain(")
+                && violation.contains("reorders stage")
+        }),
+        "scheduler/serve order drift must be rejected with the runtime child present: {violations:?}"
+    );
+
+    let router_serve_reordered = runtime
+        .replacen(
+            "router::build_repair_router(shared)",
+            "removed_repair_router(shared)",
+            1,
+        )
+        .replacen(
+            "let server = axum::serve(",
+            "let _late_router = router::build_repair_router(shared.clone());\n    let server = axum::serve(",
+            1,
+        );
+    assert_ne!(
+        router_serve_reordered, runtime,
+        "router/serve order anchors must exist"
+    );
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::Runtime,
+        &main,
+        &scheduler,
+        Some(&startup),
+        Some(&router_serve_reordered),
+        None,
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("serve_and_drain")
+                && violation.contains("router::build_repair_router(")
+                && violation.contains("reorders stage")
+        }),
+        "router/serve order drift must be rejected with the runtime child present: {violations:?}"
+    );
+
     let finish = "server_state.maintenance_coordinator.finish_recovery();";
     let mutated = main.replacen(
         finish,
@@ -1787,11 +1928,11 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
     );
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
+        Phase::Runtime,
         &mutated,
         &scheduler,
         Some(&startup),
-        None,
+        Some(&runtime),
         None,
     );
     assert!(
@@ -1807,15 +1948,16 @@ fn reviewer_mutations_reject_scheduler_fence_snapshot_and_hidden_tasks() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
     let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
+    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
     let without_snapshot = scheduler.replacen("let snapshot = {", "let omitted_snapshot = {", 1);
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
+        Phase::Runtime,
         &main,
         &without_snapshot,
         Some(&startup),
-        None,
+        Some(&runtime),
         None,
     );
     assert!(
@@ -1828,11 +1970,11 @@ fn reviewer_mutations_reject_scheduler_fence_snapshot_and_hidden_tasks() {
         scheduler.replacen("try_begin_background()", "removed_maintenance_fence()", 1);
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
+        Phase::Runtime,
         &main,
         &without_fence,
         Some(&startup),
-        None,
+        Some(&runtime),
         None,
     );
     assert!(
@@ -1891,6 +2033,7 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
     let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
+    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
 
     for anchor in [
@@ -1901,11 +2044,11 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
         let duplicated = format!("{main}\nfn hidden_startup_value() {{ {anchor}; }}\n");
         let violations = structure_violations_with_children(
             &root,
-            Phase::StartupState,
+            Phase::Runtime,
             &duplicated,
             &scheduler,
             Some(&startup),
-            None,
+            Some(&runtime),
             None,
         );
         assert!(
@@ -1919,18 +2062,18 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
     let changed_read = main.replacen("shared.read().await", "shared.write().await", 1);
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
+        Phase::Runtime,
         &changed_read,
         &scheduler,
         Some(&startup),
-        None,
+        Some(&runtime),
         None,
     );
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("exactly 5 times")),
-        "baseline shared-state read-count drift must be rejected: {violations:?}"
+            .any(|violation| violation.contains("exactly 2 times")),
+        "runtime facade shared-state read-count drift must be rejected: {violations:?}"
     );
 
     assert!(
@@ -1951,6 +2094,7 @@ fn second_review_mutation_runtime_config_reload_is_rejected() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
     let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
+    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
     for (injected, expected) in [
         (
@@ -1980,11 +2124,11 @@ fn second_review_mutation_runtime_config_reload_is_rejected() {
         );
         let violations = structure_violations_with_children(
             &root,
-            Phase::StartupState,
+            Phase::Runtime,
             &mutated,
             &scheduler,
             Some(&startup),
-            None,
+            Some(&runtime),
             None,
         );
         assert!(
@@ -2001,6 +2145,7 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
     let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
+    let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
 
     let reservation = r#"                let reservation = {
@@ -2016,24 +2161,27 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
                     state.shutdown.subscribe()
                 };
 "#;
-    let reordered = main.replacen(
+    let reordered_runtime = runtime.replacen(
         &format!("{reservation}{load_shutdown}"),
         &format!("{load_shutdown}{reservation}"),
         1,
     );
-    assert_ne!(reordered, main, "runtime snapshot blocks must exist");
+    assert_ne!(
+        reordered_runtime, runtime,
+        "runtime snapshot blocks must exist"
+    );
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
-        &reordered,
+        Phase::Runtime,
+        &main,
         &scheduler,
         Some(&startup),
-        None,
+        Some(&reordered_runtime),
         None,
     );
     assert!(
         violations.iter().any(|violation| {
-            violation.contains("runtime-registration snapshots")
+            violation.contains("register_optional_runtime_workers snapshots")
                 && violation.contains("reorders stage")
         }),
         "runtime snapshot reorder with all five reads retained must be rejected: {violations:?}"
@@ -2048,11 +2196,11 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
     assert_ne!(moved, main, "facade shutdown snapshot must move");
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
+        Phase::Runtime,
         &moved,
         &scheduler,
         Some(&startup),
-        None,
+        Some(&runtime),
         None,
     );
     assert!(
@@ -2062,19 +2210,19 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
         "facade snapshot movement with all five reads retained must be rejected: {violations:?}"
     );
 
-    let without_stdout = main.replacen(
+    let without_stdout = runtime.replacen(
         "    println!(\"WENLAN_LISTENING_ON={}\", local_addr);\n",
         "",
         1,
     );
-    assert_ne!(without_stdout, main, "stdout announcement must exist");
+    assert_ne!(without_stdout, runtime, "stdout announcement must exist");
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
-        &without_stdout,
+        Phase::Runtime,
+        &main,
         &scheduler,
         Some(&startup),
-        None,
+        Some(&without_stdout),
         None,
     );
     assert!(
@@ -2084,22 +2232,22 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
         "stdout discovery-line deletion must be rejected: {violations:?}"
     );
 
-    let changed_stdout = main.replacen(
+    let changed_stdout = runtime.replacen(
         "println!(\"WENLAN_LISTENING_ON={}\", local_addr);",
         "println!(\"WENLAN_PORT={}\", local_addr);",
         1,
     );
     assert_ne!(
-        changed_stdout, main,
+        changed_stdout, runtime,
         "stdout announcement format must exist"
     );
     let violations = structure_violations_with_children(
         &root,
-        Phase::StartupState,
-        &changed_stdout,
+        Phase::Runtime,
+        &main,
         &scheduler,
         Some(&startup),
-        None,
+        Some(&changed_stdout),
         None,
     );
     assert!(
