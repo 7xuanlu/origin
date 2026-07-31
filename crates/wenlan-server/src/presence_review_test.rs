@@ -41,7 +41,7 @@ async fn wired() -> (
     db.create_page_draft_with_id(PAGE, "A Page", BODY, None, None)
         .await
         .expect("page");
-    std::fs::write(wenlan_core::presence::secret_path(tmp.path()), SECRET).unwrap();
+    plant_secret(tmp.path());
 
     let state = Arc::new(RwLock::new(ServerState {
         db: Some(db.clone()),
@@ -49,6 +49,19 @@ async fn wired() -> (
         ..Default::default()
     }));
     (state, db, tmp)
+}
+
+/// Plants the secret with the mode the app writes. The default mode depends on
+/// the umask of whoever runs the tests, and the daemon refuses a secret other
+/// users can read, so an install fixture has to be explicit about it.
+fn plant_secret(root: &std::path::Path) {
+    let path = wenlan_core::presence::secret_path(root);
+    std::fs::write(&path, SECRET).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 /// Mints the way the app does. Duplicated from the core test on purpose — a

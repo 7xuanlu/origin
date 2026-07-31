@@ -27,8 +27,37 @@ fn mint(
     minted_at: u64,
     secret: &[u8],
 ) -> wenlan_types::requests::PresenceCapability {
+    mint_with_window(
+        action,
+        target_ids,
+        base_digest,
+        caller_id,
+        operation_id,
+        nonce,
+        minted_at,
+        minted_at + 60,
+        secret,
+    )
+}
+
+/// Mints with a window the caller chooses, correctly signed either way.
+///
+/// A capability whose window is absurd is not a forgery — the app's own secret
+/// signed it — so the only thing that can refuse it is a daemon that checks the
+/// window's shape rather than just its end.
+#[allow(clippy::too_many_arguments)]
+fn mint_with_window(
+    action: PresenceAction,
+    target_ids: &[&str],
+    base_digest: &str,
+    caller_id: &str,
+    operation_id: &str,
+    nonce: &[u8],
+    minted_at: u64,
+    expires_at: u64,
+    secret: &[u8],
+) -> wenlan_types::requests::PresenceCapability {
     let targets: Vec<String> = target_ids.iter().map(|t| (*t).to_string()).collect();
-    let expires_at = minted_at + 60;
     let bytes = signed_bytes(
         PROTOCOL_VERSION,
         action,
@@ -301,8 +330,151 @@ fn loading_a_secret_never_creates_one() {
 #[test]
 fn a_secret_the_app_wrote_loads() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(secret_path(tmp.path()), SECRET).unwrap();
+    write_secret(tmp.path(), 0o600);
     assert_eq!(load_secret(tmp.path()), Ok(SECRET.to_vec()));
+}
+
+/// Writes the secret with an explicit mode, because the default one depends on
+/// the umask of whoever is running the tests.
+fn write_secret(root: &std::path::Path, mode: u32) {
+    let path = secret_path(root);
+    std::fs::write(&path, SECRET).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+}
+
+/// T2: the secret is the only thing standing between a local process and a
+/// forged human gesture. Reading one that any process on the machine can also
+/// read, and then treating capabilities signed with it as proof a person was
+/// present, is a claim the file's own permissions contradict.
+///
+/// The daemon refuses rather than repairs. The app owns the file's lifecycle,
+/// and a daemon that quietly tightened the mode would be hiding a state
+/// somebody needs to see — the secret may already have been copied.
+#[cfg(unix)]
+#[test]
+fn a_secret_other_processes_can_read_is_refused() {
+    for mode in [0o644, 0o640, 0o604, 0o666] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_secret(tmp.path(), mode);
+        assert_eq!(
+            load_secret(tmp.path()),
+            Err(PresenceRefusal::Unavailable),
+            "mode {mode:o} lets a process outside this user read the signing secret"
+        );
+    }
+}
+
+/// The other half of the same rule: owner-only modes load. A daemon that
+/// refused these would take every correct install offline.
+#[cfg(unix)]
+#[test]
+fn an_owner_only_secret_still_loads() {
+    for mode in [0o600, 0o400] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_secret(tmp.path(), mode);
+        assert_eq!(
+            load_secret(tmp.path()),
+            Ok(SECRET.to_vec()),
+            "mode {mode:o} is owner-only and must keep working"
+        );
+    }
+}
+
+/// T5 again, from the side expiry alone cannot see.
+///
+/// `now >= expires_at` refuses a capability whose window has closed. It says
+/// nothing about a window that should never have been opened: a capability
+/// minted with a ten-year expiry is inside its window for ten years, and the
+/// app's own secret signed it, so every other check passes. The bound has to be
+/// on the window's shape, not just on its end.
+#[test]
+fn a_capability_whose_window_is_far_longer_than_the_protocol_allows_is_refused() {
+    let ten_years = 60 * 60 * 24 * 365 * 10;
+    let submitted = mint_with_window(
+        PresenceAction::ReviewPage,
+        &["page-1"],
+        "digest-a",
+        "app",
+        "op-1",
+        &[0xab; 16],
+        1_000,
+        1_000 + ten_years,
+        SECRET,
+    );
+    let targets = targets();
+    assert_eq!(
+        verify(&submitted, SECRET, 1_000, &demand(&targets, "digest-a")),
+        Err(PresenceRefusal::Invalid),
+        "a ten-year presence capability is a standing forgery licence, not a gesture"
+    );
+}
+
+/// The window the app actually mints has to survive the bound above, including
+/// at its exact edge. A check tight enough to refuse the real shape would take
+/// every gesture offline.
+#[test]
+fn the_apps_own_sixty_second_window_verifies_at_both_ends() {
+    let targets = targets();
+    let submitted = valid();
+    assert_eq!(submitted.expires_at - submitted.minted_at, 60);
+    for now in [1_000, 1_059] {
+        assert!(
+            verify(&submitted, SECRET, now, &demand(&targets, "digest-a")).is_ok(),
+            "the app's real 60-second window must verify at now={now}"
+        );
+    }
+}
+
+/// A window that ends before it begins is not a window. Nothing in the app can
+/// mint one, so a capability carrying it is either a corrupted request or a
+/// deliberately constructed one; both deserve the same answer.
+#[test]
+fn a_capability_that_expires_no_later_than_it_was_minted_is_refused() {
+    let targets = targets();
+    for expires_at in [1_000, 999] {
+        let submitted = mint_with_window(
+            PresenceAction::ReviewPage,
+            &["page-1"],
+            "digest-a",
+            "app",
+            "op-1",
+            &[0xab; 16],
+            1_000,
+            expires_at,
+            SECRET,
+        );
+        assert_eq!(
+            verify(&submitted, SECRET, 900, &demand(&targets, "digest-a")),
+            Err(PresenceRefusal::Invalid),
+            "expires_at {expires_at} is not after minted_at 1000"
+        );
+    }
+}
+
+/// A capability minted in the future would still be inside its window long
+/// after a real one had died — the clock the daemon trusts is its own. The
+/// allowance is small on purpose: it absorbs the two machines being a few
+/// seconds apart, which here is really one machine's clock moving under two
+/// processes, and nothing more.
+#[test]
+fn a_capability_minted_further_ahead_than_clock_skew_explains_is_refused() {
+    let targets = targets();
+    let submitted = valid(); // minted_at 1_000
+    assert_eq!(
+        verify(&submitted, SECRET, 990, &demand(&targets, "digest-a")),
+        Err(PresenceRefusal::Invalid),
+        "minted ten seconds in the daemon's future is a clock nobody should trust"
+    );
+    assert!(
+        verify(&submitted, SECRET, 996, &demand(&targets, "digest-a")).is_ok(),
+        "four seconds of skew is the ordinary case and must still verify"
+    );
 }
 
 /// T7 vs T8 turns on this digest, so what it does and does not cover is a

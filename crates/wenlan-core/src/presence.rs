@@ -37,6 +37,16 @@ const SECRET_FILE_NAME: &str = "presence_secret";
 /// protocol produced, so it is refused rather than stretched or truncated.
 const SECRET_LEN: usize = 32;
 
+/// The longest window this protocol recognises (D7 §3: "valid for 60 seconds").
+/// The app mints exactly this; anything wider is refused rather than honoured,
+/// because the signature proves who minted it and not that they meant to.
+const MAX_WINDOW_SECS: u64 = 60;
+
+/// How far ahead of the daemon's clock a capability may claim to have been
+/// minted. Both processes run on one machine, so this absorbs the ordinary
+/// disagreement between two reads of the same clock and nothing more.
+const MAX_CLOCK_SKEW_SECS: u64 = 5;
+
 /// What one capability authorizes. A capability for one action is invalid for
 /// the other (D7 §3, T4), which is enforced by the action being a signed
 /// component rather than by any check at the call site.
@@ -104,20 +114,35 @@ pub fn secret_path(root: &Path) -> PathBuf {
     root.join(SECRET_FILE_NAME)
 }
 
-/// Read the per-install secret. Never creates one.
+/// Read the per-install secret. Never creates one, never repairs one.
 ///
-/// Every failure — missing file, unreadable file, wrong length — is the same
-/// [`PresenceRefusal::Unavailable`]. A daemon that started before the app ever
-/// minted anything is in exactly this state, and the honest answer there is
-/// "cannot check", never "trust the caller" (D7 §5).
+/// Every failure — missing file, unreadable file, wrong length, loose mode — is
+/// the same [`PresenceRefusal::Unavailable`]. A daemon that started before the
+/// app ever minted anything is in exactly this state, and the honest answer
+/// there is "cannot check", never "trust the caller" (D7 §5).
 ///
-/// The file's mode is read but not policed. The app tightens it to `0600` on
-/// every mint, and a loose mode only widens the reach to processes running as
-/// other users — which is T11's neighbourhood, stated out of scope. Refusing on
-/// mode here would take a working install offline for a condition this side
-/// cannot repair, in exchange for a threat this protocol never claimed to stop.
+/// On Unix a secret any other user can read is refused (T2). This side cannot
+/// honestly say a capability proves a person was present while the key that
+/// signs it is readable by every process on the machine — the whole claim rests
+/// on that file. It refuses rather than tightening the mode itself: the app owns
+/// the file's lifecycle, and silently repairing it would hide a state somebody
+/// needs to see, since a secret that was world-readable may already have been
+/// copied. On non-Unix the mode carries no comparable meaning and the app
+/// refuses to mint there, so no capability exists for this side to check.
 pub fn load_secret(root: &Path) -> Result<Vec<u8>, PresenceRefusal> {
-    let bytes = std::fs::read(secret_path(root)).map_err(|_| PresenceRefusal::Unavailable)?;
+    let path = secret_path(root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .map_err(|_| PresenceRefusal::Unavailable)?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(PresenceRefusal::Unavailable);
+        }
+    }
+    let bytes = std::fs::read(&path).map_err(|_| PresenceRefusal::Unavailable)?;
     if bytes.len() != SECRET_LEN {
         return Err(PresenceRefusal::Unavailable);
     }
@@ -254,6 +279,22 @@ pub fn verify(
     if action != demand.action
         || submitted.target_ids != demand.target_ids
         || submitted.base_digest != demand.base_digest
+    {
+        return Err(PresenceRefusal::Invalid);
+    }
+    // The window's shape, before its end. `now >= expires_at` can only refuse a
+    // window that has closed; it has nothing to say about one that should never
+    // have opened. A capability minted with a ten-year expiry is inside its
+    // window for ten years and carries a MAC the app's own secret produced, so
+    // every other check here passes it — a standing licence rather than a
+    // gesture. A malformed window is `Invalid` rather than `Expired` because it
+    // is a request nobody should have sent, not a real one that aged out.
+    if submitted.expires_at <= submitted.minted_at
+        || submitted.expires_at - submitted.minted_at > MAX_WINDOW_SECS
+        // Minted in the daemon's future, by more than two clocks on one machine
+        // can plausibly differ. Such a capability outlives a real one by exactly
+        // the amount the caller chose.
+        || submitted.minted_at > now.saturating_add(MAX_CLOCK_SKEW_SECS)
     {
         return Err(PresenceRefusal::Invalid);
     }
