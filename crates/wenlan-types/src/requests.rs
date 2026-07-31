@@ -905,3 +905,66 @@ mod tests {
         assert!(r.api_key.is_none());
     }
 }
+
+// ===== UI presence (M5 D7) =====
+
+/// A capability the app's Tauri backend minted for one gesture, as it crosses
+/// the wire.
+///
+/// Binding spec: `docs/plans/2026-07-27-m5-presence-threat-model.md`. `nonce`
+/// and `mac` are lowercase hex of the app's raw bytes; the daemon needs the
+/// raw nonce to recompute the HMAC, and stores only its digest.
+///
+/// **Deserialize only, on purpose.** The app's own `PresenceCapability`
+/// refuses to implement `Serialize` so no Tauri command can hand a capability
+/// to JavaScript (T1). This is the same guarantee facing the other way: with no
+/// `Serialize`, a receipt, a log line, or an error body physically cannot carry
+/// one, so §7's redaction contract holds by construction rather than by every
+/// future call site remembering it.
+#[derive(Clone, Deserialize)]
+pub struct PresenceCapability {
+    pub protocol_version: u32,
+    /// `attest_claim` or `review_page`. A string rather than an enum so an
+    /// unknown action is a refusal the daemon words, not a deserialize error
+    /// that echoes the submitted value back.
+    pub action: String,
+    pub target_ids: Vec<String>,
+    /// Digest of the exact content the gesture was made against (T6).
+    pub base_digest: String,
+    pub caller_id: String,
+    pub operation_id: String,
+    pub minted_at: u64,
+    pub expires_at: u64,
+    pub nonce: String,
+    pub mac: String,
+}
+
+/// Redacted by construction (§7): the derived `Debug` would print the HMAC and
+/// the raw nonce into the first log line that ever formatted a request.
+impl std::fmt::Debug for PresenceCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresenceCapability")
+            .field("protocol_version", &self.protocol_version)
+            .field("action", &self.action)
+            .field("target_ids", &self.target_ids)
+            .field("base_digest", &self.base_digest)
+            .field("caller_id", &self.caller_id)
+            .field("operation_id", &self.operation_id)
+            .field("minted_at", &self.minted_at)
+            .field("expires_at", &self.expires_at)
+            .field("nonce", &"<redacted>")
+            .field("mac", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Mark one page as human-reviewed.
+///
+/// The capability already names the page and the exact content the human read,
+/// so there is nothing else to send. In particular the reviewed version is not
+/// a field: the daemon derives it from the row whose content matches
+/// `base_digest`, rather than believing a caller about which version it saw.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewPageRequest {
+    pub presence: PresenceCapability,
+}

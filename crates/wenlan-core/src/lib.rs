@@ -56,6 +56,7 @@ pub mod page_projection_tracker;
 pub mod pages;
 pub mod post_ingest;
 pub mod post_write;
+pub mod presence;
 pub mod privacy;
 pub mod prompts;
 pub mod provenance;

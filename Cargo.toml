@@ -79,6 +79,7 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 # Utilities
 regex = "1"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 dirs = "6"
 hf-hub = "0.4"

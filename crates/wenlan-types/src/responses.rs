@@ -1634,6 +1634,7 @@ mod reranker_status_tests {
             reranker_mode: "full".into(),
             on_device_inference: OnDeviceInferenceStatus::default(),
             capabilities: vec!["default_save_space".into()],
+            truth: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -1755,4 +1756,26 @@ mod search_response_tests {
             "empty array should deserialize to empty vec"
         );
     }
+}
+
+/// What a successful page review records, and what a retry of it replays.
+///
+/// This is the whole of §7's allowed payload and nothing else: protocol
+/// version, nonce **digest**, verification time, the page version and content
+/// digest the human actually read, and caller/operation identity. No HMAC, no
+/// raw nonce, no secret — which is why this type can be stored as the receipt,
+/// returned in the response, and logged, all from one shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageReviewReceipt {
+    pub page_id: String,
+    pub human_reviewed: bool,
+    /// The version the digest below belongs to, read from the row rather than
+    /// taken from the request.
+    pub reviewed_page_version: i64,
+    pub reviewed_page_digest: String,
+    pub protocol_version: u32,
+    pub nonce_digest: String,
+    pub verified_at: i64,
+    pub caller_id: String,
+    pub operation_id: String,
 }
