@@ -725,7 +725,8 @@ fn suffix_after_unique<'a>(source: &'a str, anchor: &str, owner: &str) -> Result
 }
 
 fn runtime_carried_value_violations(source: &str, owner: &str) -> Vec<String> {
-    let code = mask_rust_non_code(source);
+    let normalized_source = source.replace("\r\n", "\n");
+    let code = mask_rust_non_code(&normalized_source);
     let mut violations = unique_order_violations(&code, RUNTIME_WORKER_ORDER, owner);
     for scope in RUNTIME_OPTIONAL_WORKER_SCOPES {
         violations.extend(exact_token_count_violations(&code, scope, 1, owner));
@@ -1740,6 +1741,13 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
     let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
     let runtime = std::fs::read_to_string(root.join(MAIN_RUNTIME_CHILD)).expect("read runtime.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+
+    let crlf_runtime = runtime.replace("\r\n", "\n").replace('\n', "\r\n");
+    let violations = runtime_carried_value_violations(&crlf_runtime, MAIN_RUNTIME_CHILD);
+    assert!(
+        violations.is_empty(),
+        "runtime carried-value guard must accept Windows CRLF source: {violations:?}"
+    );
 
     let mutated_startup = startup.replacen(
         "enforce_projection_directory_invariant(",
