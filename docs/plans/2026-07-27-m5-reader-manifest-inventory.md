@@ -862,7 +862,7 @@ carrying the authority of agreement.
 |---|---|---|---|
 | `core/db.rs:3631` | `run_migrations` | `pub` | internal-only |
 | `core/db.rs:9129` | `migrate_89_page_kind_fold` | `private` | internal-only |
-| `core/db.rs:17106` | `reconcile_entity_page_parity` | `pub` | **exposure** — `server/scheduler.rs:2237` |
+| `core/db.rs:17106` | `reconcile_entity_page_parity` | `pub` | **exposure** — `server/scheduler/ambient.rs:532` |
 | `core/db.rs:26735` | `rebind_source_page_in_transaction` | `private` | internal-only |
 | `core/db.rs:34374` | `oldest_active_page` | `pub` | internal-only |
 | `core/db.rs:39570` | `list_recent_retrievals` | `pub` | internal-only |
@@ -969,7 +969,7 @@ carrying the authority of agreement.
 | `server/routes.rs:519` | `handle_distill` | `pub` | `list_stale_pages_scoped` |
 | `server/routes.rs:914` | `handle_recent_retrievals` | `pub` | `list_recent_retrievals_scoped` |
 | `server/routes.rs:978` | `handle_recent_page_changes` | `pub` | `list_recent_changes_scoped` |
-| `server/scheduler.rs:2025` | `run_ambient_job` | `private` | `reconcile_entity_page_parity` |
+| `server/scheduler/ambient.rs:320` | `run_ambient_job` | `pub(super)` | `reconcile_entity_page_parity` |
 
 ### Depth 2 — consumers
 
@@ -1059,8 +1059,8 @@ carrying the authority of agreement.
 | `server/page_routes.rs:695` | `handle_refresh_page` | `pub` | `get_page` |
 | `server/repair_routes.rs:183` | `handle_prepare` | `private` | `prepare_memory_reclassification_with_pages` |
 | `server/routes.rs:1009` | `handle_recent_pages` | `pub` | `list_recent_pages_with_badges_scoped` |
-| `server/scheduler.rs:1974` | `run_ambient_job_safe` | `private` | `run_ambient_job` |
-| `server/scheduler.rs:2326` | `fire_maintenance_stage_safe` | `private` | `run_maintenance_stage_slice` |
+| `server/scheduler.rs:1711` | `fire_maintenance_stage_safe` | `private` | `run_maintenance_stage_slice` |
+| `server/scheduler/ambient.rs:269` | `run_ambient_job_safe` | `pub(super)` | `run_ambient_job` |
 
 <!-- m5-reader-sweep:end -->
 
