@@ -43,7 +43,8 @@ fn plugin_setup_repairs_stale_daemon_versions() {
     for text in [&setup, &codex_setup] {
         for needle in [
             "Compare daemon version vs plugin manifest version",
-            "If mismatch, repair the runtime",
+            "If mismatch, check the direction before repairing.",
+            "Only if the daemon release is older than the plugin release, repair the",
             "curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v${RELEASE_VER}/install.sh | bash",
             "wenlan setup --basic",
             "wenlan background on",
