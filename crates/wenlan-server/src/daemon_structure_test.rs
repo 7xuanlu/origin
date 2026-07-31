@@ -609,13 +609,13 @@ fn adjacent_stage_violations(source: &str, first: &str, second: &str, owner: &st
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    (compact != ");")
-        .then(|| {
-            vec![format!(
-                "{owner} must keep {first:?} immediately before {second:?}; found {compact:?} between them"
-            )]
-        })
-        .unwrap_or_default()
+    if compact != ");" {
+        vec![format!(
+            "{owner} must keep {first:?} immediately before {second:?}; found {compact:?} between them"
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn exact_token_count_violations(
@@ -625,13 +625,13 @@ fn exact_token_count_violations(
     owner: &str,
 ) -> Vec<String> {
     let actual = source.matches(token).count();
-    (actual != expected)
-        .then(|| {
-            vec![format!(
-                "{owner} must contain {token:?} exactly {expected} times, found {actual}"
-            )]
-        })
-        .unwrap_or_default()
+    if actual != expected {
+        vec![format!(
+            "{owner} must contain {token:?} exactly {expected} times, found {actual}"
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn rust_keyword_count(source: &str, keyword: &str) -> usize {
@@ -655,13 +655,13 @@ fn exact_keyword_count_violations(
     owner: &str,
 ) -> Vec<String> {
     let actual = rust_keyword_count(source, keyword);
-    (actual != expected)
-        .then(|| {
-            vec![format!(
-                "{owner} must contain Rust keyword {keyword:?} exactly {expected} times, found {actual}"
-            )]
-        })
-        .unwrap_or_default()
+    if actual != expected {
+        vec![format!(
+            "{owner} must contain Rust keyword {keyword:?} exactly {expected} times, found {actual}"
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn exact_identifier_count_violations(
@@ -671,13 +671,13 @@ fn exact_identifier_count_violations(
     owner: &str,
 ) -> Vec<String> {
     let actual = rust_keyword_count(source, identifier);
-    (actual != expected)
-        .then(|| {
-            vec![format!(
-                "{owner} must contain identifier {identifier:?} exactly {expected} times, found {actual}"
-            )]
-        })
-        .unwrap_or_default()
+    if actual != expected {
+        vec![format!(
+            "{owner} must contain identifier {identifier:?} exactly {expected} times, found {actual}"
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn direct_call_count(source: &str, path: &str) -> usize {
@@ -701,13 +701,13 @@ fn exact_direct_call_count_violations(
     owner: &str,
 ) -> Vec<String> {
     let actual = direct_call_count(source, path);
-    (actual != expected)
-        .then(|| {
-            vec![format!(
-                "{owner} must call {path} exactly {expected} times, found {actual}"
-            )]
-        })
-        .unwrap_or_default()
+    if actual != expected {
+        vec![format!(
+            "{owner} must call {path} exactly {expected} times, found {actual}"
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn suffix_after_unique<'a>(source: &'a str, anchor: &str, owner: &str) -> Result<&'a str, String> {
@@ -820,13 +820,13 @@ fn exact_child_files_violations(
     expected: &BTreeSet<String>,
     owner: &str,
 ) -> Vec<String> {
-    (actual != expected)
-        .then(|| {
-            vec![format!(
-                "{owner} child files are {actual:?}, expected {expected:?}"
-            )]
-        })
-        .unwrap_or_default()
+    if actual != expected {
+        vec![format!(
+            "{owner} child files are {actual:?}, expected {expected:?}"
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn module_shapes(source: &str, module: &str) -> Vec<ModuleShape> {
@@ -972,14 +972,14 @@ fn exact_anchor_owner_violations(
             matches.iter().map(|(path, _)| *path).collect::<Vec<_>>()
         )];
     }
-    (matches[0].0 != owner)
-        .then(|| {
-            vec![format!(
-                "{anchor:?} is owned by {}, expected {owner}",
-                matches[0].0
-            )]
-        })
-        .unwrap_or_default()
+    if matches[0].0 != owner {
+        vec![format!(
+            "{anchor:?} is owned by {}, expected {owner}",
+            matches[0].0
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn exact_private_owner_violations(
@@ -1014,14 +1014,14 @@ fn exact_private_owner_violations(
 
 fn absent_item_violations(sources: &[(&str, &str)], kind: ItemKind, name: &str) -> Vec<String> {
     let matches = declarations_named(sources, kind, name);
-    (!matches.is_empty())
-        .then(|| {
-            vec![format!(
-                "future R7 item {name} exists before its phase at {:?}",
-                matches.iter().map(|(path, _)| *path).collect::<Vec<_>>()
-            )]
-        })
-        .unwrap_or_default()
+    if !matches.is_empty() {
+        vec![format!(
+            "future R7 item {name} exists before its phase at {:?}",
+            matches.iter().map(|(path, _)| *path).collect::<Vec<_>>()
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn module_boundary_violations(
@@ -1035,9 +1035,11 @@ fn module_boundary_violations(
         .filter(|declaration| declaration.kind == ItemKind::Module && declaration.name == module)
         .collect();
     if !expected {
-        return (!matches.is_empty())
-            .then(|| vec![format!("{owner} declares {module} before its phase")])
-            .unwrap_or_default();
+        return if !matches.is_empty() {
+            vec![format!("{owner} declares {module} before its phase")]
+        } else {
+            Vec::new()
+        };
     }
     if matches.len() != 1 {
         return vec![format!(
@@ -1045,9 +1047,11 @@ fn module_boundary_violations(
             matches.len()
         )];
     }
-    (matches[0].visibility != Visibility::Private)
-        .then(|| vec![format!("{owner} module {module} must stay private")])
-        .unwrap_or_default()
+    if matches[0].visibility != Visibility::Private {
+        vec![format!("{owner} module {module} must stay private")]
+    } else {
+        Vec::new()
+    }
 }
 
 fn scheduler_task_locality_violations(scheduler: &str, ambient: Option<&str>) -> Vec<String> {
@@ -1278,20 +1282,20 @@ fn structure_violations_with_children(
     }
 
     let mut owned_sources = vec![(MAIN_ROOT, main), (SCHEDULER_ROOT, scheduler)];
-    if let Some(source) = startup.as_deref() {
+    if let Some(source) = startup {
         owned_sources.push((MAIN_STARTUP_CHILD, source));
     }
-    if let Some(source) = runtime.as_deref() {
+    if let Some(source) = runtime {
         owned_sources.push((MAIN_RUNTIME_CHILD, source));
     }
-    if let Some(source) = ambient.as_deref() {
+    if let Some(source) = ambient {
         owned_sources.push((SCHEDULER_AMBIENT_CHILD, source));
     }
     let mut main_sources = vec![(MAIN_ROOT, main)];
-    if let Some(source) = startup.as_deref() {
+    if let Some(source) = startup {
         main_sources.push((MAIN_STARTUP_CHILD, source));
     }
-    if let Some(source) = runtime.as_deref() {
+    if let Some(source) = runtime {
         main_sources.push((MAIN_RUNTIME_CHILD, source));
     }
 
@@ -1402,10 +1406,7 @@ fn structure_violations_with_children(
             spawn.matches("loop {").count()
         ));
     }
-    violations.extend(scheduler_task_locality_violations(
-        scheduler,
-        ambient.as_deref(),
-    ));
+    violations.extend(scheduler_task_locality_violations(scheduler, ambient));
 
     let run_daemon = match function_body(main, "run_daemon") {
         Ok(body) => body,
@@ -1459,7 +1460,7 @@ fn structure_violations_with_children(
     }
 
     if phase.runtime_child() {
-        if let Some(source) = runtime.as_deref() {
+        if let Some(source) = runtime {
             violations.extend(runtime_carried_value_violations(source, MAIN_RUNTIME_CHILD));
         }
         violations.extend(runtime_recompute_violations(
@@ -1476,7 +1477,7 @@ fn structure_violations_with_children(
         }
     }
 
-    if let Some(source) = startup.as_deref() {
+    if let Some(source) = startup {
         let body = match function_body(source, "prepare_startup_state") {
             Ok(body) => body,
             Err(error) => {
@@ -1495,7 +1496,7 @@ fn structure_violations_with_children(
             );
         }
     }
-    if let Some(source) = runtime.as_deref() {
+    if let Some(source) = runtime {
         for (function, order) in [
             ("register_optional_runtime_workers", RUNTIME_WORKER_ORDER),
             ("serve_and_drain", RUNTIME_SERVE_ORDER),
