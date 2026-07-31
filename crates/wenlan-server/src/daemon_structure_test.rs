@@ -1172,10 +1172,30 @@ fn test_boundary_violations(root: &Path, main: &str, scheduler: &str, phase: Pha
 }
 
 fn structure_violations(root: &Path, phase: Phase, main: &str, scheduler: &str) -> Vec<String> {
-    let mut violations = test_boundary_violations(root, main, scheduler, phase);
     let startup = read_if_present(root, MAIN_STARTUP_CHILD);
     let runtime = read_if_present(root, MAIN_RUNTIME_CHILD);
     let ambient = read_if_present(root, SCHEDULER_AMBIENT_CHILD);
+    structure_violations_with_children(
+        root,
+        phase,
+        main,
+        scheduler,
+        startup.as_deref(),
+        runtime.as_deref(),
+        ambient.as_deref(),
+    )
+}
+
+fn structure_violations_with_children(
+    root: &Path,
+    phase: Phase,
+    main: &str,
+    scheduler: &str,
+    startup: Option<&str>,
+    runtime: Option<&str>,
+    ambient: Option<&str>,
+) -> Vec<String> {
+    let mut violations = test_boundary_violations(root, main, scheduler, phase);
 
     let expected_main_files: BTreeSet<String> = [
         phase.startup_child().then_some("startup.rs"),
@@ -1657,15 +1677,27 @@ fn daemon_structure_visibility_guard_rejects_public_or_duplicate_items() {
 #[test]
 fn reviewer_mutation_removed_repair_fence_is_rejected() {
     let root = repo_root();
-    let main = std::fs::read_to_string(root.join(MAIN_ROOT))
-        .expect("read main.rs")
-        .replacen(
-            "select_startup_repair_fence(&pending_repairs",
-            "removed_startup_repair_fence(&pending_repairs",
-            1,
-        );
+    let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
+    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
+    let mutated_startup = startup.replacen(
+        "select_startup_repair_fence(&pending_repairs",
+        "removed_startup_repair_fence(&pending_repairs",
+        1,
+    );
+    assert_ne!(
+        mutated_startup, startup,
+        "startup repair-fence mutation needle must exist"
+    );
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
-    let violations = structure_violations(&root, Phase::Baseline, &main, &scheduler);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &main,
+        &scheduler,
+        Some(&mutated_startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()
@@ -1678,13 +1710,35 @@ fn reviewer_mutation_removed_repair_fence_is_rejected() {
 fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
+    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
+
+    let mutated_startup = startup.replacen(
+        "enforce_projection_directory_invariant(",
+        "removed_projection_invariant(",
+        1,
+    );
+    assert_ne!(
+        mutated_startup, startup,
+        "projection invariant mutation needle must exist"
+    );
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &main,
+        &scheduler,
+        Some(&mutated_startup),
+        None,
+        None,
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("enforce_projection_directory_invariant")),
+        "live startup projection mutation must be rejected: {violations:?}"
+    );
+
     for (needle, replacement, expected) in [
-        (
-            "enforce_projection_directory_invariant(",
-            "removed_projection_invariant(",
-            "enforce_projection_directory_invariant",
-        ),
         (
             "OnDeviceProvider::new_with_model(",
             "removed_on_device_provider(",
@@ -1708,7 +1762,15 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
     ] {
         let mutated = main.replacen(needle, replacement, 1);
         assert_ne!(mutated, main, "mutation needle must exist: {needle}");
-        let violations = structure_violations(&root, Phase::Baseline, &mutated, &scheduler);
+        let violations = structure_violations_with_children(
+            &root,
+            Phase::StartupState,
+            &mutated,
+            &scheduler,
+            Some(&startup),
+            None,
+            None,
+        );
         assert!(
             violations
                 .iter()
@@ -1723,7 +1785,15 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
         &format!("{finish}\nlet hidden_between_recovery_and_share = ();"),
         1,
     );
-    let violations = structure_violations(&root, Phase::Baseline, &mutated, &scheduler);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &mutated,
+        &scheduler,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()
@@ -1736,9 +1806,18 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
 fn reviewer_mutations_reject_scheduler_fence_snapshot_and_hidden_tasks() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
+    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
     let without_snapshot = scheduler.replacen("let snapshot = {", "let omitted_snapshot = {", 1);
-    let violations = structure_violations(&root, Phase::Baseline, &main, &without_snapshot);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &main,
+        &without_snapshot,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()
@@ -1747,7 +1826,15 @@ fn reviewer_mutations_reject_scheduler_fence_snapshot_and_hidden_tasks() {
     );
     let without_fence =
         scheduler.replacen("try_begin_background()", "removed_maintenance_fence()", 1);
-    let violations = structure_violations(&root, Phase::Baseline, &main, &without_fence);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &main,
+        &without_fence,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()
@@ -1803,6 +1890,7 @@ fn hidden_ambient_task() {
 fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
+    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
 
     for anchor in [
@@ -1811,7 +1899,15 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
         "let mut deep_bgebase_pending = false",
     ] {
         let duplicated = format!("{main}\nfn hidden_startup_value() {{ {anchor}; }}\n");
-        let violations = structure_violations(&root, Phase::Baseline, &duplicated, &scheduler);
+        let violations = structure_violations_with_children(
+            &root,
+            Phase::StartupState,
+            &duplicated,
+            &scheduler,
+            Some(&startup),
+            None,
+            None,
+        );
         assert!(
             violations
                 .iter()
@@ -1821,7 +1917,15 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
     }
 
     let changed_read = main.replacen("shared.read().await", "shared.write().await", 1);
-    let violations = structure_violations(&root, Phase::Baseline, &changed_read, &scheduler);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &changed_read,
+        &scheduler,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()
@@ -1846,6 +1950,7 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
 fn second_review_mutation_runtime_config_reload_is_rejected() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
+    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
     for (injected, expected) in [
         (
@@ -1873,7 +1978,15 @@ fn second_review_mutation_runtime_config_reload_is_rejected() {
             ),
             1,
         );
-        let violations = structure_violations(&root, Phase::Baseline, &mutated, &scheduler);
+        let violations = structure_violations_with_children(
+            &root,
+            Phase::StartupState,
+            &mutated,
+            &scheduler,
+            Some(&startup),
+            None,
+            None,
+        );
         assert!(
             violations
                 .iter()
@@ -1887,6 +2000,7 @@ fn second_review_mutation_runtime_config_reload_is_rejected() {
 fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
     let root = repo_root();
     let main = std::fs::read_to_string(root.join(MAIN_ROOT)).expect("read main.rs");
+    let startup = std::fs::read_to_string(root.join(MAIN_STARTUP_CHILD)).expect("read startup.rs");
     let scheduler = std::fs::read_to_string(root.join(SCHEDULER_ROOT)).expect("read scheduler.rs");
 
     let reservation = r#"                let reservation = {
@@ -1908,7 +2022,15 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
         1,
     );
     assert_ne!(reordered, main, "runtime snapshot blocks must exist");
-    let violations = structure_violations(&root, Phase::Baseline, &reordered, &scheduler);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &reordered,
+        &scheduler,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations.iter().any(|violation| {
             violation.contains("runtime-registration snapshots")
@@ -1924,7 +2046,15 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
         1,
     );
     assert_ne!(moved, main, "facade shutdown snapshot must move");
-    let violations = structure_violations(&root, Phase::Baseline, &moved, &scheduler);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &moved,
+        &scheduler,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()
@@ -1938,7 +2068,15 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
         1,
     );
     assert_ne!(without_stdout, main, "stdout announcement must exist");
-    let violations = structure_violations(&root, Phase::Baseline, &without_stdout, &scheduler);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &without_stdout,
+        &scheduler,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()
@@ -1955,7 +2093,15 @@ fn second_review_mutations_reject_snapshot_reorder_and_stdout_deletion() {
         changed_stdout, main,
         "stdout announcement format must exist"
     );
-    let violations = structure_violations(&root, Phase::Baseline, &changed_stdout, &scheduler);
+    let violations = structure_violations_with_children(
+        &root,
+        Phase::StartupState,
+        &changed_stdout,
+        &scheduler,
+        Some(&startup),
+        None,
+        None,
+    );
     assert!(
         violations
             .iter()

@@ -3,6 +3,7 @@
 
 use axum::{routing::post, Json, Router};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +26,22 @@ struct RunningDaemon {
 
 fn binary_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_wenlan-server"))
+}
+
+fn prepare_isolated_data_dir(root: &Path) -> PathBuf {
+    let data_dir = root.join("data");
+    let pages_dir = root.join("pages");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&pages_dir).unwrap();
+    std::fs::write(
+        data_dir.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "knowledge_path": pages_dir,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    data_dir
 }
 
 async fn start_mock_provider(
@@ -55,13 +72,14 @@ async fn start_mock_provider(
 
 async fn start_daemon() -> RunningDaemon {
     let tempdir = tempfile::tempdir().unwrap();
+    let data_dir = prepare_isolated_data_dir(tempdir.path());
     let port_file = tempdir.path().join("port");
     let child = Command::new(binary_path())
         .env("WENLAN_BIND_ADDR", "127.0.0.1:0")
         // Keep the child isolated from both durable user config and data. The
         // reranker overrides below are safe only while this tempdir-scoped
         // WENLAN_DATA_DIR remains part of the process-test contract.
-        .env("WENLAN_DATA_DIR", tempdir.path().join("data"))
+        .env("WENLAN_DATA_DIR", data_dir)
         .env("WENLAN_PORT_FILE", &port_file)
         // Parent developer settings must never make this process test download
         // or eagerly load a reranker before announcing its port.
@@ -230,13 +248,14 @@ async fn sigterm_uses_the_same_graceful_drain_path() {
 #[tokio::test]
 async fn sigterm_after_bind_during_startup_uses_cooperative_shutdown() {
     let tempdir = tempfile::tempdir().unwrap();
+    let data_dir = prepare_isolated_data_dir(tempdir.path());
     let barrier = tempdir.path().join("startup-signal-barrier");
     std::fs::create_dir_all(&barrier).unwrap();
     let child = Command::new(binary_path())
         .env("WENLAN_BIND_ADDR", "127.0.0.1:0")
         // Preserve the same isolated-config invariant as start_daemon(); the
         // removed parent reranker settings must not expose real user state.
-        .env("WENLAN_DATA_DIR", tempdir.path().join("data"))
+        .env("WENLAN_DATA_DIR", data_dir)
         .env("WENLAN_TEST_STARTUP_SIGNAL_BARRIER", &barrier)
         .env_remove("WENLAN_RERANKER_MODE")
         .env_remove("WENLAN_RERANKER_ENABLED")
