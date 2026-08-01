@@ -56,8 +56,22 @@ pub(crate) fn page_embedding_text(title: &str, summary: Option<&str>, content: &
 /// follows `creation_kind`, with 'distilled' and 'research' both landing on
 /// 'concept'.
 ///
+/// One disagreement with the stored column survives on purpose, and it is the
+/// reason no reader may route on `kind` yet. Migration 89 folded
+/// `creation_kind='imported'` onto 'source' but never `'source'` itself, and it
+/// wrote a fold-ledger row for every page it saw — so migration 104, which
+/// skips any page the ledger already ruled on, leaves those rows where 89 put
+/// them. A page imported before 89 therefore still stores 'concept' while this
+/// rule says 'source'. Size the gap on a real vault with `SELECT COUNT(*) FROM
+/// pages p JOIN page_kind_fold_ledger l ON l.page_id = p.id WHERE
+/// p.creation_kind = 'source' AND p.kind = 'concept'`; closing it belongs with
+/// M6's re-derivation of `kind` on the rename, archive, and replace paths,
+/// which have the same staleness for the same reason.
+///
 /// Readers still resolve the Overview by title (`synthesis::overview`); this
-/// makes the column honest without moving any reader onto it.
+/// makes the column honest without moving any reader onto it, and
+/// `drift_guard::no_production_read_routes_on_a_non_entity_page_kind` is what
+/// keeps it that way.
 pub(crate) fn page_kind_for(title: &str, creation_kind: &str, status: &str) -> &'static str {
     if status == "active"
         && title.eq_ignore_ascii_case(crate::synthesis::overview::OVERVIEW_PAGE_TITLE)

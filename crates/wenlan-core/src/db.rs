@@ -12048,12 +12048,21 @@ impl MemoryDB {
     ///
     /// Scoped by two guards rather than run over the whole table:
     ///
-    /// * `page_kind_fold_ledger` froze the pre-fold corpus, so its absence is
-    ///   an exact marker for "created after 89". Leaving those rows alone keeps
+    /// * `page_kind_fold_ledger` froze the pre-fold corpus, so its absence
+    ///   marks a row as "created after 89". Leaving ledgered rows alone keeps
     ///   89's ledger a faithful mirror of the kinds it assigned — including the
     ///   one place today's rule would disagree with it (89 read
     ///   `creation_kind='source'` as a concept page). Re-deciding that is a
     ///   separate call with its own audit trail, not this repair's business.
+    ///   The marker is sound but not exact: page ids can be deterministic and
+    ///   reused (`delete_page`), and nothing deletes ledger rows, so a page
+    ///   deleted and recreated at the same id before this upgrade inherits the
+    ///   old ledger entry and is skipped. It keeps the `concept` it already has
+    ///   — the pre-migration state, never a fresh lie — so the failure is lost
+    ///   coverage, not a wrong answer. Tightening it (comparing the ledger's
+    ///   `migrated_at` against `pages.created_at`) needs one timestamp format
+    ///   to hold across every historical row, which is a bigger claim than this
+    ///   repair needs to make.
     /// * `kind = 'concept'` means the repair only ever moves a row off the
     ///   silent default. It cannot demote a deliberately stamped kind (the
     ///   `kind='entity'` dual-write shadows above all), and re-running it is a
@@ -27036,6 +27045,12 @@ impl MemoryDB {
         if old_page_id == new_page_id {
             return Ok(());
         }
+        // `kind` is re-derived rather than copied: migration 89 mapped only
+        // `creation_kind='imported'` onto 'source', so a pre-89 SOURCE page still
+        // carries kind='concept'. This clone is a NEW row with a new id and no
+        // fold-ledger entry, so migration 104 will never revisit it -- copying the
+        // old value would mint a fresh row that lies, which is the bug this whole
+        // change exists to end. Frozen twin of `crate::pages::page_kind_for`.
         let inserted = conn
             .execute(
                 "INSERT INTO pages
@@ -27046,7 +27061,12 @@ impl MemoryDB {
                  SELECT ?1,title,summary,content,entity_id,space,source_memory_ids,
                         version,status,embedding,created_at,last_compiled,last_modified,
                         sources_updated_count,stale_reason,user_edited,changelog,
-                        creation_kind,review_status,workspace,citations,kind
+                        creation_kind,review_status,workspace,citations,
+                        CASE WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview'
+                             WHEN creation_kind = 'authored' THEN 'authored'
+                             WHEN creation_kind IN ('imported', 'source') THEN 'source'
+                             WHEN creation_kind = 'entity' THEN 'entity'
+                             ELSE 'concept' END
                  FROM pages
                  WHERE id = ?2 AND creation_kind = 'source'",
                 libsql::params![new_page_id, old_page_id],
@@ -46663,7 +46683,7 @@ impl MemoryDB {
     ) -> Result<Option<crate::pages::Page>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut sql = String::from(
-            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
+            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
              FROM pages
              WHERE stale_reason = ? AND status = 'active'
                AND COALESCE(kind, 'concept') != 'entity'",

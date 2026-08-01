@@ -7817,17 +7817,23 @@ fn db_domain_guard_rejects_missing_duplicate_inline_and_visible_scope_drift() {
 /// would blind the scan to the very write it exists to check. Line count is
 /// preserved so reported offsets still line up with the file.
 fn strip_cfg_test_items(source: &str) -> String {
+    // Structure is read off the masked twin, content off the original: a brace
+    // living inside a string or a comment must not move the depth counter, or
+    // the region "ends" in the wrong place and real production code after it
+    // gets blanked from the scan — a silent false negative in a fail-closed
+    // guard, which is worse than no guard at all.
+    let masked = mask_lexical(source, false);
     let mut kept: Vec<&str> = Vec::new();
-    let mut lines = source.lines();
-    while let Some(line) = lines.next() {
-        if line.trim() != "#[cfg(test)]" {
+    let mut lines = source.lines().zip(masked.lines());
+    while let Some((line, masked_line)) = lines.next() {
+        if masked_line.trim() != "#[cfg(test)]" {
             kept.push(line);
             continue;
         }
         kept.push("");
         let mut depth = 0usize;
         let mut opened = false;
-        for gated in lines.by_ref() {
+        for (_, gated) in lines.by_ref() {
             kept.push("");
             depth += gated.matches('{').count();
             depth -= gated.matches('}').count().min(depth);
@@ -7842,6 +7848,142 @@ fn strip_cfg_test_items(source: &str) -> String {
     kept.join("\n")
 }
 
+/// Blank comments — and, when `keep_strings` is false, string and char literals
+/// too — to spaces, preserving byte length and every newline.
+///
+/// Two callers want opposite halves of the same walk. Reading Rust block
+/// structure needs literals blanked, so a brace inside a string cannot move a
+/// depth counter. Reading the SQL a file executes needs literals *kept* but
+/// still recognised, so a `//` or a brace inside a query is not mistaken for
+/// Rust, while prose in a comment stops being scannable text.
+///
+/// Handles the three shapes that actually bite: Rust block comments nest, raw
+/// strings (`r#"…"#`) do not honour backslash escapes, and a `'` opens a char
+/// literal only when it closes like one — otherwise it is a lifetime, which
+/// never carries braces and must be left alone.
+fn mask_lexical(source: &str, keep_strings: bool) -> String {
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let blank = |byte: u8| if byte == b'\n' { b'\n' } else { b' ' };
+    let lit = |byte: u8| if keep_strings { byte } else { blank(byte) };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(b' ');
+                i += 1;
+            }
+            continue;
+        }
+
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth = depth.saturating_sub(1);
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                out.push(blank(bytes[i]));
+                i += 1;
+            }
+            continue;
+        }
+
+        if byte == b'r' {
+            let mut hashes = 0usize;
+            let mut open = i + 1;
+            while bytes.get(open) == Some(&b'#') {
+                hashes += 1;
+                open += 1;
+            }
+            if bytes.get(open) == Some(&b'"') {
+                while i <= open {
+                    out.push(lit(bytes[i]));
+                    i += 1;
+                }
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        let mut close = i + 1;
+                        let mut seen = 0usize;
+                        while seen < hashes && bytes.get(close) == Some(&b'#') {
+                            seen += 1;
+                            close += 1;
+                        }
+                        if seen == hashes {
+                            while i < close {
+                                out.push(lit(bytes[i]));
+                                i += 1;
+                            }
+                            break;
+                        }
+                    }
+                    out.push(lit(bytes[i]));
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        if byte == b'"' {
+            out.push(lit(byte));
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    out.push(lit(bytes[i]));
+                    i += 1;
+                    if i < bytes.len() {
+                        out.push(lit(bytes[i]));
+                        i += 1;
+                    }
+                    continue;
+                }
+                let closing = bytes[i] == b'"';
+                out.push(lit(bytes[i]));
+                i += 1;
+                if closing {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if byte == b'\'' {
+            // `'x'` and `'\n'` close within a few bytes; `'static` never does.
+            let closes = if bytes.get(i + 1) == Some(&b'\\') {
+                (2..8).find(|&n| bytes.get(i + n) == Some(&b'\''))
+            } else if bytes.get(i + 2) == Some(&b'\'') {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(n) = closes {
+                for offset in 0..=n {
+                    out.push(lit(bytes[i + offset]));
+                }
+                i += n + 1;
+                continue;
+            }
+        }
+
+        out.push(byte);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
 /// Collapse a SQL column list lifted out of Rust source: line continuations,
 /// string-literal punctuation, and indentation all become single spaces, so
 /// the reported site is stable under reformatting.
@@ -7854,24 +7996,54 @@ fn normalized_column_list(columns: &str) -> String {
         .join(" ")
 }
 
-/// Production `INSERT INTO pages` statements whose column list does not name
-/// `kind`, reported as `path: <column list>`.
+/// True when the text immediately preceding an `INTO pages` is the INSERT
+/// keyword, allowing for a conflict clause: `INSERT INTO`, `INSERT OR IGNORE
+/// INTO`, `INSERT OR REPLACE INTO`. Anything else that merely mentions the
+/// table (`DELETE FROM pages`, a doc comment) is not a writer.
+fn insert_keyword_precedes(head: &str) -> bool {
+    // `ends_with` rather than word equality: the keyword is embedded in a Rust
+    // string literal, so the token carrying it is `conn.execute("INSERT`.
+    let head = head.trim_end();
+    if head.ends_with("INSERT") {
+        return true;
+    }
+    let mut words = head.split_whitespace().rev();
+    let _conflict_action = words.next();
+    words.next() == Some("OR") && words.next().is_some_and(|word| word.ends_with("INSERT"))
+}
+
+/// Production inserts into `pages` whose column list does not name `kind`,
+/// reported as `path: <column list>`.
 ///
 /// `pages.kind` (migration 89) is `NOT NULL DEFAULT 'concept'`, so omitting it
 /// does not fail the insert — it silently asserts the row is a concept page.
 /// That default is exactly how every page written after migration 89 came to
 /// lie about what it is, the reserved Overview singleton included. The column
 /// list is the only place the omission is visible, so that is what is read.
+///
+/// Matching is deliberately loose on shape and strict on meaning: whitespace is
+/// collapsed first (so a statement split across source lines reads like a
+/// compact one) and keywords are compared case-insensitively against an
+/// ASCII-uppercase twin, because a guard that only recognises the one spelling
+/// the current code happens to use is a guard that passes the day someone
+/// writes `INSERT OR IGNORE` — a form this very file's migration 89 already
+/// uses on another table.
 fn page_insert_sites_without_kind(path: &str, source: &str) -> Vec<String> {
-    const NEEDLE: &str = "INSERT INTO pages";
     let production = strip_cfg_test_items(source);
+    let collapsed = production.split_whitespace().collect::<Vec<_>>().join(" ");
+    // `to_ascii_uppercase` is length-preserving, so one offset indexes both.
+    let upper = collapsed.to_ascii_uppercase();
     let mut sites = Vec::new();
-    let mut rest = production.as_str();
-    while let Some(offset) = rest.find(NEEDLE) {
-        let after = &rest[offset + NEEDLE.len()..];
-        rest = after;
+    let mut cursor = 0usize;
+    while let Some(found) = upper[cursor..].find("INTO PAGES") {
+        let start = cursor + found;
+        cursor = start + "INTO PAGES".len();
+        let after = &collapsed[cursor..];
         // `pages_fts`, `pages_pre49`, … are other tables entirely.
         if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        if !insert_keyword_precedes(&upper[..start]) {
             continue;
         }
         let Some(open) = after.find('(') else {
@@ -7903,8 +8075,8 @@ const PRE_KIND_SCHEMA_REBUILD: &str = concat!(
 );
 
 /// Test modules in this crate live in their own files, gated by a
-/// `#[cfg(test)] mod …;` declaration in the parent — a convention teeth #16
-/// (`db_main_tests_live_outside_db_rs`) already enforces. The gate is therefore
+/// `#[cfg(test)] mod …;` declaration in the parent — a convention
+/// `db_main_tests_live_outside_db_rs` already enforces. The gate is therefore
 /// in the parent file, not in the module, so the `#[cfg(test)]` strip cannot
 /// see it and the scan has to recognise these by name.
 fn is_test_only_module(path: &str) -> bool {
@@ -7968,6 +8140,46 @@ fn page_insert_kind_guard_detects_omission_and_ignores_lookalikes() {
         .is_empty(),
         "pages_fts is a different table"
     );
+
+    // Spellings the first cut of this guard was blind to. Each one is a real
+    // way to write the same insert, so each one must still be caught.
+    for (label, source) in [
+        (
+            "conflict clause",
+            "conn.execute(\"INSERT OR IGNORE INTO pages (id, title, creation_kind) \
+             VALUES (?1, ?2, ?3)\", ())",
+        ),
+        (
+            "replace clause",
+            "conn.execute(\"INSERT OR REPLACE INTO pages (id, title, creation_kind) \
+             VALUES (?1, ?2, ?3)\", ())",
+        ),
+        (
+            "lowercase keywords",
+            "conn.execute(\"insert into pages (id, title, creation_kind) \
+             values (?1, ?2, ?3)\", ())",
+        ),
+        (
+            "split across lines",
+            "conn.execute(\"INSERT INTO\n    pages\n    (id, title, creation_kind)\n \
+             VALUES (?1, ?2, ?3)\", ())",
+        ),
+    ] {
+        assert_eq!(
+            page_insert_sites_without_kind("crates/wenlan-core/src/somewhere.rs", source),
+            ["crates/wenlan-core/src/somewhere.rs: id, title, creation_kind"],
+            "a production insert written as `{label}` must still be caught"
+        );
+    }
+
+    assert!(
+        page_insert_sites_without_kind(
+            "crates/wenlan-core/src/somewhere.rs",
+            "conn.execute(\"DELETE FROM pages WHERE id = ?1\", ())",
+        )
+        .is_empty(),
+        "a statement that merely names the table is not an insert"
+    );
 }
 
 #[test]
@@ -7993,4 +8205,290 @@ fn page_insert_kind_guard_is_fail_closed_after_test_items() {
         "the gated fixture must be ignored, and a production insert after an inline \
          #[cfg(test)] item must still be caught"
     );
+}
+
+/// A brace that is only *text* must not move the depth counter. Both fixtures
+/// below put an unmatched `{` inside the `#[cfg(test)]` region — once in a
+/// string, once in a comment — so a counter reading raw bytes never sees the
+/// region balance, blanks the rest of the file, and reports nothing. Silence
+/// is the worst possible answer from a fail-closed guard, so each fixture is
+/// followed by a production insert the scan is required to still catch.
+#[test]
+fn page_insert_kind_guard_counts_only_structural_braces() {
+    for (label, text) in [
+        ("string", "        let brace = \"{\";\n"),
+        ("comment", "        // an unmatched { , written in prose\n"),
+    ] {
+        let source = format!(
+            concat!(
+                "#[cfg(test)]\n",
+                "mod tests {{\n",
+                "{}",
+                "    fn fixture() {{\n",
+                "        conn.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n",
+                "    }}\n",
+                "}}\n",
+                "async fn create(&self) {{\n",
+                "    tx.execute(\"INSERT INTO pages (id, summary) VALUES (?1, ?2)\", ());\n",
+                "}}\n",
+            ),
+            text
+        );
+        assert_eq!(
+            page_insert_sites_without_kind("crates/wenlan-core/src/somewhere.rs", &source),
+            ["crates/wenlan-core/src/somewhere.rs: id, summary"],
+            "an unmatched brace in a {label} must not swallow the production insert after it"
+        );
+    }
+}
+
+// ── Teeth #16: no production read routes on a non-`entity` page kind ──
+
+/// `pages.kind` values a production read may not discriminate on.
+///
+/// `'entity'` is absent on purpose. The `kind='entity'` shadow fence predates
+/// this repair and is the one value every writer has always stamped
+/// deliberately, so it is the one value a reader can trust today.
+const UNROUTABLE_PAGE_KINDS: [&str; 4] = ["authored", "concept", "overview", "source"];
+
+/// Production reads that filter or route on a `pages.kind` value other than
+/// `'entity'`, reported as `path: kind <op> <literal>`.
+///
+/// Writing the column truthfully is not the same as making it trustworthy to
+/// read. Two gaps survive this change on purpose. Rename, archive, and replace
+/// paths never re-derive `kind`, so a page renamed to `Overview` — or away from
+/// it — keeps whatever it was stamped with. And migration 89 folded only
+/// `creation_kind='imported'` onto `'source'`, never `'source'` itself, so a
+/// page imported before 89 still sits at `'concept'`; migration 104's ledger
+/// guard skips exactly those rows, because 89 already wrote them an entry. A
+/// reader routing on those values today is routing on stale data, which is why
+/// the fence stays up until M6 re-derives `kind` on every mutation path.
+///
+/// A write is not a read. A SQL predicate counts only when its own string
+/// literal selects from `pages` (`FROM pages` / `JOIN pages`), which is what
+/// keeps migration 89's `CHECK` constraint and migration 104's `WHERE kind =
+/// 'concept'` repair guard out of the scan without an exemption list that would
+/// have to be maintained — and widened — by hand.
+///
+/// The operator and the quote style are matched as a pair: SQL spells equality
+/// `=` around single quotes, Rust spells it `==` around double quotes. Nothing
+/// else is a comparison. That pairing is what keeps a Rust assignment and the
+/// `kind = "concept"` line inside an eval TOML fixture from reading as reads.
+///
+/// Known ceiling: this reads comparisons, not control flow. A
+/// `match page.kind.as_str() { "source" => … }` would route on the column
+/// without ever writing an operator, and the scan will not see it. Covering
+/// that needs match-arm parsing, worth building the day a page kind is first
+/// matched on — today every kind read in the workspace is a SQL predicate or
+/// a Rust `==`/`!=`, and those are what this guards.
+fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
+    let production = strip_cfg_test_items(source);
+    // Literals kept, comments blanked: the SQL this looks for lives inside
+    // string literals, while prose *about* `kind='concept'` is not a reader.
+    let visible = mask_lexical(&production, true);
+    let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut sites = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = collapsed[cursor..].find("kind") {
+        let start = cursor + found;
+        cursor = start + "kind".len();
+        // `creation_kind`, `assigned_kind`, `prior_creation_kind` are other
+        // columns and carry no fence.
+        if collapsed[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let mut rest = collapsed[cursor..].trim_start();
+        // `COALESCE(kind, 'concept') != 'entity'` is how this codebase already
+        // spells the entity fence, at every one of its two dozen live sites, so
+        // a reader that grows here will be a copy of one of them with the
+        // literal changed. Step over the default and read the operator that
+        // follows, or the guard is blind to its single most likely spelling.
+        let head = &collapsed[..start];
+        if head
+            .len()
+            .checked_sub("COALESCE(".len())
+            .and_then(|from| head.get(from..))
+            .is_some_and(|word| word.eq_ignore_ascii_case("COALESCE("))
+        {
+            let Some(close) = rest.find(')') else {
+                continue;
+            };
+            rest = rest[close + 1..].trim_start();
+        }
+        // Which quote styles each operator may legally carry. SQLite spells
+        // inequality both `<>` and `!=`, but only Rust spells equality `==`,
+        // and a bare `=` beside a double-quoted string is a Rust *assignment*,
+        // which is what keeps the `kind = "concept"` line inside an eval TOML
+        // fixture from reading as a comparison.
+        let (op, single, double, tail) = if let Some(tail) = rest.strip_prefix("==") {
+            ("==", false, true, tail)
+        } else if let Some(tail) = rest.strip_prefix("!=") {
+            ("!=", true, true, tail)
+        } else if let Some(tail) = rest.strip_prefix("<>") {
+            ("<>", true, false, tail)
+        } else if let Some(tail) = rest.strip_prefix('=') {
+            ("=", true, false, tail)
+        } else if rest
+            .get(..2)
+            .is_some_and(|word| word.eq_ignore_ascii_case("in"))
+            && !rest[2..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        {
+            ("IN", true, false, &rest[2..])
+        } else {
+            continue;
+        };
+        let operand = tail.trim_start();
+        let (scope, list) = match operand.strip_prefix('(') {
+            Some(items) => (items.split(')').next().unwrap_or_default(), true),
+            None => (operand, false),
+        };
+        let quote = match scope.trim_start().chars().next() {
+            Some('\'') if single => '\'',
+            Some('"') if double => '"',
+            // A column, a CASE, a bind parameter, an enum path: not a literal.
+            _ => continue,
+        };
+        let literals: Vec<&str> = if list {
+            scope.split(quote).skip(1).step_by(2).collect()
+        } else {
+            scope.split(quote).nth(1).into_iter().collect()
+        };
+        let Some(routed) = literals
+            .iter()
+            .find(|literal| UNROUTABLE_PAGE_KINDS.contains(literal))
+        else {
+            continue;
+        };
+        if quote == '\'' {
+            let literal_start = collapsed[..start].rfind('"').map_or(0, |open| open + 1);
+            let statement = collapsed[literal_start..start].to_ascii_uppercase();
+            if !statement.contains("FROM PAGES") && !statement.contains("JOIN PAGES") {
+                continue;
+            }
+        }
+        sites.push(format!("{path}: kind {op} {quote}{routed}{quote}"));
+    }
+    sites
+}
+
+#[test]
+fn no_production_read_routes_on_a_non_entity_page_kind() {
+    let root = repo_root();
+    let mut sites = Vec::new();
+    for path in git_ls_files(&root, "*.rs").into_iter().filter(|path| {
+        path.starts_with("crates/")
+            && path.contains("/src/")
+            && path != "crates/wenlan-core/src/drift_guard.rs"
+            && !is_test_only_module(path)
+    }) {
+        let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
+        sites.extend(page_kind_routing_sites(&path, &source));
+    }
+    assert!(
+        sites.is_empty(),
+        "production code now reads `pages.kind` to decide something, on a value other than \
+         'entity': {sites:?}. The column is written truthfully as of migration 104, but it is \
+         not yet trustworthy to read: rename, archive, and replace paths never re-derive it, \
+         and migration 89 folded only creation_kind='imported' onto 'source', so a page \
+         imported before 89 still carries 'concept'. Resolve by title or creation_kind the way \
+         synthesis::overview does, and retire this tooth in the PR that re-derives kind on \
+         every mutation path"
+    );
+}
+
+#[test]
+fn page_kind_routing_guard_separates_reads_from_writes() {
+    let path = "crates/wenlan-core/src/somewhere.rs";
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "conn.query(\"SELECT id FROM pages WHERE kind = 'source' AND status = 'active'\", ())",
+        ),
+        [format!("{path}: kind = 'source'")],
+        "a SELECT that filters pages on a non-entity kind is exactly what the fence forbids"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "conn.query(\"SELECT id FROM pages p JOIN page_map m ON m.page_id = p.id \
+             WHERE p.kind IN ('source','overview')\", ())",
+        ),
+        [format!("{path}: kind IN 'source'")],
+        "an IN list is a filter too, and a qualified `p.kind` is still the column"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(path, "if page.kind == \"overview\" { return Ok(()); }"),
+        [format!("{path}: kind == \"overview\"")],
+        "routing in Rust on a deserialized Page is the same fence"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "conn.query(\"SELECT id FROM pages WHERE status = 'active' \
+             AND COALESCE(kind, 'concept') = 'source'\", ())",
+        ),
+        [format!("{path}: kind = 'source'")],
+        "the fence's own COALESCE spelling with the literal swapped is the likeliest \
+         way a reader lands here, so it must not be the one shape that slips through"
+    );
+
+    for (label, source) in [
+        (
+            "the entity fence itself",
+            "conn.query(\"SELECT id FROM pages WHERE kind = 'entity' AND status = 'active'\", ())",
+        ),
+        (
+            "the entity fence in its live COALESCE spelling",
+            "conn.query(\"SELECT id FROM pages WHERE status = 'active' \
+             AND COALESCE(kind, 'concept') != 'entity'\", ())",
+        ),
+        (
+            "a COALESCE projection, which decides nothing",
+            "conn.query(\"SELECT COALESCE(kind, 'concept') FROM pages WHERE id = ?1\", ())",
+        ),
+        (
+            "migration 89's CHECK constraint",
+            "conn.execute(\"ALTER TABLE pages ADD COLUMN kind TEXT NOT NULL DEFAULT 'concept' \
+             CHECK(kind IN ('entity','concept','source','overview','authored'))\", ())",
+        ),
+        (
+            "migration 104's repair guard",
+            "tx.execute(\"UPDATE pages SET kind = CASE WHEN creation_kind = 'authored' \
+             THEN 'authored' ELSE 'concept' END WHERE kind = 'concept'\", ())",
+        ),
+        (
+            "a different column",
+            "conn.query(\"SELECT id FROM pages WHERE creation_kind = 'source'\", ())",
+        ),
+        (
+            "a different table's kind",
+            "conn.query(\"SELECT id FROM entity_links WHERE kind = 'source'\", ())",
+        ),
+        (
+            "a Rust assignment, not a comparison",
+            "let mut expected = Fixture::default(); expected.kind = \"concept\";",
+        ),
+        (
+            "prose in a comment",
+            "// pre-89 imports still carry kind='concept' until M6 re-derives them",
+        ),
+        (
+            "a bind parameter",
+            "conn.query(\"SELECT id FROM pages WHERE kind = ?1\", params![kind])",
+        ),
+    ] {
+        assert!(
+            page_kind_routing_sites(path, source).is_empty(),
+            "{label} is not a read routing on kind: {:?}",
+            page_kind_routing_sites(path, source)
+        );
+    }
 }

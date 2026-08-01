@@ -38935,6 +38935,108 @@ async fn migration_104_kind_repair_is_idempotent() {
     assert_eq!(page_kind_of(&db, "page_104_idem").await, "overview");
 }
 
+/// The SOURCE-page clone re-derives `kind` instead of copying it. Migration 89
+/// mapped only `creation_kind='imported'` onto 'source', so a pre-89 SOURCE
+/// page still sits at 'concept'; the clone is a NEW row with a new id and no
+/// fold-ledger entry, so migration 104 will never revisit it. Copying would
+/// mint a fresh row that lies -- the exact bug this change exists to end.
+#[tokio::test]
+async fn rebind_source_page_clone_derives_kind_rather_than_copying_a_stale_one() {
+    let (db, _dir) = test_db().await;
+    db.upsert_documents(vec![make_memory_doc(
+        "kind-rebind-old",
+        "Source page kind survives rename",
+        "fact",
+        "work",
+        "folder",
+    )])
+    .await
+    .unwrap();
+    let chunk_id = db
+        .get_memories_by_source_id("memory", "kind-rebind-old")
+        .await
+        .unwrap()[0]
+        .id
+        .clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page_with_kind(
+        "page_rebind_old",
+        "Ingested file",
+        None,
+        "body",
+        None,
+        None,
+        &[chunk_id.as_str()],
+        &now,
+        "source",
+        "unconfirmed",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    // Recreate the pre-89 state: migration 89 mapped only 'imported' onto
+    // 'source', so a SOURCE page of that era still sits on the silent default.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET kind = 'concept' WHERE id = 'page_rebind_old'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(page_kind_of(&db, "page_rebind_old").await, "concept");
+
+    db.rebind_source_id_with_source_page(
+        "memory",
+        "kind-rebind-old",
+        "kind-rebind-new",
+        "page_rebind_old",
+        "page_rebind_new",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        page_kind_of(&db, "page_rebind_new").await,
+        "source",
+        "the clone is a new row written today, so it must carry the kind today's \
+         rule assigns, not the stale one migration 89 left on its source"
+    );
+    // The clone's CASE is a third copy of the rule's logic; pin it to the rule
+    // itself so the two cannot drift apart unnoticed.
+    assert_eq!(
+        page_kind_of(&db, "page_rebind_new").await,
+        crate::pages::page_kind_for("Ingested file", "source", "active"),
+        "the clone's inline CASE must keep agreeing with crate::pages::page_kind_for"
+    );
+}
+
+/// A draft stores `kind='authored'`, so the `Page` handed back must say so.
+/// `PAGE_COLUMNS` used to stop before `kind`, and `row_to_page` defaults a
+/// missing column 20 to 'concept' -- which matched reality only while every
+/// row was 'concept'. Stamping the column at insert is what made that silent
+/// fallback start returning a value the row does not hold.
+#[tokio::test]
+async fn page_draft_read_returns_the_kind_it_stored() {
+    let (db, _dir) = test_db().await;
+    let id = format!("page_{}", uuid::Uuid::new_v4());
+    let created = db
+        .create_page_draft_with_id(&id, "Hand written", "body", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        page_kind_of(&db, &id).await,
+        "authored",
+        "the stored row is authored"
+    );
+    assert_eq!(
+        created.kind, "authored",
+        "and the returned Page must agree with the row it just wrote"
+    );
+}
+
 async fn insert_test_page(conn: &libsql::Connection, id: &str) {
     conn.execute(
         "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified) \
