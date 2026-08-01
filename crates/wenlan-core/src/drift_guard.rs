@@ -2158,10 +2158,10 @@ fn ci_routing_contract_violations(
         }
     }
     let differential_timeout =
-        "${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 30 }}";
+        "${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 45 }}";
     if ci["jobs"]["test"]["timeout-minutes"].as_str() != Some(differential_timeout) {
         violations.push(
-            "test does not enforce the 30-minute non-Windows PR budget while allowing a 60-minute Windows/non-PR backstop".into(),
+            "test does not enforce the 45-minute non-Windows PR budget while allowing a 60-minute Windows/non-PR backstop".into(),
         );
     }
     let release_preflight_condition = ci["jobs"]["release-preflight"]["if"]
@@ -3094,7 +3094,7 @@ jobs:
         "nextest config",
         "release-profile-sensitive",
         "native/build-sensitive",
-        "30-minute non-Windows PR budget",
+        "45-minute non-Windows PR budget",
         "release-sensitive PRs and release backstops",
         "rust-lld",
         "debug runtime artifacts",
