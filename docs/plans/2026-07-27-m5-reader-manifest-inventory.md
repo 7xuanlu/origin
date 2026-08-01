@@ -871,35 +871,36 @@ carrying the authority of agreement.
 
 | Address | Function | Visibility | Exposure |
 |---|---|---|---|
-| `core/db.rs:3635` | `run_migrations` | `pub` | internal-only |
-| `core/db.rs:9133` | `migrate_89_page_kind_fold` | `private` | internal-only |
-| `core/db.rs:17110` | `reconcile_entity_page_parity` | `pub` | **exposure** — `server/scheduler/ambient.rs:532` |
-| `core/db.rs:26739` | `rebind_source_page_in_transaction` | `private` | internal-only |
-| `core/db.rs:34378` | `oldest_active_page` | `pub` | internal-only |
-| `core/db.rs:39574` | `list_recent_retrievals` | `pub` | internal-only |
-| `core/db.rs:39714` | `list_recent_retrievals_scoped` | `pub` | **exposure** — `server/routes.rs:948` |
-| `core/db.rs:39920` | `list_recent_changes` | `pub` | internal-only |
-| `core/db.rs:40223` | `list_recent_pages_with_badges` | `pub` | internal-only |
-| `core/db.rs:41136` | `append_page_history` | `private` | internal-only |
-| `core/db.rs:41297` | `insert_page_with_kind_inner` | `private` | internal-only |
-| `core/db.rs:41834` | `get_page_inner` | `private` | internal-only |
-| `core/db.rs:41863` | `get_page_by_entity` | `pub` | internal-only |
-| `core/db.rs:41938` | `list_pages_inner` | `private` | internal-only |
-| `core/db.rs:41971` | `list_pages_stale` | `pub` | internal-only |
-| `core/db.rs:42016` | `list_pages_by_space` | `pub` | internal-only |
-| `core/db.rs:43077` | `find_matching_page` | `pub` | internal-only |
-| `core/db.rs:43134` | `find_matching_page_scoped` | `pub` | internal-only |
-| `core/db.rs:43501` | `page_merge_row` | `private` | internal-only |
-| `core/db.rs:43550` | `load_page_source_index` | `pub` | **exposure** — `server/routes.rs:693` |
-| `core/db.rs:43684` | `list_active_page_titles_scoped` | `pub` | internal-only |
-| `core/db.rs:43731` | `list_relevant_active_page_titles` | `pub` | internal-only |
-| `core/db.rs:43798` | `find_active_page_id_by_title` | `pub` | internal-only |
-| `core/db.rs:43833` | `find_unique_active_page_id_by_title_scoped` | `pub` | internal-only |
-| `core/db.rs:44384` | `backfill_page_embeddings` | `pub` | internal-only |
-| `core/db.rs:45462` | `get_pages_for_memory` | `pub` | internal-only |
-| `core/db.rs:46361` | `get_stale_page_after` | `pub` | internal-only |
-| `core/db.rs:46398` | `list_stale_pages_scoped` | `pub` | **exposure** — `server/routes.rs:772` |
-| `core/db.rs:46438` | `find_stale_archived_pages` | `pub` | **exposure** — `server/cmd_backfill.rs:49` |
+| `core/db.rs:3641` | `run_migrations` | `pub` | internal-only |
+| `core/db.rs:9147` | `migrate_89_page_kind_fold` | `private` | internal-only |
+| `core/db.rs:17158` | `reconcile_entity_page_parity` | `pub` | **exposure** — `server/scheduler/ambient.rs:532` |
+| `core/db.rs:26787` | `rebind_source_page_in_transaction` | `private` | internal-only |
+| `core/db.rs:34426` | `oldest_active_page` | `pub` | internal-only |
+| `core/db.rs:39622` | `list_recent_retrievals` | `pub` | internal-only |
+| `core/db.rs:39762` | `list_recent_retrievals_scoped` | `pub` | **exposure** — `server/routes.rs:948` |
+| `core/db.rs:39968` | `list_recent_changes` | `pub` | internal-only |
+| `core/db.rs:40271` | `list_recent_pages_with_badges` | `pub` | internal-only |
+| `core/db.rs:41184` | `append_page_history` | `private` | internal-only |
+| `core/db.rs:41345` | `insert_page_with_kind_inner` | `private` | internal-only |
+| `core/db.rs:41882` | `get_page_inner` | `private` | internal-only |
+| `core/db.rs:41911` | `get_page_by_entity` | `pub` | internal-only |
+| `core/db.rs:41986` | `list_pages_inner` | `private` | internal-only |
+| `core/db.rs:42019` | `list_pages_stale` | `pub` | internal-only |
+| `core/db.rs:42064` | `list_pages_by_space` | `pub` | internal-only |
+| `core/db.rs:43125` | `find_matching_page` | `pub` | internal-only |
+| `core/db.rs:43182` | `find_matching_page_scoped` | `pub` | internal-only |
+| `core/db.rs:43549` | `page_merge_row` | `private` | internal-only |
+| `core/db.rs:43598` | `load_page_source_index` | `pub` | **exposure** — `server/routes.rs:693` |
+| `core/db.rs:43732` | `list_active_page_titles_scoped` | `pub` | internal-only |
+| `core/db.rs:43779` | `list_relevant_active_page_titles` | `pub` | internal-only |
+| `core/db.rs:43846` | `find_active_page_id_by_title` | `pub` | internal-only |
+| `core/db.rs:43881` | `find_unique_active_page_id_by_title_scoped` | `pub` | internal-only |
+| `core/db.rs:44432` | `backfill_page_embeddings` | `pub` | internal-only |
+| `core/db.rs:45510` | `get_pages_for_memory` | `pub` | internal-only |
+| `core/db.rs:46409` | `get_stale_page_after` | `pub` | internal-only |
+| `core/db.rs:46446` | `list_stale_pages_scoped` | `pub` | **exposure** — `server/routes.rs:772` |
+| `core/db.rs:46486` | `find_stale_archived_pages` | `pub` | **exposure** — `server/cmd_backfill.rs:49` |
+| `core/db/claim_derivation.rs:380` | `evaluate_page_support` | `pub` | internal-only |
 | `core/db/maintenance_duplicate_reads.rs:35` | `embedding_near_duplicate_pairs` | `pub(crate)` | internal-only |
 | `core/db/maintenance_duplicate_reads.rs:108` | `scan_near_duplicate_slice` | `pub(crate)` | internal-only |
 | `core/db/maintenance_retro_scan.rs:17` | `scan_automatic_retro_stub_slice` | `pub(crate)` | internal-only |
@@ -933,23 +934,23 @@ carrying the authority of agreement.
 
 | Address | Function | Visibility | Reaches prose via |
 |---|---|---|---|
-| `core/db.rs:3296` | `new` | `pub` | `run_migrations` |
-| `core/db.rs:3508` | `new_with_shared_embedder` | `pub` | `run_migrations` |
-| `core/db.rs:24201` | `augment_with_graph_gated` | `private` | `search_entities_by_vector_scoped` |
-| `core/db.rs:26279` | `rebind_source_id_inner` | `private` | `rebind_source_page_in_transaction` |
-| `core/db.rs:41227` | `insert_page_with_kind` | `pub(crate)` | `insert_page_with_kind_inner` |
-| `core/db.rs:41266` | `insert_document_source_page_at_hash` | `pub(crate)` | `insert_page_with_kind_inner` |
-| `core/db.rs:41540` | `replace_source_page_inner` | `private` | `append_page_history` |
-| `core/db.rs:41821` | `get_page` | `pub` | `get_page_inner` |
-| `core/db.rs:41830` | `get_page_browse` | `pub` | `get_page_inner` |
-| `core/db.rs:41916` | `list_pages` | `pub` | `list_pages_inner` |
-| `core/db.rs:41929` | `list_pages_browse` | `pub` | `list_pages_inner` |
-| `core/db.rs:42422` | `try_update_page_content` | `private` | `append_page_history` |
-| `core/db.rs:43306` | `accept_page_merge` | `pub` | `page_merge_row` |
-| `core/db.rs:43538` | `find_best_overlapping_page` | `pub` | `load_page_source_index` |
-| `core/db.rs:43671` | `list_active_page_titles` | `pub` | `list_active_page_titles_scoped` |
-| `core/db.rs:44112` | `resolve_orphan_page_links` | `pub` | `find_unique_active_page_id_by_title_scoped` |
-| `core/db.rs:46351` | `list_stale_pages` | `pub` | `list_stale_pages_scoped` |
+| `core/db.rs:3302` | `new` | `pub` | `run_migrations` |
+| `core/db.rs:3514` | `new_with_shared_embedder` | `pub` | `run_migrations` |
+| `core/db.rs:24249` | `augment_with_graph_gated` | `private` | `search_entities_by_vector_scoped` |
+| `core/db.rs:26327` | `rebind_source_id_inner` | `private` | `rebind_source_page_in_transaction` |
+| `core/db.rs:41275` | `insert_page_with_kind` | `pub(crate)` | `insert_page_with_kind_inner` |
+| `core/db.rs:41314` | `insert_document_source_page_at_hash` | `pub(crate)` | `insert_page_with_kind_inner` |
+| `core/db.rs:41588` | `replace_source_page_inner` | `private` | `append_page_history` |
+| `core/db.rs:41869` | `get_page` | `pub` | `get_page_inner` |
+| `core/db.rs:41878` | `get_page_browse` | `pub` | `get_page_inner` |
+| `core/db.rs:41964` | `list_pages` | `pub` | `list_pages_inner` |
+| `core/db.rs:41977` | `list_pages_browse` | `pub` | `list_pages_inner` |
+| `core/db.rs:42470` | `try_update_page_content` | `private` | `append_page_history` |
+| `core/db.rs:43354` | `accept_page_merge` | `pub` | `page_merge_row` |
+| `core/db.rs:43586` | `find_best_overlapping_page` | `pub` | `load_page_source_index` |
+| `core/db.rs:43719` | `list_active_page_titles` | `pub` | `list_active_page_titles_scoped` |
+| `core/db.rs:44160` | `resolve_orphan_page_links` | `pub` | `find_unique_active_page_id_by_title_scoped` |
+| `core/db.rs:46399` | `list_stale_pages` | `pub` | `list_stale_pages_scoped` |
 | `core/db/presence_review.rs:112` | `review_in_txn` | `private` | `page_binding` |
 | `core/db/repair_page_rename.rs:622` | `rename_page_projection_matches_post` | `private` | `page_on_connection` |
 | `core/db/scoped_pages.rs:280` | `list_recent_pages_with_badges_scoped` | `pub` | `list_recent_pages_with_badges` |
@@ -993,25 +994,25 @@ carrying the authority of agreement.
 | Address | Function | Visibility | Reaches prose via |
 |---|---|---|---|
 | `core/citations.rs:419` | `run_citation_backfill_with_page_limit` | `private` | `get_page` |
-| `core/db.rs:21846` | `search_memory_with_cue` | `private` | `augment_with_graph_gated` |
-| `core/db.rs:24184` | `augment_with_graph` | `pub` | `augment_with_graph_gated` |
-| `core/db.rs:24734` | `augment_with_graph_seeded_scoped` | `private` | `augment_with_graph_gated` |
-| `core/db.rs:26249` | `rebind_source_id` | `pub` | `rebind_source_id_inner` |
-| `core/db.rs:26262` | `rebind_source_id_with_source_page` | `pub` | `rebind_source_id_inner` |
-| `core/db.rs:34369` | `first_active_page` | `pub` | `list_pages` |
-| `core/db.rs:41189` | `insert_page` | `pub(crate)` | `insert_page_with_kind` |
-| `core/db.rs:41484` | `replace_source_page` | `pub(crate)` | `replace_source_page_inner` |
-| `core/db.rs:41509` | `replace_source_page_at_document_hash` | `pub(crate)` | `replace_source_page_inner` |
-| `core/db.rs:41883` | `find_page_by_source_memory` | `pub` | `get_page` |
-| `core/db.rs:42172` | `update_page_content` | `pub` | `try_update_page_content` |
-| `core/db.rs:42205` | `try_update_page_content_if_stale` | `pub` | `try_update_page_content` |
-| `core/db.rs:42231` | `try_update_page_content_with_changelog_at_source_revision` | `pub` | `try_update_page_content` |
-| `core/db.rs:42279` | `try_update_page_content_with_changelog` | `pub` | `try_update_page_content` |
-| `core/db.rs:42313` | `try_update_page_content_with_changelog_at_version` | `pub` | `try_update_page_content` |
-| `core/db.rs:42348` | `try_update_page_growth_at_versions` | `pub` | `try_update_page_content` |
-| `core/db.rs:42386` | `try_accept_page_revision` | `pub(crate)` | `try_update_page_content` |
-| `core/db.rs:43060` | `refresh_page_wikilinks` | `pub` | `get_page` |
-| `core/db.rs:43590` | `max_page_overlap` | `pub` | `find_best_overlapping_page` |
+| `core/db.rs:21894` | `search_memory_with_cue` | `private` | `augment_with_graph_gated` |
+| `core/db.rs:24232` | `augment_with_graph` | `pub` | `augment_with_graph_gated` |
+| `core/db.rs:24782` | `augment_with_graph_seeded_scoped` | `private` | `augment_with_graph_gated` |
+| `core/db.rs:26297` | `rebind_source_id` | `pub` | `rebind_source_id_inner` |
+| `core/db.rs:26310` | `rebind_source_id_with_source_page` | `pub` | `rebind_source_id_inner` |
+| `core/db.rs:34417` | `first_active_page` | `pub` | `list_pages` |
+| `core/db.rs:41237` | `insert_page` | `pub(crate)` | `insert_page_with_kind` |
+| `core/db.rs:41532` | `replace_source_page` | `pub(crate)` | `replace_source_page_inner` |
+| `core/db.rs:41557` | `replace_source_page_at_document_hash` | `pub(crate)` | `replace_source_page_inner` |
+| `core/db.rs:41931` | `find_page_by_source_memory` | `pub` | `get_page` |
+| `core/db.rs:42220` | `update_page_content` | `pub` | `try_update_page_content` |
+| `core/db.rs:42253` | `try_update_page_content_if_stale` | `pub` | `try_update_page_content` |
+| `core/db.rs:42279` | `try_update_page_content_with_changelog_at_source_revision` | `pub` | `try_update_page_content` |
+| `core/db.rs:42327` | `try_update_page_content_with_changelog` | `pub` | `try_update_page_content` |
+| `core/db.rs:42361` | `try_update_page_content_with_changelog_at_version` | `pub` | `try_update_page_content` |
+| `core/db.rs:42396` | `try_update_page_growth_at_versions` | `pub` | `try_update_page_content` |
+| `core/db.rs:42434` | `try_accept_page_revision` | `pub(crate)` | `try_update_page_content` |
+| `core/db.rs:43108` | `refresh_page_wikilinks` | `pub` | `get_page` |
+| `core/db.rs:43638` | `max_page_overlap` | `pub` | `find_best_overlapping_page` |
 | `core/db/presence_review.rs:75` | `review_page_with_presence` | `pub` | `review_in_txn` |
 | `core/db/repair_page_regenerate.rs:123` | `regenerate_page_projection_cas` | `pub(crate)` | `get_page` |
 | `core/db/repair_page_rename.rs:412` | `recover_rename_page_title_apply_receipt` | `pub(crate)` | `rename_page_projection_matches_post` |
@@ -1093,11 +1094,11 @@ carrying the authority of agreement.
 |---|---|---|---|
 | `core/citations.rs:398` | `run_citation_backfill_tick` | `pub` | `run_citation_backfill_with_page_limit` |
 | `core/citations.rs:411` | `run_citation_backfill_slice` | `pub` | `run_citation_backfill_with_page_limit` |
-| `core/db.rs:21809` | `search_memory` | `pub` | `search_memory_with_cue` |
-| `core/db.rs:22622` | `search_memory_temporal` | `pub` | `search_memory_with_cue` |
-| `core/db.rs:23133` | `search_memory_cross_rerank_cued` | `pub` | `search_memory_with_cue` |
-| `core/db.rs:23602` | `search_memory_expanded` | `pub` | `search_memory_with_cue` |
-| `core/db.rs:24717` | `augment_with_graph_seeded` | `pub` | `augment_with_graph_seeded_scoped` |
+| `core/db.rs:21857` | `search_memory` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:22670` | `search_memory_temporal` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:23181` | `search_memory_cross_rerank_cued` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:23650` | `search_memory_expanded` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:24765` | `augment_with_graph_seeded` | `pub` | `augment_with_graph_seeded_scoped` |
 | `core/db/repair_verification.rs:162` | `record_repair_verification_atomic` | `pub(crate)` | `projection_page_row_on_connection` |
 | `core/db/scoped_pages.rs:445` | `list_pages_scoped` | `pub` | `list_pages_scoped_inner` |
 | `core/db/scoped_pages.rs:461` | `list_pages_scoped_browse` | `pub` | `list_pages_scoped_inner` |
