@@ -83,20 +83,29 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 > Where the derivation does not apply, the row carries an explicit control in its
 > RED column and says so.
 
-> **Decision S0-136 — a `lane 1` row is specified against the frozen four-
-> condition predicate, not against whatever the worker turns out to do.** The
-> predicate is committed and stable at
-> `docs/plans/2026-07-27-m5-truth-state-matrix.md:21`-`:35`; the implementation
-> is not yet. Writing the tests against the document means the worker is tested
-> against its contract rather than against itself, and it means these rows are
-> reviewable now.
+> **Decision S0-136 — a `lane 1` row is specified against committed frozen text,
+> not against whatever the worker turns out to do.** For the nine predicate rows
+> in §1 that text is the frozen four-condition predicate
+> (`docs/plans/2026-07-27-m5-truth-state-matrix.md:21`-`:35`); the implementation
+> is not yet committed. Writing the tests against the document means the worker
+> is tested against its contract rather than against itself, and it means these
+> rows are reviewable now.
+>
+> *(rev 2, finding 12: rev 1 said every `lane 1` row is specified against the
+> four conditions. P6b is `lane 1` and is not — it is the axis-independence
+> claim that sits beside the predicate, whose frozen text is
+> `:14`-`:17` of the same matrix. The rule is the same, the source text is a
+> different paragraph, and rev 1's wording denied that the distinction existed.
+> See "P6 is not predicate coverage" below.)*
 
 ---
 
 ## 1. The `supported` predicate — the shared dependency
 
-Six gate rows — G1.2, G2.5, G6.9, G7.1, G7.2, G7.3 — plus the six predicate
-rows below all depend on a page being `supported`. The predicate has four
+Six gate rows — G1.2, G2.5, G6.9, G7.1, G7.2, G7.3 — plus the nine predicate
+rows below all depend on a page being `supported`. (The two P6 rows in the
+following section do not: P6 is about axis independence, not about the
+predicate — see below.) The predicate has four
 conditions, and **every** one must hold; any failure of any
 kind yields `provisional`
 (`docs/plans/2026-07-27-m5-truth-state-matrix.md:21`-`:35`):
