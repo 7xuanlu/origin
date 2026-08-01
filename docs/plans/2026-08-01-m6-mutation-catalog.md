@@ -565,8 +565,13 @@ claim being added — S0-154's split turned fifteen bundled rows into their
 constituent conditions, which is the point: the bundling was hiding untested
 conditions inside rows that already counted as covered. G4.1 alone was eleven
 components behind one row, and G4.2 seven injected events behind another —
-finding 7's exact objection. Two statuses also changed on inspection rather than
-on split, both downward: see the G6 and G9 notes for finding 8's relabels.)*
+finding 7's exact objection. Statuses also moved, always downward and never up:
+G9.1, G9.2, G9.4 and G9.5 lost their LIVE marks on inspection (finding 8 — they
+named a tooth that guards a different manifest), and the G6.3/G6.5 splits left
+the PR-A-new components — the `0.10` margin, and the four ineligible-input
+classes — correctly separated from the two threshold constants that really are
+live. One row was added rather than relabelled: G9.6 catalogues the tooth the
+old LIVE marks were borrowing.)*
 
 ---
 
