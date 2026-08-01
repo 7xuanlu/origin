@@ -21,6 +21,8 @@ static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 
 mod brief;
 pub use brief::LegacyBriefItem;
+mod claim_derivation;
+pub use claim_derivation::{DerivationJob, EXTRACTOR_VERSION, LEASE_SECS, MAX_ATTEMPTS};
 mod claim_identity;
 mod community_grouping_state;
 mod count;
@@ -76,6 +78,8 @@ pub use truth_exposure::{
 
 #[cfg(test)]
 mod brief_test;
+#[cfg(test)]
+mod claim_derivation_test;
 #[cfg(test)]
 mod claim_edge_lifecycle_test;
 #[cfg(test)]
@@ -683,7 +687,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 103;
+pub const SCHEMA_VERSION: u32 = 104;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8379,6 +8383,14 @@ impl MemoryDB {
             if version < 103 {
                 self.migrate_103_page_evaluated_at(version).await?;
             }
+
+            // Migration 104 (M5 derivation worker): the enqueue triggers, plus
+            // the first backlog sweep. `claim_derivation_jobs` has existed since
+            // 98 with neither a writer nor a reader, so the queue was empty on
+            // every install and `support_status = 'supported'` matched nothing.
+            if version < 104 {
+                self.migrate_104_claim_derivation_queue(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11852,6 +11864,40 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("m103 bump: {error}")))?;
         log::info!("[migration] Migration 103 applied: page_truth_state.evaluated_at");
+        Ok(())
+    }
+
+    /// Bring the derivation queue to life: enqueue triggers for future pages,
+    /// then one backlog sweep so the pages that already exist are on the list.
+    ///
+    /// The sweep is bounded rather than exhaustive. Migration runs at daemon
+    /// startup holding the single connection's mutex, and a vault with tens of
+    /// thousands of pages would hold every foreground request behind a full
+    /// scan; the ambient lane re-runs the sweep each turn, so a large backlog
+    /// fills in over the following ticks instead of at boot.
+    async fn migrate_104_claim_derivation_queue(&self, _prior: i64) -> Result<(), WenlanError> {
+        {
+            let conn = self.conn.lock().await;
+            let tx = conn
+                .transaction()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m104 begin: {error}")))?;
+            Self::ensure_claim_derivation_triggers(&tx).await?;
+            tx.commit()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m104 commit: {error}")))?;
+        }
+
+        let enqueued = self.enqueue_stale_derivation_jobs(500).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 104", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m104 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 104 applied: claim-derivation queue live ({enqueued} \
+             page(s) enqueued from the existing backlog)"
+        );
         Ok(())
     }
 
