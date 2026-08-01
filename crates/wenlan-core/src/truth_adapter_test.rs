@@ -23,19 +23,34 @@ use crate::truth_contract::TruthGrant;
 async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
     let (db, temp) = test_db().await;
     for id in ["p1", "p2", "p3"] {
-        db.insert_page(id, id, None, "", None, None, &[], "2026-07-28T00:00:00Z")
-            .await
-            .unwrap();
+        db.insert_page(
+            id,
+            id,
+            None,
+            "the body prose",
+            None,
+            None,
+            &[],
+            "2026-07-28T00:00:00Z",
+        )
+        .await
+        .unwrap();
     }
     {
         let conn = db.test_primary_session().await;
         // `human_reviewed = 1` is CHECK-bound to the version + digest it was
-        // reviewed at, so a review cannot outlive the prose it approved.
+        // reviewed at, so a review cannot outlive the prose it approved. The
+        // digest here has to be the real one for the page's real body -- a
+        // review of anything else is a review of text that is not on the page,
+        // and `page_truth_states` will not count it.
+        let digest = crate::provenance::revision_content_digest("the body prose");
         conn.execute(
-            "INSERT INTO page_truth_state
-                (page_id,page_version,support_status,human_reviewed,
-                 reviewed_page_version,reviewed_page_digest,updated_at)
-             VALUES ('p1',1,'supported',1,1,'digest-of-p1-v1',1)",
+            &format!(
+                "INSERT INTO page_truth_state
+                    (page_id,page_version,support_status,human_reviewed,
+                     reviewed_page_version,reviewed_page_digest,updated_at)
+                 VALUES ('p1',1,'supported',1,1,'{digest}',1)"
+            ),
             (),
         )
         .await
@@ -234,7 +249,145 @@ async fn a_named_grant_opens_only_the_page_the_call_named() {
     assert_eq!(kept[1].content, "the body prose", "the named page opens");
 }
 
+/// The other half of what `NamedPages` is defined to be: "Full prose, both
+/// axes, for exactly these page IDs."
+///
+/// The prose half was enforced and the axes half was not, because `Full`
+/// visibility was treated as the identity — so a client that declared the
+/// contract, gestured, and opened one page got the page and no way to tell
+/// whether it was supported or reviewed. That is the same unearned trust the
+/// collection carve-out spells out for entries, arriving through the door that
+/// serves the whole page.
+#[tokio::test]
+async fn a_named_grant_carries_both_axes_for_exactly_the_named_pages() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let kept = filter_pages(
+        &db,
+        &TruthGrant::NamedPages(vec!["p1".to_string(), "p2".to_string()]),
+        pages(),
+    )
+    .await
+    .unwrap();
+
+    let p1 = kept.iter().find(|p| p.id == "p1").unwrap();
+    assert_eq!(
+        p1.content, "the body prose",
+        "a named page keeps every prose field"
+    );
+    assert_eq!(
+        p1.truth.expect("a named page must carry both axes"),
+        wenlan_types::pages::PageTruth {
+            supported: true,
+            human_reviewed: true,
+        },
+    );
+
+    let p2 = kept.iter().find(|p| p.id == "p2").unwrap();
+    assert_eq!(
+        p2.content, "the body prose",
+        "an unsupported page the call named still opens in full"
+    );
+    assert_eq!(
+        p2.truth.expect("a named page must carry both axes"),
+        wenlan_types::pages::PageTruth {
+            supported: false,
+            human_reviewed: false,
+        },
+        "and says so, rather than opening silently"
+    );
+}
+
+/// "For exactly these page IDs" is a limit as well as a promise. A page that
+/// survives on its own support while riding along beside a named one was never
+/// named, so it gets no axes — the same boundary that stops a named grant from
+/// opening it.
+#[tokio::test]
+async fn a_page_riding_along_beside_a_named_one_gets_no_axes() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let kept = filter_pages(
+        &db,
+        &TruthGrant::NamedPages(vec!["p2".to_string()]),
+        pages(),
+    )
+    .await
+    .unwrap();
+
+    let p1 = kept.iter().find(|p| p.id == "p1").unwrap();
+    assert!(
+        p1.truth.is_none(),
+        "p1 came through on its own support, not on a grant that named it"
+    );
+    assert!(
+        kept.iter().find(|p| p.id == "p2").unwrap().truth.is_some(),
+        "the page the call actually named carries its axes"
+    );
+}
+
+/// The inertness gate, held for the new minting site too. Before the cutover
+/// there is no verdict to report, and a client that saw `supported: false` on
+/// every page would be reading a judgement nobody has made.
+#[tokio::test]
+async fn a_named_grant_mints_no_axes_before_the_cutover() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    db.set_truth_cutover_generation(0).await.unwrap();
+
+    let kept = filter_pages(
+        &db,
+        &TruthGrant::NamedPages(vec!["p1".to_string(), "p2".to_string()]),
+        pages(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(kept.len(), 3, "nothing is filtered at generation 0");
+    assert!(
+        kept.iter().all(|p| p.truth.is_none()),
+        "generation 0 must not mint truth axes onto the wire, named or not"
+    );
+}
+
+/// An automatic reader's wire stays byte-identical after the cutover. It
+/// declared no contract and made no gesture, so it renders no axes and must not
+/// be handed any.
+#[tokio::test]
+async fn an_automatic_reader_gets_no_axes_after_the_cutover() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let kept = filter_pages(&db, &TruthGrant::Automatic, pages())
+        .await
+        .unwrap();
+    assert!(
+        kept.iter().all(|p| p.truth.is_none()),
+        "an automatic reader must see the pre-M5 page shape"
+    );
+}
+
 // ---- filter_page --------------------------------------------------------
+
+/// The by-id reader is the one a person actually opens a page through, and it
+/// routes through `filter_pages`, so the axes have to survive the single-page
+/// path as well as the batch one.
+#[tokio::test]
+async fn the_by_id_reader_carries_both_axes_for_the_page_it_named() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let opened = filter_page(
+        &db,
+        &TruthGrant::NamedPages(vec!["p2".to_string()]),
+        Some(page("p2")),
+    )
+    .await
+    .unwrap()
+    .expect("a named unsupported page opens");
+
+    assert_eq!(opened.content, "the body prose");
+    assert_eq!(
+        opened
+            .truth
+            .expect("the page a call named must arrive with both axes"),
+        wenlan_types::pages::PageTruth {
+            supported: false,
+            human_reviewed: false,
+        },
+    );
+}
 
 #[tokio::test]
 async fn a_hidden_page_becomes_a_miss_rather_than_an_empty_body() {

@@ -186,6 +186,46 @@ impl Default for OnDeviceInferenceStatus {
     }
 }
 
+/// Where this daemon stands on the M5 truth cutover.
+///
+/// The one thing a client cannot otherwise ask. Until this shipped, the durable
+/// cutover generation was reachable only from the daemon's own maintenance
+/// subcommand, so an app had no way to tell an enforcing daemon from a
+/// pass-through one — and the M5 review action, whose whole precondition is
+/// "the cutover is live", had nothing to gate itself on.
+///
+/// Carries no page identity, no title and no prose, which is why `/api/status`
+/// keeps its `page_bearing: no` classification in the reader manifest. It
+/// describes the daemon, not anything the daemon stores.
+///
+/// Additive on both sides of the wire, and **present only when the cutover is
+/// live**. A daemon that predates the field omits it, a daemon at generation 0
+/// omits it, and a daemon that could not read its own generation omits it —
+/// three situations with one honest reading, which is why they share one
+/// spelling. `None` is that reading: a client that cannot confirm the cutover is
+/// live must behave as though it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruthStatus {
+    /// The durable cutover generation, always `> 0` as served by this daemon —
+    /// `0` means every truth adapter is pass-through, and that state is reported
+    /// by omitting the whole object rather than by sending a zero.
+    pub cutover_generation: i64,
+    /// The newest truth-contract version this daemon serves. A client declaring
+    /// a higher version is treated as legacy, so a client that reads this can
+    /// declare what the daemon actually understands instead of guessing.
+    pub contract_version: u32,
+}
+
+impl TruthStatus {
+    /// Is fail-closed provisional enforcement live?
+    ///
+    /// Presence of the object is the signal; this is the redundant floor for a
+    /// client holding a `TruthStatus` from somewhere that did send a zero.
+    pub const fn cutover_live(&self) -> bool {
+        self.cutover_generation > 0
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub is_running: bool,
@@ -225,6 +265,10 @@ pub struct StatusResponse {
     /// instead of inferring support from a version string.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// M5 truth-cutover state. Absent on daemons that predate it, which a
+    /// client must read as "not live" rather than "unknown, proceed anyway".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth: Option<TruthStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1597,6 +1641,7 @@ mod reranker_status_tests {
             reranker_mode: "full".into(),
             on_device_inference: OnDeviceInferenceStatus::default(),
             capabilities: vec!["default_save_space".into()],
+            truth: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -1718,4 +1763,26 @@ mod search_response_tests {
             "empty array should deserialize to empty vec"
         );
     }
+}
+
+/// What a successful page review records, and what a retry of it replays.
+///
+/// This is the whole of §7's allowed payload and nothing else: protocol
+/// version, nonce **digest**, verification time, the page version and content
+/// digest the human actually read, and caller/operation identity. No HMAC, no
+/// raw nonce, no secret — which is why this type can be stored as the receipt,
+/// returned in the response, and logged, all from one shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageReviewReceipt {
+    pub page_id: String,
+    pub human_reviewed: bool,
+    /// The version the digest below belongs to, read from the row rather than
+    /// taken from the request.
+    pub reviewed_page_version: i64,
+    pub reviewed_page_digest: String,
+    pub protocol_version: u32,
+    pub nonce_digest: String,
+    pub verified_at: i64,
+    pub caller_id: String,
+    pub operation_id: String,
 }

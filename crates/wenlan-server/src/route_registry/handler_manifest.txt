@@ -106,6 +106,7 @@ main|post|/api/pages|wenlan_server::page_routes::handle_create_page
 main|post|/api/pages/export|wenlan_server::page_routes::handle_export_pages
 main|post|/api/pages/search|wenlan_server::page_routes::handle_search_pages
 main|post|/api/pages/{id}/archive|wenlan_server::page_routes::handle_archive_page
+main|post|/api/pages/{id}/review|wenlan_server::page_routes::handle_review_page
 main|post|/api/pages/{id}/export|wenlan_server::page_routes::handle_export_page
 main|post|/api/pages/{id}/map/edges|wenlan_server::page_map_routes::handle_create_map_edge
 main|post|/api/pages/{id}/map/improve|wenlan_server::page_map_routes::handle_improve_page_map

@@ -327,6 +327,25 @@ impl MemoryDB {
     /// condemn every page. `evaluated_at` is what separates the two, and it is
     /// NULL for every row migration 99's backfill wrote.
     ///
+    /// `human_reviewed` is **computed, not read**. The stored bit is a
+    /// historical receipt — "somebody approved this page, at this version, with
+    /// this content digest" — and nothing clears it when the page is edited: the
+    /// update bumps `version` and rewrites `content`, and the truth row is not in
+    /// its reach. Left as-is, a page could be reviewed once, rewritten into
+    /// something else entirely, and stay both "reviewed" and (post-cutover)
+    /// fully visible on the strength of an approval of text nobody can see any
+    /// more.
+    ///
+    /// So the review is in force only while `reviewed_page_digest` still matches
+    /// the page's current content. An edited page falls back to unreviewed by
+    /// itself, and back to whatever its machine verdict earns it — fail-closed,
+    /// with no new write path and nothing to migrate. Restoring the exact text
+    /// restores the review, which is right: the receipt is about content, not
+    /// about a version counter that only ever climbs.
+    ///
+    /// Content is pulled only for rows that claim a review, so the ordinary page
+    /// carries no extra cost.
+    ///
     /// [`Support::Unevaluated`]: crate::truth_contract::Support::Unevaluated
     pub async fn page_truth_states(
         &self,
@@ -345,9 +364,12 @@ impl MemoryDB {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT page_id, support_status, human_reviewed, evaluated_at
-                   FROM page_truth_state
-                  WHERE page_id IN ({placeholders})"
+                "SELECT t.page_id, t.support_status, t.human_reviewed, t.evaluated_at,
+                        t.reviewed_page_digest,
+                        CASE WHEN t.human_reviewed = 1 THEN p.content END
+                   FROM page_truth_state t
+                   LEFT JOIN pages p ON p.id = t.page_id
+                  WHERE t.page_id IN ({placeholders})"
             );
             let params = chunk
                 .iter()
@@ -383,11 +405,26 @@ impl MemoryDB {
                     (_, Some(_)) => crate::truth_contract::Support::Unsupported,
                     (_, None) => crate::truth_contract::Support::Unevaluated,
                 };
+                // Fail closed on both halves: a NULL digest and a page that is
+                // no longer there both read as unreviewed. The schema's CHECK
+                // already forbids a `human_reviewed = 1` row without a digest
+                // (`claim_identity.rs`), so the NULL arm is unreachable through
+                // any current write path -- it is here so that stays true even
+                // if some future one forgets.
+                let reviewed_digest: Option<String> = row.get(4).unwrap_or(None);
+                let live_content: Option<String> = row.get(5).unwrap_or(None);
+                let human_reviewed = reviewed == 1
+                    && match (reviewed_digest, live_content) {
+                        (Some(recorded), Some(content)) => {
+                            recorded == crate::provenance::revision_content_digest(&content)
+                        }
+                        _ => false,
+                    };
                 out.insert(
                     page_id,
                     PageTruth {
                         support,
-                        human_reviewed: reviewed == 1,
+                        human_reviewed,
                     },
                 );
             }

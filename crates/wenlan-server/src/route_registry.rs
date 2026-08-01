@@ -379,7 +379,7 @@ const NON_SENSITIVE_PATHS: &[&str] = &[
     "/api/memory/delete/{source_id}", "/api/memory/reclassify/{source_id}", "/api/memory/revision/{id}/accept",
     "/api/memory/revision/{id}/dismiss", "/api/memory/contradiction/{source_id}/dismiss", "/api/memory/entities",
     "/api/memory/relations", "/api/memory/observations", "/api/memory/link-entity", "/api/spaces/{name}",
-    "/api/spaces/{from}/move-to/{to}", "/api/pages/{id}/archive",
+    "/api/spaces/{from}/move-to/{to}", "/api/pages/{id}/archive", "/api/pages/{id}/review",
     "/api/refinery/queue/{id}/reject", "/api/refinery/queue/{id}/accept", "/api/sources/{id}", "/api/sources/{id}/sync",
     "/api/config", "/api/config/skip-apps", "/api/config/routing", "/api/setup/status", "/api/setup/anthropic-key", "/api/on-device-model",
     "/api/on-device-model/download", "/api/chunks/{id}/update", "/api/chunks/time-range", "/api/chunks/delete-bulk",

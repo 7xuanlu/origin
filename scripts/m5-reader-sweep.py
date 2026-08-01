@@ -34,6 +34,21 @@ e.g. the citation backfill at citations.rs:423. So the set is expanded to the
 transitive caller closure of the SQL-bearing definitions, to a stated depth.
 Depth 0 is the SQL layer, depth 1 the wrapper layer, depth 2+ the consumers.
 
+The depth is DEPTH_TITLES, and it reaches 3 because a two-deep closure stopped
+one hop short of the HTTP handler on several routes. `handle_review_page` calls
+`review_page_with_presence` calls `review_in_txn` calls the `pages` SELECT: four
+names, so at depth 2 the endpoint — the thing an external reader most wants to
+find — was absent rather than listed. This is a parameter, not a claim that
+nothing lies past it.
+
+Measured once, when the cap was raised: depth 3 added 75 rows, 29 of them in
+wenlan-server, and 23 of those 29 are handlers actually registered on a route
+(cross-checked by name against
+crates/wenlan-server/src/route_registry/handler_manifest.txt; the other six are
+`run_daemon`, two page-map helpers, two scheduler functions, and a source-sync
+function). A one-time measurement, not a maintained figure — re-derive it from
+--json rather than trusting these numbers later.
+
 EXPOSURE: a reader is an exposure path iff it is `pub` (unqualified — not
 `pub(crate)` / `pub(super)`) AND called from outside wenlan-core. Caller edges
 are resolved by NAME, which over-matches on generic names; rows whose name is
@@ -53,6 +68,15 @@ import sys
 from collections import Counter
 
 MAX_FN_LINES = 12000
+# One entry per depth the closure walks, so the walk and the rendered sections
+# cannot disagree about how far it went.
+DEPTH_TITLES = (
+    'SQL-bearing definitions',
+    'wrapper layer',
+    'consumers',
+    'outer consumers — route handlers and orchestration',
+)
+MAX_DEPTH = len(DEPTH_TITLES) - 1
 TRUNCATED = []
 INVENTORY = 'docs/plans/2026-07-27-m5-reader-manifest-inventory.md'
 INVENTORY_BEGIN = '<!-- m5-reader-sweep:begin -->'
@@ -267,7 +291,7 @@ def sweep():
     known = {(r['file'], r['line']) for r in readers}
     frontier = {r['fn'] for r in readers}
     out = list(readers)
-    for depth in (1, 2):
+    for depth in range(1, MAX_DEPTH + 1):
         pats = [(n, re.compile(r'\b' + re.escape(n) + r'\s*\(')) for n in sorted(frontier)
                 if len(declared.get(n, ())) == 1]
         nxt = set()
@@ -317,11 +341,8 @@ def short_path(path):
 def render_inventory(rows):
     """Render the canonical, generated reader rows embedded in the M5 inventory."""
     sections = [INVENTORY_BEGIN]
-    for depth, title, last_column in (
-        (0, 'SQL-bearing definitions', 'Exposure'),
-        (1, 'wrapper layer', 'Reaches prose via'),
-        (2, 'consumers', 'Reaches prose via'),
-    ):
+    for depth, title in enumerate(DEPTH_TITLES):
+        last_column = 'Exposure' if depth == 0 else 'Reaches prose via'
         sections.extend([
             '',
             '### Depth %d — %s' % (depth, title),
@@ -387,8 +408,12 @@ def check_inventory(rows):
     exposure = sum(r['exposure'] for r in rows)
     print(
         'reader inventory check: ok '
-        '(%d rows; depth %d/%d/%d; exposure %d)'
-        % (len(rows), depths[0], depths[1], depths[2], exposure)
+        '(%d rows; depth %s; exposure %d)'
+        % (
+            len(rows),
+            '/'.join(str(depths[d]) for d in range(MAX_DEPTH + 1)),
+            exposure,
+        )
     )
     return True
 
@@ -539,9 +564,8 @@ if __name__ == '__main__':
     amb = [r for r in rows if r['ambiguous']]
     d = Counter(r['depth'] for r in rows)
     print('internal page-prose readers: %d' % len(rows))
-    print('  depth 0 (SQL-bearing definitions): %d' % d[0])
-    print('  depth 1 (wrapper layer):           %d' % d[1])
-    print('  depth 2 (consumers):               %d' % d[2])
+    for depth, title in enumerate(DEPTH_TITLES):
+        print('  depth %d (%s): %d' % (depth, title, d[depth]))
     if TRUNCATED:
         print('  BRACE SCAN LOST SYNC in: %s' % ', '.join(TRUNCATED))
     print('  exposure paths (pub + caller outside wenlan-core): %d' % len(exp))

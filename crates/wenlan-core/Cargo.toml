@@ -44,6 +44,7 @@ encoding_rs = { workspace = true }
 tokio = { workspace = true }
 libsql = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 hex = { workspace = true }
 lru = { workspace = true }
 

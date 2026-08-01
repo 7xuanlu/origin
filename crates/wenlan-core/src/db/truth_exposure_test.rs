@@ -762,3 +762,123 @@ fn the_projection_invariant_is_wired_into_the_daemon() {
          call and update this test to name its new home -- do not delete it."
     );
 }
+
+/// F1(b): a review is a statement about the text a person actually read, so it
+/// cannot outlive that text.
+///
+/// Nothing clears `human_reviewed` when a page is edited — the update bumps
+/// `version` and rewrites `content`, and the truth row is not in its reach. So
+/// the stored bit is a historical receipt, and whether a review is still *in
+/// force* has to be computed where truth is read: the recorded digest against
+/// the page's current content. An edited page falls back to unreviewed on its
+/// own, with no new write path and nothing to migrate.
+///
+/// Both consequences are checked here, because they come from one place: the
+/// axis the wire reports, and the visibility verdict that axis outranks.
+#[tokio::test]
+async fn an_edit_after_a_review_retires_the_review() {
+    let (db, _tmp) = test_db().await;
+    let page = "page_00000000-0000-4000-8000-0000000000b1";
+    db.create_page_draft_with_id(page, "A Page", "the prose a human read", None, None)
+        .await
+        .unwrap();
+
+    // Stand in for the review mutation: mark it against the text as it is now.
+    let digest = crate::provenance::revision_content_digest("the prose a human read");
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO page_truth_state
+                 (page_id, page_version, support_status, evaluated_at, human_reviewed,
+                  reviewed_page_version, reviewed_page_digest, updated_at)
+             VALUES (?1, 1, 'provisional', 1700000000, 1, 1, ?2, 1700000000)",
+            libsql::params![page, digest.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let ids = vec![page.to_string()];
+    assert!(
+        db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
+        "the review is in force while the page still says what it said"
+    );
+
+    // Post-cutover, a human-reviewed page is fully visible even though the
+    // machine axis says unsupported.
+    db.set_truth_cutover_generation(1).await.unwrap();
+    let grant = TruthGrant::Automatic;
+    assert_eq!(
+        db.page_visibility(&grant, &ids).await.unwrap()[page],
+        Visibility::Full,
+        "human review outranks the machine verdict"
+    );
+
+    // Now somebody edits the page.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET content = 'entirely different prose', version = version + 1
+              WHERE id = ?1",
+            libsql::params![page],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(
+        !db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
+        "the review was of text that is no longer on the page"
+    );
+    assert_ne!(
+        db.page_visibility(&grant, &ids).await.unwrap()[page],
+        Visibility::Full,
+        "and with the review retired, the unsupported page stops being fully visible"
+    );
+
+    // Put the text back and the receipt is good again: the check is on content,
+    // not on a version counter that only ever climbs.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET content = 'the prose a human read' WHERE id = ?1",
+            libsql::params![page],
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
+        "the exact text the human approved is back, so their approval is too"
+    );
+}
+
+/// A page nobody reviewed must not start reading as reviewed because of how the
+/// digest comparison is written — a missing page, or a NULL digest, is not a
+/// match.
+#[tokio::test]
+async fn an_unreviewed_page_is_unaffected_by_the_digest_check() {
+    let (db, _tmp) = test_db().await;
+    let page = "page_00000000-0000-4000-8000-0000000000b2";
+    db.create_page_draft_with_id(page, "A Page", "prose", None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO page_truth_state
+                 (page_id, page_version, support_status, evaluated_at, human_reviewed, updated_at)
+             VALUES (?1, 1, 'supported', 1700000000, 0, 1700000000)",
+            libsql::params![page],
+        )
+        .await
+        .unwrap();
+    }
+    let states = db.page_truth_states(&[page.to_string()]).await.unwrap();
+    assert!(!states[page].human_reviewed);
+    assert_eq!(
+        states[page].support,
+        crate::truth_contract::Support::Supported,
+        "the machine axis is untouched by the review check"
+    );
+}

@@ -124,6 +124,25 @@ pub async fn handle_status(
         )
     };
 
+    // Present only when the cutover is actually live. There is one contract —
+    // "absent means not live" — and reporting generation 0 would give a client a
+    // second way to spell it, so a client that checks for the field without also
+    // checking its value would conclude enforcement is on. A generation that
+    // cannot be read is absent for the same reason: a daemon that just failed to
+    // look has no standing to report a state.
+    let truth = match &db {
+        Some(db) => db
+            .truth_cutover_generation()
+            .await
+            .ok()
+            .filter(|generation| *generation > 0)
+            .map(|generation| wenlan_types::responses::TruthStatus {
+                cutover_generation: generation,
+                contract_version: wenlan_core::truth_contract::TRUTH_CONTRACT_VERSION,
+            }),
+        None => None,
+    };
+
     let (files_indexed, queue, compile_queue) = if let Some(db) = &db {
         let files_indexed = db.count().await.unwrap_or(0);
         let queue = db
@@ -158,6 +177,7 @@ pub async fn handle_status(
         reranker_mode,
         on_device_inference,
         capabilities: vec!["default_save_space".to_string()],
+        truth,
     }))
 }
 

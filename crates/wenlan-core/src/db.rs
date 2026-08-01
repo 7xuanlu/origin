@@ -45,6 +45,7 @@ mod migrations_v004_v009;
 mod onboarding_milestones;
 mod page_drafts;
 pub mod page_map;
+mod presence_review;
 pub(crate) mod repair_deterministic;
 mod repair_memory_cas;
 pub(crate) mod repair_page_regenerate;
@@ -67,6 +68,7 @@ pub(crate) use kg_quality_embedding_refresh::StaleEntityEmbeddingCandidate;
 pub(crate) use maintenance_duplicate_reads::{NearDuplicatePairRead, NearDuplicateSliceReader};
 pub(crate) use maintenance_retro_scan::AutomaticRetroPageScan;
 pub(crate) use memory_point_reads::PendingMemoryRevisionPayload;
+pub use presence_review::ReviewOutcome;
 pub use truth_exposure::{
     CutoverFence, CutoverLease, CutoverPhase, TruthMarkerAudit, TRUTH_CUTOVER_FENCE_KEY,
     TRUTH_CUTOVER_GENERATION_KEY,
@@ -112,6 +114,8 @@ mod maintenance_retro_scan_test;
 mod memory_point_reads_test;
 #[cfg(test)]
 mod page_drafts_test;
+#[cfg(test)]
+mod presence_review_test;
 #[cfg(test)]
 mod repair_deterministic_test;
 #[cfg(test)]

@@ -39,6 +39,7 @@ pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<Shar
         .route("/api/pages/{id}/links", get(handle_get_page_links))
         .route("/api/pages/{id}/archive", post(handle_archive_page))
         .route("/api/pages/{id}/revisions", get(handle_get_page_revisions))
+        .route("/api/pages/{id}/review", post(handle_review_page))
 }
 
 pub(crate) fn register_manual_edit(
@@ -954,6 +955,73 @@ pub async fn handle_get_page_revisions(
         entries,
     }))
 }
+/// POST /api/pages/{id}/review
+///
+/// Mark a page human-reviewed, on the strength of a capability the app's Tauri
+/// backend minted for one gesture. Binding spec:
+/// `docs/plans/2026-07-27-m5-presence-threat-model.md`.
+///
+/// This handler deliberately holds no protocol logic. It resolves the secret,
+/// hands the whole request to `review_page_with_presence`, and turns the answer
+/// into a status code — because the order the checks run in is the part that is
+/// easy to get backwards, and it belongs in one place rather than in every
+/// handler that ever carries presence.
+///
+/// Nothing here logs the request. The capability's `Debug` redacts its material
+/// anyway, but the surest way not to leak it is to never format it (§7).
+pub async fn handle_review_page(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(request): Json<wenlan_types::requests::ReviewPageRequest>,
+) -> Result<axum::response::Response, ServerError> {
+    use axum::response::IntoResponse;
+
+    let (db, presence_root) = {
+        let s = state.read().await;
+        (
+            s.db.as_ref()
+                .cloned()
+                .ok_or(ServerError::DbNotInitialized)?,
+            s.presence_root.clone(),
+        )
+    };
+
+    // The root is handed over unresolved. Reading the secret here and refusing
+    // early would put `presence_unavailable` in front of the replay lookup, so a
+    // client retrying a dropped response after the secret was rotated would be
+    // told its write failed when it had already succeeded — the exact T7 case
+    // the ordering exists to prevent. No configured root is the same answer as
+    // no secret in it, and both are reached at the one place that answers them.
+    let now = chrono::Utc::now().timestamp();
+    let outcome = db
+        .review_page_with_presence(&request.presence, &id, presence_root.as_deref(), now)
+        .await
+        .map_err(ServerError::from)?;
+
+    Ok(match outcome {
+        // A replay returns the stored response verbatim and the same 200 the
+        // first execution returned. A retry that succeeded looks like a success.
+        wenlan_core::db::ReviewOutcome::Applied(receipt)
+        | wenlan_core::db::ReviewOutcome::Replayed(receipt) => Json(receipt).into_response(),
+        wenlan_core::db::ReviewOutcome::Refused(refusal) => refusal_response(refusal),
+    })
+}
+
+/// The coarse wire answer. Carries the code and nothing else — no reason, no
+/// path, and no part of the submitted capability (§7).
+fn refusal_response(refusal: wenlan_core::presence::PresenceRefusal) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use wenlan_core::presence::PresenceRefusal;
+
+    let status = match refusal {
+        PresenceRefusal::Invalid | PresenceRefusal::Expired => StatusCode::FORBIDDEN,
+        PresenceRefusal::Replayed | PresenceRefusal::Conflict => StatusCode::CONFLICT,
+        PresenceRefusal::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(serde_json::json!({ "error": refusal.code() }))).into_response()
+}
+
 #[cfg(test)]
 mod create_page_endpoint_tests {
     use axum::body::Body;

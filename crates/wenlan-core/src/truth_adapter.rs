@@ -33,6 +33,19 @@ use crate::truth_contract::{TruthGrant, Visibility};
 use crate::WenlanError;
 use std::collections::HashMap;
 
+/// Put both axes on a page. **`page.truth` is written here and nowhere else.**
+///
+/// Two callers reach it and they want opposite things with the prose: the
+/// collection reduction below, which strips the page down to an entry, and the
+/// named-page path in [`filter_pages`], which leaves it whole. What they share
+/// is that the client asked for state and is contracted to render it, so the
+/// mint stays one function and "which code can put axes on the wire" stays a
+/// one-line answer.
+fn with_truth(mut page: Page, truth: wenlan_types::pages::PageTruth) -> Page {
+    page.truth = Some(truth);
+    page
+}
+
 /// Strip every prose-bearing field, keep identity and state.
 ///
 /// What survives is what `TruthGrant::CollectionEntries` is defined to allow:
@@ -41,9 +54,9 @@ use std::collections::HashMap;
 /// stale/rebuild strings, which name why a page changed and are prose about the
 /// page even though they are not the page.
 ///
-/// `truth` is set here and nowhere else. An entry without both axes is the
-/// unearned trust this whole rung exists to prevent, so the reduction that
-/// creates entries is the only thing allowed to mint one.
+/// An entry without both axes is the unearned trust this whole rung exists to
+/// prevent, so the reduction hands straight to [`with_truth`] rather than being
+/// able to produce one without them.
 fn reduce_to_entry(mut page: Page, truth: wenlan_types::pages::PageTruth) -> Page {
     page.summary = None;
     page.content = String::new();
@@ -56,15 +69,18 @@ fn reduce_to_entry(mut page: Page, truth: wenlan_types::pages::PageTruth) -> Pag
     // provisional page was distilled from, and handing them out turns a listing
     // into a retrieval plan.
     page.source_memory_ids = Vec::new();
-    page.truth = Some(truth);
-    page
+    with_truth(page, truth)
 }
 
-/// The verdict for a batch, plus the axes needed to render any entry it allows.
+/// The verdict for a batch, plus the axes for every page that must arrive
+/// carrying them.
 ///
-/// One `page_visibility` call always; a second query for the axes only when the
-/// verdict actually produced an entry, which happens on a marked collection call
-/// after the cutover and never before it.
+/// One `page_visibility` call always; a second query for the axes only when
+/// this call actually owes some, which happens on a marked collection or
+/// named-page call after the cutover and never before it. The returned map is
+/// total over the pages that owe axes and empty of everything else, so
+/// [`filter_pages`] can read "is this id in the map" as "does this page get
+/// axes" without re-deriving the rule.
 async fn verdicts(
     db: &MemoryDB,
     grant: &TruthGrant,
@@ -77,28 +93,57 @@ async fn verdicts(
     WenlanError,
 > {
     let visibility = db.page_visibility(grant, ids).await?;
-    let entry_ids: Vec<String> = visibility
+
+    // Every entry the reduction is about to create. An entry without both axes
+    // is what the collection carve-out exists to forbid.
+    let mut owed: Vec<String> = visibility
         .iter()
         .filter(|(_, v)| **v == Visibility::EntryOnly)
         .map(|(id, _)| id.clone())
         .collect();
-    if entry_ids.is_empty() {
+
+    // Plus every page this call itself named and may see whole -- the other
+    // half of what `NamedPages` is defined to be: "Full prose, both axes, for
+    // exactly these page IDs". A page that survives on its own support while
+    // riding along in the same batch was never named and gets nothing, the same
+    // boundary that stops the grant from opening it.
+    if let TruthGrant::NamedPages(named) = grant {
+        let named_and_open: Vec<String> = ids
+            .iter()
+            .filter(|id| named.contains(id))
+            .filter(|id| visibility.get(id.as_str()) == Some(&Visibility::Full))
+            .cloned()
+            .collect();
+        // Gated on the generation, unlike the entry half, which needs no gate
+        // because `page_visibility` answers `Full` for everything at 0 and so
+        // produces no entries. Without a gate here every named page would come
+        // back `supported: false` while the adapters are still meant to be
+        // inert -- a verdict nobody has made, reported as one.
+        if !named_and_open.is_empty() && db.truth_cutover_generation().await? > 0 {
+            owed.extend(named_and_open);
+        }
+    }
+
+    if owed.is_empty() {
         return Ok((visibility, HashMap::new()));
     }
-    let axes = db
-        .page_truth_states(&entry_ids)
-        .await?
-        .into_iter()
-        .map(|(id, state)| {
-            (
-                id,
-                wenlan_types::pages::PageTruth {
-                    supported: state.supported(),
-                    human_reviewed: state.human_reviewed,
-                },
-            )
-        })
-        .collect();
+
+    // Defaulted here rather than at the call site, so a page with no
+    // `page_truth_state` row still arrives with both axes rather than silently
+    // with none. Post-migration that absence is the normal case.
+    let states = db.page_truth_states(&owed).await?;
+    let axes =
+        owed.into_iter()
+            .map(|id| {
+                let truth = states.get(&id).map_or_else(unknown_axes, |state| {
+                    wenlan_types::pages::PageTruth {
+                        supported: state.supported(),
+                        human_reviewed: state.human_reviewed,
+                    }
+                });
+                (id, truth)
+            })
+            .collect();
     Ok((visibility, axes))
 }
 
@@ -117,7 +162,11 @@ fn unknown_axes() -> wenlan_types::pages::PageTruth {
 /// Reduce a page batch to what this call may see.
 ///
 /// `Hidden` drops the page entirely -- not its title, not an ID with content
-/// hanging off it. `EntryOnly` reduces it. `Full` is the identity.
+/// hanging off it. `EntryOnly` reduces it. `Full` keeps every field, and gains
+/// both axes when the call named that page: the grant's own definition is
+/// "full prose, both axes", and serving the prose alone left a client that
+/// declared the contract and gestured with no way to tell a supported page from
+/// a provisional one.
 ///
 /// A page whose ID somehow carries no verdict is dropped rather than served: the
 /// map is total over its input by construction, so this only fires if that ever
@@ -135,7 +184,14 @@ pub async fn filter_pages(
     Ok(pages
         .into_iter()
         .filter_map(|page| match visibility.get(&page.id) {
-            Some(Visibility::Full) => Some(page),
+            // Present in `axes` means this call owes the page its state --
+            // which for a `Full` page is exactly "the call named it, after the
+            // cutover". Absent leaves the pre-M5 wire untouched, which is what
+            // every automatic reader gets.
+            Some(Visibility::Full) => Some(match axes.get(&page.id) {
+                Some(truth) => with_truth(page, *truth),
+                None => page,
+            }),
             Some(Visibility::EntryOnly) => {
                 let truth = axes.get(&page.id).copied().unwrap_or_else(unknown_axes);
                 Some(reduce_to_entry(page, truth))

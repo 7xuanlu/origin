@@ -67,6 +67,14 @@ mod repair_endpoint_test;
 mod truth_error_seam_test;
 
 #[cfg(test)]
+#[path = "presence_review_test.rs"]
+mod presence_review_test;
+
+#[cfg(test)]
+#[path = "truth_status_test.rs"]
+mod truth_status_test;
+
+#[cfg(test)]
 #[path = "daemon_structure_test.rs"]
 mod daemon_structure_test;
 
