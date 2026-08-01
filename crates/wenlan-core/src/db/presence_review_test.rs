@@ -811,39 +811,57 @@ async fn a_caller_who_will_be_refused_cannot_tell_which_pages_exist() {
 /// oracle, `a_caller_who_will_be_refused_cannot_tell_which_pages_exist`, fails
 /// if it moves up) and above the mark, in one function, under one lock —
 /// structure, not a test.
+///
+/// The F1(a) hazard itself is real, and was proved by a two-step knockout
+/// rather than left as an argument. Adding `PRAGMA busy_timeout=10000` to the
+/// daemon connection turns this test's `Err` into `Ok(Refused(Conflict))` — the
+/// review waits out the writer and is still safe. Adding that pragma *and*
+/// hoisting the page read above `BEGIN IMMEDIATE` turns it into
+/// `Ok(Applied(.. reviewed_page_version: 1, digest of the ORIGINAL body ..))`
+/// while the page holds the edited text: a receipt attesting to prose nobody
+/// approved. Both knockouts were reverted. So the directly discriminating test
+/// is one pragma away, but a busy timeout changes the daemon's behavior under
+/// contention and is a decision on its own, not a side effect of a test.
+///
+/// The second connection is libsql, deliberately, not rusqlite. rusqlite and
+/// libsql link one statically-bundled SQLite here (see `crates/wenlan-core/
+/// Cargo.toml`), and rusqlite's first `Connection::open` sets serialized
+/// threading process-wide — which `spaces.rs` already documents. In a test
+/// binary running thousands of tests in parallel that reconfiguration lands
+/// under unrelated libsql connections and fails them with SQLITE_MISUSE, so a
+/// rusqlite handle here breaks tests nowhere near this file.
 #[tokio::test]
 async fn a_review_meeting_a_foreign_writer_marks_nothing() {
     let (db, root) = db().await;
-    let db_file = root.path().join("origin_memory.db");
     const EDITED: &str = "prose the human never saw";
 
-    // Staged, not committed: the write lock is taken and held across the review
-    // below, which is the only way to place an edit *inside* the review's
-    // window rather than before or after it. Handshaked in both directions
-    // rather than timed, so a slow machine cannot let the editor commit early
-    // and turn this into an ordinary conflict.
-    let (staged, wait_for_staged) = std::sync::mpsc::channel();
-    let (release, wait_for_release) = std::sync::mpsc::channel();
-    let editor = std::thread::spawn(move || {
-        let conn = rusqlite::Connection::open(&db_file).expect("second connection");
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .expect("take the write lock");
-        conn.execute(
+    // Staged, not committed: this connection holds the write lock across the
+    // review below, which is the only way to put an edit *inside* the review's
+    // window rather than before or after it. No thread and no handshake — the
+    // point is only that the lock is held, and holding it is synchronous.
+    let editor = libsql::Builder::new_local(root.path().join("origin_memory.db"))
+        .build()
+        .await
+        .expect("second database handle")
+        .connect()
+        .expect("second connection");
+    editor
+        .execute("BEGIN IMMEDIATE", ())
+        .await
+        .expect("take the write lock");
+    editor
+        .execute(
             "UPDATE pages SET content = ?1, version = version + 1 WHERE id = ?2",
-            rusqlite::params![EDITED, PAGE],
+            libsql::params![EDITED, PAGE],
         )
+        .await
         .expect("stage the edit");
-        staged.send(()).expect("announce the staged edit");
-        wait_for_release.recv().expect("wait out the review");
-        conn.execute_batch("COMMIT").expect("commit the edit");
-    });
 
-    wait_for_staged.recv().expect("editor staged its write");
     let outcome = db
         .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
         .await;
-    release.send(()).expect("let the editor commit");
-    editor.join().expect("editor thread");
+
+    editor.execute("COMMIT", ()).await.expect("commit the edit");
 
     let Err(error) = outcome else {
         panic!(
