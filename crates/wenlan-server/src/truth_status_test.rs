@@ -75,8 +75,10 @@ async fn status_omits_truth_until_the_cutover_is_live() {
     let (state, db, _tmp) = db_state().await;
 
     let before = get_status(state.clone()).await;
+    // `get(..).is_none()` rather than `is_null()`, which cannot tell an absent
+    // key from a key serialized as `null` and so passes either way.
     assert!(
-        before["truth"].is_null(),
+        before.get("truth").is_none(),
         "generation 0 is not live, so it must be absent exactly like an old daemon: {before}"
     );
 
@@ -96,14 +98,15 @@ async fn status_omits_truth_until_the_cutover_is_live() {
 }
 
 /// Without a database the daemon cannot establish that enforcement is off, so
-/// it declines to claim anything. `null` is the fail-closed reading a client is
-/// contracted to treat as "not live".
+/// it declines to claim anything. Absence is the fail-closed reading a client
+/// is contracted to treat as "not live" — the same shape as generation 0, so a
+/// client needs one branch rather than two.
 #[tokio::test]
 async fn status_omits_truth_when_the_generation_cannot_be_read() {
     let state = Arc::new(RwLock::new(ServerState::default()));
     let status = get_status(state).await;
     assert!(
-        status["truth"].is_null(),
+        status.get("truth").is_none(),
         "an unreadable generation must not be reported as generation 0: {status}"
     );
 }
