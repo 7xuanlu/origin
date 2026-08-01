@@ -3908,8 +3908,32 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     if ci["jobs"]["detect-changes"]["outputs"]["release-targets"]
         .as_str()
         .is_none()
+        || ci["jobs"]["detect-changes"]["outputs"]["release-preflight-targets"].as_str()
+            != Some("${{ steps.release-preflight-targets.outputs.release-preflight-targets }}")
     {
-        violations.push("detect-changes does not expose the canonical release matrix".into());
+        violations.push(
+            "detect-changes does not expose canonical and bounded PR release matrices".into(),
+        );
+    }
+    let bounded_matrix = job_step(
+        &ci,
+        "detect-changes",
+        "Emit bounded PR release preflight matrix",
+    );
+    let bounded_run = bounded_matrix
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if bounded_matrix.and_then(|step| step["id"].as_str()) != Some("release-preflight-targets")
+        || !bounded_run.contains("--output-name release-preflight-targets")
+        || !bounded_run.contains("--exclude-target x86_64-pc-windows-msvc")
+        || !bounded_run.contains("$GITHUB_EVENT_NAME")
+        || !bounded_run.contains("$GITHUB_HEAD_REF")
+        || !bounded_run.contains("release-please--branches--*")
+    {
+        violations.push(
+            "ordinary PR release matrix does not exclude only the duplicate Windows release profile"
+                .into(),
+        );
     }
     for (job, test_name) in [
         ("detect-changes", "Test release target inventory"),
@@ -3995,13 +4019,8 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
                 "${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}",
             )
         || job["strategy"]["fail-fast"].as_bool() != Some(true)
-        || job["strategy"]["matrix"]["include"].as_str()
-            != Some("${{ fromJSON(needs.detect-changes.outputs.release-targets).include }}")
-        || job["strategy"]["matrix"]["exclude"]
-            .as_sequence()
-            .is_none_or(|exclude| exclude.len() != 1)
-        || job["strategy"]["matrix"]["exclude"][0]["target"].as_str()
-            != Some("${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--branches--') && 'x86_64-pc-windows-msvc' || '__no_excluded_target__' }}")
+        || job["strategy"]["matrix"].as_str()
+            != Some("${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}")
     {
         violations.push(
             "release-preflight is not a fail-fast bounded ordinary-PR matrix with a full four-target backstop and cold-cache safety ceiling"

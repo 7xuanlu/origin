@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -44,10 +46,19 @@ _TARGETS = (
 )
 
 
-def release_matrix() -> dict:
-    """Return a caller-owned copy of the canonical GitHub Actions matrix."""
+def release_matrix(*, exclude_targets: Iterable[str] = ()) -> dict:
+    """Return a caller-owned matrix, optionally excluding validated targets."""
 
-    return {"include": copy.deepcopy(list(_TARGETS))}
+    excluded = set(exclude_targets)
+    known = {entry["target"] for entry in _TARGETS}
+    unknown = excluded - known
+    if unknown:
+        raise TargetError(f"cannot exclude unknown shipped targets: {sorted(unknown)}")
+    return {
+        "include": copy.deepcopy(
+            [entry for entry in _TARGETS if entry["target"] not in excluded]
+        )
+    }
 
 
 def require_target(target: str) -> dict:
@@ -59,11 +70,13 @@ def require_target(target: str) -> dict:
     raise TargetError(f"{target!r} is not a shipped release target")
 
 
-def _write_github_output(path: str, matrix_json: str) -> None:
+def _write_github_output(path: str, output_name: str, matrix_json: str) -> None:
     if "\n" in matrix_json or "\r" in matrix_json:
         raise TargetError("compact release matrix unexpectedly contains a newline")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", output_name) is None:
+        raise TargetError("GitHub output name contains unsupported characters")
     with Path(path).open("a", encoding="utf-8") as output:
-        output.write(f"release-targets={matrix_json}\n")
+        output.write(f"{output_name}={matrix_json}\n")
 
 
 def _main(argv: list[str]) -> int:
@@ -72,6 +85,8 @@ def _main(argv: list[str]) -> int:
 
     matrix_parser = subparsers.add_parser("matrix")
     matrix_parser.add_argument("--github-output")
+    matrix_parser.add_argument("--output-name", default="release-targets")
+    matrix_parser.add_argument("--exclude-target", action="append", default=[])
 
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--target", required=True)
@@ -83,13 +98,13 @@ def _main(argv: list[str]) -> int:
         return 0
 
     matrix_json = json.dumps(
-        release_matrix(),
+        release_matrix(exclude_targets=arguments.exclude_target),
         separators=(",", ":"),
         sort_keys=True,
     )
     print(matrix_json)
     if arguments.github_output:
-        _write_github_output(arguments.github_output, matrix_json)
+        _write_github_output(arguments.github_output, arguments.output_name, matrix_json)
     return 0
 
 

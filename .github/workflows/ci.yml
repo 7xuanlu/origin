@@ -56,6 +56,7 @@ jobs:
       canonical-acceptance-required: ${{ steps.test-plan.outputs.canonical-acceptance-required }}
       rust-ci-required: ${{ steps.test-plan.outputs.rust-ci-required }}
       release-targets: ${{ steps.release-targets.outputs.release-targets }}
+      release-preflight-targets: ${{ steps.release-preflight-targets.outputs.release-preflight-targets }}
       # Linux runs from one compile-once archive below. This dynamic matrix is
       # only for platform-owned macOS and Windows behavior.
       test-matrix: ${{ steps.matrix.outputs.json }}
@@ -442,6 +443,19 @@ jobs:
       - name: Emit release target matrix
         id: release-targets
         run: python3 scripts/release_targets.py matrix --github-output "$GITHUB_OUTPUT"
+      - name: Emit bounded PR release preflight matrix
+        id: release-preflight-targets
+        shell: bash
+        run: |
+          args=(
+            matrix
+            --github-output "$GITHUB_OUTPUT"
+            --output-name release-preflight-targets
+          )
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" && "$GITHUB_HEAD_REF" != release-please--branches--* ]]; then
+            args+=(--exclude-target x86_64-pc-windows-msvc)
+          fi
+          python3 scripts/release_targets.py "${args[@]}"
       - name: Test FastEmbed cache preparation
         run: python3 scripts/prepare-fastembed-cache.test.py
       - name: Restore portable FastEmbed model
@@ -1152,13 +1166,10 @@ jobs:
     timeout-minutes: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}
     strategy:
       fail-fast: true
-      matrix:
-        include: ${{ fromJSON(needs.detect-changes.outputs.release-targets).include }}
-        exclude:
-          # An ordinary PR already links and exercises Windows in `test` and
-          # `mcp-platform`; compiling the same graph again in release profile is
-          # the measured >20-minute duplicate. Full release backstops keep it.
-          - target: ${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--branches--') && 'x86_64-pc-windows-msvc' || '__no_excluded_target__' }}
+      # An ordinary PR already links and exercises Windows in `test` and
+      # `mcp-platform`; compiling the same graph again in release profile is
+      # the measured >20-minute duplicate. Full release backstops keep it.
+      matrix: ${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
