@@ -541,7 +541,7 @@ operation/digest replays; collision conflicts" describes.
 | Situation | `(caller, op)` | digest | Outcome |
 |---|---|---|---|
 | Honest retry — same inputs | hit | equal | **Replay.** Return the stored `response`. No new lease, no LLM call, no page write. |
-| Re-prepare after staleness | hit | **differs** | **Not a conflict.** The candidate legitimately re-fingerprints (machine A: `stale → prepared`). The receipt row is *replaced* under the same key with the new digest. See S0-41. |
+| Re-prepare after staleness | hit | **differs** | **Not a conflict.** The candidate legitimately re-fingerprints (machine A, transition **A19**). The receipt row is *replaced* under the same key with the new digest. See S0-41. |
 | Distinct concurrent finalize | hit | differs | **Conflict** if the existing receipt is terminal. Refuse; the first finalization won. |
 | First attempt | miss | — | Proceed. |
 
@@ -556,6 +556,8 @@ operation/digest replays; collision conflicts" describes.
 >
 > "Terminal" is exactly machine A's terminal set from artifact 2 (`published`,
 > `suppressed`, `superseded`, and `review_required` while the review is open).
+> `stale` is deliberately not in that set, and artifact 2 rev 2 now agrees — see
+> its S0-151.
 
 ### 7.4 What "retry reuses candidate, slot, page ID, lease operation, receipt" is, row by row
 
