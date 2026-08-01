@@ -83,7 +83,7 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
         // one is a state
         // the pipeline does not produce, and seeding it would leave every
         // assertion below testing the missing-marker path instead of its
-        // subject. Digest over the page's own (empty) prose and this build's
+        // subject. Digest over the page's actual prose and this build's
         // extractor, so an edit or a version bump invalidates it exactly as it
         // would in production.
         for id in ["p1", "p2", "p3"] {
@@ -94,7 +94,7 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
                  VALUES (?1, 1, ?2, ?3, 1, 0)",
                 libsql::params![
                     id,
-                    crate::provenance::revision_content_digest(""),
+                    crate::provenance::revision_content_digest("the body prose"),
                     crate::db::EXTRACTOR_VERSION
                 ],
             )

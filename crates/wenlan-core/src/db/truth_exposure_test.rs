@@ -910,6 +910,19 @@ async fn an_unreviewed_page_is_unaffected_by_the_digest_check() {
         )
         .await
         .unwrap();
+        conn.execute(
+            "INSERT INTO claim_derivation_markers
+                 (page_id, page_version, page_version_digest, extractor_version,
+                  inventory_count, created_at)
+             VALUES (?1, 1, ?2, ?3, 1, 1700000000)",
+            libsql::params![
+                page,
+                crate::provenance::revision_content_digest("prose"),
+                crate::db::EXTRACTOR_VERSION
+            ],
+        )
+        .await
+        .unwrap();
     }
     let states = db.page_truth_states(&[page.to_string()]).await.unwrap();
     assert!(!states[page].human_reviewed);

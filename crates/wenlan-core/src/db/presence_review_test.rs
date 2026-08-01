@@ -536,6 +536,15 @@ async fn a_machine_verdict_never_sets_the_human_axis() {
         )
         .await
         .unwrap();
+        conn.execute(
+            "INSERT INTO claim_derivation_markers
+                 (page_id, page_version, page_version_digest, extractor_version,
+                  inventory_count, created_at)
+             VALUES (?1, 1, ?2, ?3, 1, 1700000000)",
+            libsql::params![PAGE, body_digest(), crate::db::EXTRACTOR_VERSION],
+        )
+        .await
+        .unwrap();
     }
     let states = db.page_truth_states(&[PAGE.to_string()]).await.unwrap();
     let truth = states.get(PAGE).unwrap();
