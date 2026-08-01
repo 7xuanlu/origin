@@ -5,7 +5,16 @@ Scope: frozen contract D11, and gate G8
 (`m6_overview_identity_survives_rebinding`).
 Continues the decision numbering from artifact 7 (`S0-70`).
 
-Every `file.rs:NNN` citation was read on branch `kg-m6-stage0` at authoring time.
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
 
 ---
 
@@ -74,10 +83,10 @@ So M4 *already implements D11's max-overlap-survivor rule at the ID level*:
 > community in the space and then un-retires the survivors:
 >
 > ```sql
-> -- crates/wenlan-core/src/db.rs:13975-13976
+> -- crates/wenlan-core/src/db.rs:13979-13976
 > UPDATE communities SET retired_at = ?2, updated_at = ?2
 >  WHERE space = ?1 AND retired_at IS NULL
-> -- then, per surviving community, crates/wenlan-core/src/db.rs:13993-14001
+> -- then, per surviving community, crates/wenlan-core/src/db.rs:13997-14001
 > INSERT INTO communities (...) VALUES (...)
 >  ON CONFLICT(community_id) DO UPDATE SET ..., retired_at = NULL
 > ```
@@ -86,7 +95,7 @@ So M4 *already implements D11's max-overlap-survivor rule at the ID level*:
 > finalize commits.** M6's detach rule reads that, and cross-checks it against the
 > `community_merge` identity event that `detect_community_identity_events`
 > already emits (`crates/wenlan-core/src/community_grouping.rs:785`-`:793`,
-> called at `crates/wenlan-core/src/db.rs:13890`).
+> called at `crates/wenlan-core/src/db.rs:13894`).
 
 One nuance the contract does not state and an implementer must not guess:
 **D11 says "maximum-overlap survivor" without naming the metric, and M4's metric
@@ -164,7 +173,7 @@ D11: *"At most one active subscription per `(scope_kind, scope_id)`."*
 > "which scope did this page once belong to" unanswerable.
 
 For `scope_kind = 'community'`, `scope_id` is the M4 `community_id`
-(`crates/wenlan-core/src/db.rs:10443`). Per S0-71 that ID is stable across
+(`crates/wenlan-core/src/db.rs:10447`). Per S0-71 that ID is stable across
 splits and across the winning side of merges, so the subscription needs no
 rebinding pass.
 
@@ -187,7 +196,7 @@ rebinding pass.
 > rules exist precisely to keep non-decisions off the review surface.
 >
 > M4 already emits a `community_split` proposal into `refinement_queue`
-> (`crates/wenlan-core/src/db.rs:14085`-`:14088`) for its own naming purposes.
+> (`crates/wenlan-core/src/db.rs:14089`-`:14092`) for its own naming purposes.
 > M6 does not add a second one.
 
 ---
@@ -216,8 +225,8 @@ rebinding pass.
 > about. But a re-published generation must not stage them again: the ID is
 > `m6_digest("m6-overview-proposal-v1", [action, space, source_generation,
 > losing_scope_id])`, inserted with `INSERT OR IGNORE`, mirroring what M4 already
-> does for its own proposals (`crates/wenlan-core/src/db.rs:14071`-`:14074` for
-> the ID shape, `:14086` for the insert mode).
+> does for its own proposals (`crates/wenlan-core/src/db.rs:14075`-`:14078` for
+> the ID shape, `:14090` for the insert mode).
 
 ### 3.1 What "stops refreshing" means concretely
 
@@ -257,7 +266,7 @@ pub fn page_is_human_owned(page: &crate::pages::Page) -> bool {
 An overview created by `ensure_overview_page` has `creation_kind = "research"`
 (`crates/wenlan-core/src/synthesis/overview.rs:89`), so it starts machine-owned
 and becomes human-owned the moment a manual or filesystem edit sets `user_edited`
-(`crates/wenlan-core/src/db.rs:42536`).
+(`crates/wenlan-core/src/db.rs:42540`).
 
 ### 4.2 The four prohibitions
 
@@ -266,7 +275,7 @@ and becomes human-owned the moment a manual or filesystem edit sets `user_edited
 | never automatically **transferred** | S0-76 — transfer is only ever a human accepting a proposal |
 | never automatically **archived** | detach sets `state='detached'` on the subscription; it never touches `pages.status` |
 | never automatically **renamed** | §5, and S0-80 |
-| never automatically **overwritten** | the in-statement `AND COALESCE(user_edited, 0) = 0` guard on every content update (`crates/wenlan-core/src/db.rs:42546`, `:42567`) — the same guarantee artifact 7's S0-66 rests on |
+| never automatically **overwritten** | the in-statement `AND COALESCE(user_edited, 0) = 0` guard on every content update (`crates/wenlan-core/src/db.rs:42550`, `:42571`) — the same guarantee artifact 7's S0-66 rests on |
 
 > **Decision S0-79 — the four prohibitions are asserted against a human-edited
 > overview that has been detached, not merely one that exists.** A test that
@@ -283,19 +292,19 @@ D11: *"Titles initialize from an accepted community display name or neutral
 stable fallback; structural rebinding never changes a title."*
 
 `communities.display_name` is inserted `NULL`
-(`crates/wenlan-core/src/db.rs:13996`) and set only when a human accepts a rename
-proposal (`crates/wenlan-core/src/db.rs:16367`-`:16369`). Two properties of that
+(`crates/wenlan-core/src/db.rs:14000`) and set only when a human accepts a rename
+proposal (`crates/wenlan-core/src/db.rs:16371`-`:16373`). Two properties of that
 statement matter here, and both are already true in the tree:
 
 - **An accepted name survives regrouping.** The finalize upsert's
   `ON CONFLICT DO UPDATE` list is `space, algo_version, projection_version,
-  updated_at, retired_at` (`crates/wenlan-core/src/db.rs:13998`-`:14001`) — it
+  updated_at, retired_at` (`crates/wenlan-core/src/db.rs:14002`-`:14005`) — it
   does **not** include `display_name`. So republishing a generation cannot erase
   a name a human chose.
 - **A retired community cannot be renamed.** The update requires
-  `retired_at IS NULL` (`crates/wenlan-core/src/db.rs:16369`) and errors with
+  `retired_at IS NULL` (`crates/wenlan-core/src/db.rs:16373`) and errors with
   *"community … is missing, retired, or outside proposal space"* when it matches
-  nothing (`:16384`-`:16387`). A merge loser is therefore already un-renameable,
+  nothing (`:16388`-`:16391`). A merge loser is therefore already un-renameable,
   which is consistent with it being detached.
 
 > **Decision S0-80 — the overview title is set once at page creation and is
@@ -317,7 +326,7 @@ statement matter here, and both are already true in the tree:
 The lookup that keeps the global overview single is not scoped:
 
 ```sql
--- crates/wenlan-core/src/db.rs:43805-43808
+-- crates/wenlan-core/src/db.rs:43809-43808
 SELECT id FROM pages
  WHERE LOWER(title) = LOWER(?1) AND status = 'active'
    AND COALESCE(kind, 'concept') != 'entity'
@@ -405,7 +414,7 @@ that enum would change the accepted wire for every existing client, so:
 
 One shared mechanism, deliberately: both proposal families land in
 `refinement_queue` with `status = 'awaiting_review'`
-(`crates/wenlan-core/src/db.rs:14086`-`:14088`). A second queue would need a
+(`crates/wenlan-core/src/db.rs:14090`-`:14092`). A second queue would need a
 second review surface.
 
 ---
@@ -415,7 +424,7 @@ second review surface.
 **F1 — there is no per-scope overview substrate at all; the current overview is a
 single global title-keyed page.** `OVERVIEW_PAGE_TITLE`
 (`crates/wenlan-core/src/synthesis/overview.rs:25`) plus a space-less create
-(`:83`) plus an unscoped title lookup (`crates/wenlan-core/src/db.rs:43805`-`:43808`)
+(`:83`) plus an unscoped title lookup (`crates/wenlan-core/src/db.rs:43809`-`:43812`)
 means D11's entire `(scope_kind, scope_id)` model is PR-A-new. This is larger
 than "add a table": the existing overview's *singleton-ness is implemented by its
 title*, which is why S0-82 has to move M6 off title lookup entirely rather than
@@ -424,7 +433,7 @@ adding a second title constant.
 **F2 — M4's merge-loser signal is a second-order effect of the retire/un-retire
 sequence, not an explicit output.** Losers are identifiable only as rows still
 carrying `retired_at IS NOT NULL` after the finalize
-(`crates/wenlan-core/src/db.rs:13975`-`:13976` then `:13993`-`:14001`). That is
+(`crates/wenlan-core/src/db.rs:13979`-`:13980` then `:13997`-`:14005`). That is
 sound but implicit — nothing names it, and a future refactor that changed the
 retire strategy to a targeted `UPDATE … WHERE community_id IN (…)` would preserve
 correctness for M4 and silently break M6's detach rule. **Recommendation for

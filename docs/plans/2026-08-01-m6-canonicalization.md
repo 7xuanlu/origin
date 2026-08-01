@@ -12,6 +12,17 @@ Every `file.rs:NNN` citation in this document was read on branch `kg-m6-stage0`
 at authoring time. Unicode claims marked **[measured]** were produced by running
 the stated operation, not read out of a table.
 
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
+
 ---
 
 ## 0. What this artifact binds
@@ -23,7 +34,7 @@ Four distinct identities, easy to conflate and consequential to conflate:
 | `slot_id` | *which topic-shaped hole is this?* | the topic's defining inputs change | `genesis_candidates` (PR-A-new) |
 | `page_id` | *which page does that hole become?* | never, given a slot | `pages.id` |
 | `candidate_fingerprint` | *would re-running produce the same output?* | any output-affecting input changes | `genesis_candidates` (PR-A-new) |
-| `label_key` | *are these two wikilinks the same label?* | never, given a label | `page_links.label_key` (db.rs:6669) |
+| `label_key` | *are these two wikilinks the same label?* | never, given a label | `page_links.label_key` (db.rs:6673) |
 
 The rule that keeps them apart: **`slot_id` and `page_id` are identity; the
 fingerprint is freshness.** A candidate whose fingerprint changed is stale
@@ -42,8 +53,8 @@ the disagreement is not cosmetic.
 | Site | Construction | Separator scheme | Output | Collision-safe by construction? |
 |---|---|---|---|---|
 | `compute_edge_id`, `crates/wenlan-core/src/provenance.rs:192`-`:207` | SHA-256 over 6 parts | **length-prefixed** (`u64` LE length, then bytes) | `format!("{:x}", …)`, 64 hex | **Yes** |
-| `community_relevant_spaces_digest`, `crates/wenlan-core/src/db.rs:2487`-`:2497` | SHA-256 over a sorted+deduped space list | length-prefixed | `hex::encode(…)`, 64 hex | Yes |
-| `community_membership_digest`, `crates/wenlan-core/src/db.rs:2693`-`:2707` | SHA-256 over sorted `(node, community, attachment)` triples | length-prefixed | `hex::encode(…)`, 64 hex | Yes |
+| `community_relevant_spaces_digest`, `crates/wenlan-core/src/db.rs:2491`-`:2501` | SHA-256 over a sorted+deduped space list | length-prefixed | `hex::encode(…)`, 64 hex | Yes |
+| `community_membership_digest`, `crates/wenlan-core/src/db.rs:2697`-`:2711` | SHA-256 over sorted `(node, community, attachment)` triples | length-prefixed | `hex::encode(…)`, 64 hex | Yes |
 | `page_write_digest`, `crates/wenlan-core/src/post_write/page_update.rs:349`-`:383` | SHA-256 over the request's deciding fields | length-prefixed (via a local `field` closure) | `format!("{:x}", …)`, 64 hex | Yes |
 | `identity_digest`, `crates/wenlan-core/src/provenance.rs:104`-`:113` | SHA-256 over version, kind, content digest | `b":"` separators | 64 hex | Only *by input*: a CHECK'd enum and a hex digest, neither of which can contain `:` |
 | `source_page_id`, `crates/wenlan-core/src/document_enrichment.rs:760`-`:769` | SHA-256 over `source_page::`, source id, `::`, file path | `b"::"` separators | `src_` + **first 16 hex chars** | **No** — see finding F1 |
@@ -135,16 +146,16 @@ folded into the domain tag so that all four signals share one domain and one
 version axis.
 
 `space` is the raw space string as stored in `communities.space` /
-`community_members.space` (`db.rs:10444`, `:10456`). It is **not** normalized —
+`community_members.space` (`db.rs:10448`, `:10460`). It is **not** normalized —
 see S0-31.
 
 ### 3.2 Per-signal part vectors
 
 | Signal | Parts after `space` | Source of each part |
 |---|---|---|
-| evidence cluster | `sorted_set(initial independence_group_id set)` | `provenance_roots.independence_group_id` (`db.rs:8788`) for the roots grounding the cluster's edges, snapshotted at machine-A `observed` |
-| orphan wikilink | `normalized_label` | §6 of this document, applied to `page_links.label` (`db.rs:6670`) |
-| community overview | `community_id` | `communities.community_id` (`db.rs:10443`), the durable M4 ID |
+| evidence cluster | `sorted_set(initial independence_group_id set)` | `provenance_roots.independence_group_id` (`db.rs:8792`) for the roots grounding the cluster's edges, snapshotted at machine-A `observed` |
+| orphan wikilink | `normalized_label` | §6 of this document, applied to `page_links.label` (`db.rs:6674`) |
+| community overview | `community_id` | `communities.community_id` (`db.rs:10447`), the durable M4 ID |
 | space overview | *(none)* | the space alone; one overview slot per space |
 
 The space-overview slot has an empty per-signal part vector. That is intended and
@@ -168,7 +179,7 @@ space `S` and a hypothetical zero-part signal for the same space would collide.
 > count**, so a duplicated group cannot inflate the count. **The count is emitted**
 > so that `{a}` ∪ `{b}` and `{ab}` cannot alias, which length-prefixing alone
 > already prevents but which makes the intent readable at the call site.
-> `community_relevant_spaces_digest` (`db.rs:2488`-`:2490`) already does
+> `community_relevant_spaces_digest` (`db.rs:2492`-`:2494`) already does
 > sort-then-dedup-then-length-prefix; this is that pattern with the count made
 > explicit.
 
@@ -254,14 +265,14 @@ D5's field list, each grounded:
 |---|---|---|---|---|
 | 1 | `slot_id` | text | §3 | binds the fingerprint to its slot; a fingerprint alone can never be mistaken for another slot's |
 | 2 | signal version | int | Stage-0 constant per signal | a signal-logic change must invalidate every candidate it produced |
-| 3 | M4 community ID | text, empty part when N/A | `communities.community_id` (`db.rs:10443`) | evidence-cluster and community-overview only |
-| 4 | M4 published generation | int, empty part when N/A | `community_members.published_generation` (`db.rs:10460`) / `space_graph_state.published_generation` (`db.rs:10471`) | a re-grouping that keeps the community ID still changes what the community *is* |
+| 3 | M4 community ID | text, empty part when N/A | `communities.community_id` (`db.rs:10447`) | evidence-cluster and community-overview only |
+| 4 | M4 published generation | int, empty part when N/A | `community_members.published_generation` (`db.rs:10464`) / `space_graph_state.published_generation` (`db.rs:10475`) | a re-grouping that keeps the community ID still changes what the community *is* |
 | 5 | coverage epoch | int | machine D (artifact 2) | a contract-version epoch change invalidates everything, per D5's closing paragraph |
-| 6 | `sorted_set(root ids)` | set (S0-30) | `provenance_roots.root_id` (`db.rs:8784`) | the actual evidence, not just its group summary |
-| 7 | input generation | int | `space_graph_state.grouping_generation` (`db.rs:10470`) | the M4 lease/CAS generation the prepare read under (`db.rs:13949`-`:13951`) |
-| 8 | active-root digest | text (a `m6_digest` over `sorted_set` of `(root_id, status)` pairs) | `provenance_roots.status` (`db.rs:8789`) | a root going `active → failed` changes the answer without changing field 6 |
+| 6 | `sorted_set(root ids)` | set (S0-30) | `provenance_roots.root_id` (`db.rs:8788`) | the actual evidence, not just its group summary |
+| 7 | input generation | int | `space_graph_state.grouping_generation` (`db.rs:10474`) | the M4 lease/CAS generation the prepare read under (`db.rs:13953`-`:13955`) |
+| 8 | active-root digest | text (a `m6_digest` over `sorted_set` of `(root_id, status)` pairs) | `provenance_roots.status` (`db.rs:8793`) | a root going `active → failed` changes the answer without changing field 6 |
 | 9 | model version | text | the pinned LLM identifier | a model swap must re-derive before it re-judges |
-| 10 | projection version | text | `communities.projection_version` (`db.rs:10447`) | already M4's own re-derivation axis; reused rather than reinvented |
+| 10 | projection version | text | `communities.projection_version` (`db.rs:10451`) | already M4's own re-derivation axis; reused rather than reinvented |
 | 11 | prompt version | text | Stage-0 constant | a prompt edit changes the output; D13 forbids the *prompt text* from entering any receipt, so the version tag is the only legal carrier |
 
 > **Decision S0-33 — field 11 (prompt version) is added to D5's list.** D5
@@ -313,7 +324,7 @@ rejection.
 ```
 
 The result is `label_key`. The raw target is preserved separately as
-`page_links.label` (`db.rs:6670`), unchanged, so a rejected or folded link is
+`page_links.label` (`db.rs:6674`), unchanged, so a rejected or folded link is
 still legible to a human.
 
 ### 6.2 Addition A — the second NFKC pass
@@ -425,7 +436,7 @@ Named because a reader will assume otherwise.
 becomes `ss`. So `[[Straße]]` → `straße` and `[[STRASSE]]` → `strasse` are
 **different keys**. Rust's standard library has no `to_casefold`, the tree uses
 `to_lowercase` in both existing places (`synthesis/wikilinks.rs:59`,
-`db.rs:43912`), and matching it keeps M6's key compatible with the rows already
+`db.rs:43916`), and matching it keeps M6's key compatible with the rows already
 in `page_links`. Accepted ceiling; the upgrade is a `caseless` dependency, not a
 rewrite.
 
@@ -497,7 +508,7 @@ a filter applied later.
 
 ### 7.1 The convention M6 inherits
 
-`operation_receipts` (`crates/wenlan-core/src/db.rs:8213`-`:8220`):
+`operation_receipts` (`crates/wenlan-core/src/db.rs:8217`-`:8224`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS operation_receipts (
@@ -566,8 +577,8 @@ operation/digest replays; collision conflicts" describes.
 | candidate | `genesis_candidates` (PR-A-new), PK `candidate_id` | derived, S0-40 |
 | slot | the `slot_id` column of that same row | derived, §3; never recomputed after `observed` (S0-29) |
 | page ID | `pages.id` | derived from `slot_id`, §4; `INSERT … ON CONFLICT(id) DO NOTHING` converges, the same pattern `compute_edge_id` uses for edges (`provenance.rs:180`-`:183`) |
-| lease operation | `grouping_leases`, PK `(phase, space, input_generation)` (`db.rs:10475`, PK at `:10482`) | the existing M4 registry with M6's phase values (artifact 2, machine C); a retry re-acquires the same key, and `ON CONFLICT … DO NOTHING` (`db.rs:13443`) makes a live holder win |
-| receipt | `operation_receipts`, PK `(caller_id, operation_id)` (`db.rs:8219`) | §7.2 |
+| lease operation | `grouping_leases`, PK `(phase, space, input_generation)` (`db.rs:10479`, PK at `:10486`) | the existing M4 registry with M6's phase values (artifact 2, machine C); a retry re-acquires the same key, and `ON CONFLICT … DO NOTHING` (`db.rs:13447`) makes a live holder win |
+| receipt | `operation_receipts`, PK `(caller_id, operation_id)` (`db.rs:8223`) | §7.2 |
 
 All five are keyed on derived values. There is no minted identifier anywhere in
 the retry path, which is the property that makes crash-restart identity hold
@@ -606,15 +617,15 @@ it is rather than be moved, since it also protects the raw `label` column.
 **F4 — the community-overview slot inherits M4's UUID rebinding.** §3.5. PR-A-new.
 
 **F5 — `page_links.label_key` today is `to_lowercase()` and nothing else**
-(`crates/wenlan-core/src/db.rs:43912`, `let label_key = link.label.to_lowercase();`).
+(`crates/wenlan-core/src/db.rs:43916`, `let label_key = link.label.to_lowercase();`).
 M6's key is strictly stronger, so every existing row's `label_key` is either
 identical to the M6 key (the overwhelmingly common ASCII case) or weaker. Since
-`label_key` is half the `page_links` primary key (`db.rs:6671`), re-keying is a
+`label_key` is half the `page_links` primary key (`db.rs:6675`), re-keying is a
 migration with a collision case: two existing rows on one page whose old keys
 differ but whose M6 keys agree. **PR-A must choose** between (a) migrate and
 merge colliding rows, (b) leave `label_key` alone and have M6 compute its key at
 read time, or (c) add a second column. Option (b) is the smallest and forfeits the
-orphan index (`idx_page_links_orphan ON page_links(label_key)`, `db.rs:6677`),
+orphan index (`idx_page_links_orphan ON page_links(label_key)`, `db.rs:6681`),
 which the orphan-wikilink signal wants; that tradeoff is PR-A's to make, not
 Stage 0's.
 

@@ -1,6 +1,15 @@
 # M6 Stage-0 artifact 3 — independence-group assignment, liveness, and unknown→review policy
 
-Branch `kg-m6-stage0`, cut from `origin/main` at `e39048c7` (release 0.15.2, post-M5-refactor `a028199f`). Every `file:line` below was read on this branch and re-verified after writing.
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
 
 **Sources.** Frozen goal prompt D1 (relaxed independence-group floor), plus the Q6-locked recipe the code already implements. Companion artifacts: artifact 1 (`docs/plans/2026-08-01-m6-signal-matrix.md`) for the floors this grouping feeds, artifact 2 (`docs/plans/2026-08-01-m6-state-machines.md`) for the coverage-epoch machine referenced in §6.
 
@@ -16,7 +25,7 @@ A provenance root's `independence_group_id` is assigned once, at mint time, by `
 
 ## 2. How a root gets its `independence_group_id` today
 
-The seam is `MemoryDB::acquire_provenance_root` (`crates/wenlan-core/src/db.rs:18473`), whose contract is documented at `:18444`–`:18472`. Resolution happens **before** the insert, unconditionally, and is discarded on the conflict branch so an existing root's group is never rewritten (`crates/wenlan-core/src/db.rs:18461`–`:18463`).
+The seam is `MemoryDB::acquire_provenance_root` (`crates/wenlan-core/src/db.rs:18477`), whose contract is documented at `:18448`–`:18476`. Resolution happens **before** the insert, unconditionally, and is discarded on the conflict branch so an existing root's group is never rewritten (`crates/wenlan-core/src/db.rs:18465`–`:18467`).
 
 ```mermaid
 flowchart TD
@@ -36,19 +45,19 @@ flowchart TD
 
 | Tier | Rule | Location | Live in production? |
 |---|---|---|---|
-| 1 | LSH band match adopts an existing near-dup group | `crates/wenlan-core/src/db.rs:18507`–`:18511` | **yes** |
+| 1 | LSH band match adopts an existing near-dup group | `crates/wenlan-core/src/db.rs:18511`–`:18515` | **yes** |
 | 2a | `src:{source_identity}` | `crates/wenlan-core/src/provenance.rs:173`–`:174` | **yes** — both production callers always supply it |
 | 2b | `turn:{agent_turn}` | `crates/wenlan-core/src/provenance.rs:175` | **no** — see §7.1 |
 | 2c | `batch:{import_batch}` | `crates/wenlan-core/src/provenance.rs:176` | **no** — see §7.1 |
-| 3 | refuse, route to human review | `crates/wenlan-core/src/db.rs:18521`–`:18528` | **no** — unreachable, see §5 |
+| 3 | refuse, route to human review | `crates/wenlan-core/src/db.rs:18525`–`:18532` | **no** — unreachable, see §5 |
 
-**Tier 1 outranks tier 2 on purpose.** The comment at `crates/wenlan-core/src/db.rs:18502`–`:18506` states why: a near-dup catches groups the structural key would keep apart, such as two distinct import batches carrying byte-similar content. The consequence that matters for M6's floor is stated even more directly in the human-root rule (`crates/wenlan-core/src/db/claim_identity.rs:40`–`:43`): a delta a human copied out of a document **adopts that document's group**, so the copy does not become a second independent voice for what the document already said.
+**Tier 1 outranks tier 2 on purpose.** The comment at `crates/wenlan-core/src/db.rs:18506`–`:18510` states why: a near-dup catches groups the structural key would keep apart, such as two distinct import batches carrying byte-similar content. The consequence that matters for M6's floor is stated even more directly in the human-root rule (`crates/wenlan-core/src/db/claim_identity.rs:40`–`:43`): a delta a human copied out of a document **adopts that document's group**, so the copy does not become a second independent voice for what the document already said.
 
 **Canonicalization and the near-dup parameters.** Content is NFC-normalized with line endings unified and whitespace collapsed (`canonicalize_content`, `crates/wenlan-core/src/provenance.rs:50`). Near-dup detection uses 8-character shingles — deliberately wider than the entity-name trigram default, because a k=3 shingle set over a whole document is dominated by common substrings (`CONTENT_SHINGLE_K`, `crates/wenlan-core/src/provenance.rs:43`) — and the Jaccard threshold is reused verbatim from `retrieval::dedup` as "near-identical only, never topical" (`CONTENT_NEAR_DUP_THRESHOLD`, `crates/wenlan-core/src/provenance.rs:135`).
 
-**Atomicity.** The root row and its MinHash bands commit in one transaction (`crates/wenlan-core/src/db.rs:18497`, rationale at `:18484`–`:18496`): a root durable without its bands would be permanently invisible to later near-dup lookup, so every later near-dup would mint a separate group forever — a silent, unbounded inflation of the independence count. Only the winning root's bands are indexed (`crates/wenlan-core/src/db.rs:18565`). The comment also records the assumption this rests on: convergence holds **because the daemon is single-writer**; a genuinely concurrent multi-connection deployment reintroduces the race (`crates/wenlan-core/src/db.rs:18495`–`:18496`).
+**Atomicity.** The root row and its MinHash bands commit in one transaction (`crates/wenlan-core/src/db.rs:18501`, rationale at `:18488`–`:18500`): a root durable without its bands would be permanently invisible to later near-dup lookup, so every later near-dup would mint a separate group forever — a silent, unbounded inflation of the independence count. Only the winning root's bands are indexed (`crates/wenlan-core/src/db.rs:18569`). The comment also records the assumption this rests on: convergence holds **because the daemon is single-writer**; a genuinely concurrent multi-connection deployment reintroduces the race (`crates/wenlan-core/src/db.rs:18499`–`:18500`).
 
-**One known ceiling, and it errs the safe way.** The band match is not re-verified with an exact Jaccard pass, because `provenance_roots` stores only a digest and there is nothing to re-fetch (`crates/wenlan-core/src/db.rs:18465`–`:18472`). So a band collision can merge two genuinely independent roots into one group. That direction is the safe one: a false merge **under-counts** independence and can only make a floor harder to clear, never easier. The dangerous direction — a false *split*, which would inflate the count — requires the band lookup to miss a true near-dup, which the atomicity guarantee above is what prevents.
+**One known ceiling, and it errs the safe way.** The band match is not re-verified with an exact Jaccard pass, because `provenance_roots` stores only a digest and there is nothing to re-fetch (`crates/wenlan-core/src/db.rs:18469`–`:18476`). So a band collision can merge two genuinely independent roots into one group. That direction is the safe one: a false merge **under-counts** independence and can only make a floor harder to clear, never easier. The dangerous direction — a false *split*, which would inflate the count — requires the band lookup to miss a true near-dup, which the atomicity guarantee above is what prevents.
 
 **Decision S0-19 — M6 relies on the group assignment as-is and adds no re-verification.** The band-only ceiling biases toward under-counting, which is the direction the floor can tolerate: an under-counted candidate simply waits in the frontier. Adding exact-Jaccard re-verification would require storing canonical content, and M6 is the wrong milestone to grow the provenance substrate. If a real corpus later shows false merges suppressing legitimate genesis, the fix belongs in M2's module, not behind an M6 flag.
 
@@ -60,25 +69,25 @@ Which roots and groups count toward a D2 floor. Every column here is a real colu
 
 | Dimension | Values | Location | Counts toward a floor? |
 |---|---|---|---|
-| `provenance_roots.status` | `ingesting` | `crates/wenlan-core/src/db.rs:8789` | **no** — not yet finalized |
+| `provenance_roots.status` | `ingesting` | `crates/wenlan-core/src/db.rs:8793` | **no** — not yet finalized |
 | | `active` (default) | | **yes** |
 | | `failed` | | **no** |
-| `provenance_roots.root_kind` | `document_ingest` | `crates/wenlan-core/src/db.rs:8787` | **yes** — external |
+| `provenance_roots.root_kind` | `document_ingest` | `crates/wenlan-core/src/db.rs:8791` | **yes** — external |
 | | `human_capture` | | **yes** per D1 R1 — but never minted, §7.2 |
 | | `human_edit_delta` | | **yes** per D1 R1, subject to the one-group rule (§4) |
 | | `generated` | | **no** — D1 R2. Never minted either, §7.2 |
-| `edges.grounded` | `1` | `crates/wenlan-core/src/db.rs:8807` | **yes** |
+| `edges.grounded` | `1` | `crates/wenlan-core/src/db.rs:8811` | **yes** |
 | | `0` | | **no** — extraction proposes, only the validator grounds |
-| `edges.valid_until` | `NULL` | `crates/wenlan-core/src/db.rs:8816` | **yes** — "`valid_until IS NULL` is the assertion that it is still true" (`crates/wenlan-core/src/db/claim_identity.rs:364`–`:365`) |
+| `edges.valid_until` | `NULL` | `crates/wenlan-core/src/db.rs:8820` | **yes** — "`valid_until IS NULL` is the assertion that it is still true" (`crates/wenlan-core/src/db/claim_identity.rs:364`–`:365`) |
 | | set | | **no** — retracted |
-| `edges.root_id` | non-NULL | `crates/wenlan-core/src/db.rs:8808` | **yes** |
+| `edges.root_id` | non-NULL | `crates/wenlan-core/src/db.rs:8812` | **yes** |
 | | NULL | | **no** — but see S0-20 |
 
-The conjunction is exactly the partial index `idx_edges_active_grounded_space_type ... WHERE valid_until IS NULL AND grounded = 1` (`crates/wenlan-core/src/db.rs:8823`–`:8824`), so the hot half of the predicate is already indexed.
+The conjunction is exactly the partial index `idx_edges_active_grounded_space_type ... WHERE valid_until IS NULL AND grounded = 1` (`crates/wenlan-core/src/db.rs:8827`–`:8828`), so the hot half of the predicate is already indexed.
 
 **Root kind is immutable.** A trigger refuses any update to `root_kind` (`provenance_roots_kind_is_immutable`, `crates/wenlan-core/src/db/claim_identity.rs:459`–`:463`), because the kind is part of the root's own content address. So D1 R2's exclusion of generated roots cannot be defeated by relabelling a root after the fact.
 
-**Group liveness is derived, not stored.** There is no group table — `independence_group_id` is a bare `TEXT NOT NULL` column on `provenance_roots` (`crates/wenlan-core/src/db.rs:8788`), and a group exists exactly as long as some root carries its value. A group is **live for counting** when at least one of its roots satisfies the whole conjunction above. Nothing needs to reap a group whose roots all retract; it simply stops appearing in the count.
+**Group liveness is derived, not stored.** There is no group table — `independence_group_id` is a bare `TEXT NOT NULL` column on `provenance_roots` (`crates/wenlan-core/src/db.rs:8792`), and a group exists exactly as long as some root carries its value. A group is **live for counting** when at least one of its roots satisfies the whole conjunction above. Nothing needs to reap a group whose roots all retract; it simply stops appearing in the count.
 
 **Decision S0-20 — an edge with `grounded = 1 AND root_id IS NULL` is surfaced, never silently dropped.** The `root_id` column is nullable and the count expression joins through it, so such a row contributes zero while looking, to any casual reader, like live grounded evidence. The M3g promoter always mints a root before flipping `grounded` (`crates/wenlan-core/src/edge_grounding.rs:537` then the flip), so this should be empty — but "should be empty" is exactly the condition worth asserting. D7 forbids silently parking evidence, so PR-A's frontier reconciliation counts these rows and surfaces a non-zero count as a data-quality signal rather than letting an INNER JOIN swallow them.
 
@@ -91,7 +100,7 @@ D1: *"Chunks, mirrors, and same-session captures collapse through the independen
 | Collapse | Enforcing mechanism | Evidence on this branch | Verdict |
 |---|---|---|---|
 | **chunk → document** | every chunk of one file carries the same `source_identity` (the source memory's url-or-source_id, `crates/wenlan-core/src/edge_grounding.rs:519`–`:531`), so all chunks resolve to the same `src:` key | asserted by test: *"distinct chunks of one file share one independence_group_id"* (`crates/wenlan-core/src/edge_grounding.rs:2251`) | `EXISTS` |
-| **mirror → group** | tier 1: a byte-similar copy hits the same LSH bands and adopts the original's group, even across distinct import batches | `crates/wenlan-core/src/db.rs:18502`–`:18511` | `EXISTS` |
+| **mirror → group** | tier 1: a byte-similar copy hits the same LSH bands and adopts the original's group, even across distinct import batches | `crates/wenlan-core/src/db.rs:18506`–`:18515` | `EXISTS` |
 | **same-session capture → group** | contract intent is tier 2b (`turn:{agent_turn}`). In the tree, human authorship collapses harder: **all** human-authored roots share one group | `HUMAN_SOURCE_IDENTITY = "human:local"` (`crates/wenlan-core/src/db/claim_identity.rs:44`), used at `:689`; asserted by `every_human_delta_shares_one_independence_group` (`crates/wenlan-core/src/db/claim_identity_test.rs:599`) | `EXISTS`, by a stronger rule — see below |
 | **human edit copied from a document → that document's group** | tier 1 outranks the human key | `crates/wenlan-core/src/db/claim_identity.rs:40`–`:43` | `EXISTS` |
 
@@ -109,7 +118,7 @@ The direct consequence, which artifact 1 records as boundary case B28: **three h
 
 ### 5.1 What "unknown independence" concretely is
 
-Q6 B.4 says un-establishable independence routes to human review and never to auto-genesis. In the code that is the `None` arm of `base_independence_key` (`crates/wenlan-core/src/provenance.rs:171`–`:177`), reached when a root has no near-dup match **and** no `source_identity`, `agent_turn`, or `import_batch`. `acquire_provenance_root` then returns an error rather than minting a random group, with the reasoning inline at `crates/wenlan-core/src/db.rs:18515`–`:18528`: minting a fresh UUID group *"would silently manufacture a distinct independence group and inflate independent-support counts"*.
+Q6 B.4 says un-establishable independence routes to human review and never to auto-genesis. In the code that is the `None` arm of `base_independence_key` (`crates/wenlan-core/src/provenance.rs:171`–`:177`), reached when a root has no near-dup match **and** no `source_identity`, `agent_turn`, or `import_batch`. `acquire_provenance_root` then returns an error rather than minting a random group, with the reasoning inline at `crates/wenlan-core/src/db.rs:18519`–`:18532`: minting a fresh UUID group *"would silently manufacture a distinct independence group and inflate independent-support counts"*.
 
 ### 5.2 On this branch the branch is unreachable
 
@@ -126,7 +135,7 @@ So tier 3 cannot fire. The document lane additionally guards *before* the call: 
 
 ### 5.3 What M6 actually reads, and why the read side has no unknown state
 
-This is the part that keeps the policy simple. **M6 counts roots; it never mints them.** `independence_group_id` is `TEXT NOT NULL` (`crates/wenlan-core/src/db.rs:8788`), so every root that exists has a group. From M6's read side there is no unknown-independence root to route — the assignment either succeeded (a row exists, with a group) or the root was never created (nothing to count, nothing to see).
+This is the part that keeps the policy simple. **M6 counts roots; it never mints them.** `independence_group_id` is `TEXT NOT NULL` (`crates/wenlan-core/src/db.rs:8792`), so every root that exists has a group. From M6's read side there is no unknown-independence root to route — the assignment either succeeded (a row exists, with a group) or the root was never created (nothing to count, nothing to see).
 
 Therefore:
 
@@ -171,7 +180,7 @@ Reported, not resolved.
 
 ### 7.2 Two of the four root kinds are never minted
 
-The `root_kind` CHECK enumerates four values (`crates/wenlan-core/src/db.rs:8787`), but production mints only `document_ingest` (`crates/wenlan-core/src/edge_grounding.rs:537`) and `human_edit_delta` (`crates/wenlan-core/src/db/claim_identity.rs:694`). No production path mints `human_capture` or `generated`.
+The `root_kind` CHECK enumerates four values (`crates/wenlan-core/src/db.rs:8791`), but production mints only `document_ingest` (`crates/wenlan-core/src/edge_grounding.rs:537`) and `human_edit_delta` (`crates/wenlan-core/src/db/claim_identity.rs:694`). No production path mints `human_capture` or `generated`.
 
 Consequences, in opposite directions:
 
@@ -180,7 +189,7 @@ Consequences, in opposite directions:
 
 ### 7.3 Convergence rests on the single-writer assumption
 
-`acquire_provenance_root`'s comment states that near-dup convergence holds because the daemon is single-writer, and that a concurrent multi-connection deployment would reintroduce the race (`crates/wenlan-core/src/db.rs:18495`–`:18496`). That assumption is true today — the repo's own architecture rule is that only `wenlan-server` opens the database. Recording it here because M6 adds four new lease phases and therefore new concurrent-looking work, and a future reader could reasonably wonder whether that changes the picture. It does not: the phases serialize on one connection, and artifact 2's lease registry is what keeps them from overlapping. But if the daemon ever gains a second writer connection, independence grouping is one of the things that breaks silently, and the failure mode is group *splitting* — the inflating direction.
+`acquire_provenance_root`'s comment states that near-dup convergence holds because the daemon is single-writer, and that a concurrent multi-connection deployment would reintroduce the race (`crates/wenlan-core/src/db.rs:18499`–`:18500`). That assumption is true today — the repo's own architecture rule is that only `wenlan-server` opens the database. Recording it here because M6 adds four new lease phases and therefore new concurrent-looking work, and a future reader could reasonably wonder whether that changes the picture. It does not: the phases serialize on one connection, and artifact 2's lease registry is what keeps them from overlapping. But if the daemon ever gains a second writer connection, independence grouping is one of the things that breaks silently, and the failure mode is group *splitting* — the inflating direction.
 
 ---
 

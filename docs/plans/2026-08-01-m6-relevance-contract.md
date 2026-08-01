@@ -5,7 +5,16 @@ Scope: frozen contract D9 in full, and gate G6
 (`m6_relevance_is_bounded_and_safe`).
 Continues the decision numbering from artifact 8 (`S0-84`).
 
-Every `file.rs:NNN` citation was read on branch `kg-m6-stage0` at authoring time.
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
 
 ---
 
@@ -17,7 +26,26 @@ be the current M5 `supported` version."* Artifact 1 flagged a dead-substrate STO
 against that predicate. This artifact confirms it, narrows it, and marks every
 affected row rather than writing a contract that reads as live.
 
-**The M5 claim/truth substrate is fully built and entirely inert.** Every table
+**The M5 claim/truth substrate is fully built, and no production writer promotes
+`supported`.** Rev 1 said "entirely inert", which `#418` has made false and which
+was already broader than the evidence under it. `#418` shipped a live production
+writer into `page_truth_state`: `POST /api/pages/{id}/review`
+(`crates/wenlan-server/src/page_routes.rs:42`) reaches an upsert that sets
+`human_reviewed = 1` (`crates/wenlan-core/src/db/presence_review.rs:326`-`:341`).
+The substrate therefore has a writer — on the **human** axis. It deliberately does
+not touch the machine axis, and says so at the seam: the inserted row is
+`'provisional'` with a NULL `evaluated_at` because *"a human saying 'I read this'
+is not evidence about whether the machine found support — inventing `supported`
+here would collapse the separation the whole rung exists to make"*
+(`:321`-`:325`). The claim that survives, and the only one D9 rests on, is the
+narrow one: **nothing outside tests writes `support_status = 'supported'`** — a
+repository-wide search for the literal at `1c903bec` finds no production hit.
+
+That narrowing does not weaken S0-153's census: a page marked human-reviewed still
+carries `evaluated_at IS NULL`, so clause (b) correctly counts it as un-judged
+rather than as decided.
+
+Every table
 D9 needs exists — `claims`, `claim_revisions`, `claim_anchors`,
 `page_version_claims`, `claim_derivation_markers`, `page_truth_state`,
 `claim_derivation_jobs` (`crates/wenlan-core/src/db/claim_identity.rs:148`,
@@ -31,7 +59,7 @@ indexes, and a coverage-checked backfill. What does not exist is anything that
   any page is left without a truth row (`:539`-`:543`).
 - No production code path writes `support_status = 'supported'`. The only such
   write in the tree is a test
-  (`crates/wenlan-core/src/export/projection_invariant_test.rs:454`).
+  (`crates/wenlan-core/src/export/projection_invariant_test.rs:469`).
 - `claim_derivation_jobs` is created and indexed
   (`crates/wenlan-core/src/db/claim_identity.rs:306`, `:319`-`:322`) and then
   read and written by nothing — there is no enqueue, no worker, and no scheduler
@@ -110,35 +138,35 @@ cross on co-citation at all.
 ### 1.2 Term predicates, grounded
 
 The shared eligibility spine for every graph term. `edges` is the substrate
-(`crates/wenlan-core/src/db.rs:8799`), widened by migration 98 to carry
+(`crates/wenlan-core/src/db.rs:8803`), widened by migration 98 to carry
 `claim_revision` and `root` endpoints and the `attests` edge type
-(`crates/wenlan-core/src/db.rs:11733`):
+(`crates/wenlan-core/src/db.rs:11737`):
 
 ```sql
 -- the eligible-edge predicate, used by all three graph terms
-    valid_until IS NULL          -- active            (db.rs:8816)
-AND grounded = 1                 -- validator-grounded (db.rs:8807)
-AND root_id IS NOT NULL          -- externally rooted  (db.rs:8808)
-AND lineage <> 'legacy'          -- excludes legacy-ungrounded (db.rs:8806)
+    valid_until IS NULL          -- active            (db.rs:8820)
+AND grounded = 1                 -- validator-grounded (db.rs:8811)
+AND root_id IS NOT NULL          -- externally rooted  (db.rs:8812)
+AND lineage <> 'legacy'          -- excludes legacy-ungrounded (db.rs:8810)
 AND space = ?                    -- no cross-space
 ```
 
-joined to `provenance_roots` (`crates/wenlan-core/src/db.rs:8783`) for:
+joined to `provenance_roots` (`crates/wenlan-core/src/db.rs:8787`) for:
 
 ```sql
-    pr.status = 'active'                 -- (db.rs:8789)
-AND pr.root_kind <> 'generated'          -- (db.rs:8787)
+    pr.status = 'active'                 -- (db.rs:8793)
+AND pr.root_kind <> 'generated'          -- (db.rs:8791)
 ```
 
 | D1/D9 rule | Enforcing predicate | Where the data lives | Status |
 |---|---|---|---|
-| generated roots contribute zero | `pr.root_kind <> 'generated'` | `provenance_roots.root_kind` (`db.rs:8787`) | **LIVE** |
-| inactive roots contribute zero | `pr.status = 'active'` | `provenance_roots.status` (`db.rs:8789`) | **LIVE** |
-| retracted contributes zero | `e.valid_until IS NULL` | `edges.valid_until` (`db.rs:8816`) | **LIVE** |
-| legacy-ungrounded contributes zero | `e.grounded = 1 AND e.lineage <> 'legacy'` | `edges.grounded`, `edges.lineage` (`db.rs:8807`, `:8806`) | **LIVE** |
+| generated roots contribute zero | `pr.root_kind <> 'generated'` | `provenance_roots.root_kind` (`db.rs:8791`) | **LIVE** |
+| inactive roots contribute zero | `pr.status = 'active'` | `provenance_roots.status` (`db.rs:8793`) | **LIVE** |
+| retracted contributes zero | `e.valid_until IS NULL` | `edges.valid_until` (`db.rs:8820`) | **LIVE** |
+| legacy-ungrounded contributes zero | `e.grounded = 1 AND e.lineage <> 'legacy'` | `edges.grounded`, `edges.lineage` (`db.rs:8811`, `:8810`) | **LIVE** |
 | provisional contributes zero | `pts.support_status = 'supported'` | `page_truth_state` (`claim_identity.rs:279`) | **BLOCKED** (§0) |
 | pairs come from supported claim revisions | join through `page_version_claims` (`claim_identity.rs:215`) at the page's current version | `page_version_claims`, `claims` | **BLOCKED** (§0) |
-| collapse through the independence group | `pr.independence_group_id` | `provenance_roots.independence_group_id` (`db.rs:8788`) | **LIVE** |
+| collapse through the independence group | `pr.independence_group_id` | `provenance_roots.independence_group_id` (`db.rs:8792`) | **LIVE** |
 | candidate is the current supported version | `pts.page_version = p.version AND pts.support_status='supported'` | `page_truth_state` | **BLOCKED** (§0) |
 | precomputed bounded adjacency | — | nothing | **PR-A-new** (§8) |
 | pair statistics | — | nothing | **PR-A-new** (§8) |
@@ -214,7 +242,7 @@ contribution(g) = hub_weight(g) * 0.5 ^ (age_days(g) / 180)
 ```
 
 where `age_days` is measured from the group's most recent contributing root's
-`provenance_roots.created_at` (`crates/wenlan-core/src/db.rs:8790`), and
+`provenance_roots.created_at` (`crates/wenlan-core/src/db.rs:8794`), and
 `hub_weight` is §3's `64/d`.
 
 Decay reference values (`R-DECAY-HALFLIFE = 180 days`):
@@ -265,7 +293,7 @@ The last row is a finding, not an illustration — see F1 in §12.
 >
 > - **Distinct groups, not pages or roots.** This is what makes D1's collapse
 >   rules bite: chunks and mirrors of one document collapse to one group
->   (`provenance_roots.independence_group_id`, `db.rs:8788`), so a single source
+>   (`provenance_roots.independence_group_id`, `db.rs:8792`), so a single source
 >   split into ten chunks cannot manufacture a floor-clearing pair.
 > - **Undecayed.** The floor is a statement about how much independent evidence
 >   ever existed, not about how fresh it is. Applying decay first would let a
@@ -373,15 +401,15 @@ D9's septuple, captured before committing an automatic attachment:
 | 1 | `target_page_version` | `pages.version` | LIVE |
 | 2 | `target_support_version` | `page_truth_state.page_version` (`claim_identity.rs:281`) | BLOCKED |
 | 3 | `relevance_generation` | PR-A counter | PR-A-new |
-| 4 | `community_generation` | `space_graph_state.published_generation` (`db.rs:10471`) | LIVE |
-| 5 | `dependency_generation` | `space_graph_state.grouping_generation` (`db.rs:10470`) | LIVE |
+| 4 | `community_generation` | `space_graph_state.published_generation` (`db.rs:10475`) | LIVE |
+| 5 | `dependency_generation` | `space_graph_state.grouping_generation` (`db.rs:10474`) | LIVE |
 | 6 | `active_root_set_digest` | `m6_digest` over sorted `(root_id, status)` | LIVE |
 | 7 | `candidate_set_digest` | `m6_digest` over the sorted candidate page IDs | PR-A-new |
 
 > **Decision S0-93 — field 1 is the pair `(version, source_revision)`, per
 > artifact 7's S0-70.** The same blind spot applies: `link_page_evidence`
 > advances `source_revision` while leaving `version` fixed
-> (`crates/wenlan-core/src/db.rs:45244`-`:45249`), so a version-only snapshot
+> (`crates/wenlan-core/src/db.rs:45248`-`:45253`), so a version-only snapshot
 > cannot see an evidence change between ranking and commit — which is precisely
 > one of the five events D9 requires to write nothing and requeue.
 
@@ -389,8 +417,8 @@ The finalizer CASes all seven, re-verifies the target is the current
 M5-supported version, and in one short transaction writes the attachment and
 dependency state, page history/changelog where the canonical write seam requires
 them, stale/refresh enqueue state, the operation receipt
-(`operation_receipts`, `crates/wenlan-core/src/db.rs:8213`, PK
-`(caller_id, operation_id)` at `:8219`), and lease completion.
+(`operation_receipts`, `crates/wenlan-core/src/db.rs:8217`, PK
+`(caller_id, operation_id)` at `:8223`), and lease completion.
 
 > **Decision S0-94 — "writes nothing and requeues" is implemented as a CAS
 > failure that returns the job to `queued`, never as a retry inside the
@@ -448,7 +476,7 @@ Against the two PR-A-new tables plus the existing `edges`:
 | I5 | `page_truth_state(support_status, page_id)` | candidate retrieval; extends the existing status-only index (`claim_identity.rs:301`-`:302`) |
 
 The existing `idx_edges_active_grounded_space_type`
-(`crates/wenlan-core/src/db.rs:8823`-`:8824`, `ON edges(space, edge_type) WHERE
+(`crates/wenlan-core/src/db.rs:8827`-`:8828`, `ON edges(space, edge_type) WHERE
 valid_until IS NULL AND grounded = 1`) already matches the eligibility spine and
 serves the adjacency *rebuild*, not the route evaluation.
 
@@ -594,9 +622,10 @@ reintroduce the artifact silently. **G6 must include the never-co-occurring rare
 pair as a named negative control** — it is a known-negative in D9's own sense,
 and today's gate list does not name it.
 
-**F2 — the M5 truth substrate is complete and inert.** §0 in full. The
-schema, triggers, indexes, and backfill all exist and are well built; no
-promoter does. Every D9 clause resting on `supported` is constant-false today.
+**F2 — the M5 truth substrate is complete, and no `supported` promoter exists.**
+§0 in full. The schema, triggers, indexes, and backfill all exist and are well
+built; a human-axis writer now exists too (`#418`), but no machine-axis promoter
+does. Every D9 clause resting on `supported` is constant-false today.
 This is a program-sequencing consequence (S0-85), not a defect in either M5 or
 D9, but it means PR-B's genesis shadow would measure exactly zero without a
 claim-derivation promoter shipping first.
@@ -612,11 +641,11 @@ margins.
 
 **F4 — `edges.edge_type` and the endpoint-kind CHECKs in the base DDL do not
 list the M5 values that migration 98 adds.** The base table
-(`crates/wenlan-core/src/db.rs:8802`-`:8806`) constrains `src_kind` to
+(`crates/wenlan-core/src/db.rs:8806`-`:8810`) constrains `src_kind` to
 `page|memory|entity|external` and `edge_type` to
 `mentions|relates|cites|supports|links`, while the live post-migration schema
 accepts `claim_revision` endpoints and the `attests` type
-(`crates/wenlan-core/src/db.rs:11733`, used at
+(`crates/wenlan-core/src/db.rs:11737`, used at
 `crates/wenlan-core/src/db/claim_identity.rs:432`). Anyone grounding a predicate
 by reading the `CREATE TABLE` alone will write a filter against constraints that
 no longer hold. Not a bug — a rebuild-migration is the correct SQLite idiom —

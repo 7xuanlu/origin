@@ -7,7 +7,16 @@ which fixed the six states and twelve transitions; this artifact fixes the
 queries, the clocks, the scopes, and the exhaustion behaviour that machine F left
 open.
 
-Every `file.rs:NNN` citation was read on branch `kg-m6-stage0` at authoring time.
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
 
 ---
 
@@ -66,16 +75,16 @@ WITH eligible AS (
 )
 ```
 
-Grounded in the tree: `edges.space` (`crates/wenlan-core/src/db.rs:8809`),
-`edges.grounded` (`:8807`), `edges.valid_until` (`:8816`), `edges.root_id`
-(`:8808`), `provenance_roots.status` (`:8789`), `provenance_roots.root_kind`
-(`:8787`), `provenance_roots.independence_group_id` (`:8788`).
+Grounded in the tree: `edges.space` (`crates/wenlan-core/src/db.rs:8813`),
+`edges.grounded` (`:8811`), `edges.valid_until` (`:8820`), `edges.root_id`
+(`:8812`), `provenance_roots.status` (`:8793`), `provenance_roots.root_kind`
+(`:8791`), `provenance_roots.independence_group_id` (`:8792`).
 
 The partial index `idx_edges_active_grounded_space_type ON edges(space, edge_type)
-WHERE valid_until IS NULL AND grounded = 1` (`db.rs:8823`-`:8824`) covers the
+WHERE valid_until IS NULL AND grounded = 1` (`db.rs:8827`-`:8828`) covers the
 `edges` side of the predicate. The join to `provenance_roots` goes through
-`idx_edges_root ON edges(root_id) WHERE root_id IS NOT NULL` (`db.rs:8820`) and
-then the `provenance_roots` primary key (`db.rs:8784`). **PR-A should measure
+`idx_edges_root ON edges(root_id) WHERE root_id IS NOT NULL` (`db.rs:8824`) and
+then the `provenance_roots` primary key (`db.rs:8788`). **PR-A should measure
 this before enabling the scan**: the space filter is index-supported, the
 root-kind and status filters are not, so the cost scales with grounded edges in
 the space, not with groups.
@@ -148,7 +157,7 @@ The cursor is a **scan position within one pass**, and nothing else.
 ### 2.2 Storage and wrap
 
 Storage follows the tree's existing cursor idiom exactly: one `app_metadata`
-row (`crates/wenlan-core/src/db.rs:5668`-`:5671`, `key TEXT PRIMARY KEY, value
+row (`crates/wenlan-core/src/db.rs:5672`-`:5675`, `key TEXT PRIMARY KEY, value
 TEXT NOT NULL`), written after each slice, cleared to the empty string on wrap.
 The precedent is the automatic-maintenance cross-space cursor —
 `AUTOMATIC_CROSS_SPACE_CURSOR_KEY` (`crates/wenlan-core/src/maintenance.rs:31`),
@@ -211,8 +220,8 @@ differently on a dismissed card**:
 
 | Writer | Statement | Effect on an existing dismissed row |
 |---|---|---|
-| `insert_refinement_proposal` (`crates/wenlan-core/src/db.rs:36841`, statement at `:36858`) | `INSERT OR REPLACE INTO refinement_queue (id, action, source_ids, payload, confidence)` | **Resurrects it.** `status` is not in the column list, so REPLACE deletes the row and the new one takes the `DEFAULT 'pending'` (`migrations_v004_v009.rs:55`) |
-| `insert_lint_review_if_absent` (`crates/wenlan-core/src/db.rs:36867`, statement at `:36878`-`:36880`) | `INSERT OR IGNORE … VALUES (…, 'awaiting_review')` | **Leaves it alone.** Its doc comment (`:36864`-`:36866`) says so: *"`INSERT OR IGNORE` deliberately never resurrects a dismissed item."* |
+| `insert_refinement_proposal` (`crates/wenlan-core/src/db.rs:36845`, statement at `:36862`) | `INSERT OR REPLACE INTO refinement_queue (id, action, source_ids, payload, confidence)` | **Resurrects it.** `status` is not in the column list, so REPLACE deletes the row and the new one takes the `DEFAULT 'pending'` (`migrations_v004_v009.rs:55`) |
+| `insert_lint_review_if_absent` (`crates/wenlan-core/src/db.rs:36871`, statement at `:36882`-`:36884`) | `INSERT OR IGNORE … VALUES (…, 'awaiting_review')` | **Leaves it alone.** Its doc comment (`:36868`-`:36870`) says so: *"`INSERT OR IGNORE` deliberately never resurrects a dismissed item."* |
 
 > **Decision S0-48 — the unformed-topic card is written with `INSERT OR IGNORE`
 > and an explicit `status`, never through `insert_refinement_proposal`.** A card
@@ -313,7 +322,7 @@ human decisions, and suppression identities remain durable.
 | Compacted | Retained forever |
 |---|---|
 | `genesis_candidates.payload` (the inference input/output blob) | the candidate row itself: ID, slot ID, page ID, state, reason, timestamps |
-| — | `operation_receipts` rows (`db.rs:8213`-`:8220`) |
+| — | `operation_receipts` rows (`db.rs:8217`-`:8224`) |
 | — | the published page and its provenance |
 | — | human decisions (card dismissals, reviews) |
 | — | suppression identities (§4) |
@@ -370,7 +379,7 @@ D7's closing rule, enumerated. "Parked" means the group is eligible and
 | P2 | Cursor wrap mid-insert | group inserted at an already-passed position | the frontier row exists from F1 onward; unscanned ≠ unaccounted | §2.2 |
 | P3 | `next_scan_at` pushed forward repeatedly | 7-day timer never evaluated | 24h ceiling on `next_scan_at` | S0-46 |
 | P4 | Crash between claim and publish | reservation row exists, candidate is dead | S0-5's recovery scan fires F5 for every orphaned reservation | artifact 2 |
-| P5 | Lease held by a dead process | no worker can claim the group | `grouping_leases.expires_at` + the reap arm (`crates/wenlan-core/src/db.rs:13428`-`:13430`) | existing M4 substrate |
+| P5 | Lease held by a dead process | no worker can claim the group | `grouping_leases.expires_at` + the reap arm (`crates/wenlan-core/src/db.rs:13432`-`:13434`) | existing M4 substrate |
 | P6 | Retry exhaustion | candidate stops retrying | S0-12: `attempt > 5` → `stale` with `reason='retry_exhausted'`, which releases the reservation (F5) and returns the group to the frontier | artifact 2 |
 | P7 | Quota exhaustion (any of 5 caps) | work not started | no cap may terminalize or retire | S0-54 |
 | P8 | Suppression never lapsing | group suppressed forever | `expires_at` is set in-statement at write time and the join filters on it; there is no path that writes an unbounded expiry | §4, S0-51 |
@@ -397,10 +406,10 @@ write.** `emit_cross_space_discovery_card`
 (`crates/wenlan-core/src/maintenance.rs:834`-`:865`) reads
 `get_refinement_proposal(&id)` at `:844` and returns early if a row exists, then
 calls `insert_refinement_proposal` at `:854`, whose statement is
-`INSERT OR REPLACE` (`db.rs:36858`). Two concurrent emitters between the check and
+`INSERT OR REPLACE` (`db.rs:36862`). Two concurrent emitters between the check and
 the insert would replace a dismissed card back to `pending`. The daemon is the
 single writer, so this is currently unreachable rather than broken — but M6 must
-not copy the shape, and the `INSERT OR IGNORE` writer at `db.rs:36878` is the one
+not copy the shape, and the `INSERT OR IGNORE` writer at `db.rs:36882` is the one
 to copy. S0-48.
 
 **F2 — `refinement_queue` timestamps are TEXT, not `unixepoch()` integers**
@@ -412,15 +421,15 @@ M6 table.
 **F3 — `refinement_queue.status` has no CHECK constraint**
 (`migrations_v004_v009.rs:55`, `status TEXT DEFAULT 'pending'`), while the code
 uses at least `pending`, `awaiting_review`, `resolved`, and `dismissed`
-(`db.rs:16197`, `:16337`, `:16479`). M6's card binding should not depend on the
+(`db.rs:16201`, `:16341`, `:16483`). M6's card binding should not depend on the
 status string being well-formed; the binding row carries M6's own view of whether
 the card is open. Reported, not resolved — adding a CHECK to a live table is a
 migration with its own risk and is outside M6's scope.
 
 **F4 — the eligible-set query has no covering index for the root-side
 predicates.** `provenance_roots.status` and `root_kind` are unindexed
-(`db.rs:8787`, `:8789`; the only indexes on that table are the primary key at
-`:8784` and the `UNIQUE(identity_version, identity_digest)` at `:8791`). At
+(`db.rs:8791`, `:8793`; the only indexes on that table are the primary key at
+`:8788` and the `UNIQUE(identity_version, identity_digest)` at `:8795`). At
 current corpus sizes this is almost certainly fine; PR-A should measure before
 enabling the scan, because the M4 parity sweep's 18.88s single-connection hold at
 10k entities (documented in `crates/wenlan-core/AGENTS.md`) is the precedent for

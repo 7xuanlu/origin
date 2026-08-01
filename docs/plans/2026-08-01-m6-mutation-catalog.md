@@ -5,6 +5,17 @@ Scope: Stage-0 item 12 — a RED mutation catalog and positive controls for
 **every** gate G1–G11.
 Continues the decision numbering from artifact 11 (`S0-133`).
 
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
+
 ### Citation conventions
 
 In-repo citations are read on branch `kg-m6-stage0`. Two files carry most of
@@ -113,11 +124,13 @@ fully supported"* (`:40`-`:47`).
 > `provisional`. That is intended and is not a bug to be 'fixed' later"*
 > (`:49`-`:50`).
 
-**Why this is `lane 1` and not `BLOCKED`.** The M5 substrate is fully built and
-fully inert — `backfill_page_truth_state` marks every page provisional with the
-reason *"never evaluated: predates claim derivation"*
-(`crates/wenlan-core/src/db/claim_identity.rs:511`-`:512`), and no production
-code writes `supported`. Artifact 6 recorded that as a STOP. It is now a lane
+**Why this is `lane 1` and not `BLOCKED`.** The M5 substrate is fully built, and
+no production writer promotes `supported` — `backfill_page_truth_state` marks
+every page provisional with the reason *"never evaluated: predates claim
+derivation"* (`crates/wenlan-core/src/db/claim_identity.rs:511`-`:512`), and a
+repository-wide search for the literal `'supported'` at `1c903bec` finds no
+production hit. ("Fully inert" would be the wrong word since `#418`: the human
+axis now has a live writer. See artifact 6 §0.) Artifact 6 recorded that as a STOP. It is now a lane
 with a branch, so the twelve dependent rows are specified, not deferred.
 
 ---

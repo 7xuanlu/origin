@@ -5,6 +5,17 @@ Scope: frozen contract D14, the Rollback section, and gate G11
 (`m6_signal_cutover_is_independent`). Touches G1's prerequisite handshake.
 Continues the decision numbering from artifact 10 (`S0-118`).
 
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
+
 **Revision log.** Rev 2 answers review findings 4, 5, 6, 14 and 16. S0-119's key
 gains a non-null sentinel (finding 5); precondition 1 is restored to the frozen
 100% and made checkable by S0-153 (finding 4); S0-126 gains a concrete minimum
@@ -45,9 +56,9 @@ parity proof that must still be current:
 
 | Mechanism | Where | Keyed by |
 |---|---|---|
-| `edges_reader_cutover` + `edges_parity_watermark` | `db.rs:9044`-`:9056` (migration 82) | `consumer` |
-| `entity_reader_cutover` + `entity_page_parity_watermark` | `db.rs:10327`-`:10334` (migration 94) | `consumer` |
-| `community_reader_cutover` + `community_reader_parity` | `db.rs:10895`-`:10902` (migration 96) | `consumer` |
+| `edges_reader_cutover` + `edges_parity_watermark` | `db.rs:9048`-`:9060` (migration 82) | `consumer` |
+| `entity_reader_cutover` + `entity_page_parity_watermark` | `db.rs:10331`-`:10338` (migration 94) | `consumer` |
+| `community_reader_cutover` + `community_reader_parity` | `db.rs:10899`-`:10906` (migration 96) | `consumer` |
 | M5 truth cutover generation | `truth_exposure.rs:39` | **nothing — one global row** |
 | M5 truth writer fence | `truth_exposure.rs:43` | **nothing — one global row** |
 
@@ -55,7 +66,7 @@ The M2 gating predicate states the shape most clearly: a consumer flips *iff* it
 is enabled **and** the watermark is clean (`drift_count = 0`) **and** the
 watermark's `proven_epoch` still equals the current epoch, because that triple is
 "what 'no unreconciled older operation remains' means operationally"
-(`db.rs:9034`-`:9038`).
+(`db.rs:9038`-`:9042`).
 
 **Not one of the five has a space column.** Three are per-consumer and global
 across spaces; two are single rows in `app_metadata`. M6 needs per-space **and**
@@ -104,8 +115,8 @@ M5 already solved the hard part, and the reasoning is on the page:
 `CutoverFence { epoch, phase }` (`:90`-`:94`), `INITIAL` = epoch 0 / phase off
 (`:98`-`:101`), `next()` always increments (`:115`-`:120`), and the swap is a
 real compare-and-set — `UPDATE app_metadata SET value = ?2 WHERE key = ?1 AND
-value = ?3` (`:504`-`:505`) with an insert-if-absent second statement for a
-database's first ceremony (`:509`-`:515`).
+value = ?3` (`:541`-`:542`) with an insert-if-absent second statement for a
+database's first ceremony (`:546`-`:552`).
 
 > **Decision S0-120 — M6's per-space readiness is an `(epoch, phase)` pair per
 > key, not a bare generation integer, and every transition bumps the epoch.**
@@ -120,7 +131,7 @@ database's first ceremony (`:509`-`:515`).
 > asymmetry: *"every other gate in this module fails toward inert, but 'inert'
 > for a fence means letting writers through, and an indeterminate fence is
 > precisely the state where that is unsafe — recovery consults durable state,
-> never a guess"* (`truth_exposure.rs:466`-`:473`). M6 inherits it verbatim.
+> never a guess"* (`truth_exposure.rs:503`-`:510`). M6 inherits it verbatim.
 > Fail-closed here means *refuse*, and "fail-closed" is ambiguous enough in
 > review that the direction has to be written down.
 
@@ -245,11 +256,11 @@ inspection.
 > **What cannot prove it.** `GET /api/status` cannot, and no daemon handshake
 > resting on it can. Its response carries `is_running`, `files_indexed`, two queue
 > depths, reranker and inference state, and a capability list
-> (`crates/wenlan-server/src/routes.rs:149`-`:160`) — **no space dimension at
+> (`crates/wenlan-server/src/routes.rs:168`-`:179`) — **no space dimension at
 > all** — and its `queue` field is the document-enrichment queue, not
 > `claim_derivation_jobs`. It is also error-swallowing by construction:
-> `db.count().await.unwrap_or(0)` (`:128`) and `Ok(0) | Err(_) =>
-> QueueStatus::Idle` (`:135`) each report *healthier* than reality when the
+> `db.count().await.unwrap_or(0)` (`:147`) and `Ok(0) | Err(_) =>
+> QueueStatus::Idle` (`:154`) each report *healthier* than reality when the
 > underlying query fails, so an all-clear from it is indistinguishable from a
 > broken query. What suffices is the three counting queries above, run inside the
 > advancing transaction per S0-125, with their results written into the readiness
@@ -350,7 +361,7 @@ never expose provisional prose.
 > | # | A durable human dependency exists if… | Where |
 > |---|---|---|
 > | 1 | the page's truth state was reviewed by a human | `page_truth_state.human_reviewed = 1` (`crates/wenlan-core/src/db/claim_identity.rs:292`-`:299`) |
-> | 2 | a human-owned page links to it | `page_links.target_page_id` = this page, joined to a source page satisfying `page_is_human_owned` (`crates/wenlan-core/src/db.rs:6666`-`:6675`) |
+> | 2 | a human-owned page links to it | `page_links.target_page_id` = this page, joined to a source page satisfying `page_is_human_owned` (`crates/wenlan-core/src/db.rs:6670`-`:6679`) |
 > | 3 | a human dismissed or suppressed something naming it | the durable suppression identity of artifact 2's F7, which D14 preserves across rollback |
 > | 4 | a presence-authorized M6 action names it | an M5 receipt whose allowlisted `slot_id` or `page_id` is this page (artifact 10 §7.1) |
 >
@@ -367,12 +378,12 @@ never expose provisional prose.
 This is the structural point of the whole artifact, and it falls straight out of
 what the backup primitive actually is.
 
-`online_backup` (`db.rs:17559`) takes a **whole-database physical byte copy**:
+`online_backup` (`db.rs:17563`) takes a **whole-database physical byte copy**:
 it folds the WAL back with `PRAGMA wal_checkpoint(TRUNCATE)` under the connection
 mutex, then copies the main database file, because *"a byte copy (unlike `VACUUM
 INTO`) preserves the libSQL DiskANN vector-index shadow tables exactly; VACUUM
 reorders their rows and the snapshot then fails `PRAGMA integrity_check`"*
-(`:17546`-`:17555`).
+(`:17550`-`:17559`).
 
 A whole-database copy can only be restored whole. So:
 
@@ -419,19 +430,19 @@ A whole-database copy can only be restored whole. So:
 PR-A requires *"pre-migration online backup, integrity receipt, and restore
 drill"* (`gp@wenlan-app:466`). All three exist:
 
-- `backup_before_migration` (`db.rs:8968`) snapshots before a migration's DDL,
+- `backup_before_migration` (`db.rs:8972`) snapshots before a migration's DDL,
   fails the migration if the snapshot fails `integrity_check`
-  (`:8999`-`:9003`), and records the receipt in `app_metadata` under
-  `backup_before_migration_<n>` (`:9006`-`:9010`).
-- It skips a fresh database (`prior_version == 0`, `:8973`-`:8975`).
+  (`:9003`-`:9007`), and records the receipt in `app_metadata` under
+  `backup_before_migration_<n>` (`:9010`-`:9014`).
+- It skips a fresh database (`prior_version == 0`, `:8977`-`:8979`).
 - It **preserves the original restore point across retries**: a pre-existing
   destination can only come from an earlier failed attempt at the same
   migration, and re-snapshotting *"would have `online_backup` delete that
   pristine file and copy the now-partially-migrated live DB over it — destroying
-  the very pre-migration state this backup exists to provide"* (`:8984`-`:8989`).
+  the very pre-migration state this backup exists to provide"* (`:8988`-`:8993`).
 - Twelve migrations already call it — 82, 89, 90, 91, 92, 93, 94, 95, 96, 97,
-  98, 99 (`db.rs:9068`, `:9133`, `:9403`, `:9459`, `:9797`, `:10155`, `:10352`,
-  `:10389`, `:10801`, `:11645`, `:11678`, `:11745`).
+  98, 99 (`db.rs:9072`, `:9137`, `:9407`, `:9463`, `:9801`, `:10159`, `:10356`,
+  `:10393`, `:10805`, `:11649`, `:11682`, `:11749`).
 - The restore drill is executed rather than promised
   (`crates/wenlan-core/src/db/main_tests.rs:42250`,
   `crates/wenlan-core/src/db/edges_rebuild_test.rs:717`-`:718`).
@@ -442,7 +453,7 @@ drill"* (`gp@wenlan-app:466`). All three exist:
 > Purely additive `CREATE TABLE IF NOT EXISTS` migrations may skip it, matching
 > the existing pattern — migration 82's own note that it is *"pure `CREATE TABLE
 > IF NOT EXISTS` inside one BEGIN/COMMIT, no backfill, no data mutation —
-> kill/rerun converges trivially"* (`db.rs:9040`-`:9041`) is the standard.
+> kill/rerun converges trivially"* (`db.rs:9044`-`:9045`) is the standard.
 
 The three gaps are in §8 findings F2, F3, and F4.
 
@@ -452,13 +463,13 @@ The three gaps are in §8 findings F2, F3, and F4.
 
 PR-A: *"Older daemons must refuse the new schema."* This is implemented and
 load-bearing. `run_migrations` refuses to open a database stamped newer than the
-build supports (`db.rs:3658`-`:3664`), with the reasoning that every migration is
+build supports (`db.rs:3662`-`:3668`), with the reasoning that every migration is
 gated `if version < N`, so a newer `user_version` *"silently skips all of them
 and we would go on writing against a schema we cannot see"*, and — the part that
 makes it real — *"this is not hypothetical: an older installed build can still be
-running and reopening the same file every few seconds"* (`:3650`-`:3657`).
-`SCHEMA_VERSION` is `103` (`db.rs:682`). The repair path has its own equality
-check (`:3237`-`:3241`).
+running and reopening the same file every few seconds"* (`:3654`-`:3661`).
+`SCHEMA_VERSION` is `103` (`db.rs:686`). The repair path has its own equality
+check (`:3241`-`:3245`).
 
 > **Decision S0-133 — M6 adds no new refusal mechanism; it adds the evidence G1
 > demands.** The mechanism is live and correct. What G1 requires is different in
@@ -480,23 +491,23 @@ carries a live warning from its own author: *"the destructive half of this
 contract is wired and the protective half is not. Advancing the generation today
 would evict pages from the user's vault while every page route kept serving
 them. PR-C must land the adapters BEFORE the ceremony, not alongside it"*
-(`:450`-`:458`). So M6's PR-D must **read** M5 readiness and must never
+(`:487`-`:495`). So M6's PR-D must **read** M5 readiness and must never
 **advance** it as a side effect of an M6 cutover — advancing it is an M5
 ceremony with an M5 precondition M6 cannot evaluate. S0-125's precondition 1 is
 written as a read-only conjunction for exactly this reason.
 
 **F2 — twelve full-database copies accumulate in the data directory and nothing
 ever removes them.** `backup_before_migration` writes
-`pre_migration_<n>_backup.db` beside the live database (`db.rs:8980`-`:8983`),
+`pre_migration_<n>_backup.db` beside the live database (`db.rs:8984`-`:8987`),
 and a repository-wide search for that filename finds only the two lines that
-construct it (`:8967`, `:8983`) — no reaper, no retention policy, no cleanup on
+construct it (`:8971`, `:8987`) — no reaper, no retention policy, no cleanup on
 successful migration. A user who has upgraded through the M5 series is carrying
 up to twelve complete copies of their corpus. This is pre-existing rather than
 M6-created, but M6 adds migrations and therefore compounds it, and the copies
 are unencrypted full-corpus material sitting in the data directory. **Reported,
 not resolved** — a retention policy is a decision about user data that belongs
 to the user, not to Stage 0, and deleting a restore point is precisely the
-operation `:8984`-`:8989` warns about. The safe minimum M6 can own: do not add
+operation `:8988`-`:8993` warns about. The safe minimum M6 can own: do not add
 new ones silently, and surface the total in `wenlan doctor`.
 
 **F3 — the pre-migration backup protects against a botched migration, not
@@ -511,9 +522,9 @@ work than its one line in D14 suggests.
 
 **F4 — the restore drill proves the snapshot opens, not that the corpus is
 intact.** Recovery is documented as *"opening the produced file as a `MemoryDB`
-(`open_for_repair`) — proven by the restore-drill test"* (`db.rs:17555`-`:17558`),
+(`open_for_repair`) — proven by the restore-drill test"* (`db.rs:17559`-`:17562`),
 and `online_backup` verifies the snapshot with an independent `integrity_check`
-(`:17555`). Both are real, and both are structural: `integrity_check` proves the
+(`:17559`). Both are real, and both are structural: `integrity_check` proves the
 SQLite file is well-formed, not that page count, claim count, or truth state
 match the source. For PR-A's drill that is adequate, because the snapshot is
 taken from a quiescent single-writer database. It is **not** adequate as a model
@@ -553,7 +564,7 @@ call, not to this artifact.
 
 | G1 clause | Where |
 |---|---|
-| old pre-M6 binary refuses against a copied migrated DB | §8, S0-133 — mechanism live at `db.rs:3658`, evidence form is new |
+| old pre-M6 binary refuses against a copied migrated DB | §8, S0-133 — mechanism live at `db.rs:3662`, evidence form is new |
 | one positive fully-ready fixture | §3 precondition table, all seven true |
 | M5 readiness/cutover at 100% | §3 precondition 1, and **F1** on why it is read-only |
 

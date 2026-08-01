@@ -1,6 +1,15 @@
 # M6 Stage-0 artifact 2 — candidate, claim, lease, coverage-epoch, and finalization state machines
 
-Branch `kg-m6-stage0`, cut from `origin/main` at `e39048c7` (release 0.15.2, post-M5-refactor `a028199f`). Every `file:line` below was read on this branch.
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
 
 **Sources.** Frozen goal prompt sections D3 (candidate machine + atomic finalization), D4 (concept claims vs overview witnesses + reservation terminal semantics), D5 (deterministic identity/retry), D6 (one durable lease registry, one LLM finalization per turn), D7 (durable frontier), D8 (work bounds), D14 (forward-safe rollback). Gates G3, G4, and G5 are the executable consumers of this artifact.
 
@@ -40,7 +49,7 @@ Only machine C has an existing physical substrate. The other five are contract-f
 ### 2.1 The lease registry D6 extends
 
 ```
-crates/wenlan-core/src/db.rs:10475
+crates/wenlan-core/src/db.rs:10479
     CREATE TABLE IF NOT EXISTS grouping_leases (
         phase TEXT NOT NULL,
         space TEXT NOT NULL,
@@ -56,21 +65,21 @@ The table already has the shape D6 asks for. Exactly one phase value is written 
 
 | Operation | Location | Statement shape |
 |---|---|---|
-| Reap-then-acquire | `crates/wenlan-core/src/db.rs:13427` and `:13439` | `DELETE ... WHERE phase='community' AND space=?1 AND (expires_at <= unixepoch() OR input_generation <> ?2)` then `INSERT ... VALUES ('community', ?1, ?2, ?3, unixepoch() + 300, 1) ON CONFLICT(phase, space, input_generation) DO NOTHING` |
-| Acquire failure | `crates/wenlan-core/src/db.rs:13451` | `INSERT` affected 0 rows → `CommunityGroupingError::LeaseHeld` |
-| Release on prepare-path error | `crates/wenlan-core/src/db.rs:13742` | `DELETE ... AND token=?3` |
-| Ownership CAS at finalize | `crates/wenlan-core/src/db.rs:13919` | `SELECT 1 FROM grouping_leases WHERE phase='community' AND space=?1 AND input_generation=?2 AND token=?3 LIMIT 1` — missing row aborts the finalize |
-| Consume at finalize | `crates/wenlan-core/src/db.rs:14131` | `DELETE ... AND token=?3`, inside the same outer immediate transaction as the publish |
+| Reap-then-acquire | `crates/wenlan-core/src/db.rs:13431` and `:13443` | `DELETE ... WHERE phase='community' AND space=?1 AND (expires_at <= unixepoch() OR input_generation <> ?2)` then `INSERT ... VALUES ('community', ?1, ?2, ?3, unixepoch() + 300, 1) ON CONFLICT(phase, space, input_generation) DO NOTHING` |
+| Acquire failure | `crates/wenlan-core/src/db.rs:13455` | `INSERT` affected 0 rows → `CommunityGroupingError::LeaseHeld` |
+| Release on prepare-path error | `crates/wenlan-core/src/db.rs:13746` | `DELETE ... AND token=?3` |
+| Ownership CAS at finalize | `crates/wenlan-core/src/db.rs:13923` | `SELECT 1 FROM grouping_leases WHERE phase='community' AND space=?1 AND input_generation=?2 AND token=?3 LIMIT 1` — missing row aborts the finalize |
+| Consume at finalize | `crates/wenlan-core/src/db.rs:14135` | `DELETE ... AND token=?3`, inside the same outer immediate transaction as the publish |
 | Drop-guard cleanup | `crates/wenlan-core/src/db/community_grouping_state.rs:51`–`:75` | spawned `DELETE` when a `CommunityGroupingLeaseCleanup` is dropped un-disarmed |
 
 Four facts from that inventory shape the M6 design:
 
 1. **The reap predicate is phase-scoped by a literal.** A naive M6 acquire that copies the statement and forgets to change `'community'` would reap a live lease belonging to another phase. The M6 acquire must parameterise `phase` in **both** the `DELETE` and the `INSERT`. This is the single most likely PR-A implementation defect and G3's lease-takeover leg should have a case for it.
 2. **Acquisition is `INSERT ... ON CONFLICT DO NOTHING`, and zero affected rows is the "someone else holds it" signal.** That is already the CAS D6 wants; M6 reuses it verbatim rather than inventing a compare-and-swap.
-3. **Ownership is re-checked at finalize, inside the transaction, before anything is written** (`crates/wenlan-core/src/db.rs:13919`, ahead of the generation CAS at `:13948`). M6's finalizer keeps that ordering — lease check first, so a lost lease costs nothing.
-4. **`attempt` is declared but inert.** The only write is the literal `1` at `crates/wenlan-core/src/db.rs:13443`; no statement anywhere in the workspace updates it. M6 is free to give the column its intended meaning (decision **S0-2**).
+3. **Ownership is re-checked at finalize, inside the transaction, before anything is written** (`crates/wenlan-core/src/db.rs:13923`, ahead of the generation CAS at `:13952`). M6's finalizer keeps that ordering — lease check first, so a lost lease costs nothing.
+4. **`attempt` is declared but inert.** The only write is the literal `1` at `crates/wenlan-core/src/db.rs:13447`; no statement anywhere in the workspace updates it. M6 is free to give the column its intended meaning (decision **S0-2**).
 
-The lease's `input_generation` for the community phase is `space_graph_state.grouping_generation`, read at `crates/wenlan-core/src/db.rs:13393` and `:13415` under `WHERE space = ?1 AND dirty = 1`.
+The lease's `input_generation` for the community phase is `space_graph_state.grouping_generation`, read at `crates/wenlan-core/src/db.rs:13397` and `:13419` under `WHERE space = ?1 AND dirty = 1`.
 
 ### 2.2 The three surfaces that are *not* this registry
 
@@ -79,7 +88,7 @@ D6 says: *do not create a parallel lease system.* A reviewer will reasonably ask
 | Surface | Location | Why it is not the registry, and why M6 does not extend it |
 |---|---|---|
 | `claim_derivation_jobs` | `crates/wenlan-core/src/db/claim_identity.rs:306`–`:322` | An M5 **per-(page, page_version) work-item lease** (`status IN ('pending','leased','done','parked')`, `lease_owner`, `lease_expires_at`, `attempts`). Its key is a page version, not `(phase, space, input_generation)`; its unit of exclusion is one page's claim derivation, not one phase's turn over a space. M6 genesis consumes its output through the M5 helpers and never takes one of its leases. |
-| `CutoverLease` | `crates/wenlan-core/src/db/truth_exposure.rs:140`, minted at `:528`, consumed at `:554`/`:589` | Not durable and not a work lease: a non-`Clone` linear Rust value over the `app_metadata` cutover fence, deliberately usable exactly once so the compiler prevents a second commit (`:131`–`:138`). It gates a **human ceremony that is mutually exclusive with a running daemon** (`:622`–`:627`), so it can never contend with an automatic phase. Its stranded-`preparing` recovery at startup is a separate mechanism from lease expiry, for the reason stated at `:611`–`:620`: a lease dies with the process that minted it, and there is nothing alive to take it back. |
+| `CutoverLease` | `crates/wenlan-core/src/db/truth_exposure.rs:140`, minted at `:565`, consumed at `:591`/`:626` | Not durable and not a work lease: a non-`Clone` linear Rust value over the `app_metadata` cutover fence, deliberately usable exactly once so the compiler prevents a second commit (`:131`–`:138`). It gates a **human ceremony that is mutually exclusive with a running daemon** (`:659`–`:664`), so it can never contend with an automatic phase. Its stranded-`preparing` recovery at startup is a separate mechanism from lease expiry, for the reason stated at `:648`–`:657`: a lease dies with the process that minted it, and there is nothing alive to take it back. |
 | `MaintenanceCoordinator` reservations | `crates/wenlan-server/src/maintenance_coordinator.rs:45`–`:50` | Process-local: `expires_at: Instant`, held in an in-memory `Mutex`, gone on restart by construction. It coordinates one approved repair against daemon-owned background writers within a single process. Nothing about it is durable, so it cannot be the registry and does not conflict with one. |
 
 **Invariant I-6 (§10) is the machine-checkable form of this section:** the set of durable rows that grant exclusive execution rights to an automatic phase is exactly `grouping_leases`.
@@ -100,17 +109,17 @@ Where the frozen contract leaves a choice open, this artifact makes it. Each is 
 
 | # | Decision | Rationale |
 |---|---|---|
-| **S0-1** | `input_generation` for all four M6 phases is the space's `space_graph_state.grouping_generation` — the same counter the community phase uses (`db.rs:13393`, `:13415`). | The existing reap arm `input_generation <> ?2` then invalidates every in-flight M6 lease for free the moment the space's graph substrate moves. Cost: a graph edit unrelated to an in-flight orphan-wikilink genesis requeues it. Per D3 a requeue publishes nothing and loses nothing, so the cost is one wasted inference, and the alternative — a second per-space counter — is a second truth about "has the input moved". |
+| **S0-1** | `input_generation` for all four M6 phases is the space's `space_graph_state.grouping_generation` — the same counter the community phase uses (`db.rs:13397`, `:13419`). | The existing reap arm `input_generation <> ?2` then invalidates every in-flight M6 lease for free the moment the space's graph substrate moves. Cost: a graph edit unrelated to an in-flight orphan-wikilink genesis requeues it. Per D3 a requeue publishes nothing and loses nothing, so the cost is one wasted inference, and the alternative — a second per-space counter — is a second truth about "has the input moved". |
 | **S0-2** | `retry_wait` backoff is deterministic on `grouping_leases.attempt`: `delay = 60s * 4^(attempt-1)`, capped at 4h, **no jitter**; `attempt > 5` is exhaustion. Sequence: 60s, 4m, 16m, 64m, 4h. | The column already exists and is inert (§2.1 fact 4), so this costs no schema. No jitter because there is exactly one daemon per data root — there is no herd to disperse — and a deterministic schedule is what lets G3's crash matrix assert a specific next-attempt time rather than a range. Five attempts spans ~5.5h, so a transient model outage is ridden out within one day while a genuinely broken candidate reaches a terminal state the same day. |
-| **S0-3** | Lease TTL is per phase: `frontier` 120s, `relevance` 300s, `genesis` 900s, `refresh` 900s. The binding rule is **TTL > (model call timeout + finalize budget)**; the numbers are the Stage-0 pick and must be re-derived from the configured LLM timeout at PR-A. | M4's 300s (`db.rs:13443`) is for a lease that spans no model call. `genesis` and `refresh` each span one on-device inference plus one entailment check, so a TTL at the M4 value would expire mid-inference on a cold model load and guarantee a finalize CAS miss. `frontier` holds a pure differential query and gets the shortest TTL so a crashed scan is retryable within one refinery interval. |
-| **S0-4** | Leases are **not** renewed or heartbeated. Work that outlives its TTL loses the finalize CAS and requeues. | A renewal timer must hold lease state across the model call, which is the one thing D3 forbids spanning. The finalize ownership check (`db.rs:13919`) already makes takeover safe, so an expired lease costs one wasted inference, never a double publish. |
+| **S0-3** | Lease TTL is per phase: `frontier` 120s, `relevance` 300s, `genesis` 900s, `refresh` 900s. The binding rule is **TTL > (model call timeout + finalize budget)**; the numbers are the Stage-0 pick and must be re-derived from the configured LLM timeout at PR-A. | M4's 300s (`db.rs:13447`) is for a lease that spans no model call. `genesis` and `refresh` each span one on-device inference plus one entailment check, so a TTL at the M4 value would expire mid-inference on a cold model load and guarantee a finalize CAS miss. `frontier` holds a pure differential query and gets the shortest TTL so a crashed scan is retryable within one refinery interval. |
+| **S0-4** | Leases are **not** renewed or heartbeated. Work that outlives its TTL loses the finalize CAS and requeues. | A renewal timer must hold lease state across the model call, which is the one thing D3 forbids spanning. The finalize ownership check (`db.rs:13923`) already makes takeover safe, so an expired lease costs one wasted inference, never a double publish. |
 | **S0-5** | Startup recovery is an **eager** scan before the first refinery turn: delete every expired lease row, then release every exclusive reservation whose owning lease is gone (§11). M4's lazy reap-at-acquire is retained but is not sufficient for M6. | M4 only ever reads leases at acquire time, so lazy reaping is invisible. M6's frontier reconciliation reads *reservations* to decide whether a group has "an active bounded reservation" (D4), so a reservation orphaned by a killed process would hide its group from the frontier until something happened to acquire that exact `(phase, space, input_generation)` again — which for a space whose generation has since moved is never. That is precisely the "silently park evidence" outcome D7 forbids. |
 | **S0-6** | Reservation activity is **stored** as `genesis_candidate_roots.released_at IS NULL`, not derived by joining to the lease. The recovery scan (S0-5) is what reconciles the stored bit with lease liveness. | D4 requires partial uniqueness on active concept claims. A SQLite partial unique index can only reference columns of its own table, so "active" has to be a column. Storing it creates a second truth that can disagree with the lease after a crash; naming the recovery scan as the sole reconciler is how that disagreement gets bounded to "until the next daemon start", instead of pretending it cannot happen. |
 | **S0-7** | `coverage_epoch` is **per space** (`genesis_coverage_state.space` → `coverage_epoch`), while the identity-contract version that motivates an epoch bump is global. A space stays at its epoch until its own forward-mapping migration completes. | D14 requires a per-space cutover generation and per-space emergency disable; a global epoch would let one space's incomplete migration disable genesis everywhere, and the serial per-signal cutovers (PR-E1…E4) assume per-space independence. |
 | **S0-8** | `coverage_epoch` is monotonically non-decreasing. A D14 rollback **disables the genesis phase for the space**; it never closes or decrements an epoch. | Permanent group-coverage rows are keyed by epoch. Decrementing would orphan them, and D14 forbids discarding coverage. Disable-in-place is also what makes rollback forward-safe: re-enabling resumes at the same epoch against the same coverage rows. |
 | **S0-9** | The one-LLM-finalization-per-turn cap is enforced solely by the existing `AmbientBudgetProvider` (`scheduler.rs:455`). A candidate that receives `LlmError::NotAvailable` because the turn's budget is spent moves to `retry_wait` **without incrementing `attempt`**. | A second counter would be a second truth about the same fact. Not charging an attempt matters: a busy space would otherwise burn its five-attempt budget on turns where it never reached the model, converting a scheduling artefact into a permanent `stale`. |
 | **S0-10** | D7 compaction at 90 days nulls the candidate *payload* columns and stamps `payload_compacted_at`. The candidate row, its receipt, its terminal state, and its coverage/suppression identities are never deleted. | D7 already says receipts, page genesis, human decisions, and suppression identities remain durable. G3 and G5 replay the terminal matrix and need the row to exist to assert against. |
-| **S0-11** | Every durable timestamp and every timer comparison is `unixepoch()` evaluated by SQLite inside the statement itself, never a Rust-side `now` passed as a parameter. | The existing lease SQL already does this (`db.rs:13430`, `:13443`). One clock, and a test can move it only by moving stored values, which is what makes the crash matrix reproducible. |
+| **S0-11** | Every durable timestamp and every timer comparison is `unixepoch()` evaluated by SQLite inside the statement itself, never a Rust-side `now` passed as a parameter. | The existing lease SQL already does this (`db.rs:13434`, `:13447`). One clock, and a test can move it only by moving stored values, which is what makes the crash matrix reproducible. |
 | **S0-12** | Exhausted retry is **not** an eleventh candidate state. `retry_wait` with `attempt > 5` transitions to `stale` carrying `reason = 'retry_exhausted'`. | D3 fixes the state set at ten. G3 enumerates exhausted retry as its own crash case, so the *reason* has to be durable and distinguishable — but a distinct state would put this artifact out of contract with D3 for no gain. |
 | **S0-151** *(rev 2, finding 3)* | `stale` is re-enterable, not terminal-final. Transition **A19** returns it to `prepared` when the frontier scan next reaches the group and `unixepoch() >= next_attempt_at`, with `attempt` reset to 0. The stale-stamping transition sets `next_attempt_at` from its own `reason`: `input_moved` → now; `lease_lost` → the S0-2 delay for the current `attempt`; `retry_exhausted` → +24h; `card_expired` → +180 days. | Without a re-entry edge the machine is unsatisfiable: `candidate_id` derives from `(slot_id, coverage_epoch)` alone (artifact 4, S0-40) and the row is never deleted (S0-10), so a group returned to `waiting_frontier` by A7, A14, or A18 could never form a candidate again inside its epoch. The per-reason delay is what keeps the edge from becoming a hot loop, and it reuses `next_attempt_at` rather than adding a column: `input_moved` wasted nothing and the fingerprint already differs; `retry_exhausted` burned five model attempts, so a day is the cheapest delay that is obviously not a loop; `card_expired` matches F7's 180-day suppression window because a human did see the card and let it lapse, which is a weaker signal than dismissal but not no signal. |
 
@@ -234,7 +243,7 @@ stateDiagram-v2
 
 | `phase` value | Owner | Introduced | Lease TTL (S0-3) |
 |---|---|---|---|
-| `community` | M4 grouping cycle | shipped | 300s (`db.rs:13443`) |
+| `community` | M4 grouping cycle | shipped | 300s (`db.rs:13447`) |
 | `genesis` | M6 candidate prepare → finalize | M6 PR-A | 900s |
 | `frontier` | M6 frontier reconciliation scan | M6 PR-A | 120s |
 | `relevance` | M6 bounded relevance (D9) | M6 PR-A | 300s |
@@ -261,12 +270,12 @@ stateDiagram-v2
 | # | From → To | Trigger | Guard | Durable effect | Crash behavior |
 |---|---|---|---|---|---|
 | C1 | `absent` → `held` | prepare (A2) | `INSERT ... ON CONFLICT(phase, space, input_generation) DO NOTHING` affects 1 row | lease row: fresh UUID `token`, `expires_at = unixepoch() + ttl(phase)`, `attempt` = candidate attempt | Committed atomically with the candidate's claims (A2). |
-| C2 | `absent` → `absent` | prepare loses the race | `INSERT` affects 0 rows | none | The caller reports lease-held and does no work. Modelled on `db.rs:13451`. |
+| C2 | `absent` → `absent` | prepare loses the race | `INSERT` affects 0 rows | none | The caller reports lease-held and does no work. Modelled on `db.rs:13455`. |
 | C3 | `held` → `expired` | wall clock | `expires_at <= unixepoch()` | none — a state change with no write | Nothing observes this transition directly; it is observed by C7 or C8. |
-| C4 | `held` → `absent` | finalize commits (A10) | token still matches (gate E-1) | `DELETE ... AND token=?`, **inside the one outer transaction** | Mirrors `db.rs:14131`. The lease and the page commit together, so a crash cannot publish without consuming the lease. |
-| C5 | `held` → `absent` | error on the prepare path after acquisition | token matches | `DELETE ... AND token=?` | Mirrors `db.rs:13742`. Best-effort; C8 is the backstop. |
+| C4 | `held` → `absent` | finalize commits (A10) | token still matches (gate E-1) | `DELETE ... AND token=?`, **inside the one outer transaction** | Mirrors `db.rs:14135`. The lease and the page commit together, so a crash cannot publish without consuming the lease. |
+| C5 | `held` → `absent` | error on the prepare path after acquisition | token matches | `DELETE ... AND token=?` | Mirrors `db.rs:13746`. Best-effort; C8 is the backstop. |
 | C6 | `held` → `absent` | drop guard | guard armed | spawned `DELETE ... AND token=?` | Mirrors `community_grouping_state.rs:51`–`:75`. Best-effort by construction — it needs a live Tokio handle (`:56`) and cannot run at all if the process is killed. **C6 is never the correctness argument;** C8 is. |
-| C7 | `expired` → `absent` | next acquire for the same `(phase, space)` | `expires_at <= unixepoch()` **or** `input_generation <> ?` | `DELETE`, then C1 in the same transaction | Mirrors `db.rs:13427`. **The M6 statement must parameterise `phase`** (§2.1 fact 1). |
+| C7 | `expired` → `absent` | next acquire for the same `(phase, space)` | `expires_at <= unixepoch()` **or** `input_generation <> ?` | `DELETE`, then C1 in the same transaction | Mirrors `db.rs:13431`. **The M6 statement must parameterise `phase`** (§2.1 fact 1). |
 | C8 | `expired` → `absent` | startup recovery scan (S0-5) | `expires_at <= unixepoch()`, all phases | `DELETE`; then release orphaned reservations (B6) in the same scan | The correctness backstop for every crash. Runs before the first refinery turn. |
 | C9 | `held` → `absent` | acquire for a newer input generation | `input_generation <> ?` | `DELETE` | A live lease for a superseded generation is deliberately reaped even though it has not expired: its work is already stale, and its finalize would miss the generation CAS anyway. |
 
@@ -318,7 +327,7 @@ stateDiagram-v2
 
 Genesis uses an **M6 genesis finalizer** which, per D3, reuses M5 claim/truth transaction helpers **inside one outer immediate transaction**, does not call a self-committing M5 finalizer, and never nests transactions. Refresh of an existing page continues through the M5 refresh finalizer and is not this machine.
 
-The M4 community finalizer at `crates/wenlan-core/src/db.rs:13902`–`:14157` is the structural model: `transaction_with_behavior(TransactionBehavior::Immediate)` at `:13904`, lease ownership checked first at `:13919` before any write, the generation CAS at `:13948`, a second CAS on clearing dirty state at `:14107` whose zero-row result aborts (`:14123`), lease consumed at `:14131`, and a single `commit()` at `:14151` reached only on the `Ok` arm. M6's finalizer follows that shape with eight gates instead of two.
+The M4 community finalizer at `crates/wenlan-core/src/db.rs:13906`–`:14161` is the structural model: `transaction_with_behavior(TransactionBehavior::Immediate)` at `:13908`, lease ownership checked first at `:13923` before any write, the generation CAS at `:13952`, a second CAS on clearing dirty state at `:14111` whose zero-row result aborts (`:14127`), lease consumed at `:14135`, and a single `commit()` at `:14155` reached only on the `Ok` arm. M6's finalizer follows that shape with eight gates instead of two.
 
 ```mermaid
 stateDiagram-v2
@@ -339,7 +348,7 @@ stateDiagram-v2
 
 ### 8.1 The eight CAS gates
 
-All eight are evaluated inside the one outer transaction, in this order. The order is not arbitrary: the cheapest and most-likely-to-have-moved checks come first so a lost race costs the least work, and the lease check is first for the reason M4 already encodes at `db.rs:13919` — a finalize that has lost its lease must write nothing, including nothing expensive.
+All eight are evaluated inside the one outer transaction, in this order. The order is not arbitrary: the cheapest and most-likely-to-have-moved checks come first so a lost race costs the least work, and the lease check is first for the reason M4 already encodes at `db.rs:13923` — a finalize that has lost its lease must write nothing, including nothing expensive.
 
 | Gate | Checks | Miss means |
 |---|---|---|
@@ -380,7 +389,7 @@ On E2, one transaction atomically performs all of:
 
 G4 requires that for both genesis and refresh, a test provider that re-enters SQLite during inference or entailment completes without deadlock, while instrumentation asserts **no SQLite transaction, no connection mutex, no truth-state lock, and no DB guard spans the model call.**
 
-This is a structural consequence of the machine as specified: the model call happens on edges A5→A8, strictly between the prepare transaction (A2) and the finalize transaction (E1). No edge in any of the six machines both holds a guard and crosses a model call. The M4 prepare path already demonstrates the pattern — it releases the connection mutex between paged loads (`db.rs:13759`–`:13762`, and the per-page `drop`/`yield_now` at `:13737`) so that no long operation holds it.
+This is a structural consequence of the machine as specified: the model call happens on edges A5→A8, strictly between the prepare transaction (A2) and the finalize transaction (E1). No edge in any of the six machines both holds a guard and crosses a model call. The M4 prepare path already demonstrates the pattern — it releases the connection mutex between paged loads (`db.rs:13763`–`:13766`, and the per-page `drop`/`yield_now` at `:13741`) so that no long operation holds it.
 
 ---
 

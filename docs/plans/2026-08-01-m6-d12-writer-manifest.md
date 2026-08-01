@@ -1,11 +1,21 @@
 # M6 D12 — automatic writer/caller manifest
 
 Date authored: 2026-08-01
-Branch: `kg-m6-stage0`, cut from `origin/main` `e39048c7` (release 0.15.2, post-refactor `a028199f`).
 Stage: M6 **Stage 0**, artifact 9 of 12 ("Automatic writer/caller manifest with exact fence adapter per symbol").
 Status: **contract artifact, docs only.** No fence-adapter code exists yet and none should be written before daemon PR-D. Zero production code changed by this document.
 
 The frozen M6 goal prompt (2026-07-27, Sol closure APPROVE) is not amended here. D12 named five fence targets plus "any production caller discovered by LSP/ast-grep manifests". This document regenerates those anchors against the post-refactor tree and enumerates the callers the frozen contract could not name.
+
+**Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
+on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
+the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
+`#418` has since superseded; every citation in this artifact was mechanically
+re-pinned to `1c903bec` and re-verified to resolve to byte-identical source text,
+so no claim moved, only the numbers. App-repo citations are read from
+**`wenlan-app` `origin/main` `1d71aa4`** — resolved from that ref rather than from
+a working tree, because the local app checkout sits behind `origin/main`. That
+checkout is the user's; nothing in this work modifies it. Verify a citation with
+`git show origin/main:<path>` inside the app repo.
 
 ## 1. What "automatic" means here
 
@@ -57,7 +67,7 @@ Every page mutation in production reaches SQLite through one of three doors.
                                     ▼
                     ┌─────────────────────────────────────────┐
   entity KG   ─────►│  insert/update_entity_shadow_page        │   ← mirror door:
-  mutators          │  db.rs:9709 / db.rs:9752                 │     kind='entity' rows
+  mutators          │  db.rs:9713 / db.rs:9756                 │     kind='entity' rows
                     └─────────────────────────────────────────┘
 ```
 
@@ -92,8 +102,8 @@ run_citation_backfill_with_page_limit|crates/wenlan-core/src/citations.rs:419|se
 record_annotate_failure|crates/wenlan-core/src/citations.rs:358|set_page_citations_with_changelog_at_version @ citations.rs:374|citation_backfill|same lane as run_citation_backfill_with_page_limit|route|m6_fence::citation_giveup_update
 write_document_source_page|crates/wenlan-core/src/document_enrichment.rs:669|page_write PageWrite::DocumentSource @ document_enrichment.rs:679|doc-enrich|doc-enrichment queue worker @ document_enrichment.rs:397,466 from scheduler ambient @ crates/wenlan-server/src/scheduler/ambient.rs:594|pass_through|m6_fence::document_source_write
 sync_one_file|crates/wenlan-core/src/sources/page_watcher.rs:126|update_page @ page_watcher.rs:222|fs_edit|vault watcher sync_filesystem_edits @ page_watcher.rs:56 from crates/wenlan-server/src/scheduler.rs:1239|pass_through|m6_fence::vault_edit_update
-insert_entity_shadow_page|crates/wenlan-core/src/db.rs:9709|INSERT INTO pages @ db.rs:9716|entity|store_entity @ db.rs:29287 and migration 92 @ db.rs:10020|pass_through|m6_fence::entity_shadow_create
-update_entity_shadow_page|crates/wenlan-core/src/db.rs:9752|UPDATE pages @ db.rs:9758|entity|store_entity @ db.rs:29293, add_entity_alias @ :29613, refresh_entity_embedding @ :29849, merge_entities @ :30358, confirm_entity @ :32645|pass_through|m6_fence::entity_shadow_sync
+insert_entity_shadow_page|crates/wenlan-core/src/db.rs:9713|INSERT INTO pages @ db.rs:9720|entity|store_entity @ db.rs:29291 and migration 92 @ db.rs:10024|pass_through|m6_fence::entity_shadow_create
+update_entity_shadow_page|crates/wenlan-core/src/db.rs:9756|UPDATE pages @ db.rs:9762|entity|store_entity @ db.rs:29297, add_entity_alias @ :29617, refresh_entity_embedding @ :29853, merge_entities @ :30362, confirm_entity @ :32649|pass_through|m6_fence::entity_shadow_sync
 ```
 
 Twenty-one rows: **seventeen `route`** (`detect_page_candidates` through `record_annotate_failure`) and **four `pass_through`** (`write_document_source_page`, `sync_one_file`, and the two entity-shadow mutators).
@@ -104,7 +114,7 @@ Twenty-one rows: **seventeen `route`** (`detect_page_candidates` through `record
 
 **`refresh_page` and `refresh_page_with_prompt` are the chokepoint** for four of the fenced lanes (redistill batch, redistill slice, maintenance slice/tick, overview). They earn their own rows so a per-caller mutation test can prove that fencing the lane entry is not sufficient on its own.
 
-**`insert_entity_shadow_page` / `update_entity_shadow_page` write `pages` rows but not pages.** They mirror an `entities` row into a `kind='entity'`, empty-`content` shadow. The function's own doc comment states the contract: these rows "stay excluded from retrieval/context, export, and every page mutation" (`db.rs:9707-9708`). They are `pass_through` for exactly that reason — the fence must observe them so G9 cannot be blindsided by the KG lane, and must never let them contribute a genesis root, a relevance candidate, or a coverage claim.
+**`insert_entity_shadow_page` / `update_entity_shadow_page` write `pages` rows but not pages.** They mirror an `entities` row into a `kind='entity'`, empty-`content` shadow. The function's own doc comment states the contract: these rows "stay excluded from retrieval/context, export, and every page mutation" (`db.rs:9711-9708`). They are `pass_through` for exactly that reason — the fence must observe them so G9 cannot be blindsided by the KG lane, and must never let them contribute a genesis root, a relevance candidate, or a coverage claim.
 
 **`sync_one_file` carries human prose.** Its writer identity is `fs_edit`, which `Writer::classify` (`page_update.rs:50`) puts in `Writer::Human`. The scheduler poll is automatic; the content is a person editing markdown in the vault. `pass_through`, and D10's "human-owned page prose stays byte-identical" applies to whatever it writes.
 
@@ -116,20 +126,20 @@ These reach the same write seam but are the direct result of an explicit action,
 
 | Symbol | Location | Surface | Why excluded |
 |---|---|---|---|
-| `handle_create_page` | `crates/wenlan-server/src/page_routes.rs:262` | `POST /api/pages` | Caller supplies title and prose; `create_page_with_tuning` at `:291`. |
-| `handle_update_page` | `crates/wenlan-server/src/page_routes.rs:620` | `POST /api/memory/{id}/update-page` | The manual editor; `update_page_preserving_sources` at `:643`, writer `manual_edit`. |
-| `handle_refresh_page` | `crates/wenlan-server/src/page_routes.rs:695` | `PUT /api/pages/{id}` | Agent-requested refresh of one named page; `update_page` at `:822`, `update_page_summary` at `:847`, `clear_page_staleness` at `:849`. Writer `agent_refresh`. Distinct from the *automatic* refresh callers D12 fences. |
-| `handle_archive_page` | `crates/wenlan-server/src/page_routes.rs:178` | `POST /api/pages/{id}/archive` | `archive_page` at `:186`. |
-| `handle_delete_page` | `crates/wenlan-server/src/page_routes.rs:198` | `DELETE /api/pages/{id}` | `delete_page` at `:214`. |
-| `handle_distill` | `crates/wenlan-server/src/routes.rs:519` | `POST /api/distill` | On-demand distillation; `clear_user_edited` at `:609`, `distill_pages_scoped` at `:648`, `resolve_orphan_page_links` at `:796`. The *scheduled* entry into the same synthesis code is fenced as `distill_pages_scoped_gated`. |
-| `handle_redistill` | `crates/wenlan-server/src/routes.rs:853` | `POST /api/distill/{page_id}` | Human names the page; `clear_user_edited` at `:881`. |
+| `handle_create_page` | `crates/wenlan-server/src/page_routes.rs:263` | `POST /api/pages` | Caller supplies title and prose; `create_page_with_tuning` at `:292`. |
+| `handle_update_page` | `crates/wenlan-server/src/page_routes.rs:621` | `POST /api/memory/{id}/update-page` | The manual editor; `update_page_preserving_sources` at `:644`, writer `manual_edit`. |
+| `handle_refresh_page` | `crates/wenlan-server/src/page_routes.rs:696` | `PUT /api/pages/{id}` | Agent-requested refresh of one named page; `update_page` at `:823`, `update_page_summary` at `:848`, `clear_page_staleness` at `:850`. Writer `agent_refresh`. Distinct from the *automatic* refresh callers D12 fences. |
+| `handle_archive_page` | `crates/wenlan-server/src/page_routes.rs:179` | `POST /api/pages/{id}/archive` | `archive_page` at `:187`. |
+| `handle_delete_page` | `crates/wenlan-server/src/page_routes.rs:199` | `DELETE /api/pages/{id}` | `delete_page` at `:215`. |
+| `handle_distill` | `crates/wenlan-server/src/routes.rs:539` | `POST /api/distill` | On-demand distillation; `clear_user_edited` at `:629`, `distill_pages_scoped` at `:668`, `resolve_orphan_page_links` at `:816`. The *scheduled* entry into the same synthesis code is fenced as `distill_pages_scoped_gated`. |
+| `handle_redistill` | `crates/wenlan-server/src/routes.rs:873` | `POST /api/distill/{page_id}` | Human names the page; `clear_user_edited` at `:901`. |
 | `handle_accept_revision` | `crates/wenlan-server/src/memory_routes.rs:1220` | revision-card accept | `accept_pending_revision_with_knowledge_path` at `:1231`, writer `revision_accept`. The card is staged automatically, but publication requires the accept. |
 | `handle_accept_refinement` | `crates/wenlan-server/src/refinery_routes.rs:124` | refinement-card accept | `apply_refinement_with_decision` at `:138`, which reaches `accept_page_merge` (`refinement_queue.rs:201`), `archive_page` (`:219`), and `apply_cross_space_discovery` → `PageWrite::Create` (`:304`). The only production entry into `apply_refinement_with_decision`; `apply_refinement` (`refinement_queue.rs:117`) has no production caller. Card *emission* is automatic and writes no page rows. |
 | `apply_repair_with_pages` | `crates/wenlan-core/src/repair.rs:2060` | lint-repair apply | Behind an approved-manifest digest and a repair fence (`crates/wenlan-server/src/repair_routes.rs:230`). Reaches `apply_deterministic_repair_cas` (`repair.rs:2221`), `regenerate_page_projection_cas` (`:2233`), `apply_quarantine_stale_page_projection` (`:2273`), `apply_rename_page_title` (`:2372`). |
 | `cmd_backfill::run` | `crates/wenlan-server/src/cmd_backfill.rs:19` | hidden CLI subcommand | Operator-invoked; `delete_page` at `:95`. |
 | Page-draft mutators | `crates/wenlan-core/src/db/page_drafts.rs:204,355,476` | direct draft editor | `create_page_draft_with_id_in_registered_space`, `update_page_draft_in_registered_space`, `delete_page_draft`. Human-authored drafts. Note: **no production caller resolves to any of them on this branch** — the surface is dormant. |
 
-**Adjacent but not a page writer:** `resolve_orphan_page_links` (`crates/wenlan-core/src/db.rs:44108`) runs automatically in the refinery emergence phase (`refinery/mod.rs:1032`) and in `handle_distill` (`routes.rs:796`). It mutates `page_links`, never `pages`. It matters to M6 because D2 signal 2 (orphan wikilink) reads the same table, but it is not a fence target.
+**Adjacent but not a page writer:** `resolve_orphan_page_links` (`crates/wenlan-core/src/db.rs:44112`) runs automatically in the refinery emergence phase (`refinery/mod.rs:1032`) and in `handle_distill` (`routes.rs:816`). It mutates `page_links`, never `pages`. It matters to M6 because D2 signal 2 (orphan wikilink) reads the same table, but it is not a fence target.
 
 ## 6. Excluded — test and eval only
 
@@ -144,7 +154,7 @@ Verified by `#[cfg(test)]` boundary walk plus reading each site. Counts, not lin
 | `crates/wenlan-core/src/eval/shared.rs:2517` (`store_batch_distilled_page`) | 1 | **eval only**; `create_page_with_tuning`. Also `eval/lifecycle.rs:790`, `eval/runner.rs:190`. |
 | `crates/wenlan-core/src/document_enrichment.rs:702` (`write_source_page`) | 2 `page_write` | **`#[cfg(test)]` on the function itself** (`:701`). Sole constructor of `PageWrite::ReplaceSource`. |
 | `crates/wenlan-core/src/synthesis/overview.rs:230` (`create_research_page`) | 1 `create_page` | inside `mod tests` (opens `:136`) |
-| `crates/wenlan-core/src/page_map_improve.rs:469`, `crates/wenlan-server/src/page_map_routes.rs:597,634`, `crates/wenlan-server/src/routes.rs:1806,2031`, `crates/wenlan-server/src/memory_routes.rs:2612`, `crates/wenlan-server/src/page_routes.rs:1097`, `crates/wenlan-core/src/post_ingest.rs:2553,2631,2704` | 10 | test seed helpers past each file's `#[cfg(test)]` boundary |
+| `crates/wenlan-core/src/page_map_improve.rs:469`, `crates/wenlan-server/src/page_map_routes.rs:597,634`, `crates/wenlan-server/src/routes.rs:1826,2031`, `crates/wenlan-server/src/memory_routes.rs:2612`, `crates/wenlan-server/src/page_routes.rs:1165`, `crates/wenlan-core/src/post_ingest.rs:2553,2631,2704` | 10 | test seed helpers past each file's `#[cfg(test)]` boundary |
 
 Two variants have **no production constructor at all**: `PageWrite::ReplaceSource` (only the `#[cfg(test)]` `write_source_page`) and `PageWrite::UpdatePreservingSources` (only its own wrapper, reached from the explicit `handle_update_page`). `create_page_with_floor` (`page_dispatch.rs:220`) has zero production callers.
 
