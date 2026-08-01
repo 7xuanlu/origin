@@ -26480,7 +26480,7 @@ impl MemoryDB {
                     )));
                 }
             }
-            if source != "episode" {
+            if source != "episode" && old_source_id != new_source_id {
                 // M5 row 13, the rename half. Changing `memories.source_id`
                 // moves the evidence a support edge cites without deleting a
                 // memory, editing a chunk, or moving a space -- so not one of
@@ -26489,6 +26489,13 @@ impl MemoryDB {
                 // NULL. Handled here, synchronously, inside the transaction
                 // that performs the rename, so a reader can never observe the
                 // page renamed and still `supported`.
+                //
+                // Guarded on the IDs differing, like the collision check above.
+                // A rename to the same ID moves no evidence, so retracting on
+                // it would cost every page citing the document a re-derivation
+                // for a mutation that did not happen. No production caller has
+                // that shape today; this is a public primitive and a no-op
+                // argument should be a no-op.
                 Self::retract_support_for_rebound_source(&conn, old_source_id).await?;
 
                 if let Some((old_page_id, _)) = source_page_ids {

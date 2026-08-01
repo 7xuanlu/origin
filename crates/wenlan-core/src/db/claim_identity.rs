@@ -337,6 +337,65 @@ impl MemoryDB {
                              candidate_span_start, candidate_span_end, candidate_digest)
             );
 
+            -- What this run OWED a conclusion on, recorded before it judged.
+            --
+            -- `claim_judgment_attempts` and the live support edges are both
+            -- OUTPUTS of a run, and a run that dies mid-flight leaves neither
+            -- for the candidate it never reached. That is the hole they cannot
+            -- close between them: candidate A concludes, the worker dies before
+            -- writing candidate B's attempt row, and B produced no edge because
+            -- nothing ever scored it. Evaluation then sees one candidate, one
+            -- conclusion, and no evidence at all that a second obligation
+            -- existed -- so a run that covered half its inventory publishes as
+            -- if it had covered all of it, which is exactly what row 6 forbids.
+            --
+            -- The marker's `inventory_count` does not cover this. It counts
+            -- CLAIMS, and the missing thing is a CANDIDATE: B's claim is on the
+            -- membership roll and accounted for, with one of its two citations
+            -- silently dropped.
+            --
+            -- So the obligation is written down first and independently, and
+            -- evaluation compares outputs against it rather than against
+            -- themselves. Columns mirror `claim_judgment_attempts` exactly --
+            -- same locator, same run identity -- because the whole operation is
+            -- a set difference between the two.
+            CREATE TABLE IF NOT EXISTS claim_run_candidates (
+                page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                page_version INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL,
+                claim_revision_id TEXT NOT NULL
+                    REFERENCES claim_revisions(claim_revision_id) ON DELETE CASCADE,
+                candidate_source_id TEXT NOT NULL,
+                candidate_chunk_index INTEGER NOT NULL,
+                candidate_span_start INTEGER NOT NULL,
+                candidate_span_end INTEGER NOT NULL,
+                candidate_digest TEXT NOT NULL,
+                PRIMARY KEY (page_id, page_version, run_generation, claim_revision_id,
+                             candidate_source_id, candidate_chunk_index,
+                             candidate_span_start, candidate_span_end, candidate_digest)
+            );
+
+            -- The seal that says the row set above is COMPLETE for this run.
+            --
+            -- Without it the inventory has the defect it was built to fix, one
+            -- level up: a run that wrote A's inventory row and died before B's
+            -- leaves an inventory of one, and an inventory nobody can tell is
+            -- partial proves nothing. The seal and the rows go in under one
+            -- transaction, so the seal's presence IS the completeness claim.
+            --
+            -- It also separates the two absences that matter. A run with an
+            -- empty candidate set writes zero rows and a seal; a run that died
+            -- before recording anything writes zero rows and no seal. Row
+            -- counts cannot tell those apart and they land on opposite
+            -- verdicts.
+            CREATE TABLE IF NOT EXISTS claim_run_inventories (
+                page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                page_version INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL,
+                sealed_at INTEGER NOT NULL,
+                PRIMARY KEY (page_id, page_version, run_generation)
+            );
+
             -- The run-generation allocator: one row, monotonically increasing.
             --
             -- Deliberately global rather than a counter on the job row. A job

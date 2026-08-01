@@ -155,10 +155,14 @@ pub(super) async fn register_optional_runtime_workers(
     // and use `handle.spawn(...)` from the closure instead.
     if optional_runtime_workers_allowed(repair_recovery_pending) {
         let db_for_ready = db_arc.clone();
-        let maintenance_for_ready = {
+        let (maintenance_for_ready, shutdown_for_reconcile) = {
             let state = shared.read().await;
-            state.maintenance_coordinator.clone()
+            (
+                state.maintenance_coordinator.clone(),
+                state.shutdown.clone(),
+            )
         };
+        let maintenance_for_reconcile = maintenance_for_ready.clone();
         let emitter_for_ready: Arc<dyn wenlan_core::events::EventEmitter> =
             Arc::new(wenlan_core::events::NoopEmitter);
         let handle = tokio::runtime::Handle::current();
@@ -175,6 +179,69 @@ pub(super) async fn register_optional_runtime_workers(
             });
         });
         let _ = wenlan_core::llm_provider::LLM_READINESS_HOOK.set(hook);
+
+        // Startup spends only a bounded latency budget on the full support
+        // predicate. Continue the durable pass after the listener has had time
+        // to enter `serve`, yielding between small batches so foreground reads
+        // are never queued behind a whole-vault scan. The read gate consumes
+        // the same frontier and withholds every stored `supported` this worker
+        // has not reached, so a failure here is degraded availability rather
+        // than stale truth escaping.
+        let db_for_reconcile = db_arc.clone();
+        let mut reconcile_shutdown = shutdown_for_reconcile.subscribe();
+        tokio::spawn(async move {
+            if lifecycle::sleep_or_shutdown(
+                &mut reconcile_shutdown,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            {
+                return;
+            }
+
+            loop {
+                let pass = {
+                    let _maintenance_guard = maintenance_for_reconcile.begin_background().await;
+                    db_for_reconcile
+                        .reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)
+                        .await
+                };
+                match pass {
+                    Ok(pass) if pass.complete => {
+                        tracing::info!(
+                            "[truth] background support reconciliation completed; {} page(s) \
+                             demoted in the final batch",
+                            pass.demoted
+                        );
+                        return;
+                    }
+                    Ok(pass) => {
+                        if pass.demoted > 0 {
+                            tracing::info!(
+                                "[truth] background support reconciliation demoted {} page(s)",
+                                pass.demoted
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[truth] background support reconciliation paused after an error; \
+                             unproved pages remain unevaluated: {error}"
+                        );
+                        return;
+                    }
+                }
+
+                if lifecycle::sleep_or_shutdown(
+                    &mut reconcile_shutdown,
+                    std::time::Duration::from_millis(100),
+                )
+                .await
+                {
+                    return;
+                }
+            }
+        });
     }
 }
 

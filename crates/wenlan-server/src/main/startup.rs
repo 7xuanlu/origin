@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Keep each connection-holding reconciliation slice short enough for the
+/// post-serve continuation to yield between slices.
+pub(super) const SUPPORT_RECONCILE_BATCH: usize = 25;
+
 pub(super) struct PreparedStartupState {
     pub(super) server_state: ServerState,
     pub(super) db_arc: Arc<wenlan_core::db::MemoryDB>,
@@ -535,13 +539,67 @@ pub(super) async fn prepare_startup_state(
     // that to the conditions no SQL scan can see — a missing or stale marker, an
     // extractor bump, a citation whose bytes moved. Both are reconciliation, so
     // both are treated the same way when they fail.
+    //
+    // BOUNDED, and it has to be. The reconcile pass holds the single connection
+    // every foreground request needs and spends a multi-query evaluator per
+    // page, per claim, per candidate; run to completion here it would occupy
+    // the port for as long as a large supported vault takes, which is the very
+    // thing the batch above the drain exists to avoid. So it runs in batches
+    // under a wall-clock deadline, and what it does not reach is withheld
+    // rather than served: the durable cursor it leaves makes every unproved
+    // `supported` read `Unevaluated` until a later batch gets there. Truncating
+    // WITHOUT that gate would serve exactly the stale state the pass retracts.
+    //
+    // The deadline is a boot-latency budget, not a correctness one. Overrunning
+    // it costs re-derivation and a slower path back to `supported`; it can
+    // never publish an unproved verdict.
     if !repair_recovery_pending {
-        let drained = db_arc.drain_stale_derivation_jobs(500).await;
-        let reconciled = match drained {
+        const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+        // Start a new pass after a completed one, or resume an incomplete pass
+        // under the same ruleset. The durable ruleset binds the cursor to the
+        // extractor, threshold, and reconciliation algorithm that earned it;
+        // a changed rule restarts from the beginning, while a short-lived
+        // process cannot starve a large vault by repeatedly proving one prefix.
+        let drained = match db_arc.drain_stale_derivation_jobs(500).await {
             Ok(enqueued) => db_arc
-                .reconcile_supported_pages()
+                .begin_support_reconcile_pass()
                 .await
-                .map(|demoted| (enqueued, demoted)),
+                .map(|()| enqueued),
+            Err(e) => Err(e),
+        };
+        let reconciled = match drained {
+            Ok(enqueued) => {
+                let deadline = std::time::Instant::now() + RECONCILE_BUDGET;
+                let mut demoted = 0usize;
+                let mut outcome = Ok(());
+                loop {
+                    match db_arc
+                        .reconcile_supported_pages(SUPPORT_RECONCILE_BATCH)
+                        .await
+                    {
+                        Ok(pass) => {
+                            demoted += pass.demoted;
+                            if pass.complete {
+                                break;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                tracing::info!(
+                                    "[truth] support reconciliation paused at its boot budget; \
+                                     unproved pages read as unevaluated until the runtime worker \
+                                     resumes"
+                                );
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
+                    }
+                }
+                outcome.map(|()| (enqueued, demoted))
+            }
             Err(e) => Err(e),
         };
         match reconciled {

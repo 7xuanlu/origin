@@ -377,6 +377,15 @@ impl MemoryDB {
         if page_ids.is_empty() {
             return Ok(out);
         }
+        // How far the startup reconciliation pass has re-proved, read once for
+        // the whole batch. The pass is bounded per batch so a large vault does
+        // not hold the port shut, and bounding it is only safe if the part it
+        // has not reached stops being asserted -- otherwise truncating the scan
+        // serves exactly the stale `supported` the pass exists to retract.
+        //
+        // Taken before the connection lock, like `truth_cutover_generation`
+        // above it, because `get_app_metadata` acquires the same mutex.
+        let unproved_after = self.support_reconcile_frontier().await?;
         let conn = self.conn.lock().await;
         // Chunked because SQLite caps bound parameters, and a page list comes
         // from a response payload whose length nobody here controls.
@@ -480,8 +489,20 @@ impl MemoryDB {
                     _ => false,
                 };
                 let describes_live_text = versions_agree && derivation_is_current;
+                // Ordered by `page_id` because that is the order the reconciler
+                // walks in, so one scalar comparison decides whether this page
+                // is behind the cursor. `None` means nothing is withheld: the
+                // pass finished, or none has ever begun here.
+                let reconciled = unproved_after
+                    .as_deref()
+                    .is_none_or(|cursor| page_id.as_str() <= cursor);
                 let support = match (status.as_str(), evaluated_at) {
                     _ if !describes_live_text => crate::truth_contract::Support::Unevaluated,
+                    // A stored `supported` the current pass has not re-proved
+                    // is not a verdict yet, and lands on the same fail-safe
+                    // every other unknown here does -- the page keeps its file
+                    // and stops being asserted as supported.
+                    ("supported", _) if !reconciled => crate::truth_contract::Support::Unevaluated,
                     ("supported", _) => crate::truth_contract::Support::Supported,
                     (_, Some(_)) => crate::truth_contract::Support::Unsupported,
                     (_, None) => crate::truth_contract::Support::Unevaluated,

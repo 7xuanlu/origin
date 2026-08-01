@@ -2,7 +2,9 @@
 //! Teeth for the M5 claim-derivation queue. Each test names the weakening it
 //! guards; deleting the rule in the doc comment must turn the test RED.
 
-use super::claim_derivation::{SupportOutcome, EXTRACTOR_VERSION, MAX_ATTEMPTS, SUPPORT_THRESHOLD};
+use super::claim_derivation::{
+    CandidateLocator, SupportOutcome, EXTRACTOR_VERSION, MAX_ATTEMPTS, SUPPORT_THRESHOLD,
+};
 use super::tests::test_db;
 use super::MemoryDB;
 
@@ -332,6 +334,131 @@ async fn a_reclaimed_job_cannot_be_finished_by_its_old_owner() {
     assert_eq!(job_for(&db, "p1").await.unwrap().1, "done");
 }
 
+/// Candidate inventory is an assertion about one exact run, so a worker whose
+/// lease was reclaimed must not be able to stamp its old candidate set onto the
+/// new owner's generation. Looking up the job's current generation inside the
+/// recorder turns the stale worker into a writer for a run it never performed.
+#[tokio::test]
+async fn a_reclaimed_worker_cannot_record_inventory_for_the_new_run() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    let stale = db
+        .lease_next_derivation_job("stale")
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET lease_expires_at = 1 WHERE job_id = ?1",
+            libsql::params![stale.job_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    let current = db
+        .lease_next_derivation_job("current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(stale.run_generation, current.run_generation);
+
+    let result = db
+        .record_run_candidate_inventory(
+            &stale,
+            "stale",
+            &[(
+                revisions[0].clone(),
+                CandidateLocator {
+                    source_id: "stale-source".to_string(),
+                    chunk_index: 0,
+                    span_start: 0,
+                    span_end: 1,
+                    span_digest: "stale-digest".to_string(),
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !result,
+        "a stale worker must not write inventory for the current owner's run"
+    );
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM claim_run_candidates
+              WHERE page_id = 'p1' AND page_version = 1 AND run_generation = ?1",
+            libsql::params![current.run_generation],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0,
+        "the refusal must leave the current owner's inventory untouched"
+    );
+}
+
+/// The production recorder writes the exact candidate set and its completeness
+/// seal together for the lease that owns the run.
+#[tokio::test]
+async fn the_current_worker_records_and_seals_its_candidate_inventory() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    let job = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    let locator = CandidateLocator {
+        source_id: "source-a".to_string(),
+        chunk_index: 2,
+        span_start: 3,
+        span_end: 8,
+        span_digest: "digest-a".to_string(),
+    };
+
+    assert!(db
+        .record_run_candidate_inventory(&job, "worker", &[(revisions[0].clone(), locator.clone())],)
+        .await
+        .unwrap());
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT candidate_source_id, candidate_chunk_index,
+                    candidate_span_start, candidate_span_end, candidate_digest
+               FROM claim_run_candidates
+              WHERE page_id = ?1 AND page_version = ?2 AND run_generation = ?3",
+            libsql::params![job.page_id.as_str(), job.page_version, job.run_generation],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), locator.source_id);
+    assert_eq!(row.get::<i64>(1).unwrap(), locator.chunk_index);
+    assert_eq!(row.get::<i64>(2).unwrap(), locator.span_start);
+    assert_eq!(row.get::<i64>(3).unwrap(), locator.span_end);
+    assert_eq!(row.get::<String>(4).unwrap(), locator.span_digest);
+
+    let mut seal = conn
+        .query(
+            "SELECT COUNT(*) FROM claim_run_inventories
+              WHERE page_id = ?1 AND page_version = ?2 AND run_generation = ?3",
+            libsql::params![job.page_id.as_str(), job.page_version, job.run_generation],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seal.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1
+    );
+}
+
 /// Attempts increment at LEASE time, not at failure time. A worker that dies
 /// mid-job never reaches its failure handler, so counting failures would let a
 /// hard-crashing page retry without limit and starve the queue.
@@ -584,6 +711,38 @@ async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate: &Candidate, out
         )
     };
     let generation = current_run(&conn, &page_id, page_version).await;
+    // A real run records the candidate it owes a conclusion on BEFORE it
+    // judges, and seals the set when it has recorded all of them. Seeding the
+    // attempt without the obligation would be seeding a state the pipeline
+    // cannot produce -- and the one the evaluator now refuses to publish on.
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_run_candidates
+             (page_id, page_version, run_generation, claim_revision_id,
+              candidate_source_id, candidate_chunk_index, candidate_span_start,
+              candidate_span_end, candidate_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        libsql::params![
+            page_id.clone(),
+            page_version,
+            generation,
+            revision_id,
+            candidate.source_id.clone(),
+            candidate.chunk_index,
+            candidate.span_start,
+            candidate.span_end,
+            candidate.span_digest.clone(),
+        ],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_run_inventories
+             (page_id, page_version, run_generation, sealed_at)
+         VALUES (?1, ?2, ?3, 0)",
+        libsql::params![page_id.clone(), page_version, generation],
+    )
+    .await
+    .unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO claim_judgment_attempts
              (page_id, page_version, run_generation, claim_revision_id,
@@ -784,6 +943,95 @@ async fn carry_attempts_forward(
     )
     .await
     .unwrap();
+    // The obligations come forward with the conclusions. A run holding
+    // judgements it did not record owing is a run that cannot publish, so
+    // carrying one without the other would model a worker no fixture means.
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_run_candidates
+             (page_id, page_version, run_generation, claim_revision_id,
+              candidate_source_id, candidate_chunk_index, candidate_span_start,
+              candidate_span_end, candidate_digest)
+         SELECT page_id, page_version, ?3, claim_revision_id,
+                candidate_source_id, candidate_chunk_index, candidate_span_start,
+                candidate_span_end, candidate_digest
+           FROM claim_run_candidates
+          WHERE page_id = ?1 AND page_version = ?2
+            AND run_generation = (SELECT MAX(run_generation)
+                                    FROM claim_run_candidates
+                                   WHERE page_id = ?1 AND page_version = ?2
+                                     AND run_generation < ?3)",
+        libsql::params![page_id, page_version, generation],
+    )
+    .await
+    .unwrap();
+    seal_run_inventory(conn, page_id, page_version, generation).await;
+}
+
+/// Mark this run's candidate inventory complete, standing in for the worker
+/// call that records the set before judging any of it.
+///
+/// Sealing an EMPTY inventory is a real state and a deliberate one: a run whose
+/// claims drew no candidates recorded that fact and finished. Without the seal
+/// the same page reads as a run that died before recording anything, which is
+/// `NoPublish` rather than a verdict.
+async fn seal_run_inventory(
+    conn: &libsql::Connection,
+    page_id: &str,
+    page_version: i64,
+    generation: i64,
+) {
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_run_inventories
+             (page_id, page_version, run_generation, sealed_at)
+         VALUES (?1, ?2, ?3, 0)",
+        libsql::params![page_id, page_version, generation],
+    )
+    .await
+    .unwrap();
+}
+
+/// Record that this run owed a conclusion on a candidate and never reached it —
+/// no attempt row, and no support edge either.
+///
+/// The state a worker leaves by dying between recording its inventory and
+/// judging the last of it, and the one neither the attempt rows nor the live
+/// edges can show on their own.
+async fn owed_but_unjudged(db: &MemoryDB, revision_id: &str, candidate: &Candidate) {
+    let conn = db.conn.lock().await;
+    let (page_id, page_version): (String, i64) = {
+        let mut rows = conn
+            .query(
+                "SELECT page_id, page_version FROM page_version_claims
+                  WHERE claim_revision_id = ?1",
+                libsql::params![revision_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    };
+    let generation = current_run(&conn, &page_id, page_version).await;
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_run_candidates
+             (page_id, page_version, run_generation, claim_revision_id,
+              candidate_source_id, candidate_chunk_index, candidate_span_start,
+              candidate_span_end, candidate_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        libsql::params![
+            page_id.clone(),
+            page_version,
+            generation,
+            revision_id,
+            candidate.source_id.clone(),
+            candidate.chunk_index,
+            candidate.span_start,
+            candidate.span_end,
+            candidate.span_digest.clone(),
+        ],
+    )
+    .await
+    .unwrap();
+    seal_run_inventory(&conn, &page_id, page_version, generation).await;
 }
 
 /// [`carry_attempts_forward`] for a test that took its lease through the REAL
@@ -2499,7 +2747,7 @@ async fn the_reconciler_demotes_a_page_whose_derivation_marker_is_gone() {
          reconciler's doing and not a trigger's"
     );
 
-    assert_eq!(db.reconcile_supported_pages().await.unwrap(), 1);
+    assert_eq!(db.reconcile_supported_pages(1000).await.unwrap().demoted, 1);
     assert_eq!(truth_row(&db, "p1").await.unwrap().0, "provisional");
     assert_eq!(
         exposed_support(&db, "p1").await,
@@ -2544,7 +2792,7 @@ async fn the_reconciler_demotes_a_page_whose_cited_span_no_longer_exists() {
     }
     assert_eq!(truth_row(&db, "p1").await.unwrap().0, "supported");
 
-    assert_eq!(db.reconcile_supported_pages().await.unwrap(), 1);
+    assert_eq!(db.reconcile_supported_pages(1000).await.unwrap().demoted, 1);
     assert_eq!(truth_row(&db, "p1").await.unwrap().0, "provisional");
 }
 
@@ -2560,11 +2808,272 @@ async fn the_reconciler_leaves_a_page_that_still_proves_out_alone() {
     support_claim(&db, "p1", &revisions[0], 0.9).await;
     publish_supported(&db, "p1").await;
 
-    assert_eq!(db.reconcile_supported_pages().await.unwrap(), 0);
+    assert_eq!(db.reconcile_supported_pages(1000).await.unwrap().demoted, 0);
     assert_eq!(truth_row(&db, "p1").await.unwrap().0, "supported");
     assert_eq!(
         exposed_support(&db, "p1").await,
         crate::truth_contract::Support::Supported
+    );
+}
+
+/// The gap the attempt rows and the live edges cannot close between them.
+///
+/// Both are things a run PRODUCES. Candidate A concludes and leaves an attempt
+/// row and a support edge; candidate B is one the worker died before reaching,
+/// and nothing ever scored it, so it left neither. Evaluation reading only those
+/// two sees one candidate, one conclusion, and no trace at all that a second
+/// obligation existed — so a run that covered half its inventory publishes as
+/// though it had covered all of it, which is exactly what row 6 forbids.
+///
+/// The existing teeth cover B-with-a-deferred-attempt-row and B-with-a-live-
+/// edge. Neither covers B absent from both, because until the inventory table
+/// there was nothing in the database that could tell anyone B was owed.
+///
+/// `inventory_count` is not this check. It counts CLAIMS, and B's claim is on
+/// the membership roll and fully accounted for — with one of its two citations
+/// silently dropped.
+#[tokio::test]
+async fn a_candidate_that_left_neither_an_attempt_nor_an_edge_blocks_publication() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported,
+        "candidate A alone proves out, which is what makes the next step a test"
+    );
+
+    owed_but_unjudged(
+        &db,
+        &revisions[0],
+        &Candidate::named(&revisions[0], "digest_of_the_candidate_nobody_reached"),
+    )
+    .await;
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::NoPublish { ref reason } = outcome else {
+        panic!(
+            "a run that owed two conclusions and reached one has not finished, \
+             whatever the one it reached said; got {outcome:?}"
+        );
+    };
+    assert!(
+        reason.contains("never concluded on"),
+        "the stored reason must name the unfinished derivation: {reason}"
+    );
+
+    // Conclude on it and the page is supported again — so the refusal is about
+    // the missing conclusion, not about the row's mere existence.
+    attempt_on(
+        &db,
+        &revisions[0],
+        &Candidate::named(&revisions[0], "digest_of_the_candidate_nobody_reached"),
+        "concluded",
+    )
+    .await;
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported
+    );
+}
+
+/// A sealed inventory is authoritative in both directions. A conclusion that
+/// names a candidate outside that set is not extra proof; it is evidence that
+/// the run judged a different set from the one it declared complete.
+///
+/// Checking only `expected ⊆ concluded` misses this. With an empty sealed set
+/// and one concluded attempt, the subset check is vacuously true and the page
+/// becomes `Refuted` even though this run never declared the candidate as work
+/// it owed. The two sets must agree exactly before either support or refutation
+/// can publish.
+#[tokio::test]
+async fn a_conclusion_outside_the_sealed_inventory_blocks_publication() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    judged_but_short(&db, &revisions[0]).await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("DELETE FROM claim_run_candidates", ())
+            .await
+            .unwrap();
+    }
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::NoPublish { ref reason } = outcome else {
+        panic!(
+            "a run whose conclusions exceed its sealed inventory is internally incomplete; \
+             got {outcome:?}"
+        );
+    };
+    assert!(
+        reason.contains("outside the sealed inventory"),
+        "the stored reason must name the inventory mismatch: {reason}"
+    );
+}
+
+/// One level up: a run that died before recording ANY of its inventory.
+///
+/// Row counts cannot see this. A run whose claims genuinely drew no candidates
+/// writes zero rows, and so does a run that leased and then crashed — and those
+/// land on opposite verdicts. The seal is what separates them, so removing it
+/// has to cost the publication.
+///
+/// Leased on purpose. Generation 0 is exempt from the seal because it is the
+/// never-leased value and means no run happened at all, which the never-judged
+/// path already answers; the requirement to have recorded an inventory attaches
+/// to a run, and a run is what a lease creates.
+#[tokio::test]
+async fn a_run_that_never_recorded_its_inventory_publishes_nothing() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    publish_supported(&db, "p1").await;
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("DELETE FROM claim_run_inventories", ())
+            .await
+            .unwrap();
+    }
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::NoPublish { ref reason } = outcome else {
+        panic!("a run that recorded no inventory has not finished; got {outcome:?}");
+    };
+    assert!(
+        reason.contains("never sealed"),
+        "the stored reason must name the unrecorded inventory: {reason}"
+    );
+}
+
+/// The other half of bounding the startup pass.
+///
+/// The reconciler holds the single connection every foreground request needs and
+/// spends a multi-query evaluator per page, per claim, per candidate, so it runs
+/// in batches rather than scanning a whole vault before the daemon serves. That
+/// is only safe if the part it has not reached stops being asserted — otherwise
+/// truncating the scan serves exactly the stale `supported` the pass exists to
+/// retract, and does it silently.
+///
+/// So the durable cursor is read by BOTH sides: the pass resumes from it, and
+/// the read gate withholds everything above it.
+#[tokio::test]
+async fn a_bounded_pass_withholds_the_pages_it_has_not_reached() {
+    let (db, _temp) = db_with_queue().await;
+    for page_id in ["p1", "p2"] {
+        add_page(&db, page_id).await;
+        let revisions = derive_page(&db, page_id, 1).await;
+        support_claim(&db, page_id, &revisions[0], 0.9).await;
+        publish_supported(&db, page_id).await;
+    }
+
+    db.begin_support_reconcile_pass().await.unwrap();
+    for page_id in ["p1", "p2"] {
+        assert_eq!(
+            exposed_support(&db, page_id).await,
+            crate::truth_contract::Support::Unevaluated,
+            "a pass that has re-proved nothing yet asserts nothing"
+        );
+        assert_eq!(
+            truth_row(&db, page_id).await.unwrap().0,
+            "supported",
+            "and it withholds the verdict rather than destroying it -- the page \
+             keeps its file and its stored state"
+        );
+    }
+
+    let first = db.reconcile_supported_pages(1).await.unwrap();
+    assert!(
+        !first.complete,
+        "a batch that filled its budget has not finished the vault"
+    );
+    assert_eq!(first.demoted, 0);
+    assert_eq!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported,
+        "the page this batch re-proved is assertable again"
+    );
+    assert_eq!(
+        exposed_support(&db, "p2").await,
+        crate::truth_contract::Support::Unevaluated,
+        "the page behind the cursor is not"
+    );
+
+    // Drain the rest, and the pass reports itself finished rather than being
+    // assumed so.
+    let mut passes = 1;
+    loop {
+        let pass = db.reconcile_supported_pages(1).await.unwrap();
+        passes += 1;
+        assert_eq!(pass.demoted, 0);
+        if pass.complete {
+            break;
+        }
+        assert!(passes < 10, "a bounded pass must terminate on its own data");
+    }
+    for page_id in ["p1", "p2"] {
+        assert_eq!(
+            exposed_support(&db, page_id).await,
+            crate::truth_contract::Support::Supported
+        );
+    }
+
+    // And a finished pass is idempotent rather than restarting: the frontier
+    // says complete, so a further call does no work at all.
+    let after = db.reconcile_supported_pages(1).await.unwrap();
+    assert!(after.complete);
+    assert_eq!(after.demoted, 0);
+}
+
+/// A daemon restart must resume an incomplete pass instead of erasing its
+/// durable frontier. Resetting to the beginning on every boot can starve the
+/// tail forever when the vault is larger than one boot budget: each process
+/// re-proves the same prefix and never reaches the next page.
+#[tokio::test]
+async fn an_interrupted_reconcile_pass_resumes_from_its_durable_frontier() {
+    let (db, _temp) = db_with_queue().await;
+    for page_id in ["p1", "p2"] {
+        add_page(&db, page_id).await;
+        let revisions = derive_page(&db, page_id, 1).await;
+        support_claim(&db, page_id, &revisions[0], 0.9).await;
+        publish_supported(&db, page_id).await;
+    }
+
+    db.begin_support_reconcile_pass().await.unwrap();
+    let first = db.reconcile_supported_pages(1).await.unwrap();
+    assert!(!first.complete);
+    assert_eq!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported
+    );
+    assert_eq!(
+        exposed_support(&db, "p2").await,
+        crate::truth_contract::Support::Unevaluated
+    );
+
+    // The same startup entry point runs again after a process restart. It must
+    // preserve an incomplete frontier under the same reconciliation rules.
+    db.begin_support_reconcile_pass().await.unwrap();
+    assert_eq!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported,
+        "restart must not discard already-proved progress"
+    );
+
+    let resumed = db.reconcile_supported_pages(1).await.unwrap();
+    assert_eq!(resumed.demoted, 0);
+    assert_eq!(
+        exposed_support(&db, "p2").await,
+        crate::truth_contract::Support::Supported,
+        "the next batch must advance past the pre-restart frontier"
     );
 }
 

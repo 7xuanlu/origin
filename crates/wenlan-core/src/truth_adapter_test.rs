@@ -79,7 +79,8 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
         .unwrap();
         // A verdict is only readable while the derivation it came out of still
         // describes the page, so each of these rows needs the marker
-        // finalization would have written. A truth row without one is a state
+        // derivation would have written before finalizing. A truth row without
+        // one is a state
         // the pipeline does not produce, and seeding it would leave every
         // assertion below testing the missing-marker path instead of its
         // subject. Digest over the page's own (empty) prose and this build's

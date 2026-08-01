@@ -67,7 +67,8 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
 ///
 /// The derivation marker goes in alongside the verdict because the read gate
 /// refuses to expose one whose derivation cannot be shown to describe the live
-/// text, and finalization is what writes the marker in production. A truth row
+/// text, and in production derivation writes the marker before the run that
+/// wrote it can finalize anything. A truth row
 /// without one is a state the pipeline does not produce, and seeding it would
 /// leave every assertion in this file testing the missing-marker path instead of
 /// its subject. The digest is taken from the page's own content rather than

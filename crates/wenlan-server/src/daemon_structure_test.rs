@@ -131,6 +131,8 @@ const RUNTIME_WORKER_ORDER: &[&str] = &[
     "wait_for_startup_model_admission(",
     "OnDeviceProvider::new_with_model(",
     "LLM_READINESS_HOOK.set(",
+    "let db_for_reconcile = db_arc.clone()",
+    "reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)",
 ];
 
 const RUNTIME_OPTIONAL_WORKER_SCOPES: &[&str] = &[
@@ -157,8 +159,10 @@ const RUNTIME_REGISTER_SNAPSHOT_ORDER: &[&str] = &[
     "state.startup_model_load_reserved.clone()",
     "let mut load_shutdown = {",
     "state.shutdown.subscribe()",
-    "let maintenance_for_ready = {",
+    "let (maintenance_for_ready, shutdown_for_reconcile) = {",
     "state.maintenance_coordinator.clone()",
+    "state.shutdown.clone()",
+    "let mut reconcile_shutdown = shutdown_for_reconcile.subscribe()",
 ];
 
 const FACADE_SNAPSHOT_ORDER: &[&str] = &[

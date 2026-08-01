@@ -1159,9 +1159,9 @@ fn the_startup_backlog_drain_is_fenced_out_of_repair_mode() {
 }
 
 /// The startup reconciliation pass is what WITHDRAWS a stored `supported` whose
-/// §1 conditions no longer hold. When it does not complete, the daemon does not
-/// know which pages those are — so logging and serving anyway serves exactly the
-/// stale `supported` the pass exists to retract, and does it silently.
+/// §1 conditions no longer hold. When it errors before the listener binds, the
+/// daemon must refuse startup rather than serve exactly the stale `supported`
+/// the pass exists to retract.
 ///
 /// That is the failure this asserts against: a `warn!`-and-continue arm. The
 /// pass must be able to refuse the boot, which on this codebase means reaching
@@ -1170,9 +1170,10 @@ fn the_startup_backlog_drain_is_fenced_out_of_repair_mode() {
 ///
 /// Same shape and the same honest limit as the drain fence above: a source scan
 /// establishes that the refusal is WRITTEN, not that a running daemon reaches
-/// it. It is exactly strong enough for the defect that occurred — an error arm
-/// that logged where it had to stop — which no behavioural test catches, because
-/// none of them boots a daemon over a database whose reconciliation fails.
+/// it. It is intentionally scoped to `startup.rs`. The post-serve continuation
+/// may pause on an error because startup first opens the durable read frontier;
+/// pages beyond that frontier read `Unevaluated`, and the daemon-structure and
+/// frontier behaviour tests pin that separate fail-closed path.
 ///
 /// The generation-0 carve-out inside the arm is deliberate and is not what this
 /// checks: below the cutover every adapter is pass-through and no truth state
@@ -1183,11 +1184,8 @@ fn a_failed_startup_reconciliation_refuses_to_serve() {
 
     let mut checked = 0usize;
     for (path, body) in workspace_sources() {
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with("_test.rs"))
-        {
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        if file_name != Some("startup.rs") {
             continue;
         }
         let lines: Vec<&str> = body.lines().collect();
