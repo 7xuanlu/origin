@@ -8251,6 +8251,16 @@ fn page_insert_kind_guard_counts_only_structural_braces() {
 /// deliberately, so it is the one value a reader can trust today.
 const UNROUTABLE_PAGE_KINDS: [&str; 4] = ["authored", "concept", "overview", "source"];
 
+/// SQL clauses that bind a statement to a table. A literal carrying none of
+/// them names no table, which makes it a fragment rather than a statement.
+const SQL_TABLE_CLAUSES: [&str; 5] = ["FROM ", "JOIN ", "UPDATE ", "INTO ", "TABLE "];
+
+/// Keywords a SQL predicate opens with. A fragment names no table, so this is
+/// the only thing separating `" AND kind = 'overview'"` from a log line that
+/// happens to mention `kind='concept'` — migration 104 ships exactly such a
+/// line, and without this the tooth cries wolf on its own repair.
+const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
+
 /// Production reads that filter or route on a `pages.kind` value other than
 /// `'entity'`, reported as `path: kind <op> <literal>`.
 ///
@@ -8264,20 +8274,39 @@ const UNROUTABLE_PAGE_KINDS: [&str; 4] = ["authored", "concept", "overview", "so
 /// reader routing on those values today is routing on stale data, which is why
 /// the fence stays up until M6 re-derives `kind` on every mutation path.
 ///
-/// A write is not a read. A SQL predicate counts only when its own string
-/// literal selects from `pages` (`FROM pages` / `JOIN pages`), which is what
-/// keeps migration 89's `CHECK` constraint and migration 104's `WHERE kind =
-/// 'concept'` repair guard out of the scan without an exemption list that would
-/// have to be maintained — and widened — by hand.
+/// A write is not a read. A SQL predicate whose own literal names a table is
+/// excused unless that literal *selects* from `pages` (`FROM pages` / `JOIN
+/// pages`), which is what keeps migration 89's `CHECK` constraint, migration
+/// 104's `UPDATE pages … WHERE kind = 'concept'` repair guard, and every other
+/// table's `kind` column out of the scan without an exemption list that would
+/// have to be maintained — and widened — by hand. A literal
+/// naming *no* table proves nothing either way, and is counted rather than
+/// excused when it opens on a SQL connective: that is the only reading under
+/// which `sql.push_str(" AND kind = 'overview'")` is visible at all, since the
+/// `FROM pages` it belongs to sits in a different literal. The connective is
+/// what keeps prose out — migration 104 logs the phrase `kind='concept'`, and
+/// counting every literal that merely contains the column would make the
+/// repair's own success message a finding. The residual cost is that a
+/// fragment appended to some *other* table's query trips the tooth; naming
+/// that table in the fragment clears it.
 ///
 /// The operator and the quote style are matched as a pair: SQL spells equality
 /// `=` around single quotes, Rust spells it `==` around double quotes. Nothing
 /// else is a comparison. That pairing is what keeps a Rust assignment and the
 /// `kind = "concept"` line inside an eval TOML fixture from reading as reads.
+/// Accessors between the column and the operator are stepped over, so
+/// `page.kind.as_str() == "overview"` and `page.kind() != "concept"` are the
+/// same site as `page.kind == "overview"`.
 ///
 /// Control flow is the other half and lives in `page_kind_match_sites`, which
 /// this calls: an arm is a pattern, not an operator, so a `match` decides on
 /// the column without ever writing one.
+///
+/// What still gets past this: a comparison spelled as a method call
+/// (`kind.eq("overview")`), a literal reached through a `const`, and a
+/// predicate assembled from pieces none of which contains both the column and
+/// the value. Each is a deliberate ceiling, not an oversight — the tooth
+/// guards against a reader drifting in, not against one written to evade it.
 fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
     let production = strip_cfg_test_items(source);
     // Literals kept, comments blanked: the SQL this looks for lives inside
@@ -8315,6 +8344,29 @@ fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
                 continue;
             };
             rest = rest[close + 1..].trim_start();
+        }
+        // An accessor is transparent. `page.kind.as_str() == "overview"` and
+        // `page.kind() != "concept"` route on the value `page.kind ==
+        // "overview"` routes on; only the spelling differs, and `Page.kind` is
+        // a public `String`, so the accessor forms are the ones a reader would
+        // actually reach for. Step the chain until the operator is reachable.
+        // Nothing is decided here — the literal check below still gates every
+        // hit — so stepping past a `.len()` or a `.clone()` costs only reach.
+        loop {
+            let stepped = if let Some(after) = rest.strip_prefix("()") {
+                after
+            } else if let Some(name) = rest.strip_prefix('.') {
+                let len = name
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(name.len());
+                if len == 0 {
+                    break;
+                }
+                &name[len..]
+            } else {
+                break;
+            };
+            rest = stepped.trim_start();
         }
         // Which quote styles each operator may legally carry. SQLite spells
         // inequality both `<>` and `!=`, but only Rust spells equality `==`,
@@ -8363,7 +8415,24 @@ fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
         if quote == '\'' {
             let literal_start = collapsed[..start].rfind('"').map_or(0, |open| open + 1);
             let statement = collapsed[literal_start..start].to_ascii_uppercase();
-            if !statement.contains("FROM PAGES") && !statement.contains("JOIN PAGES") {
+            // A literal naming no table at all is a fragment, not a statement:
+            // `sql.push_str(" AND kind = 'overview'")` appended to a base built
+            // somewhere else. Demanding the proof sit in the same literal is
+            // what let that shape through, so a fragment is read as one and
+            // counted, rather than excused for failing to prove itself — but
+            // only when it opens like a predicate, or every log line mentioning
+            // `kind='concept'` becomes a finding.
+            let fragment_predicate = !SQL_TABLE_CLAUSES
+                .iter()
+                .any(|clause| statement.contains(clause))
+                && statement
+                    .split_whitespace()
+                    .next_back()
+                    .is_some_and(|word| SQL_PREDICATE_LEADS.contains(&word));
+            if !fragment_predicate
+                && !statement.contains("FROM PAGES")
+                && !statement.contains("JOIN PAGES")
+            {
                 continue;
             }
         }
@@ -8580,10 +8649,48 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
     assert_eq!(
         page_kind_routing_sites(
             path,
+            "if page.kind.as_str() == \"overview\" { return Ok(()); }"
+        ),
+        [format!("{path}: kind == \"overview\"")],
+        "`Page.kind` is a public String, so `.as_str()` is the form a reader would \
+         actually write; an accessor between the column and the operator changes \
+         the spelling and nothing else"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(path, "if page.kind() != \"concept\" { return Ok(()); }"),
+        [format!("{path}: kind != \"concept\"")],
+        "a getter is the same read as the field"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "let mut sql = String::from(\"SELECT id FROM pages WHERE space = ?1\"); \
+             sql.push_str(\" AND kind = 'overview'\");",
+        ),
+        [format!("{path}: kind = 'overview'")],
+        "a predicate appended to a base built elsewhere is still a predicate, and \
+         requiring the `FROM pages` proof in the same literal is exactly what hid it"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
             "let label = match page.kind.as_str() { \"source\" => \"doc\", _ => \"note\" };",
         ),
         [format!("{path}: match on kind, arm \"source\"")],
         "a match arm decides on the column without ever writing an operator"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "let label = match page.kind() { \"overview\" => \"home\", _ => \"note\" };",
+        ),
+        [format!("{path}: match on kind, arm \"overview\"")],
+        "the scrutinee is matched as a whole word, so an accessor call reads the \
+         same as a bare binding"
     );
 
     assert_eq!(
@@ -8626,6 +8733,15 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
         (
             "a different table's kind",
             "conn.query(\"SELECT id FROM entity_links WHERE kind = 'source'\", ())",
+        ),
+        (
+            "a fragment that names its own table",
+            "sql.push_str(\" JOIN entity_links e ON e.page_id = p.id AND e.kind = 'source'\");",
+        ),
+        (
+            "migration 104's own log line, which is prose and not a predicate",
+            "log::info!(\"[migration] Migration 104 applied: {repaired} page(s) moved off the \
+             silent kind='concept' default\");",
         ),
         (
             "a Rust assignment, not a comparison",

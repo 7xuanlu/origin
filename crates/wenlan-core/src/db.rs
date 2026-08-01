@@ -12054,15 +12054,21 @@ impl MemoryDB {
     ///   one place today's rule would disagree with it (89 read
     ///   `creation_kind='source'` as a concept page). Re-deciding that is a
     ///   separate call with its own audit trail, not this repair's business.
-    ///   The marker is sound but not exact: page ids can be deterministic and
-    ///   reused (`delete_page`), and nothing deletes ledger rows, so a page
-    ///   deleted and recreated at the same id before this upgrade inherits the
-    ///   old ledger entry and is skipped. It keeps the `concept` it already has
-    ///   — the pre-migration state, never a fresh lie — so the failure is lost
-    ///   coverage, not a wrong answer. Tightening it (comparing the ledger's
-    ///   `migrated_at` against `pages.created_at`) needs one timestamp format
-    ///   to hold across every historical row, which is a bigger claim than this
-    ///   repair needs to make.
+    ///   The marker is sound but not exact, and the gap can be a wrong answer
+    ///   rather than only lost coverage. `delete_page` removes the row and its
+    ///   history but no ledger entry, and SOURCE ids are deterministic
+    ///   (`document_enrichment::source_page_id` hashes source id + file path),
+    ///   so a file deleted and re-ingested before this upgrade lands back on
+    ///   the same id. The recreated row took `concept` from the silent default,
+    ///   the inherited ledger entry describes the page that used to hold that
+    ///   id, and this repair skips it — leaving a SOURCE page stamped
+    ///   `concept`, a value that was never true of it. It is inert today only
+    ///   because every reader is still fenced to `kind='entity'`
+    ///   (`drift_guard::no_production_read_routes_on_a_non_entity_page_kind`).
+    ///   Tightening it (comparing the ledger's `migrated_at` against
+    ///   `pages.created_at`) needs one timestamp format to hold across every
+    ///   historical row, which is a bigger claim than this repair needs to
+    ///   make; M6 re-deriving `kind` on every mutation path is what closes it.
     /// * `kind = 'concept'` means the repair only ever moves a row off the
     ///   silent default. It cannot demote a deliberately stamped kind (the
     ///   `kind='entity'` dual-write shadows above all), and re-running it is a
