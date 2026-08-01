@@ -438,7 +438,7 @@ Catalogued in full in artifact 6; the mutation view:
 | G6.11d | exceed `50 ms` on a 5k-degree hub | `R-BENCH-MAX` (S0-98) | PR-A |
 | G6.12a–e | let a CAS-losing event commit — one row per event: provisionalization, root retraction, community rebinding, relevance-stat update, candidate-set change | that event writes attachment/dependency/history/receipt state instead of requeueing | PR-A |
 | G6.13 | let an embedding cross a threshold | the embedding tie-break test | PR-A |
-| G6.14 | exceed `2,176` visited index entries in one evaluation | `SQLITE_SCANSTAT_NVISIT` asserted on the bench-only instrumented build (S0-157, R-1 option (b′), ruled 2026-08-01) | PR-A |
+| G6.14 | exceed `2,176` visited index entries in one evaluation | `SQLITE_SCANSTAT_NVISIT` **summed over every scan loop of every statement in the evaluation** — the metric is per-loop, so the bench sums before comparing (S0-157's aggregation rule, R-1 option (b′), ruled 2026-08-01) | PR-A |
 
 **G6.11's instrumentation is the row that fails quietly.** The contract requires
 *"instrumented row visits proving the bound rather than a textual SQL `LIMIT`"*
@@ -510,11 +510,15 @@ were; they are not row controls and no longer stand in for any.
 | G8.11b | let a rename silently drop a card that minted before it | the card stops appearing with no refusal and no receipt | PR-A |
 | G8.11c | skip the rename closure over the space-keyed substrate | a row keyed to the old name survives the rename and stays claimable | PR-A |
 
-**G8.7 is the merge-no-survivor STOP's home clause.** Where G2.7 is blocked
-*because* the STOP makes an exclusion unevaluable, G8.7 is blocked because the
-detach rule itself is what the ruling decides. Same status, different reason,
-and the distinction matters: a ruling that resolves G8.7 automatically resolves
-G2.7, but not the reverse.
+**G8.7 is the merge-no-survivor STOP's home clause, which is why one ruling
+cleared both** *(resolved wording, rev 9, round-7 finding 3)*. G2.7 was blocked
+*because* the STOP made an exclusion unevaluable; G8.7 was blocked because the
+detach rule itself was what the ruling had to decide. Same status, different
+reason — and the asymmetry this paragraph recorded is what happened: the ruling
+went to G8.7's clause on 2026-08-01 (R-3, ratified as S0-163), `G8.7` split into
+`G8.7a` and `G8.7b`, and `G2.7` unblocked with it. A ruling scoped instead to the
+G2 exclusion would have left the detach rule undecided, so the ordering was worth
+stating before the ruling and is worth keeping after it.
 
 **G8.11a-c is the rename case, and it is one scenario asserted three ways**
 *(new rev 6, round-5 blocker)*. Rename a space that already has M6 cards, then
@@ -733,16 +737,21 @@ old LIVE marks were borrowing.)*
 
 ## 14. Findings
 
-**F1 — two gates are blocked by one ruling, and resolving them is ordered.**
-G8.7 (merge loser detach) and G2.7 (overview evidence exclusion) are both blocked
-on the merge-no-survivor STOP, but not symmetrically: G8.7 *is* the rule the
-ruling decides, and G2.7 is downstream of it, because an overview with no
-determinate subject cannot be classified either way. A ruling on G8.7 therefore
-resolves both; a ruling that addressed only the G2 exclusion would leave the
-detach rule undecided. Worth knowing when the ruling is drafted, so it is not
-scoped to the narrower question.
+**F1 — two gates were blocked by one ruling, and resolving them was ordered.
+RESOLVED 2026-08-01.** G8.7 (merge loser detach) and G2.7 (overview evidence
+exclusion) were both blocked on the merge-no-survivor STOP, but not
+symmetrically: G8.7 *was* the rule the ruling decides, and G2.7 downstream of it,
+because an overview with no determinate subject cannot be classified either way.
+The ruling was drafted against G8.7's clause, which is what this finding asked
+for, and it resolved both — R-3 is ratified as S0-163, `G8.7` splits into
+`G8.7a` (determinate survivor) and `G8.7b` (no survivor), and `G2.7` carries no
+blocked mark. Kept rather than deleted, because the finding's claim — that a
+ruling scoped to the narrower G2 question would have left the detach rule
+undecided — is what shaped the ruling that was actually made. *(rev 9, round-7
+finding 3: rev 8 applied the ruling everywhere except here and in §9's
+home-clause note, which both still described the block in the present tense.)*
 
-**F2 — sixteen of the 203 cases cannot go red until lane 1 lands, and they are
+**F2 — sixteen of the 204 cases cannot go red until lane 1 lands, and they are
 concentrated in the gates that protect truth.** G1.2, G2.5, G6.9, G7.1–G7.3, and
 the ten remaining predicate cases all rest on a page being `supported`, and no
 production code writes that value today

@@ -95,7 +95,7 @@ COUNT(DISTINCT r.independence_group_id)
 | 2.3 | ≥ 2 **distinct** referring pages | `COUNT(DISTINCT page_links.source_page_id)`; the PK already prevents one page from contributing twice for one label | `EXISTS` |
 | 2.4 | referring pages are **active** | `pages.status = 'active'`; `resolve_orphan_page_links` already joins on exactly this (`crates/wenlan-core/src/db.rs:44117`) | `EXISTS` |
 | 2.5 | referring pages are **supported** | `page_truth_state.support_status = 'supported'`; DDL and CHECK at `crates/wenlan-core/src/db/claim_identity.rs:279`–`:300` | **`lane 1`** — §7.1 |
-| 2.6 | referring pages are **non-overview** | title rule now, `pages.kind <> 'overview'` (CHECK at `crates/wenlan-core/src/db.rs:9177`) after the follow-up PR — S0-164 | PR-A |
+| 2.6 | referring pages are **non-overview** | the title rule now — literally `lower(title) <> 'overview'`; `pages.kind <> 'overview'` (CHECK at `crates/wenlan-core/src/db.rs:9177`) only after the follow-up PR makes `kind` truthful on every path — S0-164 | PR-A |
 | 2.7 | ≥ 3 underlying groups | D1: the union of active grounded external roots supporting **the exact current claim revisions that contain the link** — not the referring page as a whole | `DERIVED` |
 | 2.8 | a stale or provisional referring page contributes nothing | D1, explicit. Depends on 2.5 | **`lane 1`** — §7.1 |
 
@@ -138,7 +138,7 @@ Each rule, its enforcing predicate, and where the data lives.
 | R2 | **Generated roots count zero** | `root_kind <> 'generated'` | same CHECK, `crates/wenlan-core/src/db.rs:8791` | `EXISTS` |
 | R3 | Chunks, mirrors, and same-session captures **collapse through the independence group** | not a filter — an assignment property. Two chunks of one file receive the same `independence_group_id` because they share `source_identity`, and near-dups are unioned by the LSH overlay. Asserted today by `distinct chunks of one file share one independence_group_id` (`crates/wenlan-core/src/edge_grounding.rs:2251`) | artifact 3 §2 | `EXISTS` |
 | R4 | **Unknown independence routes to human review and cannot auto-publish** | today `acquire_provenance_root` returns `Err` and mints nothing (`crates/wenlan-core/src/db.rs:18525`–`:18532`) | artifact 3 §5 | **partial** — the refusal exists, the durable review artifact does not |
-| R5 | **Overview pages and generated overview evidence never contribute to genesis** | title rule now, `pages.kind <> 'overview'` after the follow-up PR (S0-164) | `crates/wenlan-core/src/db.rs:9177` | PR-A |
+| R5 | **Overview pages and generated overview evidence never contribute to genesis** | the title rule now — literally `lower(title) <> 'overview'`; `pages.kind <> 'overview'` only after the follow-up PR (S0-164) | `crates/wenlan-core/src/db.rs:9177` | PR-A |
 | R6 | M5 support applies to page-mediated inputs; a stale/provisional referring page contributes nothing | `page_truth_state.support_status = 'supported'` | `crates/wenlan-core/src/db/claim_identity.rs:282` | **`lane 1`** — §7.1 |
 | R7 | New M6 prose stays invisible unless its M5 claim/support publication succeeds | artifact 2 machine E — the page and its truth state commit in one transaction, so there is no window where prose exists without published support | artifact 2 §8.2 | `PR-A-new` (by construction) |
 
@@ -191,7 +191,7 @@ B28 and B30 are in tension by design and both are correct: R1 says human capture
 
 ## 7. Findings that strain the frozen contract
 
-Reported, not resolved, per the STOP-13 instruction. Both are cases where a D1/D2 predicate names a column that exists but is not maintained, so the predicate would silently evaluate the same way for every row.
+Both are cases where a D1/D2 predicate names a column that exists but is not maintained, so the predicate would silently evaluate the same way for every row. Raised under the STOP-13 instruction rather than resolved unilaterally — and both have since been answered, so neither is open *(rev 9, round-7 finding 2: rev 8 answered them below but left this line reading "reported, not resolved")*. §7.1 resolved into `lane 1`: the promoter is in flight on `m5-truth-derivation`. §7.2 was **ruled on 2026-08-01** — R-2 = option 1, with the title rule as the named interim until `kind` is truthful (S0-164).
 
 ### 7.1 No production writer promotes `support_status` to `supported`; every page is `provisional`
 
@@ -233,9 +233,9 @@ There is no derivation worker **on this branch**. `claim_derivation_jobs` — th
 > steps.** The write-path half is in flight on the kind-fix lane, which makes
 > `pages.kind` truthful at insert. The three stale paths it deliberately deferred
 > — rename, SOURCE-replace, archive, none of which re-derive `kind` — close in a
-> follow-up PR after that lane merges. Until both land, **R5's exclusion is
-> defined by the title rule** (`lower(title) = 'overview'`), which is option 2 as
-> a named interim rather than as a silent fallback. See S0-164 below.
+> follow-up PR after that lane merges. Until both land, **R5's exclusion predicate
+> is the title rule, written literally as `lower(title) <> 'overview'`** — option
+> 2 as a named interim rather than as a silent fallback. See S0-164 below.
 
 > **Decision S0-164 *(new rev 8 — applies R-2, ruled 2026-08-01)* — M6 reads
 > overview-ness through the title rule until the `kind` column is truthful on
@@ -265,13 +265,13 @@ Production code already works around this. Overview pages are identified by **ti
 
 **Consequence for M6.** D1's rule R5 ("overview pages and generated overview evidence never contribute to genesis") and D2.2's "non-overview referring pages" are exclusion predicates protecting the floor from self-reference — an overview page citing its own community must not help mint a page about that community. Implemented as `kind <> 'overview'`, the predicate would admit every overview created since migration 89, which on a young install is all of them. Implemented as `lower(title) <> 'overview'`, it inherits a title convention that any user can defeat by renaming a page.
 
-This one is squarely inside M6's scope to fix, so it is a **decision the reviewer should make now**, not a dependency on another milestone. Three options, with my recommendation:
+This one is squarely inside M6's scope to fix, so it went to the reviewer as a decision rather than to another milestone as a dependency. **Ruled 2026-08-01: option 1**, delivered in the two steps §7.2's status block names. The three options are kept below rather than collapsed to the answer, because the sequencing S0-164 fixes is only legible against the option that was chosen and the two that were not:
 
 1. **Make `kind` truthful** — set it at every insert site, backfill by the same title rule, and add a `drift_guard`-style structural test that fails when a new `INSERT INTO pages` omits `kind`. Costs a migration and touches the write path; gives every later milestone a reliable page-kind axis.
 2. **Keep the title convention** and define R5 as `lower(title) <> 'overview'`, documenting that the exclusion is defeatable by rename.
 3. **Derive overview-ness from M6's own tables** — an overview page is one an M6 overview candidate published — and treat pre-M6 overviews via the title rule.
 
-I recommend **1**. It is the only option under which R5 means what D1 says it means, the write-path change is small and mechanical, and options 2 and 3 both leave M6 with a self-reference hole that G2 would have to encode as a known exception. But this is a schema change on a shared table, so it is the reviewer's call, not mine.
+**Option 1 was recommended and option 1 was ruled.** It is the only option under which R5 means what D1 says it means, the write-path change is small and mechanical, and options 2 and 3 both leave M6 with a self-reference hole that G2 would have to encode as a known exception. It is a schema change on a shared table, which is why it was the reviewer's call rather than mine; the reviewer made it on 2026-08-01. Option 2 survives as the *interim* and only as the interim — that is what S0-164 fixes: the title rule carries R5's exclusion until `kind` is truthful on every path, and not one step past it.
 
 ---
 
@@ -298,6 +298,6 @@ Restated as what an implementation may and may not do:
 
 G2 (`m6_genesis_counts_groups_not_rows`) asserts that "generated roots, chunks, mirrors, inactive/ungrounded external roots, M5-provisional page-mediated inputs, same-session captures, and overview evidence cannot inflate any signal", with positive controls for independent documents and UI-authorized human groups.
 
-Every clause maps onto a row above: generated roots → R2 / B23; chunks and mirrors → R3 / B24; inactive and ungrounded roots → §1's active and grounded qualifiers / B25–B27; M5-provisional inputs → R6 / B11 (blocked, §7.1); same-session captures → R3 and artifact 3 §4; overview evidence → R5 / B12 (blocked, §7.2); positive controls → B29 and B30, read alongside B28.
+Every clause maps onto a row above: generated roots → R2 / B23; chunks and mirrors → R3 / B24; inactive and ungrounded roots → §1's active and grounded qualifiers / B25–B27; M5-provisional inputs → R6 / B11 (`lane 1`, §7.1); same-session captures → R3 and artifact 3 §4; overview evidence → R5 / B12 (ruled, §7.2); positive controls → B29 and B30, read alongside B28.
 
-Two of G2's clauses currently have no way to fail, because their predicates are constant across all rows (§7.1, §7.2). A gate that cannot fail is not a gate, so G2's RED phase must include the positive control that proves the predicate discriminates — a supported page next to a provisional one, an overview page next to a concept page — and those fixtures cannot be built until §7.1 and §7.2 are resolved. That dependency should be recorded in artifact 12's mutation catalog.
+Two of G2's clauses had no way to fail on the branch as found, because their predicates are constant across all rows (§7.1, §7.2). A gate that cannot fail is not a gate, so G2's RED phase must include the positive control that proves the predicate discriminates — a supported page next to a provisional one, an overview page next to a concept page. The §7.2 half is buildable now: R-2's ruling makes the interim predicate `lower(title) <> 'overview'`, which discriminates on data that exists today, so the overview-versus-concept fixture needs nothing further. The §7.1 half still waits on the promoter, which is exactly what `lane 1` means. That dependency is recorded in artifact 12's mutation catalog.

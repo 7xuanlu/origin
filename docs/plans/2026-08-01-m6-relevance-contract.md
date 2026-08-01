@@ -434,7 +434,7 @@ them, stale/refresh enqueue state, the operation receipt
 |---|---|---|
 | indexed queries per route evaluation | ≤ 4 | `R-BUDGET-QUERIES` |
 | rows materialized per route evaluation | ≤ 512 | `R-BUDGET-ROWS` |
-| index entries visited per route evaluation | ≤ 2,176 — **gated on the bench** as of R-1 (b′) (S0-157) | `R-BUDGET-VISITS` |
+| index entries visited per route evaluation | ≤ 2,176, summed over every scan loop of every statement in the evaluation — **gated on the bench** as of R-1 (b′) (S0-157) | `R-BUDGET-VISITS` |
 | wall time per route evaluation | ≤ 50 ms, **hard** | `R-BUDGET-MS` |
 
 D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
@@ -575,9 +575,11 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > is why the traversal matters. It is a derived quantity, not a measured one, and
 > rev 2's error was treating it as something a counter could be compared against.
 
-> **Decision S0-157 *(rev 3, round-2 finding 10; amended rev 4, round-3 N4; option set corrected rev 5, round-4 item 6)* — the absolute visit bound is
-> NOT gated, and that is raised rather than papered over.** What the pinned stack
-> can honestly prove, and what it cannot:
+> **Decision S0-157 *(rev 3, round-2 finding 10; amended rev 4, round-3 N4; option set corrected rev 5, round-4 item 6; ruled rev 8; wording corrected rev 9, round-7 finding 1)* — the absolute visit bound was
+> not gated by anything the shipped stack exposes, and rather than paper that over
+> it went to a ruling: since 2026-08-01 it is gated on the bench-only instrumented
+> build (R-1 = (b′)).** What the pinned stack can honestly prove, and what it
+> cannot:
 >
 > | Clause | Instrument | Gated? |
 > |---|---|---|
@@ -614,6 +616,34 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > vendored patch it is cheaper to set and easier to leak — and, per the rev-8
 > correction to R-1's limitation #3, a leaked build pays a per-opcode
 > instrumentation cost rather than carrying a dormant symbol.
+>
+> **The aggregation rule, which the ruling needs and rev 8 did not state *(rev 9,
+> round-7 finding 1)*.** `NVISIT` is a per-loop metric, not a per-evaluation one.
+> The vendored header defines it as *"the total number of rows examined by all
+> iterations of the X-th loop"*
+> (`libsql-ffi-0.9.30/bundled/src/sqlite3.h:10269`-`:10271`), and there is no
+> whole-statement escape hatch to lean on:
+> `sqlite3_stmt_scanstatus_v2` accepts a negative loop index only for
+> `SQLITE_SCANSTAT_NCYCLE` and returns `1` — the error path — for every other
+> metric including `NVISIT`
+> (`libsql-ffi-0.9.30/bundled/src/sqlite3.c:93869`-`:93879`). An unqualified
+> assertion "`NVISIT ≤ 2,176`" therefore names no measurable quantity, and the
+> reading a bench author would reach for first — one loop of one statement — is
+> the weakest one available.
+>
+> **`R-BUDGET-VISITS` is the sum of `NVISIT` over every scan loop of every
+> statement executed during one route evaluation, including re-executions of the
+> same prepared statement within that evaluation.** The bench iterates the loop
+> indices of each statement, sums them, sums across the statements, and compares
+> the single total against `2,176`. Both breach shapes are then caught by
+> construction: one loop that alone exceeds the budget, and an accumulation across
+> the four queries in which no individual loop does.
+>
+> This is what the number always meant rather than a new constraint — `2,176` is
+> `32 + 64 + 32 + 2,048`, one term per query in this section's four-query budget,
+> and a budget assembled by addition can only be discharged by addition. Rev 8
+> named the instrument and left the summation implicit, which is precisely the
+> gap that lets a green bench coexist with a blown budget.
 
 > **Ruling request R-1 — how is G6's visit clause discharged? RULED 2026-08-01:
 > option (b′).** The request and its full option table are kept rather than
@@ -961,7 +991,7 @@ does, and worth one line in the PR-A notes.
 | incremental pair state equals full recomputation | §5, S0-91 and S0-92 |
 | generated/inactive/retracted/legacy-ungrounded contribute zero | §1.2 table, all four **LIVE** |
 | `EXPLAIN QUERY PLAN` uses fixed indexes | §7 instrument (4), §8 index list |
-| instrumented row visits, not a textual `LIMIT` | **gated as of 2026-08-01 — R-1 ruled (b′) (S0-157); `SQLITE_SCANSTAT_NVISIT` asserted on the bench-only instrumented build.** Also gated: `FULLSCAN_STEP == 0`, the decoded-row and query counters, EQP. Not gated: the absolute entry count — reachable on the pinned stack via a one-flag build (R-1 option b′), which is what the ruling chooses |
+| instrumented row visits, not a textual `LIMIT` | **gated as of 2026-08-01 — R-1 ruled (b′) (S0-157); `SQLITE_SCANSTAT_NVISIT`, summed per S0-157's aggregation rule, asserted on the bench-only instrumented build.** Gated alongside it: `FULLSCAN_STEP == 0`, the decoded-row and query counters, EQP. The absolute entry count was the one clause here with no instrument; the one-flag build the ruling chose is what closed it |
 | no group forms more than 2016 pairs | §3, `R-HUB-MAXPAIRS` |
 | candidate retrieval never exceeds 32 | §4, `R-CAND-CAP` |
 | a provisional candidate is never retrieved or attached | §1.2 — **BLOCKED**; the clause is currently vacuously true, which is worse than failing, so the test must assert the predicate is *evaluated*, not merely that no provisional page appeared |
@@ -1021,4 +1051,6 @@ re-costed rev 6)* carried five options and recommended (b′); **the user ruled
 (b′) on 2026-08-01**, so the bound is now gated on a bench-only build of the
 daemon's own libSQL with one flag appended through libsql-ffi's own
 `LIBSQLITE3_FLAGS` env knob — no vendored patch — measuring `NVISIT` on the real
-code path.
+code path. *(rev 9: the ruling carries an aggregation rule, without which
+`NVISIT` names no measurable quantity — the bound is the **sum** over every scan
+loop of every statement in one route evaluation.)*
