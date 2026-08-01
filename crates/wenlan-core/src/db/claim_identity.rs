@@ -808,17 +808,32 @@ impl MemoryDB {
     /// would be manufacturing grounding for evidence that has none, which is the
     /// one thing §3 names outright. 0 satisfies the "only if" honestly.
     ///
-    /// **Only a human-delta destination resolves today**, and that is §4a's own
-    /// "human-delta destination" case rather than a shortcut. The `supports`
-    /// CHECK requires `root_id IS NOT NULL`, §5 defines it as the provenance
-    /// root of the cited evidence, and the only memory→root link that exists is
-    /// the `hed_{root_id}` convention [`Self::mint_human_edit_delta`] writes.
-    /// Any other memory is refused by name instead of being given an invented
-    /// root — the gap is reported, not papered over.
+    /// **The evidence root is resolved by the caller and verified here.** §5
+    /// defines `root_id` as the provenance root of the cited evidence, and the
+    /// `supports` CHECK requires it to be non-NULL. PR-A derived it by parsing an
+    /// `hed_` prefix off the memory id, because that naming convention was the
+    /// only memory→root link in the schema. The cost of that shortcut was the
+    /// whole M5 blocker: only prose a human typed into the page itself was
+    /// citable, so a distilled page could never be supported and
+    /// `support_status = 'supported'` matched zero rows on every install.
+    ///
+    /// The convention is replaced by a check that is strictly stronger, not
+    /// weaker. Roots are content-addressed —
+    /// `identity_digest(root_kind, canonical_content)` — so the root a caller
+    /// names is confirmed against the cited memory's OWN bytes. A root minted
+    /// over any other content is refused. Where the old prefix was a promise
+    /// about a *name*, this is a proof about *content*, and it generalizes to
+    /// ingested evidence instead of excluding it.
+    ///
+    /// Still refuses rather than repairs: an unknown root, an inactive one, or a
+    /// root recorded under a different `identity_version` (whose digest this
+    /// code cannot recompute, so it cannot be checked) are all named refusals
+    /// rather than an invented or assumed link.
     pub async fn write_support_edge(
         &self,
         claim_revision_id: &str,
         memory_source_id: &str,
+        root_id: &str,
         verdict: &SupportVerdict,
     ) -> Result<String, WenlanError> {
         // A `supports` edge is what M5 reads as truth, so the verdict must
@@ -841,15 +856,6 @@ impl MemoryDB {
                 verdict.score, verdict.threshold_at_write
             )));
         }
-
-        // §5: the evidence's provenance root. Derived from the delta memory's
-        // own id rather than looked up, because that convention IS the link.
-        let root_id = memory_source_id.strip_prefix("hed_").ok_or_else(|| {
-            WenlanError::Conflict(format!(
-                "support_evidence_has_no_root: {memory_source_id} carries no provenance root; \
-                 only human-delta evidence is resolvable in PR-A (artifact 3 §4a)"
-            ))
-        })?;
 
         let conn = self.conn.lock().await;
 
@@ -912,6 +918,77 @@ impl MemoryDB {
                 })?,
             )
         };
+
+        // §5, and the replacement for PR-A's `hed_` prefix: prove the root the
+        // caller named actually identifies THIS evidence. The schema stores no
+        // memory->root column, but it does not have to -- roots are
+        // content-addressed, so the binding is RECOMPUTABLE from the evidence's
+        // own bytes even though it is not stored. That makes this a check rather
+        // than the trust the prefix convention asked for.
+        //
+        // The root must be minted over the cited memory row's content, which is
+        // what `acquire_provenance_root` converges on for identical bytes. A root
+        // minted over some larger document that merely CONTAINS this memory does
+        // not verify, and that refusal is correct: §4a's whole subject is the
+        // exact text a verdict read, and a whole-document root cannot answer for
+        // a chunk of it.
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT identity_version, identity_digest, root_kind, status
+                       FROM provenance_roots WHERE root_id = ?1",
+                    libsql::params![root_id],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support root lookup: {error}")))?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?
+                .ok_or_else(|| {
+                    WenlanError::Conflict(format!(
+                        "support_root_unknown: no provenance root {root_id}; a support edge may \
+                         not cite a root that does not exist"
+                    ))
+                })?;
+            let identity_version: i64 = row
+                .get(0)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+            let identity_digest: String = row
+                .get(1)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+            let root_kind: String = row
+                .get(2)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+            let status: String = row
+                .get(3)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+
+            if status != "active" {
+                return Err(WenlanError::Conflict(format!(
+                    "support_root_inactive: provenance root {root_id} is '{status}'; evidence \
+                     whose root is not active may not back a claim"
+                )));
+            }
+            // A digest written under a different identity scheme cannot be
+            // recomputed by this code, so the binding cannot be checked at all.
+            // Unknown is not true: refuse rather than accept it unverified.
+            if identity_version != crate::provenance::IDENTITY_VERSION {
+                return Err(WenlanError::Conflict(format!(
+                    "support_root_identity_version: root {root_id} was recorded under identity \
+                     version {identity_version}, which this code cannot recompute (it verifies \
+                     version {})",
+                    crate::provenance::IDENTITY_VERSION
+                )));
+            }
+            if crate::provenance::identity_digest(&root_kind, &content) != identity_digest {
+                return Err(WenlanError::Conflict(format!(
+                    "support_root_not_evidence_root: root {root_id} was minted over different \
+                     content than {memory_source_id}; a support edge may not cite a root that \
+                     does not identify the evidence it names"
+                )));
+            }
+        }
 
         // The payload records which VERSION the span was read from, and until
         // this check nothing made that number true -- the caller supplied it and
