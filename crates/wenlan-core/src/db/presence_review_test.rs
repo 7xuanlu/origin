@@ -789,39 +789,46 @@ async fn a_caller_who_will_be_refused_cannot_tell_which_pages_exist() {
 
 /// A review that meets a foreign writer fails closed, marking nothing.
 ///
-/// **This is not the F1(a) interleave test, and there cannot be one.** The
-/// interleave F1(a) rules out — an edit landing between the page read and the
-/// mark — needs the review to be suspended mid-sequence, and nothing can
-/// suspend it. Inside the daemon, `review_page_with_presence` takes the single
-/// `Arc<Mutex<Connection>>` once and holds it from before `BEGIN IMMEDIATE` to
-/// after `COMMIT`, so no other task in the process gets between any two of its
-/// steps; reading before `BEGIN` rather than after would be a distinction with
-/// no observable difference. From outside the process, the attempt below is as
-/// far as a second writer gets: SQLite admits one writer, libsql sets no busy
-/// timeout, so the review's `BEGIN IMMEDIATE` does not wait its turn — it
-/// errors. Which leaves nothing to interleave with.
+/// **What this test proves.** A second writer holding the write lock makes the
+/// review refuse to start: it returns an error rather than half-succeeding, no
+/// nonce is spent, no receipt is stored, and the capability stays good. And
+/// once that writer commits, the retry sees prose the human never approved and
+/// answers `Refused(Conflict)` — so the digest check is live across a real
+/// committed edit, not just a synthetic one.
 ///
-/// So this test claims only what it can see: a second writer holding the lock
-/// makes the review fail closed rather than half-succeed. It has teeth against
-/// the plausible future change — adding a busy timeout or a retry so the review
-/// waits out a foreign writer, which would reopen exactly the window F1(a)
-/// closed, and would turn this test's `Err` into an `Applied`.
+/// **What it does not prove: the F1(a) interleave itself.** That is an edit
+/// landing *between* the page read and the mark, which needs the review
+/// suspended mid-sequence, and nothing can suspend it. Inside the daemon,
+/// `review_page_with_presence` takes the single `Arc<Mutex<Connection>>` once
+/// and holds it from before `BEGIN IMMEDIATE` to after `COMMIT`, so no other
+/// task gets between any two of its steps — reading before `BEGIN` rather than
+/// after is a distinction with no observable difference, and the hoist that
+/// would actually be dangerous is out of the *lock*, which changes the function
+/// signature. From outside the process, the attempt below is as far as a second
+/// writer gets: SQLite admits one writer, libsql sets no busy timeout, so the
+/// review's `BEGIN IMMEDIATE` does not wait its turn — it errors, leaving
+/// nothing to interleave with. The interleave is prevented structurally, and
+/// this test is not the thing preventing it.
 ///
-/// What the ordering rests on instead: the page read sits below `verify` (F7's
-/// oracle, `a_caller_who_will_be_refused_cannot_tell_which_pages_exist`, fails
-/// if it moves up) and above the mark, in one function, under one lock —
-/// structure, not a test.
-///
-/// The F1(a) hazard itself is real, and was proved by a two-step knockout
-/// rather than left as an argument. Adding `PRAGMA busy_timeout=10000` to the
-/// daemon connection turns this test's `Err` into `Ok(Refused(Conflict))` — the
-/// review waits out the writer and is still safe. Adding that pragma *and*
-/// hoisting the page read above `BEGIN IMMEDIATE` turns it into
+/// **The hazard is real anyway, proved by a two-step knockout rather than left
+/// as an argument.** Adding `PRAGMA busy_timeout=10000` to the daemon
+/// connection turns this test's `Err` into `Ok(Refused(Conflict))` — the review
+/// waits out the writer and is still safe. Adding that pragma *and* hoisting
+/// the page read above `BEGIN IMMEDIATE` turns it into
 /// `Ok(Applied(.. reviewed_page_version: 1, digest of the ORIGINAL body ..))`
 /// while the page holds the edited text: a receipt attesting to prose nobody
 /// approved. Both knockouts were reverted. So the directly discriminating test
-/// is one pragma away, but a busy timeout changes the daemon's behavior under
-/// contention and is a decision on its own, not a side effect of a test.
+/// is one busy timeout away — but that pragma changes the daemon's behavior
+/// under contention and is a decision on its own, not a side effect of a test.
+/// It is flagged as a follow-up rather than taken here.
+///
+/// This test still has teeth on exactly that change: adding a busy timeout or a
+/// retry turns its `Err` into an answer and fails it, which is the point.
+///
+/// The rest of the ordering rests on structure plus one other oracle: the page
+/// read sits below `verify` — F7's
+/// `a_caller_who_will_be_refused_cannot_tell_which_pages_exist` fails if it
+/// moves up — and above the mark, in one function, under one lock.
 ///
 /// The second connection is libsql, deliberately, not rusqlite. rusqlite and
 /// libsql link one statically-bundled SQLite here (see `crates/wenlan-core/
@@ -909,10 +916,10 @@ async fn a_review_meeting_a_foreign_writer_marks_nothing() {
 ///
 /// Narrower than it looks, and deliberately named for what it checks: with no
 /// second writer there is no interleave to catch, so this agrees for any
-/// implementation that reads the page at all. The ordering claim is carried by
-/// `an_edit_racing_the_review_is_refused_rather_than_approved` above; this one
-/// pins that the three places the mark is written — receipt, truth state, and
-/// page row — do not disagree with each other.
+/// implementation that reads the page at all. What a second writer *can* show
+/// is in `a_review_meeting_a_foreign_writer_marks_nothing` above; this one pins
+/// that the three places the mark is written — receipt, truth state, and page
+/// row — do not disagree with each other.
 #[tokio::test]
 async fn the_receipt_records_the_version_and_digest_that_were_marked() {
     let (db, root) = db().await;

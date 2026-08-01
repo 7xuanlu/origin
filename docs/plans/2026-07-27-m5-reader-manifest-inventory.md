@@ -847,8 +847,11 @@ edges a name scan cannot attribute.
   (`DEPTH_TITLES`), not a claim that nothing lies past it. It was 2 until a
   four-name chain — `handle_review_page` over `review_page_with_presence` over
   `review_in_txn` over the `pages` SELECT — left the endpoint itself off the
-  list. Raising it added 75 rows, 28 of them route handlers, so the gap was a
-  class rather than one route.
+  list. Raising it added 75 rows, 29 of them in `wenlan-server`, and 23 of those
+  are handlers registered on a route (checked against
+  `route_registry/handler_manifest.txt`), so the gap was a class rather than one
+  route. Those tallies were measured once, when the cap was raised; re-derive
+  them from `--json` rather than trusting them later.
 - **Not a safety property.** Internal-only means no *current* caller crosses the
   crate boundary, which one `pub` re-export changes.
 

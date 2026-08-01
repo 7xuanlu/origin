@@ -38,8 +38,16 @@ The depth is DEPTH_TITLES, and it reaches 3 because a two-deep closure stopped
 one hop short of the HTTP handler on several routes. `handle_review_page` calls
 `review_page_with_presence` calls `review_in_txn` calls the `pages` SELECT: four
 names, so at depth 2 the endpoint — the thing an external reader most wants to
-find — was absent rather than listed. Raising it to 3 surfaced 75 rows, 28 of
-them route handlers. This is a parameter, not a claim that nothing lies past it.
+find — was absent rather than listed. This is a parameter, not a claim that
+nothing lies past it.
+
+Measured once, when the cap was raised: depth 3 added 75 rows, 29 of them in
+wenlan-server, and 23 of those 29 are handlers actually registered on a route
+(cross-checked by name against
+crates/wenlan-server/src/route_registry/handler_manifest.txt; the other six are
+`run_daemon`, two page-map helpers, two scheduler functions, and a source-sync
+function). A one-time measurement, not a maintained figure — re-derive it from
+--json rather than trusting these numbers later.
 
 EXPOSURE: a reader is an exposure path iff it is `pub` (unqualified — not
 `pub(crate)` / `pub(super)`) AND called from outside wenlan-core. Caller edges
