@@ -717,22 +717,17 @@ async fn an_unjudged_page_keeps_its_file_after_the_cutover() {
 /// The version and digest are not decoration: migration 98's CHECK refuses a
 /// review that does not name the exact page version and bytes a person signed
 /// off, which is what stops "reviewed" from being a sticky bit someone sets once.
+/// The read now enforces the same thing the CHECK does — see the sibling test
+/// below — so this fixture records the digest of the text p2 actually holds
+/// rather than a placeholder.
 #[tokio::test]
 async fn a_human_reviewed_page_keeps_its_file_after_a_failed_judgement() {
     let (db, _tmp) = db_with_truth_rows().await;
-    {
-        let conn = db.test_primary_session().await;
-        let digest = crate::provenance::revision_content_digest(FIXTURE_PAGE_BODY);
-        conn.execute(
-            "UPDATE page_truth_state
-                SET human_reviewed=1, reviewed_page_version=1,
-                    reviewed_page_digest=?1
-              WHERE page_id='p2'",
-            libsql::params![digest],
-        )
-        .await
-        .unwrap();
-    }
+    approve_p2(
+        &db,
+        &crate::provenance::revision_content_digest(FIXTURE_PAGE_BODY),
+    )
+    .await;
     let root = tempfile::tempdir().unwrap();
     let projection = project_all(&db, root.path());
     db.set_truth_cutover_generation(1).await.unwrap();
@@ -746,6 +741,47 @@ async fn a_human_reviewed_page_keeps_its_file_after_a_failed_judgement() {
         readable_pages(root.path()),
         ["p1", "p2"],
         "p2 failed the same judgement p3 did, and a person had already approved it"
+    );
+}
+
+/// Record a human approval of p2 naming `digest` as the text that was read.
+async fn approve_p2(db: &MemoryDB, digest: &str) {
+    let conn = db.test_primary_session().await;
+    conn.execute(
+        "UPDATE page_truth_state
+            SET human_reviewed=1, reviewed_page_version=1,
+                reviewed_page_digest=?1
+          WHERE page_id='p2'",
+        libsql::params![digest],
+    )
+    .await
+    .unwrap();
+}
+
+/// The other half, and the one that makes human authority a fact rather than a
+/// flag: an approval that names text the page no longer holds grants nothing.
+///
+/// Human review OUTRANKS a failed machine judgement, so an unverifiable approval
+/// is the strongest stale claim in the system — it keeps a file that every other
+/// signal says should go. Trusting the raw bit made "reviewed" exactly the sticky
+/// bit the schema CHECK was written to prevent, just set one layer up.
+#[tokio::test]
+async fn a_human_approval_of_text_the_page_no_longer_holds_keeps_nothing() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    approve_p2(&db, "a digest of some text this page does not hold").await;
+    let root = tempfile::tempdir().unwrap();
+    let projection = project_all(&db, root.path());
+    db.set_truth_cutover_generation(1).await.unwrap();
+
+    projection
+        .enforce_projection_directory_invariant(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        readable_pages(root.path()),
+        ["p1"],
+        "an approval that cannot be checked against the live page is not authority"
     );
 }
 

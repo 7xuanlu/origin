@@ -520,16 +520,27 @@ pub(super) async fn prepare_startup_state(
     // EXTRACTOR_VERSION, a new binary's SUPPORT_THRESHOLD, and an interrupted
     // migration — are all things that change across a restart and not during
     // one. Everything that moves while the daemon runs already has a trigger.
-    match db_arc.drain_stale_derivation_jobs(500).await {
-        Ok(0) => {}
-        Ok(enqueued) => tracing::info!(
-            "[truth] claim-derivation backlog: {enqueued} page(s) enqueued for derivation"
-        ),
-        // Not fatal: an un-swept backlog leaves pages underived, and an
-        // underived page is `Unevaluated` — it keeps its file and reads as
-        // unjudged, which is the honest state. Refusing to serve over it would
-        // trade a true "we have not looked yet" for an outage.
-        Err(e) => tracing::warn!("[truth] claim-derivation backlog sweep failed: {e}"),
+    //
+    // Fenced, because the drain WRITES. Repair recovery opens the database
+    // through `open_for_repair`, which deliberately performs no ordinary
+    // constructor side effect, and the whole point of that mode is that an
+    // operator inspecting or repairing a damaged database sees only what the
+    // repair itself does. The drain deletes stale `done` jobs and inserts
+    // pending ones, so leaving it unfenced put queue mutations into exactly the
+    // startup that promised none. The backlog is not lost — it is a boot-time
+    // sweep, so the next ordinary start performs it.
+    if !repair_recovery_pending {
+        match db_arc.drain_stale_derivation_jobs(500).await {
+            Ok(0) => {}
+            Ok(enqueued) => tracing::info!(
+                "[truth] claim-derivation backlog: {enqueued} page(s) enqueued for derivation"
+            ),
+            // Not fatal: an un-swept backlog leaves pages underived, and an
+            // underived page is `Unevaluated` — it keeps its file and reads as
+            // unjudged, which is the honest state. Refusing to serve over it
+            // would trade a true "we have not looked yet" for an outage.
+            Err(e) => tracing::warn!("[truth] claim-derivation backlog sweep failed: {e}"),
+        }
     }
 
     // Load intelligence config

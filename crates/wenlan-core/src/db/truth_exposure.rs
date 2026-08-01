@@ -336,12 +336,10 @@ impl MemoryDB {
     /// fully visible on the strength of an approval of text nobody can see any
     /// more.
     ///
-    /// So the review is in force only while `reviewed_page_digest` still matches
-    /// the page's current content. An edited page falls back to unreviewed by
-    /// itself, and back to whatever its machine verdict earns it — fail-closed,
-    /// with no new write path and nothing to migrate. Restoring the exact text
-    /// restores the review, which is right: the receipt is about content, not
-    /// about a version counter that only ever climbs.
+    /// So the review is in force only while both `reviewed_page_version` and
+    /// `reviewed_page_digest` still match the current page. An edited page falls
+    /// back to unreviewed by itself, and back to whatever its machine verdict
+    /// earns it — fail-closed, with no new write path and nothing to migrate.
     ///
     /// Content is pulled only for rows that claim a review, so the ordinary page
     /// carries no extra cost.
@@ -387,11 +385,13 @@ impl MemoryDB {
                 .join(", ");
             let sql = format!(
                 "SELECT t.page_id, t.support_status, t.human_reviewed, t.evaluated_at,
-                        t.reviewed_page_digest,
-                        CASE WHEN t.human_reviewed = 1 THEN p.content END,
-                        t.page_version, p.version
+                        t.page_version, p.version, p.content,
+                        t.reviewed_page_version, t.reviewed_page_digest,
+                        m.page_version_digest
                    FROM page_truth_state t
                    LEFT JOIN pages p ON p.id = t.page_id
+                   LEFT JOIN claim_derivation_markers m
+                     ON m.page_id = t.page_id AND m.page_version = t.page_version
                   WHERE t.page_id IN ({placeholders})"
             );
             let params = chunk
@@ -429,33 +429,58 @@ impl MemoryDB {
                 // "unknown is not a judgement" rule as the column above, applied
                 // to the question of whether the judgement is still about this
                 // text.
-                let judged_version: Option<i64> = row.get(6).unwrap_or(None);
-                let live_version: Option<i64> = row.get(7).unwrap_or(None);
-                let describes_live_text = match (judged_version, live_version) {
+                let judged_version: Option<i64> = row.get(4).unwrap_or(None);
+                let live_version: Option<i64> = row.get(5).unwrap_or(None);
+                let live_content: Option<String> = row.get(6).unwrap_or(None);
+                let reviewed_version: Option<i64> = row.get(7).unwrap_or(None);
+                let reviewed_digest: Option<String> = row.get(8).unwrap_or(None);
+                // The digest the derivation marker recorded for the version this
+                // verdict was reached on. The version number alone cannot see a
+                // same-version content replacement: an edit that rewrites the
+                // prose without bumping `version` leaves a verdict about text
+                // the page no longer holds, and the numbers still agree.
+                let marker_digest: Option<String> = row.get(9).unwrap_or(None);
+                let live_digest = live_content
+                    .as_deref()
+                    .map(crate::provenance::revision_content_digest);
+                let versions_agree = match (judged_version, live_version) {
                     (Some(judged), Some(live)) => judged == live,
                     _ => true,
                 };
+                // Applied only where a marker exists. `evaluated_at` is what
+                // separates judged from unjudged for every row migration 99
+                // backfilled, and those rows have no marker; demanding one here
+                // would reclassify them wholesale rather than close the hole
+                // this check is for. Where a real derivation published a
+                // verdict, finalization required a matching marker, so the
+                // marker is present exactly when there is something to verify.
+                let text_agrees = match (&marker_digest, &live_digest) {
+                    (Some(marker), Some(live)) => marker == live,
+                    _ => true,
+                };
+                let describes_live_text = versions_agree && text_agrees;
                 let support = match (status.as_str(), evaluated_at) {
                     _ if !describes_live_text => crate::truth_contract::Support::Unevaluated,
                     ("supported", _) => crate::truth_contract::Support::Supported,
                     (_, Some(_)) => crate::truth_contract::Support::Unsupported,
                     (_, None) => crate::truth_contract::Support::Unevaluated,
                 };
-                // Fail closed on both halves: a NULL digest and a page that is
-                // no longer there both read as unreviewed. The schema's CHECK
-                // already forbids a `human_reviewed = 1` row without a digest
-                // (`claim_identity.rs`), so the NULL arm is unreachable through
-                // any current write path -- it is here so that stays true even
-                // if some future one forgets.
-                let reviewed_digest: Option<String> = row.get(4).unwrap_or(None);
-                let live_content: Option<String> = row.get(5).unwrap_or(None);
+                // Human approval outranks every machine verdict
+                // (`truth_contract::visible_at` returns Full on it alone), which
+                // is exactly why it may not be trusted raw. A person approves a
+                // SPECIFIC text: the schema stores the version and digest they
+                // approved, and the CHECK constraint guarantees both are present
+                // whenever the flag is set. Unlike the machine axis above, an
+                // unverifiable approval is DENIED rather than waved through --
+                // granting perpetual visibility on an unreadable page or an
+                // absent digest is the fail-open direction, and the fallback is
+                // merely the machine state, never a deletion.
                 let human_reviewed = reviewed == 1
-                    && match (reviewed_digest, live_content) {
-                        (Some(recorded), Some(content)) => {
-                            recorded == crate::provenance::revision_content_digest(&content)
-                        }
-                        _ => false,
-                    };
+                    && matches!((reviewed_version, live_version), (Some(a), Some(b)) if a == b)
+                    && matches!(
+                        (reviewed_digest.as_deref(), live_digest.as_deref()),
+                        (Some(a), Some(b)) if a == b
+                    );
                 out.insert(
                     page_id,
                     PageTruth {

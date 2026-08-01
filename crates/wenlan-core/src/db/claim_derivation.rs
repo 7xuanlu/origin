@@ -180,6 +180,37 @@ fn pages_supported_by_memory(memory_ref: &str) -> String {
     )
 }
 
+/// The pages whose claims are supported by one *chunk* of one memory.
+///
+/// N1's subject. A `source_id` names a document and a document is several
+/// `memories` rows, so "this memory is gone" and "the chunk this verdict read is
+/// gone" are different events — and the second is the one a support edge is
+/// actually about. The existing whole-source triggers deliberately fire only
+/// when the LAST row for a source disappears, which is correct for what they
+/// guard and blind to a merge or update that drops chunk 1 and keeps chunk 0.
+///
+/// The chunk comes out of the edge payload rather than a column, because that is
+/// where `write_support_edge` records the chunk it verified; the same value is
+/// the leading field of the edge's span locator.
+///
+/// Not scoped to `valid_until IS NULL`, for the reason
+/// [`pages_supported_by_memory`] gives at length: trigger order is undefined, so
+/// a validity filter would make this find every affected page or none depending
+/// on which trigger SQLite happened to run first.
+fn pages_supported_by_memory_chunk(memory_ref: &str, chunk_ref: &str) -> String {
+    format!(
+        "SELECT c.page_id
+                       FROM edges e
+                       JOIN claim_revisions cr ON cr.claim_revision_id = e.src_id
+                       JOIN claims c ON c.claim_id = cr.claim_id
+                      WHERE e.edge_type = 'supports'
+                        AND e.src_kind = 'claim_revision'
+                        AND e.dst_kind = 'memory'
+                        AND e.dst_id = {memory_ref}
+                        AND json_extract(e.payload, '$.chunk_index') = {chunk_ref}"
+    )
+}
+
 /// Demote the named pages out of `supported`, then queue them for re-derivation.
 ///
 /// **Demotion is synchronous and enqueueing is not enough on its own.** Row 13
@@ -206,6 +237,17 @@ fn support_demotion_body(affected_pages: &str) -> String {
                         updated_at = CAST(strftime('%s','now') AS INTEGER)
                   WHERE support_status = 'supported'
                     AND page_id IN ({affected_pages});
+
+                 -- The conclusions this run reached were about candidates that
+                 -- have just changed, so they are not conclusions about the
+                 -- candidate set the re-derivation will face. Leaving them
+                 -- would make the next run read the claim as judged-and-found-
+                 -- wanting -- `Refuted`, which costs the page its file -- on
+                 -- the strength of a judgement about evidence that is gone.
+                 -- Clearing them returns the claim to never-judged, which is
+                 -- the same Unevaluated fail-safe the demotion above chose.
+                 DELETE FROM claim_judgment_attempts
+                  WHERE page_id IN ({affected_pages});
 
                  INSERT INTO claim_derivation_jobs
                      (job_id, page_id, page_version, status, attempts, created_at, updated_at)
@@ -319,10 +361,72 @@ impl MemoryDB {
              CREATE TRIGGER IF NOT EXISTS m5_demote_support_on_page_space_move
              AFTER UPDATE OF space ON pages
              WHEN NEW.space IS NOT OLD.space
-             BEGIN{page_move_body}END;",
+             BEGIN{page_move_body}END;
+
+             -- Matrix row 8, the synchronous half. The enqueue trigger queues
+             -- the re-derivation an edited page needs; it does not touch
+             -- `page_truth_state`, so until a worker runs the page goes on
+             -- exposing a verdict about text it no longer holds.
+             --
+             -- The WHEN mirrors `m5_page_update_enqueues_derivation` exactly, so
+             -- the work and the demotion are triggered by the same event and
+             -- cannot disagree about what counts as an edit. `NEW.content IS NOT
+             -- OLD.content` is byte comparison rather than a digest comparison:
+             -- SQLite cannot hash, and it does not need to -- comparing the
+             -- bytes themselves is strictly stronger than comparing digests of
+             -- them, and it catches the same-version content replacement that a
+             -- version check alone cannot see.
+             CREATE TRIGGER IF NOT EXISTS m5_demote_support_on_page_edit
+             AFTER UPDATE ON pages
+             WHEN NEW.status = 'active' AND NEW.kind <> 'entity'
+                  AND (NEW.version IS NOT OLD.version
+                       OR NEW.content IS NOT OLD.content
+                       OR OLD.status <> 'active')
+             BEGIN{page_edit_body}END;
+
+             -- N1. A verdict cites a CHUNK, so losing that chunk is losing the
+             -- evidence even when the document survives. The whole-source
+             -- triggers above fire only when the last row for a source_id goes,
+             -- which is right for what they guard and blind to an update or
+             -- merge that deletes chunk 1 and keeps chunk 0.
+             CREATE TRIGGER IF NOT EXISTS m5_demote_support_on_chunk_delete
+             BEFORE DELETE ON memories
+             WHEN EXISTS (
+                      SELECT 1 FROM edges
+                       WHERE edge_type = 'supports' AND src_kind = 'claim_revision'
+                         AND lineage = 'evidence'
+                         AND dst_id = OLD.source_id
+                         AND json_extract(payload, '$.chunk_index') = OLD.chunk_index
+                  )
+             BEGIN{chunk_delete_body}END;
+
+             -- And the same chunk surviving with different bytes in it. The
+             -- span offsets a verdict recorded index into a string that is no
+             -- longer there, so the citation is stale even though every row the
+             -- edge names still exists.
+             CREATE TRIGGER IF NOT EXISTS m5_demote_support_on_chunk_edit
+             AFTER UPDATE OF content ON memories
+             WHEN NEW.content IS NOT OLD.content
+              AND EXISTS (
+                      SELECT 1 FROM edges
+                       WHERE edge_type = 'supports' AND src_kind = 'claim_revision'
+                         AND lineage = 'evidence'
+                         AND dst_id = NEW.source_id
+                         AND json_extract(payload, '$.chunk_index') = NEW.chunk_index
+                  )
+             BEGIN{chunk_edit_body}END;",
             delete_body = support_demotion_body(&pages_supported_by_memory("OLD.source_id")),
             memory_move_body = support_demotion_body(&pages_supported_by_memory("NEW.source_id")),
             page_move_body = support_demotion_body("SELECT NEW.id"),
+            page_edit_body = support_demotion_body("SELECT NEW.id"),
+            chunk_delete_body = support_demotion_body(&pages_supported_by_memory_chunk(
+                "OLD.source_id",
+                "OLD.chunk_index"
+            )),
+            chunk_edit_body = support_demotion_body(&pages_supported_by_memory_chunk(
+                "NEW.source_id",
+                "NEW.chunk_index"
+            )),
         ))
         .await
         .map_err(|error| {
@@ -425,6 +529,43 @@ impl MemoryDB {
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("derivation drift enqueue: {error}")))?;
+
+        // Demote NOW, not when a worker eventually reaches the job just queued.
+        // Queueing answers "when will we know again"; it does not answer "what
+        // do we say in the meantime", and until something answers the second the
+        // page goes on asserting `supported` on evidence that stopped
+        // qualifying. With no producer on this branch, "eventually" is never —
+        // the same argument [`support_demotion_body`] makes for row 13, reached
+        // here from the scan rather than from a trigger.
+        //
+        // Strictly after the enqueue above, because being `supported` is part of
+        // what makes a page drifted: demoting first empties
+        // [`DRIFTED_SUPPORTED_PAGES`] and the re-derivation is never queued at
+        // all. The two statements are ordered, not merely adjacent.
+        //
+        // `evaluated_at = NULL` for the same reason it is NULL there: the page
+        // lands on `Unevaluated`, so it keeps its projected file. We have stopped
+        // asserting the evidence backs the prose without asserting that it does
+        // not, which is the honest state when the bar moved under a stored
+        // verdict.
+        conn.execute(
+            &format!(
+                "UPDATE page_truth_state
+                    SET support_status = 'provisional',
+                        provisional_reason = 'supporting evidence no longer clears the \
+                                              threshold; this page needs re-derivation',
+                        evaluated_at = NULL,
+                        updated_at = ?2
+                  WHERE support_status = 'supported'
+                    AND (page_id, page_version) IN (
+                        SELECT drifted_page_id, drifted_page_version
+                          FROM ({DRIFTED_SUPPORTED_PAGES})
+                    )"
+            ),
+            libsql::params![SUPPORT_THRESHOLD, now],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("derivation drift demotion: {error}")))?;
 
         Ok((created + re_derive) as usize)
     }
@@ -596,14 +737,18 @@ impl MemoryDB {
     ///    `Unevaluated`. See `empty_inventory_is_unevaluated_not_refuted` for
     ///    why this is not `Refuted`.
     /// 3. Every active claim revision in the inventory has at least one
-    ///    `supports` edge that is simultaneously active and above threshold.
-    ///    Failure → `Refuted`. This is the one condition whose failure is a
-    ///    verdict, because reaching it means the derivation ran, the claims are
-    ///    real, and the evidence was looked for and was not there.
+    ///    `supports` edge that is active, above threshold, and still
+    ///    revalidates against the evidence it names — see
+    ///    [`Self::revalidate_support_edge`]. Failure → `Refuted`. This is the
+    ///    one condition whose failure is a verdict, because reaching it means
+    ///    the derivation ran, the claims are real, and the evidence was looked
+    ///    for and was not there.
     /// 4. No revision is in a deferred, timed-out, or malformed support state.
-    ///    Detected as a membership count that disagrees with the marker's own
-    ///    `inventory_count` — the on-disk signature of a derivation that stopped
-    ///    partway. Failure → `NoPublish` (row 6).
+    ///    Detected twice, because there are two ways to stop partway: a
+    ///    membership count that disagrees with the marker's own
+    ///    `inventory_count` (extraction stopped), and a `claim_judgment_attempts`
+    ///    row this run never concluded (judging stopped). Failure → `NoPublish`
+    ///    (row 6).
     ///
     /// **Known gap, condition 3.** The matrix also requires the supporting edge
     /// to come from a "currently-eligible model version" (row 14). No model
@@ -619,6 +764,176 @@ impl MemoryDB {
     ) -> Result<SupportOutcome, WenlanError> {
         let conn = self.conn.lock().await;
         Self::evaluate_support_on(&conn, page_id, page_version).await
+    }
+
+    /// Re-run §4a's evidence checks against the bytes that are there NOW.
+    ///
+    /// [`Self::write_support_edge`] runs exactly these checks before it will
+    /// create an edge, which establishes that the citation was true at write
+    /// time and nothing beyond that. An edge is a durable record and evidence
+    /// is mutable, so the interval between those two moments is where a
+    /// support edge goes wrong: the chunk it names can be deleted while its
+    /// document survives, be rewritten in place, or be renumbered, and none of
+    /// that touches the edge's own `valid_until`. `valid_until IS NULL` means
+    /// nobody retracted this edge — never that what it cites is still there.
+    ///
+    /// Publication reads a support edge as truth, so publication re-earns it.
+    /// Everything unverifiable is a refusal: a payload missing the fields that
+    /// say WHICH bytes were judged cannot be checked against those bytes, and
+    /// unknown is not true.
+    ///
+    /// Returns the reason the edge no longer holds, or `None` when it does.
+    async fn revalidate_support_edge(
+        conn: &libsql::Connection,
+        memory_source_id: &str,
+        root_id: Option<&str>,
+        payload: &str,
+    ) -> Result<Option<String>, WenlanError> {
+        let Some(root_id) = root_id else {
+            return Ok(Some(format!(
+                "support edge on {memory_source_id} names no provenance root"
+            )));
+        };
+        let payload: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Some(format!(
+                    "support edge on {memory_source_id} has an unreadable payload: {error}"
+                )));
+            }
+        };
+        let (Some(chunk_index), Some(source_version), Some(span_start), Some(span_end)) = (
+            payload["chunk_index"].as_i64(),
+            payload["source_version"].as_i64(),
+            payload["span_start"].as_i64(),
+            payload["span_end"].as_i64(),
+        ) else {
+            return Ok(Some(format!(
+                "support edge on {memory_source_id} does not record which bytes it judged"
+            )));
+        };
+        let Some(span_digest) = payload["span_digest"].as_str() else {
+            return Ok(Some(format!(
+                "support edge on {memory_source_id} records no span digest"
+            )));
+        };
+
+        // The evidence row, addressed by CHUNK. Two rows is a refusal for the
+        // reason `write_support_edge` gives at length: nothing makes
+        // `(source_id, chunk_index)` unique, and choosing one of two candidates
+        // would be the silent arbitrary pick the chunk index exists to remove.
+        let (content, live_version) = {
+            let mut rows = conn
+                .query(
+                    "SELECT content, COALESCE(version, 1) FROM memories
+                      WHERE source_id = ?1 AND chunk_index = ?2 LIMIT 2",
+                    libsql::params![memory_source_id, chunk_index],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("support revalidation memory: {error}"))
+                })?;
+            let Some(row) = rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("support revalidation memory decode: {error}"))
+            })?
+            else {
+                return Ok(Some(format!(
+                    "the evidence is gone: {memory_source_id} has no chunk {chunk_index}"
+                )));
+            };
+            let content: String = row.get(0).map_err(|error| {
+                WenlanError::VectorDb(format!("support revalidation memory decode: {error}"))
+            })?;
+            let live_version: i64 = row.get(1).map_err(|error| {
+                WenlanError::VectorDb(format!("support revalidation memory decode: {error}"))
+            })?;
+            if rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("support revalidation memory decode: {error}"))
+                })?
+                .is_some()
+            {
+                return Ok(Some(format!(
+                    "the evidence is ambiguous: {memory_source_id} now has more than one chunk \
+                     {chunk_index}"
+                )));
+            }
+            (content, live_version)
+        };
+
+        if live_version != source_version {
+            return Ok(Some(format!(
+                "the evidence moved on: the verdict read version {source_version} of \
+                 {memory_source_id}, which is at version {live_version}"
+            )));
+        }
+
+        // `get` rather than `[..]`: these are byte offsets into text that may
+        // have changed under us, so a boundary that no longer lands on a char
+        // is a refusal, never a panic.
+        let start = usize::try_from(span_start).unwrap_or(usize::MAX);
+        let end = usize::try_from(span_end).unwrap_or(usize::MAX);
+        let Some(span) = content.get(start..end) else {
+            return Ok(Some(format!(
+                "the cited span [{start}, {end}) is no longer a valid span of {memory_source_id}"
+            )));
+        };
+        if crate::provenance::revision_content_digest(span) != span_digest {
+            return Ok(Some(format!(
+                "the text changed: the bytes at [{start}, {end}) in {memory_source_id} are not \
+                 the ones this verdict judged"
+            )));
+        }
+
+        // §5. Roots are content-addressed, so this binding is recomputable from
+        // the evidence's own bytes — which is what makes it a check here rather
+        // than a fact taken on trust from write time.
+        let mut rows = conn
+            .query(
+                "SELECT identity_version, identity_digest, root_kind, status
+                   FROM provenance_roots WHERE root_id = ?1",
+                libsql::params![root_id],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("support revalidation root: {error}"))
+            })?;
+        let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("support revalidation root decode: {error}"))
+        })?
+        else {
+            return Ok(Some(format!("provenance root {root_id} is gone")));
+        };
+        let identity_version: i64 = row.get(0).map_err(|error| {
+            WenlanError::VectorDb(format!("support revalidation root decode: {error}"))
+        })?;
+        let identity_digest: String = row.get(1).map_err(|error| {
+            WenlanError::VectorDb(format!("support revalidation root decode: {error}"))
+        })?;
+        let root_kind: String = row.get(2).map_err(|error| {
+            WenlanError::VectorDb(format!("support revalidation root decode: {error}"))
+        })?;
+        let status: String = row.get(3).map_err(|error| {
+            WenlanError::VectorDb(format!("support revalidation root decode: {error}"))
+        })?;
+        if status != "active" {
+            return Ok(Some(format!("provenance root {root_id} is now '{status}'")));
+        }
+        if identity_version != crate::provenance::IDENTITY_VERSION {
+            return Ok(Some(format!(
+                "provenance root {root_id} was recorded under identity version \
+                 {identity_version}, which this code cannot recompute"
+            )));
+        }
+        if crate::provenance::identity_digest(&root_kind, &content) != identity_digest {
+            return Ok(Some(format!(
+                "provenance root {root_id} no longer identifies the evidence at {memory_source_id}"
+            )));
+        }
+
+        Ok(None)
     }
 
     /// [`Self::evaluate_page_support`] over a connection the caller already
@@ -767,66 +1082,154 @@ impl MemoryDB {
             });
         }
 
-        // Condition 3, split by WHY a claim is unsupported. `provisional`
-        // conflates two situations that call for opposite responses, and the
+        // Condition 3, one claim at a time. Deciding it needs two things SQL
+        // cannot do — reading a span back out of live bytes, and recomputing a
+        // provenance identity digest — so the scan gathers candidates and the
+        // judgement happens here.
+        //
+        // Per claim, in descending order of what we actually know:
+        //
+        //   supported    -- at least one active, above-threshold support edge
+        //                   that STILL revalidates against current evidence.
+        //   incomplete   -- no such edge, and this run left some candidate
+        //                   without a conclusion. The run has not finished.
+        //   never judged -- no such edge, and no candidate was ever weighed. We
+        //                   have not looked at this claim at all.
+        //   judged short -- no such edge, and every candidate concluded. That
+        //                   IS a verdict about the evidence.
+        //
+        // The bottom three are what `provisional` alone conflates, and the
         // split has to reach the STORED reason or the distinction dies at the
-        // point a human would use it:
-        //
-        //   never judged -- no judge has ever scored this claim's text. The
-        //                   gathering or judging step did not happen, so we have
-        //                   not weighed this page at all.
-        //   judged short -- a judge scored this text and nothing cleared the
-        //                   bar. That IS a verdict about the evidence.
-        //
-        // The discriminator is a row in `entailment_cache` for the claim's
-        // canonical text digest, which exists if and only if some judge scored
-        // that exact text under some model and prompt.
-        let (never_judged, judged_short): (i64, i64) =
+        // point a human would use it.
+        let claim_revision_ids: Vec<String> =
             {
                 let mut rows = conn
                     .query(
-                        "SELECT
-                         SUM(CASE WHEN ec.hit IS NULL THEN 1 ELSE 0 END),
-                         SUM(CASE WHEN ec.hit IS NULL THEN 0 ELSE 1 END)
-                       FROM page_version_claims pvc
-                       JOIN claim_revisions cr
-                         ON cr.claim_revision_id = pvc.claim_revision_id
-                       LEFT JOIN (
-                           SELECT DISTINCT claim_text_digest AS digest, 1 AS hit
-                             FROM entailment_cache
-                       ) ec ON ec.digest = cr.canonical_text_digest
-                      WHERE pvc.page_id = ?1 AND pvc.page_version = ?2
-                        AND NOT EXISTS (
-                            SELECT 1 FROM edges e
-                             WHERE e.edge_type = 'supports'
-                               AND e.src_kind = 'claim_revision'
-                               AND e.src_id = pvc.claim_revision_id
-                               AND e.valid_until IS NULL
-                               AND e.superseded_by IS NULL
-                               AND json_extract(e.payload, '$.score') >= ?3
-                        )",
-                        libsql::params![page_id, page_version, SUPPORT_THRESHOLD],
+                        "SELECT claim_revision_id FROM page_version_claims
+                      WHERE page_id = ?1 AND page_version = ?2",
+                        libsql::params![page_id, page_version],
                     )
                     .await
                     .map_err(|error| WenlanError::VectorDb(format!("support scan: {error}")))?;
-                match rows.next().await.map_err(|error| {
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next().await.map_err(|error| {
                     WenlanError::VectorDb(format!("support scan decode: {error}"))
                 })? {
-                    Some(row) => (
-                        row.get::<Option<i64>>(0)
-                            .map_err(|error| {
-                                WenlanError::VectorDb(format!("support scan decode: {error}"))
-                            })?
-                            .unwrap_or(0),
-                        row.get::<Option<i64>>(1)
-                            .map_err(|error| {
-                                WenlanError::VectorDb(format!("support scan decode: {error}"))
-                            })?
-                            .unwrap_or(0),
-                    ),
+                    ids.push(row.get::<String>(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("support scan decode: {error}"))
+                    })?);
+                }
+                ids
+            };
+
+        let (mut never_judged, mut judged_short, mut incomplete) = (0i64, 0i64, 0i64);
+        for claim_revision_id in &claim_revision_ids {
+            let candidates: Vec<(String, Option<String>, String)> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT e.dst_id, e.root_id, e.payload FROM edges e
+                          WHERE e.edge_type = 'supports'
+                            AND e.src_kind = 'claim_revision'
+                            AND e.dst_kind = 'memory'
+                            AND e.src_id = ?1
+                            AND e.valid_until IS NULL
+                            AND e.superseded_by IS NULL
+                            AND json_extract(e.payload, '$.score') >= ?2",
+                        libsql::params![claim_revision_id.clone(), SUPPORT_THRESHOLD],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support candidate scan: {error}"))
+                    })?;
+                let mut found = Vec::new();
+                while let Some(row) = rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("support candidate decode: {error}"))
+                })? {
+                    let decode =
+                        |error| WenlanError::VectorDb(format!("support candidate decode: {error}"));
+                    found.push((
+                        row.get::<String>(0).map_err(decode)?,
+                        row.get::<Option<String>>(1).map_err(decode)?,
+                        row.get::<String>(2).map_err(decode)?,
+                    ));
+                }
+                found
+            };
+
+            let mut supported = false;
+            for (dst_id, root_id, payload) in &candidates {
+                if Self::revalidate_support_edge(conn, dst_id, root_id.as_deref(), payload)
+                    .await?
+                    .is_none()
+                {
+                    supported = true;
+                    break;
+                }
+            }
+            if supported {
+                continue;
+            }
+
+            // No live evidence, so the question becomes what this RUN managed
+            // to do about this claim — which `entailment_cache` cannot answer,
+            // being global and timeless. See `claim_judgment_attempts`.
+            let (attempted, unconcluded): (i64, i64) = {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*),
+                                SUM(CASE WHEN outcome <> 'concluded' THEN 1 ELSE 0 END)
+                           FROM claim_judgment_attempts
+                          WHERE page_id = ?1 AND page_version = ?2
+                            AND claim_revision_id = ?3",
+                        libsql::params![page_id, page_version, claim_revision_id.clone()],
+                    )
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("support attempts: {error}")))?;
+                match rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("support attempts decode: {error}"))
+                })? {
+                    Some(row) => {
+                        let decode = |error| {
+                            WenlanError::VectorDb(format!("support attempts decode: {error}"))
+                        };
+                        (
+                            row.get::<i64>(0).map_err(decode)?,
+                            row.get::<Option<i64>>(1).map_err(decode)?.unwrap_or(0),
+                        )
+                    }
                     None => (0, 0),
                 }
             };
+
+            if unconcluded > 0 {
+                incomplete += 1;
+            } else if attempted == 0 {
+                never_judged += 1;
+            } else {
+                judged_short += 1;
+            }
+        }
+
+        // Row 6, the no-publication-on-incomplete-derivation invariant. A
+        // candidate with no conclusion means the run is still in flight, so
+        // nothing about it may be published — not even `Unevaluated`, which is
+        // itself a statement that we looked and came up empty. Ranked above
+        // never-judged because a run that started and stalled is a stronger
+        // reason to write nothing than one that never began.
+        //
+        // This is the case a cache-row discriminator gets wrong and gets wrong
+        // in the worst direction: one candidate concludes short, another times
+        // out, the cache has a row either way, and the claim reads as fully
+        // judged with no support — which is `Refuted`, which costs the page its
+        // file for evaluation that never actually finished.
+        if incomplete > 0 {
+            return Ok(SupportOutcome::NoPublish {
+                reason: format!(
+                    "incomplete derivation: {incomplete} of {inventory_count} claim(s) have a \
+                     candidate this run never concluded on"
+                ),
+            });
+        }
 
         // A claim nobody has judged means the derivation has not run to
         // completion over this inventory, whatever the marker says about

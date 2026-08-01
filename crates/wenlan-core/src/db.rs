@@ -11889,6 +11889,12 @@ impl MemoryDB {
                 .transaction()
                 .await
                 .map_err(|error| WenlanError::VectorDb(format!("m105 begin: {error}")))?;
+            // Re-run 98's table ensure. Every statement in it is
+            // `IF NOT EXISTS`, so this is a no-op on a database that already
+            // has the claim-identity substrate -- and it is what carries
+            // `claim_judgment_attempts` onto one that passed 98 before that
+            // table existed.
+            Self::ensure_claim_identity_tables(&tx).await?;
             Self::ensure_claim_derivation_triggers(&tx).await?;
             Self::ensure_support_invalidation_triggers(&tx).await?;
             tx.commit()

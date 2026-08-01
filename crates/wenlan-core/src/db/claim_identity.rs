@@ -281,6 +281,41 @@ impl MemoryDB {
             CREATE INDEX IF NOT EXISTS idx_entailment_cache_scored_at
                 ON entailment_cache(scored_at);
 
+            -- Which candidates THIS run had to weigh, and how far each got.
+            --
+            -- `entailment_cache` cannot answer that question and was never
+            -- meant to. It is keyed by content digests alone, so it is global
+            -- and timeless: a row means some judge once scored this text
+            -- against this span, with no way back to which run required it or
+            -- whether the run finished. Reading a cache hit as this-claim-has-
+            -- been-judged therefore lets a run that concluded on one candidate
+            -- and timed out on another read as fully judged -- and a claim that
+            -- is fully judged with no qualifying edge is Refuted, which costs
+            -- the page its file for evaluation that never finished.
+            --
+            -- The run is (page_id, page_version) -- the same pair that names a
+            -- derivation job. `candidate_digest` is the source span digest of
+            -- the evidence weighed, so the row set IS the candidate set: one
+            -- row per candidate the run was required to conclude on. Absence
+            -- of rows is therefore meaningful and fail-closed -- never judged,
+            -- not judged-and-found-wanting.
+            --
+            -- `outcome` is a whitelist of two, and 'deferred' deliberately
+            -- covers timed-out, errored, and malformed alike: they differ in
+            -- how they happened and not at all in what they mean here, which
+            -- is that this candidate has no conclusion. A third value would
+            -- add a distinction no reader acts on.
+            CREATE TABLE IF NOT EXISTS claim_judgment_attempts (
+                page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                page_version INTEGER NOT NULL,
+                claim_revision_id TEXT NOT NULL
+                    REFERENCES claim_revisions(claim_revision_id) ON DELETE CASCADE,
+                candidate_digest TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('concluded','deferred')),
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (page_id, page_version, claim_revision_id, candidate_digest)
+            );
+
             -- The two truth axes, independent by construction. support_status
             -- is the machine axis and is a whitelist -- an unanticipated state
             -- is provisional by construction rather than by enumeration

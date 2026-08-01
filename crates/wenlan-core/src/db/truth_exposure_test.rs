@@ -763,15 +763,15 @@ fn the_projection_invariant_is_wired_into_the_daemon() {
     );
 }
 
-/// F1(b): a review is a statement about the text a person actually read, so it
-/// cannot outlive that text.
+/// F1(b): a review is a statement about the exact page version and text a
+/// person actually read, so it cannot outlive either.
 ///
 /// Nothing clears `human_reviewed` when a page is edited — the update bumps
 /// `version` and rewrites `content`, and the truth row is not in its reach. So
 /// the stored bit is a historical receipt, and whether a review is still *in
-/// force* has to be computed where truth is read: the recorded digest against
-/// the page's current content. An edited page falls back to unreviewed on its
-/// own, with no new write path and nothing to migrate.
+/// force* has to be computed where truth is read: the recorded version and
+/// digest against the current page. An edited page falls back to unreviewed on
+/// its own, with no new write path and nothing to migrate.
 ///
 /// Both consequences are checked here, because they come from one place: the
 /// axis the wire reports, and the visibility verdict that axis outranks.
@@ -826,18 +826,24 @@ async fn an_edit_after_a_review_retires_the_review() {
         .unwrap();
     }
 
+    let after_edit = db.page_truth_states(&ids).await.unwrap()[page];
     assert!(
-        !db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
-        "the review was of text that is no longer on the page"
+        !after_edit.human_reviewed,
+        "the review was of a version and text that are no longer current"
     );
-    assert_ne!(
+    assert_eq!(
+        after_edit.support,
+        crate::truth_contract::Support::Unevaluated,
+        "the machine verdict was also about the superseded page version"
+    );
+    assert_eq!(
         db.page_visibility(&grant, &ids).await.unwrap()[page],
         Visibility::Full,
-        "and with the review retired, the unsupported page stops being fully visible"
+        "the edited page remains visible because it is now unevaluated, not because the old review survived"
     );
 
-    // Put the text back and the receipt is good again: the check is on content,
-    // not on a version counter that only ever climbs.
+    // Putting the text back does not restore a review of an older page version.
+    // The truth-state contract binds approval to both exact version and digest.
     {
         let conn = db.conn.lock().await;
         conn.execute(
@@ -848,8 +854,8 @@ async fn an_edit_after_a_review_retires_the_review() {
         .unwrap();
     }
     assert!(
-        db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
-        "the exact text the human approved is back, so their approval is too"
+        !db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
+        "restoring bytes does not make an approval of page version 1 apply to version 2"
     );
 }
 
@@ -931,4 +937,156 @@ async fn a_verdict_about_a_superseded_version_does_not_answer_for_the_new_one() 
         .await
         .unwrap();
     assert_eq!(visible.get("p2"), Some(&Visibility::Full));
+}
+
+/// N2. The startup backlog drain WRITES, so it may not run in repair recovery.
+///
+/// Repair recovery opens the database through `open_for_repair` precisely so
+/// that startup performs no ordinary side effect: an operator inspecting a
+/// damaged database must see only what the repair itself does. The drain
+/// deletes stale `done` jobs and inserts pending ones, so an unfenced call put
+/// queue mutations into the one startup that promised none.
+///
+/// Same shape and same honest limit as the projection tooth above: a source
+/// scan cannot prove the guard is reached at runtime, and does not try to. It
+/// is exactly strong enough to catch the failure that actually occurred --
+/// a writer landing outside the fence, invisible to every behavioural test
+/// because none of them boots a repair-mode daemon.
+#[test]
+fn the_startup_backlog_drain_is_fenced_out_of_repair_mode() {
+    const DRAIN: &str = "drain_stale_derivation_jobs(";
+    const FENCE: &str = "repair_recovery_pending";
+
+    // Braces inside line comments would confuse the depth walk below, and the
+    // call is preceded by a long comment block. Strip comments, keep the lines.
+    let uncommented = |line: &str| line.split("//").next().unwrap_or("").to_string();
+
+    let mut checked = 0usize;
+    for (path, body) in workspace_sources() {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("_test.rs"))
+        {
+            continue;
+        }
+        let lines: Vec<String> = body.lines().map(uncommented).collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains(DRAIN) || line.trim_start().starts_with("pub async fn") {
+                continue;
+            }
+            // Walk up to the `{` that opens the block this call sits in.
+            let mut depth = 0i32;
+            let mut opener: Option<&str> = None;
+            for above in lines[..index].iter().rev() {
+                for ch in above.chars().rev() {
+                    match ch {
+                        '}' => depth += 1,
+                        '{' if depth == 0 => {
+                            opener = Some(above);
+                            break;
+                        }
+                        '{' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if opener.is_some() {
+                    break;
+                }
+            }
+            let opener = opener.unwrap_or_else(|| {
+                panic!(
+                    "{}: found no enclosing block for the backlog drain",
+                    path.display()
+                )
+            });
+            assert!(
+                opener.contains(FENCE),
+                "{}: the backlog drain must sit directly inside the repair fence, but its \
+                 enclosing block opens with `{}`. The drain mutates `claim_derivation_jobs`; \
+                 repair recovery opens the database side-effect-free and must stay that way.",
+                path.display(),
+                opener.trim()
+            );
+            checked += 1;
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "no production call to {DRAIN} anywhere in the workspace. The drain is what continues \
+         the migration's truncated batch; without it a vault larger than one batch stays \
+         partially enqueued forever. If it moved, update this test to name its new home -- do \
+         not delete it."
+    );
+}
+
+/// Blocker 4. Human approval outranks every machine verdict, so it is the one
+/// flag that must never be trusted raw.
+///
+/// A person approves a SPECIFIC text — the schema stores the version and digest
+/// they signed off, and the CHECK constraint guarantees both are present. Read
+/// as a bare boolean, that approval silently became perpetual: edit the prose
+/// afterwards and the page kept full visibility on the strength of a review of
+/// text it no longer holds, which is the human-axis twin of matrix row 8.
+///
+/// Asserted through `page_visibility`, the gate adapters actually call, because
+/// the flag's whole effect is that `visible_at` returns `Full` on it alone.
+#[tokio::test]
+async fn a_human_approval_of_older_text_stops_granting_visibility() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    // p2 is provisional with a stamped verdict: Unsupported, and hidden from an
+    // automatic reader unless a human approval overrides it.
+    let approved_digest = crate::provenance::revision_content_digest("");
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE page_truth_state
+                SET human_reviewed = 1, reviewed_page_version = 1,
+                    reviewed_page_digest = ?2
+              WHERE page_id = ?1",
+            libsql::params!["p2", approved_digest.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let granted = db.page_truth_states(&ids(&["p2"])).await.unwrap();
+    assert!(
+        granted.get("p2").unwrap().human_reviewed,
+        "an approval of the text the page actually holds must still grant"
+    );
+    assert_eq!(
+        db.page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+            .await
+            .unwrap()
+            .get("p2"),
+        Some(&Visibility::Full),
+        "the approval is what keeps this unsupported page readable"
+    );
+
+    // Rewrite the prose. The version is deliberately left alone: a bumped
+    // version would be caught by the version comparison, and the hole being
+    // closed here is the one where the numbers still agree.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("UPDATE pages SET content = 'rewritten' WHERE id = 'p2'", ())
+            .await
+            .unwrap();
+    }
+
+    let after = db.page_truth_states(&ids(&["p2"])).await.unwrap();
+    assert!(
+        !after.get("p2").unwrap().human_reviewed,
+        "an approval of superseded text may not go on granting authority"
+    );
+    assert_eq!(
+        db.page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+            .await
+            .unwrap()
+            .get("p2"),
+        Some(&Visibility::Hidden),
+        "with the stale approval withdrawn the page falls back to its machine \
+         verdict, which is what an unsupported page is owed"
+    );
 }

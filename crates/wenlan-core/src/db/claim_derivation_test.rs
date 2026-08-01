@@ -489,30 +489,71 @@ async fn derive_page(db: &MemoryDB, page_id: &str, claim_count: usize) -> Vec<St
     revisions
 }
 
-/// Record that some judge scored this claim's text, without producing a
-/// qualifying support edge. This is the on-disk signature of "candidates were
-/// judged and fell short", as distinct from "nobody ever looked".
-async fn judged_but_short(db: &MemoryDB, revision_id: &str) {
+/// Record that this run weighed a candidate for this claim and reached
+/// `outcome`, plus the cache row a real judge would have left behind.
+///
+/// The attempt row is what condition 3 reads. The cache row is not — it is
+/// written because a judgement that left no cache entry is a state the real
+/// pipeline does not produce, and a fixture that omitted it would be testing a
+/// DB that cannot exist.
+async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate_digest: &str, outcome: &str) {
     let conn = db.conn.lock().await;
-    let digest: String = {
+    let (digest, page_id, page_version): (String, String, i64) = {
         let mut rows = conn
             .query(
-                "SELECT canonical_text_digest FROM claim_revisions WHERE claim_revision_id = ?1",
+                "SELECT cr.canonical_text_digest, pvc.page_id, pvc.page_version
+                   FROM claim_revisions cr
+                   JOIN page_version_claims pvc
+                     ON pvc.claim_revision_id = cr.claim_revision_id
+                  WHERE cr.claim_revision_id = ?1",
                 libsql::params![revision_id],
             )
             .await
             .unwrap();
-        rows.next().await.unwrap().unwrap().get(0).unwrap()
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+        )
     };
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_judgment_attempts
+             (page_id, page_version, claim_revision_id, candidate_digest, outcome, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        libsql::params![
+            page_id,
+            page_version,
+            revision_id,
+            candidate_digest,
+            outcome
+        ],
+    )
+    .await
+    .unwrap();
     conn.execute(
         "INSERT OR IGNORE INTO entailment_cache
              (claim_text_digest, source_span_digest, model_id, model_version,
               prompt_version, score, threshold_at_write, backend, scored_at)
-         VALUES (?1, 'span', 'judge', 'v1', 'p1', 0.1, 0.75, 'test', 0)",
-        libsql::params![digest],
+         VALUES (?1, ?2, 'judge', 'v1', 'p1', 0.1, 0.75, 'test', 0)",
+        libsql::params![digest, candidate_digest],
     )
     .await
     .unwrap();
+}
+
+/// This run weighed every candidate for the claim and none cleared the bar —
+/// as distinct from nobody ever looking, and from looking and not finishing.
+async fn judged_but_short(db: &MemoryDB, revision_id: &str) {
+    attempt_on(db, revision_id, &evidence_span_digest(), "concluded").await;
+}
+
+/// The evidence prose every support fixture cites, and the digest of the span
+/// covering all of it.
+const EVIDENCE_TEXT: &str = "evidence prose";
+
+fn evidence_span_digest() -> String {
+    crate::provenance::revision_content_digest(EVIDENCE_TEXT)
 }
 
 /// A `supports` edge at `score`, written straight to `edges` — these tests are
@@ -520,7 +561,25 @@ async fn judged_but_short(db: &MemoryDB, revision_id: &str) {
 /// The matching `entailment_cache` row goes in too, because a support edge that
 /// cannot name the verdict behind it is a state `write_support_edge` refuses to
 /// create, and a fixture that produced one would be testing an impossible DB.
+///
+/// The edge is fully formed for the same reason: evaluation now revalidates the
+/// chunk, version, span, and root a verdict named, so an edge missing any of
+/// them is not a shortcut but a DIFFERENT test — one about a malformed edge
+/// rather than about the condition under test. Cheaper to seed it right.
 async fn support_claim(db: &MemoryDB, page_id: &str, revision_id: &str, score: f64) {
+    support_claim_at_chunk(db, page_id, revision_id, score, 0).await;
+}
+
+/// [`support_claim`] where the cited evidence is some chunk other than the
+/// first, so a test can delete or rewrite the chunk a verdict actually names
+/// while its document lives on.
+async fn support_claim_at_chunk(
+    db: &MemoryDB,
+    page_id: &str,
+    revision_id: &str,
+    score: f64,
+    chunk_index: i64,
+) {
     judged_but_short(db, revision_id).await;
     let conn = db.conn.lock().await;
     let space: String = {
@@ -539,29 +598,53 @@ async fn support_claim(db: &MemoryDB, page_id: &str, revision_id: &str, score: f
         // source_id, so a row without one reads as spaceless and is rejected.
         "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
                                last_modified, chunk_type, space)
-         VALUES (?1, 'evidence prose', 'memory', ?2, 'evidence', 0, 0, 'text', ?3)",
-        libsql::params![format!("m_{mem_id}"), mem_id.clone(), space.clone()],
-    )
-    .await
-    .unwrap();
-    // `edges` CHECKs that a supports edge carries a root — the schema enforcing
-    // the same rule `write_support_edge` verifies. These tests are about the
-    // predicate, so the root is seeded rather than earned.
-    let root_id = format!("root_{revision_id}");
-    conn.execute(
-        "INSERT OR IGNORE INTO provenance_roots
-             (root_id, identity_version, identity_digest, root_kind,
-              independence_group_id, status, created_at)
-         VALUES (?1, 1, ?2, 'document_ingest', ?3, 'active', 0)",
+         VALUES (?1, ?4, 'memory', ?2, 'evidence', ?5, 0, 'text', ?3)",
         libsql::params![
-            root_id.clone(),
-            format!("digest_{revision_id}"),
-            format!("group_{revision_id}")
+            format!("m_{mem_id}"),
+            mem_id.clone(),
+            space.clone(),
+            EVIDENCE_TEXT,
+            chunk_index
         ],
     )
     .await
     .unwrap();
-    let payload = format!("{{\"score\":{score},\"threshold_at_write\":0.75}}");
+    // `edges` CHECKs that a supports edge carries a root — the schema enforcing
+    // the same rule `write_support_edge` verifies. The identity digest is the
+    // real one over the evidence bytes, because revalidation recomputes it.
+    //
+    // ONE root for every fixture edge, not one per revision: roots are
+    // content-addressed and `provenance_roots` is UNIQUE on
+    // (identity_version, identity_digest), so identical evidence bytes converge
+    // on a single row — which is what `acquire_provenance_root` does in
+    // production too.
+    let root_id = "root_evidence_prose".to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO provenance_roots
+             (root_id, identity_version, identity_digest, root_kind,
+              independence_group_id, status, created_at)
+         VALUES (?1, ?3, ?2, 'document_ingest', 'group_evidence_prose', 'active', 0)",
+        libsql::params![
+            root_id.clone(),
+            crate::provenance::identity_digest("document_ingest", EVIDENCE_TEXT),
+            crate::provenance::IDENTITY_VERSION
+        ],
+    )
+    .await
+    .unwrap();
+    let payload = serde_json::json!({
+        "chunk_index": chunk_index,
+        "source_version": 1,
+        "span_start": 0,
+        "span_end": EVIDENCE_TEXT.len(),
+        "span_digest": evidence_span_digest(),
+        "model_id": "judge",
+        "model_version": "v1",
+        "prompt_version": "p1",
+        "score": score,
+        "threshold_at_write": 0.75,
+    })
+    .to_string();
     conn.execute(
         "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
                             grounded, root_id, space, weight, payload, provenance,
@@ -1554,4 +1637,341 @@ async fn the_backlog_drain_converges_past_a_single_batch() {
     for i in 0..7 {
         assert_eq!(job_for(&db, &format!("p{i}")).await.unwrap().1, "pending");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Row 8, N1, and row 6's judging half: evidence and text that move afterwards
+// ---------------------------------------------------------------------------
+
+/// Another chunk of the document the fixture's evidence came from, so a test can
+/// delete or rewrite the CITED chunk while the document itself survives.
+async fn add_sibling_chunk(db: &MemoryDB, revision_id: &str, chunk_index: i64) {
+    let conn = db.conn.lock().await;
+    let source_id = format!("mem_{revision_id}");
+    conn.execute(
+        "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                               last_modified, chunk_type, space)
+         SELECT ?1, 'other prose', 'memory', ?2, 'evidence', ?3, 0, 'text', space
+           FROM memories WHERE source_id = ?2 LIMIT 1",
+        libsql::params![
+            format!("m_{source_id}_c{chunk_index}"),
+            source_id,
+            chunk_index
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+/// Whether the read surface still tells callers this page is supported.
+async fn exposed_support(db: &MemoryDB, page_id: &str) -> crate::truth_contract::Support {
+    db.page_truth_states(&[page_id.to_string()])
+        .await
+        .unwrap()
+        .get(page_id)
+        .copied()
+        .unwrap_or_default()
+        .support
+}
+
+/// Drive one page from queued to published `supported`, the state every test
+/// below starts from.
+async fn publish_supported(db: &MemoryDB, page_id: &str) {
+    let job = lease_page(db, page_id, 1, "worker").await;
+    let outcome = db.evaluate_page_support(page_id, 1).await.unwrap();
+    assert_eq!(outcome, SupportOutcome::Supported);
+    assert!(db
+        .finalize_page_support(page_id, 1, &job, "worker", &outcome)
+        .await
+        .unwrap());
+    assert!(db.finish_derivation_job(&job, "worker").await.unwrap());
+    assert_eq!(truth_row(db, page_id).await.unwrap().0, "supported");
+    assert_eq!(
+        exposed_support(db, page_id).await,
+        crate::truth_contract::Support::Supported
+    );
+}
+
+/// Row 8, the synchronous half. Rewriting a page's text WITHOUT bumping its
+/// version leaves `page_truth_state.page_version` equal to `pages.version`, so
+/// the version comparison at the read surface sees nothing wrong and the page
+/// goes on being served as supported prose it no longer contains. A queued job
+/// does not help: on a substrate whose producer does not exist yet, the page
+/// waits forever in the meantime.
+#[tokio::test]
+async fn an_in_place_page_rewrite_stops_the_page_exposing_supported() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    publish_supported(&db, "p1").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET content = 'different prose entirely' WHERE id = 'p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
+    assert_eq!(
+        status, "provisional",
+        "a page whose text was replaced under its own version must lose its stored verdict"
+    );
+    assert!(
+        evaluated.is_none(),
+        "and lose it as Unevaluated: our bookkeeping moved, the prose was not refuted"
+    );
+    assert_ne!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported,
+        "the point is what the READ surface says, not what is queued"
+    );
+}
+
+/// Row 15, the synchronous half. The backlog scan finds a page whose evidence no
+/// longer clears the live bar and re-queues it — but a queued job is a promise
+/// about the future, and until it is kept the page keeps telling every caller
+/// its claims are supported.
+#[tokio::test]
+async fn drifted_support_stops_the_page_exposing_supported() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], SUPPORT_THRESHOLD + 0.02).await;
+    publish_supported(&db, "p1").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            // `json_set`, so the edge stays otherwise well-formed: this test is
+            // about a score that fell under the bar, not about a payload that
+            // lost the fields revalidation reads.
+            "UPDATE edges SET payload = json_set(payload, '$.score', ?1)
+              WHERE edge_type = 'supports'",
+            libsql::params![SUPPORT_THRESHOLD - 0.05],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(db.enqueue_stale_derivation_jobs(100).await.unwrap(), 1);
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "pending");
+    let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
+    assert_eq!(
+        status, "provisional",
+        "the scan has to demote the page it just re-queued, not only queue it"
+    );
+    assert!(evaluated.is_none());
+    assert_ne!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported
+    );
+}
+
+/// N1, the invalidation half. A support edge cites a CHUNK, but the retraction
+/// and demotion triggers that shipped first fire only when the LAST row for a
+/// `source_id` disappears — correct for what they guard, and blind to the update
+/// and merge paths that delete a non-head chunk and keep the source head. Delete
+/// the cited chunk 1 with chunk 0 still present and nothing used to happen at
+/// all: the edge kept its `valid_until IS NULL`, and the page kept its verdict.
+#[tokio::test]
+async fn deleting_only_the_cited_chunk_demotes_the_page() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim_at_chunk(&db, "p1", &revisions[0], 0.9, 1).await;
+    add_sibling_chunk(&db, &revisions[0], 0).await;
+    publish_supported(&db, "p1").await;
+
+    let source_id = format!("mem_{}", revisions[0]);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM memories WHERE source_id = ?1 AND chunk_index = 1",
+            libsql::params![source_id.clone()],
+        )
+        .await
+        .unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memories WHERE source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await
+            .unwrap();
+        let survivors: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            survivors, 1,
+            "the shape under test is a chunk dying while its document lives — a \
+             whole-source trigger cannot see this"
+        );
+    }
+
+    let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
+    assert_eq!(status, "provisional");
+    assert!(evaluated.is_none());
+    assert_ne!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported
+    );
+    assert_eq!(
+        job_for(&db, "p1").await.unwrap().1,
+        "pending",
+        "and it has to be re-judged, not merely un-asserted"
+    );
+}
+
+/// N1, the same shape reached by rewriting the chunk instead of deleting it.
+/// Every row the edge names still exists, so nothing about the document's
+/// structure changed — but the span offsets now index into a different string,
+/// which makes the citation false in exactly the way a reader cannot see.
+#[tokio::test]
+async fn rewriting_only_the_cited_chunk_demotes_the_page() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim_at_chunk(&db, "p1", &revisions[0], 0.9, 1).await;
+    add_sibling_chunk(&db, &revisions[0], 0).await;
+    publish_supported(&db, "p1").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET content = 'rewritten evidence'
+              WHERE source_id = ?1 AND chunk_index = 1",
+            libsql::params![format!("mem_{}", revisions[0])],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "provisional");
+    assert_ne!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported
+    );
+}
+
+/// N1's other half, and the reason the recompute-in-transaction design is safe
+/// at all: evaluation itself must revalidate the evidence it asserts, so a page
+/// cannot be re-published on a dead citation even with every invalidation
+/// trigger removed. `valid_until IS NULL` means nobody retracted this edge — it
+/// has never meant the bytes it names are still there.
+///
+/// The triggers are dropped deliberately. They are the first line of defence and
+/// the teeth above prove they work; this proves the second line holds on its own,
+/// which is what makes the two independent rather than one defence counted twice.
+#[tokio::test]
+async fn a_dead_chunk_edge_cannot_republish_support() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim_at_chunk(&db, "p1", &revisions[0], 0.9, 1).await;
+    add_sibling_chunk(&db, &revisions[0], 0).await;
+    publish_supported(&db, "p1").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS m5_demote_support_on_chunk_delete;
+             DROP TRIGGER IF EXISTS m5_demote_support_on_memory_delete;",
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "DELETE FROM memories WHERE source_id = ?1 AND chunk_index = 1",
+            libsql::params![format!("mem_{}", revisions[0])],
+        )
+        .await
+        .unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM edges
+                  WHERE edge_type = 'supports' AND valid_until IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let live: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            live, 1,
+            "with the triggers gone the edge is still active — that is the state \
+             evaluation has to survive"
+        );
+    }
+    assert_eq!(
+        truth_row(&db, "p1").await.unwrap().0,
+        "supported",
+        "and the stored verdict is untouched, so republication is genuinely on the table"
+    );
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_ne!(
+        outcome,
+        SupportOutcome::Supported,
+        "an active, above-threshold edge whose chunk is gone is not support"
+    );
+    let job = lease_page(&db, "p1", 1, "worker2").await;
+    assert!(db
+        .finalize_page_support("p1", 1, &job, "worker2", &outcome)
+        .await
+        .unwrap());
+    assert_eq!(
+        truth_row(&db, "p1").await.unwrap().0,
+        "provisional",
+        "publishing the re-evaluation must take the page out of supported"
+    );
+}
+
+/// Row 6, the judging half — the failure a cache-row discriminator gets wrong.
+/// `entailment_cache` is keyed by content digests alone, so it is global and
+/// timeless: one candidate concluding leaves a row, and the claim then reads as
+/// judged no matter how many other required candidates never came back. Judged
+/// with no support is `Refuted`, which stamps `evaluated_at` and costs the page
+/// its file — for evaluation that never finished.
+#[tokio::test]
+async fn a_candidate_this_run_never_concluded_blocks_publication() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+
+    attempt_on(&db, &revisions[0], "candidate_a", "concluded").await;
+    assert!(
+        matches!(
+            db.evaluate_page_support("p1", 1).await.unwrap(),
+            SupportOutcome::Refuted { .. }
+        ),
+        "a run that concluded on every candidate and found nothing IS a verdict"
+    );
+
+    attempt_on(&db, &revisions[0], "candidate_b", "deferred").await;
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert!(
+        matches!(outcome, SupportOutcome::NoPublish { .. }),
+        "one candidate short and another still out is an unfinished run, not a \
+         refutation; got {outcome:?}"
+    );
+}
+
+/// The same distinction from the other side: absence of attempt rows is
+/// never-judged, and never-judged may not read as judged-and-found-wanting. This
+/// is what keeps a substrate with no producer at all — every page, zero attempts
+/// — on `Unevaluated` instead of refuting the entire vault.
+#[tokio::test]
+async fn a_claim_with_no_attempt_rows_is_never_judged() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    derive_page(&db, "p1", 1).await;
+
+    assert!(
+        matches!(
+            db.evaluate_page_support("p1", 1).await.unwrap(),
+            SupportOutcome::Unevaluated { .. }
+        ),
+        "nobody looked, so there is nothing to refute"
+    );
 }
