@@ -3995,11 +3995,16 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
                 "${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}",
             )
         || job["strategy"]["fail-fast"].as_bool() != Some(true)
-        || job["strategy"]["matrix"].as_str()
-            != Some("${{ fromJSON(needs.detect-changes.outputs.release-targets) }}")
+        || job["strategy"]["matrix"]["include"].as_str()
+            != Some("${{ fromJSON(needs.detect-changes.outputs.release-targets).include }}")
+        || job["strategy"]["matrix"]["exclude"]
+            .as_sequence()
+            .is_none_or(|exclude| exclude.len() != 1)
+        || job["strategy"]["matrix"]["exclude"][0]["target"].as_str()
+            != Some("${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--branches--') && 'x86_64-pc-windows-msvc' || '__no_excluded_target__' }}")
     {
         violations.push(
-            "release-preflight is not a fail-fast four-target matrix with a cold-cache safety ceiling"
+            "release-preflight is not a fail-fast bounded ordinary-PR matrix with a full four-target backstop and cold-cache safety ceiling"
                 .into(),
         );
     }
@@ -4409,7 +4414,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
         "release-sensitive PRs and release backstops",
-        "fail-fast four-target",
+        "bounded ordinary-PR matrix",
         "canonical release matrix",
         "bounded 90/60-minute",
         "Docker DAG",

@@ -300,9 +300,12 @@ jobs:
               - 'scripts/stage-vulkan-loader-windows.ps1'
               - 'scripts/stage-vulkan-loader-windows.test.ps1'
             release-preflight:
-              # Keep the four shipped targets off ordinary shared-code PRs,
+              # Keep release-profile builds off ordinary shared-code PRs,
               # while native linkage, build tooling, and packaged entrypoints
-              # still prove the release profile before merge. Cargo.lock and
+              # still prove three shipped profiles before merge. Windows PRs
+              # use the functional + linked-binary lanes; main and the
+              # release-please PR retain the full Windows release build.
+              # Cargo.lock and
               # broad crate manifests are intentionally excluded: their full
               # accumulated graph is proved on main and the release-please PR.
               - 'Cargo.toml'
@@ -1132,10 +1135,11 @@ jobs:
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true' && github.event_name != 'pull_request'
         run: bash scripts/smoke-mcp.sh
 
-  # Build-only preflight for every shipped release target. Native/build/package
-  # diffs prove their release profile before merge; main/manual runs and the
-  # release-please PR prove the accumulated graph. Ordinary shared-code PRs keep
-  # release-profile work off their required path.
+  # Build-only preflight for shipped release targets. Release-sensitive ordinary
+  # PRs prove the three non-Windows profiles while the existing Windows
+  # functional/platform lanes prove native linkage. Main/manual runs and the
+  # release-please PR retain the complete four-target release matrix, including
+  # the measured 25-55 minute cold Windows release build.
   release-preflight:
     name: release-preflight (${{ matrix.target }})
     needs: [detect-changes]
@@ -1148,7 +1152,13 @@ jobs:
     timeout-minutes: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}
     strategy:
       fail-fast: true
-      matrix: ${{ fromJSON(needs.detect-changes.outputs.release-targets) }}
+      matrix:
+        include: ${{ fromJSON(needs.detect-changes.outputs.release-targets).include }}
+        exclude:
+          # An ordinary PR already links and exercises Windows in `test` and
+          # `mcp-platform`; compiling the same graph again in release profile is
+          # the measured >20-minute duplicate. Full release backstops keep it.
+          - target: ${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--branches--') && 'x86_64-pc-windows-msvc' || '__no_excluded_target__' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
