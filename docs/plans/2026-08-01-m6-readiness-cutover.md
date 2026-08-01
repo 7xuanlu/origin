@@ -5,6 +5,13 @@ Scope: frozen contract D14, the Rollback section, and gate G11
 (`m6_signal_cutover_is_independent`). Touches G1's prerequisite handshake.
 Continues the decision numbering from artifact 10 (`S0-118`).
 
+**Revision log.** Rev 2 answers review findings 4, 5, 6, 14 and 16. S0-119's key
+gains a non-null sentinel (finding 5); precondition 1 is restored to the frozen
+100% and made checkable by S0-153 (finding 4); S0-126 gains a concrete minimum
+window (finding 14); S0-129 gains its third condition (finding 6); S0-131's
+ledger-class count is reconciled (finding 16). No S0 number was reused or
+renumbered.
+
 ### Citation conventions
 
 In-repo citations are read on branch `kg-m6-stage0`. Three files carry almost
@@ -63,9 +70,23 @@ zero-dimensional.
 > had one. A new table starts empty, which is the only starting state that means
 > "no space is cut over" without a backfill guessing at intent.
 >
-> `signal` is `NULL` for stages A–D and one of the four genesis signals for
-> stage E, so G11's independence is a key property rather than a checked
-> invariant.
+> `signal` is **`NOT NULL DEFAULT '-'`**: the literal `'-'` for stages A–D, and
+> one of the four genesis signal names for stage E. G11's independence is then a
+> key property rather than a checked invariant.
+
+> **Decision S0-152 *(rev 2, finding 5)* — the stage-A–D `signal` is a non-null
+> sentinel, never `NULL`.** Rev 1 wrote `NULL`, which silently made the key not a
+> key. In SQLite, NULLs are distinct inside a `PRIMARY KEY` or `UNIQUE` on an
+> ordinary rowid table, so `('Work','D',NULL)` could be inserted without limit
+> and a space could hold any number of contradictory stage-D readiness rows. This
+> was checked rather than recalled: on SQLite 3.51.0, two inserts of
+> `('Work','D',NULL)` into `PRIMARY KEY (space, stage, signal)` both succeed,
+> while with the sentinel the second fails `UNIQUE constraint failed` and four
+> distinct stage-E signal rows still coexist. `WITHOUT ROWID` and `STRICT` would
+> also have rejected the NULL, but this repository has no table of either kind,
+> so a decision resting on that would have rested on a convention the code does
+> not follow. The sentinel is `'-'` rather than the empty string so it stays
+> visible in query output.
 
 ---
 
@@ -183,13 +204,57 @@ inspection.
 
 | # | Precondition | Checkable form |
 |---|---|---|
-| 1 | M5 truth readiness | truth cutover phase is `committed` **and** the space has at least one page with `support_status='supported'` (see F1) |
+| 1 | M5 truth readiness at **100%** (G1's word, `gp@wenlan-app:537`) | truth cutover phase is `committed` **and** the space's evaluation census is complete — see S0-153 (and F1 on why this stays read-only) |
 | 2 | M6 reader manifest | the D12 manifest's structural CI test is green on the deployed commit |
 | 3 | M6 writer manifest | same test, writer half; every listed caller has its fence adapter |
 | 4 | relevance parity | incremental pair state equals full recomputation for this space (artifact 6 §5 oracle) |
 | 5 | dependency state | zero rows in the refresh dependency table for this space referencing a retracted or absent root |
 | 6 | app availability | the app's compatibility manifest advertises a contract version this daemon supports (G1) |
 | 7 | zero pending incompatible jobs | zero rows in the genesis/refresh job tables for this space at a schema older than the current readiness epoch |
+
+> **Decision S0-153 *(rev 2, finding 4)* — "M5 readiness/cutover at 100%" is a
+> census over `page_truth_state`, and nothing the daemon reports about itself can
+> stand in for it.** Rev 1 weakened G1's *100%* to "at least one supported page",
+> which G1 rejects on its face — the gate says 100%, and a gate that passes at 99%
+> is not that gate. The frozen wording is restored, and 100% is checkable because
+> M5 already recorded the distinction the census needs:
+>
+> ```sql
+> -- all three must return zero for the space
+> -- (a) pages with no truth row, or a row judged against a stale version
+> SELECT count(*) FROM pages p
+>   LEFT JOIN page_truth_state t ON t.page_id = p.id
+>  WHERE p.space = ?1 AND (t.page_id IS NULL OR t.page_version <> p.version);
+> -- (b) pages never actually judged
+> SELECT count(*) FROM pages p JOIN page_truth_state t ON t.page_id = p.id
+>  WHERE p.space = ?1 AND t.evaluated_at IS NULL;
+> -- (c) derivation work still owed or abandoned
+> SELECT count(*) FROM claim_derivation_jobs j JOIN pages p ON p.id = j.page_id
+>  WHERE p.space = ?1 AND j.status IN ('pending','leased','parked');
+> ```
+>
+> Clause (b) is the one that carries the weight, and it is available only because
+> M5 anticipated exactly this: `evaluated_at` is *"When a judgement last ran, or
+> NULL if none ever has"*, and *"migration 99 leaves this NULL for every
+> backfilled page, which is what keeps a cutover from archiving a whole vault on
+> day one"* (`crates/wenlan-core/src/db/claim_identity.rs:285`-`:291`). Without
+> (b), a freshly-migrated vault reads as fully decided when in truth nothing has
+> been looked at. Clause (c) counts `parked` as incomplete because a parked job is
+> a page the pipeline gave up on, which is the definition of not-100%.
+>
+> **What cannot prove it.** `GET /api/status` cannot, and no daemon handshake
+> resting on it can. Its response carries `is_running`, `files_indexed`, two queue
+> depths, reranker and inference state, and a capability list
+> (`crates/wenlan-server/src/routes.rs:149`-`:160`) — **no space dimension at
+> all** — and its `queue` field is the document-enrichment queue, not
+> `claim_derivation_jobs`. It is also error-swallowing by construction:
+> `db.count().await.unwrap_or(0)` (`:128`) and `Ok(0) | Err(_) =>
+> QueueStatus::Idle` (`:135`) each report *healthier* than reality when the
+> underlying query fails, so an all-clear from it is indistinguishable from a
+> broken query. What suffices is the three counting queries above, run inside the
+> advancing transaction per S0-125, with their results written into the readiness
+> row — a claim re-derivable from durable rows afterwards, rather than a status a
+> process asserted about itself.
 
 > **Decision S0-125 — every precondition is evaluated inside the same
 > transaction that advances the readiness epoch, against durable state.** A
@@ -220,8 +285,20 @@ soak" (`gp@wenlan-app:517`), but never defines when a soak has passed.
 >    `supported` to `provisional` as a consequence of M6 work.
 >
 > A minimum window is a necessary condition, not a sufficient one — a space with
-> no activity during the window has proven nothing, so the receipt also records
-> the number of M6 turns observed and a soak with zero turns does not pass.
+> no activity during the window has proven nothing.
+>
+> **The minimum, concretely (rev 2, finding 14): 72 hours of wall clock, at least
+> 20 observed M6 turns in this space, and at least one daemon start inside the
+> window.** Rev 1 said "a minimum window" and named no number, which carries the
+> same defect as an operator-attested soak: nothing can fail it. 72 hours spans
+> three daily cycles, so a once-a-day ingestion pattern is seen more than once and
+> a weekday boundary cannot hide inside the window. Twenty turns is the smallest
+> count at which the per-turn caps of artifacts 5 and 6 have been exercised often
+> enough for component 2 to mean anything. The daemon-start clause is there
+> because every crash-recovery edge in artifact 2 — A7, and machine C's lease
+> expiry — runs only on startup, so a soak with no restart has never observed the
+> recovery half; an operator who reaches 72 hours without one satisfies it by
+> restarting deliberately, which is seconds of work rather than a stall.
 
 > **Decision S0-127 — the soak receipt is durable, per `(space, stage, signal)`,
 > and is a precondition of the next stage's transaction (S0-125).** An
@@ -258,12 +335,30 @@ never expose provisional prose.
 > means the counter is zero — never "the query found nothing."
 
 > **Decision S0-129 — archiving a genesis page requires machine ownership AND
-> byte-and-version equality with genesis, checked at archive time.** Ownership
-> is `page_is_human_owned` (`post_write/page_update.rs:111`-`:113`:
-> `page.user_edited || page.creation_kind == "authored"`), and the byte/version
-> half needs the genesis-provenance row PR-A creates. Neither half alone is
-> sufficient: a machine-owned page can still have been *depended on* by a human
-> decision, and D14 keeps depended-on pages readable.
+> byte-and-version equality with genesis AND no durable human dependency, all
+> three checked at archive time.** Ownership is `page_is_human_owned`
+> (`post_write/page_update.rs:111`-`:113`: `page.user_edited ||
+> page.creation_kind == "authored"`), and the byte/version half needs the
+> genesis-provenance row PR-A creates.
+>
+> **The third condition (rev 2, finding 6).** Rev 1's own rationale said "a
+> machine-owned page can still have been *depended on* by a human decision, and
+> D14 keeps depended-on pages readable" — and then required only two conditions,
+> leaving the hazard it had just named unguarded. The guard is four zero-count
+> checks over substrate that mostly exists already:
+>
+> | # | A durable human dependency exists if… | Where |
+> |---|---|---|
+> | 1 | the page's truth state was reviewed by a human | `page_truth_state.human_reviewed = 1` (`crates/wenlan-core/src/db/claim_identity.rs:292`-`:299`) |
+> | 2 | a human-owned page links to it | `page_links.target_page_id` = this page, joined to a source page satisfying `page_is_human_owned` (`crates/wenlan-core/src/db.rs:6666`-`:6675`) |
+> | 3 | a human dismissed or suppressed something naming it | the durable suppression identity of artifact 2's F7, which D14 preserves across rollback |
+> | 4 | a presence-authorized M6 action names it | an M5 receipt whose allowlisted `slot_id` or `page_id` is this page (artifact 10 §7.1) |
+>
+> Any one of the four blocks the archive; the page stays readable and the reverse
+> ledger records it as retained-with-reason. Checks 1 and 2 are ordinary SQL over
+> tables that ship today. Checks 3 and 4 become evaluable when PR-A lands their
+> rows and are vacuously zero until then — safe only because 1 and 2 are not
+> vacuous, which is the condition PR-A must not quietly break.
 
 ---
 
@@ -288,13 +383,34 @@ A whole-database copy can only be restored whole. So:
 > there is no partial restore that could preserve the later edit. Once any human
 > edit post-dates the snapshot, the snapshot is diagnostic material only.
 
-> **Decision S0-131 — the reverse ledger enumerates the thirteen row classes
-> D14 names, and a ledger missing any class does not qualify.** D14 (`gp@wenlan-app:418`-`:421`)
-> lists them: M6 genesis/page version, claim, support, truth, history, card,
-> attachment, dependency, candidate, frontier, coverage, suppression,
-> subscription, genesis-provenance, receipt, and later human edit. The list is
-> the test: PR-D's reverse-ledger test asserts one case per class, and a class
-> with no case is a failing gate, not an omission.
+> **Decision S0-131 — the reverse ledger enumerates the sixteen row classes D14
+> names, and a ledger missing any class does not qualify.** D14
+> (`gp@wenlan-app:418`-`:421`) requires "exact compatibility for every M6
+> genesis/page version, claim/support/truth/history/card row, attachment,
+> dependency, candidate, frontier, coverage, suppression, subscription,
+> genesis-provenance, receipt, and later human edit". Written as prose that is
+> twelve comma-separated phrases, two of which are slash-compounds; expanded, it
+> is sixteen row classes:
+>
+> | # | Class | | # | Class |
+> |---|---|---|---|---|
+> | 1 | M6 genesis page version | | 9 | candidate |
+> | 2 | claim | | 10 | frontier |
+> | 3 | support | | 11 | coverage |
+> | 4 | truth | | 12 | suppression |
+> | 5 | history | | 13 | subscription |
+> | 6 | card | | 14 | genesis-provenance |
+> | 7 | attachment | | 15 | receipt |
+> | 8 | dependency | | 16 | later human edit |
+>
+> *(rev 2, finding 16: rev 1 wrote "thirteen" above a list that already had
+> sixteen entries. The list was right and the count was wrong, so the count is
+> what changed — no class was added or removed. The table replaces the run-on
+> sentence precisely so the next reader can check the count without parsing
+> slashes.)*
+>
+> The list is the test: PR-D's reverse-ledger test asserts one case per class, and
+> a class with no case is a failing gate, not an omission.
 
 ---
 
@@ -401,7 +517,7 @@ and `online_backup` verifies the snapshot with an independent `integrity_check`
 SQLite file is well-formed, not that page count, claim count, or truth state
 match the source. For PR-A's drill that is adequate, because the snapshot is
 taken from a quiescent single-writer database. It is **not** adequate as a model
-for the reverse ledger, where the question is semantic equality across thirteen
+for the reverse ledger, where the question is semantic equality across sixteen
 row classes — which is why S0-131 specifies counts per class rather than reusing
 the integrity check.
 
@@ -457,6 +573,9 @@ call, not to this artifact.
 `S0-128` "before the first M6 mutation" is a durable counter, never an empty query result ·
 `S0-129` archiving a genesis page requires machine ownership AND byte/version equality ·
 `S0-130` snapshot restore is legal only with no later human edit; everything else is a reverse ledger ·
-`S0-131` the reverse ledger enumerates all thirteen D14 row classes, one test case each ·
+`S0-131` the reverse ledger enumerates all sixteen D14 row classes, one test case each ·
 `S0-132` non-additive M6 migrations call `backup_before_migration` and assert the receipt ·
 `S0-133` M6 adds no new refusal mechanism, only G1's old-binary evidence.
+
+**Added in rev 2:** `S0-152` the stage-A–D `signal` is a non-null sentinel `'-'`, never NULL ·
+`S0-153` M5 readiness at 100% is a three-query census; `/api/status` cannot prove it.
