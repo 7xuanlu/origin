@@ -439,7 +439,7 @@ them, stale/refresh enqueue state, the operation receipt
 
 D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
 
-> **Decision S0-95 *(amended in rev 2, finding 11 — number kept)* — four
+> **Decision S0-95 *(amended in rev 2, finding 10 — number kept)* — four
 > instruments, and the normative proof of *visited work* is SQLite's own
 > statement counters, not decoded rows and not `EXPLAIN QUERY PLAN`.**
 >
@@ -496,7 +496,7 @@ arithmetic. Candidate retrieval returns **at most 32** pages
 `32 × 64 = 2,048` rows in the worst case — **four times** `R-BUDGET-ROWS`, which
 is 512. Two frozen numbers and one derived number that cannot all hold.
 
-> **Decision S0-156 *(rev 2, finding 11)* — query (c) aggregates in SQLite and
+> **Decision S0-156 *(rev 2, finding 10)* — query (c) aggregates in SQLite and
 > returns one row per candidate, so the evaluation materializes ~160 rows while
 > visiting up to 2,048 index entries. `R-BUDGET-VISITS` is set at 2,176 and is
 > the bound that actually constrains the hub.** Common-neighbour needs

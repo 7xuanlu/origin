@@ -420,7 +420,7 @@ A whole-database copy can only be restored whole. So:
 > | 7 | attachment | | 15 | receipt |
 > | 8 | dependency | | 16 | later human edit |
 >
-> *(rev 2, finding 16: rev 1 wrote "thirteen" above a list that already had
+> *(rev 2, finding 13: rev 1 wrote "thirteen" above a list that already had
 > sixteen entries. The list was right and the count was wrong, so the count is
 > what changed — no class was added or removed. The table replaces the run-on
 > sentence precisely so the next reader can check the count without parsing
