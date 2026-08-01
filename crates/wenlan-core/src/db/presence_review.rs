@@ -116,30 +116,30 @@ async fn review_in_txn(
     presence_root: Option<&Path>,
     now: i64,
 ) -> Result<ReviewOutcome, WenlanError> {
-    // Not a check so much as what makes the lookup key computable: an unknown
-    // action has no request digest, so there is nothing to look up.
-    let Some(action) = parse_action(&submitted.action) else {
-        return Ok(ReviewOutcome::Refused(PresenceRefusal::Invalid));
-    };
-    let submitted_digest =
-        crate::presence::request_digest(action, &submitted.target_ids, &submitted.base_digest);
-
     // Step 1: has this caller run this operation before, and with what?
-    if let Some(outcome) = stored_answer(
-        conn,
-        &submitted.caller_id,
-        &submitted.operation_id,
-        &submitted_digest,
-    )
-    .await?
+    //
+    // Keyed on the caller and operation ID alone. Nothing about the submitted
+    // request is inspected before the row on file is in hand — not the MAC, not
+    // the window, not even whether the action parses. Anything that answers
+    // ahead of this lookup answers for an operation ID whose mutation may
+    // already have happened, and every refusal reads to a client as "your write
+    // did not land".
+    if let Some(stored) =
+        stored_receipt(conn, &submitted.caller_id, &submitted.operation_id).await?
     {
-        return Ok(outcome);
+        // Only now is the request itself looked at, and only to tell a replay
+        // from a collision on the operation ID.
+        let submitted_digest = parse_action(&submitted.action).map(|action| {
+            crate::presence::request_digest(action, &submitted.target_ids, &submitted.base_digest)
+        });
+        return answer_for(stored, submitted_digest.as_deref());
     }
 
     // Step 2: the secret and the capability. Nothing here reads a row, so
     // nothing here can leak one — and `presence_unavailable` is reachable only
     // now, past the replay path, so a rotated secret cannot swallow the answer
-    // to a mutation that already happened.
+    // to a mutation that already happened. An action the daemon does not know
+    // is refused here too, by `verify` itself.
     let secret = match presence_root.map(crate::presence::load_secret) {
         Some(Ok(secret)) => secret,
         _ => return Ok(ReviewOutcome::Refused(PresenceRefusal::Unavailable)),
@@ -180,12 +180,16 @@ async fn review_in_txn(
 /// `Some` means this request is finished with — either the stored response for a
 /// retry, or a refusal because one operation ID has been used for two different
 /// mutations. `None` means this is the first execution.
-async fn stored_answer(
+/// The row on file for this caller and operation, if there is one.
+///
+/// The key is the caller and operation ID and nothing else. Deliberately no
+/// property of the submitted request takes part, so nothing about the request
+/// can decide the answer before the row is in hand.
+async fn stored_receipt(
     conn: &libsql::Connection,
     caller_id: &str,
     operation_id: &str,
-    submitted_digest: &str,
-) -> Result<Option<ReviewOutcome>, WenlanError> {
+) -> Result<Option<(String, String)>, WenlanError> {
     let mut rows = conn
         .query(
             "SELECT request_digest, response_json FROM presence_receipts
@@ -201,14 +205,30 @@ async fn stored_answer(
     else {
         return Ok(None);
     };
-    let stored_digest: String = row.get(0).unwrap_or_default();
-    let response_json: String = row.get(1).unwrap_or_default();
-    if stored_digest != submitted_digest {
-        return Ok(Some(ReviewOutcome::Refused(PresenceRefusal::Conflict)));
+    Ok(Some((
+        row.get(0).unwrap_or_default(),
+        row.get(1).unwrap_or_default(),
+    )))
+}
+
+/// Replay or conflict, once a row is on file.
+///
+/// `submitted_digest` is `None` when the request cannot be hashed at all —
+/// an action the daemon does not know. That is not the request on file, so it
+/// is a second request under a spent operation ID: a conflict. Refusing it as
+/// invalid instead would tell a client retrying a mutation that already
+/// happened that its write never landed.
+fn answer_for(
+    stored: (String, String),
+    submitted_digest: Option<&str>,
+) -> Result<ReviewOutcome, WenlanError> {
+    let (stored_digest, response_json) = stored;
+    if submitted_digest != Some(stored_digest.as_str()) {
+        return Ok(ReviewOutcome::Refused(PresenceRefusal::Conflict));
     }
     let receipt: PageReviewReceipt = serde_json::from_str(&response_json)
         .map_err(|e| WenlanError::VectorDb(format!("presence receipt is unreadable: {e}")))?;
-    Ok(Some(ReviewOutcome::Replayed(receipt)))
+    Ok(ReviewOutcome::Replayed(receipt))
 }
 
 /// The page's live version and the digest of its exact current content.
@@ -340,15 +360,8 @@ pub(super) async fn apply_review_in_txn(
         // reachable, the honest answer is the one already stored rather than a
         // 500 over a mutation somebody else completed — so look again before
         // giving up.
-        return match stored_answer(
-            conn,
-            &verified.caller_id,
-            &verified.operation_id,
-            &verified.request_digest,
-        )
-        .await?
-        {
-            Some(outcome) => Ok(outcome),
+        return match stored_receipt(conn, &verified.caller_id, &verified.operation_id).await? {
+            Some(stored) => answer_for(stored, Some(&verified.request_digest)),
             None => Err(WenlanError::VectorDb(format!(
                 "presence receipt store: {e}"
             ))),

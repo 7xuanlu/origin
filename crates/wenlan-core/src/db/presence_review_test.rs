@@ -579,6 +579,70 @@ async fn a_retry_after_the_secret_was_replaced_still_replays() {
     assert_eq!(replayed.verified_at, applied.verified_at);
 }
 
+/// The receipt lookup has to be *literally* first, ahead of parsing too.
+///
+/// Parsing the action looks like bookkeeping rather than a check — an unknown
+/// action has no request digest, so there is nothing to look the receipt up
+/// with. But answering `presence_invalid` there still answers it, and it does
+/// so for an operation ID whose mutation already happened. A client retrying
+/// with a garbled action reads `invalid` as "the daemon rejected my request"
+/// and is entitled to conclude the write never landed, which is exactly the
+/// wrong conclusion and exactly what the binding order exists to prevent.
+///
+/// So a receipt on file wins over an unparseable request. The stored row says
+/// this operation ID has already been spent; a request that cannot even be
+/// hashed certainly is not the same one, which makes it a collision on the
+/// operation ID -- a conflict. The client is told to re-read and start over,
+/// never that nothing happened.
+#[tokio::test]
+async fn a_retry_with_a_garbled_action_conflicts_rather_than_denying_the_write() {
+    let (db, root) = db().await;
+    let applied = db
+        .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
+        .await
+        .unwrap();
+    assert!(
+        matches!(applied, super::ReviewOutcome::Applied(_)),
+        "first execution must apply, got {applied:?}"
+    );
+
+    // Same caller, same operation ID, an action the daemon does not know.
+    let garbled = mint(
+        "review_the_page_please",
+        &[PAGE],
+        &body_digest(),
+        "app",
+        "op-1",
+        &[0xa1; 16],
+        1_000,
+        SECRET,
+    );
+    let retry = db
+        .review_page_with_presence(&garbled, PAGE, Some(root.path()), 1_020)
+        .await
+        .unwrap();
+
+    assert!(
+        !matches!(
+            retry,
+            super::ReviewOutcome::Refused(PresenceRefusal::Invalid)
+        ),
+        "a retry against a spent operation ID must never read as \
+         'your request was rejected'; got {retry:?}"
+    );
+    assert!(
+        matches!(
+            retry,
+            super::ReviewOutcome::Refused(PresenceRefusal::Conflict)
+        ),
+        "expected a conflict on the reused operation ID, got {retry:?}"
+    );
+    assert!(
+        reviewed(&db).await,
+        "and the mutation that did happen is still on the page"
+    );
+}
+
 /// The same, one step earlier: with no secret at all and no receipt on file,
 /// the answer is still `presence_unavailable`. The reordering must not turn a
 /// daemon that cannot check into one that waves the caller through.
