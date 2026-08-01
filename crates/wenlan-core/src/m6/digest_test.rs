@@ -200,6 +200,50 @@ fn boolean_parts_are_the_literal_t_and_f() {
     );
 }
 
+/// Mutant for S0-28, the *partial* form: the domain is concatenated raw while
+/// the parts keep their length prefixes.
+///
+/// This is the mutation a reviewer is most likely to write by accident —
+/// dropping `write_part` from the domain line alone — and the fully-raw mutant
+/// above does not catch it, because differing part lengths keep the two byte
+/// streams apart. It needs its own colliding input.
+fn mutant_raw_domain_framed_parts(domain: &str, parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[test]
+fn s0_28_raw_domain_prefix_collides_even_when_the_parts_are_framed() {
+    // The construction: an unframed domain lets its own trailing bytes be read
+    // as the next part's length prefix.
+    //
+    //   ("d",      [0x00]) -> "d" ++ [1,0,0,0,0,0,0,0] ++ [0x00]
+    //   ("d\x01",  [])     -> "d" ++ [1] ++ [0,0,0,0,0,0,0,0]
+    //
+    // Both are the nine bytes `d 01 00 00 00 00 00 00 00`.
+    let domain_a = "d";
+    let parts_a: [&[u8]; 1] = [b"\x00"];
+    let domain_b = "d\u{1}";
+    let parts_b: [&[u8]; 1] = [b""];
+
+    assert_eq!(
+        mutant_raw_domain_framed_parts(domain_a, &parts_a),
+        mutant_raw_domain_framed_parts(domain_b, &parts_b),
+        "control failed: an unframed domain was expected to alias these"
+    );
+
+    assert_ne!(
+        m6_digest(domain_a, &parts_a),
+        m6_digest(domain_b, &parts_b),
+        "the domain tag must be absorbed through write_part like any other part"
+    );
+}
+
 #[test]
 fn digest_is_stable_across_calls() {
     // Guards against any accidental nondeterminism (hasher state, iteration
