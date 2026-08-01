@@ -8275,12 +8275,9 @@ const UNROUTABLE_PAGE_KINDS: [&str; 4] = ["authored", "concept", "overview", "so
 /// else is a comparison. That pairing is what keeps a Rust assignment and the
 /// `kind = "concept"` line inside an eval TOML fixture from reading as reads.
 ///
-/// Known ceiling: this reads comparisons, not control flow. A
-/// `match page.kind.as_str() { "source" => … }` would route on the column
-/// without ever writing an operator, and the scan will not see it. Covering
-/// that needs match-arm parsing, worth building the day a page kind is first
-/// matched on — today every kind read in the workspace is a SQL predicate or
-/// a Rust `==`/`!=`, and those are what this guards.
+/// Control flow is the other half and lives in `page_kind_match_sites`, which
+/// this calls: an arm is a pattern, not an operator, so a `match` decides on
+/// the column without ever writing one.
 fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
     let production = strip_cfg_test_items(source);
     // Literals kept, comments blanked: the SQL this looks for lives inside
@@ -8372,7 +8369,147 @@ fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
         }
         sites.push(format!("{path}: kind {op} {quote}{routed}{quote}"));
     }
+    sites.extend(page_kind_match_sites(path, &production));
     sites
+}
+
+/// Byte offset of the delimiter closing a region that opens just past the
+/// caller's cursor. Callers pass string-masked text, so a delimiter inside a
+/// literal or a comment cannot move the count.
+fn balanced_span(text: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 1usize;
+    for (offset, ch) in text.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+/// True when `text` names `kind` as a whole word — `page.kind`,
+/// `kind.as_str()`, a bare binding — and not `creation_kind` or
+/// `assigned_kind`, which carry no fence.
+fn names_kind_binding(text: &str) -> bool {
+    let mut cursor = 0usize;
+    while let Some(found) = text[cursor..].find("kind") {
+        let start = cursor + found;
+        cursor = start + "kind".len();
+        let joined_left = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let joined_right = text[cursor..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
+        if !joined_left && !joined_right {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rust `match` / `matches!` routing on a page kind — the shape the comparison
+/// scan structurally cannot see, because an arm is a pattern and never writes
+/// an operator.
+///
+/// Structure is read off a string-masked twin and content off a
+/// literal-preserving one. `mask_lexical` preserves byte length, so a single
+/// offset indexes both. This scan works on uncollapsed text, unlike the SQL
+/// scan: SQL is written across source lines with `\` continuations and has to
+/// be flattened first, while Rust tokens are already adjacent.
+///
+/// A literal counts only in *pattern* position (`"source" =>`, `"source" |`).
+/// A `"source"` sitting in an arm's body is prose — an error message, a log
+/// line — and flagging it would make the tooth cry wolf on the arms that are
+/// actually fine.
+fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
+    let structural = mask_lexical(production, false);
+    let visible = mask_lexical(production, true);
+    let mut sites = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = structural[cursor..].find("match") {
+        let start = cursor + found;
+        cursor = start + "match".len();
+        if structural[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        // `match x { arms }` and `matches!(x, patterns)` are one decision
+        // written two ways. In the macro every literal after the comma is a
+        // pattern already, so it needs no `=>` to prove it is one.
+        let (scrutinee, arms, all_patterns) = if structural[cursor..].starts_with("es!") {
+            let Some(open) = structural[cursor..].find('(') else {
+                continue;
+            };
+            let from = cursor + open + 1;
+            let Some(len) = balanced_span(&structural[from..], '(', ')') else {
+                continue;
+            };
+            let Some(comma) = visible[from..from + len].find(',') else {
+                continue;
+            };
+            (
+                &visible[from..from + comma],
+                &visible[from + comma..from + len],
+                true,
+            )
+        } else {
+            if structural[cursor..].starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let Some(open) = structural[cursor..].find('{') else {
+                continue;
+            };
+            let from = cursor + open + 1;
+            let Some(len) = balanced_span(&structural[from..], '{', '}') else {
+                continue;
+            };
+            (
+                &visible[cursor..cursor + open],
+                &visible[from..from + len],
+                false,
+            )
+        };
+        if !names_kind_binding(scrutinee) {
+            continue;
+        }
+        let routed = if all_patterns {
+            arms.split('"')
+                .skip(1)
+                .step_by(2)
+                .find(|literal| UNROUTABLE_PAGE_KINDS.contains(literal))
+        } else {
+            pattern_literal(arms)
+        };
+        if let Some(routed) = routed {
+            sites.push(format!("{path}: match on kind, arm \"{routed}\""));
+        }
+    }
+    sites
+}
+
+/// The first arm pattern in `arms` naming a page kind no reader may route on.
+fn pattern_literal(arms: &str) -> Option<&str> {
+    let mut rest = arms;
+    while let Some(open) = rest.find('"') {
+        let body = &rest[open + 1..];
+        let close = body.find('"')?;
+        let literal = &body[..close];
+        rest = &body[close + 1..];
+        let follows = rest.trim_start();
+        if (follows.starts_with("=>") || follows.starts_with('|'))
+            && UNROUTABLE_PAGE_KINDS.contains(&literal)
+        {
+            return Some(literal);
+        }
+    }
+    None
 }
 
 #[test]
@@ -8440,6 +8577,24 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
          way a reader lands here, so it must not be the one shape that slips through"
     );
 
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "let label = match page.kind.as_str() { \"source\" => \"doc\", _ => \"note\" };",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a match arm decides on the column without ever writing an operator"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "if matches!(page.kind.as_str(), \"overview\" | \"authored\") { return Ok(()); }",
+        ),
+        [format!("{path}: match on kind, arm \"overview\"")],
+        "matches! is the same decision spelled as a macro"
+    );
+
     for (label, source) in [
         (
             "the entity fence itself",
@@ -8483,6 +8638,19 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
         (
             "a bind parameter",
             "conn.query(\"SELECT id FROM pages WHERE kind = ?1\", params![kind])",
+        ),
+        (
+            "a match on the entity fence",
+            "let shadow = match page.kind.as_str() { \"entity\" => true, _ => false };",
+        ),
+        (
+            "a match on a different column",
+            "let l = match page.creation_kind.as_str() { \"source\" => 1, _ => 0 };",
+        ),
+        (
+            "prose in an arm body, which decides nothing",
+            "let l = match page.kind.as_str() { \"entity\" => bail!(\"source missing\"), \
+             _ => 0 };",
         ),
     ] {
         assert!(
