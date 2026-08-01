@@ -364,7 +364,8 @@ fn every_fingerprint_field_moves_the_digest() {
     v.input_generation = 2;
     variants.push(("input_generation", v));
 
-    let mut v = base_fingerprint(&slot, &other_roots);
+    // Field 8 varies via the constructor argument, so this one needs no mutation.
+    let v = base_fingerprint(&slot, &other_roots);
     variants.push(("active_root_digest", v));
 
     let mut v = base_fingerprint(&slot, &roots_digest);
