@@ -63,6 +63,7 @@ mod scoped_entities;
 mod scoped_pages;
 mod source_sync;
 mod space_context;
+mod space_rename;
 mod truth_exposure;
 
 pub(crate) use community_grouping_state::CommunityGroupingLeaseCleanup;
@@ -147,6 +148,8 @@ mod scoped_entities_test;
 mod scoped_pages_test;
 #[cfg(test)]
 mod scoped_records_test;
+#[cfg(test)]
+mod space_rename_test;
 #[cfg(test)]
 #[path = "db/test_support_test.rs"]
 pub(crate) mod test_support;
@@ -19627,6 +19630,12 @@ impl MemoryDB {
             .map_err(|e| {
                 WenlanError::VectorDb(format!("update_space cascade pages scope: {}", e))
             })?;
+
+            // S0-162: close the rename over the community and genesis substrate
+            // too, so no M6-reachable row is left naming a space that does not
+            // resolve.
+            space_rename::cascade_space_rename(&tx, name, new_name).await?;
+
             #[cfg(test)]
             page_drafts_test::transaction_test_hooks::after_space_cascade(&format!(
                 "update_space:{name}"
