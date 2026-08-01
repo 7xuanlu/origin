@@ -11,7 +11,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ci_test_plan import PlanError, build_plan, command_groups_for
+from ci_test_plan import (
+    PlanError,
+    archive_command_for,
+    build_plan,
+    command_groups_for,
+    required_suite_outputs,
+)
 
 
 WORKSPACE_ROOT = "/repo"
@@ -298,6 +304,24 @@ class PackageClosureTests(unittest.TestCase):
 
 
 class NarrowOwnerTests(unittest.TestCase):
+    def test_explicit_isolated_test_module_selects_its_real_prefix(self) -> None:
+        path = "crates/wenlan-core/src/lint/pages/security_test.rs"
+        plan = plan_for(path)
+
+        self.assertEqual(
+            plan["workspace_lib"],
+            {
+                "mode": "filterset",
+                "packages": ["wenlan-core"],
+                "filterset": (
+                    "package(wenlan-core) "
+                    "& test(/^lint::pages::fs::tests::security_cases::/)"
+                ),
+            },
+        )
+        self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
+        self.assertEqual(plan["core_integration"], {"mode": "skip"})
+
     def test_extant_core_integration_file_selects_only_its_test_target(self) -> None:
         path = "crates/wenlan-core/tests/folder_ingest_e2e.rs"
         plan = plan_for(path)
@@ -323,24 +347,210 @@ class NarrowOwnerTests(unittest.TestCase):
         )
         self.assertEqual(plan["core_integration"], {"mode": "skip"})
 
-    def test_explicit_isolated_test_module_selects_its_real_prefix(self) -> None:
-        path = "crates/wenlan-core/src/lint/pages/security_test.rs"
-        plan = plan_for(path)
 
-        self.assertEqual(
-            plan["workspace_lib"],
-            {
-                "mode": "filterset",
-                "packages": ["wenlan-core"],
-                "filterset": (
-                    "package(wenlan-core) "
-                    "& test(/^lint::pages::fs::tests::security_cases::/)"
-                ),
-            },
-        )
+class PluginOwnerTests(unittest.TestCase):
+    PR_415_PATHS = (
+        "plugin-codex/skills/setup/SKILL.md",
+        "plugin/skills/setup/SKILL.md",
+    )
+
+    def test_pr_415_exact_paths_are_owned_without_full_rust_fallback(self) -> None:
+        plan = plan_for(*self.PR_415_PATHS)
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
         self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
         self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["canonical_smokes"], {"mode": "skip"})
 
+    def test_mixed_rust_and_pr_415_diff_keeps_the_rust_only_plan(self) -> None:
+        rust_path = "crates/wenlan-server/src/routes.rs"
+        rust_only = plan_for(rust_path)
+        mixed = plan_for(rust_path, *self.PR_415_PATHS)
+
+        for suite in (
+            "workspace_lib",
+            "cli_server_integration",
+            "core_integration",
+            "canonical_smokes",
+        ):
+            self.assertEqual(mixed[suite], rust_only[suite])
+        self.assertEqual(mixed["mode"], "differential")
+
+    def test_every_plugin_job_owned_path_is_ignored_by_cargo_ownership(self) -> None:
+        paths = (
+            "plugin/skills/setup/SKILL.md",
+            "plugin-codex/skills/setup/SKILL.md",
+            ".agents/plugins/wenlan/skills/setup/SKILL.md",
+            ".claude-plugin/marketplace.json",
+            "plugin-contract.json",
+            "scripts/validate-codex-plugin-slice.py",
+            "scripts/validate-plugin-contract.py",
+            "scripts/validate-plugin-contract.test.sh",
+        )
+
+        for path in paths:
+            with self.subTest(path=path):
+                plan = plan_for(path)
+                self.assertEqual(plan["mode"], "differential")
+                self.assertFalse(any(required_suite_outputs(plan).values()))
+
+
+class NonRustOwnerTests(unittest.TestCase):
+    def assert_non_rust_owner(self, *paths: str) -> None:
+        plan = plan_for(*paths)
+        self.assertEqual(plan["mode"], "differential")
+        self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
+        self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
+        self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["canonical_smokes"], {"mode": "skip"})
+        self.assertFalse(any(required_suite_outputs(plan).values()))
+
+    def test_exact_docs_only_paths_have_no_rust_suites(self) -> None:
+        paths = (
+            "README.md",
+            "docs/windows-vulkan.md",
+            "crates/wenlan-core/AGENTS.md",
+            "LICENSE",
+            "scripts/check-readme-translations.py",
+            "scripts/check-readme-translations.test.sh",
+            "scripts/update-readme-eval.py",
+            "scripts/update-readme-eval.test.py",
+            "scripts/validate-versions.sh",
+            "scripts/validate-versions.test.sh",
+        )
+
+        for path in paths:
+            with self.subTest(path=path):
+                self.assert_non_rust_owner(path)
+
+    def test_exact_npm_only_paths_have_no_rust_suites(self) -> None:
+        for path in (
+            "crates/wenlan-cli/npm/package.json",
+            "crates/wenlan-mcp/npm/install.js",
+        ):
+            with self.subTest(path=path):
+                self.assert_non_rust_owner(path)
+
+    def test_docs_npm_and_plugin_only_diff_stays_on_fast_lanes(self) -> None:
+        self.assert_non_rust_owner(
+            "docs/windows-vulkan.md",
+            "crates/wenlan-mcp/npm/install.js",
+            "plugin/skills/setup/SKILL.md",
+        )
+
+    def test_non_rust_owners_do_not_widen_a_mixed_rust_plan(self) -> None:
+        rust_path = "crates/wenlan-server/src/routes.rs"
+        rust_only = plan_for(rust_path)
+        mixed = plan_for(
+            rust_path,
+            "docs/windows-vulkan.md",
+            "crates/wenlan-mcp/npm/install.js",
+            "plugin/skills/setup/SKILL.md",
+        )
+
+        for suite in (
+            "workspace_lib",
+            "cli_server_integration",
+            "core_integration",
+            "canonical_smokes",
+        ):
+            self.assertEqual(mixed[suite], rust_only[suite])
+
+    def test_markdown_test_fixture_is_not_misclassified_as_docs_only(self) -> None:
+        plan = plan_for("crates/wenlan-core/tests/fixtures/example.md")
+
+        self.assertEqual(plan["mode"], "full")
+        self.assertTrue(required_suite_outputs(plan)["rust-ci-required"])
+
+
+class SuiteOutputTests(unittest.TestCase):
+    def test_behavioral_source_requires_lib_integration_and_canonical_smokes(
+        self,
+    ) -> None:
+        outputs = required_suite_outputs(
+            plan_for("crates/wenlan-server/src/routes.rs")
+        )
+
+        self.assertEqual(
+            outputs,
+            {
+                "workspace-lib-required": True,
+                "cli-server-integration-required": True,
+                "core-integration-required": False,
+                "canonical-smokes-required": True,
+                "canonical-acceptance-required": True,
+                "rust-ci-required": True,
+            },
+        )
+
+    def test_direct_integration_requires_only_its_canonical_suite(self) -> None:
+        outputs = required_suite_outputs(
+            plan_for("crates/wenlan-cli/tests/distribution.rs")
+        )
+
+        self.assertFalse(outputs["workspace-lib-required"])
+        self.assertTrue(outputs["cli-server-integration-required"])
+        self.assertFalse(outputs["core-integration-required"])
+        self.assertFalse(outputs["canonical-smokes-required"])
+        self.assertTrue(outputs["canonical-acceptance-required"])
+        self.assertTrue(outputs["rust-ci-required"])
+
+    def test_isolated_and_plugin_paths_do_not_require_canonical_acceptance(
+        self,
+    ) -> None:
+        isolated = required_suite_outputs(
+            plan_for("crates/wenlan-core/src/lint/pages/security_test.rs")
+        )
+        plugin = required_suite_outputs(
+            plan_for("plugin-codex/skills/setup/SKILL.md")
+        )
+
+        self.assertTrue(isolated["workspace-lib-required"])
+        self.assertFalse(isolated["canonical-acceptance-required"])
+        self.assertFalse(any(plugin.values()))
+
+    def test_full_plan_requires_every_suite(self) -> None:
+        self.assertTrue(
+            all(required_suite_outputs(plan_for("Cargo.lock")).values())
+        )
+
+    def test_plan_command_writes_each_required_suite_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metadata_path = Path(directory) / "metadata.json"
+            output_path = Path(directory) / "github-output.txt"
+            metadata_path.write_text(json.dumps(cargo_metadata()), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("ci_test_plan.py")),
+                    "plan",
+                    "--changed-files-json",
+                    json.dumps(["Cargo.lock"]),
+                    "--metadata-file",
+                    str(metadata_path),
+                    "--event-name",
+                    "pull_request",
+                    "--github-output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).parent.parent,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = output_path.read_text(encoding="utf-8")
+            for name in (
+                "workspace-lib-required",
+                "cli-server-integration-required",
+                "core-integration-required",
+                "canonical-smokes-required",
+                "canonical-acceptance-required",
+                "rust-ci-required",
+            ):
+                self.assertIn(f"{name}=true\n", output)
 
 class FailClosedTests(unittest.TestCase):
     def test_deleted_integration_target_falls_back_to_owning_package_suite(self) -> None:
@@ -364,6 +574,13 @@ class FailClosedTests(unittest.TestCase):
         plan = plan_for("crates/new-crate/src/lib.rs")
 
         self.assertEqual(plan["mode"], "full")
+
+    def test_unknown_non_plugin_repository_path_stays_fail_closed(self) -> None:
+        plan = plan_for("config/new-ci-input.json")
+
+        self.assertEqual(plan["mode"], "full")
+        self.assertEqual(plan["canonical_smokes"], {"mode": "full"})
+        self.assertTrue(all(required_suite_outputs(plan).values()))
 
     def test_cargo_build_native_and_ci_inputs_fall_back_to_all_suites(self) -> None:
         for path in [
@@ -478,6 +695,123 @@ class CommandGenerationTests(unittest.TestCase):
                 ]
             ],
         )
+
+    def test_full_workspace_archive_compiles_the_complete_lib_inventory(self) -> None:
+        plan = plan_for("Cargo.lock")
+
+        self.assertEqual(
+            archive_command_for(
+                plan,
+                cargo_metadata(),
+                archive_file="/tmp/workspace-lib.tar.zst",
+            ),
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                "/tmp/workspace-lib.tar.zst",
+                "--workspace",
+                "--lib",
+            ],
+        )
+
+    def test_package_archive_compiles_only_selected_package_libs(self) -> None:
+        plan = plan_for("crates/wenlan-server/src/routes.rs")
+
+        self.assertEqual(
+            archive_command_for(
+                plan,
+                cargo_metadata(),
+                archive_file="/tmp/workspace-lib.tar.zst",
+            ),
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                "/tmp/workspace-lib.tar.zst",
+                "-p",
+                "wenlan-mcp",
+                "-p",
+                "wenlan-server",
+                "--lib",
+            ],
+        )
+
+    def test_filterset_archive_defers_test_selector_until_partition_run(self) -> None:
+        plan = plan_for(
+            "crates/wenlan-core/src/lint/pages/security_test.rs"
+        )
+        filterset = (
+            "package(wenlan-core) "
+            "& test(/^lint::pages::fs::tests::security_cases::/)"
+        )
+
+        archive = archive_command_for(
+            plan,
+            cargo_metadata(),
+            archive_file="/tmp/workspace-lib.tar.zst",
+        )
+        run = command_groups_for(
+            "workspace-lib",
+            plan,
+            cargo_metadata(),
+            partition="slice:2/2",
+            archive_file="/tmp/workspace-lib.tar.zst",
+            workspace_remap="/repo",
+        )
+
+        self.assertEqual(
+            archive,
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                "/tmp/workspace-lib.tar.zst",
+                "-p",
+                "wenlan-core",
+                "--lib",
+            ],
+        )
+        self.assertNotIn("-E", archive)
+        self.assertEqual(
+            run,
+            [
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--archive-file",
+                    "/tmp/workspace-lib.tar.zst",
+                    "--workspace-remap",
+                    "/repo",
+                    "-E",
+                    filterset,
+                    "--no-tests=pass",
+                    "--partition",
+                    "slice:2/2",
+                ]
+            ],
+        )
+
+    def test_archive_run_requires_a_safe_workspace_remap(self) -> None:
+        plan = plan_for("Cargo.lock")
+
+        with self.assertRaisesRegex(PlanError, "requires workspace-remap"):
+            command_groups_for(
+                "workspace-lib",
+                plan,
+                cargo_metadata(),
+                archive_file="/tmp/workspace-lib.tar.zst",
+            )
+        with self.assertRaisesRegex(PlanError, "non-empty path argument"):
+            archive_command_for(
+                plan,
+                cargo_metadata(),
+                archive_file="--unexpected-option",
+            )
 
     def test_isolated_module_uses_literal_nextest_filterset_argument(self) -> None:
         plan = plan_for(
