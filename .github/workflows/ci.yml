@@ -908,7 +908,9 @@ jobs:
         if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.platform-test-plan }}
-        run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-json "$CI_TEST_PLAN"
+        # PowerShell/native argv processing strips the JSON property's quote
+        # characters. Read the compact plan directly from the environment.
+        run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-env CI_TEST_PLAN
       # When this OS already owns behavioral tests, keep platform compile proof
       # in the same target directory instead of rebuilding the native graph in
       # mcp-platform. That job remains the owner for OSes absent from this matrix.

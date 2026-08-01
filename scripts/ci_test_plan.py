@@ -1172,7 +1172,9 @@ def _main(argv: list[str]) -> int:
             "contract-integration",
         ),
     )
-    run_parser.add_argument("--plan-json", required=True)
+    run_plan_source = run_parser.add_mutually_exclusive_group(required=True)
+    run_plan_source.add_argument("--plan-json")
+    run_plan_source.add_argument("--plan-env")
     run_parser.add_argument("--partition")
     run_parser.add_argument("--archive-file")
     run_parser.add_argument("--workspace-remap")
@@ -1226,8 +1228,13 @@ def _main(argv: list[str]) -> int:
             subprocess.run(executable_command, check=True)
         return 0
 
+    plan_json = arguments.plan_json
+    if arguments.command == "run" and arguments.plan_env is not None:
+        plan_json = os.environ.get(arguments.plan_env)
+        if plan_json is None:
+            raise PlanError(f"plan environment variable is unset: {arguments.plan_env}")
     try:
-        plan = json.loads(arguments.plan_json)
+        plan = json.loads(plan_json)
     except json.JSONDecodeError as error:
         raise PlanError("plan-json is invalid") from error
     if arguments.command == "clippy":

@@ -122,6 +122,7 @@ class FiltersetExecutionTests(unittest.TestCase):
         listing: dict,
         *,
         partition: str | None = None,
+        plan_from_env: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], bool]:
         plan = plan_for(
             "crates/wenlan-core/src/lint/pages/security_test.rs"
@@ -162,6 +163,7 @@ else:
             environment["FAKE_CARGO_METADATA"] = json.dumps(cargo_metadata())
             environment["FAKE_NEXTEST_LISTING"] = json.dumps(listing)
             environment["NEXTEST_RUN_MARKER"] = str(run_marker)
+            environment["FAKE_CI_TEST_PLAN"] = json.dumps(plan)
 
             arguments = [
                 sys.executable,
@@ -169,9 +171,11 @@ else:
                 "run",
                 "--suite",
                 "workspace-lib",
-                "--plan-json",
-                json.dumps(plan),
             ]
+            if plan_from_env:
+                arguments.extend(["--plan-env", "FAKE_CI_TEST_PLAN"])
+            else:
+                arguments.extend(["--plan-json", json.dumps(plan)])
             if partition is not None:
                 arguments.extend(["--partition", partition])
             result = subprocess.run(
@@ -238,6 +242,26 @@ else:
                     }
                 }
             }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(did_run)
+
+    def test_plan_environment_preserves_compact_json_on_windows(self) -> None:
+        result, did_run = self.run_filterset_with_listing(
+            {
+                "rust-suites": {
+                    "wenlan-core": {
+                        "testcases": {
+                            "owned::active": {
+                                "ignored": False,
+                                "filter-match": {"status": "matches"},
+                            }
+                        }
+                    }
+                }
+            },
+            plan_from_env=True,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)

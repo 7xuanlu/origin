@@ -3014,35 +3014,40 @@ fn ci_routing_contract_violations(
         );
     }
 
-    for (job, step_name, suite, expected_plan) in [
+    for (job, step_name, suite, plan_argument, expected_plan) in [
         (
             "test",
             "Workspace lib tests (macOS)",
             "workspace-lib",
+            "--plan-json \"$CI_TEST_PLAN\"",
             "${{ needs.detect-changes.outputs.platform-test-plan }}",
         ),
         (
             "test",
             "Integration tests wenlan-cli + wenlan-server (macOS)",
             "cli-server-integration",
+            "--plan-json \"$CI_TEST_PLAN\"",
             "${{ needs.detect-changes.outputs.platform-test-plan }}",
         ),
         (
             "test",
             "Integration tests wenlan-cli + wenlan-server (Windows)",
             "cli-server-integration",
+            "--plan-env CI_TEST_PLAN",
             "${{ needs.detect-changes.outputs.platform-test-plan }}",
         ),
         (
             "canonical-acceptance",
             "Integration tests wenlan-cli + wenlan-server (Linux)",
             "cli-server-integration",
+            "--plan-json \"$CI_TEST_PLAN\"",
             "${{ needs.detect-changes.outputs.test-plan }}",
         ),
         (
             "canonical-acceptance",
             "Run integration tests (core) (Linux)",
             "core-integration",
+            "--plan-json \"$CI_TEST_PLAN\"",
             "${{ needs.detect-changes.outputs.test-plan }}",
         ),
     ] {
@@ -3055,7 +3060,7 @@ fn ci_routing_contract_violations(
             .unwrap_or_default();
         if !run.contains("python3 scripts/ci_test_plan.py run")
             || !run.contains(&format!("--suite {suite}"))
-            || !run.contains("--plan-json \"$CI_TEST_PLAN\"")
+            || !run.contains(plan_argument)
             || plan != expected_plan
         {
             violations.push(format!(
