@@ -3806,7 +3806,6 @@ jobs:
         "expected-vs-actual",
         "unnecessarily serialized",
         "dev/test artifact reuse",
-        "compiler-cache lane",
         "cache writes",
         "reusable target cache",
         "restore-only target-free rust-cache",
