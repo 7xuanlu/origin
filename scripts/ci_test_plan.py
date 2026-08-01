@@ -121,6 +121,19 @@ def _full_plan(reason: str) -> dict:
     }
 
 
+def _skip_plan(reason: str) -> dict:
+    return {
+        "version": 1,
+        "mode": "differential",
+        "reasons": [reason],
+        "workspace_lib": {"mode": "skip"},
+        "cli_server_integration": {"mode": "skip"},
+        "core_integration": {"mode": "skip"},
+        "contract_integration": {"mode": "skip"},
+        "canonical_smokes": {"mode": "skip"},
+    }
+
+
 def _normalize_path(raw_path: object) -> str:
     if not isinstance(raw_path, str) or not raw_path:
         raise PlanError("changed paths must be non-empty strings")
@@ -472,6 +485,94 @@ def build_plan(
         "contract_integration": contract_plan,
         "canonical_smokes": {"mode": "full" if canonical_smokes else "skip"},
     }
+
+
+def build_platform_plan(
+    changed_paths: Iterable[object],
+    cargo_metadata: object,
+    *,
+    event_name: str,
+    existing_paths: set[str] | None = None,
+) -> dict:
+    """Plan platform behavior without letting CI infrastructure widen it."""
+
+    paths = [_normalize_path(path) for path in changed_paths]
+    if event_name != "pull_request":
+        return build_plan(
+            paths,
+            cargo_metadata,
+            event_name=event_name,
+            existing_paths=existing_paths,
+        )
+    if not paths:
+        raise PlanError("changed path inventory is empty")
+
+    # Linux owns repository/workflow/planner contracts. Platform behavior is
+    # widened only by product crate inputs or the shared Cargo/toolchain graph.
+    # drift_guard.rs is test-contract source: its Rust tests run canonically on
+    # Linux and must not turn a workflow-only PR into two full native suites.
+    shared_platform_inputs = {
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        ".config/nextest.toml",
+    }
+    relevant = [
+        path
+        for path in paths
+        if path in shared_platform_inputs
+        or (
+            path.startswith("crates/")
+            and path != "crates/wenlan-core/src/drift_guard.rs"
+        )
+    ]
+    if not relevant:
+        return _skip_plan("no platform behavioral inputs changed")
+
+    relevant_existing = None
+    if existing_paths is not None:
+        normalized_existing = {_normalize_path(path) for path in existing_paths}
+        relevant_existing = set(relevant) & normalized_existing
+    plan = build_plan(
+        relevant,
+        cargo_metadata,
+        event_name=event_name,
+        existing_paths=relevant_existing,
+    )
+
+    # Cross-platform MCP/type compile contracts have dedicated Linux and
+    # mcp-platform owners. Do not pull their reverse-dev-dependency tests into
+    # the expensive macOS behavior lane merely because server/core changed.
+    workspace = plan["workspace_lib"]
+    if plan["mode"] == "differential" and workspace["mode"] in {
+        "packages",
+        "filterset",
+    }:
+        behavioral_packages = {"wenlan-core", "wenlan-server", "wenlan"}
+        packages = [
+            package
+            for package in workspace["packages"]
+            if package in behavioral_packages
+        ]
+        if packages:
+            workspace["packages"] = packages
+            if workspace["mode"] == "filterset":
+                expressions = [
+                    expression
+                    for expression in workspace["filterset"].split(" | ")
+                    if any(
+                        expression.startswith(f"package({package})")
+                        for package in packages
+                    )
+                ]
+                if not expressions:
+                    raise PlanError(
+                        "platform workspace filterset lost every behavioral owner"
+                    )
+                workspace["filterset"] = " | ".join(expressions)
+        else:
+            plan["workspace_lib"] = {"mode": "skip"}
+    return plan
 
 
 def required_suite_outputs(plan: object) -> dict[str, bool]:
@@ -1051,6 +1152,9 @@ def _main(argv: list[str]) -> int:
     plan_parser.add_argument("--changed-files-json", required=True)
     plan_parser.add_argument("--metadata-file", required=True)
     plan_parser.add_argument("--event-name", required=True)
+    plan_parser.add_argument(
+        "--scope", choices=("canonical", "platform"), default="canonical"
+    )
     plan_parser.add_argument("--github-output")
 
     archive_parser = subparsers.add_parser("archive")
@@ -1088,7 +1192,8 @@ def _main(argv: list[str]) -> int:
             raise PlanError("changed-files-json is invalid") from error
         if not isinstance(changed_paths, list):
             raise PlanError("changed-files-json must be an array")
-        plan = build_plan(
+        planner = build_platform_plan if arguments.scope == "platform" else build_plan
+        plan = planner(
             changed_paths,
             _load_json_file(arguments.metadata_file),
             event_name=arguments.event_name,

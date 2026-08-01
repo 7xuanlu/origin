@@ -16,6 +16,7 @@ from ci_test_plan import (
     affected_package_names,
     archive_command_for,
     build_plan,
+    build_platform_plan,
     clippy_command_for,
     command_groups_for,
     local_test_commands_for,
@@ -320,6 +321,117 @@ class PackageClosureTests(unittest.TestCase):
             ["wenlan", "wenlan-core", "wenlan-mcp", "wenlan-server"],
         )
         self.assertNotIn("filterset", plan["workspace_lib"])
+
+
+class PlatformPlanTests(unittest.TestCase):
+    INFRASTRUCTURE_PATHS = (
+        ".github/workflows/ci.yml",
+        ".githooks/pre-push",
+        "scripts/ci_test_plan.py",
+        "scripts/ci_test_plan.test.py",
+        "scripts/release_targets.py",
+        "scripts/release_targets.test.py",
+        "scripts/build-release-binaries.sh",
+        "scripts/release-workflow-contract.test.py",
+        "crates/wenlan-core/src/drift_guard.rs",
+    )
+
+    def platform_plan_for(self, *paths: str) -> dict:
+        return build_platform_plan(
+            paths,
+            cargo_metadata(),
+            event_name="pull_request",
+            existing_paths=set(paths),
+        )
+
+    def test_infrastructure_only_diff_skips_every_platform_behavior_suite(self) -> None:
+        plan = self.platform_plan_for(*self.INFRASTRUCTURE_PATHS)
+
+        self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
+        self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
+        self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["contract_integration"], {"mode": "skip"})
+        self.assertFalse(any(required_suite_outputs(plan).values()))
+
+    def test_infrastructure_does_not_widen_mixed_server_change(self) -> None:
+        product = "crates/wenlan-server/src/bind_addr_tests.rs"
+        focused = self.platform_plan_for(product)
+        mixed = self.platform_plan_for(product, *self.INFRASTRUCTURE_PATHS)
+
+        for suite in (
+            "workspace_lib",
+            "cli_server_integration",
+            "core_integration",
+            "contract_integration",
+            "canonical_smokes",
+        ):
+            self.assertEqual(mixed[suite], focused[suite])
+        self.assertEqual(
+            mixed["workspace_lib"]["packages"],
+            ["wenlan-server"],
+        )
+        self.assertEqual(
+            mixed["cli_server_integration"],
+            {"mode": "packages", "packages": ["wenlan-server"]},
+        )
+
+    def test_platform_workspace_lib_excludes_compile_only_reverse_dependents(self) -> None:
+        plan = self.platform_plan_for("crates/wenlan-types/src/lib.rs")
+
+        self.assertEqual(
+            plan["workspace_lib"]["packages"],
+            ["wenlan", "wenlan-core", "wenlan-server"],
+        )
+        self.assertNotIn("wenlan-mcp", plan["workspace_lib"]["packages"])
+        self.assertNotIn("wenlan-types", plan["workspace_lib"]["packages"])
+
+    def test_platform_filterset_excludes_reverse_dependents_from_expression(
+        self,
+    ) -> None:
+        plan = self.platform_plan_for(
+            "crates/wenlan-server/src/bind_addr_tests.rs",
+            "crates/wenlan-core/src/lint/pages/security_test.rs",
+        )
+
+        self.assertEqual(plan["workspace_lib"]["mode"], "filterset")
+        self.assertEqual(
+            plan["workspace_lib"]["packages"],
+            ["wenlan-core", "wenlan-server"],
+        )
+        self.assertNotIn("package(wenlan-mcp)", plan["workspace_lib"]["filterset"])
+
+    def test_manifest_native_and_toolchain_inputs_still_fail_closed_full(self) -> None:
+        for path in (
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".config/nextest.toml",
+            "crates/wenlan-core/Cargo.toml",
+            "crates/wenlan-core/build.rs",
+            "crates/wenlan-core/native/bridge.cpp",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.platform_plan_for(path)["mode"], "full")
+
+    def test_non_pr_platform_plan_keeps_full_backstop(self) -> None:
+        plan = build_platform_plan(
+            self.INFRASTRUCTURE_PATHS,
+            cargo_metadata(),
+            event_name="push",
+            existing_paths=set(self.INFRASTRUCTURE_PATHS),
+        )
+
+        self.assertEqual(plan["mode"], "full")
+        self.assertTrue(all(required_suite_outputs(plan).values()))
+
+    def test_empty_pr_inventory_still_fails_closed(self) -> None:
+        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
+            build_platform_plan(
+                [],
+                cargo_metadata(),
+                event_name="pull_request",
+                existing_paths=set(),
+            )
 
 
 class NarrowOwnerTests(unittest.TestCase):

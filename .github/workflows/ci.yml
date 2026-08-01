@@ -43,6 +43,8 @@ jobs:
       macos:   ${{ steps.filter.outputs.macos }}
       windows: ${{ steps.filter.outputs.windows }}
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
+      macos-m4: ${{ steps.filter.outputs.macos-m4 }}
+      windows-llm-probe: ${{ steps.filter.outputs.windows-llm-probe }}
       release-preflight: ${{ steps.filter.outputs.release-preflight }}
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
       workspace-platform: ${{ steps.filter.outputs.workspace-platform }}
@@ -55,6 +57,9 @@ jobs:
       canonical-smokes-required: ${{ steps.test-plan.outputs.canonical-smokes-required }}
       canonical-acceptance-required: ${{ steps.test-plan.outputs.canonical-acceptance-required }}
       rust-ci-required: ${{ steps.test-plan.outputs.rust-ci-required }}
+      platform-test-plan: ${{ steps.platform-test-plan.outputs.test-plan }}
+      platform-workspace-lib-required: ${{ steps.platform-test-plan.outputs.workspace-lib-required }}
+      platform-cli-server-integration-required: ${{ steps.platform-test-plan.outputs.cli-server-integration-required }}
       release-targets: ${{ steps.release-targets.outputs.release-targets }}
       release-preflight-targets: ${{ steps.release-preflight-targets.outputs.release-preflight-targets }}
       # Linux runs from one compile-once archive below. This dynamic matrix is
@@ -183,6 +188,13 @@ jobs:
               - 'crates/wenlan-cli/tests/cli_integration.rs'
               - 'crates/wenlan-core/src/drift_guard.rs'
               - 'crates/wenlan-core/src/config.rs'
+              - 'crates/wenlan-core/src/community_grouping.rs'
+              - 'crates/wenlan-core/src/community_partition.rs'
+              - 'crates/wenlan-core/src/edge_grounding.rs'
+              - 'crates/wenlan-core/src/provenance.rs'
+              - 'crates/wenlan-core/src/db.rs'
+              - 'crates/wenlan-core/src/db/community_grouping_state.rs'
+              - 'crates/wenlan-core/src/refinery/mod.rs'
               - 'crates/wenlan-core/src/db/presence_review_test.rs'
               - 'crates/wenlan-core/src/export/knowledge.rs'
               - 'crates/wenlan-core/src/export/projection_invariant_test.rs'
@@ -300,6 +312,31 @@ jobs:
               - 'scripts/lint-scale-gate.sh'
               - 'scripts/stage-vulkan-loader-windows.ps1'
               - 'scripts/stage-vulkan-loader-windows.test.ps1'
+            macos-m4:
+              - 'crates/wenlan-core/src/community_grouping.rs'
+              - 'crates/wenlan-core/src/community_partition.rs'
+              - 'crates/wenlan-core/src/edge_grounding.rs'
+              - 'crates/wenlan-core/src/db.rs'
+              - 'crates/wenlan-core/src/db/community_grouping_state.rs'
+              - 'crates/wenlan-core/src/provenance.rs'
+              - 'crates/wenlan-core/src/refinery/mod.rs'
+              - 'crates/wenlan-core/tests/m4_community_gates.rs'
+              - '.config/nextest.toml'
+            windows-llm-probe:
+              - 'crates/wenlan-core/src/engine.rs'
+              - 'crates/wenlan-core/src/llm_provider.rs'
+              - 'crates/wenlan-core/src/bin/model_probe.rs'
+              - 'crates/wenlan-core/Cargo.toml'
+              - 'crates/**/build.rs'
+              - 'scripts/stage-onnxruntime-windows.ps1'
+              - 'scripts/smoke-windows-llm.ps1'
+              - 'scripts/smoke-windows-llm.test.ps1'
+              - 'scripts/setup-vulkan-sdk-windows.ps1'
+              - 'scripts/setup-vulkan-sdk-windows.test.ps1'
+              - 'scripts/stage-vulkan-loader-windows.ps1'
+              - 'scripts/stage-vulkan-loader-windows.test.ps1'
+              - 'scripts/setup-msvc-ninja-windows.ps1'
+              - 'scripts/setup-msvc-ninja-windows.test.ps1'
             release-preflight:
               # Keep release-profile builds off ordinary shared-code PRs,
               # while native linkage, build tooling, and packaged entrypoints
@@ -432,6 +469,21 @@ jobs:
         run: |
           cargo metadata --format-version 1 --locked --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
           python3 scripts/ci_test_plan.py plan \
+            --changed-files-json "$CHANGED_FILES_JSON" \
+            --metadata-file "$RUNNER_TEMP/cargo-metadata.json" \
+            --event-name "$CI_EVENT_NAME" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Plan affected platform behavior tests
+        id: platform-test-plan
+        if: steps.release-proof.outputs.verified-release-merge != 'true'
+        env:
+          CHANGED_FILES_JSON: ${{ steps.filter.outputs.impact_files }}
+          # Release-please is the pre-release backstop, so it keeps the full
+          # platform plan even though it arrives as a pull_request event.
+          CI_EVENT_NAME: ${{ startsWith(github.head_ref, 'release-please--branches--') && 'release-please' || github.event_name }}
+        run: |
+          python3 scripts/ci_test_plan.py plan \
+            --scope platform \
             --changed-files-json "$CHANGED_FILES_JSON" \
             --metadata-file "$RUNNER_TEMP/cargo-metadata.json" \
             --event-name "$CI_EVENT_NAME" \
@@ -768,15 +820,15 @@ jobs:
       # by the Windows CLI/server integration step + the schtasks install
       # round-trip E2E further down.
       - name: Workspace lib tests (macOS)
-        if: matrix.os == 'macos-14' && needs.detect-changes.outputs.workspace-lib-required == 'true'
+        if: matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-workspace-lib-required == 'true'
         # nextest spawns one process per test by default — sidesteps the
         # ONNX atexit FFI race that required --test-threads=1 with cargo test.
         # FastEmbed initialization has its own cross-process file lock.
         env:
-          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.platform-test-plan }}
         run: python3 scripts/ci_test_plan.py run --suite workspace-lib --plan-json "$CI_TEST_PLAN"
       - name: M4 community gates (macOS-owned)
-        if: matrix.os == 'macos-14'
+        if: "matrix.os == 'macos-14' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')"
         # This target contains cfg(macos) RSS probes. Linux owns the complete
         # core-integration plan; this focused leg compiles and runs the actual
         # macOS branches whenever its fail-closed owner filter schedules macOS.
@@ -823,7 +875,7 @@ jobs:
       # compilation. Run them before the long Windows Cargo steps so a broken
       # release harness fails in seconds rather than near the end of the job.
       - name: Validate Windows smoke harness
-        if: matrix.os == 'windows-2022'
+        if: "matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -848,27 +900,39 @@ jobs:
       # newly added integration target fails closed into this canonical lane
       # unless it is explicitly classified as manual-only with a reason.
       - name: Integration tests wenlan-cli + wenlan-server (macOS)
-        if: matrix.os == 'macos-14'
-        run: cargo nextest run -p wenlan -p wenlan-server -E 'kind(test)'
+        if: matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.platform-test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-json "$CI_TEST_PLAN"
       - name: Integration tests wenlan-cli + wenlan-server (Windows)
-        if: matrix.os == 'windows-2022'
-        run: cargo nextest run -p wenlan -p wenlan-server
+        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.platform-test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-json "$CI_TEST_PLAN"
+      # When this OS already owns behavioral tests, keep platform compile proof
+      # in the same target directory instead of rebuilding the native graph in
+      # mcp-platform. That job remains the owner for OSes absent from this matrix.
+      - name: Build CLI/server contract binaries (test owner)
+        if: needs.detect-changes.outputs.workspace-platform == 'true'
+        run: cargo build -p wenlan -p wenlan-server --bins
       # Ordinary Windows PR proof uses debug artifacts already warmed by the
       # integration suite. Stage both pinned runtime DLLs next to the daemon
       # because the scheduled task must not depend on this runner shell's
       # ORT_DYLIB_PATH or Vulkan SDK PATH.
       - name: Build Windows contract binaries
-        if: matrix.os == 'windows-2022'
+        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'
         shell: pwsh
         run: |
-          cargo build -p wenlan -p wenlan-server
+          if ("${{ needs.detect-changes.outputs.workspace-platform }}" -ne "true") {
+            cargo build -p wenlan -p wenlan-server
+          }
           & scripts/stage-onnxruntime-windows.ps1 `
             -DestinationDirectory "target\debug"
           & scripts/stage-vulkan-loader-windows.ps1 `
             -DestinationDirectory "target\debug"
 
       - name: Validate Windows LLM probe
-        if: matrix.os == 'windows-2022'
+        if: "matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')"
         shell: pwsh
         run: cargo test -p wenlan-core --bin model_probe
 
@@ -878,7 +942,7 @@ jobs:
       # binds /api/health, and background off stops the daemon while preserving
       # the task registration. Test cleanup removes the task separately.
       - name: E2E wenlan background on/off round-trip (Windows; schtasks)
-        if: matrix.os == 'windows-2022'
+        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -966,6 +1030,9 @@ jobs:
       # main-owned target cache instead of paying a cold first-run compile.
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # Exact mirror of whether this OS appears in the behavioral test matrix.
+      # When true, that job owns the Cargo proof and reuses its target directory.
+      TEST_OWNS_PLATFORM: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -993,20 +1060,20 @@ jobs:
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Install sqlite3 (Windows platform build)
-        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'
+        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true' && env.TEST_OWNS_PLATFORM != 'true'
         shell: pwsh
         run: |
           vcpkg install sqlite3:x64-windows-static-md
           "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" |
             Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Set up Vulkan SDK (Windows platform build)
-        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'
+        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true' && env.TEST_OWNS_PLATFORM != 'true'
         shell: pwsh
         run: |
           & scripts/setup-vulkan-sdk-windows.test.ps1
           & scripts/setup-vulkan-sdk-windows.ps1
       - name: Configure MSVC Ninja (Windows platform build)
-        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'
+        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true' && env.TEST_OWNS_PLATFORM != 'true'
         shell: pwsh
         run: |
           & scripts/setup-msvc-ninja-windows.test.ps1
@@ -1020,13 +1087,13 @@ jobs:
           cache-targets: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Compile platform-owned MCP runtime
-        if: needs.detect-changes.outputs.workspace-platform != 'true'
+        if: env.TEST_OWNS_PLATFORM == 'true' || needs.detect-changes.outputs.workspace-platform != 'true'
         run: cargo check -p wenlan-mcp --lib --bins
       # Dependency-graph changes can alter native target linkage. Link every
       # shipped binary in the dev profile here; release-profile proof remains
       # reserved for release-sensitive paths in release-preflight.
       - name: Build workspace contract binaries
-        if: needs.detect-changes.outputs.workspace-platform == 'true'
+        if: needs.detect-changes.outputs.workspace-platform == 'true' && env.TEST_OWNS_PLATFORM != 'true'
         run: cargo build -p wenlan -p wenlan-server -p wenlan-mcp --bins
 
   # Canonical acceptance runs beside the long workspace-lib lane. On PR #384,
