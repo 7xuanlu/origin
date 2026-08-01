@@ -22,7 +22,9 @@ static ONLINE_BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 mod brief;
 pub use brief::LegacyBriefItem;
 mod claim_derivation;
-pub use claim_derivation::{DerivationJob, EXTRACTOR_VERSION, LEASE_SECS, MAX_ATTEMPTS};
+pub use claim_derivation::{
+    DerivationJob, SupportOutcome, EXTRACTOR_VERSION, LEASE_SECS, MAX_ATTEMPTS, SUPPORT_THRESHOLD,
+};
 mod claim_identity;
 mod community_grouping_state;
 mod count;
