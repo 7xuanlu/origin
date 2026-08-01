@@ -137,6 +137,10 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
             "contract-integration",
             &["Affected wenlan-mcp + wenlan-types integrations"],
         ),
+        (
+            "release-preflight",
+            &["Native ORT smoke (Windows release preflight)"],
+        ),
     ];
 
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse ci.yml");
@@ -212,6 +216,12 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
         if *job_name == "test" && !download["if"].is_null() {
             violations.push("test downloads the model only on a subset of matrix OSes".into());
         }
+        if *job_name == "release-preflight"
+            && download["if"].as_str() != Some("matrix.target == 'x86_64-pc-windows-msvc'")
+        {
+            violations
+                .push("release-preflight does not scope the FastEmbed download to Windows".into());
+        }
 
         for consumer_name in *consumer_names {
             let consumer_index = steps
@@ -225,6 +235,16 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 None => violations.push(format!(
                     "job {job_name} is missing consumer step {consumer_name:?}"
                 )),
+            }
+            if *job_name == "release-preflight" {
+                let cache_override = consumer_index
+                    .and_then(|index| steps.get(index))
+                    .and_then(|step| step["env"]["WENLAN_TEST_FASTEMBED_CACHE"].as_str());
+                if cache_override != Some("${{ env.FASTEMBED_CACHE_DIR }}") {
+                    violations.push(format!(
+                        "release-preflight consumer {consumer_name:?} does not use the prepared FastEmbed cache"
+                    ));
+                }
             }
         }
     }

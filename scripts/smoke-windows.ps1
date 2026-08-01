@@ -1,5 +1,6 @@
 param(
-    [string]$ExePath = "target\release\wenlan-server.exe"
+    [string]$ExePath = "target\release\wenlan-server.exe",
+    [int]$HealthTimeoutSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,19 +20,28 @@ $ExpectedVulkanLoader = (
 $Marker = "ORT_VECTOR_$([System.Guid]::NewGuid().ToString('N'))"
 $DataDir = $null
 $proc = $null
+$StdoutLog = $null
+$StderrLog = $null
 
 try {
     $DataDir = New-Item -ItemType Directory -Path "$env:TEMP\origin-smoke-$([System.Guid]::NewGuid())"
     $env:WENLAN_BIND_ADDR = "127.0.0.1:$Port"
     $env:WENLAN_DATA_DIR = $DataDir.FullName
     Remove-Item Env:ORT_DYLIB_PATH -ErrorAction SilentlyContinue
+    $StdoutLog = Join-Path $DataDir.FullName "wenlan-server.stdout.log"
+    $StderrLog = Join-Path $DataDir.FullName "wenlan-server.stderr.log"
 
     Write-Host "==> Starting daemon"
-    $proc = Start-Process -FilePath $ExePath -PassThru -WindowStyle Hidden
+    $proc = Start-Process -FilePath $ExePath -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $StdoutLog -RedirectStandardError $StderrLog
 
     Write-Host "==> Waiting for /api/health"
     $healthy = $false
-    for ($i = 0; $i -lt 30; $i++) {
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($HealthTimeoutSeconds)
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        if ($proc.HasExited) {
+            break
+        }
         try {
             $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" -UseBasicParsing -TimeoutSec 1
             if ($resp.StatusCode -eq 200) {
@@ -43,7 +53,10 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $healthy) {
-        throw "daemon did not become healthy"
+        $exit = if ($proc.HasExited) { "exit=$($proc.ExitCode)" } else { "still-running" }
+        $stdout = if (Test-Path $StdoutLog) { (Get-Content $StdoutLog -Tail 40) -join "`n" } else { "<missing>" }
+        $stderr = if (Test-Path $StderrLog) { (Get-Content $StderrLog -Tail 40) -join "`n" } else { "<missing>" }
+        throw "daemon did not become healthy ($exit)`nstdout:`n$stdout`nstderr:`n$stderr"
     }
 
     $LoadedVulkanModules = @(

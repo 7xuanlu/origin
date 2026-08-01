@@ -1239,6 +1239,8 @@ jobs:
       # `mcp-platform`; compiling the same graph again in release profile is
       # the measured >20-minute duplicate. Full release backstops keep it.
       matrix: ${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
@@ -1332,12 +1334,22 @@ jobs:
             -DestinationDirectory "target\${{ matrix.target }}\release"
           & scripts/stage-onnxruntime-windows.ps1 `
             -DestinationDirectory "target\${{ matrix.target }}\release"
+      # The native smoke starts a fresh daemon. Give it the model prepared by
+      # detect-changes so health does not depend on a cold Hugging Face fetch.
+      - name: Download portable FastEmbed model
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
+          path: .fastembed_cache
       - name: Build and smoke shipped release binaries
         shell: bash
         run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
       - name: Native ORT smoke (Windows release preflight)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
+        env:
+          WENLAN_TEST_FASTEMBED_CACHE: ${{ env.FASTEMBED_CACHE_DIR }}
         run: |
           & scripts/smoke-windows.ps1 `
             -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
