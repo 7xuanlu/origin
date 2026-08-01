@@ -8636,6 +8636,16 @@ fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
     }
 }
 
+/// `Stmt::Item` and `Stmt::Expr` keep their attributes on the item or the
+/// expression, where the item and expression gates already read them.
+fn stmt_attrs(statement: &syn::Stmt) -> &[syn::Attribute] {
+    match statement {
+        syn::Stmt::Local(local) => &local.attrs,
+        syn::Stmt::Macro(statement) => &statement.attrs,
+        _ => &[],
+    }
+}
+
 /// Every `Expr` variant that carries attributes, so a `#[cfg(test)]` in
 /// expression position is read wherever it is written. Enumerated rather than
 /// sampled: a partial list here is the same defect shape as the partial
@@ -8662,6 +8672,69 @@ fn expr_attrs(expr: &Expr) -> &[syn::Attribute] {
     )
 }
 
+/// Every `cfg` gate on non-expression nodes, written once and mixed into both
+/// visitors in this scan.
+///
+/// [`MatchVisitor`] walks a file looking for routing sites; `KindReader` walks a
+/// single scrutinee asking whether it names the column. They have to agree on
+/// which nodes are production code, because the second one runs on a subtree the
+/// first has already entered: a scrutinee whose only `kind` read sits behind
+/// `#[cfg(test)]` is not a production reader, and reporting it is the same
+/// cry-wolf the item and statement gates fixed one level up. Sharing the gates
+/// is what stops the two from drifting apart again.
+///
+/// Each visitor still writes its own `visit_expr`: `KindReader` stops walking
+/// the moment it has found the column, and `MatchVisitor` does not.
+macro_rules! skip_cfg_test_nodes {
+    () => {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if is_cfg_test(item_attrs(node)) {
+                return;
+            }
+            visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if is_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            visit::visit_impl_item(self, node);
+        }
+
+        fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+            if is_cfg_test(trait_item_attrs(node)) {
+                return;
+            }
+            visit::visit_trait_item(self, node);
+        }
+
+        fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+            if is_cfg_test(stmt_attrs(node)) {
+                return;
+            }
+            visit::visit_stmt(self, node);
+        }
+
+        fn visit_arm(&mut self, node: &'ast syn::Arm) {
+            if is_cfg_test(&node.attrs) {
+                return;
+            }
+            visit::visit_arm(self, node);
+        }
+
+        // A struct-literal field keeps its attributes on the `FieldValue` and
+        // not on the expression underneath, so an expression gate alone reads
+        // an empty attribute list and descends. This is live style here
+        // (crates/wenlan-core/src/lint/runner.rs:132).
+        fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+            if is_cfg_test(&node.attrs) {
+                return;
+            }
+            visit::visit_field_value(self, node);
+        }
+    };
+}
+
 struct MatchVisitor<'a> {
     path: &'a str,
     sites: Vec<String>,
@@ -8683,54 +8756,14 @@ impl MatchVisitor<'_> {
 impl<'ast> Visit<'ast> for MatchVisitor<'_> {
     // Every position where a `cfg` can gate executable code gets the same
     // check. Items and impl items alone left cfg-gated statements, trait items,
-    // match arms and expressions unread.
-    fn visit_item(&mut self, node: &'ast syn::Item) {
-        if is_cfg_test(item_attrs(node)) {
-            return;
-        }
-        visit::visit_item(self, node);
-    }
-
-    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-        if is_cfg_test(impl_item_attrs(node)) {
-            return;
-        }
-        visit::visit_impl_item(self, node);
-    }
-
-    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
-        if is_cfg_test(trait_item_attrs(node)) {
-            return;
-        }
-        visit::visit_trait_item(self, node);
-    }
-
-    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
-        // `Stmt::Item` and `Stmt::Expr` keep their attributes on the item or
-        // the expression, where the visitors above and below already read them.
-        let attrs = match node {
-            syn::Stmt::Local(local) => &local.attrs[..],
-            syn::Stmt::Macro(statement) => &statement.attrs[..],
-            _ => &[],
-        };
-        if is_cfg_test(attrs) {
-            return;
-        }
-        visit::visit_stmt(self, node);
-    }
+    // match arms, expressions and struct-literal fields unread.
+    skip_cfg_test_nodes!();
 
     fn visit_expr(&mut self, node: &'ast Expr) {
         if is_cfg_test(expr_attrs(node)) {
             return;
         }
         visit::visit_expr(self, node);
-    }
-
-    fn visit_arm(&mut self, node: &'ast syn::Arm) {
-        if is_cfg_test(&node.attrs) {
-            return;
-        }
-        visit::visit_arm(self, node);
     }
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
@@ -8769,8 +8802,12 @@ impl<'ast> Visit<'ast> for MatchVisitor<'_> {
                     if expr_names_kind(&invocation.scrutinee) {
                         self.record(&invocation.pattern);
                     }
-                    // The scrutinee can itself contain a `match`.
+                    // The scrutinee and the guard are both ordinary
+                    // expressions, and either can contain a `match` of its own.
                     self.visit_expr(&invocation.scrutinee);
+                    if let Some(guard) = &invocation.guard {
+                        self.visit_expr(guard);
+                    }
                 }
                 // Unreadable is not clean. A `matches!` whose pattern cannot be
                 // recovered is a decision on unknown terms, and swallowing the
@@ -8794,11 +8831,17 @@ impl<'ast> Visit<'ast> for MatchVisitor<'_> {
     }
 }
 
-/// `matches!(scrutinee, pattern | pattern if guard $(,)?)`. The guard is parsed
-/// so it can be discarded: its literals are an expression's, not a pattern's.
+/// `matches!(scrutinee, pattern | pattern if guard $(,)?)`.
+///
+/// The guard is KEPT rather than discarded. Its own literals are still not
+/// routing — they are an expression's, not a pattern's, which is why the guard
+/// is never passed to `record` — but it is a whole expression, so a `match` on
+/// the column can be written inside it. Parsing it and throwing it away made
+/// `matches!(flag, true if match page.kind.as_str() { … })` invisible.
 struct MatchesInvocation {
     scrutinee: Expr,
     pattern: Pat,
+    guard: Option<Expr>,
 }
 
 impl Parse for MatchesInvocation {
@@ -8806,16 +8849,22 @@ impl Parse for MatchesInvocation {
         let scrutinee = input.parse()?;
         input.parse::<Token![,]>()?;
         let pattern = Pat::parse_multi_with_leading_vert(input)?;
-        if input.peek(Token![if]) {
+        let guard = if input.peek(Token![if]) {
             input.parse::<Token![if]>()?;
-            let _: Expr = input.parse()?;
-        }
+            Some(input.parse()?)
+        } else {
+            None
+        };
         // core's `matches!` ends in `$(,)?`, and `parse_body` refuses leftover
         // tokens — so an ordinary trailing comma used to fail the parse.
         if input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
         }
-        Ok(MatchesInvocation { scrutinee, pattern })
+        Ok(MatchesInvocation {
+            scrutinee,
+            pattern,
+            guard,
+        })
     }
 }
 
@@ -8830,14 +8879,21 @@ impl Parse for MatchesInvocation {
 /// missed `Tuple`, `Call` and `Block`, and any such list is one syntax away
 /// from the next miss. Identifiers are still compared whole, so `creation_kind`
 /// — a different column, carrying no fence — never matches at any depth.
+///
+/// The tree is walked under the SAME `cfg` gates as the file above it. A
+/// scrutinee is ordinary code and can carry its own test-only branch, so
+/// without them a `match` whose production scrutinee reads some other column
+/// reported purely because a `#[cfg(test)]` sibling named `kind`.
 fn expr_names_kind(expr: &Expr) -> bool {
     struct KindReader {
         found: bool,
     }
 
     impl<'ast> Visit<'ast> for KindReader {
+        skip_cfg_test_nodes!();
+
         fn visit_expr(&mut self, node: &'ast Expr) {
-            if self.found {
+            if self.found || is_cfg_test(expr_attrs(node)) {
                 return;
             }
             self.found = names_kind_here(node);
@@ -9120,6 +9176,18 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
     assert_eq!(
         page_kind_routing_sites_in_snippet(
             path,
+            "if matches!(flag, true if match page.kind.as_str() { \"source\" => true, \
+             _ => false }) { return Ok(()); }",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a `matches!` guard is a whole expression and can hold a `match` of its \
+         own. The guard was parsed only to be discarded, so the invocation's own \
+         scrutinee — `flag`, naming nothing — was the only thing ever looked at"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
             "#[cfg(not(test))]\nfn f(page: &Page) -> u8 {\n    \
              match page.kind.as_str() { \"source\" => 1, _ => 0 }\n}",
         ),
@@ -9287,6 +9355,20 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
             "a compound scrutinee over a different column",
             "let l = match (page.creation_kind.as_str(), active) { \
              (\"source\", true) => 1, _ => 0 };",
+        ),
+        (
+            "a cfg-gated struct-literal field, whose attribute syn keeps on the \
+             field and not on the expression under it",
+            "let built = Built {\n    #[cfg(test)]\n    \
+             route: match page.kind.as_str() { \"source\" => 1, _ => 0 },\n    \
+             name,\n};",
+        ),
+        (
+            "a scrutinee whose only `kind` read is cfg-gated, so the value the \
+             production build matches on is a different column entirely",
+            "let l = match ({\n    #[cfg(test)]\n    let k = page.kind.as_str();\n    \
+             #[cfg(not(test))]\n    let k = page.slug.as_str();\n    k\n}) { \
+             \"source\" => 1, _ => 0 };",
         ),
     ] {
         assert!(
