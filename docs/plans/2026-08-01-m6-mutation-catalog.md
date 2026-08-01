@@ -45,6 +45,20 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 | **lane 1** | prerequisite in flight — the claim-derivation promoter being built on `m5-truth-derivation`. Not vapor, not a follow-up: the RED test is specified here against the frozen predicate so it becomes executable the day that branch lands |
 | **BLOCKED** | blocked pending the merge-no-survivor ruling. Not weakened, not dropped, not narrowed — carried at full strength with its dependency named |
 
+> **Decision S0-160 *(rev 4, round-3 N5)* — a frozen clause whose mapping waits
+> on a ruling carries a `RULING` row; it is never simply absent.** Withdrawing
+> rev 3's visit proof (artifact 6, S0-157) left G6's visit clause with no row at
+> all, which under S0-134 means *not gated* — correct, but invisible. An absent
+> row and an unnoticed clause look identical in this catalog, and the catalog is
+> the gate's index, so invisibility is the one failure it cannot afford.
+>
+> A `RULING` row names the clause, names the decision it waits on, and counts. It
+> is not coverage and must never be totalled as though it were: the status exists
+> precisely so the hole is legible in the coverage table instead of hiding in the
+> difference between two numbers. When the ruling lands, the row becomes a normal
+> mutation row with a real control, or the clause is restated and the row is
+> retired with a note. G10.16 is the only one today.
+
 > **Decision S0-134 — a gate clause with no mutation row in this catalog is not
 > gated.** The gate definitions in the frozen contract are prose; prose passes by
 > reading. A clause that nobody can name a breaking mutation for is a clause no
@@ -78,7 +92,7 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 > section — three controls for thirteen G6 rows — which is not what S0-135 says
 > and does not discriminate: a section-level control passing tells you the
 > section's happy path works, not that row 7's tooth bites on row 7's condition.
-> A stated derivation rule is better than 163 hand-written cells, which would
+> A stated derivation rule is better than 200 hand-written cells, which would
 > drift; it works precisely *because* S0-154 makes every row single-conditioned.
 > Where the derivation does not apply, the row carries an explicit control in its
 > RED column and says so.
@@ -135,6 +149,15 @@ provisional by construction rather than by enumeration"* (`:37`-`:38`).
 | P4b | ignore the **timed-out** support state | a page with one timed-out revision reads `supported` | lane 1 |
 | P4c | ignore the **malformed** support state | a page with one malformed revision reads `supported` | lane 1 |
 | P5 | publish a partial derivation run | a run completing some claims and failing others flips the page rather than leaving prior state | lane 1 |
+
+*(rev 4, round-3 group 7: rev 3's G10.13a–c named a locale but not a **cell** —
+"an M6 state" in that locale, which is not one condition and cannot have a control
+differing in exactly one. S0-117 requires each of thirteen states present and
+non-empty in each of three locales, so the contract's own unit is the
+state×locale cell and there are exactly **39** of them. The letters a…m index
+S0-117's thirteen states in its order, so `G10.14f` is unambiguously
+`zh-Hans` × "overview transfer proposal". The three row-families materialize all
+39 and are counted as 39 by the mechanical rule below.)*
 
 *(rev 2, finding 12: rev 1's P3 and P4 each bundled three states behind a single
 row, and P4's RED column asserted only the deferred one — timed-out and malformed
@@ -517,7 +540,10 @@ Catalogued in artifact 10; the mutation view:
 | G10.10 | let a stale action apply instead of conflicting | the typed conflict | PR-A |
 | G10.11a–e | accept one M6 action without presence — one row per action: candidate create, merge, dismiss, overview transfer, overview retire | that action commits unauthenticated | PR-A |
 | G10.12a–m | drop one rendered state from the M6 enumeration — one row per state, the thirteen artifact 10's S0-117 enumerates | that state's present-and-non-empty assertion | PR-A |
-| G10.13a–c | ship a locale whose catalog has no own string for an M6 state — one row per locale; `zh-Hans`/`zh-Hant` silently render the English fallback, `en` renders the raw key | that locale's own-string assertion | PR-A |
+| G10.13a–m | **`en`** has no own string for state a…m — one row per state | that cell renders the raw key | PR-A |
+| G10.14a–m | **`zh-Hans`** has no own string for state a…m — one row per state | that cell silently renders the English fallback | PR-A |
+| G10.15a–m | **`zh-Hant`** has no own string for state a…m — one row per state | that cell silently renders the English fallback | PR-A |
+| G10.16 | the visit clause of G6 — **deliberately unmapped pending ruling R-1**; see S0-160 here and S0-157 in artifact 6 | — | `RULING` |
 
 **G10.9 is the row with a wrong-looking natural implementation.** Filtering
 unknown variants out of the list is the default behavior of every renderer, and
@@ -559,19 +585,35 @@ space and every signal disabled on every other space.
 > mutation row and nobody notices — which is exactly the failure mode S0-134
 > describes, arriving through drift instead of oversight.
 
-Current coverage: **11 gates, 152 gate mutation cases, 11 predicate cases, 163
+Current coverage: **11 gates, 189 gate mutation cases, 11 predicate cases, 200
 total.**
 
 | Status | Cases |
 |---|---|
 | LIVE | 32 |
-| PR-A | 113 |
+| PR-A | 149 |
 | lane 1 | 16 |
 | BLOCKED | 2 |
+| RULING | 1 |
 
 (Counts are mechanical — every catalog row is a table line whose ID matches
 `G<n>.<n>[a-z]` or `P<n>[a-z]`, and the status is its last cell. A row written
 `G4.5a–d` is one line standing for four cases and counts as four.)
+
+**`RULING` is a status, and it is not a synonym for "not yet written."** A row
+marked `RULING` names a frozen clause that this catalog deliberately does not
+map, because the mapping depends on a decision that has not been made. S0-134
+says an unmapped clause is not gated; a clause that is silently absent is
+indistinguishable from one nobody noticed, which is the exact failure S0-134
+exists to catch. Carrying the row with an explicit `RULING` status keeps the
+index complete and makes the hole countable — one row today, G10.16.
+
+*(rev 4: rev 3 reported 163. Round 3's group 7 held G10.13a–c non-concrete —
+it named a locale but never the state×locale **cell** S0-135 requires — so the
+locale condition is now one row per locale per state: G10.13a–m (`en`),
+G10.14a–m (`zh-Hans`), G10.15a–m (`zh-Hant`), the 39 cells S0-117 demands.
+G10.16 adds the `RULING` row for G6's visit clause. Total **200**. Again no new
+claim: the same coverage, spelled at the grain the contract asks for.)*
 
 *(rev 3: rev 2 reported 145. Round 2's finding 7 found two rows still bundled —
 G6.11 carried four independent limits and G10.12 carried thirteen rendered states
@@ -604,7 +646,7 @@ resolves both; a ruling that addressed only the G2 exclusion would leave the
 detach rule undecided. Worth knowing when the ruling is drafted, so it is not
 scoped to the narrower question.
 
-**F2 — sixteen of the 163 cases cannot go red until lane 1 lands, and they are
+**F2 — sixteen of the 200 cases cannot go red until lane 1 lands, and they are
 concentrated in the gates that protect truth.** G1.2, G2.5, G6.9, G7.1–G7.3, and
 the ten remaining predicate cases all rest on a page being `supported`, and no
 production code writes that value today
@@ -651,3 +693,7 @@ must check.
 rows are split into lettered sub-rows keeping their number ·
 `S0-155` each row's positive control is derived from the row by a fixed rule, and
 the derivation is the contract.
+
+**Added in rev 4:** `S0-160` a frozen clause whose mapping is waiting on a ruling
+carries a `RULING` catalog row naming the ruling it waits on — an unmapped clause is
+visibly ungated per S0-134, never silently absent.

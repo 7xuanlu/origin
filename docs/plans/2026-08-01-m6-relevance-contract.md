@@ -551,7 +551,7 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > is why the traversal matters. It is a derived quantity, not a measured one, and
 > rev 2's error was treating it as something a counter could be compared against.
 
-> **Decision S0-157 *(rev 3, round-2 finding 10)* — the absolute visit bound is
+> **Decision S0-157 *(rev 3, round-2 finding 10; amended rev 4, round-3 N4)* — the absolute visit bound is
 > NOT gated, and that is raised rather than papered over.** What the pinned stack
 > can honestly prove, and what it cannot:
 >
@@ -564,22 +564,48 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > | `50 ms` route budget | `R-BENCH-MAX` (S0-98) | **yes** |
 > | **absolute entries visited ≤ 2,176** | none available | **no** |
 >
-> `VM_STEP` is retained for one honest use: a **scaling** assertion. Across the
-> bench's degree ladder, `VM_STEP` for query (c) must grow no faster than linearly
-> in hub degree. That catches the 32 × 64 blowup as a *shape* regression — the
-> failure mode D9 actually fears — without claiming a number of entries. It is
-> weaker than a bound and is labelled as such wherever it appears.
+> **The scaling assertion rev 3 proposed is withdrawn (rev 4, round-3 N4).** It
+> said `VM_STEP` for query (c) must grow "no faster than linearly" in hub degree.
+> The worst-case traversal *is* `32 × d` — linear in `d` — so the assertion passes
+> the exact blowup it was introduced to catch. It was not a weak proof; it was a
+> proof that cannot fail on its own target, which is worse than none because it
+> reads as coverage in a table. `VM_STEP` is therefore recorded as diagnostic
+> output only, asserted against nothing.
 >
-> **This leaves G6's "instrumented row visits proving the bound"
-> (`gp@wenlan-app:613`-`:614`) partly unsatisfiable on the current stack, which is
-> a contract question, not a Stage-0 drafting choice.** It goes to the ruling
-> queue with three options: (a) accept no-full-scan plus the scaling assertion as
-> the discharge of the visit clause; (b) require `SQLITE_ENABLE_STMT_SCANSTATUS`
-> in the SQLite build so `SQLITE_SCANSTAT_NVISIT` becomes available and the bound
-> becomes literally measurable; (c) restate the clause as a materialization bound,
-> which is already gated. Rev 2 reserved exactly this escape — *"the honest
-> consequence is that G6's visit clause is not gated and must be raised as
-> such"* — and rev 3 takes it.
+> **G6's "instrumented row visits proving the bound" (`gp@wenlan-app:613`-`:614`)
+> is therefore not gated by anything, and no substitute proxy will be invented to
+> cover that. This is a contract question and it needs a ruling.**
+
+> **Ruling request R-1 — how is G6's visit clause discharged?** Four options,
+> with what each costs and what it gives up:
+>
+> | | Option | Satisfies the clause as frozen? | Cost |
+> |---|---|---|---|
+> | (a) | Accept `FULLSCAN_STEP == 0` + EQP index assertions as the discharge | No — proves *no full scan*, not a bound | None; already gated |
+> | (b) | Build the daemon's SQLite with `SQLITE_ENABLE_STMT_SCANSTATUS` and assert `SQLITE_SCANSTAT_NVISIT` | Yes, on the production statement | Custom libSQL build; collides with the documented two-bundled-SQLite hazard (`crates/wenlan-core/Cargo.toml:63`-`:67`) |
+> | (c) | Restate the clause as a materialization bound | No — changes what the contract asks | None; already gated |
+> | (d) | **Bench-only**: a standalone benchmark binary opens the same file with a `SCANSTATUS`-enabled SQLite, runs the identical SQL, asserts `NVISIT ≤ 2,176` | Yes, on a faithful replica | One bench-only dependency; does not measure the production statement |
+>
+> **Recommendation: (d).** It is the only option that both keeps the frozen number
+> and measures the quantity the number is about. (a) and (c) discharge the clause
+> by reinterpreting it, which is the move S0-99 forbids for the 50 ms constant and
+> should be no more available here. (b) is the theoretically cleanest — it
+> instruments the real statement — but it puts a second SQLite build inside the
+> daemon, which is the precise failure this workspace already documents and
+> deliberately avoids; paying that risk for a benchmark is a bad trade.
+>
+> **What (d) gives up, stated plainly so the ruling is informed:** the bench
+> measures a replica, not the production statement. Same file, same schema, same
+> indexes, same SQL — but a different connection and a different SQLite build, so
+> it proves the *query and its indexes* stay inside the bound, not that the
+> daemon's own execution did. That is a real gap. It is also the same gap every
+> benchmark in this contract already has, since none of them run inside the
+> daemon process.
+>
+> Rev 2 reserved this escape — *"the honest consequence is that G6's visit clause
+> is not gated and must be raised as such"* — rev 3 took it, and rev 4 sharpens it
+> into a decision the ruling can make in one move. Artifact 12 carries the
+> matching `RULING` row (G10.16, S0-160) so the unmapped clause stays countable.
 
 ---
 
@@ -849,7 +875,8 @@ Every constant has an ID so an amendment has an address.
 **Added in rev 2:** `S0-156` query (c) aggregates in SQLite, so the evaluation
 materializes ~160 rows while traversing up to 2,048 index entries.
 
-**Added in rev 3:** `S0-157` the absolute visit bound is NOT gated — `VM_STEP`
-counts opcode steps, not entries, and no reachable counter counts entries; what
-is gated is listed explicitly, and the shortfall goes to the ruling queue rather
-than being absorbed.
+**Added in rev 3:** `S0-157` *(sharpened rev 4)* the absolute visit bound is NOT
+gated — `VM_STEP` counts opcode steps, not entries, no reachable counter counts
+entries, and rev 3's linear-scaling proxy is withdrawn because a `32 × d`
+traversal is itself linear. Ruling request R-1 carries four options and
+recommends (d), a bench-only `SCANSTATUS` measurement.

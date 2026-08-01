@@ -390,8 +390,9 @@ that enum would change the accepted wire for every existing client, so:
 > #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 > pub enum OverviewProposalPayload {
 >     OverviewTransfer {
->         space: String,
->         source_generation: i64,
+>         space: String,             // spaces.id, never spaces.name (artifact 10, S0-158)
+>         cutover_generation: i64,   // the enforcement clock S0-109 gates on
+>         source_generation: i64,    // the content clock this proposal was computed under
 >         losing_scope_kind: String,
 >         losing_scope_id: String,
 >         losing_page_id: String,
@@ -399,6 +400,7 @@ that enum would change the accepted wire for every existing client, so:
 >     },
 >     OverviewRetire {
 >         space: String,
+>         cutover_generation: i64,
 >         source_generation: i64,
 >         losing_scope_kind: String,
 >         losing_scope_id: String,
@@ -406,6 +408,12 @@ that enum would change the accepted wire for every existing client, so:
 >     },
 > }
 > ```
+>
+> *(rev 4, round-3 N3: rev 3 carried `source_generation` alone. Artifact 10's
+> S0-148 had by then given cards two clocks and S0-109 gates actions on the
+> cutover one, so a proposal carrying only the content clock could not be judged
+> against the gate that decides whether its action may be offered at all. Both are
+> now carried, per artifact 10's S0-159.)*
 >
 > It carries `deny_unknown_fields` for the same reason the community wire does.
 > It lives in a new module rather than in `communities.rs`, so that a future
