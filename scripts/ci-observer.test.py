@@ -191,6 +191,28 @@ class CiObserverTests(unittest.TestCase):
         )
         self.assertNotIn("CI required gate target exceeded", result.stdout)
 
+    def test_skipped_release_preflight_keeps_ordinary_pr_in_slo_sample(self):
+        conclusion = job(102, "conclusion")
+        conclusion["completed_at"] = "2026-07-24T01:19:30Z"
+        skipped_preflight = job(
+            103, "release-preflight (x86_64-pc-windows-msvc)"
+        )
+        skipped_preflight["conclusion"] = "skipped"
+        result, receipt = self.run_observer(
+            event(),
+            [
+                {
+                    "total_count": 2,
+                    "jobs": [conclusion, skipped_preflight],
+                }
+            ],
+            {"active_caches_size_in_bytes": 1, "active_caches_count": 1},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(receipt["required_gate_target"]["applicable"])
+        self.assertEqual(receipt["required_gate_target"]["status"], "within_target")
+        self.assertEqual(receipt["required_gate_target"]["exempt_jobs"], [])
+
     def test_main_and_release_please_runs_are_not_ordinary_pr_samples(self):
         for run_event, head_branch in (
             ("push", "main"),
