@@ -217,12 +217,22 @@ page is not automatically retired — machine A's `superseded` exit and machine 
 coverage bookkeeping are the only things that can retire it, and neither fires on
 a bare UUID change.
 
-**This is a gap, not a decision.** PR-A must either (a) subscribe overview slots
-to M4's rebinding events so a rebind carries the slot forward, or (b) accept
-orphaned overview pages and give machine F an explicit rule for them. Stage 0
-cannot pick without knowing M4's rebind semantics under split/merge, which is
-outside this artifact's citation reach. **Marked PR-A-new; G-catalog case
-`C-slot-community-rebind`.**
+**This was written as a gap; artifact 8 has since closed it (rev 2, finding 16).**
+The two options were (a) subscribe overview slots to M4's rebinding events, or
+(b) accept orphaned overview pages and give machine F an explicit rule. This
+artifact said Stage 0 could not pick without knowing M4's rebind semantics under
+split/merge — but artifact 8 reached that far and picked **(b)**: *"M6 does not
+subscribe overview slots to rebind events. It adds an explicit detach rule to
+machine F, keyed on the merge loser"* (`2026-08-01-m6-overview-matrix.md`, S0-71).
+Its reasoning is that for splits and for the surviving side of a merge the
+subscription would fire zero times, because M4 guarantees those community IDs do
+not change; the merge loser is the only uncovered case and is one rule rather than
+a subscription system. **The decision is S0-71, not an open choice here.** It is
+still PR-A-new work, and G-catalog case `C-slot-community-rebind` still exists —
+now as the test of S0-71's detach rule rather than as a placeholder for an
+undecided fork. The merge-loser half remains dependent on the open
+merge-no-survivor ruling (STOP-3), which is a different question from whether M6
+subscribes.
 
 ---
 

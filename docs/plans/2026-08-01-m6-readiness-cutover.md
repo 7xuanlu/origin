@@ -254,11 +254,17 @@ inspection.
 > a page the pipeline gave up on, which is the definition of not-100%.
 >
 > **What cannot prove it.** `GET /api/status` cannot, and no daemon handshake
-> resting on it can. Its response carries `is_running`, `files_indexed`, two queue
-> depths, reranker and inference state, and a capability list
-> (`crates/wenlan-server/src/routes.rs:168`-`:179`) — **no space dimension at
-> all** — and its `queue` field is the document-enrichment queue, not
-> `claim_derivation_jobs`. It is also error-swallowing by construction:
+> resting on it can. Post-`#418` the response *does* carry truth state, which
+> sharpens the point rather than softening it: `StatusResponse.truth` is an
+> `Option<TruthStatus>` (`crates/wenlan-types/src/responses.rs:271`) holding
+> exactly two fields, `cutover_generation` (`:212`) and `contract_version`
+> (`:216`). Both are **global**, neither is a census, and nothing else in the
+> response has a space dimension either — `is_running`, `files_indexed`, two queue
+> depths, reranker and inference state, a capability list
+> (`crates/wenlan-server/src/routes.rs:168`-`:179`). Its `queue` field is the
+> document-enrichment queue, not `claim_derivation_jobs`. A daemon can therefore
+> report a live cutover at a supported contract version while one of its spaces
+> sits 40% evaluated, and a handshake reading only this would see nothing wrong. It is also error-swallowing by construction:
 > `db.count().await.unwrap_or(0)` (`:147`) and `Ok(0) | Err(_) =>
 > QueueStatus::Idle` (`:154`) each report *healthier* than reality when the
 > underlying query fails, so an all-clear from it is indistinguishable from a

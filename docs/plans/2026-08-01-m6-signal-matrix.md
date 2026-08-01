@@ -20,7 +20,8 @@ checkout is the user's; nothing in this work modifies it. Verify a citation with
 | `EXISTS` | a table and column on this branch answers the predicate today |
 | `DERIVED` | answerable from existing tables, but no query does it today — PR-A writes the query, adds no schema |
 | `PR-A-new` | no substrate; PR-A must add schema. Named, never invented behavior |
-| `BLOCKED` | substrate exists but is not maintained by any live writer — see §7 |
+| `lane 1` | substrate exists, its writer is in flight on `m5-truth-derivation` — see §7.1. Same meaning as artifact 12's `lane 1` |
+| `BLOCKED` | blocked on an open contract ruling — see §7.2. Same meaning as artifact 12's `BLOCKED`; rev 1 used this label for both cases, which artifact 12 never did |
 
 **Status.** Contract only. No schema, no code.
 
@@ -93,10 +94,10 @@ COUNT(DISTINCT r.independence_group_id)
 | 2.2 | links group by normalized label, not raw text | `page_links.label_key`, lowercased at write time (`crates/wenlan-core/src/db.rs:43916`); `label` keeps first-seen casing for display. Primary key is `(source_page_id, label_key)`, DDL `crates/wenlan-core/src/db.rs:6670` | `EXISTS`, but see decision S0-14 |
 | 2.3 | ≥ 2 **distinct** referring pages | `COUNT(DISTINCT page_links.source_page_id)`; the PK already prevents one page from contributing twice for one label | `EXISTS` |
 | 2.4 | referring pages are **active** | `pages.status = 'active'`; `resolve_orphan_page_links` already joins on exactly this (`crates/wenlan-core/src/db.rs:44117`) | `EXISTS` |
-| 2.5 | referring pages are **supported** | `page_truth_state.support_status = 'supported'`; DDL and CHECK at `crates/wenlan-core/src/db/claim_identity.rs:279`–`:300` | **`BLOCKED`** — §7.1 |
+| 2.5 | referring pages are **supported** | `page_truth_state.support_status = 'supported'`; DDL and CHECK at `crates/wenlan-core/src/db/claim_identity.rs:279`–`:300` | **`lane 1`** — §7.1 |
 | 2.6 | referring pages are **non-overview** | intended: `pages.kind <> 'overview'` (CHECK at `crates/wenlan-core/src/db.rs:9177`) | **`BLOCKED`** — §7.2 |
 | 2.7 | ≥ 3 underlying groups | D1: the union of active grounded external roots supporting **the exact current claim revisions that contain the link** — not the referring page as a whole | `DERIVED` |
-| 2.8 | a stale or provisional referring page contributes nothing | D1, explicit. Depends on 2.5 | **`BLOCKED`** — §7.1 |
+| 2.8 | a stale or provisional referring page contributes nothing | D1, explicit. Depends on 2.5 | **`lane 1`** — §7.1 |
 
 **Decision S0-14 — the D8 wikilink key normalization is stricter than `label_key` and PR-A must not conflate them.** `label_key` today is `to_lowercase()` and nothing else (`crates/wenlan-core/src/db.rs:43916`). D8 requires NFKC, lowercase, whitespace collapse, alias/fragment stripping, control and bidi rejection, and a `1..=128` scalar bound. Those are different functions: `to_lowercase()` accepts a 4000-character label containing a bidi override, and NFKC folds characters that `to_lowercase` leaves distinct. PR-A adds the D8 normalizer as a **separate** function used for the M6 slot ID and admission, and leaves `label_key` untouched — rewriting `label_key` would rewrite the primary key of every existing `page_links` row. Where the two disagree, admission uses the D8 form and the existing link rows are read through it. Two labels that collide under D8 but not under `label_key` are one candidate; the reverse cannot happen, since D8's normalization is a refinement of lowercasing.
 
@@ -192,20 +193,39 @@ B28 and B30 are in tension by design and both are correct: R1 says human capture
 
 Reported, not resolved, per the STOP-13 instruction. Both are cases where a D1/D2 predicate names a column that exists but is not maintained, so the predicate would silently evaluate the same way for every row.
 
-### 7.1 `page_truth_state.support_status` has no live writer; every page is `provisional`
+### 7.1 No production writer promotes `support_status` to `supported`; every page is `provisional`
 
-> **Status: escalated 2026-08-01, pending ruling.** Contract-level; not resolved inside Stage 0. Artifact 12 marks the G2 clauses that depend on this predicate as blocked-pending-ruling rather than treating them as live gates.
+> **Status (rev 2): resolved into a lane, no longer pending a ruling.** The
+> claim-derivation promoter is in flight on `m5-truth-derivation`, so artifact 12
+> catalogues the dependent G2 clauses as **`lane 1` — prerequisite in flight**,
+> not blocked-pending-ruling. Rev 1's `BLOCKED` marks on the support-dependent
+> rows were both stale and, worse, used a different meaning of the word than
+> artifact 12 does (there, `BLOCKED` means the merge-no-survivor ruling alone).
+> Corrected below; §7.2's escalation is a genuinely different one and stays open.
 
-**Confirmed.** The only production write to `page_truth_state` anywhere in the workspace is `backfill_page_truth_state` (`crates/wenlan-core/src/db/claim_identity.rs:502`), called exactly once, from migration 99 (`crates/wenlan-core/src/db.rs:11756`). The migration's own doc comment states the outcome:
+**Confirmed, with the scope `#418` forces (rev 2, finding 15).** Rev 1 said
+`page_truth_state` "has no live writer", which is no longer true and was always
+broader than the claim M6 rests on. At `1c903bec` there are **two** production
+writers: the migration-99 backfill (`crates/wenlan-core/src/db/claim_identity.rs:502`,
+called once from `crates/wenlan-core/src/db.rs:11756`), and the presence-review
+upsert `#418` added, which sets `human_reviewed = 1` and deliberately leaves the
+machine axis at `'provisional'`
+(`crates/wenlan-core/src/db/presence_review.rs:326`-`:341`, reasoning at
+`:321`-`:325`). The claim that survives, and the only one D1 and D2 depend on, is
+narrower: **no production writer promotes `support_status` to `'supported'`** — a
+repository-wide search for that literal at `1c903bec` returns no production hit,
+and the derivation queue is still unserved, `claim_derivation_jobs` having no
+production reader or writer outside its own DDL. The migration's doc comment
+states the resulting floor:
 
 > Migration 99 (M5 PR-A): fail-closed page truth-state backfill. **Every page becomes `provisional` and unreviewed.** Nothing is read from a legacy field and turned into a truth claim — see `backfill_page_truth_state` for why that is the whole point rather than a conservative default.
 > — `crates/wenlan-core/src/db.rs:11742`–`:11747`
 
-There is no derivation worker. `claim_derivation_jobs` — the table whose lease columns exist precisely so "a crashed worker [is] reclaimable instead of parking a page forever" (`crates/wenlan-core/src/db/claim_identity.rs:304`–`:305`) — has **no production reader or writer at all**: the only references outside its own DDL at `:306`–`:322` are in test files.
+There is no derivation worker **on this branch**. `claim_derivation_jobs` — the table whose lease columns exist precisely so "a crashed worker [is] reclaimable instead of parking a page forever" (`crates/wenlan-core/src/db/claim_identity.rs:304`–`:305`) — has no production reader or writer at `1c903bec`: the only references outside its own DDL at `:306`–`:322` are in test files. One is being built on `m5-truth-derivation`, which is what makes these rows `lane 1` rather than open-ended.
 
 **Consequence for M6.** On any real database on this branch, `support_status = 'supported'` matches zero rows. Predicate 2.5 is therefore not merely unverified — it is false for every page, so **the orphan-wikilink signal cannot admit a single candidate**, and D1's rule R6 ("a stale/provisional referring page contributes nothing") excludes everything. A PR-B genesis shadow for orphan wikilinks would measure exactly zero on every install and read as "the signal is rare" rather than "the substrate is dead" — the same failure mode the eval seed contract exists to prevent elsewhere in this repo.
 
-**Why this is a report and not a blocker I should resolve.** G1 already requires "M5 readiness/cutover at 100%" before M6 code begins, so the intended sequencing may well be that the derivation worker lands in a remaining M5 PR. What I cannot verify from this branch is whether that worker is planned or overlooked. The decision belongs to whoever owns the M5 scope, and it changes M6 sequencing either way: **PR-B's orphan-wikilink shadow is unmeasurable until a support-derivation writer exists**, and G1's prerequisite check should assert a live writer, not merely the presence of the table.
+**Why this is a report and not a blocker I should resolve.** G1 already requires "M5 readiness/cutover at 100%" before M6 code begins, and the sequencing is now known rather than guessed: the derivation worker is being built on `m5-truth-derivation`. The consequence for M6 is unchanged — **PR-B's orphan-wikilink shadow is unmeasurable until that writer lands** — and so is the recommendation that G1's prerequisite check assert a live writer rather than the presence of the table. Artifact 11's S0-153 census is that assertion made concrete.
 
 ### 7.2 `pages.kind` is never set on insert, so `kind = 'overview'` cannot identify overview pages
 

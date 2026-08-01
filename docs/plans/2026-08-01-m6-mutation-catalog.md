@@ -78,7 +78,7 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 > section — three controls for thirteen G6 rows — which is not what S0-135 says
 > and does not discriminate: a section-level control passing tells you the
 > section's happy path works, not that row 7's tooth bites on row 7's condition.
-> A stated derivation rule is better than 129 hand-written cells, which would
+> A stated derivation rule is better than 145 hand-written cells, which would
 > drift; it works precisely *because* S0-154 makes every row single-conditioned.
 > Where the derivation does not apply, the row carries an explicit control in its
 > RED column and says so.
@@ -212,7 +212,7 @@ supported pre-M6 binary against a **copied** migrated database. Artifact 11
 (S0-133) established the refusal mechanism is already live and correct; what is
 missing is this evidence form.
 
-**Positive control:** one fully ready fixture — all seven conditions true —
+**Suite-level control** (row controls are per S0-155): one fully ready fixture — all seven conditions true —
 passes both halves.
 
 ---
@@ -250,7 +250,7 @@ it, and the STOP's resolution decides which way it falls.
 > the back door. The row stays BLOCKED until the ruling lands, and the interim
 > test is labelled as testing the interim.
 
-**Positive controls:** independent documents cross the threshold as expected;
+**Suite-level controls** (row controls are per S0-155): independent documents cross the threshold as expected;
 UI-authorized human groups count.
 
 ---
@@ -281,7 +281,7 @@ or quarantine (`gp@wenlan-app:565`-`:568`).
 > disjunction over every group after every exit catches that. Crash injection is
 > applied at each exit, since the contract says atomically.
 
-**Positive control:** non-overlapping candidates both publish.
+**Suite-level control** (row controls are per S0-155): non-overlapping candidates both publish.
 
 ---
 
@@ -293,8 +293,8 @@ loss (`gp@wenlan-app:572`-`:576`).
 
 | # | Weaken this | Must go RED | Status |
 |---|---|---|---|
-| G4.1 | move any of the eleven components outside the one outer transaction | that component advances while another does not | PR-A |
-| G4.2 | drop the CAS on any injected event | the finalize commits against changed state | PR-A |
+| G4.1a–k | move **one** of the eleven components outside the one outer transaction — one row per component | that component advances while another does not | PR-A |
+| G4.2a–g | drop the CAS on **one** injected event — one row per event: failure, concurrent root retraction, dependency change, human edit, community generation change, lease expiry, claim loss | the finalize commits against the state that event changed | PR-A |
 | G4.3 | expose the filesystem projection before SQLite truth commits | stale or provisional prose is readable | PR-A |
 | G4.4 | skip restart reconciliation of the outbox | a projection is left partially advanced | PR-A |
 | G4.5a–d | hold one of the four across the model call — one row per holder: SQLite transaction, connection mutex, truth-state lock, DB guard | the re-entrant provider test deadlocks on that holder | PR-A |
@@ -317,7 +317,7 @@ projection-outbox state.
 > assertion is that no guard is *held* across the call, which is a structural
 > fact the instrumentation can observe directly.
 
-**Positive control:** an uninterrupted finalize advances all eleven components
+**Suite-level control** (row controls are per S0-155): an uninterrupted finalize advances all eleven components
 exactly once.
 
 ---
@@ -339,7 +339,7 @@ covered, claimed, waiting, surfaced, suppressed, or quarantined
 (`gp@wenlan-app:591`-`:592`). G3's reservation crash matrix is repeated here
 against the frontier invariant (`:595`-`:598`).
 
-**Positive control:** a permanently small space surfaces **once** — not zero
+**Suite-level control** (row controls are per S0-155): a permanently small space surfaces **once** — not zero
 times, and not repeatedly.
 
 ---
@@ -372,8 +372,9 @@ Catalogued in full in artifact 6; the mutation view:
 **G6.11's instrumentation is the row that fails quietly.** The contract requires
 *"instrumented row visits proving the bound rather than a textual SQL `LIMIT`"*
 (`gp@wenlan-app:613`-`:614`) — a `LIMIT 512` on an unindexed predicate visits
-the whole table and still reports 512 rows returned. Artifact 6's S0-98 names
-the three counters.
+the whole table and still reports 512 rows returned. Artifact 6's **S0-95** names
+the four instruments (rev 2, finding 16: rev 1 cited S0-98, which is the 50 ms
+budget, and counted three instruments before S0-95 gained the row-visit counter).
 
 > **Rev 2, finding 8 — three G6 rows were marked LIVE against substrate that does
 > not exist.** Checked at `1c903bec`: a repository-wide search finds **no**
@@ -413,7 +414,7 @@ were; they are not row controls and no longer stand in for any.
 > it publishes a refresh whose claim inventory silently shrank. Artifact 7's
 > bijection check (S0-58) is the mechanism.
 
-**Positive control:** a safe machine refresh publishes.
+**Suite-level control** (row controls are per S0-155): a safe machine refresh publishes.
 
 ---
 
@@ -440,7 +441,7 @@ detach rule itself is what the ruling decides. Same status, different reason,
 and the distinction matters: a ruling that resolves G8.7 automatically resolves
 G2.7, but not the reverse.
 
-**Positive control:** a split and a merge that each have a determinate survivor
+**Suite-level control** (row controls are per S0-155): a split and a merge that each have a determinate survivor
 preserve IDs, titles, and every subscription.
 
 ---
@@ -510,6 +511,12 @@ unknown variants out of the list is the default behavior of every renderer, and
 a test that asserts "no crash" passes on it. The assertion must be that the card
 is *present in the list*, shows an unsupported state, and offers no actions.
 
+**Suite-level control** (rev 2, finding 7 — rev 1 supplied none for G10, the only
+gate with no control at all): a fully ready space at a matching contract version
+renders every card kind, offers exactly the actions its presence state permits,
+and completes one typed daemon/Tauri/TypeScript action round trip end to end
+(artifact 10, S0-150). Row controls are per S0-155.
+
 ---
 
 ## 12. G11 — `m6_signal_cutover_is_independent`
@@ -524,7 +531,7 @@ is *present in the list*, shows an unsupported state, and offers no actions.
 | G11.6 | let an unreadable readiness row default to permitted | the fail-closed direction (artifact 11, S0-121) | PR-A |
 | G11.7 | let a `committed` space return to `off` | the one-way door (artifact 11, S0-122) | PR-A |
 
-**Positive control:** enabling E1 on one space leaves E2, E3, E4 disabled on that
+**Suite-level control** (row controls are per S0-155): enabling E1 on one space leaves E2, E3, E4 disabled on that
 space and every signal disabled on every other space.
 
 ---
@@ -539,13 +546,13 @@ space and every signal disabled on every other space.
 > mutation row and nobody notices — which is exactly the failure mode S0-134
 > describes, arriving through drift instead of oversight.
 
-Current coverage: **11 gates, 118 gate mutation cases, 11 predicate cases, 129
+Current coverage: **11 gates, 134 gate mutation cases, 11 predicate cases, 145
 total.**
 
 | Status | Cases |
 |---|---|
 | LIVE | 32 |
-| PR-A | 79 |
+| PR-A | 95 |
 | lane 1 | 16 |
 | BLOCKED | 2 |
 
@@ -553,12 +560,13 @@ total.**
 `G<n>.<n>[a-z]` or `P<n>[a-z]`, and the status is its last cell. A row written
 `G4.5a–d` is one line standing for four cases and counts as four.)
 
-*(rev 2: rev 1 reported 93 rows. The number rose to 129 without a single new
-claim being added — S0-154's split turned thirteen bundled rows into their
-constituent conditions, which is the point: the bundling was hiding
-untested conditions inside rows that counted as covered. Two statuses also
-changed on inspection rather than on split, both downward: see the G6 and G9
-notes for findings 8's relabels.)
+*(rev 2: rev 1 reported 93 rows. The number rose to 145 without a single new
+claim being added — S0-154's split turned fifteen bundled rows into their
+constituent conditions, which is the point: the bundling was hiding untested
+conditions inside rows that already counted as covered. G4.1 alone was eleven
+components behind one row, and G4.2 seven injected events behind another —
+finding 7's exact objection. Two statuses also changed on inspection rather than
+on split, both downward: see the G6 and G9 notes for finding 8's relabels.)*
 
 ---
 
@@ -573,7 +581,7 @@ resolves both; a ruling that addressed only the G2 exclusion would leave the
 detach rule undecided. Worth knowing when the ruling is drafted, so it is not
 scoped to the narrower question.
 
-**F2 — sixteen of the 129 cases cannot go red until lane 1 lands, and they are
+**F2 — sixteen of the 145 cases cannot go red until lane 1 lands, and they are
 concentrated in the gates that protect truth.** G1.2, G2.5, G6.9, G7.1–G7.3, and
 the ten remaining predicate cases all rest on a page being `supported`, and no
 production code writes that value today
