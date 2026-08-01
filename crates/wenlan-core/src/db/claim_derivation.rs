@@ -60,12 +60,42 @@ pub const LEASE_SECS: i64 = 600;
 /// retry without limit.
 pub const MAX_ATTEMPTS: i64 = 5;
 
+/// Where a judged candidate lives, to the byte.
+///
+/// The exact tuple `write_support_edge` folds into a support edge's identity,
+/// and the exact tuple `claim_judgment_attempts` records. A span digest alone
+/// does not identify a candidate — one document can hold the same sentence
+/// twice, and under a digest-only key concluding on the first occurrence
+/// silently discharges the obligation to conclude on the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateLocator {
+    source_id: String,
+    chunk_index: i64,
+    span_start: i64,
+    span_end: i64,
+    span_digest: String,
+}
+
+/// One live `supports` edge, with everything condition 3 and condition 4 need.
+struct SupportCandidate {
+    source_id: String,
+    root_id: Option<String>,
+    payload: String,
+    /// `None` when the payload does not say which bytes were judged, which is
+    /// unmatchable against any attempt row and therefore unregistered.
+    locator: Option<CandidateLocator>,
+}
+
 /// A leased unit of derivation work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivationJob {
     pub job_id: String,
     pub page_id: String,
     pub page_version: i64,
+    /// The run this lease started. Every `claim_judgment_attempts` row the
+    /// worker writes must carry it, and evaluation reads only rows that do —
+    /// see [`MemoryDB::lease_next_derivation_job`].
+    pub run_generation: i64,
 }
 
 /// The score a stored entailment verdict must clear *now*.
@@ -226,30 +256,46 @@ fn pages_supported_by_memory_chunk(memory_ref: &str, chunk_ref: &str) -> String 
 /// evidence backs the prose, without asserting that it doesn't. Only the second
 /// costs a page its projected file, and losing a file because *our* evidence
 /// bookkeeping changed is the mass-flip failure this rung exists to prevent.
-fn support_demotion_body(affected_pages: &str) -> String {
-    format!(
-        "
-                 UPDATE page_truth_state
+/// Why a page was demoted when the evidence under it was withdrawn.
+const REASON_EVIDENCE_WITHDRAWN: &str =
+    "supporting evidence was withdrawn; this page needs re-derivation";
+
+/// Why a page was demoted when the document its verdict cites was renamed.
+const REASON_EVIDENCE_REBOUND: &str =
+    "the cited document was renamed; this page needs re-derivation";
+
+/// Why a page was demoted when startup could not re-prove its stored verdict.
+const REASON_RECONCILE_UNPROVEN: &str =
+    "the stored support verdict no longer survives re-evaluation; this page needs re-derivation";
+
+/// The two statements a demotion is: stop asserting, then queue the re-check.
+///
+/// One definition, two consumers — the trigger bodies below join them, and
+/// [`MemoryDB::retract_support_for_rebound_source`] executes them with a bound
+/// parameter. Writing them out twice is how a synchronous route path and a
+/// trigger come to disagree about what a demotion means.
+///
+/// There is deliberately no third statement clearing `claim_judgment_attempts`.
+/// Deleting them was unsound: a worker holding a live lease is neither revoked
+/// nor fenced by a delete, so it repopulates the same key straight afterwards —
+/// the delete removed the durable run-to-candidate record without removing the
+/// stale conclusions it was aimed at. The run generation does that job properly.
+/// The reset below returns the job to `pending`, the next lease stamps a fresh
+/// generation, and every conclusion the superseded run reached goes inert
+/// without a row being touched.
+fn support_demotion_statements(affected_pages: &str, reason: &str) -> [String; 2] {
+    [
+        format!(
+            "UPDATE page_truth_state
                     SET support_status = 'provisional',
-                        provisional_reason = 'supporting evidence was withdrawn; this page \
-                                              needs re-derivation',
+                        provisional_reason = '{reason}',
                         evaluated_at = NULL,
                         updated_at = CAST(strftime('%s','now') AS INTEGER)
                   WHERE support_status = 'supported'
-                    AND page_id IN ({affected_pages});
-
-                 -- The conclusions this run reached were about candidates that
-                 -- have just changed, so they are not conclusions about the
-                 -- candidate set the re-derivation will face. Leaving them
-                 -- would make the next run read the claim as judged-and-found-
-                 -- wanting -- `Refuted`, which costs the page its file -- on
-                 -- the strength of a judgement about evidence that is gone.
-                 -- Clearing them returns the claim to never-judged, which is
-                 -- the same Unevaluated fail-safe the demotion above chose.
-                 DELETE FROM claim_judgment_attempts
-                  WHERE page_id IN ({affected_pages});
-
-                 INSERT INTO claim_derivation_jobs
+                    AND page_id IN ({affected_pages})"
+        ),
+        format!(
+            "INSERT INTO claim_derivation_jobs
                      (job_id, page_id, page_version, status, attempts, created_at, updated_at)
                  SELECT p.id || ':' || p.version, p.id, p.version, 'pending', 0,
                         CAST(strftime('%s','now') AS INTEGER),
@@ -265,9 +311,14 @@ fn support_demotion_body(affected_pages: &str) -> String {
                      attempts = 0,
                      last_error = NULL,
                      updated_at = CAST(strftime('%s','now') AS INTEGER)
-                  WHERE claim_derivation_jobs.status = 'done';
-        "
-    )
+                  WHERE claim_derivation_jobs.status = 'done'"
+        ),
+    ]
+}
+
+fn support_demotion_body(affected_pages: &str) -> String {
+    let [demote, requeue] = support_demotion_statements(affected_pages, REASON_EVIDENCE_WITHDRAWN);
+    format!("\n{demote};\n{requeue};\n")
 }
 
 /// Pages whose published `supported` verdict no longer survives a fresh reading
@@ -441,10 +492,46 @@ impl MemoryDB {
     /// vault is fully derived at the current extractor version — it is a real
     /// measurement, which is exactly what the empty queue before this worker
     /// was not.
+    /// **The enqueue and the demotion are one transaction, not two statements
+    /// that usually both run.** The order below is load-bearing — being
+    /// `supported` is part of what makes a page drifted, so demoting first
+    /// empties the drift query and the re-derivation is never queued — but an
+    /// order argument is only a safety argument if both statements land. A
+    /// failure after the enqueue and before the demotion leaves the page queued
+    /// and still asserting `supported` on evidence that stopped qualifying,
+    /// which is precisely the fail-open state row 15 exists to close, and the
+    /// caller that sees the error has no way to tell that half of it committed.
+    /// One transaction makes the pair atomic: either the page is demoted and
+    /// queued, or nothing changed and the error is the whole truth.
     pub async fn enqueue_stale_derivation_jobs(&self, limit: i64) -> Result<usize, WenlanError> {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("derivation sweep begin: {error}")))?;
+        let swept = Self::sweep_stale_derivation_jobs(&tx, now, limit).await;
+        match swept {
+            Ok(total) => {
+                tx.commit().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("derivation sweep commit: {error}"))
+                })?;
+                Ok(total)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
 
+    /// [`Self::enqueue_stale_derivation_jobs`]'s body, over the transaction that
+    /// makes its statement order mean something.
+    async fn sweep_stale_derivation_jobs(
+        conn: &libsql::Transaction,
+        now: i64,
+        limit: i64,
+    ) -> Result<usize, WenlanError> {
         // A 'done' job whose marker no longer satisfies the current extractor
         // is a stale claim of completion. Dropping it is what makes an
         // EXTRACTOR_VERSION bump re-derive the vault: the marker check below
@@ -603,6 +690,225 @@ impl MemoryDB {
         }
     }
 
+    /// Re-prove every published `supported` verdict against the whole of §1, and
+    /// demote the ones that no longer survive it. Returns how many were demoted.
+    ///
+    /// The startup reconciler, and the only pass that proves ALL FOUR
+    /// conditions. Everything else that reconciles is a SQL scan, and SQL is
+    /// where the gap was: [`DRIFTED_SUPPORTED_PAGES`] sees a score that fell
+    /// below the live bar and an edge somebody retracted, and it is structurally
+    /// blind to the rest of §1 —
+    ///
+    ///   * a marker that is **missing**, or written by an older
+    ///     `EXTRACTOR_VERSION`, or describing text the page no longer holds. A
+    ///     marker-only backlog scan re-queues such a page and stops there, so
+    ///     the stored `supported` stayed readable until a worker arrived, which
+    ///     on a branch with no producer is never.
+    ///   * an edge whose citation no longer **revalidates** — the chunk deleted,
+    ///     the span rewritten, the provenance root retired. Deciding that needs
+    ///     to read a span out of live bytes and recompute an identity digest,
+    ///     neither of which SQLite can do, so no scan can ever cover it.
+    ///
+    /// Rather than restate §1 in a second dialect, this runs the one evaluator:
+    /// whatever [`Self::evaluate_page_support`] would say now is what the page
+    /// is. Two implementations of a four-condition predicate is two chances to
+    /// disagree about it, and the disagreement would surface as pages that are
+    /// `supported` to the reconciler and `Refuted` to the worker.
+    ///
+    /// A page that fails lands on `Unevaluated`, never on `Unsupported`, even
+    /// when the fresh verdict is `Refuted`. The reconciler is a CHECK, not a
+    /// run: it establishes that the stored verdict is no longer earned, which is
+    /// not the same as establishing the opposite. Stamping `evaluated_at` here
+    /// would cost the page its projected file on the strength of a pass that
+    /// spent no judge budget at all. The re-derivation it queues is what may
+    /// legitimately reach `Refuted`.
+    pub async fn reconcile_supported_pages(&self) -> Result<usize, WenlanError> {
+        let conn = self.conn.lock().await;
+
+        let supported: Vec<(String, i64)> = {
+            let mut rows = conn
+                .query(
+                    "SELECT t.page_id, t.page_version
+                       FROM page_truth_state t
+                       JOIN pages p ON p.id = t.page_id
+                      WHERE t.support_status = 'supported'
+                        AND p.status = 'active'
+                        AND p.kind <> 'entity'
+                      ORDER BY t.page_id",
+                    (),
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("support reconcile scan: {error}"))
+                })?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("support reconcile decode: {error}"))
+            })? {
+                let decode =
+                    |error| WenlanError::VectorDb(format!("support reconcile decode: {error}"));
+                found.push((
+                    row.get::<String>(0).map_err(decode)?,
+                    row.get::<i64>(1).map_err(decode)?,
+                ));
+            }
+            found
+        };
+
+        let mut failing = Vec::new();
+        for (page_id, page_version) in &supported {
+            // `NoPublish` counts as a failure here, unlike at publication time.
+            // A worker refusing to publish leaves a page alone because some
+            // OTHER run owns it; the reconciler finding that the current state
+            // cannot be re-derived is exactly the case where continuing to
+            // assert `supported` is the unearned claim.
+            if Self::evaluate_support_on(&conn, page_id, *page_version).await?
+                != SupportOutcome::Supported
+            {
+                failing.push(page_id.clone());
+            }
+        }
+        if failing.is_empty() {
+            return Ok(0);
+        }
+
+        // One transaction for the whole demotion, for the reason
+        // [`Self::enqueue_stale_derivation_jobs`] gives: a page demoted but not
+        // queued is recoverable, a page queued but not demoted goes on serving
+        // a verdict we have just established it cannot earn, and a partial
+        // failure must not be able to leave the second.
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("support reconcile begin: {error}")))?;
+        let demoted = async {
+            for page_id in &failing {
+                for statement in support_demotion_statements("SELECT ?1", REASON_RECONCILE_UNPROVEN)
+                {
+                    tx.execute(&statement, libsql::params![page_id.as_str()])
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!("support reconcile demote: {error}"))
+                        })?;
+                }
+            }
+            Ok::<usize, WenlanError>(failing.len())
+        }
+        .await;
+
+        match demoted {
+            Ok(count) => {
+                tx.commit().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("support reconcile commit: {error}"))
+                })?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Retract the support edges that cite one document, and demote the pages
+    /// resting on them — inside the caller's transaction.
+    ///
+    /// The rename path is the one production mutation that moves evidence
+    /// without touching a single row a trigger watches. `rebind_source_id`
+    /// changes `memories.source_id`; it does not delete a memory, does not
+    /// change a memory's content, and does not move a space, so
+    /// `m5_demote_support_on_memory_delete`, `..._chunk_delete`, `..._chunk_edit`
+    /// and the two space-move triggers all stay silent. The support edge keeps
+    /// pointing at a `dst_id` that names nothing, `valid_until` is still NULL
+    /// because nobody retracted it, and the page goes on exposing `supported`
+    /// indefinitely — nothing later re-checks it, because no production caller
+    /// re-evaluates a page whose text did not change.
+    ///
+    /// A catch-all trigger on `memories.source_id` is the wrong answer: it is
+    /// the hottest table in the database and the rename is a known, bounded,
+    /// already-transactional caller. So the caller does it explicitly, in the
+    /// transaction that performs the rename, and the page cannot be observed
+    /// renamed-but-still-supported at any point.
+    ///
+    /// **Retract rather than re-point.** The rename optimization fires on equal
+    /// content hashes, so re-pointing each edge at the new `source_id` would
+    /// usually be true — but `edge_id` is content-addressed over the endpoint,
+    /// so every edge would have to be re-minted, and `rebind_source_id` is a
+    /// general primitive whose other callers promise nothing about content.
+    /// Retracting costs one re-derivation per affected page and lands them on
+    /// `Unevaluated`, which keeps every file. Being wrong in that direction
+    /// costs judge budget; being wrong in the other direction is a citation
+    /// pointing at bytes nobody checked.
+    pub(super) async fn retract_support_for_rebound_source(
+        conn: &libsql::Connection,
+        old_source_id: &str,
+    ) -> Result<(), WenlanError> {
+        // Demote and re-queue BEFORE retracting, because the edges are what
+        // identify the affected pages. `pages_supported_by_memory` deliberately
+        // ignores `valid_until` — see its doc comment — so this order is belt
+        // and braces rather than the only thing holding it up.
+        for statement in
+            support_demotion_statements(&pages_supported_by_memory("?1"), REASON_EVIDENCE_REBOUND)
+        {
+            conn.execute(&statement, libsql::params![old_source_id])
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("rebind support demotion: {error}"))
+                })?;
+        }
+        conn.execute(
+            "UPDATE edges
+                SET valid_until = CAST(strftime('%s','now') AS INTEGER),
+                    superseded_by = NULL
+              WHERE edge_type = 'supports'
+                AND src_kind = 'claim_revision'
+                AND dst_kind = 'memory'
+                AND dst_id = ?1
+                AND valid_until IS NULL",
+            libsql::params![old_source_id],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("rebind support retraction: {error}")))?;
+        Ok(())
+    }
+
+    /// Allocate the next run generation. Monotone, never 0.
+    ///
+    /// A generation is burned whether or not the lease that asked for it finds
+    /// work. Gaps are free — the only property anything depends on is that a
+    /// value is never reissued, so two runs can never be mistaken for one.
+    pub(super) async fn allocate_run_generation(
+        conn: &libsql::Connection,
+    ) -> Result<i64, WenlanError> {
+        let mut rows = conn
+            .query(
+                "UPDATE claim_run_generations
+                    SET last_generation = last_generation + 1
+                  WHERE id = 1
+                  RETURNING last_generation",
+                (),
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("run generation allocate: {error}")))?;
+        let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("run generation allocate row: {error}"))
+        })?
+        else {
+            // The allocator row is seeded by the same statement batch that
+            // creates the table, so its absence means the substrate is not
+            // there. Refusing beats inventing a generation nothing else agrees
+            // with: a wrong generation makes another run's rows look like this
+            // one's, which is the exact confusion it exists to prevent.
+            return Err(WenlanError::VectorDb(
+                "run generation allocator row is missing; refusing to start a derivation run \
+                 without a run identity"
+                    .to_string(),
+            ));
+        };
+        row.get::<i64>(0)
+            .map_err(|error| WenlanError::VectorDb(format!("run generation decode: {error}")))
+    }
+
     /// Take the oldest claimable job, or `None` when the queue is drained.
     ///
     /// Claimable means pending, or leased with an expired lease — the second
@@ -610,6 +916,18 @@ impl MemoryDB {
     /// update are one statement so two workers racing cannot both win: SQLite
     /// serializes the write, and the loser's subquery re-evaluates against the
     /// already-leased row.
+    ///
+    /// **Every lease is a new run.** `(page_id, page_version)` names a job that
+    /// outlives its attempts: a released or reclaimed job keeps the same row
+    /// while `attempts` climbs, so judgment rows from an attempt that died
+    /// halfway would otherwise sit beside rows from the attempt that replaced
+    /// it and read as one complete run. A claim that reads as fully judged with
+    /// no qualifying edge is `Refuted`, which costs the page its file — so the
+    /// mix-up fails in the most expensive direction available. Stamping a fresh
+    /// generation here makes the previous attempt's rows inert without deleting
+    /// them, which is also the lease invalidation a reclaim needs: the stalled
+    /// worker's rows land under a generation nobody reads, and its finalization
+    /// is refused by the lease guard.
     pub async fn lease_next_derivation_job(
         &self,
         owner: &str,
@@ -617,6 +935,7 @@ impl MemoryDB {
         let now = chrono::Utc::now().timestamp();
         let expires = now + LEASE_SECS;
         let conn = self.conn.lock().await;
+        let generation = Self::allocate_run_generation(&conn).await?;
 
         let mut rows = conn
             .query(
@@ -625,6 +944,7 @@ impl MemoryDB {
                         lease_owner = ?1,
                         lease_expires_at = ?2,
                         attempts = attempts + 1,
+                        run_generation = ?5,
                         updated_at = ?3
                   WHERE job_id = (
                       SELECT job_id FROM claim_derivation_jobs
@@ -637,7 +957,7 @@ impl MemoryDB {
                        LIMIT 1
                   )
                   RETURNING job_id, page_id, page_version",
-                libsql::params![owner, expires, now, MAX_ATTEMPTS],
+                libsql::params![owner, expires, now, MAX_ATTEMPTS, generation],
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("derivation lease: {error}")))?;
@@ -650,6 +970,12 @@ impl MemoryDB {
             return Ok(None);
         };
 
+        // Superseded runs' rows are left in place, deliberately. They are the
+        // only durable record of what each attempt weighed and how far it got,
+        // the generation filter already makes them unreadable as this run's
+        // work, and deleting them is what the previous design got wrong: a
+        // stalled worker can still be writing, so a delete removes live state
+        // and cannot remove the state it was aiming at.
         Ok(Some(DerivationJob {
             job_id: row.get::<String>(0).map_err(|error| {
                 WenlanError::VectorDb(format!("derivation lease job_id: {error}"))
@@ -660,6 +986,7 @@ impl MemoryDB {
             page_version: row.get::<i64>(2).map_err(|error| {
                 WenlanError::VectorDb(format!("derivation lease page_version: {error}"))
             })?,
+            run_generation: generation,
         }))
     }
 
@@ -744,11 +1071,20 @@ impl MemoryDB {
     ///    the derivation ran, the claims are real, and the evidence was looked
     ///    for and was not there.
     /// 4. No revision is in a deferred, timed-out, or malformed support state.
-    ///    Detected twice, because there are two ways to stop partway: a
+    ///    Detected three ways, because there are three ways to stop partway: a
     ///    membership count that disagrees with the marker's own
-    ///    `inventory_count` (extraction stopped), and a `claim_judgment_attempts`
-    ///    row this run never concluded (judging stopped). Failure → `NoPublish`
-    ///    (row 6).
+    ///    `inventory_count` (extraction stopped), a `claim_judgment_attempts`
+    ///    row this run never concluded (judging stopped), and a live candidate
+    ///    edge this run never registered an attempt for at all (judging never
+    ///    reached it). Failure → `NoPublish` (row 6).
+    ///
+    ///    **Condition 4 is checked before condition 3, per claim, and a valid
+    ///    support edge does not excuse it.** Reading condition 3 first and
+    ///    short-circuiting on the first edge that revalidates publishes
+    ///    `Supported` for a claim with one good edge and one candidate the run
+    ///    timed out on — a run that did not finish, reported as one that
+    ///    finished and succeeded. §1 condition 4 is a property of the RUN, not
+    ///    of whether some candidate happened to work out.
     ///
     /// **Known gap, condition 3.** The matrix also requires the supporting edge
     /// to come from a "currently-eligible model version" (row 14). No model
@@ -1082,17 +1418,46 @@ impl MemoryDB {
             });
         }
 
-        // Condition 3, one claim at a time. Deciding it needs two things SQL
-        // cannot do — reading a span back out of live bytes, and recomputing a
-        // provenance identity digest — so the scan gathers candidates and the
-        // judgement happens here.
+        // Which RUN's conclusions count. `(page_id, page_version)` names a job
+        // that outlives its attempts, so the generation stamped on the job row
+        // is what says which rows belong to the attempt currently in force. A
+        // page with no job row has no run at all, and 0 — the never-leased
+        // value, never allocated to a real run — is the honest reading.
+        let run_generation: i64 =
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT run_generation FROM claim_derivation_jobs
+                      WHERE page_id = ?1 AND page_version = ?2",
+                        libsql::params![page_id, page_version],
+                    )
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("support run read: {error}")))?;
+                match rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("support run decode: {error}"))
+                })? {
+                    Some(row) => row.get::<i64>(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("support run decode: {error}"))
+                    })?,
+                    None => 0,
+                }
+            };
+
+        // Conditions 3 and 4, one claim at a time. Deciding them needs two
+        // things SQL cannot do — reading a span back out of live bytes, and
+        // recomputing a provenance identity digest — so the scan gathers
+        // candidates and the judgement happens here.
         //
-        // Per claim, in descending order of what we actually know:
+        // Per claim, in the order the conditions are ranked:
         //
+        //   incomplete   -- this run left some candidate without a conclusion.
+        //                   The run has not finished, whatever else is true.
+        //   unregistered -- a live candidate edge this run never weighed at
+        //                   all. The same failure from the other side: the run
+        //                   did not cover the inventory it faced.
         //   supported    -- at least one active, above-threshold support edge
-        //                   that STILL revalidates against current evidence.
-        //   incomplete   -- no such edge, and this run left some candidate
-        //                   without a conclusion. The run has not finished.
+        //                   that this run concluded on and that STILL
+        //                   revalidates against current evidence.
         //   never judged -- no such edge, and no candidate was ever weighed. We
         //                   have not looked at this claim at all.
         //   judged short -- no such edge, and every candidate concluded. That
@@ -1122,12 +1487,24 @@ impl MemoryDB {
                 ids
             };
 
-        let (mut never_judged, mut judged_short, mut incomplete) = (0i64, 0i64, 0i64);
+        let (mut never_judged, mut judged_short, mut incomplete, mut unregistered) =
+            (0i64, 0i64, 0i64, 0i64);
         for claim_revision_id in &claim_revision_ids {
-            let candidates: Vec<(String, Option<String>, String)> = {
+            // The candidate's LOCATION comes out of the payload alongside the
+            // edge, because location is what identifies a candidate: the same
+            // sentence can appear twice in one document, and two occurrences
+            // share a span digest. A payload missing any part of the locator
+            // matches no attempt row, which reads as unregistered — the same
+            // refusal `revalidate_support_edge` reaches for the same reason.
+            let candidates: Vec<SupportCandidate> = {
                 let mut rows = conn
                     .query(
-                        "SELECT e.dst_id, e.root_id, e.payload FROM edges e
+                        "SELECT e.dst_id, e.root_id, e.payload,
+                                json_extract(e.payload, '$.chunk_index'),
+                                json_extract(e.payload, '$.span_start'),
+                                json_extract(e.payload, '$.span_end'),
+                                json_extract(e.payload, '$.span_digest')
+                           FROM edges e
                           WHERE e.edge_type = 'supports'
                             AND e.src_kind = 'claim_revision'
                             AND e.dst_kind = 'memory'
@@ -1147,20 +1524,109 @@ impl MemoryDB {
                 })? {
                     let decode =
                         |error| WenlanError::VectorDb(format!("support candidate decode: {error}"));
+                    let source_id = row.get::<String>(0).map_err(decode)?;
+                    let locator = match (
+                        row.get::<Option<i64>>(3).map_err(decode)?,
+                        row.get::<Option<i64>>(4).map_err(decode)?,
+                        row.get::<Option<i64>>(5).map_err(decode)?,
+                        row.get::<Option<String>>(6).map_err(decode)?,
+                    ) {
+                        (Some(chunk), Some(start), Some(end), Some(digest)) => {
+                            Some(CandidateLocator {
+                                source_id: source_id.clone(),
+                                chunk_index: chunk,
+                                span_start: start,
+                                span_end: end,
+                                span_digest: digest,
+                            })
+                        }
+                        _ => None,
+                    };
+                    found.push(SupportCandidate {
+                        source_id,
+                        root_id: row.get::<Option<String>>(1).map_err(decode)?,
+                        payload: row.get::<String>(2).map_err(decode)?,
+                        locator,
+                    });
+                }
+                found
+            };
+
+            // What THIS run managed to do about this claim — which
+            // `entailment_cache` cannot answer, being global and timeless, and
+            // which rows from a superseded run must not answer either. See
+            // `claim_judgment_attempts`.
+            let attempts: Vec<(CandidateLocator, String)> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT candidate_source_id, candidate_chunk_index,
+                                candidate_span_start, candidate_span_end,
+                                candidate_digest, outcome
+                           FROM claim_judgment_attempts
+                          WHERE page_id = ?1 AND page_version = ?2
+                            AND run_generation = ?3
+                            AND claim_revision_id = ?4",
+                        libsql::params![
+                            page_id,
+                            page_version,
+                            run_generation,
+                            claim_revision_id.clone()
+                        ],
+                    )
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("support attempts: {error}")))?;
+                let mut found = Vec::new();
+                while let Some(row) = rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("support attempts decode: {error}"))
+                })? {
+                    let decode =
+                        |error| WenlanError::VectorDb(format!("support attempts decode: {error}"));
                     found.push((
-                        row.get::<String>(0).map_err(decode)?,
-                        row.get::<Option<String>>(1).map_err(decode)?,
-                        row.get::<String>(2).map_err(decode)?,
+                        CandidateLocator {
+                            source_id: row.get::<String>(0).map_err(decode)?,
+                            chunk_index: row.get::<i64>(1).map_err(decode)?,
+                            span_start: row.get::<i64>(2).map_err(decode)?,
+                            span_end: row.get::<i64>(3).map_err(decode)?,
+                            span_digest: row.get::<String>(4).map_err(decode)?,
+                        },
+                        row.get::<String>(5).map_err(decode)?,
                     ));
                 }
                 found
             };
 
+            // Condition 4 first, and ahead of condition 3 rather than after it.
+            // A run that timed out on one candidate did not finish, and one
+            // other candidate working out does not make it finished — reading
+            // condition 3 first and stopping at the first edge that revalidates
+            // publishes `Supported` for exactly that page.
+            if attempts.iter().any(|(_, outcome)| outcome != "concluded") {
+                incomplete += 1;
+                continue;
+            }
+            // The inventory half of condition 4. Every live candidate has to be
+            // one this run actually weighed; an edge with no attempt row behind
+            // it is evidence the run never accounted for, and publishing on it
+            // is publishing on work nobody did.
+            if candidates.iter().any(|candidate| {
+                candidate.locator.as_ref().is_none_or(|locator| {
+                    !attempts.iter().any(|(concluded, _)| concluded == locator)
+                })
+            }) {
+                unregistered += 1;
+                continue;
+            }
+
             let mut supported = false;
-            for (dst_id, root_id, payload) in &candidates {
-                if Self::revalidate_support_edge(conn, dst_id, root_id.as_deref(), payload)
-                    .await?
-                    .is_none()
+            for candidate in &candidates {
+                if Self::revalidate_support_edge(
+                    conn,
+                    &candidate.source_id,
+                    candidate.root_id.as_deref(),
+                    &candidate.payload,
+                )
+                .await?
+                .is_none()
                 {
                     supported = true;
                     break;
@@ -1170,40 +1636,7 @@ impl MemoryDB {
                 continue;
             }
 
-            // No live evidence, so the question becomes what this RUN managed
-            // to do about this claim — which `entailment_cache` cannot answer,
-            // being global and timeless. See `claim_judgment_attempts`.
-            let (attempted, unconcluded): (i64, i64) = {
-                let mut rows = conn
-                    .query(
-                        "SELECT COUNT(*),
-                                SUM(CASE WHEN outcome <> 'concluded' THEN 1 ELSE 0 END)
-                           FROM claim_judgment_attempts
-                          WHERE page_id = ?1 AND page_version = ?2
-                            AND claim_revision_id = ?3",
-                        libsql::params![page_id, page_version, claim_revision_id.clone()],
-                    )
-                    .await
-                    .map_err(|error| WenlanError::VectorDb(format!("support attempts: {error}")))?;
-                match rows.next().await.map_err(|error| {
-                    WenlanError::VectorDb(format!("support attempts decode: {error}"))
-                })? {
-                    Some(row) => {
-                        let decode = |error| {
-                            WenlanError::VectorDb(format!("support attempts decode: {error}"))
-                        };
-                        (
-                            row.get::<i64>(0).map_err(decode)?,
-                            row.get::<Option<i64>>(1).map_err(decode)?.unwrap_or(0),
-                        )
-                    }
-                    None => (0, 0),
-                }
-            };
-
-            if unconcluded > 0 {
-                incomplete += 1;
-            } else if attempted == 0 {
+            if attempts.is_empty() {
                 never_judged += 1;
             } else {
                 judged_short += 1;
@@ -1227,6 +1660,20 @@ impl MemoryDB {
                 reason: format!(
                     "incomplete derivation: {incomplete} of {inventory_count} claim(s) have a \
                      candidate this run never concluded on"
+                ),
+            });
+        }
+
+        // The other half of row 6. A live candidate with no attempt row behind
+        // it is not a claim we judged and lost — it is evidence this run never
+        // opened, and a verdict that rests on it rests on nothing. Ranked with
+        // `incomplete` rather than below it because they are the same failure:
+        // the run did not cover its inventory.
+        if unregistered > 0 {
+            return Ok(SupportOutcome::NoPublish {
+                reason: format!(
+                    "unaccounted evidence: {unregistered} of {inventory_count} claim(s) have a \
+                     live support candidate this run never weighed"
                 ),
             });
         }

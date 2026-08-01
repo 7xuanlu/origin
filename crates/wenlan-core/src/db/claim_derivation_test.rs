@@ -489,14 +489,80 @@ async fn derive_page(db: &MemoryDB, page_id: &str, claim_count: usize) -> Vec<St
     revisions
 }
 
+/// A judged candidate, identified the way a support edge identifies one: which
+/// memory, which chunk, which bytes. A digest alone is not an identity — one
+/// document can hold the same sentence twice.
+#[derive(Clone)]
+struct Candidate {
+    source_id: String,
+    chunk_index: i64,
+    span_start: i64,
+    span_end: i64,
+    span_digest: String,
+}
+
+impl Candidate {
+    /// The candidate [`support_claim_at_chunk`] writes an edge for: the whole of
+    /// [`EVIDENCE_TEXT`] in chunk `chunk_index` of this revision's evidence
+    /// memory. The attempt row and the edge have to agree byte for byte, or
+    /// evaluation reads the edge as one this run never weighed.
+    fn at_chunk(revision_id: &str, chunk_index: i64) -> Self {
+        Self {
+            source_id: format!("mem_{revision_id}"),
+            chunk_index,
+            span_start: 0,
+            span_end: EVIDENCE_TEXT.len() as i64,
+            span_digest: evidence_span_digest(),
+        }
+    }
+
+    /// A candidate that exists only as a judgement — no edge, no memory row.
+    /// For tests about how many candidates a run owed a conclusion on.
+    fn named(revision_id: &str, span_digest: &str) -> Self {
+        Self {
+            source_id: format!("mem_{revision_id}"),
+            chunk_index: 0,
+            span_start: 0,
+            span_end: 0,
+            span_digest: span_digest.to_string(),
+        }
+    }
+
+    /// Same bytes, different place. The collision case: two occurrences of one
+    /// sentence share a digest and are still two separate obligations.
+    fn at_offset(mut self, span_start: i64, span_end: i64) -> Self {
+        self.span_start = span_start;
+        self.span_end = span_end;
+        self
+    }
+}
+
+/// The run a page's job is currently on. Fixtures stamp their attempt rows with
+/// it for the same reason a worker does: a conclusion belongs to the attempt
+/// that reached it, and evaluation reads no other.
+async fn current_run(conn: &libsql::Connection, page_id: &str, page_version: i64) -> i64 {
+    let mut rows = conn
+        .query(
+            "SELECT run_generation FROM claim_derivation_jobs
+              WHERE page_id = ?1 AND page_version = ?2",
+            libsql::params![page_id, page_version],
+        )
+        .await
+        .unwrap();
+    match rows.next().await.unwrap() {
+        Some(row) => row.get::<i64>(0).unwrap(),
+        None => 0,
+    }
+}
+
 /// Record that this run weighed a candidate for this claim and reached
 /// `outcome`, plus the cache row a real judge would have left behind.
 ///
-/// The attempt row is what condition 3 reads. The cache row is not — it is
+/// The attempt row is what conditions 3 and 4 read. The cache row is not — it is
 /// written because a judgement that left no cache entry is a state the real
 /// pipeline does not produce, and a fixture that omitted it would be testing a
 /// DB that cannot exist.
-async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate_digest: &str, outcome: &str) {
+async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate: &Candidate, outcome: &str) {
     let conn = db.conn.lock().await;
     let (digest, page_id, page_version): (String, String, i64) = {
         let mut rows = conn
@@ -517,15 +583,23 @@ async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate_digest: &str, ou
             row.get(2).unwrap(),
         )
     };
+    let generation = current_run(&conn, &page_id, page_version).await;
     conn.execute(
         "INSERT OR REPLACE INTO claim_judgment_attempts
-             (page_id, page_version, claim_revision_id, candidate_digest, outcome, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+             (page_id, page_version, run_generation, claim_revision_id,
+              candidate_source_id, candidate_chunk_index, candidate_span_start,
+              candidate_span_end, candidate_digest, outcome, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
         libsql::params![
             page_id,
             page_version,
+            generation,
             revision_id,
-            candidate_digest,
+            candidate.source_id.clone(),
+            candidate.chunk_index,
+            candidate.span_start,
+            candidate.span_end,
+            candidate.span_digest.clone(),
             outcome
         ],
     )
@@ -536,7 +610,7 @@ async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate_digest: &str, ou
              (claim_text_digest, source_span_digest, model_id, model_version,
               prompt_version, score, threshold_at_write, backend, scored_at)
          VALUES (?1, ?2, 'judge', 'v1', 'p1', 0.1, 0.75, 'test', 0)",
-        libsql::params![digest, candidate_digest],
+        libsql::params![digest, candidate.span_digest.clone()],
     )
     .await
     .unwrap();
@@ -545,7 +619,13 @@ async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate_digest: &str, ou
 /// This run weighed every candidate for the claim and none cleared the bar —
 /// as distinct from nobody ever looking, and from looking and not finishing.
 async fn judged_but_short(db: &MemoryDB, revision_id: &str) {
-    attempt_on(db, revision_id, &evidence_span_digest(), "concluded").await;
+    attempt_on(
+        db,
+        revision_id,
+        &Candidate::at_chunk(revision_id, 0),
+        "concluded",
+    )
+    .await;
 }
 
 /// The evidence prose every support fixture cites, and the digest of the span
@@ -580,7 +660,16 @@ async fn support_claim_at_chunk(
     score: f64,
     chunk_index: i64,
 ) {
-    judged_but_short(db, revision_id).await;
+    // The attempt row has to name the SAME location the edge below cites. A
+    // conclusion recorded against chunk 0 does not discharge an edge into
+    // chunk 3 — that is the whole point of locating a candidate.
+    attempt_on(
+        db,
+        revision_id,
+        &Candidate::at_chunk(revision_id, chunk_index),
+        "concluded",
+    )
+    .await;
     let conn = db.conn.lock().await;
     let space: String = {
         let mut rows = conn
@@ -664,6 +753,49 @@ async fn support_claim_at_chunk(
     .unwrap();
 }
 
+/// Re-file the previous run's judgements under `generation`, standing in for a
+/// worker that reached those same conclusions during the run it now holds.
+///
+/// Evaluation only reads the current run's attempt rows, so without this a
+/// fixture that seeded judgements before taking a lease would evaluate as a page
+/// nobody has weighed yet. Tests that are ABOUT run isolation deliberately skip
+/// this and let the older rows stay where they are.
+async fn carry_attempts_forward(
+    conn: &libsql::Connection,
+    page_id: &str,
+    page_version: i64,
+    generation: i64,
+) {
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_judgment_attempts
+             (page_id, page_version, run_generation, claim_revision_id,
+              candidate_source_id, candidate_chunk_index, candidate_span_start,
+              candidate_span_end, candidate_digest, outcome, updated_at)
+         SELECT page_id, page_version, ?3, claim_revision_id,
+                candidate_source_id, candidate_chunk_index, candidate_span_start,
+                candidate_span_end, candidate_digest, outcome, updated_at
+           FROM claim_judgment_attempts
+          WHERE page_id = ?1 AND page_version = ?2
+            AND run_generation = (SELECT MAX(run_generation)
+                                    FROM claim_judgment_attempts
+                                   WHERE page_id = ?1 AND page_version = ?2
+                                     AND run_generation < ?3)",
+        libsql::params![page_id, page_version, generation],
+    )
+    .await
+    .unwrap();
+}
+
+/// [`carry_attempts_forward`] for a test that took its lease through the REAL
+/// `lease_next_derivation_job` — which allocates a run of its own and carries
+/// nothing, exactly as a worker starting fresh should. Tests that seeded their
+/// judgements up front call this to say "this run reached them too".
+async fn carry_seeded_judgements(db: &MemoryDB, page_id: &str, page_version: i64) {
+    let conn = db.conn.lock().await;
+    let generation = current_run(&conn, page_id, page_version).await;
+    carry_attempts_forward(&conn, page_id, page_version, generation).await;
+}
+
 /// Put one page's job in the state a worker holds it in, and return its id.
 ///
 /// Publication is bound to the lease, so every test that finalizes has to hold
@@ -673,28 +805,35 @@ async fn support_claim_at_chunk(
 /// The real lease path has its own teeth above; this is a fixture.
 async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str) -> String {
     let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "UPDATE claim_derivation_jobs
-                SET status = 'leased', lease_owner = ?3,
-                    lease_expires_at = ?4, attempts = attempts + 1, updated_at = ?4
-              WHERE page_id = ?1 AND page_version = ?2
-              RETURNING job_id",
-            libsql::params![
-                page_id,
-                page_version,
-                owner,
-                chrono::Utc::now().timestamp() + 600
-            ],
-        )
-        .await
-        .unwrap();
-    rows.next()
-        .await
-        .unwrap()
-        .expect("the page must have a queued job to lease")
-        .get::<String>(0)
-        .unwrap()
+    let generation = MemoryDB::allocate_run_generation(&conn).await.unwrap();
+    let job_id = {
+        let mut rows = conn
+            .query(
+                "UPDATE claim_derivation_jobs
+                    SET status = 'leased', lease_owner = ?3,
+                        lease_expires_at = ?4, attempts = attempts + 1,
+                        run_generation = ?5, updated_at = ?4
+                  WHERE page_id = ?1 AND page_version = ?2
+                  RETURNING job_id",
+                libsql::params![
+                    page_id,
+                    page_version,
+                    owner,
+                    chrono::Utc::now().timestamp() + 600,
+                    generation
+                ],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("the page must have a queued job to lease")
+            .get::<String>(0)
+            .unwrap()
+    };
+    carry_attempts_forward(&conn, page_id, page_version, generation).await;
+    job_id
 }
 
 async fn truth_row(db: &MemoryDB, page_id: &str) -> Option<(String, Option<i64>, i64)> {
@@ -804,6 +943,22 @@ async fn an_unfiled_page_can_be_supported_by_unfiled_evidence() {
     )
     .await
     .expect("an unfiled page and its own unfiled evidence are the same space");
+    // The judgement behind that edge, filed where the judge would have filed it.
+    // Writing the edge without it would leave the run owing a conclusion on its
+    // own evidence — the state the inventory check exists to catch.
+    attempt_on(
+        &db,
+        &revisions[0],
+        &Candidate {
+            source_id: minted.memory_source_id.clone(),
+            chunk_index: verdict.chunk_index,
+            span_start: verdict.span_start,
+            span_end: verdict.span_end,
+            span_digest: verdict.span_digest.clone(),
+        },
+        "concluded",
+    )
+    .await;
 
     // Both sides agree, and they agree on the sentinel rather than on NULL —
     // asserted rather than inferred from the write succeeding, because a fence
@@ -1222,6 +1377,7 @@ async fn a_reclaimed_job_cannot_publish_its_old_owners_verdict() {
         .await
         .unwrap()
         .unwrap();
+    carry_seeded_judgements(&db, "p1", 1).await;
     let stale = db.evaluate_page_support("p1", 1).await.unwrap();
     assert_eq!(stale, SupportOutcome::Supported);
 
@@ -1246,6 +1402,7 @@ async fn a_reclaimed_job_cannot_publish_its_old_owners_verdict() {
         .unwrap()
         .unwrap();
     assert_eq!(reclaimed.job_id, job.job_id);
+    carry_seeded_judgements(&db, "p1", 1).await;
     let fresh = db.evaluate_page_support("p1", 1).await.unwrap();
     assert!(
         matches!(fresh, SupportOutcome::Refuted { .. }),
@@ -1284,6 +1441,7 @@ async fn a_parked_jobs_former_worker_cannot_publish() {
         .await
         .unwrap()
         .unwrap();
+    carry_seeded_judgements(&db, "p1", 1).await;
     let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
     assert_eq!(outcome, SupportOutcome::Supported);
 
@@ -1327,6 +1485,7 @@ async fn evidence_that_moved_after_evaluation_is_not_published() {
         .await
         .unwrap()
         .unwrap();
+    carry_seeded_judgements(&db, "p1", 1).await;
     let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
     assert_eq!(outcome, SupportOutcome::Supported);
 
@@ -1772,6 +1931,75 @@ async fn drifted_support_stops_the_page_exposing_supported() {
     );
 }
 
+/// Row 15's order argument is only a safety argument if BOTH statements land.
+///
+/// The enqueue must run before the demotion — being `supported` is part of what
+/// makes a page drifted, so demoting first empties the drift query and the
+/// re-derivation is never queued. That ordering makes the failure window
+/// specific: a failure after the enqueue and before the demotion leaves the page
+/// queued and still asserting `supported` over evidence that stopped qualifying,
+/// which is precisely the fail-open state row 15 exists to close. Worse, the
+/// caller sees an error and cannot tell that half of it committed.
+///
+/// So the pair has to be atomic. The demotion is made to fail here, and the
+/// assertion is that the enqueue did not survive it — the page is exactly as it
+/// was, and the error is the whole truth. Run as two autocommitted statements
+/// the job row would be sitting there, which is the state under test.
+#[tokio::test]
+async fn a_failed_demotion_takes_its_enqueue_down_with_it() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], SUPPORT_THRESHOLD + 0.02).await;
+    publish_supported(&db, "p1").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET payload = json_set(payload, '$.score', ?1)
+              WHERE edge_type = 'supports'",
+            libsql::params![SUPPORT_THRESHOLD - 0.05],
+        )
+        .await
+        .unwrap();
+        // Break the demotion and nothing else. A storage-level refusal is the
+        // honest shape of the failure -- a disk error, a lock, a constraint --
+        // and it lands on the second statement of the pair, which is the only
+        // ordering where the enqueue could be left behind.
+        conn.execute_batch(
+            "CREATE TRIGGER red_proof_demotion_fails
+             BEFORE UPDATE OF support_status ON page_truth_state
+             WHEN NEW.support_status = 'provisional'
+             BEGIN SELECT RAISE(ABORT, 'demotion refused'); END;",
+        )
+        .await
+        .unwrap();
+    }
+
+    // The page's job is `done` from the publication above. The sweep's drift arm
+    // deletes that row and re-inserts a `pending` one, so `pending` afterwards is
+    // this sweep's enqueue and nothing else's.
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "done");
+
+    let failed = db.enqueue_stale_derivation_jobs(100).await;
+    assert!(
+        failed.is_err(),
+        "a demotion that cannot land must be reported, not swallowed"
+    );
+
+    assert_eq!(
+        job_for(&db, "p1").await.unwrap().1,
+        "done",
+        "the enqueue must not outlive the demotion it was paired with -- a queued \
+         page still asserting `supported` is the fail-open state row 15 closes"
+    );
+    assert_eq!(
+        truth_row(&db, "p1").await.unwrap().0,
+        "supported",
+        "and nothing else moved either: the error is the whole truth"
+    );
+}
+
 /// N1, the invalidation half. A support edge cites a CHUNK, but the retraction
 /// and demotion triggers that shipped first fire only when the LAST row for a
 /// `source_id` disappears — correct for what they guard, and blind to the update
@@ -1858,13 +2086,23 @@ async fn rewriting_only_the_cited_chunk_demotes_the_page() {
 
 /// N1's other half, and the reason the recompute-in-transaction design is safe
 /// at all: evaluation itself must revalidate the evidence it asserts, so a page
-/// cannot be re-published on a dead citation even with every invalidation
-/// trigger removed. `valid_until IS NULL` means nobody retracted this edge — it
-/// has never meant the bytes it names are still there.
+/// cannot be re-published on a dead citation with no trigger having fired.
+/// `valid_until IS NULL` means nobody retracted this edge — it has never meant
+/// the bytes it names are still there.
 ///
 /// The triggers are dropped deliberately. They are the first line of defence and
 /// the teeth above prove they work; this proves the second line holds on its own,
 /// which is what makes the two independent rather than one defence counted twice.
+///
+/// Precisely: two of the three are dropped outright below
+/// (`m5_demote_support_on_chunk_delete`, `m5_demote_support_on_memory_delete`).
+/// `m5_retract_support_on_memory_delete` stays installed and is left in place on
+/// purpose — its last-chunk `NOT EXISTS` guard is structurally false while a
+/// sibling chunk survives, so it cannot fire in the delete-chunk-1-keep-chunk-0
+/// shape this test uses. The assertions below do not take that on trust: the
+/// edge is asserted still active and the stored verdict still `supported`
+/// immediately before evaluation runs, so whatever the surviving trigger did or
+/// did not do, the demotion that follows is revalidation's alone.
 #[tokio::test]
 async fn a_dead_chunk_edge_cannot_republish_support() {
     let (db, _temp) = db_with_queue().await;
@@ -1939,7 +2177,13 @@ async fn a_candidate_this_run_never_concluded_blocks_publication() {
     add_page(&db, "p1").await;
     let revisions = derive_page(&db, "p1", 1).await;
 
-    attempt_on(&db, &revisions[0], "candidate_a", "concluded").await;
+    attempt_on(
+        &db,
+        &revisions[0],
+        &Candidate::named(&revisions[0], "candidate_a"),
+        "concluded",
+    )
+    .await;
     assert!(
         matches!(
             db.evaluate_page_support("p1", 1).await.unwrap(),
@@ -1948,7 +2192,13 @@ async fn a_candidate_this_run_never_concluded_blocks_publication() {
         "a run that concluded on every candidate and found nothing IS a verdict"
     );
 
-    attempt_on(&db, &revisions[0], "candidate_b", "deferred").await;
+    attempt_on(
+        &db,
+        &revisions[0],
+        &Candidate::named(&revisions[0], "candidate_b"),
+        "deferred",
+    )
+    .await;
     let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
     assert!(
         matches!(outcome, SupportOutcome::NoPublish { .. }),
@@ -1973,5 +2223,418 @@ async fn a_claim_with_no_attempt_rows_is_never_judged() {
             SupportOutcome::Unevaluated { .. }
         ),
         "nobody looked, so there is nothing to refute"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Condition 4's two halves: no candidate left hanging, and no candidate left
+// unweighed. A run is complete or it publishes nothing.
+// ---------------------------------------------------------------------------
+
+/// The short-circuit. Condition 3 is satisfiable by ONE edge, so a loop that
+/// stops at the first candidate that revalidates publishes `Supported` for a run
+/// that is still out on another candidate — a real, above-threshold citation
+/// standing in for evidence nobody finished weighing. The unfinished candidate
+/// has to win over the finished one, or "every candidate was weighed" degrades
+/// into "some candidate was weighed", which is not condition 4.
+#[tokio::test]
+async fn a_deferred_candidate_outranks_a_support_edge_that_revalidates() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported,
+        "the valid edge on its own is genuine support, so the refusal below is \
+         about the deferral and nothing else"
+    );
+
+    attempt_on(
+        &db,
+        &revisions[0],
+        &Candidate::named(&revisions[0], "a_second_passage"),
+        "deferred",
+    )
+    .await;
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::NoPublish { ref reason } = outcome else {
+        panic!("a run still out on a candidate has not finished; got {outcome:?}");
+    };
+    assert!(
+        reason.contains("incomplete") || reason.contains("did not finish"),
+        "the stored reason must name the unfinished run: {reason}"
+    );
+}
+
+/// Candidate identity is a LOCATION, not a digest. One document can hold the
+/// same sentence twice, and the two occurrences are two separate obligations
+/// even though their span digests are byte-identical.
+///
+/// Keyed on the digest alone, the run's conclusion about the first occurrence
+/// silently discharges the second, and the page publishes `Supported` on
+/// evidence nobody weighed. Keyed on the location, the second occurrence is
+/// unaccounted-for until it is weighed on its own.
+#[tokio::test]
+async fn two_occurrences_of_one_sentence_are_two_obligations() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    // Edge + conclusion at offsets 0..14 of the evidence chunk.
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    // The document actually says it twice. Both spans locate, and both hash to
+    // the same digest — that is the whole point.
+    let doubled = format!("{EVIDENCE_TEXT} {EVIDENCE_TEXT}");
+    let second = Candidate::at_chunk(&revisions[0], 0)
+        .at_offset(EVIDENCE_TEXT.len() as i64 + 1, doubled.len() as i64);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET content = ?2 WHERE source_id = ?1",
+            libsql::params![second.source_id.clone(), doubled.clone()],
+        )
+        .await
+        .unwrap();
+        // The provenance root is content-addressed over the WHOLE chunk, and
+        // revalidation recomputes it, so the root has to be the root of the
+        // document that holds the sentence twice. Leaving the single-occurrence
+        // root behind would make both edges fail §5 and the test would pass for
+        // the wrong reason — a broken provenance binding rather than an
+        // unweighed candidate.
+        conn.execute(
+            "UPDATE provenance_roots SET identity_digest = ?2 WHERE root_id = ?1",
+            libsql::params![
+                "root_evidence_prose",
+                crate::provenance::identity_digest("document_ingest", &doubled)
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, root_id, space, weight, payload,
+                                provenance, operation_id, created_at, superseded_by,
+                                valid_until)
+             SELECT 'e_second_occurrence', src_id, src_kind, dst_id, dst_kind, edge_type,
+                    lineage, grounded, root_id, space, weight,
+                    json_set(json_set(payload, '$.span_start', ?2), '$.span_end', ?3),
+                    provenance, operation_id, created_at, superseded_by, valid_until
+               FROM edges WHERE edge_id = ?1",
+            libsql::params![
+                format!("e_{}", revisions[0]),
+                second.span_start,
+                second.span_end
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::NoPublish { ref reason } = outcome else {
+        panic!(
+            "a conclusion about the first occurrence says nothing about the \
+             second; got {outcome:?}"
+        );
+    };
+    assert!(
+        reason.contains("never weighed"),
+        "the stored reason must name the unweighed evidence: {reason}"
+    );
+
+    // Weigh it, and the page is supported again — which is only reachable if the
+    // two conclusions are two ROWS. Under digest-only identity the second write
+    // would replace the first and the count would still be one.
+    attempt_on(&db, &revisions[0], &second, "concluded").await;
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported
+    );
+    let recorded: i64 = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM claim_judgment_attempts WHERE claim_revision_id = ?1",
+                libsql::params![revisions[0].clone()],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        recorded, 2,
+        "two occurrences must occupy two attempt rows, or one conclusion is \
+         answering for both"
+    );
+}
+
+/// The inventory half on its own: a live, above-threshold, fully revalidating
+/// support edge that this run has no conclusion for at all. Nothing is wrong
+/// with the edge — it is simply work the run never did, and publishing on it is
+/// publishing on somebody else's homework.
+#[tokio::test]
+async fn a_support_edge_this_run_never_weighed_blocks_publication() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("DELETE FROM claim_judgment_attempts", ())
+            .await
+            .unwrap();
+    }
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert!(
+        matches!(outcome, SupportOutcome::NoPublish { .. }),
+        "an unaccounted-for candidate is an unfinished run, not support; got \
+         {outcome:?}"
+    );
+}
+
+/// Run identity, through the real lease. `(page_id, page_version)` names a JOB,
+/// which outlives every attempt made on it: a reclaim or a retry produces a new
+/// run against the same key. Without a generation the new run inherits the old
+/// one's conclusions and can publish work it never did — the same defect as the
+/// demotion path deleting attempt rows a leased worker then repopulates.
+///
+/// The old rows must SURVIVE the boundary. They are the only durable record of
+/// what the previous attempt concluded; evaluation ignores them, which is a
+/// different thing from destroying them while a stalled worker may still be
+/// writing.
+#[tokio::test]
+async fn a_retried_job_does_not_inherit_the_previous_runs_conclusions() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    let first = db
+        .lease_next_derivation_job("worker-a")
+        .await
+        .unwrap()
+        .unwrap();
+    carry_seeded_judgements(&db, "p1", 1).await;
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported
+    );
+
+    db.release_derivation_job(&first.job_id, "worker-a", "daemon restart")
+        .await
+        .unwrap();
+    let retry = db
+        .lease_next_derivation_job("worker-b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.job_id, first.job_id, "same job, second attempt");
+    assert_ne!(
+        retry.run_generation, first.run_generation,
+        "a fresh attempt is a fresh run, or there is nothing to tell them apart"
+    );
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert!(
+        matches!(outcome, SupportOutcome::NoPublish { .. }),
+        "the retry owes its own conclusion on evidence it has not weighed; got \
+         {outcome:?}"
+    );
+
+    let survived: i64 = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM claim_judgment_attempts WHERE run_generation = ?1",
+                libsql::params![first.run_generation],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        survived, 1,
+        "the previous run's record must outlive the run itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The startup reconciler, and the rename that no trigger can see
+// ---------------------------------------------------------------------------
+
+/// Blocker 3. A stored `supported` is a claim about the LIVE §1 conditions, and
+/// the boot-time pass is what re-proves them. Migration 105's threshold scan can
+/// only see scores; the conditions it cannot see are exactly the ones that go
+/// stale across a restart — a marker that never landed, an extractor bump, prose
+/// rewritten in place.
+///
+/// Here the marker is gone. `evaluate_page_support` calls that `Unevaluated` —
+/// condition 1 unproven — so a reconciler that re-proves §1 demotes, and one
+/// that defaults a missing marker to agreement serves the stale verdict forever,
+/// because nothing else will ever come along to disturb it.
+#[tokio::test]
+async fn the_reconciler_demotes_a_page_whose_derivation_marker_is_gone() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    publish_supported(&db, "p1").await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM claim_derivation_markers WHERE page_id = 'p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        truth_row(&db, "p1").await.unwrap().0,
+        "supported",
+        "nothing has disturbed the stored verdict, so the demotion below is the \
+         reconciler's doing and not a trigger's"
+    );
+
+    assert_eq!(db.reconcile_supported_pages().await.unwrap(), 1);
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "provisional");
+    assert_eq!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Unevaluated,
+        "and the read surface stops asserting support"
+    );
+    assert_eq!(
+        job_for(&db, "p1").await.unwrap().1,
+        "pending",
+        "the page is queued for the derivation that would settle it"
+    );
+}
+
+/// The same pass against the condition-3 half — the one no SQL scan can reach.
+/// The cited chunk is deleted, so the span the verdict named cannot be read back
+/// out of live bytes. A reconciler that re-runs the real predicate sees this; a
+/// SQL restatement of "score >= threshold" does not, because the score is still
+/// 0.9 and the edge is still active.
+#[tokio::test]
+async fn the_reconciler_demotes_a_page_whose_cited_span_no_longer_exists() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim_at_chunk(&db, "p1", &revisions[0], 0.9, 3).await;
+    add_sibling_chunk(&db, &revisions[0], 0).await;
+    publish_supported(&db, "p1").await;
+
+    {
+        let conn = db.conn.lock().await;
+        // Drop the cited chunk WITHOUT letting the invalidation trigger fire, so
+        // the reconciler is the only thing that can notice. This is the state a
+        // restart inherits when the edit happened under an older binary.
+        conn.execute_batch("DROP TRIGGER IF EXISTS m5_demote_support_on_chunk_delete;")
+            .await
+            .unwrap();
+        conn.execute(
+            "DELETE FROM memories WHERE source_id = ?1 AND chunk_index = 3",
+            libsql::params![format!("mem_{}", revisions[0])],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "supported");
+
+    assert_eq!(db.reconcile_supported_pages().await.unwrap(), 1);
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "provisional");
+}
+
+/// And the other direction, so the pass cannot degrade into "demote everything".
+/// A page whose §1 conditions all still hold must come through untouched —
+/// otherwise every boot costs every supported page its file and the reconciler
+/// is an outage rather than a safety net.
+#[tokio::test]
+async fn the_reconciler_leaves_a_page_that_still_proves_out_alone() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    publish_supported(&db, "p1").await;
+
+    assert_eq!(db.reconcile_supported_pages().await.unwrap(), 0);
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "supported");
+    assert_eq!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Supported
+    );
+}
+
+/// Blocker 2, shaped like the caller that actually does this. The folder sync in
+/// `crates/wenlan-server/src/source_routes.rs` treats a file whose content hash
+/// matches a vanished file as a RENAME and calls
+/// `rebind_source_id_with_source_page` — the same call this test makes, with the
+/// same arguments in the same order.
+///
+/// A support edge names its evidence by `source_id`. Rebinding moves every chunk
+/// to the new id and leaves the edge pointing at an id no memory has, so the
+/// page goes on asserting `supported` over a citation that resolves to nothing.
+/// Evaluation-time revalidation is no answer: nothing in production calls the
+/// predicate on a rename, so "a worker will notice eventually" means never.
+///
+/// Retract-and-demote rather than re-point, because `edge_id` is content-
+/// addressed over the endpoint — re-pointing means re-minting every edge — and
+/// `rebind_source_id` is a general primitive whose other callers promise nothing
+/// about the new id holding the same bytes. Retraction lands the page on
+/// `Unevaluated`, which keeps its file and costs only judge budget.
+#[tokio::test]
+async fn a_renamed_document_stops_its_pages_asserting_support() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    publish_supported(&db, "p1").await;
+
+    let old_source_id = format!("mem_{}", revisions[0]);
+    db.rebind_source_id_with_source_page(
+        "memory",
+        &old_source_id,
+        "doc_renamed",
+        "page_source_old",
+        "page_source_new",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        truth_row(&db, "p1").await.unwrap().0,
+        "provisional",
+        "the rename has to cost the verdict in the SAME transaction that moves \
+         the evidence"
+    );
+    assert_eq!(
+        exposed_support(&db, "p1").await,
+        crate::truth_contract::Support::Unevaluated,
+        "and the page keeps its file while it waits to be re-derived"
+    );
+    assert_eq!(
+        job_for(&db, "p1").await.unwrap().1,
+        "pending",
+        "re-derivation is queued rather than merely hoped for"
+    );
+
+    let live_edges: i64 = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM edges
+                  WHERE edge_type = 'supports' AND dst_id = ?1 AND valid_until IS NULL",
+                libsql::params![old_source_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        live_edges, 0,
+        "an edge citing an id no memory holds must not stay active"
     );
 }

@@ -63,6 +63,16 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
     (db, temp)
 }
 
+/// Seed a page whose truth has actually been decided.
+///
+/// The derivation marker goes in alongside the verdict because the read gate
+/// refuses to expose one whose derivation cannot be shown to describe the live
+/// text, and finalization is what writes the marker in production. A truth row
+/// without one is a state the pipeline does not produce, and seeding it would
+/// leave every assertion in this file testing the missing-marker path instead of
+/// its subject. The digest is taken from the page's own content rather than
+/// hardcoded, so a test that rewrites the prose invalidates the marker exactly
+/// as an edit does.
 async fn set_truth(conn: &TestDbSession, page_id: &str, status: &str) {
     conn.execute(
         "INSERT INTO page_truth_state
@@ -70,6 +80,29 @@ async fn set_truth(conn: &TestDbSession, page_id: &str, status: &str) {
              evaluated_at)
          VALUES (?1,1,?2,0,1,1)",
         libsql::params![page_id, status],
+    )
+    .await
+    .unwrap();
+    let content: String = {
+        let mut rows = conn
+            .query(
+                "SELECT content FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_derivation_markers
+             (page_id, page_version, page_version_digest, extractor_version,
+              inventory_count, created_at)
+         VALUES (?1, 1, ?2, ?3, 1, 0)",
+        libsql::params![
+            page_id,
+            crate::provenance::revision_content_digest(&content),
+            crate::db::EXTRACTOR_VERSION
+        ],
     )
     .await
     .unwrap();

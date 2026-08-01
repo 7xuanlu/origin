@@ -529,17 +529,48 @@ pub(super) async fn prepare_startup_state(
     // pending ones, so leaving it unfenced put queue mutations into exactly the
     // startup that promised none. The backlog is not lost — it is a boot-time
     // sweep, so the next ordinary start performs it.
+    // The drain also DEMOTES. Row 15's whole point is that a page whose support
+    // stopped clearing the live bar must stop asserting `supported` now rather
+    // than whenever a worker reaches it, and `reconcile_supported_pages` extends
+    // that to the conditions no SQL scan can see — a missing or stale marker, an
+    // extractor bump, a citation whose bytes moved. Both are reconciliation, so
+    // both are treated the same way when they fail.
     if !repair_recovery_pending {
-        match db_arc.drain_stale_derivation_jobs(500).await {
-            Ok(0) => {}
-            Ok(enqueued) => tracing::info!(
-                "[truth] claim-derivation backlog: {enqueued} page(s) enqueued for derivation"
+        let drained = db_arc.drain_stale_derivation_jobs(500).await;
+        let reconciled = match drained {
+            Ok(enqueued) => db_arc
+                .reconcile_supported_pages()
+                .await
+                .map(|demoted| (enqueued, demoted)),
+            Err(e) => Err(e),
+        };
+        match reconciled {
+            Ok((0, 0)) => {}
+            Ok((enqueued, demoted)) => tracing::info!(
+                "[truth] claim-derivation reconciliation: {enqueued} page(s) enqueued, \
+                 {demoted} demoted out of supported"
             ),
-            // Not fatal: an un-swept backlog leaves pages underived, and an
-            // underived page is `Unevaluated` — it keeps its file and reads as
-            // unjudged, which is the honest state. Refusing to serve over it
-            // would trade a true "we have not looked yet" for an outage.
-            Err(e) => tracing::warn!("[truth] claim-derivation backlog sweep failed: {e}"),
+            // Fail CLOSED, on the same rule and through the same helper as the
+            // projection invariant above. This pass is what withdraws a stored
+            // `supported` whose evidence no longer holds; when it does not
+            // complete, the daemon does not know which pages those are, and
+            // logging and serving anyway means serving exactly the stale
+            // `supported` state the pass exists to retract. At generation 0
+            // every adapter is pass-through and no truth state reaches a
+            // reader, so the failure records the absence of a restriction that
+            // is not in force: `error!` and serve.
+            Err(e) => {
+                let live = db_arc.truth_cutover_generation().await.unwrap_or(1) != 0;
+                if live {
+                    let msg = format!(
+                        "[truth] claim-derivation reconciliation failed at cutover generation \
+                         >= 1; refusing to serve possibly-stale supported state: {e}"
+                    );
+                    report_bootstrap_error(&wenlan_root, &msg);
+                    return Err(anyhow::anyhow!(msg));
+                }
+                tracing::error!("[truth] claim-derivation reconciliation failed: {e}");
+            }
         }
     }
 

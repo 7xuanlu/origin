@@ -689,7 +689,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 105;
+pub const SCHEMA_VERSION: u32 = 106;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8393,6 +8393,19 @@ impl MemoryDB {
             if version < 105 {
                 self.migrate_105_claim_derivation_queue(version).await?;
             }
+
+            // Migration 106 (M5 derivation worker, round-4): give a derivation
+            // run an identity. 105's judgment rows were keyed by
+            // `(page_id, page_version, claim_revision_id, candidate_digest)`,
+            // which names a JOB and a span's CONTENT -- neither of which
+            // identifies an attempt or a place. Re-running 105's ensure cannot
+            // carry the new shape onto a database already stamped 105, because
+            // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table and
+            // `CREATE TRIGGER IF NOT EXISTS` will not replace an existing
+            // trigger body.
+            if version < 106 {
+                self.migrate_106_derivation_run_identity(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11912,6 +11925,104 @@ impl MemoryDB {
             "[migration] Migration 105 applied: claim-derivation queue live ({enqueued} \
              page(s) enqueued from the existing backlog)"
         );
+        Ok(())
+    }
+
+    /// Give a derivation run an identity, and a judged candidate a place.
+    ///
+    /// Migration 105 keyed `claim_judgment_attempts` by
+    /// `(page_id, page_version, claim_revision_id, candidate_digest)`. Both
+    /// halves of that were wrong in the same direction — too coarse — and both
+    /// let a run publish on work it did not do:
+    ///
+    ///   * `(page_id, page_version)` names a JOB. A released or reclaimed lease
+    ///     reuses the row, so rows from an attempt that crashed halfway sit
+    ///     beside rows from the attempt that replaced it and read as one
+    ///     complete run. `run_generation` splits them.
+    ///   * `candidate_digest` is span CONTENT. One document may hold the same
+    ///     sentence twice, so two genuinely distinct citations collided on one
+    ///     row and concluding on either discharged both. The four location
+    ///     columns are the same tuple `write_support_edge` folds into an edge's
+    ///     identity.
+    ///
+    /// **The table is dropped rather than migrated.** SQLite cannot widen a
+    /// primary key in place, and there is nothing here worth a rebuild: the rows
+    /// are per-run scratch, no production code path writes them yet, and their
+    /// absence reads as never-judged, which is the `Unevaluated` fail-safe every
+    /// other unknown in this module lands on. Rebuilding rows under a run
+    /// identity they were never written with would be inventing the very fact
+    /// the column exists to record.
+    ///
+    /// The m5 triggers are dropped and reinstalled for the same reason the table
+    /// is: `CREATE TRIGGER IF NOT EXISTS` leaves an existing trigger's body
+    /// alone, and 105's bodies carry the `DELETE FROM claim_judgment_attempts`
+    /// that the run generation replaces.
+    async fn migrate_106_derivation_run_identity(&self, _prior: i64) -> Result<(), WenlanError> {
+        {
+            let conn = self.conn.lock().await;
+            let tx = conn
+                .transaction()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m106 begin: {error}")))?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS claim_judgment_attempts;
+                 DROP TRIGGER IF EXISTS m5_demote_support_on_memory_delete;
+                 DROP TRIGGER IF EXISTS m5_demote_support_on_memory_space_move;
+                 DROP TRIGGER IF EXISTS m5_demote_support_on_page_space_move;
+                 DROP TRIGGER IF EXISTS m5_demote_support_on_page_edit;
+                 DROP TRIGGER IF EXISTS m5_demote_support_on_chunk_delete;
+                 DROP TRIGGER IF EXISTS m5_demote_support_on_chunk_edit;",
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m106 drop: {error}")))?;
+
+            // `claim_derivation_jobs` predates 106, so the new column has to be
+            // added rather than declared. Guarded because `ensure_claim_identity_tables`
+            // below creates the table WITH the column on a fresh database, and
+            // `ADD COLUMN` on an existing one is not idempotent.
+            let has_run_generation: i64 = {
+                let mut rows = tx
+                    .query(
+                        "SELECT COUNT(*) FROM pragma_table_info('claim_derivation_jobs')
+                          WHERE name = 'run_generation'",
+                        (),
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("m106 job column probe: {error}"))
+                    })?;
+                match rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("m106 job column row: {error}"))
+                })? {
+                    Some(row) => row.get::<i64>(0).unwrap_or(0),
+                    None => 0,
+                }
+            };
+            if has_run_generation == 0 {
+                tx.execute(
+                    "ALTER TABLE claim_derivation_jobs
+                     ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0",
+                    (),
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("m106 job run_generation: {error}"))
+                })?;
+            }
+
+            Self::ensure_claim_identity_tables(&tx).await?;
+            Self::ensure_claim_derivation_triggers(&tx).await?;
+            Self::ensure_support_invalidation_triggers(&tx).await?;
+            tx.commit()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m106 commit: {error}")))?;
+        }
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA user_version = 106", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m106 bump: {error}")))?;
+        log::info!("[migration] Migration 106 applied: derivation runs carry a run identity");
         Ok(())
     }
 
@@ -26370,6 +26481,16 @@ impl MemoryDB {
                 }
             }
             if source != "episode" {
+                // M5 row 13, the rename half. Changing `memories.source_id`
+                // moves the evidence a support edge cites without deleting a
+                // memory, editing a chunk, or moving a space -- so not one of
+                // the invalidation triggers fires, and the edge keeps naming a
+                // `dst_id` that no longer exists while its `valid_until` stays
+                // NULL. Handled here, synchronously, inside the transaction
+                // that performs the rename, so a reader can never observe the
+                // page renamed and still `supported`.
+                Self::retract_support_for_rebound_source(&conn, old_source_id).await?;
+
                 if let Some((old_page_id, _)) = source_page_ids {
                     Self::mark_pages_depending_on_memory_source_except(
                         &conn,

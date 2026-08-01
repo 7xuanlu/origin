@@ -293,12 +293,26 @@ impl MemoryDB {
             -- is fully judged with no qualifying edge is Refuted, which costs
             -- the page its file for evaluation that never finished.
             --
-            -- The run is (page_id, page_version) -- the same pair that names a
-            -- derivation job. `candidate_digest` is the source span digest of
-            -- the evidence weighed, so the row set IS the candidate set: one
-            -- row per candidate the run was required to conclude on. Absence
-            -- of rows is therefore meaningful and fail-closed -- never judged,
-            -- not judged-and-found-wanting.
+            -- The run is (page_id, page_version, run_generation), and the
+            -- generation is the load-bearing third of that. `(page_id,
+            -- page_version)` names a JOB, not a run attempt: an expired or
+            -- released lease reuses the same row, so rows written by an attempt
+            -- that crashed halfway sit beside rows written by the attempt that
+            -- replaced it, and the two read as one complete run. That is the
+            -- worst direction to be wrong in -- a claim that looks fully judged
+            -- with no qualifying edge is Refuted, which costs the page its
+            -- file. A generation is allocated per LEASE (see
+            -- `claim_run_generations`), so every attempt is its own run and
+            -- rows from two of them can never be combined.
+            --
+            -- The candidate is identified by its exact LOCATION, not by its
+            -- span digest. A digest alone is span CONTENT, and a document may
+            -- contain the same sentence twice: two genuinely distinct citations
+            -- then collide on one row, and concluding on one silently discharges
+            -- the obligation to conclude on the other. The columns mirror
+            -- `write_support_edge`'s span locator exactly -- source, chunk,
+            -- offsets, digest -- because matching an attempt row to the support
+            -- edge it produced is the whole point of recording it.
             --
             -- `outcome` is a whitelist of two, and 'deferred' deliberately
             -- covers timed-out, errored, and malformed alike: they differ in
@@ -308,13 +322,36 @@ impl MemoryDB {
             CREATE TABLE IF NOT EXISTS claim_judgment_attempts (
                 page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
                 page_version INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL,
                 claim_revision_id TEXT NOT NULL
                     REFERENCES claim_revisions(claim_revision_id) ON DELETE CASCADE,
+                candidate_source_id TEXT NOT NULL,
+                candidate_chunk_index INTEGER NOT NULL,
+                candidate_span_start INTEGER NOT NULL,
+                candidate_span_end INTEGER NOT NULL,
                 candidate_digest TEXT NOT NULL,
                 outcome TEXT NOT NULL CHECK(outcome IN ('concluded','deferred')),
                 updated_at INTEGER NOT NULL,
-                PRIMARY KEY (page_id, page_version, claim_revision_id, candidate_digest)
+                PRIMARY KEY (page_id, page_version, run_generation, claim_revision_id,
+                             candidate_source_id, candidate_chunk_index,
+                             candidate_span_start, candidate_span_end, candidate_digest)
             );
+
+            -- The run-generation allocator: one row, monotonically increasing.
+            --
+            -- Deliberately global rather than a counter on the job row. A job
+            -- row is DELETED and recreated by the backlog sweep whenever its
+            -- marker or its support goes stale, and a per-job counter would
+            -- restart at 0 there -- handing the next run a generation that
+            -- orphaned attempt rows from an earlier run already carry. A single
+            -- monotone source has no reset to reason about, and gaps (a lease
+            -- that allocated and then found nothing claimable) cost nothing.
+            CREATE TABLE IF NOT EXISTS claim_run_generations (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_generation INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO claim_run_generations (id, last_generation)
+                 VALUES (1, 0);
 
             -- The two truth axes, independent by construction. support_status
             -- is the machine axis and is a whitelist -- an unanticipated state
@@ -349,6 +386,14 @@ impl MemoryDB {
 
             -- Durable derivation work. The lease columns make a crashed worker
             -- reclaimable instead of parking a page forever.
+            --
+            -- `run_generation` is the run this job is currently on, stamped
+            -- from `claim_run_generations` at every lease. It is what makes a
+            -- reclaimed or retried job a NEW run rather than a continuation of
+            -- the one that died: judgment rows carry the generation they were
+            -- written under, and evaluation reads only the generation the job
+            -- row names now. 0 is the never-leased value -- no run has happened
+            -- yet, and no allocated generation is ever 0.
             CREATE TABLE IF NOT EXISTS claim_derivation_jobs (
                 job_id TEXT PRIMARY KEY,
                 page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
@@ -358,6 +403,7 @@ impl MemoryDB {
                 lease_owner TEXT,
                 lease_expires_at INTEGER,
                 attempts INTEGER NOT NULL DEFAULT 0,
+                run_generation INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL

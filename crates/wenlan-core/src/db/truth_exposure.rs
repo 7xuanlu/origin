@@ -362,9 +362,11 @@ impl MemoryDB {
     /// seen from the other side — v1's refutation is not evidence about v2, and
     /// letting it stand would archive a page over a judgement nobody made of it.
     ///
-    /// A row whose page is missing keeps its stored reading. There is nothing to
-    /// compare against, and `page_truth_state` cascades from `pages`, so the
-    /// case does not arise from a delete.
+    /// A row whose page is missing reads as [`Support::Unevaluated`] too: with
+    /// no live text there is nothing to compare the marker against, and a
+    /// comparison that cannot be made is not a comparison that passed.
+    /// `page_truth_state` cascades from `pages`, so the case does not arise from
+    /// a delete in the first place.
     ///
     /// [`Support::Unevaluated`]: crate::truth_contract::Support::Unevaluated
     pub async fn page_truth_states(
@@ -387,7 +389,7 @@ impl MemoryDB {
                 "SELECT t.page_id, t.support_status, t.human_reviewed, t.evaluated_at,
                         t.page_version, p.version, p.content,
                         t.reviewed_page_version, t.reviewed_page_digest,
-                        m.page_version_digest
+                        m.page_version_digest, m.extractor_version
                    FROM page_truth_state t
                    LEFT JOIN pages p ON p.id = t.page_id
                    LEFT JOIN claim_derivation_markers m
@@ -434,12 +436,13 @@ impl MemoryDB {
                 let live_content: Option<String> = row.get(6).unwrap_or(None);
                 let reviewed_version: Option<i64> = row.get(7).unwrap_or(None);
                 let reviewed_digest: Option<String> = row.get(8).unwrap_or(None);
-                // The digest the derivation marker recorded for the version this
-                // verdict was reached on. The version number alone cannot see a
-                // same-version content replacement: an edit that rewrites the
-                // prose without bumping `version` leaves a verdict about text
-                // the page no longer holds, and the numbers still agree.
+                // The derivation marker for the version this verdict was reached
+                // on. The version number alone cannot see a same-version content
+                // replacement: an edit that rewrites the prose without bumping
+                // `version` leaves a verdict about text the page no longer
+                // holds, and the numbers still agree.
                 let marker_digest: Option<String> = row.get(9).unwrap_or(None);
+                let marker_extractor: Option<i64> = row.get(10).unwrap_or(None);
                 let live_digest = live_content
                     .as_deref()
                     .map(crate::provenance::revision_content_digest);
@@ -447,18 +450,36 @@ impl MemoryDB {
                     (Some(judged), Some(live)) => judged == live,
                     _ => true,
                 };
-                // Applied only where a marker exists. `evaluated_at` is what
-                // separates judged from unjudged for every row migration 99
-                // backfilled, and those rows have no marker; demanding one here
-                // would reclassify them wholesale rather than close the hole
-                // this check is for. Where a real derivation published a
-                // verdict, finalization required a matching marker, so the
-                // marker is present exactly when there is something to verify.
-                let text_agrees = match (&marker_digest, &live_digest) {
-                    (Some(marker), Some(live)) => marker == live,
-                    _ => true,
+                // A verdict is readable only while the derivation it came out
+                // of still describes this page. All three parts are required
+                // and an absent one is a failure, not a pass.
+                //
+                // The marker must EXIST. Defaulting a missing marker to
+                // agreement was the hole: `evaluate_page_support` treats a
+                // missing marker as `Unevaluated` — condition 1 — so the writer
+                // and the reader disagreed about the same page, and the reader
+                // was the lenient one. Nothing reclassifies by tightening it,
+                // because a row can only read as `Supported` or `Unsupported` in
+                // the first place if `support_status = 'supported'` or
+                // `evaluated_at` is set, and both of those come from
+                // finalization, which required a matching marker. Migration 99's
+                // backfilled rows have neither, so they are `Unevaluated` under
+                // either rule.
+                //
+                // The EXTRACTOR must be current, for the reason
+                // `claim_derivation_markers` records it at all: identical page
+                // text under a changed extractor yields a different claim set,
+                // so an old marker no longer describes the inventory the verdict
+                // was reached over. Bumping `EXTRACTOR_VERSION` re-queues every
+                // page, and until this check the stored `supported` went on
+                // being served the whole time that queue drained.
+                let derivation_is_current = match (&marker_digest, marker_extractor, &live_digest) {
+                    (Some(marker), Some(extractor), Some(live)) => {
+                        marker == live && extractor == super::claim_derivation::EXTRACTOR_VERSION
+                    }
+                    _ => false,
                 };
-                let describes_live_text = versions_agree && text_agrees;
+                let describes_live_text = versions_agree && derivation_is_current;
                 let support = match (status.as_str(), evaluated_at) {
                     _ if !describes_live_text => crate::truth_contract::Support::Unevaluated,
                     ("supported", _) => crate::truth_contract::Support::Supported,
