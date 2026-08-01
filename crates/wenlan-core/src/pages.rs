@@ -41,6 +41,37 @@ pub(crate) fn page_embedding_text(title: &str, summary: Option<&str>, content: &
     }
 }
 
+/// Decide a page's `kind` — migration 89's page-kind discriminator — from what
+/// the page actually is.
+///
+/// One rule, shared by every insert path, so a page's stated kind cannot depend
+/// on which writer happened to create it. `kind` is `NOT NULL DEFAULT 'concept'`,
+/// which means an insert that stays silent does not fail; it asserts the row is
+/// a concept page. Every page written between migration 89 and this rule did
+/// exactly that, the reserved Overview singleton included.
+///
+/// The Overview is recognised by title, matching migration 89's own backfill:
+/// its `creation_kind` is 'research', indistinguishable from any other research
+/// page, and the title is reserved only among live pages. Everything else
+/// follows `creation_kind`, with 'distilled' and 'research' both landing on
+/// 'concept'.
+///
+/// Readers still resolve the Overview by title (`synthesis::overview`); this
+/// makes the column honest without moving any reader onto it.
+pub(crate) fn page_kind_for(title: &str, creation_kind: &str, status: &str) -> &'static str {
+    if status == "active"
+        && title.eq_ignore_ascii_case(crate::synthesis::overview::OVERVIEW_PAGE_TITLE)
+    {
+        return "overview";
+    }
+    match creation_kind {
+        "authored" => "authored",
+        "imported" | "source" => "source",
+        "entity" => "entity",
+        _ => "concept",
+    }
+}
+
 /// Maps a source memory's `memory_type` to the read-trust tier it sits behind.
 pub fn trust_tier_for_memory_type(memory_type: Option<&str>) -> u8 {
     match memory_type {

@@ -7806,3 +7806,191 @@ fn db_domain_guard_rejects_missing_duplicate_inline_and_visible_scope_drift() {
         );
     }
 }
+
+// ── Teeth #15: every production `INSERT INTO pages` names `kind` ──
+
+/// Blank out `#[cfg(test)]`-gated items so a test fixture sitting beside
+/// production code is not mistaken for a production writer. Brace-balanced
+/// rather than truncating at the first marker, because the gate also appears
+/// as a statement *inside* production functions (`page_drafts.rs` gates a test
+/// hook two statements above the real Page-draft INSERT) — truncating there
+/// would blind the scan to the very write it exists to check. Line count is
+/// preserved so reported offsets still line up with the file.
+fn strip_cfg_test_items(source: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut lines = source.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "#[cfg(test)]" {
+            kept.push(line);
+            continue;
+        }
+        kept.push("");
+        let mut depth = 0usize;
+        let mut opened = false;
+        for gated in lines.by_ref() {
+            kept.push("");
+            depth += gated.matches('{').count();
+            depth -= gated.matches('}').count().min(depth);
+            opened |= gated.contains('{');
+            // A braced item ends when its braces balance; an attribute on a
+            // plain `use`/`const` statement ends at the first `;`.
+            if (opened && depth == 0) || (!opened && gated.trim_end().ends_with(';')) {
+                break;
+            }
+        }
+    }
+    kept.join("\n")
+}
+
+/// Collapse a SQL column list lifted out of Rust source: line continuations,
+/// string-literal punctuation, and indentation all become single spaces, so
+/// the reported site is stable under reformatting.
+fn normalized_column_list(columns: &str) -> String {
+    columns
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c| c == '\\' || c == '"'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Production `INSERT INTO pages` statements whose column list does not name
+/// `kind`, reported as `path: <column list>`.
+///
+/// `pages.kind` (migration 89) is `NOT NULL DEFAULT 'concept'`, so omitting it
+/// does not fail the insert — it silently asserts the row is a concept page.
+/// That default is exactly how every page written after migration 89 came to
+/// lie about what it is, the reserved Overview singleton included. The column
+/// list is the only place the omission is visible, so that is what is read.
+fn page_insert_sites_without_kind(path: &str, source: &str) -> Vec<String> {
+    const NEEDLE: &str = "INSERT INTO pages";
+    let production = strip_cfg_test_items(source);
+    let mut sites = Vec::new();
+    let mut rest = production.as_str();
+    while let Some(offset) = rest.find(NEEDLE) {
+        let after = &rest[offset + NEEDLE.len()..];
+        rest = after;
+        // `pages_fts`, `pages_pre49`, … are other tables entirely.
+        if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let Some(open) = after.find('(') else {
+            continue;
+        };
+        let Some(close) = after[open..].find(')') else {
+            continue;
+        };
+        let columns = normalized_column_list(&after[open + 1..open + close]);
+        if columns.split(',').any(|column| column.trim() == "kind") {
+            continue;
+        }
+        sites.push(format!("{path}: {columns}"));
+    }
+    sites
+}
+
+/// Migration 46 rebuilds `pages` from the legacy `concepts` table at
+/// `user_version = 46`, forty-three migrations before `kind` exists. Naming the
+/// column there would be a syntax error against the schema of its own era, so
+/// it is the one production insert that legitimately omits it — pinned by its
+/// exact column list rather than a line number so the exemption cannot quietly
+/// widen to cover a new writer.
+const PRE_KIND_SCHEMA_REBUILD: &str = concat!(
+    "crates/wenlan-core/src/db.rs: ",
+    "id, title, summary, content, entity_id, domain, source_memory_ids, version, status, ",
+    "embedding, created_at, last_compiled, last_modified, sources_updated_count, ",
+    "stale_reason, user_edited"
+);
+
+/// Test modules in this crate live in their own files, gated by a
+/// `#[cfg(test)] mod …;` declaration in the parent — a convention teeth #16
+/// (`db_main_tests_live_outside_db_rs`) already enforces. The gate is therefore
+/// in the parent file, not in the module, so the `#[cfg(test)]` strip cannot
+/// see it and the scan has to recognise these by name.
+fn is_test_only_module(path: &str) -> bool {
+    let stem = path.strip_suffix(".rs").unwrap_or(path);
+    stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.contains("_test/")
+        || stem.contains("_tests/")
+        || stem.contains("_test_support")
+}
+
+#[test]
+fn every_production_page_insert_names_kind() {
+    let root = repo_root();
+    let mut sites = Vec::new();
+    for path in git_ls_files(&root, "*.rs").into_iter().filter(|path| {
+        path.starts_with("crates/")
+            && path.contains("/src/")
+            && path != "crates/wenlan-core/src/drift_guard.rs"
+            && !is_test_only_module(path)
+    }) {
+        let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
+        sites.extend(page_insert_sites_without_kind(&path, &source));
+    }
+    assert_eq!(
+        sites,
+        [PRE_KIND_SCHEMA_REBUILD],
+        "a production INSERT INTO pages omits `kind`, so the row it writes takes the \
+         NOT NULL DEFAULT 'concept' and claims to be a concept page whatever it really is. \
+         Name the column and stamp it from crate::pages::page_kind_for"
+    );
+}
+
+#[test]
+fn page_insert_kind_guard_detects_omission_and_ignores_lookalikes() {
+    let omitted = page_insert_sites_without_kind(
+        "crates/wenlan-core/src/somewhere.rs",
+        "conn.execute(\"INSERT INTO pages (id, title, creation_kind) VALUES (?1, ?2, ?3)\", ())",
+    );
+    assert_eq!(
+        omitted,
+        ["crates/wenlan-core/src/somewhere.rs: id, title, creation_kind"],
+        "positive control must catch an omission and must not read `creation_kind` as `kind`"
+    );
+
+    assert!(
+        page_insert_sites_without_kind(
+            "crates/wenlan-core/src/somewhere.rs",
+            "conn.execute(\"INSERT INTO pages (id, title, kind, creation_kind) \
+             VALUES (?1, ?2, ?3, ?4)\", ())",
+        )
+        .is_empty(),
+        "a column list naming kind is not a violation"
+    );
+
+    assert!(
+        page_insert_sites_without_kind(
+            "crates/wenlan-core/src/somewhere.rs",
+            "conn.execute(\"INSERT INTO pages_fts(rowid, title) VALUES (?1, ?2)\", ())",
+        )
+        .is_empty(),
+        "pages_fts is a different table"
+    );
+}
+
+#[test]
+fn page_insert_kind_guard_is_fail_closed_after_test_items() {
+    let source = concat!(
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn fixture() {\n",
+        "        conn.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n",
+        "    }\n",
+        "}\n",
+        "async fn create(&self) {\n",
+        "    #[cfg(test)]\n",
+        "    if validate {\n",
+        "        hooks::after_validation(id).await;\n",
+        "    }\n",
+        "    tx.execute(\"INSERT INTO pages (id, summary) VALUES (?1, ?2)\", ());\n",
+        "}\n",
+    );
+    assert_eq!(
+        page_insert_sites_without_kind("crates/wenlan-core/src/somewhere.rs", source),
+        ["crates/wenlan-core/src/somewhere.rs: id, summary"],
+        "the gated fixture must be ignored, and a production insert after an inline \
+         #[cfg(test)] item must still be caught"
+    );
+}

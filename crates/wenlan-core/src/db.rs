@@ -8386,6 +8386,14 @@ impl MemoryDB {
                 self.migrate_103_page_evaluated_at(version).await?;
             }
 
+            // Migration 104: repair the pages migration 89 never got to see.
+            // 89 classified the corpus of its day, but no insert named `kind`,
+            // so every page written since took the DEFAULT. See
+            // migrate_104_page_kind_repair.
+            if version < 104 {
+                self.migrate_104_page_kind_repair(version).await?;
+            }
+
             // Migration 105 (M5 derivation worker): the enqueue triggers, plus
             // the first backlog sweep. `claim_derivation_jobs` has existed since
             // 98 with neither a writer nor a reader, so the queue was empty on
@@ -12024,6 +12032,80 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("m106 bump: {error}")))?;
         log::info!("[migration] Migration 106 applied: derivation runs carry a run identity");
+        Ok(())
+    }
+
+    /// Migration 104: make `pages.kind` truthful for the rows migration 89
+    /// never saw.
+    ///
+    /// 89 added the column and backfilled the corpus of its day honestly, but
+    /// no insert path ever named the column, so `NOT NULL DEFAULT 'concept'`
+    /// answered for every page written since — including the reserved Overview
+    /// singleton, which `ensure_overview_page` creates through the ordinary
+    /// page-create path. The write path now stamps `kind` from
+    /// `crate::pages::page_kind_for`; this applies that same rule, once, to the
+    /// rows that missed it.
+    ///
+    /// Scoped by two guards rather than run over the whole table:
+    ///
+    /// * `page_kind_fold_ledger` froze the pre-fold corpus, so its absence is
+    ///   an exact marker for "created after 89". Leaving those rows alone keeps
+    ///   89's ledger a faithful mirror of the kinds it assigned — including the
+    ///   one place today's rule would disagree with it (89 read
+    ///   `creation_kind='source'` as a concept page). Re-deciding that is a
+    ///   separate call with its own audit trail, not this repair's business.
+    /// * `kind = 'concept'` means the repair only ever moves a row off the
+    ///   silent default. It cannot demote a deliberately stamped kind (the
+    ///   `kind='entity'` dual-write shadows above all), and re-running it is a
+    ///   no-op.
+    ///
+    /// The CASE is the frozen historical twin of `page_kind_for`, pinned equal
+    /// by `page_kind_rule_matches_the_migration_104_case`. Deliberately no
+    /// reader moves onto the column here: the Overview is still resolved by
+    /// title (`synthesis::overview`), and routing reads through `kind` is M6's
+    /// business. This migration only stops the column from lying.
+    async fn migrate_104_page_kind_repair(&self, prior_version: i64) -> Result<(), WenlanError> {
+        // §6.9: a data pass over `pages` gets a restore point, same as 89 and 99.
+        self.backup_before_migration(104, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m104 begin: {error}")))?;
+        let repaired = tx
+            .execute(
+                "UPDATE pages SET kind = CASE \
+                    WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview' \
+                    WHEN creation_kind = 'authored' THEN 'authored' \
+                    WHEN creation_kind IN ('imported', 'source') THEN 'source' \
+                    WHEN creation_kind = 'entity' THEN 'entity' \
+                    ELSE 'concept' END \
+                 WHERE kind = 'concept' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM page_kind_fold_ledger l WHERE l.page_id = pages.id \
+                   ) \
+                   AND CASE \
+                    WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview' \
+                    WHEN creation_kind = 'authored' THEN 'authored' \
+                    WHEN creation_kind IN ('imported', 'source') THEN 'source' \
+                    WHEN creation_kind = 'entity' THEN 'entity' \
+                    ELSE 'concept' END <> 'concept'",
+                (),
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m104 repair kind: {error}")))?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m104 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 104", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m104 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 104 applied: {repaired} page(s) moved off the silent \
+             kind='concept' default"
+        );
         Ok(())
     }
 
@@ -26960,11 +27042,11 @@ impl MemoryDB {
                      (id,title,summary,content,entity_id,space,source_memory_ids,
                       version,status,embedding,created_at,last_compiled,last_modified,
                       sources_updated_count,stale_reason,user_edited,changelog,
-                      creation_kind,review_status,workspace,citations)
+                      creation_kind,review_status,workspace,citations,kind)
                  SELECT ?1,title,summary,content,entity_id,space,source_memory_ids,
                         version,status,embedding,created_at,last_compiled,last_modified,
                         sources_updated_count,stale_reason,user_edited,changelog,
-                        creation_kind,review_status,workspace,citations
+                        creation_kind,review_status,workspace,citations,kind
                  FROM pages
                  WHERE id = ?2 AND creation_kind = 'source'",
                 libsql::params![new_page_id, old_page_id],
@@ -41604,19 +41686,25 @@ impl MemoryDB {
             }
         }
 
+        // Migration 89's discriminator, stamped from the ONE rule rather than
+        // left to the column DEFAULT -- this is the single funnel every
+        // page-insert path reaches, so stamping here is what makes `kind`
+        // truthful corpus-wide. Both arms below write `status='active'`.
+        let kind = crate::pages::page_kind_for(title, creation_kind, "active");
+
         let concept_result = match &embedding_sql {
             Some(emb) => {
                 conn.execute(
-                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9, ?10, ?11, ?12, ?13)",
-                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, emb.as_str(), now, creation_kind, review_status, workspace, citations_json],
+                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, emb.as_str(), now, creation_kind, review_status, workspace, citations_json, kind],
                 ).await
             }
             None => {
                 conn.execute(
-                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8, ?9, ?10, ?11, ?12)",
-                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, now, creation_kind, review_status, workspace, citations_json],
+                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, now, creation_kind, review_status, workspace, citations_json, kind],
                 ).await
             }
         };
