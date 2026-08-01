@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use syn::parse::{Parse, ParseStream};
+use syn::parse::{Parse, ParseStream, Parser as _};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{Expr, Lit, Pat, Token};
@@ -7813,7 +7813,33 @@ fn db_domain_guard_rejects_missing_duplicate_inline_and_visible_scope_drift() {
 
 // ── Teeth #15: every production `INSERT INTO pages` names `kind` ──
 
-/// Blank out `#[cfg(test)]`-gated items so a test fixture sitting beside
+/// True when this line is a lone `cfg` attribute that makes what follows
+/// test-only, judged by the same predicate the AST half uses.
+///
+/// The lexical half used to compare against the exact text `#[cfg(test)]`, which
+/// the AST half stopped doing in round 5. That left the two halves of this tooth
+/// disagreeing: `#[cfg(all(test, feature = "slow"))]` is every bit as test-only,
+/// and the visitor gates cannot retract a finding the text scan has already
+/// recorded — so a test-only comparison surfaced as a production finding no
+/// matter what the parser decided.
+///
+/// Structure is read off the masked twin so a `#[cfg(…)]` inside a comment is
+/// not a gate; the predicate is evaluated on the ORIGINAL line, because masking
+/// blanks string literals and `feature = "slow"` has to survive to be parsed.
+/// A line that looks like a gate but will not parse is left in place and
+/// therefore SCANNED — unreadable is not clean, and the bias stays with the
+/// visible false finding rather than the silent miss.
+fn line_gates_out_of_production(line: &str, masked_line: &str) -> bool {
+    let structural = masked_line.trim();
+    if !structural.starts_with("#[cfg(") || !structural.ends_with(")]") {
+        return false;
+    }
+    syn::Attribute::parse_outer
+        .parse_str(line.trim())
+        .is_ok_and(|attrs| is_cfg_test(&attrs))
+}
+
+/// Blank out `cfg`-gated test-only items so a test fixture sitting beside
 /// production code is not mistaken for a production writer. Brace-balanced
 /// rather than truncating at the first marker, because the gate also appears
 /// as a statement *inside* production functions (`page_drafts.rs` gates a test
@@ -7830,7 +7856,7 @@ fn strip_cfg_test_items(source: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut lines = source.lines().zip(masked.lines());
     while let Some((line, masked_line)) = lines.next() {
-        if masked_line.trim() != "#[cfg(test)]" {
+        if !line_gates_out_of_production(line, masked_line) {
             kept.push(line);
             continue;
         }
@@ -8304,11 +8330,24 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 ///
 /// Control flow is the other half and lives in `page_kind_match_sites`, which
 /// this calls. That half is parsed rather than scanned. What being parsed buys
-/// is narrower than it first looks, and worth stating exactly: the SHAPE of a
-/// `match`, `matches!`, `if let` or `while let` no longer hides anything —
-/// guards, comma-optional bodies, turbofish commas, closure commas and nesting
-/// are structure rather than punctuation now. What a reader NAMES can still
-/// hide, and that is where the list below lives.
+/// is narrower than it first looks, and worth stating exactly. Punctuation
+/// stopped being load-bearing: comma-optional bodies, turbofish commas and
+/// closure commas are structure now.
+///
+/// Nesting is reached in four positions, which is the honest enumeration this
+/// paragraph owed and did not give: a `match` written inside an ARM BODY, inside
+/// an ARM GUARD, inside a `matches!` SCRUTINEE, and inside a `matches!` GUARD.
+/// The last of those was parsed and thrown away until round 7, so
+/// `matches!(flag, true if match page.kind.as_str() { … })` was invisible while
+/// this very paragraph claimed guards could not hide shape. Reaching a position
+/// is not the same as recording in it: the routed literal is taken from
+/// `arm.pat` only, because a `"source"` in a body or a guard is a value the code
+/// computes rather than a pattern the column is matched against, and recording
+/// either would make the tooth cry wolf. A guard that compares directly —
+/// `if page.kind.as_str() == "source"` — is still caught, but by the lexical
+/// comparison scan above, not by either visitor.
+///
+/// What a reader NAMES can still hide, and that is where the list below lives.
 ///
 /// What still gets past this, each verified to escape rather than assumed to:
 ///
@@ -8361,6 +8400,35 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 /// computed near anything named `kind` can report. A file that does not parse,
 /// and a `matches!` whose pattern cannot be recovered, are likewise reported
 /// rather than passed.
+///
+/// WHERE a `cfg` is read is its own ledger, and it is a cry-wolf ledger rather
+/// than a hole ledger: an unread `cfg` position can only ADD a finding for code
+/// that never ships, never hide a reader. Both halves of the tooth now ask the
+/// same question through `compiles_outside_test` — the lexical scan judged the
+/// literal text `#[cfg(test)]` until round 7, so `#[cfg(all(test, feature =
+/// "slow"))]` produced a production finding the visitor gates had no power to
+/// retract, since a text-scan finding is recorded before the parser runs.
+///
+/// Ten positions are read: items, impl items, trait items, foreign items,
+/// statements, expressions, match arms, struct-literal fields, field
+/// declarations, and enum variants. The item containers are enumerated in FULL
+/// against the pinned syn (15 of 16 `Item` variants; 4 of 5 for each of the
+/// three item-member enums), because the 7-of-15 list that preceded this was
+/// defended as const-position-only and that defence was wrong: a const position
+/// can hold a macro, `visit_macro` re-parses macro input as statements, and
+/// `#[cfg(test)] type T = [u8; ignored!(match page.kind.as_str() { … })];`
+/// duly reported. Const position bounds what compiles, not what this scan reads.
+///
+/// Left unread, each a potential false finding and nothing worse, and each
+/// CHECKED to escape rather than argued away — the `Item` omission was argued
+/// away once already: a file-level inner `#![cfg(test)]` (no file in this tree
+/// carries one), an attribute on a FUNCTION PARAMETER, and an attribute on a
+/// GENERIC PARAMETER, type or const alike. All three reach code by the route
+/// that made the `Item` omission real — a macro or a const expression this scan
+/// re-parses — and all three are pinned by controls below, so the list cannot
+/// quietly go stale. A `cfg` in PATTERN position is deliberately NOT on the
+/// list: `syn` refuses to parse one, so that shape is reported as unreadable
+/// rather than silently scanned.
 ///
 /// None of the above is characterised as evasion; they are ordinary ways to
 /// write the same decision that this tooth does not reach. It is a drift guard
@@ -8538,9 +8606,12 @@ fn page_kind_routing_sites_in_snippet(path: &str, snippet: &str) -> Vec<String> 
 ///
 /// With an AST the three regions of `pattern if guard => body` arrive already
 /// separated, so guards, comma-optional block bodies, turbofish commas, closure
-/// commas, and nested matches all stop being special cases. Only `arm.pat` is
-/// searched: a `"source"` in a body is prose and one in a guard is an
-/// expression, and flagging either would make the tooth cry wolf.
+/// commas, and nested matches all stop being special cases. The routed literal
+/// is taken from `arm.pat` ALONE — a `"source"` in a body is prose and one in a
+/// guard is an expression, and recording either would make the tooth cry wolf.
+/// That is a rule about where a literal is RECORDED, not about where this walks:
+/// arm bodies, arm guards, `matches!` scrutinees and `matches!` guards are all
+/// traversed, because a `match` written inside any of them is its own site.
 ///
 /// A production file parses as a FILE or it is a finding. There is deliberately
 /// no retry as a function body here: substituting something the parser *can*
@@ -8605,33 +8676,77 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+/// Every `Item` variant that carries attributes. Enumerated in full rather than
+/// sampled, for the third time in this scan's history: a partial list of
+/// scrutinee wrappers, then a partial list of `Expr` variants, then this.
+///
+/// The 7-of-15 list this replaces was defended as consequence-free on the
+/// grounds that the omitted containers hold expressions only in const position,
+/// where no runtime `page` exists. That reasoning was wrong, and the
+/// counter-example is short: a const position can hold a MACRO, and
+/// `visit_macro` re-parses macro input as statements, so
+/// `#[cfg(test)] type T = [u8; ignored!(match page.kind.as_str() { … })];`
+/// reported a test-only match as production. Const position bounds what
+/// COMPILES, not what this scan reads.
+///
+/// Checked against the pinned syn (=2.0.117): of its 16 `Item` variants, 15
+/// carry `attrs` and all 15 are listed. `Item::Verbatim` is the one exclusion —
+/// it wraps a raw `TokenStream` and has no attributes to read.
 fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     match item {
-        syn::Item::Fn(item) => &item.attrs,
-        syn::Item::Mod(item) => &item.attrs,
-        syn::Item::Impl(item) => &item.attrs,
         syn::Item::Const(item) => &item.attrs,
-        syn::Item::Static(item) => &item.attrs,
-        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
         syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
         _ => &[],
     }
 }
 
+/// All 4 attribute-bearing `ImplItem` variants of the pinned syn; `Verbatim` is
+/// the exclusion. `Type` was the omission — an associated type's array length is
+/// a const position, and a const position can hold a macro.
 fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
     match item {
-        syn::ImplItem::Fn(item) => &item.attrs,
         syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
         syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
         _ => &[],
     }
 }
 
+/// All 4 attribute-bearing `TraitItem` variants of the pinned syn; `Verbatim` is
+/// the exclusion.
 fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
     match item {
-        syn::TraitItem::Fn(item) => &item.attrs,
         syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
         syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+/// All 4 attribute-bearing `ForeignItem` variants of the pinned syn; `Verbatim`
+/// is the exclusion. An `extern` block is reached through `Item::ForeignMod`,
+/// and `ForeignItem::Macro` is another macro this scan re-parses.
+fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
         _ => &[],
     }
 }
@@ -8672,8 +8787,14 @@ fn expr_attrs(expr: &Expr) -> &[syn::Attribute] {
     )
 }
 
-/// Every `cfg` gate on non-expression nodes, written once and mixed into both
+/// The `cfg` gates on non-expression nodes, written once and mixed into both
 /// visitors in this scan.
+///
+/// Nine positions, not "every position" — the earlier wording overclaimed. What
+/// is covered: items, impl items, trait items, foreign items, statements, match
+/// arms, struct-literal fields, struct/union field declarations, and enum
+/// variants. What is not is listed in the ceiling on `page_kind_routing_sites`,
+/// and each visitor's own `visit_expr` adds the tenth.
 ///
 /// [`MatchVisitor`] walks a file looking for routing sites; `KindReader` walks a
 /// single scrutinee asking whether it names the column. They have to agree on
@@ -8722,6 +8843,13 @@ macro_rules! skip_cfg_test_nodes {
             visit::visit_arm(self, node);
         }
 
+        fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+            if is_cfg_test(foreign_item_attrs(node)) {
+                return;
+            }
+            visit::visit_foreign_item(self, node);
+        }
+
         // A struct-literal field keeps its attributes on the `FieldValue` and
         // not on the expression underneath, so an expression gate alone reads
         // an empty attribute list and descends. This is live style here
@@ -8731,6 +8859,23 @@ macro_rules! skip_cfg_test_nodes {
                 return;
             }
             visit::visit_field_value(self, node);
+        }
+
+        // A field DECLARATION and an enum variant reach code through their
+        // type's array length and their discriminant. Both are const positions,
+        // and a const position can hold a macro this scan re-parses.
+        fn visit_field(&mut self, node: &'ast syn::Field) {
+            if is_cfg_test(&node.attrs) {
+                return;
+            }
+            visit::visit_field(self, node);
+        }
+
+        fn visit_variant(&mut self, node: &'ast syn::Variant) {
+            if is_cfg_test(&node.attrs) {
+                return;
+            }
+            visit::visit_variant(self, node);
         }
     };
 }
@@ -8754,9 +8899,9 @@ impl MatchVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for MatchVisitor<'_> {
-    // Every position where a `cfg` can gate executable code gets the same
-    // check. Items and impl items alone left cfg-gated statements, trait items,
-    // match arms, expressions and struct-literal fields unread.
+    // The shared gates. Items and impl items alone left cfg-gated statements,
+    // trait items, match arms, expressions, struct-literal fields, field
+    // declarations and enum variants unread.
     skip_cfg_test_nodes!();
 
     fn visit_expr(&mut self, node: &'ast Expr) {
@@ -9219,6 +9364,71 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
          item was scanned or skipped — it asserted nothing at all"
     );
 
+    // The three `cfg` positions the ceiling admits are unread, pinned so the
+    // admission cannot go stale. Each asserts a KNOWN FALSE FINDING — the code
+    // is test-only and the scan says production — and each is here because the
+    // previous round argued an unread attribute position was consequence-free
+    // and was wrong. If a later change starts reading one of these, the control
+    // reddens and the ceiling gets corrected with it rather than drifting.
+    for (label, source) in [
+        (
+            "an attribute on a function parameter",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             fn f(#[cfg(test)] p: [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })]) {}",
+        ),
+        (
+            "an attribute on a generic type parameter",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             struct S<#[cfg(test)] T = [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })]>(T);",
+        ),
+        (
+            "an attribute on a const generic parameter",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             fn g<#[cfg(test)] const N: usize>() -> [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })] { todo!() }",
+        ),
+    ] {
+        assert_eq!(
+            page_kind_routing_sites_in_snippet(path, source),
+            [format!("{path}: match on kind, arm \"source\"")],
+            "{label} is an unread cfg position, so this test-only match reports as \
+             production. Pinned as DISCLOSED behaviour, not endorsed: if this ever \
+             stops reporting, delete the pin and the matching ceiling sentence together"
+        );
+    }
+
+    assert_eq!(
+        page_kind_routing_sites(
+            "crates/wenlan-core/src/somewhere.rs",
+            "#![cfg(test)]\nfn f(page: &Page) -> u8 {\n    \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n}",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a file-level inner attribute is the third and last unread position, and \
+         the only one reached through the production entry rather than a snippet. \
+         No file in this tree carries one, which is why it is disclosed and \
+         pinned rather than fixed; `is_test_only_module` screens test files by \
+         name instead"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "macro_rules! ignored_pat { ($($tt:tt)*) => { _ }; }\n\
+             let (#[cfg(test)] ignored_pat!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }), y) = t;",
+        ),
+        [format!(
+            "{path}: could not be parsed as Rust, so the page-kind match scan could not run"
+        )],
+        "a `cfg` in PATTERN position is the one that does NOT belong on that \
+         list: syn refuses the shape, so it is reported as unreadable rather \
+         than silently scanned — the fail-closed direction, and the reason the \
+         ceiling names three positions and not four"
+    );
+
     // The production entry point, not the snippet one: these prove that a file
     // this scan cannot read reports itself rather than passing clean.
     assert_eq!(
@@ -9335,6 +9545,30 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
             "a cfg that REQUIRES test, whatever else it also requires",
             "#[cfg(all(test, feature = \"slow\"))]\nfn f(page: &Page) -> u8 {\n    \
              match page.kind.as_str() { \"source\" => 1, _ => 0 }\n}",
+        ),
+        (
+            "the same cfg over a COMPARISON. The lexical half judged the literal \
+             text `#[cfg(test)]` while the AST half was already evaluating the \
+             predicate, so one tooth gave two answers — and a text-scan finding \
+             is recorded before the parser runs, so the visitor gates could not \
+             retract it",
+            "#[cfg(all(test, feature = \"slow\"))]\nfn f(page: &Page) {\n    \
+             if page.kind.as_str() == \"source\" {}\n}",
+        ),
+        (
+            "a cfg-gated type alias whose array length holds a macro. A const \
+             position bounds what COMPILES, not what this scan reads: macro input \
+             is re-parsed as statements, so the omitted `Item::Type` reported a \
+             test-only match as production",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             #[cfg(test)]\ntype T = [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })];",
+        ),
+        (
+            "the same route through a cfg-gated extern block, so the fix reads as \
+             a class rather than one patched variant",
+            "#[cfg(test)]\nextern \"C\" {\n    \
+             ignored_items!(match page.kind.as_str() { \"source\" => 1, _ => 0 });\n}",
         ),
         (
             "a cfg-gated statement, an attribute position items alone never reached",
