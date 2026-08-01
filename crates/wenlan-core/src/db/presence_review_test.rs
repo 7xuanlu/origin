@@ -787,13 +787,114 @@ async fn a_caller_who_will_be_refused_cannot_tell_which_pages_exist() {
     assert_eq!(count(&db, "presence_receipts").await, 0);
 }
 
-/// F1(a): the receipt has to describe what was actually marked.
+/// A review that meets a foreign writer fails closed, marking nothing.
 ///
-/// Reading the page's version and digest before opening the transaction leaves
-/// a window for an edit to land in between, after which the stored receipt
-/// attests to content that was never the content marked. Reading inside the
-/// transaction closes it structurally — this pins the property the structure
-/// provides, so a later refactor that hoists the read back out fails here.
+/// **This is not the F1(a) interleave test, and there cannot be one.** The
+/// interleave F1(a) rules out — an edit landing between the page read and the
+/// mark — needs the review to be suspended mid-sequence, and nothing can
+/// suspend it. Inside the daemon, `review_page_with_presence` takes the single
+/// `Arc<Mutex<Connection>>` once and holds it from before `BEGIN IMMEDIATE` to
+/// after `COMMIT`, so no other task in the process gets between any two of its
+/// steps; reading before `BEGIN` rather than after would be a distinction with
+/// no observable difference. From outside the process, the attempt below is as
+/// far as a second writer gets: SQLite admits one writer, libsql sets no busy
+/// timeout, so the review's `BEGIN IMMEDIATE` does not wait its turn — it
+/// errors. Which leaves nothing to interleave with.
+///
+/// So this test claims only what it can see: a second writer holding the lock
+/// makes the review fail closed rather than half-succeed. It has teeth against
+/// the plausible future change — adding a busy timeout or a retry so the review
+/// waits out a foreign writer, which would reopen exactly the window F1(a)
+/// closed, and would turn this test's `Err` into an `Applied`.
+///
+/// What the ordering rests on instead: the page read sits below `verify` (F7's
+/// oracle, `a_caller_who_will_be_refused_cannot_tell_which_pages_exist`, fails
+/// if it moves up) and above the mark, in one function, under one lock —
+/// structure, not a test.
+#[tokio::test]
+async fn a_review_meeting_a_foreign_writer_marks_nothing() {
+    let (db, root) = db().await;
+    let db_file = root.path().join("origin_memory.db");
+    const EDITED: &str = "prose the human never saw";
+
+    // Staged, not committed: the write lock is taken and held across the review
+    // below, which is the only way to place an edit *inside* the review's
+    // window rather than before or after it. Handshaked in both directions
+    // rather than timed, so a slow machine cannot let the editor commit early
+    // and turn this into an ordinary conflict.
+    let (staged, wait_for_staged) = std::sync::mpsc::channel();
+    let (release, wait_for_release) = std::sync::mpsc::channel();
+    let editor = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&db_file).expect("second connection");
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .expect("take the write lock");
+        conn.execute(
+            "UPDATE pages SET content = ?1, version = version + 1 WHERE id = ?2",
+            rusqlite::params![EDITED, PAGE],
+        )
+        .expect("stage the edit");
+        staged.send(()).expect("announce the staged edit");
+        wait_for_release.recv().expect("wait out the review");
+        conn.execute_batch("COMMIT").expect("commit the edit");
+    });
+
+    wait_for_staged.recv().expect("editor staged its write");
+    let outcome = db
+        .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
+        .await;
+    release.send(()).expect("let the editor commit");
+    editor.join().expect("editor thread");
+
+    let Err(error) = outcome else {
+        panic!(
+            "a review that could not open its transaction must not report an \
+             answer: {outcome:?}"
+        );
+    };
+    assert!(
+        error.to_string().contains("presence review begin"),
+        "the failure must be the transaction refusing to open: {error}"
+    );
+
+    assert!(
+        !reviewed(&db).await,
+        "the page must not be marked human-reviewed"
+    );
+    assert_eq!(count(&db, "presence_nonces").await, 0);
+    assert_eq!(count(&db, "presence_receipts").await, 0);
+
+    // The capability was never spent, so the caller can simply try again.
+    let retry = db
+        .review_page_with_presence(&gesture("op-1", 0xa1), PAGE, Some(root.path()), 1_010)
+        .await
+        .expect("the review must answer once the writer is gone");
+    match retry {
+        // The edit committed while the review was locked out, so the prose the
+        // human approved is no longer the prose on the page.
+        super::ReviewOutcome::Refused(PresenceRefusal::Conflict) => {}
+        other => panic!("the page moved on, so the retry must conflict: {other:?}"),
+    }
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT content FROM pages WHERE id = ?1",
+            libsql::params![PAGE],
+        )
+        .await
+        .unwrap();
+    let live: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(live, EDITED, "the review refused; it did not undo the edit");
+}
+
+/// The receipt describes the row the transaction actually marked.
+///
+/// Narrower than it looks, and deliberately named for what it checks: with no
+/// second writer there is no interleave to catch, so this agrees for any
+/// implementation that reads the page at all. The ordering claim is carried by
+/// `an_edit_racing_the_review_is_refused_rather_than_approved` above; this one
+/// pins that the three places the mark is written — receipt, truth state, and
+/// page row — do not disagree with each other.
 #[tokio::test]
 async fn the_receipt_records_the_version_and_digest_that_were_marked() {
     let (db, root) = db().await;
