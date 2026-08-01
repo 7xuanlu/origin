@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Push-time checks reuse CI's fail-closed package planner. Ordinary source
+# changes run Clippy + lib tests for the owning crate's reverse dependency
+# closure; direct integration-test edits run that target. Shared build inputs
+# intentionally fall back to the full workspace. CI remains the owner of broad
+# integration, HTTP smoke, platform, and release-profile proofs.
+
+ZERO_SHA="0000000000000000000000000000000000000000"
+all_changed=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "${local_ref:-}" ] && continue
+    [ "$local_sha" = "$ZERO_SHA" ] && continue
+    case "$local_ref" in
+        refs/tags/*) continue ;;
+    esac
+
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+        base=$(git merge-base "$local_sha" origin/main 2>/dev/null \
+            || git rev-list --max-parents=0 "$local_sha" | head -n 1)
+    else
+        base="$remote_sha"
+    fi
+    changed=$(git diff --name-only --diff-filter=ACMRD "$base" "$local_sha")
+    [ -n "$changed" ] && all_changed=$(printf '%s\n%s' "$all_changed" "$changed")
+done
+
+all_changed=$(printf '%s' "$all_changed" | sed '/^$/d' | sort -u)
+if [ -z "$all_changed" ]; then
+    echo "Pre-push: no changed branch files; skipping local checks."
+    exit 0
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN=python3
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=python
+else
+    echo "FAIL: Python is required for affected-test planning." >&2
+    exit 1
+fi
+
+changed_json=$(printf '%s\n' "$all_changed" | "$PYTHON_BIN" -c \
+    'import json, sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
+
+echo "Pre-push: running affected package closure checks..."
+"$PYTHON_BIN" scripts/ci_test_plan.py local \
+    --changed-files-json "$changed_json" \
+    --level push
+echo "Pre-push: affected checks passed; CI owns broader integration/platform proofs."

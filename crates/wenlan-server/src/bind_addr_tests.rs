@@ -8,9 +8,14 @@ unsafe extern "C" {
 }
 
 static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEST_SUBPROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn env_lock() -> &'static Mutex<()> {
     TEST_ENV_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn subprocess_lock() -> &'static Mutex<()> {
+    TEST_SUBPROCESS_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[cfg(unix)]
@@ -31,6 +36,7 @@ fn daemon_exit_skips_c_exit_handlers() {
         exit_daemon(0);
     }
 
+    let _guard = subprocess_lock().lock().unwrap();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -338,6 +344,10 @@ fn startup_repair_claim_requires_the_canonical_daemon_port() {
 
 #[test]
 fn data_root_lock_excludes_a_second_daemon_for_the_same_root() {
+    // A concurrently spawned test child inherits open Unix file descriptors,
+    // including this lock. Keep the drop-and-reacquire proof isolated from
+    // every test in this module that launches the current test executable.
+    let _guard = subprocess_lock().lock().unwrap();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("wenlan");
     let first = DaemonDataLock::acquire(&root, false).unwrap();
@@ -400,6 +410,7 @@ fn data_root_lock_child_process_holds_lock() {
 
 #[test]
 fn data_root_lock_excludes_another_process_with_a_different_temp_dir() {
+    let _guard = subprocess_lock().lock().unwrap();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("wenlan");
     let child_tmp = parent.path().join("other-tmp");

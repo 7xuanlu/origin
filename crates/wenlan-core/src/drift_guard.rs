@@ -134,8 +134,8 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
             &["Integration tests wenlan-cli + wenlan-server (Linux)"],
         ),
         (
-            "test-quarantine",
-            &["Quarantined tests (wenlan-mcp + wenlan-types)"],
+            "contract-integration",
+            &["Affected wenlan-mcp + wenlan-types integrations"],
         ),
     ];
 
@@ -993,7 +993,7 @@ jobs:
           path: .fastembed_cache
           name: stale
       - name: Integration tests wenlan-cli + wenlan-server (Linux)
-  test-quarantine:
+  contract-integration:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
@@ -1002,7 +1002,7 @@ jobs:
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           name: stale
-      - name: Quarantined tests (wenlan-mcp + wenlan-types)
+      - name: Affected wenlan-mcp + wenlan-types integrations
 "#;
     let violations = fastembed_ci_cache_violations(workflow);
     assert!(
@@ -2104,6 +2104,8 @@ fn ci_routing_contract_violations(
         "macos",
         "windows",
         "windows-lint",
+        "macos-m4",
+        "windows-llm-probe",
         "release-preflight",
         "mcp-platform",
         "workspace-platform",
@@ -2111,9 +2113,13 @@ fn ci_routing_contract_violations(
         "workspace-lib-required",
         "cli-server-integration-required",
         "core-integration-required",
+        "contract-integration-required",
         "canonical-smokes-required",
         "canonical-acceptance-required",
         "rust-ci-required",
+        "platform-test-plan",
+        "platform-workspace-lib-required",
+        "platform-cli-server-integration-required",
     ] {
         if ci["jobs"]["detect-changes"]["outputs"][output]
             .as_str()
@@ -2214,6 +2220,7 @@ fn ci_routing_contract_violations(
         "workspace-lib-required",
         "cli-server-integration-required",
         "core-integration-required",
+        "contract-integration-required",
         "canonical-smokes-required",
         "canonical-acceptance-required",
         "rust-ci-required",
@@ -2226,9 +2233,74 @@ fn ci_routing_contract_violations(
         }
     }
 
+    let platform_planner = job_step(
+        &ci,
+        "detect-changes",
+        "Plan affected platform behavior tests",
+    );
+    let platform_planner_run = platform_planner
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let platform_event = platform_planner
+        .and_then(|step| step["env"]["CI_EVENT_NAME"].as_str())
+        .unwrap_or_default();
+    let platform_order = (
+        detect_step_index("Plan affected Rust tests"),
+        detect_step_index("Plan affected platform behavior tests"),
+    );
+    if platform_planner.and_then(|step| step["id"].as_str()) != Some("platform-test-plan")
+        || platform_planner.and_then(|step| step["if"].as_str())
+            != Some(universal_planner_condition)
+        || platform_planner.is_some_and(|step| step.get("continue-on-error").is_some())
+        || !matches!(platform_order, (Some(canonical), Some(platform)) if canonical < platform)
+        || !platform_planner_run.contains("python3 scripts/ci_test_plan.py plan")
+        || !platform_planner_run.contains("--scope platform")
+        || !platform_planner_run.contains("--changed-files-json \"$CHANGED_FILES_JSON\"")
+        || !platform_planner_run.contains("--metadata-file \"$RUNNER_TEMP/cargo-metadata.json\"")
+        || !platform_planner_run.contains("--event-name \"$CI_EVENT_NAME\"")
+        || !platform_planner_run.contains("--github-output \"$GITHUB_OUTPUT\"")
+        || platform_event
+            != "${{ startsWith(github.head_ref, 'release-please--branches--') && 'release-please' || github.event_name }}"
+    {
+        violations.push(
+            "detect-changes does not emit a separate fail-closed platform behavior plan"
+                .into(),
+        );
+    }
+    for (output, planner_output) in [
+        ("platform-test-plan", "test-plan"),
+        ("platform-workspace-lib-required", "workspace-lib-required"),
+        (
+            "platform-cli-server-integration-required",
+            "cli-server-integration-required",
+        ),
+    ] {
+        let expected = format!("${{{{ steps.platform-test-plan.outputs.{planner_output} }}}}");
+        if ci["jobs"]["detect-changes"]["outputs"][output].as_str() != Some(expected.as_str()) {
+            violations.push(format!(
+                "detect-changes output {output} does not come from the platform test planner"
+            ));
+        }
+    }
+    for contract in [
+        "def build_platform_plan(",
+        "if not relevant:",
+        "no platform behavioral inputs changed",
+        "path != \"crates/wenlan-core/src/drift_guard.rs\"",
+        "behavioral_packages = {\"wenlan-core\", \"wenlan-server\", \"wenlan\"}",
+        "choices=(\"canonical\", \"platform\")",
+    ] {
+        if !planner_source.contains(contract) {
+            violations.push(format!(
+                "platform test planner lost required contract {contract:?}"
+            ));
+        }
+    }
+
     let rust_ci_formula = r#"    required["rust-ci-required"] = (
         required["workspace-lib-required"]
         or required["canonical-acceptance-required"]
+        or required["contract-integration-required"]
     )"#;
     if !planner_source.contains(rust_ci_formula) {
         violations.push(
@@ -2468,6 +2540,60 @@ fn ci_routing_contract_violations(
             ));
         }
     }
+    let macos_m4 = detect_change_filter_paths(&ci, "macos-m4");
+    for path in [
+        "crates/wenlan-core/src/community_grouping.rs",
+        "crates/wenlan-core/src/community_partition.rs",
+        "crates/wenlan-core/src/edge_grounding.rs",
+        "crates/wenlan-core/src/provenance.rs",
+        "crates/wenlan-core/src/db.rs",
+        "crates/wenlan-core/src/db/community_grouping_state.rs",
+        "crates/wenlan-core/src/refinery/mod.rs",
+        "crates/wenlan-core/tests/m4_community_gates.rs",
+        ".config/nextest.toml",
+    ] {
+        if !macos_m4.contains(path) {
+            violations.push(format!("macos-m4 routing omits M4 contract input {path}"));
+        }
+    }
+    for path in &macos_m4 {
+        if !filter_routes_path(&macos_paths, path) {
+            violations.push(format!(
+                "M4-sensitive path does not also schedule the macOS job: {path}"
+            ));
+        }
+    }
+
+    let windows_llm = detect_change_filter_paths(&ci, "windows-llm-probe");
+    for path in [
+        "crates/wenlan-core/src/engine.rs",
+        "crates/wenlan-core/src/llm_provider.rs",
+        "crates/wenlan-core/src/bin/model_probe.rs",
+        "crates/wenlan-core/Cargo.toml",
+        "crates/**/build.rs",
+        "scripts/stage-onnxruntime-windows.ps1",
+        "scripts/smoke-windows-llm.ps1",
+        "scripts/smoke-windows-llm.test.ps1",
+        "scripts/setup-vulkan-sdk-windows.ps1",
+        "scripts/setup-vulkan-sdk-windows.test.ps1",
+        "scripts/stage-vulkan-loader-windows.ps1",
+        "scripts/stage-vulkan-loader-windows.test.ps1",
+        "scripts/setup-msvc-ninja-windows.ps1",
+        "scripts/setup-msvc-ninja-windows.test.ps1",
+    ] {
+        if !windows_llm.contains(path) {
+            violations.push(format!(
+                "windows-llm-probe routing omits LLM contract input {path}"
+            ));
+        }
+    }
+    for path in &windows_llm {
+        if !filter_routes_path(&windows_paths, path) {
+            violations.push(format!(
+                "LLM-sensitive path does not also schedule the Windows job: {path}"
+            ));
+        }
+    }
     for path in [
         "crates/wenlan-mcp/src/**",
         "crates/wenlan-mcp/Cargo.toml",
@@ -2546,20 +2672,20 @@ fn ci_routing_contract_violations(
     if test_rust_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some("true") {
         violations.push("platform test matrix does not retain its reusable target cache".into());
     }
-    let quarantine_rust_cache = job_step_using(&ci, "test-quarantine", "Swatinem/rust-cache");
-    if quarantine_rust_cache.and_then(|step| step["with"]["shared-key"].as_str()) != Some("test")
-        || quarantine_rust_cache.and_then(|step| step["with"]["cache-targets"].as_str())
+    let contract_rust_cache = job_step_using(&ci, "contract-integration", "Swatinem/rust-cache");
+    if contract_rust_cache.and_then(|step| step["with"]["shared-key"].as_str()) != Some("test")
+        || contract_rust_cache.and_then(|step| step["with"]["cache-targets"].as_str())
             != Some("false")
-        || quarantine_rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
+        || contract_rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
     {
         violations.push(
-            "test-quarantine does not reuse test inputs through a restore-only target-free rust-cache"
+            "contract-integration does not reuse test inputs through a restore-only target-free rust-cache"
                 .into(),
         );
     }
     for job in [
         "canonical-acceptance",
-        "test-quarantine",
+        "contract-integration",
         "plugin-rust-contract",
     ] {
         if ci["jobs"][job]["env"]["SCCACHE_GHA_RW_MODE"].as_str() != Some("READ_ONLY") {
@@ -2567,12 +2693,19 @@ fn ci_routing_contract_violations(
         }
     }
     let rust_ci_job_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'";
-    for job in ["fmt", "lint", "test-quarantine"] {
+    for job in ["fmt", "lint"] {
         if ci["jobs"][job]["if"].as_str() != Some(rust_ci_job_condition) {
             violations.push(format!(
                 "required Rust job {job} does not derive exactly from rust-ci-required"
             ));
         }
+    }
+    let contract_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true'";
+    if ci["jobs"]["contract-integration"]["if"].as_str() != Some(contract_condition) {
+        violations.push(
+            "required contract integration job does not derive exactly from its planner output"
+                .into(),
+        );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
     let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')";
@@ -2669,6 +2802,7 @@ fn ci_routing_contract_violations(
         "linux-nextest",
         "mcp-platform",
         "canonical-acceptance",
+        "contract-integration",
         "release-preflight",
         "plugin-rust-contract",
     ] {
@@ -2687,6 +2821,7 @@ fn ci_routing_contract_violations(
             "needs.detect-changes.outputs.workspace-platform",
         ),
         ("canonical-acceptance", "\"$run_canonical\""),
+        ("contract-integration", "\"$run_contract\""),
         ("release-preflight", "startsWith(github.head_ref"),
         ("docs", "needs.detect-changes.outputs.docs"),
         ("plugin", "needs.detect-changes.outputs.plugin"),
@@ -2746,11 +2881,37 @@ fn ci_routing_contract_violations(
         );
     }
 
+    let m4_condition = "matrix.os == 'macos-14' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')";
+    if job_step(&ci, "test", "M4 community gates (macOS-owned)")
+        .and_then(|step| step["if"].as_str())
+        != Some(m4_condition)
+    {
+        violations.push(
+            "macOS M4 gate is not focused to community/provenance inputs plus backstops".into(),
+        );
+    }
+    let windows_llm_condition = "matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')";
+    for step_name in [
+        "Validate Windows smoke harness",
+        "Validate Windows LLM probe",
+    ] {
+        if job_step(&ci, "test", step_name).and_then(|step| step["if"].as_str())
+            != Some(windows_llm_condition)
+        {
+            violations.push(format!(
+                "{step_name} is not focused to Windows LLM inputs plus backstops"
+            ));
+        }
+    }
+
     let debug_build = job_step(&ci, "test", "Build Windows contract binaries");
-    if debug_build
+    if debug_build.and_then(|step| step["if"].as_str())
+        != Some("matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'")
+        || debug_build
         .and_then(|step| step["run"].as_str())
         .is_none_or(|run| {
             !run.contains("cargo build -p wenlan -p wenlan-server")
+                || !run.contains("needs.detect-changes.outputs.workspace-platform")
                 || !run.contains("scripts/stage-onnxruntime-windows.ps1")
                 || !run.contains("scripts/stage-vulkan-loader-windows.ps1")
                 || !run.contains("target\\debug")
@@ -2761,14 +2922,18 @@ fn ci_routing_contract_violations(
             "ordinary Windows contract does not build and stage adjacent ONNX/Vulkan debug runtime artifacts".into(),
         );
     }
-    let schtasks = job_step(
+    let schtasks_step = job_step(
         &ci,
         "test",
         "E2E wenlan background on/off round-trip (Windows; schtasks)",
-    )
-    .and_then(|step| step["run"].as_str())
-    .unwrap_or_default();
-    if !schtasks.contains(r"target\debug\wenlan.exe") {
+    );
+    let schtasks = schtasks_step
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if schtasks_step.and_then(|step| step["if"].as_str())
+        != Some("matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'")
+        || !schtasks.contains(r"target\debug\wenlan.exe")
+    {
         violations.push("ordinary Windows schtasks contract does not use debug binaries".into());
     }
 
@@ -2780,6 +2945,7 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
     let mcp_rust_cache = job_step_using(&ci, "mcp-platform", "Swatinem/rust-cache");
+    let test_owner_formula = "${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}";
     let mcp_windows_linker = job_step(
         &ci,
         "mcp-platform",
@@ -2798,13 +2964,18 @@ fn ci_routing_contract_violations(
         || !mcp_condition.contains("github.event_name != 'pull_request'")
         || !mcp_run.contains("cargo check -p wenlan-mcp --lib --bins")
         || mcp_run.contains("--all-targets")
+        || mcp_compile.and_then(|step| step["if"].as_str())
+            != Some("env.TEST_OWNS_PLATFORM == 'true' || needs.detect-changes.outputs.workspace-platform != 'true'")
         || ci["jobs"]["mcp-platform"]["env"]["CARGO_PROFILE_DEV_DEBUG"].as_str() != Some("0")
         || ci["jobs"]["mcp-platform"]["env"]["CARGO_PROFILE_TEST_DEBUG"].as_str() != Some("0")
+        || ci["jobs"]["mcp-platform"]["env"]["TEST_OWNS_PLATFORM"].as_str()
+            != Some(test_owner_formula)
         || mcp_rust_cache.and_then(|step| step["with"]["shared-key"].as_str())
             != Some("mcp-platform")
         || mcp_rust_cache.and_then(|step| step["with"]["cache-all-crates"].as_str())
             != Some("false")
         || mcp_rust_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some("false")
+        || mcp_rust_cache.is_some_and(|step| step.get("if").is_some())
         || mcp_windows_linker.and_then(|step| step["if"].as_str())
             != Some("matrix.os == 'windows-2022'")
         || mcp_windows_linker
@@ -2817,17 +2988,67 @@ fn ci_routing_contract_violations(
         );
     }
 
-    for (job, step_name, suite) in [
-        ("test", "Workspace lib tests (macOS)", "workspace-lib"),
+    let transferred_workspace = job_step(
+        &ci,
+        "test",
+        "Build CLI/server contract binaries (test owner)",
+    );
+    if job_step(
+        &ci,
+        "test",
+        "Compile platform-owned MCP runtime (test owner)",
+    )
+    .is_some()
+        || transferred_workspace.and_then(|step| step["if"].as_str())
+            != Some("needs.detect-changes.outputs.workspace-platform == 'true'")
+        || transferred_workspace
+            .and_then(|step| step["run"].as_str())
+            .is_none_or(|run| {
+                !run.contains("cargo build -p wenlan -p wenlan-server --bins")
+                    || run.contains("wenlan-mcp")
+            })
+    {
+        violations.push(
+            "CLI/server platform proof is not transferred without pulling MCP into the critical test owner"
+                .into(),
+        );
+    }
+
+    for (job, step_name, suite, plan_argument, expected_plan) in [
+        (
+            "test",
+            "Workspace lib tests (macOS)",
+            "workspace-lib",
+            "--plan-json \"$CI_TEST_PLAN\"",
+            "${{ needs.detect-changes.outputs.platform-test-plan }}",
+        ),
+        (
+            "test",
+            "Integration tests wenlan-cli + wenlan-server (macOS)",
+            "cli-server-integration",
+            "--plan-json \"$CI_TEST_PLAN\"",
+            "${{ needs.detect-changes.outputs.platform-test-plan }}",
+        ),
+        (
+            "test",
+            "Integration tests wenlan-cli + wenlan-server (Windows)",
+            "cli-server-integration",
+            "--plan-env CI_TEST_PLAN",
+            "${{ needs.detect-changes.outputs.platform-test-plan }}",
+        ),
         (
             "canonical-acceptance",
             "Integration tests wenlan-cli + wenlan-server (Linux)",
             "cli-server-integration",
+            "--plan-json \"$CI_TEST_PLAN\"",
+            "${{ needs.detect-changes.outputs.test-plan }}",
         ),
         (
             "canonical-acceptance",
             "Run integration tests (core) (Linux)",
             "core-integration",
+            "--plan-json \"$CI_TEST_PLAN\"",
+            "${{ needs.detect-changes.outputs.test-plan }}",
         ),
     ] {
         let step = job_step(&ci, job, step_name);
@@ -2839,8 +3060,8 @@ fn ci_routing_contract_violations(
             .unwrap_or_default();
         if !run.contains("python3 scripts/ci_test_plan.py run")
             || !run.contains(&format!("--suite {suite}"))
-            || !run.contains("--plan-json \"$CI_TEST_PLAN\"")
-            || plan != "${{ needs.detect-changes.outputs.test-plan }}"
+            || !run.contains(plan_argument)
+            || plan != expected_plan
         {
             violations.push(format!(
                 "{job} {step_name} does not execute the validated impacted-test plan"
@@ -2866,41 +3087,27 @@ fn ci_routing_contract_violations(
             ));
         }
     }
-    let linux_integration = job_step(
-        &ci,
-        "canonical-acceptance",
-        "Integration tests wenlan-cli + wenlan-server (Linux)",
-    );
-    let macos_integration = job_step(
-        &ci,
-        "test",
-        "Integration tests wenlan-cli + wenlan-server (macOS)",
-    );
-    if linux_integration.is_none()
-        || macos_integration.and_then(|step| step["if"].as_str()) != Some("matrix.os == 'macos-14'")
-        || macos_integration
-            .and_then(|step| step["run"].as_str())
-            .is_none_or(|run| !run.contains("-E 'kind(test)'"))
-    {
-        violations
-            .push("Linux/macOS integration step duplicates wenlan CLI/server lib tests".into());
-    }
-    let windows_integration = job_step(
-        &ci,
-        "test",
-        "Integration tests wenlan-cli + wenlan-server (Windows)",
-    );
-    if windows_integration
-        .and_then(|step| step["if"].as_str())
-        .is_none_or(|condition| !condition.contains("matrix.os == 'windows-2022'"))
-        || windows_integration
-            .and_then(|step| step["run"].as_str())
-            .is_none_or(|run| {
-                !run.contains("cargo nextest run -p wenlan -p wenlan-server")
-                    || run.contains("kind(test)")
-            })
-    {
-        violations.push("Windows does not retain its full CLI/server platform contract".into());
+    for (step_name, expected_condition) in [
+        (
+            "Workspace lib tests (macOS)",
+            "matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-workspace-lib-required == 'true'",
+        ),
+        (
+            "Integration tests wenlan-cli + wenlan-server (macOS)",
+            "matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'",
+        ),
+        (
+            "Integration tests wenlan-cli + wenlan-server (Windows)",
+            "matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'",
+        ),
+    ] {
+        if job_step(&ci, "test", step_name).and_then(|step| step["if"].as_str())
+            != Some(expected_condition)
+        {
+            violations.push(format!(
+                "platform step {step_name} is not gated by its focused platform plan"
+            ));
+        }
     }
 
     let Some(test_steps) = ci["jobs"]["test"]["steps"].as_sequence() else {
@@ -2995,7 +3202,8 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             "        or required[\"canonical-acceptance-required\"]",
             "        and required[\"canonical-acceptance-required\"]",
             1,
-        );
+        )
+        .replacen("    if not relevant:", "    if False:", 1);
     let platform_sensitive_paths = platform_sensitive_paths(&root);
     let release_profile_sensitive_paths = release_profile_sensitive_paths(&root);
     let mut violations = ci_routing_contract_violations(
@@ -3012,6 +3220,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "rust-ci-required output is not the union",
         "non-Rust fast-owner",
         "unknown paths",
+        "platform test planner lost required contract",
     ] {
         assert!(
             violations
@@ -3287,7 +3496,7 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
         "test",
         "mcp-platform",
         "canonical-acceptance",
-        "test-quarantine",
+        "contract-integration",
         "release-preflight",
         "docs",
         "plugin",
@@ -3500,8 +3709,8 @@ fn ci_manifest_and_lockfile_changes_get_focused_platform_compile_proof() {
         .expect("workspace platform build step");
     assert_eq!(
         workspace["if"].as_str(),
-        Some("needs.detect-changes.outputs.workspace-platform == 'true'"),
-        "workspace build must be limited to dependency-sensitive changes"
+        Some("needs.detect-changes.outputs.workspace-platform == 'true' && env.TEST_OWNS_PLATFORM != 'true'"),
+        "workspace build must be limited to dependency-sensitive changes without a test owner"
     );
     let run = workspace["run"].as_str().unwrap_or_default();
     assert!(
@@ -3520,8 +3729,7 @@ fn ci_manifest_and_lockfile_changes_get_focused_platform_compile_proof() {
         .iter()
         .position(|step| step["name"].as_str() == Some("Build workspace contract binaries"))
         .expect("workspace platform build step index");
-    let windows_condition =
-        "matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'";
+    let windows_condition = "matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true' && env.TEST_OWNS_PLATFORM != 'true'";
     for (step_name, required_command) in [
         (
             "Install sqlite3 (Windows platform build)",
@@ -3596,7 +3804,7 @@ fn ci_fans_out_one_prepared_fastembed_artifact_per_run() {
         "linux-nextest",
         "test",
         "canonical-acceptance",
-        "test-quarantine",
+        "contract-integration",
     ] {
         assert!(
             job_step_using(&ci, job, "actions/cache/restore").is_none(),
@@ -3824,8 +4032,8 @@ jobs:
         "debug runtime artifacts",
         "differentially compile every wenlan-mcp target",
         "mcp-platform routing",
-        "duplicates wenlan CLI/server lib tests",
-        "full CLI/server platform contract",
+        "CLI/server platform proof",
+        "ordinary Windows contract",
         "fail fast before integration",
         "fail fast from integration",
         "root installer",
@@ -3896,8 +4104,32 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     if ci["jobs"]["detect-changes"]["outputs"]["release-targets"]
         .as_str()
         .is_none()
+        || ci["jobs"]["detect-changes"]["outputs"]["release-preflight-targets"].as_str()
+            != Some("${{ steps.release-preflight-targets.outputs.release-preflight-targets }}")
     {
-        violations.push("detect-changes does not expose the canonical release matrix".into());
+        violations.push(
+            "detect-changes does not expose canonical and bounded PR release matrices".into(),
+        );
+    }
+    let bounded_matrix = job_step(
+        &ci,
+        "detect-changes",
+        "Emit bounded PR release preflight matrix",
+    );
+    let bounded_run = bounded_matrix
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if bounded_matrix.and_then(|step| step["id"].as_str()) != Some("release-preflight-targets")
+        || !bounded_run.contains("--output-name release-preflight-targets")
+        || !bounded_run.contains("--exclude-target x86_64-pc-windows-msvc")
+        || !bounded_run.contains("$GITHUB_EVENT_NAME")
+        || !bounded_run.contains("$GITHUB_HEAD_REF")
+        || !bounded_run.contains("release-please--branches--*")
+    {
+        violations.push(
+            "ordinary PR release matrix does not exclude only the duplicate Windows release profile"
+                .into(),
+        );
     }
     for (job, test_name) in [
         ("detect-changes", "Test release target inventory"),
@@ -3984,10 +4216,10 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             )
         || job["strategy"]["fail-fast"].as_bool() != Some(true)
         || job["strategy"]["matrix"].as_str()
-            != Some("${{ fromJSON(needs.detect-changes.outputs.release-targets) }}")
+            != Some("${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}")
     {
         violations.push(
-            "release-preflight is not a fail-fast four-target matrix with a cold-cache safety ceiling"
+            "release-preflight is not a fail-fast bounded ordinary-PR matrix with a full four-target backstop and cold-cache safety ceiling"
                 .into(),
         );
     }
@@ -4003,10 +4235,18 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             .push("tag release does not enforce the bounded 90/60-minute matrix timeout".into());
     }
     if job_needs(&release, "docker") != ["prepare-release"]
-        || job_needs(&release, "docker-manifest") != ["docker", "release"]
+        || job_needs(&release, "docker-manifest")
+            != [
+                "docker",
+                "release",
+                "publish-crates",
+                "publish-npm",
+                "update-homebrew",
+            ]
+        || job_needs(&release, "finalize-release") != ["docker-manifest"]
     {
         violations.push(
-            "Docker DAG does not build per-arch images after prepare-release and gate the manifest on docker plus release"
+            "Docker DAG does not build per-arch images after prepare-release, gate public manifests on every publish channel, and gate final release promotion on that manifest barrier"
                 .into(),
         );
     }
@@ -4377,7 +4617,11 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "    timeout-minutes: 900",
         )
         .replace("    needs: prepare-release", "    needs: release")
-        .replace("    needs: [docker, release]", "    needs: docker")
+        .replace(
+            "    needs: [docker, release, publish-crates, publish-npm, update-homebrew]",
+            "    needs: [docker, release]",
+        )
+        .replace("    needs: docker-manifest", "    needs: release")
         .replace(
             "          save-if: \"false\"",
             "          save-if: \"true\"",
@@ -4385,7 +4629,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
         "release-sensitive PRs and release backstops",
-        "fail-fast four-target",
+        "bounded ordinary-PR matrix",
         "canonical release matrix",
         "bounded 90/60-minute",
         "Docker DAG",
@@ -4686,7 +4930,9 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         "test",
         "Integration tests wenlan-cli + wenlan-server (macOS)",
     );
-    if macos_integration.and_then(|step| step["if"].as_str()) != Some("matrix.os == 'macos-14'") {
+    if macos_integration.and_then(|step| step["if"].as_str())
+        != Some("matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'")
+    {
         violations.push("macOS lost its shared CLI/server integration owner".into());
     }
     for step_name in [
@@ -5412,6 +5658,7 @@ fn ci_observer_contract_violations(
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>();
     let expected_script_lines = [
+        "python3 scripts/ci-cache-maintenance.test.py",
         "python3 scripts/ci-observer.test.py",
         "python3 scripts/ci-timed-command.test.py",
         "python3 scripts/verify-ort-source-pin.test.py",
@@ -5498,8 +5745,8 @@ fn ci_observer_contract_violations(
         violations.push("CI observer uses an action without an immutable SHA pin".into());
     }
     let allowed_actions = [
-        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
-        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
     ];
     if uses.len() != allowed_actions.len()
         || uses.iter().any(|action| !allowed_actions.contains(action))
@@ -5724,8 +5971,8 @@ fn ci_observer_contract_rejects_short_circuited_or_optional_measurement_tests() 
     let script = std::fs::read_to_string(root.join("scripts/ci-observer.py")).unwrap_or_default();
     let ci = ci
         .replace(
-            "      - name: Verify CI observer and ORT contracts\n        run: |\n          python3 scripts/ci-observer.test.py",
-            "      - name: Verify CI observer and ORT contracts\n        if: \"false\"\n        run: |\n          exit 0\n          python3 scripts/ci-observer.test.py",
+            "      - name: Verify CI observer and ORT contracts\n        run: |",
+            "      - name: Verify CI observer and ORT contracts\n        if: \"false\"\n        run: |\n          exit 0",
         );
     let violations = ci_observer_contract_violations(&ci, &observer, &script);
     assert!(
@@ -5744,8 +5991,8 @@ fn ci_observer_contract_rejects_non_blocking_measurement_tests() {
         std::fs::read_to_string(root.join(".github/workflows/ci-observer.yml")).unwrap_or_default();
     let script = std::fs::read_to_string(root.join("scripts/ci-observer.py")).unwrap_or_default();
     let ci = ci.replace(
-        "      - name: Verify CI observer and ORT contracts\n        run: |\n          python3 scripts/ci-observer.test.py",
-        "      - name: Verify CI observer and ORT contracts\n        continue-on-error: true\n        run: |\n          python3 scripts/ci-observer.test.py",
+        "      - name: Verify CI observer and ORT contracts\n        run: |",
+        "      - name: Verify CI observer and ORT contracts\n        continue-on-error: true\n        run: |",
     );
     let violations = ci_observer_contract_violations(&ci, &observer, &script);
     assert!(

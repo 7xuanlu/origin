@@ -39,15 +39,21 @@ The `release.yml` workflow validates that the pushed tag version matches `versio
 
 ## What the release workflow does
 
-The `v*` tag push triggers `.github/workflows/release.yml`. Its **first** job immediately demotes the freshly-created release to a **prerelease**, so `releases/latest` keeps resolving to the last good version while the build runs; only after every build + publish step below succeeds does the `finalize-release` job clear the prerelease flag.
+The `v*` tag push triggers `.github/workflows/release.yml`. Its **first** job immediately demotes the freshly-created release to a **prerelease**, so `releases/latest` keeps resolving to the last good version while the build runs. That same preflight requires `7xuanlu/homebrew-tap` to be anonymously readable and the Homebrew credential to exist before any package or image publishing starts.
+
+Binary and per-architecture Docker builds then run in parallel. The architecture-specific Docker tags (`vX.Y.Z-amd64` / `vX.Y.Z-arm64`) are staging outputs; the public multi-architecture version tag and `latest` are withheld until crates.io, npm, Homebrew, all release binaries, and both Docker architecture builds succeed. A prerelease tag may receive its exact version manifest, but never moves Docker `latest`. Only after that promotion barrier succeeds does `finalize-release` clear the GitHub prerelease flag.
 
 1. Validates version consistency.
 2. Builds `wenlan`, `wenlan-server`, and `wenlan-mcp` for `aarch64-apple-darwin`.
 3. Smoke-tests `wenlan --help` and `wenlan-server --help`.
-4. Creates the GitHub release with standalone binaries attached.
+4. Uploads standalone binaries to the gated GitHub prerelease.
 5. Publishes `wenlan-types` and `wenlan-mcp` to crates.io.
 6. Publishes `wenlan-mcp` and `wenlan` to npm.
-7. Updates the Homebrew tap for `wenlan-mcp`.
+7. Updates the public Homebrew tap for `wenlan` and `wenlan-mcp`, then anonymously taps, installs, and runs both formula tests on macOS arm64.
+8. Publishes the GHCR multi-architecture version manifest and, for stable tags only, moves `latest`.
+9. Promotes the GitHub prerelease to the latest stable release.
+
+Release workflow changes have static mutation-tested contracts in `scripts/release-workflow-contract.test.py`, but external registries and the revised job DAG are only proved end-to-end by the next real tag. Do not cite an older successful tag as evidence for a newer workflow topology.
 
 `wenlan-mcp` now lives in this monorepo under `crates/wenlan-mcp` and shares the workspace Apache-2.0 license. The desktop DMG is still built from [wenlan-app](https://github.com/7xuanlu/wenlan-app); see its `RELEASING.md` for that pipeline.
 
@@ -61,4 +67,13 @@ Configure these in the repository settings (Settings, Secrets and variables, Act
 | ------ | ------- |
 | `CARGO_REGISTRY_TOKEN` | Publish `wenlan-types` to crates.io. Create at crates.io under Account Settings, API Tokens. |
 | `RELEASE_TOKEN` | Fine-grained PAT (contents:write) used by release-please-action so its push triggers the next workflow run. GITHUB_TOKEN-driven pushes never fire downstream workflows. |
-| `GITHUB_TOKEN` | Built-in. Used for GitHub release creation and release-please PR management. No setup needed. |
+| `HOMEBREW_TAP_TOKEN` | Fine-grained PAT with contents:write on the **public** `7xuanlu/homebrew-tap` repository. The workflow verifies anonymous clone/install separately; authenticated push access is not sufficient. |
+| `GITHUB_TOKEN` | Built-in. Used for GitHub release assets and GHCR staging/promotion. No setup needed. |
+
+Before merging a release PR, verify the tap is public without credentials:
+
+```bash
+GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/7xuanlu/homebrew-tap.git HEAD
+```
+
+If this fails or prompts for credentials, make the tap public before cutting the tag. The release preflight intentionally stops while the GitHub release is still a prerelease and before crates.io, npm, or GHCR promotion.

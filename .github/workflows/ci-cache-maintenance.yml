@@ -1,0 +1,52 @@
+name: CI Cache Maintenance
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Plan deletions without applying them
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ci-cache-maintenance
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test cache maintenance planner
+        run: python3 scripts/ci-cache-maintenance.test.py
+      - name: Prune oldest caches to the 9 GB operating target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(
+            --repository "$GITHUB_REPOSITORY"
+            --target-gb 9
+            --receipt "$RUNNER_TEMP/cache-maintenance.json"
+          )
+          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/ci-cache-maintenance.py "${args[@]}"
+      - name: Upload cache maintenance receipt
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ci-cache-maintenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cache-maintenance.json
+          if-no-files-found: warn
+          retention-days: 30

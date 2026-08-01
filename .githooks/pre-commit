@@ -3,9 +3,12 @@ set -euo pipefail
 
 echo "Pre-commit: running fast checks..."
 
-# Detect which files changed to skip irrelevant checks
-STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+# Commit-time checks stay owner-local. Reverse-dependency tests belong to the
+# pre-push planner and CI, so an edit in one crate does not compile the world
+# twice before it can be shared.
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMRD)
 HAS_RUST=$(echo "$STAGED_FILES" | grep -q '\.rs$' && echo "yes" || echo "no")
+HAS_RUST_INPUT=$(echo "$STAGED_FILES" | grep -Eq '(\.rs$|(^|/)Cargo\.toml$|^Cargo\.lock$|^rust-toolchain\.toml$|^clippy\.toml$)' && echo "yes" || echo "no")
 
 if [ "$HAS_RUST" = "yes" ]; then
     echo "  Auto-formatting Rust..."
@@ -13,12 +16,16 @@ if [ "$HAS_RUST" = "yes" ]; then
     # Re-stage any files that cargo fmt modified
     git diff --name-only | grep '\.rs$' | xargs git add 2>/dev/null || true
 
-    # Detect which crates were touched so we can run targeted clippy
+fi
+
+if [ "$HAS_RUST_INPUT" = "yes" ]; then
+    # Detect direct owners only; the pre-push hook expands the reverse closure.
     TOUCHED_CRATES=""
     if echo "$STAGED_FILES" | grep -q '^crates/wenlan-types/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p wenlan-types"; fi
     if echo "$STAGED_FILES" | grep -q '^crates/wenlan-core/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p wenlan-core"; fi
     if echo "$STAGED_FILES" | grep -q '^crates/wenlan-server/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p wenlan-server"; fi
     if echo "$STAGED_FILES" | grep -q '^crates/wenlan-cli/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p wenlan"; fi
+    if echo "$STAGED_FILES" | grep -q '^crates/wenlan-mcp/'; then TOUCHED_CRATES="$TOUCHED_CRATES -p wenlan-mcp"; fi
 
     if [ -n "$TOUCHED_CRATES" ]; then
         echo "  Running Clippy on changed crates..."

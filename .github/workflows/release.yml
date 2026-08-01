@@ -38,7 +38,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
@@ -48,7 +48,7 @@ jobs:
       # existed. Pin orchestration to the commit that supplied this workflow,
       # while the release source itself remains the exact tag checkout above.
       - name: Checkout release tooling
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-tools
@@ -163,6 +163,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # A token-authenticated push can succeed against a private tap while every
+      # documented `brew tap` command returns 404. Fail before any package or
+      # image publishing unless both the credential and anonymous read path are
+      # ready. The release is already demoted above, so a failed preflight cannot
+      # leave a half-built version as GitHub's latest release.
+      - name: Require a public Homebrew tap
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          if [[ -z "$HOMEBREW_TAP_TOKEN" ]]; then
+            echo "ERROR: HOMEBREW_TAP_TOKEN is required to update 7xuanlu/homebrew-tap."
+            exit 1
+          fi
+          if ! git ls-remote https://github.com/7xuanlu/homebrew-tap.git HEAD >/dev/null; then
+            echo "ERROR: https://github.com/7xuanlu/homebrew-tap is not anonymously readable."
+            echo "Make the tap public before cutting a release; authenticated push access is not an installation proof."
+            exit 1
+          fi
+          echo "Homebrew tap is anonymously readable."
+
   release:
     name: Build & Publish ${{ matrix.target }}
     needs: prepare-release
@@ -176,14 +198,14 @@ jobs:
     timeout-minutes: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || 60 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Checkout release tooling
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-tools
@@ -454,7 +476,7 @@ jobs:
           echo "OK: Windows archive contains required runtimes"
 
       - name: Upload archives to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: dist/*
           tag_name: ${{ env.RELEASE_TAG }}
@@ -467,7 +489,7 @@ jobs:
 
       - name: Upload Homebrew artifacts (wenlan + wenlan-mcp)
         if: matrix.target == 'aarch64-apple-darwin'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: homebrew-artifacts
           path: |
@@ -498,7 +520,7 @@ jobs:
             runs-on: ubuntu-24.04-arm
             tag-suffix: arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
@@ -512,13 +534,13 @@ jobs:
             echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
             exit 1
           fi
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: docker/Dockerfile.daemon
@@ -528,12 +550,15 @@ jobs:
 
   docker-manifest:
     name: Combine Docker Manifest (multi-arch)
-    needs: [docker, release]
+    # Architecture images still build in parallel with binaries, but their
+    # public version/last-known-good aliases are promotion outputs. Do not make
+    # either alias visible until every other required channel has succeeded.
+    needs: [docker, release, publish-crates, publish-npm, update-homebrew]
     runs-on: ubuntu-24.04
     permissions:
       packages: write
     steps:
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -543,7 +568,11 @@ jobs:
           TAG="${{ env.RELEASE_TAG }}"
           IMG="ghcr.io/7xuanlu/wenlan-server"
           docker buildx imagetools create -t "$IMG:$TAG" "$IMG:$TAG-amd64" "$IMG:$TAG-arm64"
-          docker buildx imagetools create -t "$IMG:latest"  "$IMG:$TAG-amd64" "$IMG:$TAG-arm64"
+          if [[ "$TAG" == *-* ]]; then
+            echo "$TAG is a prerelease tag; leaving $IMG:latest on the last stable release."
+          else
+            docker buildx imagetools create -t "$IMG:latest" "$IMG:$TAG-amd64" "$IMG:$TAG-arm64"
+          fi
 
   publish-crates:
     name: Publish crates.io (wenlan-types + wenlan-mcp)
@@ -552,7 +581,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
@@ -650,7 +679,7 @@ jobs:
       contents: read
       id-token: write    # OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
@@ -664,10 +693,11 @@ jobs:
             echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
             exit 1
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
       - name: Ensure npm supports OIDC trusted publishing
         # Trusted publishing (tokenless OIDC) requires npm >= 11.5.1. Node 24's
         # bundled npm may lag; pin to latest so the OIDC handshake is available.
@@ -718,10 +748,12 @@ jobs:
   update-homebrew:
     name: Update Homebrew tap
     needs: release
-    runs-on: ubuntu-latest
+    # The tap ships macOS arm64 archives. Validate the formulas with the real
+    # Homebrew client on the same architecture instead of stopping at `ruby -c`.
+    runs-on: macos-14
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: homebrew-artifacts
           merge-multiple: true
@@ -730,8 +762,8 @@ jobs:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           VERSION="${RELEASE_TAG#v}"
-          SHA_MCP_DARWIN_ARM64=$(sha256sum wenlan-mcp-darwin-arm64.tar.gz | cut -d' ' -f1)
-          SHA_CLI_DARWIN_ARM64=$(sha256sum wenlan-cli-darwin-arm64.tar.gz | cut -d' ' -f1)
+          SHA_MCP_DARWIN_ARM64=$(shasum -a 256 wenlan-mcp-darwin-arm64.tar.gz | cut -d' ' -f1)
+          SHA_CLI_DARWIN_ARM64=$(shasum -a 256 wenlan-cli-darwin-arm64.tar.gz | cut -d' ' -f1)
 
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/7xuanlu/homebrew-tap.git" tap
           mkdir -p tap/Formula
@@ -802,20 +834,42 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/wenlan-mcp.rb Formula/wenlan.rb
-          git commit -m "wenlan + wenlan-mcp ${VERSION}"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "Homebrew formulas already describe ${VERSION}; nothing to commit."
+          else
+            git commit -m "wenlan + wenlan-mcp ${VERSION}"
+            git push origin HEAD:main
+          fi
 
       - name: Verify formula syntax
         run: |
           ruby -c tap/Formula/wenlan-mcp.rb
           ruby -c tap/Formula/wenlan.rb
 
+      - name: Verify anonymous Homebrew install path
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          rm -rf public-tap
+          git clone https://github.com/7xuanlu/homebrew-tap.git public-tap
+          cmp tap/Formula/wenlan-mcp.rb public-tap/Formula/wenlan-mcp.rb
+          cmp tap/Formula/wenlan.rb public-tap/Formula/wenlan.rb
+
+          brew untap 7xuanlu/tap >/dev/null 2>&1 || true
+          brew tap 7xuanlu/tap https://github.com/7xuanlu/homebrew-tap.git
+          brew install 7xuanlu/tap/wenlan 7xuanlu/tap/wenlan-mcp
+          brew test 7xuanlu/tap/wenlan
+          brew test 7xuanlu/tap/wenlan-mcp
+
   finalize-release:
     name: Promote the prerelease
     # Runs only after EVERY build + publish job succeeds. A failure in any of
     # them skips this job (GitHub requires all `needs` to succeed), so the
     # release stays a prerelease — never a `releases/latest` without artifacts.
-    needs: [release, docker-manifest, publish-crates, publish-npm, update-homebrew]
+    # docker-manifest is itself the fail-closed promotion barrier over every
+    # required channel; only after it publishes the aliases may GitHub's
+    # prerelease become the latest stable release.
+    needs: docker-manifest
     runs-on: ubuntu-latest
     steps:
       - name: Promote

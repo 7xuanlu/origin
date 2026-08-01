@@ -164,3 +164,6 @@ for job in prepare-release release docker publish-crates publish-npm; do
     fi
 done
 echo "PASS test 10: release-producing jobs checkout and verify RELEASE_TAG"
+
+python3 "$REPO_ROOT/scripts/release-workflow-contract.test.py"
+echo "PASS test 11: release promotion and public install contracts"

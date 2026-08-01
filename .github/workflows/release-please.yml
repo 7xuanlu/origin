@@ -24,7 +24,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@0dfd8538845b8e92600d271a895a5372865d4062 # v5
         id: release
         with:
           # No release-type input — setting it makes the action ignore config-file.
@@ -46,7 +46,7 @@ jobs:
       # PR head with empty `statusCheckRollup` and block branch protection.
       - name: Checkout (for Cargo version sync)
         if: steps.release.outputs.pr != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: release-please--branches--main
           token: ${{ secrets.RELEASE_TOKEN }}

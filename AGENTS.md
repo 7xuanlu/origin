@@ -133,9 +133,9 @@ Wenlan runs across several layers. The split is driven by three questions: **(1)
 | Layer | What runs | Where | When | Time | Blocks? |
 |---|---|---|---|---|---|
 | **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
-| **L2 pre-commit** | `cargo fmt --all`, clippy on staged crates | Local | `git commit` | ~5s | Yes |
-| **L3 pre-push** | `cargo clippy --workspace --all-targets`, `cargo test --workspace --lib` | Local | `git push` | ~60-90s | Yes |
-| **L4 CI on PR** | Same checks workspace-wide; tests for types + server + CLI; core lib tests + chat_import_e2e + distillation_quality + folder_ingest_e2e; live-daemon HTTP acceptance suite — black-box tests against the running daemon; first member `scripts/smoke-folder-ingest.sh` (ingest → search sentinel → delete → reap), new user-facing flows add a script here as they land | GitHub (`ci.yml`) | Every PR | ~10min | Yes (required) |
+| **L2 pre-commit** | `cargo fmt --all`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
+| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; a directly edited integration target runs alone | Local | `git push` | change-dependent | Yes |
+| **L4 CI on PR** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` retain the full workspace/platform/release backstop. | GitHub (`ci.yml`) | Every PR | target ≤20min | Yes (required) |
 | **L5 coverage on PR** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Every PR | ~10min | **No (informational)** |
 | **L6 main canary** | Embedding-only eval (`cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval`) | GitHub (`main-canary.yml`) | Push to `main` | ~10min | No (post-merge) |
 | **L7 manual local** | `bash scripts/coverage.sh` (HTML coverage), GPU eval suite (`cargo test -- --ignored`), Anthropic batch judge (`ANTHROPIC_API_KEY=... cargo test ...`), live smokes with a real on-device judge (`bash scripts/live-smoke-doc-reconcile.sh`, `bash scripts/live-smoke-page-citations.sh`) — run the matching live smoke before merging a feature whose e2e stubs the LLM or never boots the daemon | Your laptop | On demand | minutes-hours | No |
@@ -190,11 +190,11 @@ Main branch has: required CI (`conclusion` — aggregate gate over `fmt` + `lint
 Manual setup: `bash scripts/setup-hooks.sh`. Hooks live under `.githooks/`.
 
 - **Pre-commit:** auto-formats Rust (`cargo fmt --all`, re-stages changed files) + Clippy on changed crates. Formatting issues can never reach CI.
-- **Pre-push:** workspace clippy + library tests. No coverage gate (see above).
+- **Pre-push:** planner-selected Clippy + library tests for affected packages and reverse dependents. Direct integration-test edits run only that target. No coverage gate (see above).
 
 ### Drift-defense (doc/flag/config drift)
 
-Four fail-loud doc/flag/config-drift teeth live as `#[cfg(test)]` lib tests in `crates/wenlan-core/src/drift_guard.rs` (picked up by the same `cargo test --workspace --lib` that CI + pre-push already run — no extra wiring). The file also carries teeth #4 (root `AGENTS.md` byte budget) and #5 (FastEmbed CI cache), which guard non-drift concerns:
+Four fail-loud doc/flag/config-drift teeth live as `#[cfg(test)]` lib tests in `crates/wenlan-core/src/drift_guard.rs` (selected whenever the planner includes `wenlan-core`, and always by the full `main` backstop). The file also carries teeth #4 (root `AGENTS.md` byte budget) and #5 (FastEmbed CI cache), which guard non-drift concerns:
 
 - **Teeth #1 — path resolver:** tracked markdown may not reference an in-repo path that doesn't exist on the branch. Skips `docs/plans/**`, `docs/superpowers/**`, and `*AUDIT.md` (historical/aspirational), and only checks file-like refs. Suppress an intentional ref with `<!-- drift-ok -->`.
 - **Teeth #2 — flag doc contract (fail-closed):** every behavioral `WENLAN_*` flag read in `crates/*/src` must be documented in an `AGENTS.md`, else allowlisted (`FLAG_ALLOWLIST`, infra/test) or grandfathered (`BASELINE_UNDOCUMENTED`, the burn-down list of flags undocumented at introduction). A NEW undocumented flag fails the build.
@@ -205,6 +205,8 @@ The fuzzy surfaces (eval numbers stale vs the current env-hash, design-doc/decis
 
 - One-off: `bash scripts/drift-audit.sh`
 - Recurring: `/loop 7d "bash scripts/drift-audit.sh"`, or a cron/launchd entry. Reports land in `docs/superpowers/drift-reports/` (gitignored working-doc space).
+
+GitHub Actions caches are pruned daily by `ci-cache-maintenance.yml` to a 9 GB operating target (oldest unprotected entries first; the portable FastEmbed snapshot is protected). The workflow uploads a receipt and supports a manual dry run.
 
 ## Architecture
 

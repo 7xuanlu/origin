@@ -57,6 +57,7 @@ NATIVE_SUFFIXES = {
 }
 
 CLI_SERVER_PACKAGES = {"wenlan", "wenlan-server"}
+CONTRACT_PACKAGES = {"wenlan-mcp", "wenlan-types"}
 MANUAL_CORE_INTEGRATION = {"cached_scenario_db_check", "eval_harness"}
 
 PLUGIN_JOB_PREFIXES = (
@@ -87,6 +88,7 @@ SUITE_OUTPUT_KEYS = {
     "workspace-lib-required": "workspace_lib",
     "cli-server-integration-required": "cli_server_integration",
     "core-integration-required": "core_integration",
+    "contract-integration-required": "contract_integration",
     "canonical-smokes-required": "canonical_smokes",
 }
 
@@ -114,7 +116,21 @@ def _full_plan(reason: str) -> dict:
         "workspace_lib": {"mode": "full"},
         "cli_server_integration": {"mode": "full"},
         "core_integration": {"mode": "full"},
+        "contract_integration": {"mode": "full"},
         "canonical_smokes": {"mode": "full"},
+    }
+
+
+def _skip_plan(reason: str) -> dict:
+    return {
+        "version": 1,
+        "mode": "differential",
+        "reasons": [reason],
+        "workspace_lib": {"mode": "skip"},
+        "cli_server_integration": {"mode": "skip"},
+        "core_integration": {"mode": "skip"},
+        "contract_integration": {"mode": "skip"},
+        "canonical_smokes": {"mode": "skip"},
     }
 
 
@@ -308,6 +324,8 @@ def build_plan(
     isolated_filters: dict[str, set[str]] = defaultdict(set)
     cli_server_packages: set[str] = set()
     cli_server_targets: dict[str, set[str]] = defaultdict(set)
+    contract_packages: set[str] = set()
+    contract_targets: dict[str, set[str]] = defaultdict(set)
     core_full = False
     core_targets: set[str] = set()
     canonical_smokes = False
@@ -369,6 +387,12 @@ def build_plan(
                         f"removed or unknown integration target uses package suite: {path}"
                     )
                     continue
+                if package_name in CONTRACT_PACKAGES:
+                    contract_packages.add(package_name)
+                    reasons.append(
+                        f"removed or unknown contract target uses package suite: {path}"
+                    )
+                    continue
                 if package_name == "wenlan-core":
                     core_full = True
                     reasons.append(
@@ -381,6 +405,10 @@ def build_plan(
             if package_name in CLI_SERVER_PACKAGES:
                 cli_server_targets[package_name].add(target)
                 reasons.append(f"owned integration target changed: {path}")
+                continue
+            if package_name in CONTRACT_PACKAGES:
+                contract_targets[package_name].add(target)
+                reasons.append(f"owned contract target changed: {path}")
                 continue
             if package_name == "wenlan-core":
                 if target not in MANUAL_CORE_INTEGRATION:
@@ -395,6 +423,7 @@ def build_plan(
             closure = _closure(package_name, reverse)
             broad_packages.update(closure)
             cli_server_packages.update(closure & CLI_SERVER_PACKAGES)
+            contract_packages.update(closure & CONTRACT_PACKAGES)
             core_full = core_full or "wenlan-core" in closure
             canonical_smokes = True
             reasons.append(f"source change selects reverse dependency closure: {path}")
@@ -404,6 +433,8 @@ def build_plan(
 
     for package_name in cli_server_packages:
         cli_server_targets.pop(package_name, None)
+    for package_name in contract_packages:
+        contract_targets.pop(package_name, None)
 
     if cli_server_packages:
         cli_server_plan = {
@@ -428,6 +459,22 @@ def build_plan(
     else:
         core_plan = {"mode": "skip"}
 
+    if contract_packages:
+        contract_plan = {
+            "mode": "packages",
+            "packages": sorted(contract_packages),
+        }
+    elif contract_targets:
+        contract_plan = {
+            "mode": "targets",
+            "targets": {
+                package: sorted(targets)
+                for package, targets in sorted(contract_targets.items())
+            },
+        }
+    else:
+        contract_plan = {"mode": "skip"}
+
     return {
         "version": 1,
         "mode": "differential",
@@ -435,8 +482,97 @@ def build_plan(
         "workspace_lib": _workspace_lib_plan(broad_packages, isolated_filters),
         "cli_server_integration": cli_server_plan,
         "core_integration": core_plan,
+        "contract_integration": contract_plan,
         "canonical_smokes": {"mode": "full" if canonical_smokes else "skip"},
     }
+
+
+def build_platform_plan(
+    changed_paths: Iterable[object],
+    cargo_metadata: object,
+    *,
+    event_name: str,
+    existing_paths: set[str] | None = None,
+) -> dict:
+    """Plan platform behavior without letting CI infrastructure widen it."""
+
+    paths = [_normalize_path(path) for path in changed_paths]
+    if event_name != "pull_request":
+        return build_plan(
+            paths,
+            cargo_metadata,
+            event_name=event_name,
+            existing_paths=existing_paths,
+        )
+    if not paths:
+        raise PlanError("changed path inventory is empty")
+
+    # Linux owns repository/workflow/planner contracts. Platform behavior is
+    # widened only by product crate inputs or the shared Cargo/toolchain graph.
+    # drift_guard.rs is test-contract source: its Rust tests run canonically on
+    # Linux and must not turn a workflow-only PR into two full native suites.
+    shared_platform_inputs = {
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        ".config/nextest.toml",
+    }
+    relevant = [
+        path
+        for path in paths
+        if path in shared_platform_inputs
+        or (
+            path.startswith("crates/")
+            and path != "crates/wenlan-core/src/drift_guard.rs"
+        )
+    ]
+    if not relevant:
+        return _skip_plan("no platform behavioral inputs changed")
+
+    relevant_existing = None
+    if existing_paths is not None:
+        normalized_existing = {_normalize_path(path) for path in existing_paths}
+        relevant_existing = set(relevant) & normalized_existing
+    plan = build_plan(
+        relevant,
+        cargo_metadata,
+        event_name=event_name,
+        existing_paths=relevant_existing,
+    )
+
+    # Cross-platform MCP/type compile contracts have dedicated Linux and
+    # mcp-platform owners. Do not pull their reverse-dev-dependency tests into
+    # the expensive macOS behavior lane merely because server/core changed.
+    workspace = plan["workspace_lib"]
+    if plan["mode"] == "differential" and workspace["mode"] in {
+        "packages",
+        "filterset",
+    }:
+        behavioral_packages = {"wenlan-core", "wenlan-server", "wenlan"}
+        packages = [
+            package
+            for package in workspace["packages"]
+            if package in behavioral_packages
+        ]
+        if packages:
+            workspace["packages"] = packages
+            if workspace["mode"] == "filterset":
+                expressions = [
+                    expression
+                    for expression in workspace["filterset"].split(" | ")
+                    if any(
+                        expression.startswith(f"package({package})")
+                        for package in packages
+                    )
+                ]
+                if not expressions:
+                    raise PlanError(
+                        "platform workspace filterset lost every behavioral owner"
+                    )
+                workspace["filterset"] = " | ".join(expressions)
+        else:
+            plan["workspace_lib"] = {"mode": "skip"}
+    return plan
 
 
 def required_suite_outputs(plan: object) -> dict[str, bool]:
@@ -464,6 +600,7 @@ def required_suite_outputs(plan: object) -> dict[str, bool]:
     required["rust-ci-required"] = (
         required["workspace-lib-required"]
         or required["canonical-acceptance-required"]
+        or required["contract-integration-required"]
     )
     return required
 
@@ -508,13 +645,134 @@ def _validated_path_argument(raw_path: object, *, name: str) -> str:
     return raw_path
 
 
+def affected_package_names(plan: object, cargo_metadata: object) -> list[str]:
+    """Return the package closure that owns local/CI compilation checks."""
+
+    if not isinstance(plan, dict) or plan.get("version") != 1:
+        raise PlanError("unsupported or malformed test plan")
+    packages, _directories = _workspace(cargo_metadata)
+    selected: set[str] = set()
+    for suite_name, owners in (
+        ("workspace_lib", None),
+        ("cli_server_integration", CLI_SERVER_PACKAGES),
+        ("contract_integration", CONTRACT_PACKAGES),
+    ):
+        suite = plan.get(suite_name)
+        if not isinstance(suite, dict):
+            raise PlanError(f"test plan has no suite {suite_name!r}")
+        mode = suite.get("mode")
+        if mode == "full":
+            selected.update(packages if owners is None else owners)
+        elif mode in {"packages", "filterset"}:
+            selected.update(
+                _validated_package_names(
+                    suite.get("packages"), packages, allowed=owners
+                )
+            )
+        elif mode == "targets":
+            targets = suite.get("targets")
+            if not isinstance(targets, dict) or not targets:
+                raise PlanError(f"test plan target suite {suite_name!r} is empty")
+            unknown = set(targets) - set(packages)
+            if unknown or (owners is not None and not set(targets) <= owners):
+                raise PlanError(
+                    f"test plan target suite {suite_name!r} has unknown owners"
+                )
+            selected.update(targets)
+        elif mode != "skip":
+            raise PlanError(f"unknown {suite_name} mode: {mode!r}")
+
+    core = plan.get("core_integration")
+    if not isinstance(core, dict):
+        raise PlanError("test plan has no suite 'core_integration'")
+    if core.get("mode") != "skip":
+        if "wenlan-core" not in packages:
+            raise PlanError("Cargo metadata has no wenlan-core package")
+        selected.add("wenlan-core")
+    return sorted(selected)
+
+
+def clippy_command_for(plan: object, cargo_metadata: object) -> list[str]:
+    """Build one affected-package Clippy command, preserving main's full backstop."""
+
+    names = affected_package_names(plan, cargo_metadata)
+    if not names:
+        return []
+    if isinstance(plan, dict) and plan.get("mode") == "full":
+        return ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+    direct_test_change = any(
+        isinstance(plan.get(suite_name), dict)
+        and plan[suite_name].get("mode") == "targets"
+        for suite_name in (
+            "cli_server_integration",
+            "core_integration",
+            "contract_integration",
+        )
+    )
+    # Ordinary source edits already compile their integration owners in the
+    # selected test lanes. Lint lib/bin targets here so local push and PR lint
+    # do not compile every integration target a second time. A directly edited
+    # integration target keeps all-targets lint for its owning package.
+    target_scope = ["--all-targets"] if direct_test_change else ["--lib", "--bins"]
+    return [
+        "cargo",
+        "clippy",
+        *_package_args(names),
+        *target_scope,
+        "--",
+        "-D",
+        "warnings",
+    ]
+
+
+def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[str]]:
+    """Return bounded pre-push tests: affected libs plus directly changed targets."""
+
+    packages, _directories = _workspace(cargo_metadata)
+    commands: list[list[str]] = []
+    workspace = plan.get("workspace_lib") if isinstance(plan, dict) else None
+    if not isinstance(workspace, dict):
+        raise PlanError("test plan has no suite 'workspace_lib'")
+    workspace_mode = workspace.get("mode")
+    if workspace_mode == "full":
+        commands.append(["cargo", "test", "--workspace", "--lib"])
+        commands.append(
+            ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
+        )
+    elif workspace_mode in {"packages", "filterset"}:
+        names = _validated_package_names(workspace.get("packages"), packages)
+        commands.append(["cargo", "test", *_package_args(names), "--lib"])
+        if "wenlan-server" in names:
+            commands.append(
+                ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
+            )
+    elif workspace_mode != "skip":
+        raise PlanError(f"unknown workspace-lib mode: {workspace_mode!r}")
+
+    for suite_name in (
+        "cli-server-integration",
+        "core-integration",
+        "contract-integration",
+    ):
+        suite = plan.get(suite_name.replace("-", "_")) if isinstance(plan, dict) else None
+        if not isinstance(suite, dict):
+            raise PlanError(f"test plan has no suite {suite_name!r}")
+        # Source changes are covered locally by affected lib tests and Clippy's
+        # --all-targets compile. CI owns the broader integration/smoke proof.
+        if suite.get("mode") != "targets":
+            continue
+        for command in command_groups_for(suite_name, plan, cargo_metadata):
+            commands.append(["cargo", "test", *command[3:]])
+    return commands
+
+
 def archive_command_for(
     plan: object,
     cargo_metadata: object,
     *,
     archive_file: str,
 ) -> list[str]:
-    """Build one workspace-lib archive without applying test predicates."""
+    """Build one affected unit-test archive without applying test predicates."""
 
     if not isinstance(plan, dict) or plan.get("version") != 1:
         raise PlanError("unsupported or malformed test plan")
@@ -534,7 +792,7 @@ def archive_command_for(
         _validated_path_argument(archive_file, name="archive-file"),
     ]
     if mode == "full":
-        return [*cargo, "--workspace", "--lib"]
+        return [*cargo, "--workspace", "--lib", "--bin", "wenlan-server"]
     if mode in {"packages", "filterset"}:
         if mode == "filterset":
             filterset = suite.get("filterset")
@@ -543,7 +801,10 @@ def archive_command_for(
         names = _validated_package_names(suite.get("packages"), packages)
         # Filterset plans archive each selected package's complete lib test
         # binary. Test-name predicates are valid only when the archive runs.
-        return [*cargo, *_package_args(names), "--lib"]
+        command = [*cargo, *_package_args(names), "--lib"]
+        if "wenlan-server" in names:
+            command.extend(["--bin", "wenlan-server"])
+        return command
     raise PlanError(f"unknown workspace-lib mode: {mode!r}")
 
 
@@ -624,10 +885,17 @@ def command_groups_for(
                 ]
             raise PlanError(f"unknown workspace-lib mode: {mode!r}")
         if mode == "full":
-            return [workspace_command([*cargo, "--workspace", "--lib"])]
+            return [
+                workspace_command(
+                    [*cargo, "--workspace", "--lib", "--bin", "wenlan-server"]
+                )
+            ]
         if mode == "packages":
             names = _validated_package_names(suite.get("packages"), packages)
-            return [workspace_command([*cargo, *_package_args(names), "--lib"])]
+            command = [*cargo, *_package_args(names), "--lib"]
+            if "wenlan-server" in names:
+                command.extend(["--bin", "wenlan-server"])
+            return [workspace_command(command)]
         if mode == "filterset":
             filterset = suite.get("filterset")
             if not isinstance(filterset, str) or not filterset:
@@ -736,6 +1004,51 @@ def command_groups_for(
             ]
         ]
 
+    if suite_name == "contract-integration":
+        if mode == "full":
+            names = sorted(CONTRACT_PACKAGES)
+            return [[*cargo, *_package_args(names), "-E", "kind(test)"]]
+        if mode == "packages":
+            names = _validated_package_names(
+                suite.get("packages"),
+                packages,
+                allowed=CONTRACT_PACKAGES,
+            )
+            return [[*cargo, *_package_args(names), "-E", "kind(test)"]]
+        if mode == "targets":
+            raw_targets = suite.get("targets")
+            if not isinstance(raw_targets, dict) or not raw_targets:
+                raise PlanError("contract integration target plan is empty")
+            commands = []
+            for package_name in sorted(raw_targets):
+                if package_name not in CONTRACT_PACKAGES:
+                    raise PlanError(
+                        f"contract target package has no owner: {package_name}"
+                    )
+                names = raw_targets[package_name]
+                if (
+                    not isinstance(names, list)
+                    or not names
+                    or not all(isinstance(name, str) and name for name in names)
+                ):
+                    raise PlanError(
+                        f"contract targets for {package_name} are malformed"
+                    )
+                known = _integration_targets(packages[package_name])
+                unknown = set(names) - known
+                if unknown:
+                    raise PlanError(
+                        f"unknown contract targets for {package_name}: {sorted(unknown)}"
+                    )
+                target_args = [
+                    argument
+                    for target in sorted(set(names))
+                    for argument in ("--test", target)
+                ]
+                commands.append([*cargo, "-p", package_name, *target_args])
+            return commands
+        raise PlanError(f"unknown contract-integration mode: {mode!r}")
+
     raise PlanError(f"unknown suite name: {suite_name!r}")
 
 
@@ -839,6 +1152,9 @@ def _main(argv: list[str]) -> int:
     plan_parser.add_argument("--changed-files-json", required=True)
     plan_parser.add_argument("--metadata-file", required=True)
     plan_parser.add_argument("--event-name", required=True)
+    plan_parser.add_argument(
+        "--scope", choices=("canonical", "platform"), default="canonical"
+    )
     plan_parser.add_argument("--github-output")
 
     archive_parser = subparsers.add_parser("archive")
@@ -853,12 +1169,22 @@ def _main(argv: list[str]) -> int:
             "workspace-lib",
             "cli-server-integration",
             "core-integration",
+            "contract-integration",
         ),
     )
-    run_parser.add_argument("--plan-json", required=True)
+    run_plan_source = run_parser.add_mutually_exclusive_group(required=True)
+    run_plan_source.add_argument("--plan-json")
+    run_plan_source.add_argument("--plan-env")
     run_parser.add_argument("--partition")
     run_parser.add_argument("--archive-file")
     run_parser.add_argument("--workspace-remap")
+
+    clippy_parser = subparsers.add_parser("clippy")
+    clippy_parser.add_argument("--plan-json", required=True)
+
+    local_parser = subparsers.add_parser("local")
+    local_parser.add_argument("--changed-files-json", required=True)
+    local_parser.add_argument("--level", choices=("commit", "push"), required=True)
 
     arguments = parser.parse_args(argv)
     if arguments.command == "plan":
@@ -868,7 +1194,8 @@ def _main(argv: list[str]) -> int:
             raise PlanError("changed-files-json is invalid") from error
         if not isinstance(changed_paths, list):
             raise PlanError("changed-files-json must be an array")
-        plan = build_plan(
+        planner = build_platform_plan if arguments.scope == "platform" else build_plan
+        plan = planner(
             changed_paths,
             _load_json_file(arguments.metadata_file),
             event_name=arguments.event_name,
@@ -879,11 +1206,46 @@ def _main(argv: list[str]) -> int:
             _write_github_output(arguments.github_output, plan, plan_json)
         return 0
 
+    metadata = _cargo_metadata()
+    if arguments.command == "local":
+        try:
+            changed_paths = json.loads(arguments.changed_files_json)
+        except json.JSONDecodeError as error:
+            raise PlanError("changed-files-json is invalid") from error
+        if not isinstance(changed_paths, list) or not changed_paths:
+            raise PlanError("changed-files-json must be a non-empty array")
+        plan = build_plan(changed_paths, metadata, event_name="pull_request")
+        commands = [clippy_command_for(plan, metadata)]
+        if arguments.level == "push":
+            commands.extend(local_test_commands_for(plan, metadata))
+        commands = [command for command in commands if command]
+        if not commands:
+            print("local checks: no affected Rust packages")
+            return 0
+        for command in commands:
+            executable_command = _executable_command(command)
+            print("+", " ".join(executable_command), flush=True)
+            subprocess.run(executable_command, check=True)
+        return 0
+
+    plan_json = arguments.plan_json
+    if arguments.command == "run" and arguments.plan_env is not None:
+        plan_json = os.environ.get(arguments.plan_env)
+        if plan_json is None:
+            raise PlanError(f"plan environment variable is unset: {arguments.plan_env}")
     try:
-        plan = json.loads(arguments.plan_json)
+        plan = json.loads(plan_json)
     except json.JSONDecodeError as error:
         raise PlanError("plan-json is invalid") from error
-    metadata = _cargo_metadata()
+    if arguments.command == "clippy":
+        command = clippy_command_for(plan, metadata)
+        if not command:
+            print("clippy: no affected Rust packages")
+            return 0
+        executable_command = _executable_command(command)
+        print("+", " ".join(executable_command), flush=True)
+        subprocess.run(executable_command, check=True)
+        return 0
     if arguments.command == "archive":
         command = archive_command_for(
             plan,

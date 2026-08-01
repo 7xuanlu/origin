@@ -45,7 +45,7 @@ jobs:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
@@ -66,7 +66,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore portable FastEmbed model
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-bge-base-en-v1.5-q-v3-portable
@@ -86,7 +86,7 @@ jobs:
           cargo llvm-cov report
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-reports
           path: rust-coverage.json

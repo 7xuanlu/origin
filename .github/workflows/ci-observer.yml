@@ -27,7 +27,7 @@ jobs:
     steps:
       # For workflow_run, github.sha is the trusted default-branch commit.
       # The observed PR head SHA remains data and is never checked out.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -81,7 +81,7 @@ jobs:
             --output "$RUNNER_TEMP/ci-observer/receipt.json"
       - name: Upload CI observer receipt
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ci-observer-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           path: ${{ runner.temp }}/ci-observer/receipt.json

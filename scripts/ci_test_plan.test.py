@@ -13,9 +13,13 @@ from pathlib import Path
 
 from ci_test_plan import (
     PlanError,
+    affected_package_names,
     archive_command_for,
     build_plan,
+    build_platform_plan,
+    clippy_command_for,
     command_groups_for,
+    local_test_commands_for,
     required_suite_outputs,
 )
 
@@ -81,7 +85,12 @@ def cargo_metadata() -> dict:
                 ("wenlan-types",),
                 ("eval_harness", "folder_ingest_e2e", "read_scope"),
             ),
-            package("wenlan-types", "crates/wenlan-types", ()),
+            package(
+                "wenlan-types",
+                "crates/wenlan-types",
+                (),
+                ("page_draft_wire", "plugin_distribution"),
+            ),
             package(
                 "wenlan-server",
                 "crates/wenlan-server",
@@ -113,6 +122,7 @@ class FiltersetExecutionTests(unittest.TestCase):
         listing: dict,
         *,
         partition: str | None = None,
+        plan_from_env: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], bool]:
         plan = plan_for(
             "crates/wenlan-core/src/lint/pages/security_test.rs"
@@ -153,6 +163,7 @@ else:
             environment["FAKE_CARGO_METADATA"] = json.dumps(cargo_metadata())
             environment["FAKE_NEXTEST_LISTING"] = json.dumps(listing)
             environment["NEXTEST_RUN_MARKER"] = str(run_marker)
+            environment["FAKE_CI_TEST_PLAN"] = json.dumps(plan)
 
             arguments = [
                 sys.executable,
@@ -160,9 +171,11 @@ else:
                 "run",
                 "--suite",
                 "workspace-lib",
-                "--plan-json",
-                json.dumps(plan),
             ]
+            if plan_from_env:
+                arguments.extend(["--plan-env", "FAKE_CI_TEST_PLAN"])
+            else:
+                arguments.extend(["--plan-json", json.dumps(plan)])
             if partition is not None:
                 arguments.extend(["--partition", partition])
             result = subprocess.run(
@@ -234,6 +247,26 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(did_run)
 
+    def test_plan_environment_preserves_compact_json_on_windows(self) -> None:
+        result, did_run = self.run_filterset_with_listing(
+            {
+                "rust-suites": {
+                    "wenlan-core": {
+                        "testcases": {
+                            "owned::active": {
+                                "ignored": False,
+                                "filter-match": {"status": "matches"},
+                            }
+                        }
+                    }
+                }
+            },
+            plan_from_env=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(did_run)
+
     def test_partition_does_not_narrow_filterset_validation(self) -> None:
         result, did_run = self.run_filterset_with_listing(
             {
@@ -269,6 +302,10 @@ class PackageClosureTests(unittest.TestCase):
             {"mode": "packages", "packages": ["wenlan-server"]},
         )
         self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(
+            plan["contract_integration"],
+            {"mode": "packages", "packages": ["wenlan-mcp"]},
+        )
 
     def test_types_source_runs_every_reverse_dependent_package_and_integration(self) -> None:
         plan = plan_for("crates/wenlan-types/src/responses.rs")
@@ -289,6 +326,13 @@ class PackageClosureTests(unittest.TestCase):
             {"mode": "packages", "packages": ["wenlan", "wenlan-server"]},
         )
         self.assertEqual(plan["core_integration"], {"mode": "full"})
+        self.assertEqual(
+            plan["contract_integration"],
+            {
+                "mode": "packages",
+                "packages": ["wenlan-mcp", "wenlan-types"],
+            },
+        )
 
     def test_unknown_source_inside_known_crate_uses_package_closure_not_module_guess(
         self,
@@ -301,6 +345,117 @@ class PackageClosureTests(unittest.TestCase):
             ["wenlan", "wenlan-core", "wenlan-mcp", "wenlan-server"],
         )
         self.assertNotIn("filterset", plan["workspace_lib"])
+
+
+class PlatformPlanTests(unittest.TestCase):
+    INFRASTRUCTURE_PATHS = (
+        ".github/workflows/ci.yml",
+        ".githooks/pre-push",
+        "scripts/ci_test_plan.py",
+        "scripts/ci_test_plan.test.py",
+        "scripts/release_targets.py",
+        "scripts/release_targets.test.py",
+        "scripts/build-release-binaries.sh",
+        "scripts/release-workflow-contract.test.py",
+        "crates/wenlan-core/src/drift_guard.rs",
+    )
+
+    def platform_plan_for(self, *paths: str) -> dict:
+        return build_platform_plan(
+            paths,
+            cargo_metadata(),
+            event_name="pull_request",
+            existing_paths=set(paths),
+        )
+
+    def test_infrastructure_only_diff_skips_every_platform_behavior_suite(self) -> None:
+        plan = self.platform_plan_for(*self.INFRASTRUCTURE_PATHS)
+
+        self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
+        self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
+        self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["contract_integration"], {"mode": "skip"})
+        self.assertFalse(any(required_suite_outputs(plan).values()))
+
+    def test_infrastructure_does_not_widen_mixed_server_change(self) -> None:
+        product = "crates/wenlan-server/src/bind_addr_tests.rs"
+        focused = self.platform_plan_for(product)
+        mixed = self.platform_plan_for(product, *self.INFRASTRUCTURE_PATHS)
+
+        for suite in (
+            "workspace_lib",
+            "cli_server_integration",
+            "core_integration",
+            "contract_integration",
+            "canonical_smokes",
+        ):
+            self.assertEqual(mixed[suite], focused[suite])
+        self.assertEqual(
+            mixed["workspace_lib"]["packages"],
+            ["wenlan-server"],
+        )
+        self.assertEqual(
+            mixed["cli_server_integration"],
+            {"mode": "packages", "packages": ["wenlan-server"]},
+        )
+
+    def test_platform_workspace_lib_excludes_compile_only_reverse_dependents(self) -> None:
+        plan = self.platform_plan_for("crates/wenlan-types/src/lib.rs")
+
+        self.assertEqual(
+            plan["workspace_lib"]["packages"],
+            ["wenlan", "wenlan-core", "wenlan-server"],
+        )
+        self.assertNotIn("wenlan-mcp", plan["workspace_lib"]["packages"])
+        self.assertNotIn("wenlan-types", plan["workspace_lib"]["packages"])
+
+    def test_platform_filterset_excludes_reverse_dependents_from_expression(
+        self,
+    ) -> None:
+        plan = self.platform_plan_for(
+            "crates/wenlan-server/src/bind_addr_tests.rs",
+            "crates/wenlan-core/src/lint/pages/security_test.rs",
+        )
+
+        self.assertEqual(plan["workspace_lib"]["mode"], "filterset")
+        self.assertEqual(
+            plan["workspace_lib"]["packages"],
+            ["wenlan-core", "wenlan-server"],
+        )
+        self.assertNotIn("package(wenlan-mcp)", plan["workspace_lib"]["filterset"])
+
+    def test_manifest_native_and_toolchain_inputs_still_fail_closed_full(self) -> None:
+        for path in (
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".config/nextest.toml",
+            "crates/wenlan-core/Cargo.toml",
+            "crates/wenlan-core/build.rs",
+            "crates/wenlan-core/native/bridge.cpp",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.platform_plan_for(path)["mode"], "full")
+
+    def test_non_pr_platform_plan_keeps_full_backstop(self) -> None:
+        plan = build_platform_plan(
+            self.INFRASTRUCTURE_PATHS,
+            cargo_metadata(),
+            event_name="push",
+            existing_paths=set(self.INFRASTRUCTURE_PATHS),
+        )
+
+        self.assertEqual(plan["mode"], "full")
+        self.assertTrue(all(required_suite_outputs(plan).values()))
+
+    def test_empty_pr_inventory_still_fails_closed(self) -> None:
+        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
+            build_platform_plan(
+                [],
+                cargo_metadata(),
+                event_name="pull_request",
+                existing_paths=set(),
+            )
 
 
 class NarrowOwnerTests(unittest.TestCase):
@@ -347,6 +502,19 @@ class NarrowOwnerTests(unittest.TestCase):
         )
         self.assertEqual(plan["core_integration"], {"mode": "skip"})
 
+    def test_extant_contract_integration_selects_only_its_target(self) -> None:
+        path = "crates/wenlan-mcp/tests/real_router.rs"
+        plan = plan_for(path)
+
+        self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
+        self.assertEqual(
+            plan["contract_integration"],
+            {
+                "mode": "targets",
+                "targets": {"wenlan-mcp": ["real_router"]},
+            },
+        )
+
 
 class PluginOwnerTests(unittest.TestCase):
     PR_415_PATHS = (
@@ -361,6 +529,7 @@ class PluginOwnerTests(unittest.TestCase):
         self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
         self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
         self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["contract_integration"], {"mode": "skip"})
         self.assertEqual(plan["canonical_smokes"], {"mode": "skip"})
 
     def test_mixed_rust_and_pr_415_diff_keeps_the_rust_only_plan(self) -> None:
@@ -372,6 +541,7 @@ class PluginOwnerTests(unittest.TestCase):
             "workspace_lib",
             "cli_server_integration",
             "core_integration",
+            "contract_integration",
             "canonical_smokes",
         ):
             self.assertEqual(mixed[suite], rust_only[suite])
@@ -403,6 +573,7 @@ class NonRustOwnerTests(unittest.TestCase):
         self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
         self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
         self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["contract_integration"], {"mode": "skip"})
         self.assertEqual(plan["canonical_smokes"], {"mode": "skip"})
         self.assertFalse(any(required_suite_outputs(plan).values()))
 
@@ -453,6 +624,7 @@ class NonRustOwnerTests(unittest.TestCase):
             "workspace_lib",
             "cli_server_integration",
             "core_integration",
+            "contract_integration",
             "canonical_smokes",
         ):
             self.assertEqual(mixed[suite], rust_only[suite])
@@ -478,6 +650,7 @@ class SuiteOutputTests(unittest.TestCase):
                 "workspace-lib-required": True,
                 "cli-server-integration-required": True,
                 "core-integration-required": False,
+                "contract-integration-required": True,
                 "canonical-smokes-required": True,
                 "canonical-acceptance-required": True,
                 "rust-ci-required": True,
@@ -492,6 +665,7 @@ class SuiteOutputTests(unittest.TestCase):
         self.assertFalse(outputs["workspace-lib-required"])
         self.assertTrue(outputs["cli-server-integration-required"])
         self.assertFalse(outputs["core-integration-required"])
+        self.assertFalse(outputs["contract-integration-required"])
         self.assertFalse(outputs["canonical-smokes-required"])
         self.assertTrue(outputs["canonical-acceptance-required"])
         self.assertTrue(outputs["rust-ci-required"])
@@ -546,6 +720,7 @@ class SuiteOutputTests(unittest.TestCase):
                 "workspace-lib-required",
                 "cli-server-integration-required",
                 "core-integration-required",
+                "contract-integration-required",
                 "canonical-smokes-required",
                 "canonical-acceptance-required",
                 "rust-ci-required",
@@ -569,6 +744,7 @@ class FailClosedTests(unittest.TestCase):
         self.assertEqual(plan["workspace_lib"], {"mode": "full"})
         self.assertEqual(plan["cli_server_integration"], {"mode": "full"})
         self.assertEqual(plan["core_integration"], {"mode": "full"})
+        self.assertEqual(plan["contract_integration"], {"mode": "full"})
 
     def test_unknown_workspace_rust_path_falls_back_to_all_suites(self) -> None:
         plan = plan_for("crates/new-crate/src/lib.rs")
@@ -635,6 +811,112 @@ class FailClosedTests(unittest.TestCase):
 
 
 class CommandGenerationTests(unittest.TestCase):
+    def test_pr_clippy_uses_affected_dependency_closure(self) -> None:
+        plan = plan_for("crates/wenlan-server/src/routes.rs")
+
+        self.assertEqual(
+            affected_package_names(plan, cargo_metadata()),
+            ["wenlan-mcp", "wenlan-server"],
+        )
+        self.assertEqual(
+            clippy_command_for(plan, cargo_metadata()),
+            [
+                "cargo",
+                "clippy",
+                "-p",
+                "wenlan-mcp",
+                "-p",
+                "wenlan-server",
+                "--lib",
+                "--bins",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )
+
+    def test_direct_integration_change_keeps_test_target_clippy(self) -> None:
+        plan = plan_for("crates/wenlan-mcp/tests/real_router.rs")
+
+        self.assertEqual(
+            clippy_command_for(plan, cargo_metadata()),
+            [
+                "cargo",
+                "clippy",
+                "-p",
+                "wenlan-mcp",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )
+
+    def test_main_plan_keeps_full_workspace_clippy_backstop(self) -> None:
+        plan = plan_for("Cargo.lock")
+
+        self.assertEqual(
+            clippy_command_for(plan, cargo_metadata()),
+            [
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )
+
+    def test_local_push_runs_affected_libs_and_only_direct_integration(self) -> None:
+        source_plan = plan_for("crates/wenlan-server/src/routes.rs")
+        target_plan = plan_for("crates/wenlan-mcp/tests/real_router.rs")
+
+        self.assertEqual(
+            local_test_commands_for(source_plan, cargo_metadata()),
+            [
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-mcp",
+                    "-p",
+                    "wenlan-server",
+                    "--lib",
+                ],
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-server",
+                    "--bin",
+                    "wenlan-server",
+                ],
+            ],
+        )
+        self.assertEqual(
+            local_test_commands_for(target_plan, cargo_metadata()),
+            [["cargo", "test", "-p", "wenlan-mcp", "--test", "real_router"]],
+        )
+
+    def test_contract_target_generates_required_target_only_command(self) -> None:
+        plan = plan_for("crates/wenlan-types/tests/page_draft_wire.rs")
+
+        self.assertEqual(
+            command_groups_for("contract-integration", plan, cargo_metadata()),
+            [
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "-p",
+                    "wenlan-types",
+                    "--test",
+                    "page_draft_wire",
+                ]
+            ],
+        )
+
     def test_partition_rejects_shell_text_and_non_workspace_suites(self) -> None:
         plan = plan_for("Cargo.lock")
         for partition in ["slice:0/2", "slice:3/2", "slice:1/2;echo unsafe"]:
@@ -671,6 +953,8 @@ class CommandGenerationTests(unittest.TestCase):
                     "run",
                     "--workspace",
                     "--lib",
+                    "--bin",
+                    "wenlan-server",
                     "--partition",
                     "slice:1/2",
                 ]
@@ -692,6 +976,8 @@ class CommandGenerationTests(unittest.TestCase):
                     "-p",
                     "wenlan-server",
                     "--lib",
+                    "--bin",
+                    "wenlan-server",
                 ]
             ],
         )
@@ -713,6 +999,8 @@ class CommandGenerationTests(unittest.TestCase):
                 "/tmp/workspace-lib.tar.zst",
                 "--workspace",
                 "--lib",
+                "--bin",
+                "wenlan-server",
             ],
         )
 
@@ -736,6 +1024,8 @@ class CommandGenerationTests(unittest.TestCase):
                 "-p",
                 "wenlan-server",
                 "--lib",
+                "--bin",
+                "wenlan-server",
             ],
         )
 

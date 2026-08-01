@@ -45,6 +45,16 @@ class ReleaseTargetTests(unittest.TestCase):
             with self.subTest(target=entry["target"]):
                 self.assertEqual(require_target(entry["target"]), entry)
 
+    def test_pr_matrix_can_exclude_only_the_slow_windows_release_profile(self) -> None:
+        self.assertEqual(
+            release_matrix(exclude_targets=["x86_64-pc-windows-msvc"]),
+            {"include": EXPECTED[:-1]},
+        )
+
+    def test_matrix_rejects_unknown_exclusions(self) -> None:
+        with self.assertRaisesRegex(TargetError, "unknown shipped targets"):
+            release_matrix(exclude_targets=["x86_64-apple-darwin"])
+
     def test_unknown_target_fails_closed(self) -> None:
         with self.assertRaisesRegex(TargetError, "not a shipped release target"):
             require_target("x86_64-apple-darwin")
