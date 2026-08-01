@@ -678,7 +678,7 @@ Stage 0's.
 `S0-35` second NFKC pass after lowercasing ·
 `S0-36` post-normalization structural rejection ·
 `S0-37` 1024-scalar pre-cap ·
-`S0-38` reject all `Cc`/`Cf`, no ZWNJ exception ·
+`S0-38` reject all `Cc`/`Cf`, no ZWNJ exception *(ratified — see below)* ·
 `S0-39` a rejected link is dropped, not an ingest failure ·
 `S0-40` `candidate_id` is derived, not minted ·
 `S0-41` non-terminal receipts are replaceable, terminal ones are not.
@@ -697,3 +697,7 @@ number is kept because the property it guarantees is unchanged: M6 never
 transforms a space identifier. If space *names* ever need normalization, that
 still belongs to the spaces layer — and M6 now inherits it for free in the
 stronger sense that it never touches names at all.
+
+**Ratified by the user 2026-08-01:** `S0-38` — the reject-all-`Cc`/`Cf` rule was
+carried with an open veto window through five review rounds; the window is closed
+and the rule stands as written.

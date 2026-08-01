@@ -461,8 +461,36 @@ merged group falls through to a fresh `community-m4-new-{n}`
 ("the survivor keeps its overview") has no survivor in that case. MG5 covers it
 by treating every participant as a loser, which is the only reading that loses no
 data, but it is worth flagging that **D11's merge language presumes a survivor
-that M4 does not always produce.** Reported, not resolved — this is a contract
-question, not an implementation one.
+that M4 does not always produce.** **Ruled 2026-08-01 (STOP-13): MG5's
+all-losers reading is ratified as an explicit D11 amendment scoped to the detach
+rule — see S0-163 below.** It was a contract question and it got a contract
+answer, rather than being settled by whatever the implementation happened to do.
+
+> **Decision S0-163 *(new rev 8 — ratifies R-3, ruled 2026-08-01 under STOP-13)* —
+> where a merge produces no surviving community, every participant is a loser,
+> and this is an explicit amendment to D11 scoped to the detach rule alone.**
+> D11 says *"on merge, the survivor keeps its overview"* and F3 shows M4 does not
+> always produce one: when every old ID is claimed by another group first, the
+> merged group falls through to a fresh `community-m4-new-{n}` and then a fresh
+> UUID (`crates/wenlan-core/src/community_partition.rs:841`-`:860`,
+> `crates/wenlan-core/src/community_grouping.rs:503`-`:512`). MG5's all-losers
+> reading is ratified as the contract's answer.
+>
+> **The amendment is scoped, and the scope is the point.** It changes what
+> "survivor" means when there is none — nothing else in D11 moves. Specifically it
+> does **not** license any of the four things D11 forbids: a human-edited overview
+> is never automatically transferred, archived, renamed, or overwritten. STOP-7
+> constrains this answer independently of STOP-13 authorizing it, so the detach of
+> an all-losers merge stages a proposal and stops there, exactly as MG1–MG4 do.
+> Every participant's overview becomes detached, stays readable, stops refreshing,
+> and stages one transfer/retire proposal.
+>
+> **What the ruling did not decide, and PR-A should measure.** The no-survivor
+> path is reachable in code but its **frequency is unmeasured**. Instrument it in
+> PR-A rather than assume it is rare: if all-losers merges turn out to be common,
+> a contract that detaches every participant is a different user experience from
+> one that detaches an occasional straggler, and that is worth knowing before
+> PR-C builds maintenance on top of it.
 
 **F4 — the existing global overview is refreshed unconditionally.**
 `refresh_overview_page` (`crates/wenlan-core/src/synthesis/overview.rs:104`)
@@ -516,3 +544,7 @@ with no adversarial effort beyond choosing an ordinary word as a community name.
 `S0-82` M6 overviews resolve by subscription row, never by title lookup ·
 `S0-83` the space-overview invariant is asserted as "no row written" ·
 `S0-84` a separate `OverviewProposalPayload` type; `community-v1` stays frozen.
+
+**Added in rev 8:** `S0-163` where a merge produces no surviving community, every
+participant is a loser — an explicit D11 amendment scoped to the detach rule,
+ratified 2026-08-01 under STOP-13 (R-3); see F3.

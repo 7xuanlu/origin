@@ -434,7 +434,7 @@ them, stale/refresh enqueue state, the operation receipt
 |---|---|---|
 | indexed queries per route evaluation | ≤ 4 | `R-BUDGET-QUERIES` |
 | rows materialized per route evaluation | ≤ 512 | `R-BUDGET-ROWS` |
-| index entries visited per route evaluation | ≤ 2,176 — **derived, NOT gated** (S0-157) | `R-BUDGET-VISITS` |
+| index entries visited per route evaluation | ≤ 2,176 — **gated on the bench** as of R-1 (b′) (S0-157) | `R-BUDGET-VISITS` |
 | wall time per route evaluation | ≤ 50 ms, **hard** | `R-BUDGET-MS` |
 
 D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
@@ -586,7 +586,7 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > | no full scan | `FULLSCAN_STEP == 0`, bench connection | **yes** |
 > | each query uses its named index | `EXPLAIN QUERY PLAN` (instrument 4) | **yes** |
 > | `50 ms` route budget | `R-BENCH-MAX` (S0-98) | **yes** |
-> | **absolute entries visited ≤ 2,176** | none available | **no** |
+> | **absolute entries visited ≤ 2,176** | `SQLITE_SCANSTAT_NVISIT`, bench-only instrumented build (R-1 (b′), ruled 2026-08-01) | **yes, on the bench** |
 >
 > **The scaling assertion rev 3 proposed is withdrawn (rev 4, round-3 N4).** It
 > said `VM_STEP` for query (c) must grow "no faster than linearly" in hub degree.
@@ -597,10 +597,29 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > output only, asserted against nothing.
 >
 > **G6's "instrumented row visits proving the bound" (`gp@wenlan-app:613`-`:614`)
-> is therefore not gated by anything, and no substitute proxy will be invented to
-> cover that. This is a contract question and it needs a ruling.**
+> was therefore not gated by anything, and no substitute proxy was invented to
+> cover that. It was a contract question and it got a ruling.**
+>
+> **Ruled 2026-08-01: option (b′).** The clause is discharged by a bench-only
+> build of the daemon's own libSQL, instrumented through libsql-ffi's own
+> `LIBSQLITE3_FLAGS` knob and asserting `NVISIT ≤ 2,176` on the real code path.
+> The honest scope of that discharge, carried forward from R-1's limitations
+> rather than dropped now that the ruling went our way: the assertion runs on a
+> build that is **not byte-identical** to the shipped one, and the statement is
+> prepared through `libsql-sys` rather than the `libsql::Connection` wrapper the
+> daemon uses. Same C library, same planner, same flag list plus one; different
+> Rust wrapper and an extra counter in the VDBE structures. PR-A owns one further
+> obligation the ruling should be read as attaching: the instrumented build must
+> not reach a release, and because the mechanism is an env var rather than a
+> vendored patch it is cheaper to set and easier to leak — and, per the rev-8
+> correction to R-1's limitation #3, a leaked build pays a per-opcode
+> instrumentation cost rather than carrying a dormant symbol.
 
-> **Ruling request R-1 — how is G6's visit clause discharged?** *(amended rev 5,
+> **Ruling request R-1 — how is G6's visit clause discharged? RULED 2026-08-01:
+> option (b′).** The request and its full option table are kept rather than
+> collapsed to the answer, because a reader asking *why* the bench build is
+> allowed to differ from the shipped one needs the four options that were
+> refused. *(amended rev 5,
 > round-4 item 6: rev 4 offered four options and mis-costed one of them, which hid
 > the option that is actually best. Five now. Re-costed again in rev 6, round-5
 > item 3: (b′) turns out to need no vendored patch at all, and (b) turns out to
@@ -618,7 +637,7 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > **The mechanics, corrected twice over *(rev 6, round-5 item 3)*.** Rev 5 costed
 > (b′) as needing "a maintained patch of `libsql-ffi/build.rs`". It does not — and
 > the reason is better than the one round 5 supplied. Round 5 pointed at `cc`'s
-> generic `CFLAGS`/`TARGET_CFLAGS` (`cc-1.2.59/src/lib.rs:65`, `:117`, resolved at
+> generic `CFLAGS`/`TARGET_CFLAGS` (`cc-1.2.59/src/lib.rs:70`, `:117`, resolved at
 > `:2015` and applied at `:2064` under the comment *"do this last, to allow these
 > to override everything else"*) and stated that no libsql-specific knob exists.
 > **That last part does not hold: libsql-ffi ships its own env knob for exactly
@@ -691,17 +710,40 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 >    releases" but "keep an env var out of release builds", and the two are not
 >    equally visible: a patch sits in the tree where a reviewer trips over it,
 >    whereas an env var is invisible in the source and lives in whatever sets it.
->    Cheaper to apply, easier to leak. Two things bound the risk — the flag is
->    inert unless something calls `sqlite3_stmt_scanstatus`, and cargo's
+>    Cheaper to apply, easier to leak. **One** thing bounds the risk: cargo's
 >    `rerun-if-env-changed` (`build.rs:422`) makes the instrumented artifact
->    rebuild rather than persist — but the ruling should still state release
->    hygiene explicitly rather than assume it.
+>    rebuild rather than persist, so the leak cannot survive a build with the
+>    variable unset. The ruling should still state release hygiene explicitly
+>    rather than assume it.
+>
+>    *(rev 8, round-6 item 2 — correcting this artifact against itself.* Rev 6
+>    named a second bound: *"the flag is inert unless something calls
+>    `sqlite3_stmt_scanstatus`."* **That is false, and the vendored source says
+>    so twice.** The `SQLITE_DBCONFIG_STMT_SCANSTATUS` documentation states that
+>    in a `SQLITE_ENABLE_STMT_SCANSTATUS` build *"the flag is set (collection of
+>    statistics is enabled) by default"*
+>    (`libsql-ffi-0.9.30/bundled/src/sqlite3.c:2885`-`:2893`), and the VDBE's
+>    inner step loop is compiled with a per-opcode `pOp->nExec++` plus a
+>    `sqlite3Hwtime()` read under exactly that `#elif
+>    defined(SQLITE_ENABLE_STMT_SCANSTATUS)` branch (`sqlite3.c:95142`-`:95147`).
+>    Nothing has to call the reporting API for a leaked build to pay for the
+>    instrumentation on every statement it executes. That makes the release-
+>    hygiene obligation **stronger**, not weaker, than rev 6 costed it: the cost
+>    of a leak is a measurable per-opcode tax on production reads, not a dormant
+>    symbol. The only true mitigation after the fact is the runtime
+>    `sqlite3_db_config(db, SQLITE_DBCONFIG_STMT_SCANSTATUS, 0, ...)` toggle,
+>    which someone must deliberately call — so it is a recovery path, not a
+>    default. The ruling stands on (b′) regardless, because the bound that
+>    matters — the rebuild-on-unset fingerprint — is the one that survived
+>    verification.)*
 >
 > Rev 2 reserved this escape — *"the honest consequence is that G6's visit clause
 > is not gated and must be raised as such"* — rev 3 took it, rev 4 sharpened it
 > into a decision the ruling can make in one move, and rev 5 corrects the option
-> set it offered. Artifact 12 carries the matching `RULING` row (G6.14, S0-160) so
-> the unmapped clause stays countable.
+> set it offered. Artifact 12 carried the matching `RULING` row (G6.14, S0-160) so
+> the unmapped clause stayed countable; **on 2026-08-01 the ruling landed and that
+> row became a normal mutation case**, which is the outcome S0-160 was written to
+> make possible rather than to postpone.
 
 ---
 
@@ -919,7 +961,7 @@ does, and worth one line in the PR-A notes.
 | incremental pair state equals full recomputation | §5, S0-91 and S0-92 |
 | generated/inactive/retracted/legacy-ungrounded contribute zero | §1.2 table, all four **LIVE** |
 | `EXPLAIN QUERY PLAN` uses fixed indexes | §7 instrument (4), §8 index list |
-| instrumented row visits, not a textual `LIMIT` | **not gated today; ruling R-1 (S0-157) decides how.** Gated: `FULLSCAN_STEP == 0`, the decoded-row and query counters, EQP. Not gated: the absolute entry count — reachable on the pinned stack via a one-flag build (R-1 option b′), which is what the ruling chooses |
+| instrumented row visits, not a textual `LIMIT` | **gated as of 2026-08-01 — R-1 ruled (b′) (S0-157); `SQLITE_SCANSTAT_NVISIT` asserted on the bench-only instrumented build.** Also gated: `FULLSCAN_STEP == 0`, the decoded-row and query counters, EQP. Not gated: the absolute entry count — reachable on the pinned stack via a one-flag build (R-1 option b′), which is what the ruling chooses |
 | no group forms more than 2016 pairs | §3, `R-HUB-MAXPAIRS` |
 | candidate retrieval never exceeds 32 | §4, `R-CAND-CAP` |
 | a provisional candidate is never retrieved or attached | §1.2 — **BLOCKED**; the clause is currently vacuously true, which is worse than failing, so the test must assert the predicate is *evaluated*, not merely that no provisional page appeared |
@@ -971,10 +1013,12 @@ Every constant has an ID so an amendment has an address.
 **Added in rev 2:** `S0-156` query (c) aggregates in SQLite, so the evaluation
 materializes ~160 rows while traversing up to 2,048 index entries.
 
-**Added in rev 3:** `S0-157` *(sharpened rev 4)* the absolute visit bound is NOT
-gated — `VM_STEP` counts opcode steps, not entries, no reachable counter counts
-entries, and rev 3's linear-scaling proxy is withdrawn because a `32 × d`
-traversal is itself linear. Ruling request R-1 *(amended rev 5, re-costed rev 6)*
-carries five options and recommends (b′): a bench-only build of the daemon's own
-libSQL with one flag appended through libsql-ffi's own `LIBSQLITE3_FLAGS` env
-knob — no vendored patch — measuring `NVISIT` on the real code path.
+**Added in rev 3:** `S0-157` *(sharpened rev 4; RULED rev 8)* the absolute visit
+bound was not gated — `VM_STEP` counts opcode steps, not entries, no reachable
+counter counts entries, and rev 3's linear-scaling proxy is withdrawn because a
+`32 × d` traversal is itself linear. Ruling request R-1 *(amended rev 5,
+re-costed rev 6)* carried five options and recommended (b′); **the user ruled
+(b′) on 2026-08-01**, so the bound is now gated on a bench-only build of the
+daemon's own libSQL with one flag appended through libsql-ffi's own
+`LIBSQLITE3_FLAGS` env knob — no vendored patch — measuring `NVISIT` on the real
+code path.

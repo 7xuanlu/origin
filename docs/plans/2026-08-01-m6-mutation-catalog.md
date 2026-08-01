@@ -43,8 +43,8 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 | **LIVE** | the substrate exists on this branch; the mutation is writable today |
 | **PR-A** | needs schema or code that PR-A creates; writable the moment it lands |
 | **lane 1** | prerequisite in flight — the claim-derivation promoter being built on `m5-truth-derivation`. Not vapor, not a follow-up: the RED test is specified here against the frozen predicate so it becomes executable the day that branch lands |
-| **RULING** | the clause is frozen but its mapping waits on a ruling; the row is an index entry, **not** coverage (S0-160) |
-| **BLOCKED** | blocked pending the merge-no-survivor ruling. Not weakened, not dropped, not narrowed — carried at full strength with its dependency named |
+| **RULING** | the clause is frozen but its mapping waits on a ruling; the row is an index entry, **not** coverage (S0-160). *No row carries this as of rev 8 — R-1 ruled and G6.14 became a real case. The status stays defined for the next such clause.* |
+| **BLOCKED** | blocked pending the merge-no-survivor ruling. Not weakened, not dropped, not narrowed — carried at full strength with its dependency named. *No row carries this as of rev 8 — R-3 ratified as S0-163 and G8.7/G2.7 unblocked. The status stays defined, and the full-strength discipline is why the rows were testable the moment the ruling landed.* |
 
 > **Decision S0-160 *(rev 4, round-3 N5)* — a frozen clause whose mapping waits
 > on a ruling carries a `RULING` row; it is never simply absent.** Withdrawing
@@ -58,7 +58,12 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 > precisely so the hole is legible in the coverage table instead of hiding in the
 > difference between two numbers. When the ruling lands, the row becomes a normal
 > mutation row with a real control, or the clause is restated and the row is
-> retired with a note. G6.14 is the only one today.
+> retired with a note. **G6.14 was the only one, and it retired on 2026-08-01
+> when R-1 ruled (b′): the row is now a normal mutation case with a real
+> control.** The status stays defined rather than being deleted with its last
+> row — the next frozen clause that outruns its instrument needs somewhere to
+> land, and re-deriving this decision at that moment is exactly the invisibility
+> S0-160 exists to prevent.
 >
 > *(rev 5, round-4 item 4: rev 4 filed this row as `G10.16`, inside the G10 app
 > gate. The clause is G6's (`gp@wenlan-app:600`) and extends G6.11's limits, and
@@ -283,16 +288,21 @@ Seven exclusions, each of which must be independently unable to inflate a signal
 | G2.4b | count an **ungrounded** external root | an ungrounded root contributes | LIVE |
 | G2.5 | count M5-provisional page-mediated inputs | a provisional page's claims contribute | lane 1 |
 | G2.6 | count same-session captures as independent | one capture session crosses a threshold | LIVE |
-| G2.7 | count overview evidence toward concept coverage | an overview's own evidence inflates the concept signal | **BLOCKED** |
+| G2.7 | count overview evidence toward concept coverage | an overview's own evidence inflates the concept signal | PR-A |
 | G2.8 | move any D2 threshold by one unit without failing | each threshold's boundary test | LIVE |
 
-**Why G2.7 is BLOCKED and stays at full strength.** The exclusion is stated over
-*overview evidence*, which presupposes that every overview has a determinate
-subject community. The merge-no-survivor case (artifact 8, F3) is precisely the
-case where a merge retires every input community and no side survives to own the
-resulting overview. An overview whose subject is undefined cannot be classified
-as overview evidence or concept evidence, so the exclusion is not evaluable for
-it, and the STOP's resolution decides which way it falls.
+**G2.7 unblocked 2026-08-01.** The exclusion is stated over *overview evidence*,
+which presupposes that every overview has a determinate subject community — the
+one thing the merge-no-survivor case (artifact 8, F3) did not supply, since a
+merge that retires every input community leaves no side to own the resulting
+overview. S0-163's D11 amendment supplies it: in an all-losers merge every
+participant is a loser, so every overview has a determinate disposition and the
+exclusion is evaluable again.
+
+*(The dependency direction this catalog recorded held. It said a ruling on G8.7's
+clause resolves G2.7 and not the reverse; the ruling went to G8.7's clause and
+both unblocked. Worth one line because it is the artifact set predicting its own
+resolution correctly rather than being corrected by it.)*
 
 > **Decision S0-138 — G2.7 is carried at full strength with its dependency
 > named, and the interim behavior does not become the contract.** Artifact 8's
@@ -301,6 +311,11 @@ it, and the STOP's resolution decides which way it falls.
 > marking the row green would convert a placeholder into a settled decision by
 > the back door. The row stays BLOCKED until the ruling lands, and the interim
 > test is labelled as testing the interim.
+>
+> *(amended rev 8: ruled 2026-08-01. The interim did **not** become the contract
+> by default — it was ratified deliberately as S0-163, which is the outcome this
+> decision was written to force rather than to prevent. The row's status moves to
+> PR-A and the test stops being labelled as testing an interim.)*
 
 **Suite-level controls** (row controls are per S0-155): independent documents cross the threshold as expected;
 UI-authorized human groups count.
@@ -423,7 +438,7 @@ Catalogued in full in artifact 6; the mutation view:
 | G6.11d | exceed `50 ms` on a 5k-degree hub | `R-BENCH-MAX` (S0-98) | PR-A |
 | G6.12a–e | let a CAS-losing event commit — one row per event: provisionalization, root retraction, community rebinding, relevance-stat update, candidate-set change | that event writes attachment/dependency/history/receipt state instead of requeueing | PR-A |
 | G6.13 | let an embedding cross a threshold | the embedding tie-break test | PR-A |
-| G6.14 | the instrumented-visit clause (`gp@wenlan-app:613`-`:614`) — **deliberately unmapped pending ruling R-1**; see S0-160 here and S0-157 in artifact 6 | — | `RULING` |
+| G6.14 | exceed `2,176` visited index entries in one evaluation | `SQLITE_SCANSTAT_NVISIT` asserted on the bench-only instrumented build (S0-157, R-1 option (b′), ruled 2026-08-01) | PR-A |
 
 **G6.11's instrumentation is the row that fails quietly.** The contract requires
 *"instrumented row visits proving the bound rather than a textual SQL `LIMIT`"*
@@ -484,7 +499,8 @@ were; they are not row controls and no longer stand in for any.
 | G8.4 | accept a label proposal against a stale generation | the stale-generation rejection | LIVE |
 | G8.5 | allow a duplicate subscription row | uniqueness | PR-A |
 | G8.6 | let a machine overwrite a human-edited overview | the ownership guard | LIVE |
-| G8.7 | leave a merge loser attached | the detach rule (artifact 8, MG5) | **BLOCKED** |
+| G8.7a | leave a merge loser attached when the merge HAS a determinate survivor | the detach rule (artifact 8, MG1–MG4) | PR-A |
+| G8.7b | leave any participant attached when the merge has NO survivor | the all-losers detach rule (artifact 8, MG5 + S0-163) | PR-A |
 | G8.8 | let a space overview resolve by title lookup | the collision hazard (artifact 8, S0-82) | LIVE |
 | G8.9 | rename an overview silently on any of the above | no-silent-title-change | LIVE |
 | G8.10a | lose **subscription** rows on any of the above | no-data-loss, subscription | PR-A |
@@ -506,8 +522,9 @@ assert all three: identity is unchanged (`slot_id`, `page_id`, and card identity
 survive, because the digest input is `spaces.id` and not the name — artifact 10,
 S0-161), nothing disappears silently (a card that minted before the rename still
 mints after it, and any refusal is an explicit fail-closed refusal rather than an
-absence), and no orphaned state is left behind (no row in the twelve-table
-space-keyed substrate still names the old space — artifact 10, S0-162).
+absence), and no orphaned state is left behind (no row in the eleven-table
+community substrate still names the old space — artifact 10, S0-162, whose
+enumeration is closed and whose one deliberate exclusion is recorded there).
 
 The three are separated because they fail independently and a single assertion
 would hide two of them: stable-ID derivation alone satisfies G8.11a while still
@@ -628,8 +645,8 @@ space and every signal disabled on every other space.
 > mutation row and nobody notices — which is exactly the failure mode S0-134
 > describes, arriving through drift instead of oversight.
 
-Current coverage: **11 gates, 191 gate mutation cases, 11 predicate cases, and
-1 `RULING` placeholder that is NOT coverage — 203 rows counted mechanically.**
+Current coverage: **11 gates, 193 gate mutation cases, 11 predicate cases, and
+no `RULING` placeholder — 204 rows counted mechanically.**
 
 *(rev 5, round-4 item 5: rev 4 labelled the then-200 as "189 gate mutation
 cases", which counted the `RULING` row as a mutation and contradicted S0-160's
@@ -644,10 +661,10 @@ arriving with S0-161's reversal and S0-162.)*
 | Status | Cases |
 |---|---|
 | LIVE | 32 |
-| PR-A | 152 |
+| PR-A | 156 |
 | lane 1 | 16 |
-| BLOCKED | 2 |
-| RULING | 1 |
+| BLOCKED | 0 |
+| RULING | 0 |
 
 (Counts are mechanical — every catalog row is a table line whose ID matches
 `G<n>.<n>[a-z]` or `P<n>[a-z]`, and the status is its last cell. A row written
@@ -659,11 +676,22 @@ map, because the mapping depends on a decision that has not been made. S0-134
 says an unmapped clause is not gated; a clause that is silently absent is
 indistinguishable from one nobody noticed, which is the exact failure S0-134
 exists to catch. Carrying the row with an explicit `RULING` status keeps the
-index complete and makes the hole countable — one row today, G6.14. It is
-filed under the gate that owns the clause, not the gate that happened to be
-under revision when the hole was found; S0-144 resolves a clause to a row by
-the row's gate prefix, so filing it elsewhere would leave the clause unmapped
-while looking mapped.
+index complete and makes the hole countable. **No row carries it today** —
+G6.14 held it until R-1 ruled on 2026-08-01, and the count is now zero. The
+status and its filing rule survive the row: a `RULING` row is filed under the
+gate that owns the clause, not the gate that happened to be under revision when
+the hole was found, because S0-144 resolves a clause to a row by the row's gate
+prefix and filing it elsewhere would leave the clause unmapped while looking
+mapped.
+
+*(rev 8: the morning rulings landed and **BLOCKED reached zero**. G6.14 stops
+being a `RULING` placeholder and becomes a real case (R-1 → (b′)); G8.7 and G2.7
+unblock (R-3 ratified as S0-163). 203 → 204: three rows changed status and
+exactly one was added — `G8.7b`, the all-losers merge. That row exists because
+the ruling changed what the contract *says*, and a changed contract should leave
+a test behind: "no survivor" is not an instance of "a loser stays attached", so
+covering it inside G8.7's prose would have left exactly the unmapped clause
+S0-134 exists to catch.)*
 
 *(rev 6: rev 5 reported 200 and rev 6 reports 203. `G8.11a`-`c` — the rename
 case — arrives with S0-161's reversal to stable-`spaces.id` identity and with
@@ -766,4 +794,5 @@ the derivation is the contract.
 carries a `RULING` catalog row naming the ruling it waits on — an unmapped clause is
 visibly ungated per S0-134, never silently absent. *(rev 5: the row is filed under
 the gate that owns the clause — G6.14, not G10.16 — so S0-144's prefix-based
-completeness test resolves it, and it is never totalled as coverage.)*
+completeness test resolves it, and it is never totalled as coverage. rev 8: its
+only row retired when R-1 ruled; the status survives the row.)*

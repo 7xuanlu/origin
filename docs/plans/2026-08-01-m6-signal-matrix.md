@@ -21,7 +21,7 @@ checkout is the user's; nothing in this work modifies it. Verify a citation with
 | `DERIVED` | answerable from existing tables, but no query does it today — PR-A writes the query, adds no schema |
 | `PR-A-new` | no substrate; PR-A must add schema. Named, never invented behavior |
 | `lane 1` | substrate exists, its writer is in flight on `m5-truth-derivation` — see §7.1. Same meaning as artifact 12's `lane 1` |
-| `BLOCKED` | blocked on an open contract ruling — see §7.2. Same meaning as artifact 12's `BLOCKED`; rev 1 used this label for both cases, which artifact 12 never did |
+| ~~`BLOCKED`~~ | *retired rev 8.* It meant blocked on an open contract ruling (§7.2). R-2 was ruled on 2026-08-01, so no row in this artifact carries it. The legend row survives only to record that this artifact's `BLOCKED` was never artifact 12's — a collision §7.1 called out, and one worth keeping legible now that both are discharged |
 
 **Status.** Contract only. No schema, no code.
 
@@ -74,7 +74,7 @@ COUNT(DISTINCT r.independence_group_id)
 | 1.2 | **durable** — the community's membership is the published one, not an in-flight recompute | three conditions together: `community_members.published_generation = space_graph_state.published_generation`, `space_graph_state.dirty = 0`, and `grouping_generation = published_generation`. The join recurs at `crates/wenlan-core/src/db.rs:15970` and `:15497` | `EXISTS` |
 | 1.3 | the publication was actually finalized, not merely stamped | a matching `community_publication_receipts` row (membership digest + algo/projection version), enforced by the fail-closed reader gate `community_reader_durable_gate_sql` at `crates/wenlan-core/src/db.rs:2642` | `EXISTS` |
 | 1.4 | ≥ 3 distinct independence groups over the community's members | the §1 count expression, scoped to edges whose endpoint is a `community_members.node_id` of this community | `DERIVED` |
-| 1.5 | overview evidence excluded | see §5, rule R5 | `BLOCKED` — see §7.2 |
+| 1.5 | overview evidence excluded | see §5, rule R5; title-rule interim per S0-164 | PR-A |
 
 **Scope clause for §1's count.** `e.src_kind = 'entity' AND e.src_id IN (SELECT node_id FROM community_members WHERE community_id = ?)`, unioned with the same over `dst_kind`/`dst_id`. `community_members` is keyed `(space, node_id)` with `node_kind` defaulting to `'entity'` (`crates/wenlan-core/src/db.rs:10459`–`:10460`), so an entity endpoint is the only member kind today.
 
@@ -95,7 +95,7 @@ COUNT(DISTINCT r.independence_group_id)
 | 2.3 | ≥ 2 **distinct** referring pages | `COUNT(DISTINCT page_links.source_page_id)`; the PK already prevents one page from contributing twice for one label | `EXISTS` |
 | 2.4 | referring pages are **active** | `pages.status = 'active'`; `resolve_orphan_page_links` already joins on exactly this (`crates/wenlan-core/src/db.rs:44117`) | `EXISTS` |
 | 2.5 | referring pages are **supported** | `page_truth_state.support_status = 'supported'`; DDL and CHECK at `crates/wenlan-core/src/db/claim_identity.rs:279`–`:300` | **`lane 1`** — §7.1 |
-| 2.6 | referring pages are **non-overview** | intended: `pages.kind <> 'overview'` (CHECK at `crates/wenlan-core/src/db.rs:9177`) | **`BLOCKED`** — §7.2 |
+| 2.6 | referring pages are **non-overview** | title rule now, `pages.kind <> 'overview'` (CHECK at `crates/wenlan-core/src/db.rs:9177`) after the follow-up PR — S0-164 | PR-A |
 | 2.7 | ≥ 3 underlying groups | D1: the union of active grounded external roots supporting **the exact current claim revisions that contain the link** — not the referring page as a whole | `DERIVED` |
 | 2.8 | a stale or provisional referring page contributes nothing | D1, explicit. Depends on 2.5 | **`lane 1`** — §7.1 |
 
@@ -138,7 +138,7 @@ Each rule, its enforcing predicate, and where the data lives.
 | R2 | **Generated roots count zero** | `root_kind <> 'generated'` | same CHECK, `crates/wenlan-core/src/db.rs:8791` | `EXISTS` |
 | R3 | Chunks, mirrors, and same-session captures **collapse through the independence group** | not a filter — an assignment property. Two chunks of one file receive the same `independence_group_id` because they share `source_identity`, and near-dups are unioned by the LSH overlay. Asserted today by `distinct chunks of one file share one independence_group_id` (`crates/wenlan-core/src/edge_grounding.rs:2251`) | artifact 3 §2 | `EXISTS` |
 | R4 | **Unknown independence routes to human review and cannot auto-publish** | today `acquire_provenance_root` returns `Err` and mints nothing (`crates/wenlan-core/src/db.rs:18525`–`:18532`) | artifact 3 §5 | **partial** — the refusal exists, the durable review artifact does not |
-| R5 | **Overview pages and generated overview evidence never contribute to genesis** | intended `pages.kind <> 'overview'` | `crates/wenlan-core/src/db.rs:9177` | **`BLOCKED`** — §7.2 |
+| R5 | **Overview pages and generated overview evidence never contribute to genesis** | title rule now, `pages.kind <> 'overview'` after the follow-up PR (S0-164) | `crates/wenlan-core/src/db.rs:9177` | PR-A |
 | R6 | M5 support applies to page-mediated inputs; a stale/provisional referring page contributes nothing | `page_truth_state.support_status = 'supported'` | `crates/wenlan-core/src/db/claim_identity.rs:282` | **`lane 1`** — §7.1 |
 | R7 | New M6 prose stays invisible unless its M5 claim/support publication succeeds | artifact 2 machine E — the page and its truth state commit in one transaction, so there is no window where prose exists without published support | artifact 2 §8.2 | `PR-A-new` (by construction) |
 
@@ -229,7 +229,33 @@ There is no derivation worker **on this branch**. `claim_derivation_jobs` — th
 
 ### 7.2 `pages.kind` is never set on insert, so `kind = 'overview'` cannot identify overview pages
 
-> **Status: escalated 2026-08-01, pending ruling.** Contract-level; not resolved inside Stage 0. Artifact 12 marks the G2 clauses that depend on this predicate as blocked-pending-ruling rather than treating them as live gates.
+> **Status: RULED 2026-08-01 — option 1 (make `kind` truthful), delivered in two
+> steps.** The write-path half is in flight on the kind-fix lane, which makes
+> `pages.kind` truthful at insert. The three stale paths it deliberately deferred
+> — rename, SOURCE-replace, archive, none of which re-derive `kind` — close in a
+> follow-up PR after that lane merges. Until both land, **R5's exclusion is
+> defined by the title rule** (`lower(title) = 'overview'`), which is option 2 as
+> a named interim rather than as a silent fallback. See S0-164 below.
+
+> **Decision S0-164 *(new rev 8 — applies R-2, ruled 2026-08-01)* — M6 reads
+> overview-ness through the title rule until the `kind` column is truthful on
+> every path, and does not route on `kind` before then.** The ordering is not
+> caution for its own sake; two facts force it.
+>
+> First, **the title rule is currently the more accurate predicate.** `kind` is
+> derived at insert and never re-derived, so a page that is renamed, has its
+> source replaced, or is archived carries whatever `kind` it was born with. A
+> read-time title predicate cannot go stale that way. Adopting `kind` before the
+> stale paths close would trade a correct predicate for an authoritative-looking
+> one.
+>
+> Second, **a drift-guard tooth enforces the ordering mechanically.** The
+> kind-fix lane's tooth fails the build if production read routes on any `kind`
+> other than `'entity'`. M6 routing on `kind = 'overview'` before that fence
+> lifts does not produce a subtle bug; it produces a red build. Whoever lifts the
+> fence does it in the follow-up PR that closes the stale paths, in that order,
+> and this decision names that as the sequence rather than leaving it to be
+> discovered.
 
 **Confirmed.** The `kind` column was added by migration 89 with `DEFAULT 'concept'` and a CHECK over `('entity','concept','source','overview','authored')` (`crates/wenlan-core/src/db.rs:9177`). The only writer of `'overview'` is that migration's own backfill, `CASE WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview'` (`crates/wenlan-core/src/db.rs:9254`).
 

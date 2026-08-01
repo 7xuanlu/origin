@@ -596,3 +596,7 @@ call, not to this artifact.
 
 **Added in rev 2:** `S0-152` the stage-A–D `signal` is a non-null sentinel `'-'`, never NULL ·
 `S0-153` M5 readiness at 100% is a three-query census; `/api/status` cannot prove it.
+
+**Ratified by the user 2026-08-01:** `S0-126` — the three-component soak receipt
+was carried with an open veto window through five review rounds; the window is
+closed and the decision stands as written.
