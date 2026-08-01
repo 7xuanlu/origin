@@ -6,13 +6,14 @@ fail() {
   exit 1
 }
 
-release_yml=".github/workflows/release.yml"
+release_targets="scripts/release_targets.py"
 cli_runner="crates/wenlan-cli/npm/run.js"
 
 expected_darwin_asset="wenlan-darwin-arm64.tar.gz"
 
-grep -q "artifact_name: wenlan-darwin-arm64" "$release_yml" \
-  || fail "release.yml does not produce wenlan-darwin-arm64"
+python3 "$release_targets" matrix \
+  | grep -q '"artifact_name":"wenlan-darwin-arm64"' \
+  || fail "canonical release target inventory does not produce wenlan-darwin-arm64"
 
 grep -q "const ASSET = \"${expected_darwin_asset}\"" "$cli_runner" \
   || fail "npm wenlan runner does not download ${expected_darwin_asset}"

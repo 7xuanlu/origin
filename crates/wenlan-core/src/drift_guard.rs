@@ -134,8 +134,8 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
             &["Integration tests wenlan-cli + wenlan-server (Linux)"],
         ),
         (
-            "test-quarantine",
-            &["Quarantined tests (wenlan-mcp + wenlan-types)"],
+            "contract-integration",
+            &["Affected wenlan-mcp + wenlan-types integrations"],
         ),
     ];
 
@@ -993,7 +993,7 @@ jobs:
           path: .fastembed_cache
           name: stale
       - name: Integration tests wenlan-cli + wenlan-server (Linux)
-  test-quarantine:
+  contract-integration:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
@@ -1002,7 +1002,7 @@ jobs:
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           name: stale
-      - name: Quarantined tests (wenlan-mcp + wenlan-types)
+      - name: Affected wenlan-mcp + wenlan-types integrations
 "#;
     let violations = fastembed_ci_cache_violations(workflow);
     assert!(
@@ -2111,6 +2111,7 @@ fn ci_routing_contract_violations(
         "workspace-lib-required",
         "cli-server-integration-required",
         "core-integration-required",
+        "contract-integration-required",
         "canonical-smokes-required",
         "canonical-acceptance-required",
         "rust-ci-required",
@@ -2214,6 +2215,7 @@ fn ci_routing_contract_violations(
         "workspace-lib-required",
         "cli-server-integration-required",
         "core-integration-required",
+        "contract-integration-required",
         "canonical-smokes-required",
         "canonical-acceptance-required",
         "rust-ci-required",
@@ -2229,6 +2231,7 @@ fn ci_routing_contract_violations(
     let rust_ci_formula = r#"    required["rust-ci-required"] = (
         required["workspace-lib-required"]
         or required["canonical-acceptance-required"]
+        or required["contract-integration-required"]
     )"#;
     if !planner_source.contains(rust_ci_formula) {
         violations.push(
@@ -2546,20 +2549,20 @@ fn ci_routing_contract_violations(
     if test_rust_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some("true") {
         violations.push("platform test matrix does not retain its reusable target cache".into());
     }
-    let quarantine_rust_cache = job_step_using(&ci, "test-quarantine", "Swatinem/rust-cache");
-    if quarantine_rust_cache.and_then(|step| step["with"]["shared-key"].as_str()) != Some("test")
-        || quarantine_rust_cache.and_then(|step| step["with"]["cache-targets"].as_str())
+    let contract_rust_cache = job_step_using(&ci, "contract-integration", "Swatinem/rust-cache");
+    if contract_rust_cache.and_then(|step| step["with"]["shared-key"].as_str()) != Some("test")
+        || contract_rust_cache.and_then(|step| step["with"]["cache-targets"].as_str())
             != Some("false")
-        || quarantine_rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
+        || contract_rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
     {
         violations.push(
-            "test-quarantine does not reuse test inputs through a restore-only target-free rust-cache"
+            "contract-integration does not reuse test inputs through a restore-only target-free rust-cache"
                 .into(),
         );
     }
     for job in [
         "canonical-acceptance",
-        "test-quarantine",
+        "contract-integration",
         "plugin-rust-contract",
     ] {
         if ci["jobs"][job]["env"]["SCCACHE_GHA_RW_MODE"].as_str() != Some("READ_ONLY") {
@@ -2567,12 +2570,19 @@ fn ci_routing_contract_violations(
         }
     }
     let rust_ci_job_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'";
-    for job in ["fmt", "lint", "test-quarantine"] {
+    for job in ["fmt", "lint"] {
         if ci["jobs"][job]["if"].as_str() != Some(rust_ci_job_condition) {
             violations.push(format!(
                 "required Rust job {job} does not derive exactly from rust-ci-required"
             ));
         }
+    }
+    let contract_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true'";
+    if ci["jobs"]["contract-integration"]["if"].as_str() != Some(contract_condition) {
+        violations.push(
+            "required contract integration job does not derive exactly from its planner output"
+                .into(),
+        );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
     let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')";
@@ -2669,6 +2679,7 @@ fn ci_routing_contract_violations(
         "linux-nextest",
         "mcp-platform",
         "canonical-acceptance",
+        "contract-integration",
         "release-preflight",
         "plugin-rust-contract",
     ] {
@@ -2687,6 +2698,7 @@ fn ci_routing_contract_violations(
             "needs.detect-changes.outputs.workspace-platform",
         ),
         ("canonical-acceptance", "\"$run_canonical\""),
+        ("contract-integration", "\"$run_contract\""),
         ("release-preflight", "startsWith(github.head_ref"),
         ("docs", "needs.detect-changes.outputs.docs"),
         ("plugin", "needs.detect-changes.outputs.plugin"),
@@ -3287,7 +3299,7 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
         "test",
         "mcp-platform",
         "canonical-acceptance",
-        "test-quarantine",
+        "contract-integration",
         "release-preflight",
         "docs",
         "plugin",
@@ -3596,7 +3608,7 @@ fn ci_fans_out_one_prepared_fastembed_artifact_per_run() {
         "linux-nextest",
         "test",
         "canonical-acceptance",
-        "test-quarantine",
+        "contract-integration",
     ] {
         assert!(
             job_step_using(&ci, job, "actions/cache/restore").is_none(),
@@ -4003,10 +4015,18 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             .push("tag release does not enforce the bounded 90/60-minute matrix timeout".into());
     }
     if job_needs(&release, "docker") != ["prepare-release"]
-        || job_needs(&release, "docker-manifest") != ["docker", "release"]
+        || job_needs(&release, "docker-manifest")
+            != [
+                "docker",
+                "release",
+                "publish-crates",
+                "publish-npm",
+                "update-homebrew",
+            ]
+        || job_needs(&release, "finalize-release") != ["docker-manifest"]
     {
         violations.push(
-            "Docker DAG does not build per-arch images after prepare-release and gate the manifest on docker plus release"
+            "Docker DAG does not build per-arch images after prepare-release, gate public manifests on every publish channel, and gate final release promotion on that manifest barrier"
                 .into(),
         );
     }
@@ -4377,7 +4397,11 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "    timeout-minutes: 900",
         )
         .replace("    needs: prepare-release", "    needs: release")
-        .replace("    needs: [docker, release]", "    needs: docker")
+        .replace(
+            "    needs: [docker, release, publish-crates, publish-npm, update-homebrew]",
+            "    needs: [docker, release]",
+        )
+        .replace("    needs: docker-manifest", "    needs: release")
         .replace(
             "          save-if: \"false\"",
             "          save-if: \"true\"",
@@ -5498,8 +5522,8 @@ fn ci_observer_contract_violations(
         violations.push("CI observer uses an action without an immutable SHA pin".into());
     }
     let allowed_actions = [
-        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
-        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
     ];
     if uses.len() != allowed_actions.len()
         || uses.iter().any(|action| !allowed_actions.contains(action))

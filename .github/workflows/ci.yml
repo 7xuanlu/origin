@@ -51,6 +51,7 @@ jobs:
       workspace-lib-required: ${{ steps.test-plan.outputs.workspace-lib-required }}
       cli-server-integration-required: ${{ steps.test-plan.outputs.cli-server-integration-required }}
       core-integration-required: ${{ steps.test-plan.outputs.core-integration-required }}
+      contract-integration-required: ${{ steps.test-plan.outputs.contract-integration-required }}
       canonical-smokes-required: ${{ steps.test-plan.outputs.canonical-smokes-required }}
       canonical-acceptance-required: ${{ steps.test-plan.outputs.canonical-acceptance-required }}
       rust-ci-required: ${{ steps.test-plan.outputs.rust-ci-required }}
@@ -59,7 +60,7 @@ jobs:
       # only for platform-owned macOS and Windows behavior.
       test-matrix: ${{ steps.matrix.outputs.json }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       # dorny/paths-filter reads pull-request files through the REST API, whose
       # response is capped at 3,000 files. Reject a larger PR before routing a
       # silently truncated inventory.
@@ -78,7 +79,7 @@ jobs:
             echo "$CHANGED_FILE_COUNT changed files exceed the REST API limit; cannot route fail-closed"
             exit 1
           fi
-      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
         id: filter
         with:
           list-files: json
@@ -405,6 +406,7 @@ jobs:
           echo "json={\"include\":[${include}]}" >> "$GITHUB_OUTPUT"
       - name: Verify CI observer and ORT contracts
         run: |
+          python3 scripts/ci-cache-maintenance.test.py
           python3 scripts/ci-observer.test.py
           python3 scripts/ci-timed-command.test.py
           python3 scripts/verify-ort-source-pin.test.py
@@ -442,14 +444,14 @@ jobs:
       - name: Restore portable FastEmbed model
         id: fastembed-portable-restore
         if: "steps.release-proof.outputs.verified-release-merge != 'true' && steps.test-plan.outputs.rust-ci-required == 'true'"
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: .fastembed_cache
           key: fastembed-bge-base-en-v1.5-q-v3-portable
           enableCrossOsArchive: "true"
       - name: Restore legacy Linux FastEmbed model
         if: "steps.release-proof.outputs.verified-release-merge != 'true' && steps.test-plan.outputs.rust-ci-required == 'true' && steps.fastembed-portable-restore.outputs.cache-hit != 'true'"
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-bge-base-en-v1.5-q-v2
@@ -461,7 +463,7 @@ jobs:
       # not a reason to fail a prepared and locally verified model snapshot.
       - name: Publish portable FastEmbed model for this run
         if: "steps.release-proof.outputs.verified-release-merge != 'true' && steps.test-plan.outputs.rust-ci-required == 'true'"
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
@@ -473,7 +475,7 @@ jobs:
       - name: Save portable FastEmbed model
         if: "steps.release-proof.outputs.verified-release-merge != 'true' && steps.test-plan.outputs.rust-ci-required == 'true' && steps.fastembed-portable-restore.outputs.cache-hit != 'true'"
         continue-on-error: true
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: .fastembed_cache
           key: fastembed-bge-base-en-v1.5-q-v3-portable
@@ -490,7 +492,7 @@ jobs:
     if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
@@ -503,7 +505,7 @@ jobs:
     if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
@@ -521,7 +523,10 @@ jobs:
           # non-PR backstop as the only producer so required PRs never churn
           # the repository cache budget.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy affected dependency closure
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py clippy --plan-json "$CI_TEST_PLAN"
       - name: Verify wenlan-mcp uses path dep for wenlan-types
         run: |
           SOURCE=$(cargo metadata --format-version 1 --locked \
@@ -549,12 +554,12 @@ jobs:
       SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
       RUSTC_WRAPPER: sccache
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Restore compiler inputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -565,7 +570,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
-          tool: cargo-nextest@0.9.140
+          tool: cargo-nextest
       - name: Build workspace-lib nextest archive
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
@@ -574,7 +579,7 @@ jobs:
             --plan-json "$CI_TEST_PLAN" \
             --archive-file "$RUNNER_TEMP/wenlan-workspace-lib-${GITHUB_RUN_ID}.tar.zst"
       - name: Publish workspace-lib nextest archive
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: wenlan-workspace-lib-nextest-${{ github.run_id }}
           path: ${{ runner.temp }}/wenlan-workspace-lib-${{ github.run_id }}.tar.zst
@@ -596,21 +601,21 @@ jobs:
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
       - name: Install cargo-nextest
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
-          tool: cargo-nextest@0.9.140
+          tool: cargo-nextest
       - name: Download workspace-lib nextest archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: wenlan-workspace-lib-nextest-${{ github.run_id }}
           path: ${{ runner.temp }}/wenlan-nextest-archive
       - name: Download portable FastEmbed model
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
@@ -652,7 +657,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
@@ -736,7 +741,7 @@ jobs:
       # the matrix starts. Each platform downloads that run-scoped artifact without
       # contending on the repository cache API.
       - name: Download portable FastEmbed model
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
@@ -791,7 +796,7 @@ jobs:
           if ($gateCode -ne 0) { throw "Windows functional scale gate failed" }
       - name: Upload Page lint scale receipt (Windows)
         if: always() && matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: task-19-lint-scale-${{ matrix.os }}-${{ github.sha }}
           path: ${{ runner.temp }}/task-19-memory-lint-debugger-*.txt
@@ -949,7 +954,7 @@ jobs:
       matrix:
         os: [macos-14, windows-2022]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
@@ -1027,12 +1032,12 @@ jobs:
       RUSTC_WRAPPER: sccache
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Restore compiler inputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -1045,7 +1050,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Download portable FastEmbed model
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
@@ -1054,7 +1059,7 @@ jobs:
         run: bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
       - name: Upload Page lint scale receipt (Linux)
         if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: task-19-lint-scale-ubuntu-24.04-${{ github.sha }}
           path: ${{ runner.temp }}/task-19-memory-lint-debugger-linux.txt
@@ -1145,7 +1150,7 @@ jobs:
       fail-fast: true
       matrix: ${{ fromJSON(needs.detect-changes.outputs.release-targets) }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
@@ -1247,17 +1252,14 @@ jobs:
           & scripts/smoke-windows.ps1 `
             -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
 
-  # Quarantine lane: exercises test files present in the tree but not wired
-  # into the required `test` job (dormant wenlan-mcp / wenlan-types
-  # integration suites). Excluded from `conclusion.needs` so it can never
-  # gate merges; continue-on-error keeps the checks-tab from flagging red.
-  # Promote a suite into `test` once proven stable here.
-  test-quarantine:
-    name: test-quarantine
+  # Required contract integrations for wenlan-mcp / wenlan-types. The planner
+  # selects affected packages through reverse dependency closure, or an exact
+  # integration target when only that target changed. Main keeps the full set.
+  contract-integration:
+    name: contract integration
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true'
     runs-on: ubuntu-24.04
-    continue-on-error: true
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
       SCCACHE_GHA_ENABLED: "true"
@@ -1265,16 +1267,16 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           # Reuse the required test lane's dependency inputs without producing
-          # a quarantine-specific cache or saving target artifacts.
+          # a contract-specific cache or saving target artifacts.
           shared-key: test
           cache-all-crates: "true"
           cache-targets: "false"
@@ -1286,12 +1288,14 @@ jobs:
       # real_router.rs boots a real MemoryDB. detect-changes owns the only cold
       # fetch; this lane must fail closed if the prepared snapshot is absent.
       - name: Download portable FastEmbed model
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
-      - name: Quarantined tests (wenlan-mcp + wenlan-types)
-        run: cargo nextest run -p wenlan-mcp -p wenlan-types
+      - name: Affected wenlan-mcp + wenlan-types integrations
+        env:
+          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
+        run: python3 scripts/ci_test_plan.py run --suite contract-integration --plan-json "$CI_TEST_PLAN"
 
   # Plugin artifacts have Rust-side consumers that are invisible to Cargo path
   # ownership. Keep their exact contract tests required without routing a
@@ -1309,12 +1313,12 @@ jobs:
       SCCACHE_GHA_RW_MODE: READ_ONLY
       RUSTC_WRAPPER: sccache
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Restore compiler inputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -1342,7 +1346,7 @@ jobs:
     if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.docs == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Validate README translations and eval provenance
         run: |
           python3 scripts/check-readme-translations.py
@@ -1361,7 +1365,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, fmt, lint, linux-nextest-build, linux-nextest, test, mcp-platform, canonical-acceptance, release-preflight, docs, plugin, plugin-rust-contract, npm]
+    needs: [detect-changes, fmt, lint, linux-nextest-build, linux-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -1392,6 +1396,7 @@ jobs:
           run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'
           run_workspace_lib='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true' }}'
           run_canonical='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true' }}'
+          run_contract='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true' }}'
           expect_job fmt "$run_rust" '${{ needs.fmt.result }}'
           expect_job lint "$run_rust" '${{ needs.lint.result }}'
           expect_job linux-nextest-build "$run_workspace_lib" '${{ needs.linux-nextest-build.result }}'
@@ -1399,6 +1404,7 @@ jobs:
           expect_job test "$run_platform" '${{ needs.test.result }}'
           expect_job mcp-platform '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}' '${{ needs.mcp-platform.result }}'
           expect_job canonical-acceptance "$run_canonical" '${{ needs.canonical-acceptance.result }}'
+          expect_job contract-integration "$run_contract" '${{ needs.contract-integration.result }}'
           expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'
           expect_job docs '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.docs == 'true' }}' '${{ needs.docs.result }}'
           expect_job plugin '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin == 'true' }}' '${{ needs.plugin.result }}'
@@ -1410,7 +1416,7 @@ jobs:
     if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Validate plugin.json schema
         run: |
           jq -e '.name and .version and .description and .repository' plugin/.claude-plugin/plugin.json
@@ -1435,8 +1441,8 @@ jobs:
     if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.npm == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
       - name: Validate wenlan-mcp npm package
