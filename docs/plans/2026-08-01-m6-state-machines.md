@@ -63,8 +63,8 @@ Four facts from that inventory shape the M6 design:
 
 1. **The reap predicate is phase-scoped by a literal.** A naive M6 acquire that copies the statement and forgets to change `'community'` would reap a live lease belonging to another phase. The M6 acquire must parameterise `phase` in **both** the `DELETE` and the `INSERT`. This is the single most likely PR-A implementation defect and G3's lease-takeover leg should have a case for it.
 2. **Acquisition is `INSERT ... ON CONFLICT DO NOTHING`, and zero affected rows is the "someone else holds it" signal.** That is already the CAS D6 wants; M6 reuses it verbatim rather than inventing a compare-and-swap.
-3. **Ownership is re-checked at finalize, inside the transaction, before anything is written** (`:13919`, ahead of the generation CAS at `:13948`). M6's finalizer keeps that ordering — lease check first, so a lost lease costs nothing.
-4. **`attempt` is declared but inert.** The only write is the literal `1` at `:13443`; no statement anywhere in the workspace updates it. M6 is free to give the column its intended meaning (decision **S0-2**).
+3. **Ownership is re-checked at finalize, inside the transaction, before anything is written** (`crates/wenlan-core/src/db.rs:13919`, ahead of the generation CAS at `:13948`). M6's finalizer keeps that ordering — lease check first, so a lost lease costs nothing.
+4. **`attempt` is declared but inert.** The only write is the literal `1` at `crates/wenlan-core/src/db.rs:13443`; no statement anywhere in the workspace updates it. M6 is free to give the column its intended meaning (decision **S0-2**).
 
 The lease's `input_generation` for the community phase is `space_graph_state.grouping_generation`, read at `crates/wenlan-core/src/db.rs:13393` and `:13415` under `WHERE space = ?1 AND dirty = 1`.
 
