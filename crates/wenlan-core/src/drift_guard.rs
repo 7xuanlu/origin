@@ -540,9 +540,13 @@ fn release_rust_cache_violations(workflow: &str) -> Vec<String> {
     }
     let windows_only = "${{ matrix.target == 'x86_64-pc-windows-msvc' }}";
     if rust_cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != Some("release-${{ matrix.target }}")
+        != Some("release-v2-${{ matrix.target }}")
+        || rust_cache.and_then(|step| step["with"]["workspaces"].as_str())
+            != Some(". -> target/${{ matrix.target }}")
         || rust_cache.and_then(|step| step["with"]["cache-all-crates"].as_str())
             != Some(windows_only)
+        || rust_cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str())
+            != Some("false")
         || rust_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some(windows_only)
         || rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
     {
@@ -4412,8 +4416,11 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     }
     let cache = job_step_using(&ci, "release-preflight", "Swatinem/rust-cache");
     if cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != Some("release-${{ matrix.target }}")
+        != Some("release-v2-${{ matrix.target }}")
+        || cache.and_then(|step| step["with"]["workspaces"].as_str())
+            != Some(". -> target/${{ matrix.target }}")
         || cache.and_then(|step| step["with"]["cache-all-crates"].as_str()) != Some("true")
+        || cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str()) != Some("false")
         || cache.and_then(|step| step["with"]["cache-targets"].as_str())
             != Some("${{ matrix.target == 'x86_64-pc-windows-msvc' }}")
         || cache.and_then(|step| step["with"]["save-if"].as_str())
@@ -4427,8 +4434,12 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     let windows_cache = "${{ matrix.target == 'x86_64-pc-windows-msvc' }}";
     if release_cache.and_then(|step| step["with"]["shared-key"].as_str())
         != cache.and_then(|step| step["with"]["shared-key"].as_str())
+        || release_cache.and_then(|step| step["with"]["workspaces"].as_str())
+            != cache.and_then(|step| step["with"]["workspaces"].as_str())
         || release_cache.and_then(|step| step["with"]["cache-all-crates"].as_str())
             != Some(windows_cache)
+        || release_cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str())
+            != Some("false")
         || release_cache.and_then(|step| step["with"]["cache-targets"].as_str())
             != Some(windows_cache)
         || release_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
@@ -4672,6 +4683,26 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "mutation must exercise {expected:?}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn release_preflight_contract_rejects_implicit_cross_target_cache_root() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace(
+            "          workspaces: . -> target/${{ matrix.target }}",
+            "          workspaces: . -> target",
+        );
+    let release =
+        std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release");
+    let violations = release_preflight_contract_violations(&ci, &release);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("target-scoped, capacity-bounded, and main-owned")),
+        "mutation must reject an implicit cross-target cache root: {violations:?}"
+    );
 }
 
 // ── Teeth #10: canonical acceptance runs beside the long workspace-lib lane ──
