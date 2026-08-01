@@ -434,32 +434,101 @@ them, stale/refresh enqueue state, the operation receipt
 |---|---|---|
 | indexed queries per route evaluation | ≤ 4 | `R-BUDGET-QUERIES` |
 | rows materialized per route evaluation | ≤ 512 | `R-BUDGET-ROWS` |
-| wall time per route evaluation | ≤ 50 ms | `R-BUDGET-MS` |
+| **index entries visited per route evaluation** | **≤ 2,176** | **`R-BUDGET-VISITS`** |
+| wall time per route evaluation | ≤ 50 ms, **hard** | `R-BUDGET-MS` |
 
 D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
 
-> **Decision S0-95 — the row counter counts rows *returned into process memory*,
-> and the proof obligation is discharged by three independent instruments, all
-> three required.**
+> **Decision S0-95 *(amended in rev 2, finding 11 — number kept)* — four
+> instruments, and the normative proof of *visited work* is SQLite's own
+> statement counters, not decoded rows and not `EXPLAIN QUERY PLAN`.**
 >
-> 1. **A process-side counter** incremented once per row actually decoded from
->    a `libsql::Rows` cursor. This is the normative number for
->    `R-BUDGET-ROWS` — it is the only one that measures what the process paid
->    for.
-> 2. **A query counter** incremented once per `query`/`execute` call inside the
->    route evaluation, for `R-BUDGET-QUERIES`.
-> 3. **`EXPLAIN QUERY PLAN` assertions** that each of the four queries uses the
->    named index from §8 and contains no `SCAN` over `edges`, `pages`, or
->    `provenance_roots`.
+> 1. **A process-side decoded-row counter**, incremented once per row decoded
+>    from a `libsql::Rows` cursor. Normative for `R-BUDGET-ROWS`, which is a
+>    *materialization* budget — D9's word is "materializes".
+> 2. **A query counter**, one per `query`/`execute` call in the evaluation, for
+>    `R-BUDGET-QUERIES`.
+> 3. **`SQLITE_STMTSTATUS_VM_STEP`** read per statement, summed across the four,
+>    normative for the new `R-BUDGET-VISITS`; and **`SQLITE_STMTSTATUS_FULLSCAN_STEP`
+>    asserted equal to zero** on every one of them.
+> 4. **`EXPLAIN QUERY PLAN` assertions** that each query uses the named index
+>    from §8 and contains no `SCAN` over `edges`, `pages`, or `provenance_roots`.
 >
-> Instrument (1) alone can be satisfied by a query that scans a million rows and
-> returns 512; instrument (3) alone proves index usage but not volume. Requiring
-> all three closes both gaps, and G6's `EXPLAIN QUERY PLAN` clause is instrument
-> (3), not the whole obligation.
+> **Why rev 1 was wrong here.** It made instrument (1) normative for the bound
+> and then said, in its own next sentence, that instrument (1) "can be satisfied
+> by a query that scans a million rows and returns 512" — naming the defect and
+> adopting it in the same decision. It then leaned on `EXPLAIN QUERY PLAN` to
+> close the gap, which it cannot: EQP reports the *plan*, not the *work*. A plan
+> that correctly uses an index range scan over a 5k-degree hub is a passing EQP
+> assertion and an unbounded traversal. D9 anticipated exactly this — *"`LIMIT` in
+> SQL text alone is not proof of visited work"* — and G6 asks for *"instrumented
+> row visits"* (`gp@wenlan-app:613`-`:614`), which is a runtime counter or it is
+> nothing.
+>
+> **What suffices, concretely, and what it costs.** SQLite exposes real visit
+> counters through `sqlite3_stmt_status`: `SQLITE_STMTSTATUS_VM_STEP` (4) scales
+> with work actually performed, and `SQLITE_STMTSTATUS_FULLSCAN_STEP` (1) is
+> non-zero exactly when a full scan happened. They are reachable from this
+> workspace, but not from the API it currently uses: `libsql::Statement`
+> (`libsql` 0.9.30, the workspace pin) exposes no status accessor, while
+> `libsql_sys::Statement::get_status(status: i32) -> i32` wraps
+> `sqlite3_stmt_status` directly. `libsql-sys` is **not** a direct dependency
+> today, so PR-A must add it — pinned to the identical `0.9.30`, because this
+> crate already carries a warning about exactly this hazard: rusqlite is
+> deliberately on `buildtime_bindgen` rather than `bundled` since *"having two
+> bundled SQLite builds in the same binary causes libsql's thread-mode assertion
+> to fail at runtime"* (`crates/wenlan-core/Cargo.toml:63`-`:67`). A second
+> SQLite arriving through a version-skewed `libsql-sys` would reproduce that
+> failure. If PR-A finds it cannot take the dependency, the honest consequence is
+> that G6's visit clause is not gated and must be raised as such — not that
+> decoded rows quietly become the proof again.
 
 The four queries are exactly: (a) candidate retrieval, (b) adjacency for the
 source endpoint, (c) adjacency for the candidate endpoints, (d) pair statistics
 for the candidate pairs.
+
+### 7.1 The 32 × 64 blowup, and why only the visit counter sees it (finding 11)
+
+Query (c) is where the frozen constants collide, and rev 1 did not do the
+arithmetic. Candidate retrieval returns **at most 32** pages
+(`gp@wenlan-app:284`) and adjacency is capped at **64 rows per endpoint**
+(`gp@wenlan-app:287`). Fetching adjacency for the candidate endpoints is therefore
+`32 × 64 = 2,048` rows in the worst case — **four times** `R-BUDGET-ROWS`, which
+is 512. Two frozen numbers and one derived number that cannot all hold.
+
+> **Decision S0-156 *(rev 2, finding 11)* — query (c) aggregates in SQLite and
+> returns one row per candidate, so the evaluation materializes ~160 rows while
+> visiting up to 2,048 index entries. `R-BUDGET-VISITS` is set at 2,176 and is
+> the bound that actually constrains the hub.** Common-neighbour needs
+> `|N(source) ∩ N(candidate)|` — a *count*, not the rows. Query (c) is
+>
+> ```sql
+> SELECT endpoint_id, count(*) FROM m6_adjacency
+>  WHERE space = ?1 AND endpoint_id IN (<the ≤32 candidates>)
+>    AND neighbor_id IN (<the ≤64 source neighbours>)
+>  GROUP BY endpoint_id
+> ```
+>
+> which materializes at most 32 rows. Whole-evaluation materialization is then
+> 32 (a) + 64 (b) + 32 (c) + ≤32 (d) = **≤ 160**, comfortably inside 512, and the
+> 512 budget stops being the binding constraint on anything.
+>
+> **This is the exact case that makes finding 11's two halves one insight.** The
+> aggregation moves the 2,048-row traversal *inside* SQLite, where a decoded-row
+> counter cannot see it: instrument (1) reports 32 and passes while the engine
+> walks 2,048 index entries. `EXPLAIN QUERY PLAN` also passes — it is a correct
+> indexed range scan. Only `SQLITE_STMTSTATUS_VM_STEP` moves. A design that
+> respects the materialization budget by pushing work into the engine is exactly
+> the design that makes visit instrumentation load-bearing rather than belt-and-
+> braces, and it is why D9 wrote *"`LIMIT` in SQL text alone is not proof of
+> visited work"* rather than trusting a row count.
+>
+> The 2,176 figure is `2,048` for query (c) plus `32 + 64 + 32` for the other
+> three, i.e. the arithmetic worst case with no slack — deliberately, so that a
+> regression that adds one unindexed lookup fails rather than fitting in a
+> margin. `R-BENCH-HUB` asserts it on the 5,000-degree hub, where every candidate
+> genuinely has a full 64-row adjacency and the worst case is real rather than
+> theoretical.
 
 ---
 
@@ -534,18 +603,32 @@ corpus."* A benchmark whose corpus is not reproducible is not a gate.
 
 | Metric | Pass | Fail | ID |
 |---|---|---|---|
-| route evaluation p50 | ≤ 25 ms | > 25 ms | `R-BENCH-P50` |
-| route evaluation p99 | ≤ 50 ms | > 50 ms | `R-BENCH-P99` |
+| route evaluation **max** | ≤ 50 ms | any evaluation > 50 ms | `R-BENCH-MAX` |
+| route evaluation p50 | reported | — (tracking only) | `R-BENCH-P50` |
+| route evaluation p99 | reported | — (tracking only) | `R-BENCH-P99` |
 | queries per evaluation | ≤ 4, always | any evaluation > 4 | `R-BENCH-Q` |
 | rows per evaluation | ≤ 512, always | any evaluation > 512 | `R-BENCH-ROWS` |
 | 5,000-degree hub evaluation | within all of the above | any breach | `R-BENCH-HUB` |
 
-> **Decision S0-98 — `R-BUDGET-MS` (50 ms) is a p99, and p50 gets its own
-> tighter limit at half of it.** D9 says "completes within 50 ms" without naming
-> a percentile. Read as a mean it is untestable against tail behavior, which is
-> where a hub blows up; read as a hard maximum it is flaky on a laptop under
-> load. p99 with a p50 companion is the reading that catches hub pathology
-> without failing on scheduler noise.
+> **Decision S0-98 *(amended in rev 2, finding 11 — number kept)* —
+> `R-BUDGET-MS` is a **hard** 50 ms limit. The p50 and p99 figures are reporting,
+> not the gate.** Rev 1 reinterpreted it as a p99 on the reasoning that a hard
+> maximum is flaky on a laptop under load. That reasoning is about measurement
+> conditions and the fix belongs there, not in the constant: D9 says *"completes
+> within `50 ms`"* (`gp@wenlan-app:293`) and G6 calls it *"the frozen `50 ms`
+> route budget"* (`gp@wenlan-app:613`). **Stage 0 does not get to reinterpret a
+> constant the contract froze** — a Stage-0 artifact that relaxes a frozen number
+> because the relaxed version is easier to measure is doing the thing S0-99
+> forbids one paragraph later, with the extra problem that a p99 over a
+> thousand-evaluation run tolerates ten breaches by construction, and hub
+> pathology is a tail event.
+>
+> Flakiness is answered by specifying the measurement instead: the gate is the
+> **maximum** over the Stage-0 representative 100k-memory/5k-page corpus, warm
+> cache, single evaluation at a time, no concurrent refinery turn — the same
+> fixture conditions D9 names. `R-BENCH-P50` and `R-BENCH-P99` remain in the
+> benchmark table as reported figures for tracking drift; neither is a pass
+> condition on its own, and `R-BENCH-MAX` is.
 
 > **Decision S0-99 — a benchmark failure stops for a Sol-reviewed contract
 > amendment and may not be fixed by tuning a constant.** This is D9's own rule
@@ -662,7 +745,8 @@ does, and worth one line in the PR-A notes.
 | exact score/margin/hysteresis boundary tests | §11, with `R-HYST-MARGIN` marked PR-A-new (F3) |
 | incremental pair state equals full recomputation | §5, S0-91 and S0-92 |
 | generated/inactive/retracted/legacy-ungrounded contribute zero | §1.2 table, all four **LIVE** |
-| `EXPLAIN QUERY PLAN` uses fixed indexes | §7 instrument (3), §8 index list |
+| `EXPLAIN QUERY PLAN` uses fixed indexes | §7 instrument (4), §8 index list |
+| instrumented row visits, not a textual `LIMIT` | §7 instrument (3) and §7.1 — `R-BUDGET-VISITS` via `SQLITE_STMTSTATUS_VM_STEP` |
 | no group forms more than 2016 pairs | §3, `R-HUB-MAXPAIRS` |
 | candidate retrieval never exceeds 32 | §4, `R-CAND-CAP` |
 | a provisional candidate is never retrieved or attached | §1.2 — **BLOCKED**; the clause is currently vacuously true, which is worse than failing, so the test must assert the predicate is *evaluated*, not merely that no provisional page appeared |
@@ -683,7 +767,7 @@ Every constant has an ID so an amendment has an address.
 `R-KIND-EXCLUDED` source/overview · `R-HYST-ASSIGN` 0.50 · `R-HYST-MARGIN` 0.10 ·
 `R-HYST-HOLD` 0.30 · `R-HYST-SIGNAL` direct-or-qualified ·
 `R-BUDGET-QUERIES` 4 · `R-BUDGET-ROWS` 512 · `R-BUDGET-MS` 50 ·
-`R-BENCH-P50` 25 ms · `R-BENCH-P99` 50 ms · `R-CORPUS-MEM` 100k ·
+`R-BENCH-MAX` 50 ms hard · `R-BENCH-P50` reported · `R-BENCH-P99` reported · `R-CORPUS-MEM` 100k ·
 `R-CORPUS-PAGE` 5k · `R-CORPUS-SPACE` 8 · `R-CORPUS-GROUP` 12k ·
 `R-CORPUS-ZIPF` 1.1 · `R-CORPUS-HUB` 5000/1024/65 · `R-CORPUS-FANOUT` 8 ·
 `R-CORPUS-AGE` 0–720 d · `R-CORPUS-GENFRAC` 15% · `R-CORPUS-RETFRAC` 5% ·
@@ -706,7 +790,11 @@ Every constant has an ID so an amendment has an address.
 `S0-95` three required instruments for the budget proof ·
 `S0-96` the route evaluation never touches `edges` directly ·
 `S0-97` the corpus is a seeded deterministic recipe identified by digest ·
-`S0-98` 50 ms is a p99, with a 25 ms p50 companion ·
+`S0-98` *(amended rev 2)* 50 ms is a hard maximum; p50/p99 are reporting only ·
 `S0-99` a benchmark failure is an amendment, never a tuning ·
 `S0-100` "qualified co-citation" means the 3-group floor was cleared ·
 `S0-101` an exact tie is bit-equality after 9-dp rounding.
+
+**Added in rev 2:** `S0-156` query (c) aggregates in SQLite; `R-BUDGET-VISITS` at
+2,176 is the bound that constrains the hub, and it is the only instrument that
+sees the 32 × 64 traversal.
