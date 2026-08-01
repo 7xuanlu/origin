@@ -882,3 +882,53 @@ async fn an_unreviewed_page_is_unaffected_by_the_digest_check() {
         "the machine axis is untouched by the review check"
     );
 }
+
+/// Matrix row 8. A page edited after being judged carries a verdict about text
+/// it no longer holds. The enqueue trigger queues the WORK; until a worker runs
+/// — on a substrate whose producer does not exist yet, never — `supported` keeps
+/// the new prose readable on the strength of a judgement of the old.
+///
+/// Asserted in both directions, because the fail-safe has to cut both ways. A
+/// stale `supported` must stop granting, and a stale failed verdict must stop
+/// hiding: v1's refutation is not evidence about v2, and letting it stand would
+/// archive a page over a judgement nobody ever made of it.
+#[tokio::test]
+async fn a_verdict_about_a_superseded_version_does_not_answer_for_the_new_one() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let before = db.page_truth_states(&ids(&["p1", "p2"])).await.unwrap();
+    assert_eq!(
+        before.get("p1").unwrap().support,
+        crate::truth_contract::Support::Supported
+    );
+    assert_eq!(
+        before.get("p2").unwrap().support,
+        crate::truth_contract::Support::Unsupported
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("UPDATE pages SET version = 2 WHERE id IN ('p1','p2')", ())
+            .await
+            .unwrap();
+    }
+
+    let after = db.page_truth_states(&ids(&["p1", "p2"])).await.unwrap();
+    assert_eq!(
+        after.get("p1").unwrap().support,
+        crate::truth_contract::Support::Unevaluated,
+        "a v1 `supported` verdict may not answer for v2's prose"
+    );
+    assert_eq!(
+        after.get("p2").unwrap().support,
+        crate::truth_contract::Support::Unevaluated,
+        "and a v1 refutation may not archive v2 either"
+    );
+
+    // The same call through the gate every adapter actually uses: the page that
+    // was being hidden on a superseded verdict gets its prose back.
+    let visible = db
+        .page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+        .await
+        .unwrap();
+    assert_eq!(visible.get("p2"), Some(&Visibility::Full));
+}

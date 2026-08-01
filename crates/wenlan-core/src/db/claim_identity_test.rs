@@ -764,6 +764,7 @@ async fn support_scenario_saving(db: &MemoryDB, page_id: &str, saved: &str) -> S
         memory_source_id: minted.memory_source_id,
         root_id: minted.root_id,
         verdict: super::claim_identity::SupportVerdict {
+            chunk_index: 0,
             source_version: 1,
             span_start: 0,
             span_end: ADDED_PROSE.len() as i64,
@@ -1453,6 +1454,7 @@ async fn ordinary_scenario(
         .unwrap();
     }
     super::claim_identity::SupportVerdict {
+        chunk_index: 0,
         source_version: 1,
         span_start: 0,
         span_end: EVIDENCE_PROSE.len() as i64,
@@ -1616,6 +1618,7 @@ async fn a_support_edge_may_not_cite_evidence_from_another_space() {
     }
 
     let verdict = super::claim_identity::SupportVerdict {
+        chunk_index: 0,
         source_version: 1,
         span_start: 0,
         span_end: ADDED_PROSE.len() as i64,
@@ -1652,4 +1655,94 @@ async fn a_support_edge_may_not_cite_evidence_from_another_space() {
         .unwrap();
     let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(count, 0, "a fenced write leaves no edge behind");
+}
+
+/// Weakening: resolve evidence by document instead of by chunk.
+///
+/// `source_id` names a DOCUMENT, and one document is several `memories` rows
+/// sharing that id — `store_raw_import_memories_batch` writes exactly that
+/// shape. A lookup on `source_id` alone therefore resolves to whichever chunk
+/// the query happens to return, and BOTH §4a checks then run against text the
+/// verdict never read: the root digest is recomputed over the wrong bytes, and
+/// the span offsets index into the wrong string.
+///
+/// The failure is fail-closed — valid support becomes unwritable rather than
+/// wrong — which is the same dead-substrate reading this rung exists to end, one
+/// layer down: the worker sees zero support edges and reports "no evidence
+/// found" when the truth is "the write was refused". The edge also could not
+/// have said which chunk was ever verified.
+#[tokio::test]
+async fn support_resolves_the_chunk_the_verdict_names() {
+    let (db, _temp) = db_with_substrate().await;
+    let mut scenario = support_scenario(&db, "sp_chunked").await;
+    {
+        let conn = db.conn.lock().await;
+        // The real evidence becomes chunk 1; a decoy paragraph of the same
+        // document takes chunk 0 — the row a document-wide lookup reaches first.
+        conn.execute(
+            "UPDATE memories SET chunk_index = 1 WHERE source_id = ?1",
+            libsql::params![scenario.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                                   last_modified, chunk_type, space)
+             SELECT 'decoy_' || id, 'A different paragraph of the same document.',
+                    source, source_id, title, 0, last_modified, chunk_type, space
+               FROM memories WHERE source_id = ?1 AND chunk_index = 1",
+            libsql::params![scenario.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    scenario.verdict.chunk_index = 1;
+
+    db.write_support_edge(
+        &scenario.claim_revision_id,
+        &scenario.memory_source_id,
+        &scenario.root_id,
+        &scenario.verdict,
+    )
+    .await
+    .expect("the chunk the verdict names is the chunk that must be verified");
+}
+
+/// And when the pair still cannot resolve to one row, refuse by name rather than
+/// pick. Nothing in the schema makes `(source_id, chunk_index)` unique — only a
+/// plain index on `source_id` exists — so the pair is a convention the rest of
+/// the tree keeps, not a guarantee this code may lean on. Choosing between two
+/// candidates would be the same silent arbitrary resolution the chunk index was
+/// added to remove.
+#[tokio::test]
+async fn support_refuses_evidence_that_resolves_to_two_rows() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp_ambiguous").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                                   last_modified, chunk_type, space)
+             SELECT 'twin_' || id, content, source, source_id, title, chunk_index,
+                    last_modified, chunk_type, space
+               FROM memories WHERE source_id = ?1",
+            libsql::params![scenario.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.root_id,
+            &scenario.verdict,
+        )
+        .await
+        .expect_err("an unresolvable chunk is not something a verdict may cite");
+    assert!(
+        error.to_string().contains("support_evidence_ambiguous"),
+        "the refusal has to name the ambiguity: {error}"
+    );
 }

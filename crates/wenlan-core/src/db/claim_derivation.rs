@@ -157,6 +157,113 @@ pub(super) const ENQUEUE_TRIGGERS: &str = "
     END;
 ";
 
+/// The pages whose claims are supported by one memory, as a subquery yielding
+/// `page_id`.
+///
+/// Deliberately **not** scoped to `valid_until IS NULL`. Two triggers fire on
+/// each of these events — the retraction in `claim_identity`, and the demotion
+/// here — and SQLite does not define which runs first. A validity filter would
+/// therefore make this find every affected page or none of them depending on an
+/// ordering nobody controls. Matching regardless of validity is order-independent
+/// and errs toward re-deriving a page whose edge was already withdrawn, which
+/// costs one derivation and cannot cost correctness.
+fn pages_supported_by_memory(memory_ref: &str) -> String {
+    format!(
+        "SELECT c.page_id
+                       FROM edges e
+                       JOIN claim_revisions cr ON cr.claim_revision_id = e.src_id
+                       JOIN claims c ON c.claim_id = cr.claim_id
+                      WHERE e.edge_type = 'supports'
+                        AND e.src_kind = 'claim_revision'
+                        AND e.dst_kind = 'memory'
+                        AND e.dst_id = {memory_ref}"
+    )
+}
+
+/// Demote the named pages out of `supported`, then queue them for re-derivation.
+///
+/// **Demotion is synchronous and enqueueing is not enough on its own.** Row 13
+/// is "a supporting memory is deleted or moved": the edge is retracted, but
+/// `page_truth_state` still says `supported` and every reader believes it until
+/// some worker gets around to the job. On a branch whose producer does not exist
+/// yet that is *forever*. Queueing the work and demoting the claim are answers
+/// to different questions — when will we know again, and what do we say in the
+/// meantime — so this does both.
+///
+/// `evaluated_at = NULL` is the whole safety argument for the demotion. It lands
+/// the page on `Unevaluated`, not `Unsupported`: we have stopped asserting the
+/// evidence backs the prose, without asserting that it doesn't. Only the second
+/// costs a page its projected file, and losing a file because *our* evidence
+/// bookkeeping changed is the mass-flip failure this rung exists to prevent.
+fn support_demotion_body(affected_pages: &str) -> String {
+    format!(
+        "
+                 UPDATE page_truth_state
+                    SET support_status = 'provisional',
+                        provisional_reason = 'supporting evidence was withdrawn; this page \
+                                              needs re-derivation',
+                        evaluated_at = NULL,
+                        updated_at = CAST(strftime('%s','now') AS INTEGER)
+                  WHERE support_status = 'supported'
+                    AND page_id IN ({affected_pages});
+
+                 INSERT INTO claim_derivation_jobs
+                     (job_id, page_id, page_version, status, attempts, created_at, updated_at)
+                 SELECT p.id || ':' || p.version, p.id, p.version, 'pending', 0,
+                        CAST(strftime('%s','now') AS INTEGER),
+                        CAST(strftime('%s','now') AS INTEGER)
+                   FROM pages p
+                  WHERE p.status = 'active'
+                    AND p.kind <> 'entity'
+                    AND p.id IN ({affected_pages})
+                 ON CONFLICT(job_id) DO UPDATE SET
+                     status = 'pending',
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     attempts = 0,
+                     last_error = NULL,
+                     updated_at = CAST(strftime('%s','now') AS INTEGER)
+                  WHERE claim_derivation_jobs.status = 'done';
+        "
+    )
+}
+
+/// Pages whose published `supported` verdict no longer survives a fresh reading
+/// of §1 condition 3, as a subquery yielding `(page_id, page_version)`.
+///
+/// This is the reconciliation half of rows 13 and 15. A marker check cannot see
+/// either of them: the marker is about *extraction*, and both rows are about
+/// evidence that stopped qualifying afterwards — an edge retracted when its
+/// memory was deleted, or a threshold constant that rose under an edge nobody
+/// touched. A page in that state has a current marker AND a `done` job, so the
+/// marker-only scan skipped it and it stayed `supported` forever.
+///
+/// `?1` is the live threshold, deliberately, for the same reason
+/// [`SUPPORT_THRESHOLD`] is compared live everywhere else: comparing each edge
+/// to the bar it was written under makes every stored verdict self-certifying.
+const DRIFTED_SUPPORTED_PAGES: &str = "
+    SELECT p.id AS drifted_page_id, p.version AS drifted_page_version
+      FROM pages p
+      JOIN page_truth_state t
+        ON t.page_id = p.id AND t.page_version = p.version
+     WHERE p.status = 'active'
+       AND p.kind <> 'entity'
+       AND t.support_status = 'supported'
+       AND EXISTS (
+           SELECT 1 FROM page_version_claims pvc
+            WHERE pvc.page_id = p.id AND pvc.page_version = p.version
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                   WHERE e.edge_type = 'supports'
+                     AND e.src_kind = 'claim_revision'
+                     AND e.src_id = pvc.claim_revision_id
+                     AND e.valid_until IS NULL
+                     AND e.superseded_by IS NULL
+                     AND json_extract(e.payload, '$.score') >= ?1
+              )
+       )
+";
+
 impl MemoryDB {
     /// Install the enqueue triggers. Idempotent; safe on a resumed migration.
     pub(super) async fn ensure_claim_derivation_triggers(
@@ -164,6 +271,62 @@ impl MemoryDB {
     ) -> Result<(), WenlanError> {
         tx.execute_batch(ENQUEUE_TRIGGERS).await.map_err(|error| {
             WenlanError::VectorDb(format!("m105 claim-derivation triggers: {error}"))
+        })?;
+        Ok(())
+    }
+
+    /// Install the support-invalidation demotion triggers (migration 105).
+    ///
+    /// Separate triggers with separate names rather than an edit to the
+    /// retraction triggers `ensure_claim_edge_lifecycle_triggers` already
+    /// installs: `CREATE TRIGGER IF NOT EXISTS` will not replace a trigger that
+    /// exists, so amending those bodies would mean dropping and recreating
+    /// proven objects on every install. These are additive and their effect does
+    /// not depend on firing before or after the retraction — see
+    /// [`pages_supported_by_memory`].
+    ///
+    /// There is no page-delete twin on purpose. `page_truth_state` and
+    /// `claim_derivation_jobs` both cascade from `pages`, so a deleted page's
+    /// truth row and queue entry are already gone; demoting a row on its way out
+    /// and queueing derivation for a page that will not exist are both no-ops
+    /// dressed as care.
+    pub(super) async fn ensure_support_invalidation_triggers(
+        tx: &libsql::Transaction,
+    ) -> Result<(), WenlanError> {
+        tx.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS m5_demote_support_on_memory_delete
+             BEFORE DELETE ON memories
+             WHEN EXISTS (
+                      SELECT 1 FROM edges
+                       WHERE edge_type = 'supports' AND src_kind = 'claim_revision'
+                         AND lineage = 'evidence'
+                         AND dst_id = OLD.source_id
+                  )
+              AND NOT EXISTS (
+                      SELECT 1 FROM memories
+                       WHERE source_id = OLD.source_id AND id <> OLD.id
+                  )
+             BEGIN{delete_body}END;
+
+             CREATE TRIGGER IF NOT EXISTS m5_demote_support_on_memory_space_move
+             AFTER UPDATE OF space ON memories
+             WHEN NEW.space IS NOT OLD.space
+             BEGIN{memory_move_body}END;
+
+             -- The page's own move retracts its claims' support edges, because
+             -- they carry the space they were written under. Same loss of
+             -- support, reached from the other end.
+             CREATE TRIGGER IF NOT EXISTS m5_demote_support_on_page_space_move
+             AFTER UPDATE OF space ON pages
+             WHEN NEW.space IS NOT OLD.space
+             BEGIN{page_move_body}END;",
+            delete_body = support_demotion_body(&pages_supported_by_memory("OLD.source_id")),
+            memory_move_body = support_demotion_body(&pages_supported_by_memory("NEW.source_id")),
+            page_move_body = support_demotion_body("SELECT NEW.id"),
+        ))
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("m105 support-invalidation triggers: {error}"))
         })?;
         Ok(())
     }
@@ -197,6 +360,24 @@ impl MemoryDB {
         .await
         .map_err(|error| WenlanError::VectorDb(format!("derivation backlog sweep: {error}")))?;
 
+        // The same stale-completion argument as above, for the drift rows: a
+        // page whose support no longer clears the live bar has a `done` job
+        // occupying its unique (page_id, page_version) slot, and that row would
+        // block the re-enqueue below exactly the way a stale marker's does.
+        conn.execute(
+            &format!(
+                "DELETE FROM claim_derivation_jobs
+                  WHERE status = 'done'
+                    AND (page_id, page_version) IN (
+                        SELECT drifted_page_id, drifted_page_version
+                          FROM ({DRIFTED_SUPPORTED_PAGES})
+                    )"
+            ),
+            libsql::params![SUPPORT_THRESHOLD],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("derivation drift sweep: {error}")))?;
+
         let created = conn
             .execute(
                 "INSERT INTO claim_derivation_jobs
@@ -224,7 +405,61 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("derivation backlog enqueue: {error}"))
             })?;
 
-        Ok(created as usize)
+        let re_derive = conn
+            .execute(
+                &format!(
+                    "INSERT INTO claim_derivation_jobs
+                         (job_id, page_id, page_version, status, attempts, created_at, updated_at)
+                     SELECT d.drifted_page_id || ':' || d.drifted_page_version,
+                            d.drifted_page_id, d.drifted_page_version, 'pending', 0, ?2, ?2
+                       FROM ({DRIFTED_SUPPORTED_PAGES}) d
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM claim_derivation_jobs j
+                           WHERE j.page_id = d.drifted_page_id
+                             AND j.page_version = d.drifted_page_version
+                      )
+                      ORDER BY d.drifted_page_id
+                      LIMIT ?3"
+                ),
+                libsql::params![SUPPORT_THRESHOLD, now, limit],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("derivation drift enqueue: {error}")))?;
+
+        Ok((created + re_derive) as usize)
+    }
+
+    /// Run [`Self::enqueue_stale_derivation_jobs`] until the backlog is drained,
+    /// in batches of `batch`. Returns the total enqueued.
+    ///
+    /// The bound on a single scan is a boot-latency bound, not a policy: the
+    /// migration runs while the daemon is still coming up, and a full scan of a
+    /// large vault would hold every foreground request behind it. Bounding it
+    /// and then never continuing is a different thing entirely — a vault with
+    /// 1,200 pages had 500 queued and 700 that no scan would ever reach, so the
+    /// backlog sweep converged on a *subset* and the queue was quietly partial
+    /// on exactly the installs it exists for. This is the continuation: the
+    /// batch keeps each statement short, the loop keeps the sweep total.
+    ///
+    /// Termination is bounded by the data, not by trust. A pass that fills its
+    /// batch may have more behind it; a pass that comes back short has reached
+    /// the end, because every row a pass creates fails the next pass's
+    /// `NOT EXISTS` guard. Worst case is `ceil(pages / batch)` passes.
+    ///
+    /// ponytail: each pass restarts the `pages` scan, so draining a vault of n
+    /// pages costs O(n²/batch) index probes. Irrelevant at the thousands of
+    /// pages a personal vault holds; if one ever outgrows that, the fix is a
+    /// keyset cursor on `p.id`, not a bigger batch.
+    pub async fn drain_stale_derivation_jobs(&self, batch: i64) -> Result<usize, WenlanError> {
+        let batch = batch.max(1);
+        let mut total = 0usize;
+        loop {
+            let created = self.enqueue_stale_derivation_jobs(batch).await?;
+            total += created;
+            if created < batch as usize {
+                return Ok(total);
+            }
+        }
     }
 
     /// Take the oldest claimable job, or `None` when the queue is drained.
@@ -383,7 +618,23 @@ impl MemoryDB {
         page_version: i64,
     ) -> Result<SupportOutcome, WenlanError> {
         let conn = self.conn.lock().await;
+        Self::evaluate_support_on(&conn, page_id, page_version).await
+    }
 
+    /// [`Self::evaluate_page_support`] over a connection the caller already
+    /// holds.
+    ///
+    /// It exists so [`Self::finalize_page_support`] can recompute the whole
+    /// verdict *inside its own transaction* rather than trust one handed to it.
+    /// Everything the verdict rests on — the page digest, the marker, the
+    /// inventory, edge validity, the live threshold — can move between phase 2
+    /// and phase 3 without the page version changing, so re-reading the page
+    /// version alone was never enough to make a publication safe.
+    async fn evaluate_support_on(
+        conn: &libsql::Connection,
+        page_id: &str,
+        page_version: i64,
+    ) -> Result<SupportOutcome, WenlanError> {
         let (live_version, live_digest) = {
             let mut rows = conn
                 .query(
@@ -619,13 +870,35 @@ impl MemoryDB {
     /// the cutover generation advanced, which is the whole-vault archive this
     /// worker exists to make impossible.
     ///
-    /// The page version is re-read under the transaction and the write is
-    /// abandoned if it moved: model work happened outside any lock, so the text
-    /// the verdict describes may no longer be the text on disk.
+    /// **Publication is bound to the lease, and to evidence that has not moved.**
+    /// Two guards run inside the transaction, before anything is written:
+    ///
+    /// 1. The job named by `job_id` must still be `leased` by `owner`. The
+    ///    `lease_owner` guard on [`Self::finish_derivation_job`] protected only
+    ///    the *queue*, not the truth row: a worker that stalled past its lease
+    ///    could be reclaimed, overtaken by a worker that reached the opposite
+    ///    verdict, and still overwrite that published verdict on waking. Its
+    ///    later `finish` failed, but the stale truth write had already landed.
+    ///    A parked job's former worker had the same opening.
+    /// 2. The verdict is **recomputed here** and must equal the one handed in.
+    ///    Re-reading the page version cannot close this: a support edge can be
+    ///    retracted, a marker can be superseded, and the threshold constant can
+    ///    rise, all without the page version moving. Recomputing under the same
+    ///    transaction that writes is the only comparison that covers every input
+    ///    at once, and it costs one extra read of rows this function was already
+    ///    going to touch.
+    ///
+    /// Both guards *refuse* rather than repair — a mismatch returns `false` and
+    /// writes nothing, leaving the job for whoever legitimately holds it. This
+    /// module refuses rather than repairs everywhere else for the same reason:
+    /// a worker that publishes a verdict it did not compute is indistinguishable
+    /// from one that did.
     pub async fn finalize_page_support(
         &self,
         page_id: &str,
         page_version: i64,
+        job_id: &str,
+        owner: &str,
         outcome: &SupportOutcome,
     ) -> Result<bool, WenlanError> {
         if let SupportOutcome::NoPublish { .. } = outcome {
@@ -639,26 +912,38 @@ impl MemoryDB {
             .map_err(|error| WenlanError::VectorDb(format!("support finalize begin: {error}")))?;
 
         let published = async {
-            let live_version: Option<i64> = {
+            // Guard 1: the lease. `page_id`/`page_version` are matched too, so a
+            // job id cannot be spent against a different page than the one it
+            // names.
+            let holds_lease = {
                 let mut rows = tx
                     .query(
-                        "SELECT version FROM pages WHERE id = ?1 AND status = 'active'",
-                        libsql::params![page_id],
+                        "SELECT 1 FROM claim_derivation_jobs
+                          WHERE job_id = ?1 AND page_id = ?2 AND page_version = ?3
+                            AND status = 'leased' AND lease_owner = ?4",
+                        libsql::params![job_id, page_id, page_version, owner],
                     )
                     .await
                     .map_err(|error| {
-                        WenlanError::VectorDb(format!("support finalize page: {error}"))
+                        WenlanError::VectorDb(format!("support finalize lease: {error}"))
                     })?;
-                match rows.next().await.map_err(|error| {
-                    WenlanError::VectorDb(format!("support finalize page decode: {error}"))
-                })? {
-                    Some(row) => Some(row.get(0).map_err(|error| {
-                        WenlanError::VectorDb(format!("support finalize page decode: {error}"))
-                    })?),
-                    None => None,
-                }
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support finalize lease decode: {error}"))
+                    })?
+                    .is_some()
             };
-            if live_version != Some(page_version) {
+            if !holds_lease {
+                return Ok(false);
+            }
+
+            // Guard 2: the verdict, recomputed against the state this
+            // transaction is about to write into. A moved page reaches here as
+            // `NoPublish`, which never equals a publishable outcome, so the
+            // version check the old code did by hand is subsumed rather than
+            // dropped.
+            if Self::evaluate_support_on(&tx, page_id, page_version).await? != *outcome {
                 return Ok(false);
             }
 
@@ -667,8 +952,13 @@ impl MemoryDB {
                 SupportOutcome::Refuted { reason } => {
                     ("provisional", Some(reason.clone()), Some(now))
                 }
-                // No stamp: `evaluated_at` stays whatever it was, which for a
-                // page that has never been judged is NULL.
+                // No stamp, and the stored one is CLEARED rather than kept.
+                // `evaluated_at` answers "has this page version been judged",
+                // and `page_truth_state` holds one row per PAGE, so carrying the
+                // old value forward answers it about a version that is gone: a
+                // v1 `Refuted` stamp surviving a v2 `Unevaluated` publish makes
+                // v2 read as Unsupported and costs it its file — the exact
+                // inversion of the fail-safe this variant exists to give.
                 SupportOutcome::Unevaluated { reason } => {
                     ("provisional", Some(reason.clone()), None)
                 }
@@ -689,7 +979,7 @@ impl MemoryDB {
                      page_version = ?2,
                      support_status = ?3,
                      provisional_reason = ?4,
-                     evaluated_at = COALESCE(?5, page_truth_state.evaluated_at),
+                     evaluated_at = ?5,
                      human_reviewed = CASE
                          WHEN page_truth_state.reviewed_page_version = ?2
                          THEN page_truth_state.human_reviewed ELSE 0 END,
@@ -727,6 +1017,15 @@ impl MemoryDB {
     /// derived), which is the honest record of "we could not judge this" — a
     /// worker that cannot finish must never be the reason a page is called
     /// Unsupported.
+    ///
+    /// A `leased` job is only parked once its lease has **expired**. Attempts
+    /// are counted at lease time (see [`MAX_ATTEMPTS`]), so the worker holding
+    /// the last one is at `attempts == MAX_ATTEMPTS` from the moment it starts:
+    /// parking on the count alone retires a run that is healthy and still going,
+    /// and its finish then fails for a reason that has nothing to do with it.
+    /// Four daemon restarts followed by one good run is an ordinary history, not
+    /// a poison item. Expiry is what distinguishes the two, so expiry is what
+    /// this waits for; a `pending` job has no run to interrupt and parks at once.
     pub async fn park_exhausted_derivation_jobs(&self) -> Result<usize, WenlanError> {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().await;
@@ -737,7 +1036,11 @@ impl MemoryDB {
                         lease_owner = NULL,
                         lease_expires_at = NULL,
                         updated_at = ?1
-                  WHERE status IN ('pending','leased') AND attempts >= ?2",
+                  WHERE attempts >= ?2
+                    AND (status = 'pending'
+                         OR (status = 'leased'
+                             AND lease_expires_at IS NOT NULL
+                             AND lease_expires_at <= ?1))",
                 libsql::params![now, MAX_ATTEMPTS],
             )
             .await

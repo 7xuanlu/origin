@@ -11872,11 +11872,16 @@ impl MemoryDB {
     /// Bring the derivation queue to life: enqueue triggers for future pages,
     /// then one backlog sweep so the pages that already exist are on the list.
     ///
-    /// The sweep is bounded rather than exhaustive. Migration runs at daemon
-    /// startup holding the single connection's mutex, and a vault with tens of
-    /// thousands of pages would hold every foreground request behind a full
-    /// scan; the ambient lane re-runs the sweep each turn, so a large backlog
-    /// fills in over the following ticks instead of at boot.
+    /// The sweep here is bounded rather than exhaustive. Migration runs at
+    /// daemon startup holding the single connection's mutex, and a vault with
+    /// tens of thousands of pages would hold every foreground request behind a
+    /// full scan.
+    ///
+    /// The bound needs a continuation or it is a silent truncation: on a vault
+    /// of 1,200 pages this queues 500 and the other 700 are reachable only by
+    /// being edited. [`MemoryDB::drain_stale_derivation_jobs`] is that
+    /// continuation, and the daemon calls it once per boot (see
+    /// `wenlan-server`'s startup), after the port work that must not wait on it.
     async fn migrate_105_claim_derivation_queue(&self, _prior: i64) -> Result<(), WenlanError> {
         {
             let conn = self.conn.lock().await;
@@ -11885,6 +11890,7 @@ impl MemoryDB {
                 .await
                 .map_err(|error| WenlanError::VectorDb(format!("m105 begin: {error}")))?;
             Self::ensure_claim_derivation_triggers(&tx).await?;
+            Self::ensure_support_invalidation_triggers(&tx).await?;
             tx.commit()
                 .await
                 .map_err(|error| WenlanError::VectorDb(format!("m105 commit: {error}")))?;

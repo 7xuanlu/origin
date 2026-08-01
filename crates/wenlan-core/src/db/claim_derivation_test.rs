@@ -581,6 +581,39 @@ async fn support_claim(db: &MemoryDB, page_id: &str, revision_id: &str, score: f
     .unwrap();
 }
 
+/// Put one page's job in the state a worker holds it in, and return its id.
+///
+/// Publication is bound to the lease, so every test that finalizes has to hold
+/// one. Leasing by `(page_id, page_version)` rather than through
+/// `lease_next_derivation_job` keeps a multi-page test from having to guess the
+/// queue order, and keeps the version straight on a page that has jobs for two.
+/// The real lease path has its own teeth above; this is a fixture.
+async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str) -> String {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "UPDATE claim_derivation_jobs
+                SET status = 'leased', lease_owner = ?3,
+                    lease_expires_at = ?4, attempts = attempts + 1, updated_at = ?4
+              WHERE page_id = ?1 AND page_version = ?2
+              RETURNING job_id",
+            libsql::params![
+                page_id,
+                page_version,
+                owner,
+                chrono::Utc::now().timestamp() + 600
+            ],
+        )
+        .await
+        .unwrap();
+    rows.next()
+        .await
+        .unwrap()
+        .expect("the page must have a queued job to lease")
+        .get::<String>(0)
+        .unwrap()
+}
+
 async fn truth_row(db: &MemoryDB, page_id: &str) -> Option<(String, Option<i64>, i64)> {
     let conn = db.conn.lock().await;
     let mut rows = conn
@@ -612,8 +645,9 @@ async fn a_fully_supported_page_is_supported() {
         db.evaluate_page_support("p1", 1).await.unwrap(),
         SupportOutcome::Supported
     );
+    let job = lease_page(&db, "p1", 1, "worker").await;
     assert!(db
-        .finalize_page_support("p1", 1, &SupportOutcome::Supported)
+        .finalize_page_support("p1", 1, &job, "worker", &SupportOutcome::Supported)
         .await
         .unwrap());
     let (status, evaluated, reviewed) = truth_row(&db, "p1").await.unwrap();
@@ -668,6 +702,7 @@ async fn an_unfiled_page_can_be_supported_by_unfiled_evidence() {
         .unwrap();
     }
     let verdict = super::claim_identity::SupportVerdict {
+        chunk_index: 0,
         source_version: 1,
         span_start: 0,
         span_end: ADDED.len() as i64,
@@ -740,7 +775,10 @@ async fn a_claim_judged_and_found_wanting_refutes_the_page() {
         reason.contains("judged and fell short"),
         "the stored reason must say the evidence was weighed: {reason}"
     );
-    db.finalize_page_support("p1", 1, &outcome).await.unwrap();
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    db.finalize_page_support("p1", 1, &job, "worker", &outcome)
+        .await
+        .unwrap();
     let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
     assert_eq!(status, "provisional");
     assert!(
@@ -772,7 +810,10 @@ async fn a_claim_nobody_judged_leaves_the_page_unevaluated() {
         "the stored reason must name the gathering gap: {reason}"
     );
 
-    db.finalize_page_support("p1", 1, &outcome).await.unwrap();
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    db.finalize_page_support("p1", 1, &job, "worker", &outcome)
+        .await
+        .unwrap();
     let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
     assert_eq!(status, "provisional");
     assert!(
@@ -796,7 +837,10 @@ async fn the_two_provisional_reasons_are_distinguishable_on_disk() {
 
     for id in ["ungathered", "refuted"] {
         let outcome = db.evaluate_page_support(id, 1).await.unwrap();
-        db.finalize_page_support(id, 1, &outcome).await.unwrap();
+        let job = lease_page(&db, id, 1, "worker").await;
+        db.finalize_page_support(id, 1, &job, "worker", &outcome)
+            .await
+            .unwrap();
     }
 
     let conn = db.conn.lock().await;
@@ -879,7 +923,10 @@ async fn a_worker_that_resolves_no_evidence_flips_nothing() {
             matches!(outcome, SupportOutcome::Unevaluated { .. }),
             "{id} got {outcome:?}"
         );
-        db.finalize_page_support(id, 1, &outcome).await.unwrap();
+        let job = lease_page(&db, id, 1, "worker").await;
+        db.finalize_page_support(id, 1, &job, "worker", &outcome)
+            .await
+            .unwrap();
     }
 
     for id in ["p1", "p2", "p3"] {
@@ -918,7 +965,10 @@ async fn an_empty_inventory_is_unevaluated_not_refuted() {
     derive_page(&db, "p1", 0).await;
 
     let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
-    db.finalize_page_support("p1", 1, &outcome).await.unwrap();
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    db.finalize_page_support("p1", 1, &job, "worker", &outcome)
+        .await
+        .unwrap();
     let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
     assert_eq!(status, "provisional");
     assert!(evaluated.is_none());
@@ -999,8 +1049,11 @@ async fn a_partial_derivation_publishes_nothing() {
         matches!(outcome, SupportOutcome::NoPublish { .. }),
         "got {outcome:?}"
     );
+    let job = lease_page(&db, "p1", 1, "worker").await;
     assert!(
-        !db.finalize_page_support("p1", 1, &outcome).await.unwrap(),
+        !db.finalize_page_support("p1", 1, &job, "worker", &outcome)
+            .await
+            .unwrap(),
         "a no-publish outcome must write nothing at all"
     );
     assert!(truth_row(&db, "p1").await.is_none());
@@ -1025,8 +1078,9 @@ async fn a_verdict_for_a_superseded_version_is_not_published() {
         db.evaluate_page_support("p1", 1).await.unwrap(),
         SupportOutcome::NoPublish { .. }
     ));
+    let job = lease_page(&db, "p1", 1, "worker").await;
     assert!(
-        !db.finalize_page_support("p1", 1, &SupportOutcome::Supported)
+        !db.finalize_page_support("p1", 1, &job, "worker", &SupportOutcome::Supported)
             .await
             .unwrap(),
         "finalization re-checks the version under its own transaction"
@@ -1054,10 +1108,450 @@ async fn publishing_support_leaves_a_current_human_review_intact() {
         .unwrap();
     }
 
-    db.finalize_page_support("p1", 1, &SupportOutcome::Supported)
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    db.finalize_page_support("p1", 1, &job, "worker", &SupportOutcome::Supported)
         .await
         .unwrap();
     let (status, _, reviewed) = truth_row(&db, "p1").await.unwrap();
     assert_eq!(status, "supported");
     assert_eq!(reviewed, 1, "a current approval survives a support write");
+}
+
+// ---------------------------------------------------------------------------
+// Publication is bound to the lease and to evidence that has not moved
+// ---------------------------------------------------------------------------
+
+/// The reclaim scenario end to end. Worker A evaluates the page as Supported and
+/// stalls past its lease. B reclaims it, finds the support edge retracted,
+/// evaluates Refuted, and publishes. A wakes and tries to publish its stale
+/// Supported — and the PAGE VERSION NEVER MOVED, so the re-read `finalize` used
+/// to do could not tell the two apart. Its `finish` failing afterwards is no
+/// comfort: the truth row is already wrong by then.
+#[tokio::test]
+async fn a_reclaimed_job_cannot_publish_its_old_owners_verdict() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    let job = db
+        .lease_next_derivation_job("worker-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(stale, SupportOutcome::Supported);
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET lease_expires_at = 1 WHERE job_id = ?1",
+            libsql::params![job.job_id.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET valid_until = 1 WHERE edge_type = 'supports'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    let reclaimed = db
+        .lease_next_derivation_job("worker-b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.job_id, job.job_id);
+    let fresh = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert!(
+        matches!(fresh, SupportOutcome::Refuted { .. }),
+        "got {fresh:?}"
+    );
+    assert!(db
+        .finalize_page_support("p1", 1, &reclaimed.job_id, "worker-b", &fresh)
+        .await
+        .unwrap());
+
+    assert!(
+        !db.finalize_page_support("p1", 1, &job.job_id, "worker-a", &stale)
+            .await
+            .unwrap(),
+        "a worker whose lease was reclaimed must not publish over its successor"
+    );
+    let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
+    assert_eq!(status, "provisional", "worker B's verdict has to survive");
+    assert!(evaluated.is_some());
+}
+
+/// The lease guard, isolated. Here the evidence never changes, so the verdict
+/// recomputed at finalization is byte-identical to the one worker A holds —
+/// nothing but the job state can refuse this write. A parked job is retired for
+/// a human; its former worker publishing into it is the same intrusion as the
+/// reclaim case with none of the other signals present.
+#[tokio::test]
+async fn a_parked_jobs_former_worker_cannot_publish() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    let job = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(outcome, SupportOutcome::Supported);
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET attempts = ?1, lease_expires_at = 1",
+            libsql::params![MAX_ATTEMPTS],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(db.park_exhausted_derivation_jobs().await.unwrap(), 1);
+
+    assert!(
+        !db.finalize_page_support("p1", 1, &job.job_id, "worker", &outcome)
+            .await
+            .unwrap(),
+        "a parked job has no holder, so nobody may publish through it"
+    );
+    assert!(
+        truth_row(&db, "p1").await.is_none(),
+        "and the page keeps the state parking promised to leave alone"
+    );
+}
+
+/// The evidence guard, isolated. The worker holds a live, unexpired lease the
+/// whole time — the job state is impeccable — but a support edge was retracted
+/// between phase 2 and phase 3. The page version cannot see that: support moves
+/// without the prose moving, which is exactly why re-reading the version was
+/// never enough to make a publication safe.
+#[tokio::test]
+async fn evidence_that_moved_after_evaluation_is_not_published() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    let job = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(outcome, SupportOutcome::Supported);
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET valid_until = 1 WHERE edge_type = 'supports'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(
+        !db.finalize_page_support("p1", 1, &job.job_id, "worker", &outcome)
+            .await
+            .unwrap(),
+        "a verdict whose evidence is gone must not be published on the strength \
+         of an unchanged page version"
+    );
+    assert!(truth_row(&db, "p1").await.is_none());
+}
+
+/// F2's full surface, not merely its easy half. The extractor writes two claims
+/// and the judge reaches only one of them — a timeout, a deferral, a malformed
+/// response, anything that ends without a score. The judged one fell short, so
+/// there IS a real verdict in this inventory, and the tempting reading is
+/// "something was judged and failed, so the page is Refuted". It is not: one
+/// unscored claim means the derivation never ran to completion over this page,
+/// and Refuted stamps `evaluated_at` and costs the page its file for a gap in
+/// OUR pipeline. The unjudged claim has to win.
+#[tokio::test]
+async fn a_judged_short_claim_beside_an_unjudged_one_is_unevaluated() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 2).await;
+    judged_but_short(&db, &revisions[0]).await;
+    // revisions[1] is never scored at all — no edge, no cache row.
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::Unevaluated { ref reason } = outcome else {
+        panic!("an incomplete derivation is not a verdict; got {outcome:?}");
+    };
+    assert!(
+        reason.contains("never been scored"),
+        "the stored reason must name the gap rather than the shortfall: {reason}"
+    );
+
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    db.finalize_page_support("p1", 1, &job, "worker", &outcome)
+        .await
+        .unwrap();
+    assert!(
+        truth_row(&db, "p1").await.unwrap().1.is_none(),
+        "an incomplete derivation must never cost the page its file"
+    );
+}
+
+/// F4. `page_truth_state` holds one row per PAGE, so a v1 verdict's timestamp
+/// outliving a v2 publish answers "has this been judged" about text that is
+/// gone. v2 here is genuinely unjudged, and keeping v1's stamp exposes it as
+/// Unsupported and takes its file — the precise inversion of what `Unevaluated`
+/// exists to give.
+#[tokio::test]
+async fn an_unevaluated_publish_clears_the_previous_verdicts_timestamp() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    judged_but_short(&db, &revisions[0]).await;
+
+    let refuted = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert!(matches!(refuted, SupportOutcome::Refuted { .. }));
+    let job1 = lease_page(&db, "p1", 1, "worker").await;
+    assert!(db
+        .finalize_page_support("p1", 1, &job1, "worker", &refuted)
+        .await
+        .unwrap());
+    assert!(
+        truth_row(&db, "p1").await.unwrap().1.is_some(),
+        "the v1 verdict is a real one and does stamp"
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET version = 2, content = 'rewritten prose' WHERE id = 'p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let outcome = db.evaluate_page_support("p1", 2).await.unwrap();
+    assert!(
+        matches!(outcome, SupportOutcome::Unevaluated { .. }),
+        "v2 has no marker at all; got {outcome:?}"
+    );
+    let job2 = lease_page(&db, "p1", 2, "worker").await;
+    assert!(db
+        .finalize_page_support("p1", 2, &job2, "worker", &outcome)
+        .await
+        .unwrap());
+
+    let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
+    assert_eq!(status, "provisional");
+    assert!(
+        evaluated.is_none(),
+        "v1's judgement must not answer for v2's text"
+    );
+}
+
+/// F5. Attempts count at LEASE time, so the worker holding the last one sits at
+/// `attempts == MAX_ATTEMPTS` from its first instant. Parking on the count alone
+/// retires a run that is healthy and still going: four daemon restarts followed
+/// by one good run is an ordinary history, not a poison item, and the worker
+/// then discovers its work was thrown away when its finish silently fails.
+#[tokio::test]
+async fn a_healthy_fifth_lease_is_not_parked() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    for _ in 0..MAX_ATTEMPTS - 1 {
+        let job = db
+            .lease_next_derivation_job("worker")
+            .await
+            .unwrap()
+            .unwrap();
+        db.release_derivation_job(&job.job_id, "worker", "daemon restart")
+            .await
+            .unwrap();
+    }
+    let job = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .expect("the last attempt is still claimable");
+    assert_eq!(job_for(&db, "p1").await.unwrap().2, MAX_ATTEMPTS);
+
+    assert_eq!(
+        db.park_exhausted_derivation_jobs().await.unwrap(),
+        0,
+        "an unexpired lease is a run in progress, not an exhausted job"
+    );
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "leased");
+    assert!(
+        db.finish_derivation_job(&job.job_id, "worker")
+            .await
+            .unwrap(),
+        "and the healthy run's finish must still be accepted"
+    );
+}
+
+/// The other half of F5, so the fix cannot degrade into "never park a leased
+/// job". Once the last lease expires it IS a crash, and parking is exactly
+/// right — otherwise a job that dies on its final attempt is claimable by
+/// nobody and parked by nothing, and sits leased forever.
+#[tokio::test]
+async fn an_expired_fifth_lease_still_parks() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    for _ in 0..MAX_ATTEMPTS - 1 {
+        let job = db
+            .lease_next_derivation_job("worker")
+            .await
+            .unwrap()
+            .unwrap();
+        db.release_derivation_job(&job.job_id, "worker", "boom")
+            .await
+            .unwrap();
+    }
+    db.lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("UPDATE claim_derivation_jobs SET lease_expires_at = 1", ())
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(db.park_exhausted_derivation_jobs().await.unwrap(), 1);
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "parked");
+}
+
+// ---------------------------------------------------------------------------
+// Rows 13 and 15: evidence that stops qualifying after the derivation ran
+// ---------------------------------------------------------------------------
+
+/// Row 13. A supporting memory is deleted. Its edge is retracted, but nothing
+/// used to touch the page: `page_truth_state` kept saying `supported` and no job
+/// was created, so the page could stay supported indefinitely on evidence that
+/// no longer exists. Queueing the work and demoting the claim answer different
+/// questions — when will we know again, and what do we say meanwhile — so both
+/// have to happen, and the demotion has to be synchronous because on a substrate
+/// with no producer "eventually" is never.
+#[tokio::test]
+async fn withdrawing_evidence_demotes_the_page_and_requeues_it() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(outcome, SupportOutcome::Supported);
+    assert!(db
+        .finalize_page_support("p1", 1, &job, "worker", &outcome)
+        .await
+        .unwrap());
+    assert!(db.finish_derivation_job(&job, "worker").await.unwrap());
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "supported");
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "done");
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM memories WHERE source_id = ?1",
+            libsql::params![format!("mem_{}", revisions[0])],
+        )
+        .await
+        .unwrap();
+    }
+
+    let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
+    assert_eq!(
+        status, "provisional",
+        "evidence that is gone costs the page its verdict at once"
+    );
+    assert!(
+        evaluated.is_none(),
+        "and costs it as Unevaluated — we stopped asserting support, we did not \
+         assert the prose is wrong"
+    );
+    assert_eq!(
+        job_for(&db, "p1").await.unwrap().1,
+        "pending",
+        "with nothing back on the queue, nothing would ever re-judge it"
+    );
+}
+
+/// Row 15. A page whose evidence no longer clears the LIVE bar keeps a current
+/// marker and a `done` job, so a scan that looks only at markers walks straight
+/// past it and the page stays `supported` forever. `SUPPORT_THRESHOLD` is a
+/// compile-time constant, so this reaches the same state from the other side: to
+/// the scan, an edge whose score falls below the bar and a bar that rises above
+/// the score are the same row.
+#[tokio::test]
+async fn support_that_no_longer_clears_the_bar_is_re_enqueued() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], SUPPORT_THRESHOLD + 0.02).await;
+
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(outcome, SupportOutcome::Supported);
+    assert!(db
+        .finalize_page_support("p1", 1, &job, "worker", &outcome)
+        .await
+        .unwrap());
+    assert!(db.finish_derivation_job(&job, "worker").await.unwrap());
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "done");
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET payload = ?1 WHERE edge_type = 'supports'",
+            libsql::params![format!(
+                "{{\"score\":{},\"threshold_at_write\":0.75}}",
+                SUPPORT_THRESHOLD - 0.05
+            )],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.enqueue_stale_derivation_jobs(100).await.unwrap(),
+        1,
+        "the scan has to see edge validity and the live bar, not only the marker"
+    );
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "pending");
+}
+
+/// F6. One bounded sweep is a truncation unless something continues it. The
+/// migration queues a batch and stops; every page past it was reachable only by
+/// being edited, so on a vault larger than the batch the "backlog scan"
+/// converged on a subset and the queue was quietly partial on exactly the
+/// installs it exists for.
+#[tokio::test]
+async fn the_backlog_drain_converges_past_a_single_batch() {
+    let (db, _temp) = db_before_the_worker().await;
+    for i in 0..7 {
+        add_page(&db, &format!("p{i}")).await;
+    }
+    install_triggers(&db).await;
+
+    assert_eq!(
+        db.enqueue_stale_derivation_jobs(2).await.unwrap(),
+        2,
+        "one bounded pass reaches two of the seven"
+    );
+    assert_eq!(
+        db.drain_stale_derivation_jobs(2).await.unwrap(),
+        5,
+        "the drain has to finish the other five"
+    );
+    for i in 0..7 {
+        assert_eq!(job_for(&db, &format!("p{i}")).await.unwrap().1, "pending");
+    }
 }

@@ -65,6 +65,17 @@ pub struct HumanEditDelta {
 /// without anything noticing, which is the failure §4a is written to prevent.
 #[derive(Debug, Clone)]
 pub struct SupportVerdict {
+    /// Which chunk of the cited source the span was read from.
+    ///
+    /// A `source_id` names a *document*, and one document is several `memories`
+    /// rows sharing that id — `store_raw_import_memories_batch` writes exactly
+    /// that shape. Without this, resolving evidence by `source_id` alone picks
+    /// whichever row the query happens to return: verification recomputes the
+    /// span digest against the wrong chunk and refuses support that is perfectly
+    /// valid, and the stored edge cannot say which chunk was ever verified.
+    /// Fail-closed, so the visible symptom is unsupportable pages rather than
+    /// wrong support — the same dead-substrate reading this rung exists to end.
+    pub chunk_index: i64,
     /// The exact memory version the span was read from.
     pub source_version: i64,
     /// Byte offsets into that version, per `faithfulness::sentence_spans`.
@@ -879,6 +890,19 @@ impl MemoryDB {
                 .map_err(|error| WenlanError::VectorDb(format!("support claim decode: {error}")))?
         };
 
+        // The evidence row, addressed by CHUNK and not by document. `source_id`
+        // names a document; one document is many `memories` rows sharing that
+        // id, so a lookup on `source_id` alone resolves to an arbitrary chunk
+        // and the digest check below then answers about text the verdict never
+        // read.
+        //
+        // Nothing in the schema makes `(source_id, chunk_index)` unique -- only
+        // a plain index on `source_id` exists -- so the pair is a convention the
+        // rest of the tree keeps rather than a guarantee this code may lean on.
+        // A second row is therefore read for and REFUSED by name: an ambiguous
+        // corpus is a state this function cannot verify against, and picking one
+        // of two candidates would be exactly the silent arbitrary choice the
+        // chunk index was added to remove.
         let (content, space, live_version): (String, String, i64) = {
             let mut rows = conn
                 .query(
@@ -890,8 +914,13 @@ impl MemoryDB {
                     // `memories.space` stays NOT NULL (migration 91), which is
                     // exactly why it has to be right rather than merely untested.
                     "SELECT content, COALESCE(space, ?2), COALESCE(version, 1)
-                     FROM memories WHERE source_id = ?1",
-                    libsql::params![memory_source_id, super::UNFILED_SPACE_ID],
+                     FROM memories WHERE source_id = ?1 AND chunk_index = ?3
+                     LIMIT 2",
+                    libsql::params![
+                        memory_source_id,
+                        super::UNFILED_SPACE_ID,
+                        verdict.chunk_index
+                    ],
                 )
                 .await
                 .map_err(|error| {
@@ -903,10 +932,11 @@ impl MemoryDB {
                 .map_err(|error| WenlanError::VectorDb(format!("support memory decode: {error}")))?
                 .ok_or_else(|| {
                     WenlanError::Conflict(format!(
-                        "support_evidence_unknown: no memory {memory_source_id}"
+                        "support_evidence_unknown: no memory {memory_source_id} chunk {}",
+                        verdict.chunk_index
                     ))
                 })?;
-            (
+            let resolved = (
                 row.get(0).map_err(|error| {
                     WenlanError::VectorDb(format!("support memory decode: {error}"))
                 })?,
@@ -916,7 +946,20 @@ impl MemoryDB {
                 row.get(2).map_err(|error| {
                     WenlanError::VectorDb(format!("support memory decode: {error}"))
                 })?,
-            )
+            );
+            if rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support memory decode: {error}")))?
+                .is_some()
+            {
+                return Err(WenlanError::Conflict(format!(
+                    "support_evidence_ambiguous: {memory_source_id} has more than one chunk {}; \
+                     a support edge may not name evidence that cannot be resolved to one row",
+                    verdict.chunk_index
+                )));
+            }
+            resolved
         };
 
         // §5, and the replacement for PR-A's `hed_` prefix: prove the root the
@@ -1087,9 +1130,15 @@ impl MemoryDB {
         // Offsets in, and the two axes separate cleanly: a different PLACE is a
         // different edge, while a re-judgment of the SAME place keeps the same
         // id and is caught by the conflict check as the verdict change it is.
+        //
+        // The chunk index leads, because "a place" in a multi-chunk document is
+        // a chunk AND an offset: offsets restart at 0 in every chunk, so two
+        // genuinely distinct citations in chunks 0 and 1 would otherwise collide
+        // on one edge id and the second would be refused as a superseding
+        // re-judgment of the first.
         let span_locator = format!(
-            "{}:{}:{}",
-            verdict.span_start, verdict.span_end, verdict.span_digest
+            "{}:{}:{}:{}",
+            verdict.chunk_index, verdict.span_start, verdict.span_end, verdict.span_digest
         );
         let edge_id = crate::provenance::compute_edge_id(
             "supports",
@@ -1100,6 +1149,7 @@ impl MemoryDB {
             &span_locator,
         );
         let payload = serde_json::json!({
+            "chunk_index": verdict.chunk_index,
             "source_version": verdict.source_version,
             "span_start": verdict.span_start,
             "span_end": verdict.span_end,

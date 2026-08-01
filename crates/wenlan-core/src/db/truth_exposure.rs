@@ -346,6 +346,28 @@ impl MemoryDB {
     /// Content is pulled only for rows that claim a review, so the ordinary page
     /// carries no extra cost.
     ///
+    /// # A verdict about a version that is gone is not a verdict
+    ///
+    /// `page_truth_state` holds one row per PAGE and records which
+    /// `page_version` the verdict was reached on, so a page edited after being
+    /// judged carries a row describing text it no longer holds. Matrix row 8
+    /// requires that edit to cost the old verdict, and nothing else here can
+    /// make it: the enqueue trigger queues the *work*, and until a worker gets
+    /// to it — on a branch with no producer, never — a `supported` v1 row keeps
+    /// v2's prose readable on the strength of a judgement of different text.
+    ///
+    /// So the version is compared at the read, where it holds for every consumer
+    /// at once rather than once per caller who remembers to. A stale row reads
+    /// as [`Support::Unevaluated`] in both directions, the same fail-safe the
+    /// NULL `evaluated_at` case gets: the page keeps its file and stops being
+    /// asserted as supported. De-stamping a stale `Refuted` is that same call
+    /// seen from the other side — v1's refutation is not evidence about v2, and
+    /// letting it stand would archive a page over a judgement nobody made of it.
+    ///
+    /// A row whose page is missing keeps its stored reading. There is nothing to
+    /// compare against, and `page_truth_state` cascades from `pages`, so the
+    /// case does not arise from a delete.
+    ///
     /// [`Support::Unevaluated`]: crate::truth_contract::Support::Unevaluated
     pub async fn page_truth_states(
         &self,
@@ -366,7 +388,8 @@ impl MemoryDB {
             let sql = format!(
                 "SELECT t.page_id, t.support_status, t.human_reviewed, t.evaluated_at,
                         t.reviewed_page_digest,
-                        CASE WHEN t.human_reviewed = 1 THEN p.content END
+                        CASE WHEN t.human_reviewed = 1 THEN p.content END,
+                        t.page_version, p.version
                    FROM page_truth_state t
                    LEFT JOIN pages p ON p.id = t.page_id
                   WHERE t.page_id IN ({placeholders})"
@@ -400,7 +423,20 @@ impl MemoryDB {
                 // `unwrap_or(None)` puts a malformed or absent column on the
                 // unjudged side -- the side that keeps a page's file.
                 let evaluated_at: Option<i64> = row.get(3).unwrap_or(None);
+                // The version the verdict was reached on, and the one the page
+                // is at now. A malformed or absent either side means the
+                // comparison cannot be made, so it is not made -- the same
+                // "unknown is not a judgement" rule as the column above, applied
+                // to the question of whether the judgement is still about this
+                // text.
+                let judged_version: Option<i64> = row.get(6).unwrap_or(None);
+                let live_version: Option<i64> = row.get(7).unwrap_or(None);
+                let describes_live_text = match (judged_version, live_version) {
+                    (Some(judged), Some(live)) => judged == live,
+                    _ => true,
+                };
                 let support = match (status.as_str(), evaluated_at) {
+                    _ if !describes_live_text => crate::truth_contract::Support::Unevaluated,
                     ("supported", _) => crate::truth_contract::Support::Supported,
                     (_, Some(_)) => crate::truth_contract::Support::Unsupported,
                     (_, None) => crate::truth_contract::Support::Unevaluated,

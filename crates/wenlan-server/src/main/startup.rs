@@ -506,6 +506,32 @@ pub(super) async fn prepare_startup_state(
         }
     }
 
+    // M5: finish the claim-derivation backlog the migration could only start.
+    //
+    // Migration 105 sweeps one bounded batch, because it runs holding the single
+    // connection's mutex and a full scan of a large vault would delay boot. That
+    // bound truncates rather than defers unless something continues it: a vault
+    // with more pages than the batch leaves the remainder reachable only by
+    // being edited, and the derivation queue is then quietly partial on exactly
+    // the installs the backlog scan exists for.
+    //
+    // Once per boot is the right cadence and not merely the convenient one. The
+    // three inputs that can strand a page here — a new binary's
+    // EXTRACTOR_VERSION, a new binary's SUPPORT_THRESHOLD, and an interrupted
+    // migration — are all things that change across a restart and not during
+    // one. Everything that moves while the daemon runs already has a trigger.
+    match db_arc.drain_stale_derivation_jobs(500).await {
+        Ok(0) => {}
+        Ok(enqueued) => tracing::info!(
+            "[truth] claim-derivation backlog: {enqueued} page(s) enqueued for derivation"
+        ),
+        // Not fatal: an un-swept backlog leaves pages underived, and an
+        // underived page is `Unevaluated` — it keeps its file and reads as
+        // unjudged, which is the honest state. Refusing to serve over it would
+        // trade a true "we have not looked yet" for an outage.
+        Err(e) => tracing::warn!("[truth] claim-derivation backlog sweep failed: {e}"),
+    }
+
     // Load intelligence config
     server_state.prompts = wenlan_core::prompts::PromptRegistry::load(
         &wenlan_core::prompts::PromptRegistry::override_dir(),
