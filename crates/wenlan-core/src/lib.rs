@@ -44,6 +44,7 @@ pub mod kg_quality;
 pub mod lint;
 pub mod llm_classifier;
 pub mod llm_provider;
+pub mod m6;
 pub mod maintenance;
 pub mod memory_schema;
 pub mod migrate_rename;

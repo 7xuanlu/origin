@@ -91,6 +91,12 @@ leiden-rs = { version = "=0.8.1", default-features = false }
 # graph. Root Cargo.toml is release-please-locked, so this is a per-crate
 # dep like text-splitter/tiktoken-rs above rather than a workspace one.
 unicode-normalization = "0.1"
+# Unicode general categories for the M6 wikilink-key gate (S0-38: reject every
+# Cc *and* Cf scalar). std only offers `char::is_control()` = Cc, which would
+# miss the entire Cf class — RLO, ZWSP, and the BOM are all Cf, and Cf is where
+# the invisible-label attacks live. Already in the lock file transitively, so
+# this pins it as a direct dep rather than growing the resolved graph.
+unicode-properties = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 fastembed = { workspace = true, features = ["ort-load-dynamic"] }
