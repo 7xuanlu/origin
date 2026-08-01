@@ -797,38 +797,53 @@ async fn a_caller_who_will_be_refused_cannot_tell_which_pages_exist() {
 /// committed edit, not just a synthetic one.
 ///
 /// **What it does not prove: the F1(a) interleave itself.** That is an edit
-/// landing *between* the page read and the mark, which needs the review
-/// suspended mid-sequence, and nothing can suspend it. Inside the daemon,
-/// `review_page_with_presence` takes the single `Arc<Mutex<Connection>>` once
-/// and holds it from before `BEGIN IMMEDIATE` to after `COMMIT`, so no other
-/// task gets between any two of its steps — reading before `BEGIN` rather than
-/// after is a distinction with no observable difference, and the hoist that
-/// would actually be dangerous is out of the *lock*, which changes the function
-/// signature. From outside the process, the attempt below is as far as a second
-/// writer gets: SQLite admits one writer, libsql sets no busy timeout, so the
-/// review's `BEGIN IMMEDIATE` does not wait its turn — it errors, leaving
-/// nothing to interleave with. The interleave is prevented structurally, and
-/// this test is not the thing preventing it.
+/// landing *between* the page read and the mark. This test cannot reach it:
+/// its writer already holds the write lock before the review starts, so the
+/// review's `BEGIN IMMEDIATE` errors and there is no window to land in — no
+/// matter where the page read sits.
 ///
-/// **The hazard is real anyway, proved by a two-step knockout rather than left
-/// as an argument.** Adding `PRAGMA busy_timeout=10000` to the daemon
-/// connection turns this test's `Err` into `Ok(Refused(Conflict))` — the review
-/// waits out the writer and is still safe. Adding that pragma *and* hoisting
-/// the page read above `BEGIN IMMEDIATE` turns it into
-/// `Ok(Applied(.. reviewed_page_version: 1, digest of the ORIGINAL body ..))`
-/// while the page holds the edited text: a receipt attesting to prose nobody
-/// approved. Both knockouts were reverted. So the directly discriminating test
-/// is one busy timeout away — but that pragma changes the daemon's behavior
-/// under contention and is a decision on its own, not a side effect of a test.
-/// It is flagged as a follow-up rather than taken here.
+/// **What does prevent the interleave: the page read happens inside the
+/// `BEGIN IMMEDIATE` transaction.** That is the whole boundary, and it is
+/// narrower than "one function, one lock" makes it sound. The connection mutex
+/// is no part of it — it serializes this daemon's own tasks over the single
+/// connection it owns, and an interleaving writer does not need that
+/// connection. An independent one (another process, or a second handle in this
+/// one) can open, edit, and commit entirely inside the gap between a read taken
+/// before `BEGIN IMMEDIATE` and the `BEGIN` itself; it never has to be holding
+/// the lock when our `BEGIN` fires, only to have finished before it. So a read
+/// hoisted above the transaction is unsafe *even with the mutex held across the
+/// whole function*: the version and digest come from before the edit, the mark
+/// lands after it, and the receipt attests to prose nobody approved. Taken
+/// inside the transaction, that writer is excluded for its duration and the row
+/// the receipt quotes is the row the mark is about to touch.
 ///
-/// This test still has teeth on exactly that change: adding a busy timeout or a
-/// retry turns its `Err` into an answer and fails it, which is the point.
+/// **That order is guarded, not merely described.**
+/// `the_page_binding_is_read_inside_the_transaction` below reads
+/// `presence_review.rs` and fails if the read leaves the transaction. It earns
+/// its place: under that hoist every behavior test in this file still passes,
+/// so nothing else here would notice.
+///
+/// **The hazard is not hypothetical either — it was reproduced.** In this
+/// test's setup the writer holds the lock, so making the hoist visible *here*
+/// took a `PRAGMA busy_timeout=10000` on the daemon connection as scaffolding:
+/// not because waiting is any part of the hazard, but because it is what lets
+/// this particular writer's edit land in the window instead of locking the
+/// review out. With the pragma alone this test's `Err` becomes
+/// `Ok(Refused(Conflict))` — the review waits the writer out and is still safe.
+/// With the pragma *and* the page read hoisted above `BEGIN IMMEDIATE` it
+/// becomes `Ok(Applied(.. reviewed_page_version: 1, digest of the ORIGINAL
+/// body ..))` while the page holds the edited text: the receipt attesting to
+/// prose nobody approved, in the flesh. Both edits were reverted. That pragma
+/// changes the daemon's behavior under contention, so adopting it is a decision
+/// on its own — flagged as a follow-up rather than taken here.
+///
+/// This test has teeth on exactly that change: a busy timeout or a retry turns
+/// its `Err` into an answer and fails it, which is the point.
 ///
 /// The rest of the ordering rests on structure plus one other oracle: the page
 /// read sits below `verify` — F7's
 /// `a_caller_who_will_be_refused_cannot_tell_which_pages_exist` fails if it
-/// moves up — and above the mark, in one function, under one lock.
+/// moves up — and above the mark, in one transaction.
 ///
 /// The second connection is libsql, deliberately, not rusqlite. rusqlite and
 /// libsql link one statically-bundled SQLite here (see `crates/wenlan-core/
@@ -910,6 +925,82 @@ async fn a_review_meeting_a_foreign_writer_marks_nothing() {
         .unwrap();
     let live: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(live, EDITED, "the review refused; it did not undo the edit");
+}
+
+/// The page is read inside the transaction, checked against the source.
+///
+/// This is an ordering, and orderings are what a refactor changes without
+/// meaning to. No behavior test in this file can hold it down: catching the
+/// hoist needs a foreign write committed inside a window microseconds wide, and
+/// the only reliable ways in are a test hook in the daemon's write path or a
+/// sleep race — a hook is production surface that exists only for a test, and a
+/// race is a flake. So the shape is asserted against the source instead.
+///
+/// Two links of one chain: `BEGIN IMMEDIATE` runs before `review_in_txn` is
+/// called, and every read of the page binding is inside `review_in_txn`.
+/// Together they say the page is read after the transaction is acquired, and
+/// they keep saying it if `review_in_txn` grows a helper later. What they
+/// cannot see is a read reaching the page under another name — a fresh inline
+/// query against `pages` above the `BEGIN` would pass. A guard on the refactor
+/// that is actually likely, not a proof.
+#[test]
+fn the_page_binding_is_read_inside_the_transaction() {
+    const SOURCE: &str = include_str!("presence_review.rs");
+
+    // Calls only. `page_binding` is defined *below* its call site, so counting
+    // the definition would invert the very order under test; `review_in_txn`
+    // additionally appears inside `apply_review_in_txn`, hence the name
+    // boundary rather than a bare substring.
+    let calls_to = |name: &str| -> Vec<usize> {
+        SOURCE
+            .match_indices(name)
+            .map(|(at, _)| at)
+            .filter(|at| {
+                let before = &SOURCE[..*at];
+                !before.ends_with("fn ")
+                    && !before.ends_with(|c: char| c.is_alphanumeric() || c == '_')
+            })
+            .collect()
+    };
+
+    let begin = SOURCE
+        .find(r#"execute("BEGIN IMMEDIATE""#)
+        .expect("the review must open its transaction with BEGIN IMMEDIATE");
+    let enters_body = *calls_to("review_in_txn(")
+        .first()
+        .expect("the review must call review_in_txn");
+    assert!(
+        begin < enters_body,
+        "the transaction must be open before the ordered body runs"
+    );
+
+    // rustfmt closes a top-level item with a brace in column zero and the fmt
+    // gate keeps it there, which is what finds the end of the body without
+    // parsing Rust.
+    let body_start = SOURCE
+        .find("async fn review_in_txn(")
+        .expect("review_in_txn must be a top-level function");
+    let body_end = body_start
+        + SOURCE[body_start..]
+            .find("\n}\n")
+            .expect("review_in_txn must close on a column-zero brace");
+
+    let reads = calls_to("page_binding(");
+    assert!(
+        !reads.is_empty(),
+        "the review must still read the page binding somewhere"
+    );
+    for at in reads {
+        assert!(
+            (body_start..body_end).contains(&at),
+            "the page binding must be read inside review_in_txn, which runs \
+             inside the transaction. Hoisted above BEGIN IMMEDIATE it is read \
+             before the transaction is acquired, an independent connection can \
+             commit an edit in the gap, and the receipt then attests to a \
+             version and digest the mark never touched. Offending read at byte \
+             {at}."
+        );
+    }
 }
 
 /// The receipt describes the row the transaction actually marked.
