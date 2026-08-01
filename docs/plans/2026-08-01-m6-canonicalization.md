@@ -145,12 +145,21 @@ slot_id = m6_digest("m6-slot-v1", [ signal_tag, space, <per-signal parts…> ])
 folded into the domain tag so that all four signals share one domain and one
 version axis.
 
-`space` is the raw space string as stored in `communities.space` /
-`community_members.space` (`db.rs:10448`, `:10460`). It is **not** normalized —
-see S0-31 — and it is **not** the ID-valued `space_id` M6 payloads carry. Those
-columns are name-valued and are not touched by the rename cascade, so the two
-values can diverge; artifact 10's S0-161 settles which one wins where, and keeps
-this digest input exactly as specified here.
+`space` is **`spaces.id`** — the daemon-minted UUID, the same value M6 payloads
+carry as `space_id` (artifact 10, S0-158). It is **not** the name-valued string
+stored in `communities.space` / `community_members.space` (`db.rs:10448`,
+`:10460`). Minting resolves that stored name to its ID through the lookup that
+already exists and refuses the mint on a miss (artifact 10, S0-161), and a rename
+is closed over the space-keyed substrate so the resolution stays live (S0-162).
+
+Digesting the stable ID is precisely what makes a rename unable to re-key a slot,
+a page, or a card: the name changes, `spaces.id` does not, so re-derivation under
+the new name reproduces the same `slot_id` and the same `page_id` (§4).
+
+*(rev 6, round-5 blocker: rev 5 specified the raw stored **name** here. That
+choice was reversed — it made durable identity depend on a mutable string, and
+its own recovery path re-keyed the very slots it was written to protect. See
+artifact 10, S0-161.)*
 
 ### 3.2 Per-signal part vectors
 
@@ -662,7 +671,7 @@ Stage 0's.
 `S0-28` domain tag is a length-prefixed part ·
 `S0-29` evidence-cluster slot set pinned at `observed` ·
 `S0-30` set encoding: dedup, byte-lex sort, count-prefixed ·
-`S0-31` space string is not normalized ·
+`S0-31` *(amended rev 6)* the space part is `spaces.id`, so normalization does not arise ·
 `S0-32` `m6p_` + full digest, no truncation ·
 `S0-33` prompt version added to the fingerprint ·
 `S0-34` inapplicable fingerprint fields are zero-length, never omitted ·
@@ -674,9 +683,17 @@ Stage 0's.
 `S0-40` `candidate_id` is derived, not minted ·
 `S0-41` non-terminal receipts are replaceable, terminal ones are not.
 
-S0-31 is stated inline in §3.1 and repeated here for completeness: the `space`
-part is the raw stored string. Spaces are daemon-managed identifiers with their
-own uniqueness discipline, and normalizing them inside M6 would create a second
-opinion about space identity that the rest of the daemon does not share. If space
-names ever need normalization, that belongs to the spaces layer and M6 inherits
-it for free.
+S0-31 is stated inline in §3.1 and repeated here for completeness. Through rev 5
+it read *"the `space` part is the raw stored string, not normalized"* and argued
+that normalizing a space name inside M6 would create a second opinion about space
+identity the rest of the daemon does not share. That argument was sound and its
+conclusion still holds — M6 has no opinion about space names — but rev 6 reaches
+it a shorter way: the digest input is `spaces.id`, a daemon-minted UUID with no
+case, no width, and no combining forms, so there is nothing to normalize and no
+second opinion is possible even in principle.
+
+**S0-31 is therefore superseded by construction rather than repealed.** The
+number is kept because the property it guarantees is unchanged: M6 never
+transforms a space identifier. If space *names* ever need normalization, that
+still belongs to the spaces layer — and M6 now inherits it for free in the
+stronger sense that it never touches names at all.

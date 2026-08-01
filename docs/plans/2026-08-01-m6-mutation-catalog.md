@@ -102,7 +102,7 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 > section — three controls for thirteen G6 rows — which is not what S0-135 says
 > and does not discriminate: a section-level control passing tells you the
 > section's happy path works, not that row 7's tooth bites on row 7's condition.
-> A stated derivation rule is better than 200 hand-written cells, which would
+> A stated derivation rule is better than 203 hand-written cells, which would
 > drift; it works precisely *because* S0-154 makes every row single-conditioned.
 > Where the derivation does not apply, the row carries an explicit control in its
 > RED column and says so.
@@ -490,6 +490,9 @@ were; they are not row controls and no longer stand in for any.
 | G8.10a | lose **subscription** rows on any of the above | no-data-loss, subscription | PR-A |
 | G8.10b | lose **proposal** rows on any of the above | no-data-loss, proposal | PR-A |
 | G8.10c | lose **history** rows on any of the above | no-data-loss, history | PR-A |
+| G8.11a | derive M6 identity from the space **name** instead of `spaces.id` | renaming a space re-keys a `slot_id`, a `page_id`, or a card | PR-A |
+| G8.11b | let a rename silently drop a card that minted before it | the card stops appearing with no refusal and no receipt | PR-A |
+| G8.11c | skip the rename closure over the space-keyed substrate | a row keyed to the old name survives the rename and stays claimable | PR-A |
 
 **G8.7 is the merge-no-survivor STOP's home clause.** Where G2.7 is blocked
 *because* the STOP makes an exclusion unevaluable, G8.7 is blocked because the
@@ -497,8 +500,28 @@ detach rule itself is what the ruling decides. Same status, different reason,
 and the distinction matters: a ruling that resolves G8.7 automatically resolves
 G2.7, but not the reverse.
 
+**G8.11a-c is the rename case, and it is one scenario asserted three ways**
+*(new rev 6, round-5 blocker)*. Rename a space that already has M6 cards, then
+assert all three: identity is unchanged (`slot_id`, `page_id`, and card identity
+survive, because the digest input is `spaces.id` and not the name — artifact 10,
+S0-161), nothing disappears silently (a card that minted before the rename still
+mints after it, and any refusal is an explicit fail-closed refusal rather than an
+absence), and no orphaned state is left behind (no row in the twelve-table
+space-keyed substrate still names the old space — artifact 10, S0-162).
+
+The three are separated because they fail independently and a single assertion
+would hide two of them: stable-ID derivation alone satisfies G8.11a while still
+failing G8.11b, since a stale `communities.space` misses the lookup no matter
+what the digest is made of. G8.11c is the one that has to be *added* to the
+substrate rather than merely observed — `update_space`'s cascade stops at
+memories, entities, and pages today (`db.rs:19266`-`:19298`), and the scheduler
+claims dirty spaces without joining a live `spaces` row
+(`db/community_grouping_state.rs:84`), so an orphaned row is not guaranteed to
+retire on its own.
+
 **Suite-level control** (row controls are per S0-155): a split and a merge that each have a determinate survivor
-preserve IDs, titles, and every subscription.
+preserve IDs, titles, and every subscription; a rename with no M6 cards in the
+space is a no-op on every count.
 
 ---
 
@@ -605,18 +628,23 @@ space and every signal disabled on every other space.
 > mutation row and nobody notices — which is exactly the failure mode S0-134
 > describes, arriving through drift instead of oversight.
 
-Current coverage: **11 gates, 188 gate mutation cases, 11 predicate cases, and
-1 `RULING` placeholder that is NOT coverage — 200 rows counted mechanically.**
+Current coverage: **11 gates, 191 gate mutation cases, 11 predicate cases, and
+1 `RULING` placeholder that is NOT coverage — 203 rows counted mechanically.**
 
-*(rev 5, round-4 item 5: rev 4 labelled the same 200 as "189 gate mutation
+*(rev 5, round-4 item 5: rev 4 labelled the then-200 as "189 gate mutation
 cases", which counted the `RULING` row as a mutation and contradicted S0-160's
-own sentence that it must never be totalled as coverage. The mechanical total is
-unchanged — the row is still a row — but the semantic split is 188 + 1 + 11.)*
+own sentence that it must never be totalled as coverage. The row is still a row,
+but the semantic split keeps it out of the coverage figure.)*
+
+*(rev 6, round-5 blocker: +3 — `G8.11a`-`c`, the rename case. 188 → 191 gate
+mutation cases, 200 → 203 mechanical rows, PR-A 149 → 152. No claim was
+reinterpreted and no row was split; this is three genuinely new assertions
+arriving with S0-161's reversal and S0-162.)*
 
 | Status | Cases |
 |---|---|
 | LIVE | 32 |
-| PR-A | 149 |
+| PR-A | 152 |
 | lane 1 | 16 |
 | BLOCKED | 2 |
 | RULING | 1 |
@@ -636,6 +664,17 @@ filed under the gate that owns the clause, not the gate that happened to be
 under revision when the hole was found; S0-144 resolves a clause to a row by
 the row's gate prefix, so filing it elsewhere would leave the clause unmapped
 while looking mapped.
+
+*(rev 6: rev 5 reported 200 and rev 6 reports 203. `G8.11a`-`c` — the rename
+case — arrives with S0-161's reversal to stable-`spaces.id` identity and with
+S0-162's rename-closure rule. Unlike every earlier movement in this list, these
+three ARE new claims rather than a regrain: nothing in rev 5 asserted anything
+about a rename, because rev 5's identity rule made the rename gap a documented
+behaviour instead of a tested one.)*
+
+*(rev 5: total unchanged at 200. Round 4's item 5 corrected only the semantic
+split — 188 gate mutations + 1 `RULING` + 11 predicate cases — after rev 4
+totalled the `RULING` row as coverage.)*
 
 *(rev 4: rev 3 reported 163. Round 3's group 7 held G10.13a–c non-concrete —
 it named a locale but never the state×locale **cell** S0-135 requires — so the
@@ -675,7 +714,7 @@ resolves both; a ruling that addressed only the G2 exclusion would leave the
 detach rule undecided. Worth knowing when the ruling is drafted, so it is not
 scoped to the narrower question.
 
-**F2 — sixteen of the 200 cases cannot go red until lane 1 lands, and they are
+**F2 — sixteen of the 203 cases cannot go red until lane 1 lands, and they are
 concentrated in the gates that protect truth.** G1.2, G2.5, G6.9, G7.1–G7.3, and
 the ten remaining predicate cases all rest on a page being `supported`, and no
 production code writes that value today

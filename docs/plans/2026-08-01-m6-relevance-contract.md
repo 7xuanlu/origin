@@ -505,12 +505,20 @@ D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
 > (`libsql-ffi-0.9.30/build.rs:198`-`:219`) in which
 > `SQLITE_ENABLE_STMT_SCANSTATUS` does not appear anywhere, and the amalgamation
 > guards the implementation behind `#ifdef SQLITE_ENABLE_STMT_SCANSTATUS`
-> (`libsql-ffi-0.9.30/bundled/SQLite3MultipleCiphers/src/sqlite3.c:17643`,
-> `libsql-ffi-0.9.30/bundled/SQLite3MultipleCiphers/src/sqlite3.c:22353`). So the
-> symbol
-> is declared and simply not compiled: calling it today is a link failure, not a
-> runtime error — and enabling it is **appending one flag to an existing list**,
-> not adding a SQLite.
+> (`libsql-ffi-0.9.30/bundled/src/sqlite3.c:93836`, guarding the definition of
+> `sqlite3_stmt_scanstatus_v2` at `:93840`; the internal helpers are guarded at
+> `:17643` and `:22353`). So the symbol is declared and simply not compiled:
+> calling it today is a link failure, not a runtime error — and enabling it is
+> **appending one flag to an existing list**, not adding a SQLite.
+>
+> *(Path corrected rev 6, round-5 item 3: rev 5 cited these lines in
+> `bundled/SQLite3MultipleCiphers/src/sqlite3.c`. The two amalgamations are
+> byte-identical — verified with `cmp` — so the line numbers and the quoted text
+> were right, but the path was not the one that gets compiled. Wenlan enables
+> `core` and `replication` only (workspace `Cargo.toml:59`, no sqlean feature
+> anywhere in the workspace), so `build.rs` selects `bundled/src/sqlite3.c`
+> (`libsql-ffi-0.9.30/build.rs:262`-`:263`). Citing the multiple-ciphers copy
+> invited exactly the "second SQLite" confusion rev 4 already made once.)*
 >
 > The dependency hazard rev 2 flagged is still real and still governs any bench
 > that takes `libsql-sys`: rusqlite is deliberately on `buildtime_bindgen` rather
@@ -594,16 +602,51 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 
 > **Ruling request R-1 — how is G6's visit clause discharged?** *(amended rev 5,
 > round-4 item 6: rev 4 offered four options and mis-costed one of them, which hid
-> the option that is actually best. Five now, re-costed.)*
+> the option that is actually best. Five now. Re-costed again in rev 6, round-5
+> item 3: (b′) turns out to need no vendored patch at all, and (b) turns out to
+> need more than rev 5 charged it. The recommendation is unchanged; only the
+> prices moved, both toward (b′).)*
 >
 > | | Option | Satisfies the clause as frozen? | Cost |
 > |---|---|---|---|
 > | (a) | Accept `FULLSCAN_STEP == 0` + EQP index assertions as the discharge | No — proves *no full scan*, not a bound | None; already gated |
-> | (b) | **Ship** the flag: add `SQLITE_ENABLE_STMT_SCANSTATUS` to libsql-ffi's flag list in the daemon's own build and assert `NVISIT` on the production statement | Yes, on the production statement | The instrumentation ships to users; needs a maintained patch of `libsql-ffi/build.rs`; still needs `libsql-sys` to reach the handle |
-> | (b′) | **Bench-only, same build**: the identical one-flag patch, applied in a build graph that produces no shipped artifact; bench runs the identical SQL on the same file through `libsql-sys` and asserts `NVISIT ≤ 2,176` | Yes, on the real libSQL/SQLite code path | The patch is graph-wide, so the bench must live outside the shipping workspace; statement is prepared through `libsql-sys`, not the `libsql::Connection` wrapper |
+> | (b) | **Ship** the flag: build the daemon with `LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS` and assert `NVISIT` on the production statement | Yes, on the production statement | Instrumentation ships to every user — **and** it needs a wrapper/API-exposure change in `libsql` itself, because `libsql::Statement.inner` is private (`libsql-0.9.30/src/statement.rs:31`-`:33`), so a statement prepared by `libsql::Connection` cannot be reached from outside that crate |
+> | (b′) | **Bench-only, same build**: the same env flag set only for a bench build in its own target directory; the bench runs the identical SQL on the same file through `libsql-sys` and asserts `NVISIT ≤ 2,176` | Yes, on the real libSQL/SQLite code path | One env var and one target directory — **no vendored patch**; the statement is prepared through `libsql-sys` rather than the `libsql::Connection` wrapper |
 > | (c) | Restate the clause as a materialization bound | No — changes what the contract asks | None; already gated |
 > | (d) | Bench-only with a **different** SQLite build (rev 4's proposal): a standalone binary opens the same file with its own `SCANSTATUS`-enabled SQLite | Yes, on a replica | One bench-only dependency; a *different* query planner from the daemon's |
 >
+> **The mechanics, corrected twice over *(rev 6, round-5 item 3)*.** Rev 5 costed
+> (b′) as needing "a maintained patch of `libsql-ffi/build.rs`". It does not — and
+> the reason is better than the one round 5 supplied. Round 5 pointed at `cc`'s
+> generic `CFLAGS`/`TARGET_CFLAGS` (`cc-1.2.59/src/lib.rs:65`, `:117`, resolved at
+> `:2015` and applied at `:2064` under the comment *"do this last, to allow these
+> to override everything else"*) and stated that no libsql-specific knob exists.
+> **That last part does not hold: libsql-ffi ships its own env knob for exactly
+> this purpose.** `LIBSQLITE3_FLAGS` is read at
+> `libsql-ffi-0.9.30/build.rs:411`-`:421` and appends each entry to the very same
+> `cc::Build` that carries the explicit flag list — one `cfg`, declared at `:198`,
+> given the flag list at `:199`-`:219`, given its source at `:262`, given this env
+> knob at `:411`, and compiled exactly once at `:424`. A bare `SQLITE_*` token is
+> rewritten to `-D<token>` at `:415`-`:416`.
+>
+> So (b′)'s build mechanics are, in full:
+>
+> ```
+> LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS \
+> CARGO_TARGET_DIR=<bench-only target dir> \
+>   cargo test -p <bench crate> --ignored …
+> ```
+>
+> `LIBSQLITE3_FLAGS` beats generic `CFLAGS` on two counts that matter for a bound
+> we intend to trust. It is **scoped** — generic `CFLAGS` reaches every `cc`-built
+> C dependency in the build graph, this reaches only libsql-ffi's SQLite — and it
+> is **fingerprinted**: `build.rs:422` emits
+> `cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS`, so cargo rebuilds when the value
+> changes. A stale non-instrumented artifact cannot be silently measured, and an
+> instrumented one cannot silently persist into the next ordinary build. The
+> separate target directory is therefore a cache-thrash convenience, not a
+> correctness requirement — which is the honest way to state it.
+
 > **Rev 4's costing of (b) was wrong and it is worth naming the error, because it
 > is what made (d) look best.** Rev 4 wrote (b) off as colliding with the
 > two-bundled-SQLite hazard. That hazard is specific: *"Having two bundled SQLite
@@ -616,31 +659,43 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > number is about, and — unlike (d) — runs against the same SQLite source and the
 > same flag list the daemon ships, so the query planner, the index choices and the
 > pager are the daemon's, not a look-alike's. (d)'s single advantage over (b′) was
-> avoiding a patched build; now that the patch is known to be one appended flag,
-> (d) is strictly dominated: it carries every limitation (b′) has, plus a different
-> planner. (a) and (c) discharge the clause by reinterpreting it, which is the move
-> S0-99 forbids for the 50 ms constant and should be no more available here. (b) is
-> the only option that instruments the shipped statement, and it is available if
-> the ruling wants it — the cost is that every user pays for instrumentation that
-> exists for one benchmark.
+> avoiding a patched build; now that there is no patch at all — one scoped,
+> cargo-fingerprinted env var — (d) is strictly dominated: it carries every
+> limitation (b′) has, plus a different planner. (a) and (c) discharge the clause
+> by reinterpreting it, which is the move S0-99 forbids for the 50 ms constant and
+> should be no more available here. (b) is the only option that instruments the
+> shipped statement, and it remains available if the ruling wants it — but its
+> price rose in rev 6: every user pays for instrumentation that exists for one
+> benchmark, **and** somebody must land a wrapper or API-exposure change in
+> `libsql` before the production statement can be reached at all
+> (`libsql-0.9.30/src/statement.rs:31`-`:33`).
 >
-> **What (b′) gives up, stated plainly so the ruling is informed.** Three things,
-> none of which (d) fixes:
+> **What (b′) gives up, stated plainly so the ruling is informed** *(re-derived
+> rev 6 against the corrected mechanics)*. Three things, none of which (d) fixes:
 >
-> 1. The instrumented build is not byte-identical to the shipped one — the flag
->    adds counters to VDBE structures
->    (`libsql-ffi-0.9.30/bundled/SQLite3MultipleCiphers/src/sqlite3.c:17078`). It
->    is the same planner with instrumentation, not the same binary.
-> 2. The statement is prepared through `libsql-sys` — `raw_stmt` is a public field
+> 1. **Still applies, unchanged.** The instrumented build is not byte-identical to
+>    the shipped one — the flag adds counters to VDBE structures
+>    (`libsql-ffi-0.9.30/bundled/src/sqlite3.c:17078`-`:17081`, and the scan-status
+>    arrays at `:24207`-`:24210`). It is the same planner with instrumentation, not
+>    the same binary.
+> 2. **Still applies as a fact, but it stops being a reason to prefer (b).** The
+>    statement is prepared through `libsql-sys` — `raw_stmt` is a public field
 >    (`libsql-sys-0.9.30/src/statement.rs:10`) and `get_status` a public method
->    (`libsql-sys-0.9.30/src/statement.rs:183`) — rather
->    than through the `libsql::Connection` the daemon uses, because
->    `libsql::Statement.inner` is private
+>    (`:183`) — rather than through the `libsql::Connection` the daemon uses,
+>    because `libsql::Statement.inner` is private
 >    (`libsql-0.9.30/src/statement.rs:31`-`:33`). Same C library, different Rust
->    wrapper.
-> 3. `build.rs` flags are not cargo features, so the patch applies to every
->    consumer in its build graph. Keeping the instrumented build out of releases is
->    a build-layout obligation the ruling should state explicitly, not a default.
+>    wrapper. Rev 5 listed this as (b′)'s cost alone; in fact the private field
+>    blocks **(b) too**, and harder — a bench may reach around the wrapper, while
+>    shipping instrumentation on the production statement cannot.
+> 3. **Changed shape.** The obligation is no longer "keep a vendored patch out of
+>    releases" but "keep an env var out of release builds", and the two are not
+>    equally visible: a patch sits in the tree where a reviewer trips over it,
+>    whereas an env var is invisible in the source and lives in whatever sets it.
+>    Cheaper to apply, easier to leak. Two things bound the risk — the flag is
+>    inert unless something calls `sqlite3_stmt_scanstatus`, and cargo's
+>    `rerun-if-env-changed` (`build.rs:422`) makes the instrumented artifact
+>    rebuild rather than persist — but the ruling should still state release
+>    hygiene explicitly rather than assume it.
 >
 > Rev 2 reserved this escape — *"the honest consequence is that G6's visit clause
 > is not gated and must be raised as such"* — rev 3 took it, rev 4 sharpened it
@@ -919,6 +974,7 @@ materializes ~160 rows while traversing up to 2,048 index entries.
 **Added in rev 3:** `S0-157` *(sharpened rev 4)* the absolute visit bound is NOT
 gated — `VM_STEP` counts opcode steps, not entries, no reachable counter counts
 entries, and rev 3's linear-scaling proxy is withdrawn because a `32 × d`
-traversal is itself linear. Ruling request R-1 *(amended rev 5)* carries five
-options and recommends (b′): a bench-only build of the daemon's own libSQL with
-one flag appended, measuring `NVISIT` on the real code path.
+traversal is itself linear. Ruling request R-1 *(amended rev 5, re-costed rev 6)*
+carries five options and recommends (b′): a bench-only build of the daemon's own
+libSQL with one flag appended through libsql-ffi's own `LIBSQLITE3_FLAGS` env
+knob — no vendored patch — measuring `NVISIT` on the real code path.
