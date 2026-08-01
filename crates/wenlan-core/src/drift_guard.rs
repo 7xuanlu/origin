@@ -9,6 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use syn::parse::{Parse, ParseStream};
+use syn::visit::{self, Visit};
+use syn::{Expr, Lit, Pat, Token};
 
 #[cfg(test)]
 #[path = "drift_guard/r4_test_support_test.rs"]
@@ -8299,8 +8302,9 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 /// same site as `page.kind == "overview"`.
 ///
 /// Control flow is the other half and lives in `page_kind_match_sites`, which
-/// this calls: an arm is a pattern, not an operator, so a `match` decides on
-/// the column without ever writing one, guard or no guard.
+/// this calls. That half is parsed rather than scanned, so `match`, `matches!`,
+/// `if let`, and `while let` are all the same site, and guards, comma-optional
+/// bodies, turbofish commas, and nested matches stop being special cases.
 ///
 /// What still gets past this, each verified to escape rather than assumed to:
 ///
@@ -8320,14 +8324,20 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 ///   inside a CASE. This is the price of the connective gate, and the gate is
 ///   what keeps migration 104's log line out; widening the lead set trades
 ///   reach for false findings on prose.
-/// - a Rust pattern route not spelled `match` or `matches!` — `if let "source"
-///   = page.kind.as_str()`. Neither scan looks for a pattern that precedes its
-///   scrutinee.
+/// - a `match` inside a macro body that is not a sequence of statements. Macro
+///   tokens are not parsed on the way in, so the scan re-parses what it can
+///   (`my_wrapper!(let l = match page.kind … ;)` is reached) and skips bodies
+///   with their own grammar. Narrower than the old text scan, which saw every
+///   macro body — that is the one place going structural costs reach.
 ///
-/// None of these is characterised as evasion; they are ordinary ways to write
-/// the same decision that this tooth does not reach. It is a drift guard over
-/// the shapes this repository actually writes — the SQL fence in its two live
-/// spellings, the Rust comparison, the `match` — and a reader in one of the
+/// The rest of the Rust half is no longer a ceiling: `if let`/`while let` were
+/// disclosed holes under the text scan and are now covered, and the guard,
+/// comma-boundary, and turbofish defects two review rounds found are gone by
+/// construction rather than patched.
+///
+/// None of the above is characterised as evasion; they are ordinary ways to
+/// write the same decision that this tooth does not reach. It is a drift guard
+/// over the shapes this repository actually writes, and a reader in one of the
 /// shapes above lands unnoticed.
 fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
     let production = strip_cfg_test_items(source);
@@ -8464,222 +8474,254 @@ fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
         }
         sites.push(format!("{path}: kind {op} {quote}{routed}{quote}"));
     }
-    sites.extend(page_kind_match_sites(path, &production));
+    // The match scan gets the ORIGINAL source, not the stripped twin.
+    // `strip_cfg_test_items` blanks whole lines, which is right for a text scan
+    // but does not always leave valid Rust — eight files in this tree stop
+    // parsing after it runs — and the parser needs a file it can read. Test
+    // items are skipped structurally instead, by attribute.
+    sites.extend(page_kind_match_sites(path, source));
     sites
-}
-
-/// Byte offset of the delimiter closing a region that opens just past the
-/// caller's cursor. Callers pass string-masked text, so a delimiter inside a
-/// literal or a comment cannot move the count.
-fn balanced_span(text: &str, open: char, close: char) -> Option<usize> {
-    let mut depth = 1usize;
-    for (offset, ch) in text.char_indices() {
-        if ch == open {
-            depth += 1;
-        } else if ch == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(offset);
-            }
-        }
-    }
-    None
-}
-
-/// Byte offset of `needle` in `text` at bracket depth zero. Callers enter at
-/// depth zero and pass string-masked text, so a bracket inside a literal or a
-/// comment cannot move the count, and a `=>` inside a nested `match` block or a
-/// `,` inside a call's argument list is skipped rather than read as this
-/// level's punctuation.
-fn top_level_find(text: &str, needle: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    for (offset, ch) in text.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            _ => {}
-        }
-        if depth == 0 && text[offset..].starts_with(needle) {
-            return Some(offset);
-        }
-    }
-    None
-}
-
-/// Byte offset of the `if` opening a match arm's guard: a whole word at bracket
-/// depth zero, so an `if` inside a pattern's parentheses or one spelled
-/// `identifier` is not mistaken for the keyword.
-fn guard_start(head: &str) -> Option<usize> {
-    let mut cursor = 0usize;
-    while let Some(found) = top_level_find(&head[cursor..], "if") {
-        let at = cursor + found;
-        cursor = at + "if".len();
-        let joined_left = head[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        let joined_right = head[cursor..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
-        if !joined_left && !joined_right {
-            return Some(at);
-        }
-    }
-    None
-}
-
-/// Byte offset just past a match arm's body, given the offset just after its
-/// `=>`. A braced body ends at its closing brace, an expression body at the
-/// comma separating it from the next arm.
-fn arm_body_end(arms: &str, from: usize) -> usize {
-    let start = from + (arms[from..].len() - arms[from..].trim_start().len());
-    if arms[start..].starts_with('{') {
-        return match balanced_span(&arms[start + 1..], '{', '}') {
-            Some(close) => start + 1 + close + 1,
-            None => arms.len(),
-        };
-    }
-    match top_level_find(&arms[start..], ",") {
-        Some(at) => start + at + 1,
-        None => arms.len(),
-    }
-}
-
-/// True when `text` names `kind` as a whole word — `page.kind`,
-/// `kind.as_str()`, a bare binding — and not `creation_kind` or
-/// `assigned_kind`, which carry no fence.
-fn names_kind_binding(text: &str) -> bool {
-    let mut cursor = 0usize;
-    while let Some(found) = text[cursor..].find("kind") {
-        let start = cursor + found;
-        cursor = start + "kind".len();
-        let joined_left = text[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        let joined_right = text[cursor..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
-        if !joined_left && !joined_right {
-            return true;
-        }
-    }
-    false
 }
 
 /// Rust `match` / `matches!` routing on a page kind — the shape the comparison
 /// scan structurally cannot see, because an arm is a pattern and never writes
 /// an operator.
 ///
-/// Structure is read off a string-masked twin and content off a
-/// literal-preserving one. `mask_lexical` preserves byte length, so a single
-/// offset indexes both. This scan works on uncollapsed text, unlike the SQL
-/// scan: SQL is written across source lines with `\` continuations and has to
-/// be flattened first, while Rust tokens are already adjacent.
+/// Parsed with `syn` rather than walked as text. Two rounds of review found two
+/// separate defects in a hand-rolled arm walker (a literal read by the
+/// punctuation that followed it, then an arm boundary read off commas), and the
+/// second one has no textual fix: `make::<u8, u16>("source")` and `a < b, c > d`
+/// are the same character sequence at the depth a bracket counter can see, so
+/// only a parser can say whether that comma separates arms. `drift_guard` is
+/// `#[cfg(test)]` (lib.rs:29) and `syn` is already a dev-dependency of this
+/// crate with `full` + `visit`, so this costs nothing at production-compile
+/// time.
 ///
-/// An arm is `pattern if guard => body`, and only the pattern decides. The
-/// three regions are cut apart by walking `=>` to `=>` at bracket depth zero
-/// and splitting each arm's head at its guard keyword. A `"source"` in the body
-/// is prose — an error message, a log line — and one in a guard is an
-/// expression; flagging either would make the tooth cry wolf on arms that are
-/// actually fine, while reading a literal by the punctuation that follows it
-/// would miss `"source" if active =>`, a pattern whose literal is followed by
-/// `if`.
+/// With an AST the three regions of `pattern if guard => body` arrive already
+/// separated, so guards, comma-optional block bodies, turbofish commas, closure
+/// commas, and nested matches all stop being special cases. Only `arm.pat` is
+/// searched: a `"source"` in a body is prose and one in a guard is an
+/// expression, and flagging either would make the tooth cry wolf.
 fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
-    let structural = mask_lexical(production, false);
-    let visible = mask_lexical(production, true);
-    let mut sites = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(found) = structural[cursor..].find("match") {
-        let start = cursor + found;
-        cursor = start + "match".len();
-        if structural[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-        {
-            continue;
-        }
-        // `match x { arms }` and `matches!(x, patterns)` are one decision
-        // written two ways. In the macro every literal after the comma is a
-        // pattern already, so it needs no `=>` to prove it is one.
-        let (scrutinee, arms, masked, all_patterns) = if structural[cursor..].starts_with("es!") {
-            let Some(open) = structural[cursor..].find('(') else {
-                continue;
-            };
-            let from = cursor + open + 1;
-            let Some(len) = balanced_span(&structural[from..], '(', ')') else {
-                continue;
-            };
-            let Some(comma) = visible[from..from + len].find(',') else {
-                continue;
-            };
-            (
-                &visible[from..from + comma],
-                &visible[from + comma..from + len],
-                &structural[from + comma..from + len],
-                true,
-            )
-        } else {
-            if structural[cursor..].starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-                continue;
-            }
-            let Some(open) = structural[cursor..].find('{') else {
-                continue;
-            };
-            let from = cursor + open + 1;
-            let Some(len) = balanced_span(&structural[from..], '{', '}') else {
-                continue;
-            };
-            (
-                &visible[cursor..cursor + open],
-                &visible[from..from + len],
-                &structural[from..from + len],
-                false,
-            )
-        };
-        if !names_kind_binding(scrutinee) {
-            continue;
-        }
-        // In the macro every literal before the guard is already a pattern, so
-        // it needs no `=>` to prove it is one — but the guard is an expression
-        // there too, and its literals decide nothing.
-        let routed = if all_patterns {
-            unroutable_literal(guard_start(masked).map_or(arms, |at| &arms[..at]))
-        } else {
-            pattern_literal(arms, masked)
-        };
-        if let Some(routed) = routed {
-            sites.push(format!("{path}: match on kind, arm \"{routed}\""));
-        }
-    }
-    sites
+    let Some(file) = parse_rust(production) else {
+        // Fail loud. A file this scan cannot read is a file whose readers are
+        // unknown, which in a fail-closed guard must not read as "clean".
+        return vec![format!(
+            "{path}: could not be parsed as Rust, so the page-kind match scan could not run"
+        )];
+    };
+    let mut visitor = MatchVisitor {
+        path,
+        sites: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.sites
 }
 
-/// The first arm pattern in `arms` naming a page kind no reader may route on.
+/// Parse a whole file, or the statement fragments the control test is written
+/// as. Files are tried first so a real source is never re-read as a fn body.
+fn parse_rust(source: &str) -> Option<syn::File> {
+    if let Ok(file) = syn::parse_file(source) {
+        return Some(file);
+    }
+    syn::parse_file(&format!("fn drift_guard_probe() {{\n{source}\n}}")).ok()
+}
+
+/// True for `#[cfg(test)]` and for any `cfg` naming `test` inside an `all`/`any`.
 ///
-/// An arm is three regions — `pattern if guard => body` — and only the first
-/// decides on the column. Walking `=>` to `=>` and cutting each arm at its
-/// guard is what separates them; reading a literal by what punctuation follows
-/// it cannot, because `"source" if active =>` is a pattern whose literal is
-/// followed by `if`, while `"entity" if tag == "source" =>` routes on `entity`
-/// alone and its `"source"` is an expression.
-fn pattern_literal<'a>(arms: &'a str, masked: &str) -> Option<&'a str> {
-    let mut cursor = 0usize;
-    while cursor < masked.len() {
-        let arrow = cursor + top_level_find(&masked[cursor..], "=>")?;
-        let head_end = guard_start(&masked[cursor..arrow]).map_or(arrow, |at| cursor + at);
-        if let Some(literal) = unroutable_literal(&arms[cursor..head_end]) {
-            return Some(literal);
-        }
-        cursor = arm_body_end(masked, arrow + 2);
-    }
-    None
+/// The ident is matched as a token, never as a substring, so
+/// `#[cfg(feature = "test-utils")]` — a string literal — stays production code.
+/// Erring toward *not* skipping is the safe direction: an unskipped test fixture
+/// is a visible false finding, while an over-eager skip is a silent hole in a
+/// fail-closed guard.
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && matches!(&attr.meta, syn::Meta::List(list) if cfg_names_test(list.tokens.clone()))
+    })
 }
 
-/// The first double-quoted literal in `text` naming a page kind no reader may
-/// route on. Callers pass one arm's pattern region, never a whole arm.
-fn unroutable_literal(text: &str) -> Option<&str> {
-    text.split('"')
-        .skip(1)
-        .step_by(2)
-        .find(|literal| UNROUTABLE_PAGE_KINDS.contains(literal))
+fn cfg_names_test(tokens: proc_macro2::TokenStream) -> bool {
+    tokens.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(ident) => ident == "test",
+        proc_macro2::TokenTree::Group(group) => cfg_names_test(group.stream()),
+        _ => false,
+    })
+}
+
+/// Attributes of the item kinds that can carry code. A `#[cfg(test)]` struct or
+/// type alias holds no `match`, so those need no arm here.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+struct MatchVisitor<'a> {
+    path: &'a str,
+    sites: Vec<String>,
+}
+
+impl MatchVisitor<'_> {
+    /// Records the pattern if it routes on a forbidden kind, and says whether
+    /// it did, so a `match` can stop at its first offending arm.
+    fn record(&mut self, pattern: &Pat) -> bool {
+        let Some(kind) = pattern_kind(pattern) else {
+            return false;
+        };
+        self.sites
+            .push(format!("{}: match on kind, arm \"{kind}\"", self.path));
+        true
+    }
+}
+
+impl<'ast> Visit<'ast> for MatchVisitor<'_> {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if is_cfg_test(item_attrs(node)) {
+            return;
+        }
+        visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        let attrs = match node {
+            syn::ImplItem::Fn(item) => &item.attrs[..],
+            syn::ImplItem::Const(item) => &item.attrs[..],
+            syn::ImplItem::Macro(item) => &item.attrs[..],
+            _ => &[],
+        };
+        if is_cfg_test(attrs) {
+            return;
+        }
+        visit::visit_impl_item(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        if expr_names_kind(&node.expr) {
+            for arm in &node.arms {
+                if self.record(&arm.pat) {
+                    break;
+                }
+            }
+        }
+        visit::visit_expr_match(self, node);
+    }
+
+    /// `if let "source" = page.kind.as_str()` and `while let` route on the
+    /// column exactly as a `match` arm does; the pattern simply precedes its
+    /// scrutinee. Free to cover once the shape is an AST node rather than text.
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        if expr_names_kind(&node.expr) {
+            self.record(&node.pat);
+        }
+        visit::visit_expr_let(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "matches")
+        {
+            if let Ok(invocation) = node.parse_body::<MatchesInvocation>() {
+                if expr_names_kind(&invocation.scrutinee) {
+                    self.record(&invocation.pattern);
+                }
+            }
+            return;
+        }
+        // A `match` written inside some other macro's body is still a reader.
+        // Token streams are not parsed by `syn` on the way in, so recover the
+        // ones that happen to be statements; the rest (`vec![1, 2]`, a format
+        // string) simply do not parse and are skipped.
+        if let Ok(statements) = node.parse_body_with(syn::Block::parse_within) {
+            for statement in &statements {
+                self.visit_stmt(statement);
+            }
+        }
+    }
+}
+
+/// `matches!(scrutinee, pattern | pattern if guard)`. The guard is parsed so it
+/// can be discarded: its literals are an expression's, not a pattern's.
+struct MatchesInvocation {
+    scrutinee: Expr,
+    pattern: Pat,
+}
+
+impl Parse for MatchesInvocation {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let scrutinee = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let pattern = Pat::parse_multi_with_leading_vert(input)?;
+        if input.peek(Token![if]) {
+            input.parse::<Token![if]>()?;
+            let _: Expr = input.parse()?;
+        }
+        Ok(MatchesInvocation { scrutinee, pattern })
+    }
+}
+
+/// True when a scrutinee reads the page-kind column: `page.kind`,
+/// `page.kind.as_str()`, `page.kind()`, a bare `kind` binding. Identifiers are
+/// compared whole, so `creation_kind` — a different column carrying no fence —
+/// can never match, and `page_kind_for(..)` is a call, not a read of the field.
+fn expr_names_kind(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(field) => match &field.member {
+            syn::Member::Named(name) => name == "kind" || expr_names_kind(&field.base),
+            syn::Member::Unnamed(_) => expr_names_kind(&field.base),
+        },
+        Expr::MethodCall(call) => call.method == "kind" || expr_names_kind(&call.receiver),
+        Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "kind"),
+        Expr::Reference(reference) => expr_names_kind(&reference.expr),
+        Expr::Paren(paren) => expr_names_kind(&paren.expr),
+        Expr::Unary(unary) => expr_names_kind(&unary.expr),
+        Expr::Try(try_expr) => expr_names_kind(&try_expr.expr),
+        Expr::Cast(cast) => expr_names_kind(&cast.expr),
+        Expr::Group(group) => expr_names_kind(&group.expr),
+        _ => false,
+    }
+}
+
+/// The page kind a pattern routes on, at any depth of an or-pattern, a
+/// reference, or a tuple — every position where the literal is still matched
+/// against rather than evaluated.
+fn pattern_kind(pattern: &Pat) -> Option<String> {
+    match pattern {
+        Pat::Lit(literal) => match &literal.lit {
+            Lit::Str(text) => {
+                let value = text.value();
+                UNROUTABLE_PAGE_KINDS
+                    .contains(&value.as_str())
+                    .then_some(value)
+            }
+            _ => None,
+        },
+        Pat::Or(cases) => cases.cases.iter().find_map(pattern_kind),
+        Pat::Paren(paren) => pattern_kind(&paren.pat),
+        Pat::Reference(reference) => pattern_kind(&reference.pat),
+        Pat::Ident(ident) => ident
+            .subpat
+            .as_ref()
+            .and_then(|(_, subpattern)| pattern_kind(subpattern)),
+        Pat::TupleStruct(tuple) => tuple.elems.iter().find_map(pattern_kind),
+        Pat::Tuple(tuple) => tuple.elems.iter().find_map(pattern_kind),
+        Pat::Slice(slice) => slice.elems.iter().find_map(pattern_kind),
+        _ => None,
+    }
 }
 
 #[test]
@@ -8846,6 +8888,26 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
         "the macro takes a guard too"
     );
 
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "let l = match page.kind.as_str() {\n    \
+             \"entity\" => if active { 0 } else { 1 }\n    \
+             \"source\" => 2,\n    _ => 0,\n};",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "Rust lets an arm whose body is an expression-with-block drop its \
+         trailing comma, and this repository writes that style, so an arm \
+         boundary read off commas loses every arm after the first such body"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(path, "if let \"source\" = page.kind.as_str() { skip(); }"),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "an `if let` is a match arm with the pattern written first, and reading \
+         the AST makes it the same site rather than a disclosed hole"
+    );
+
     for (label, source) in [
         (
             "the entity fence itself",
@@ -8920,6 +8982,27 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
         (
             "the same guard literal inside the macro",
             "if matches!(page.kind.as_str(), \"entity\" if tag == \"source\") { return Ok(()); }",
+        ),
+        (
+            "a forbidden literal in an arm body, reached past a turbofish comma",
+            "let l = match page.kind.as_str() { \"entity\" => make::<u8, u16>(\"source\"), \
+             _ => 0 };",
+        ),
+        (
+            "the same shape with a two-argument closure",
+            "let l = match page.kind.as_str() { \"entity\" => fold(|a, b| pick(a, b, \"source\")), \
+             _ => 0 };",
+        ),
+        (
+            "a test fixture, which the scan now skips by attribute rather than by \
+             blanking its lines",
+            "#[cfg(test)]\nmod tests {\n    fn f(page: &Page) -> u8 {\n        \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n    }\n}",
+        ),
+        (
+            "a cfg naming a feature that merely starts with the word test",
+            "#[cfg(feature = \"test-utils\")]\nfn f(page: &Page) -> u8 {\n    \
+             match page.creation_kind.as_str() { \"source\" => 1, _ => 0 }\n}",
         ),
     ] {
         assert!(
