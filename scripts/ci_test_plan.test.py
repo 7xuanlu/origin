@@ -747,7 +747,15 @@ class CommandGenerationTests(unittest.TestCase):
                     "-p",
                     "wenlan-server",
                     "--lib",
-                ]
+                ],
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-server",
+                    "--bin",
+                    "wenlan-server",
+                ],
             ],
         )
         self.assertEqual(
@@ -809,6 +817,8 @@ class CommandGenerationTests(unittest.TestCase):
                     "run",
                     "--workspace",
                     "--lib",
+                    "--bin",
+                    "wenlan-server",
                     "--partition",
                     "slice:1/2",
                 ]
@@ -830,6 +840,8 @@ class CommandGenerationTests(unittest.TestCase):
                     "-p",
                     "wenlan-server",
                     "--lib",
+                    "--bin",
+                    "wenlan-server",
                 ]
             ],
         )
@@ -851,6 +863,8 @@ class CommandGenerationTests(unittest.TestCase):
                 "/tmp/workspace-lib.tar.zst",
                 "--workspace",
                 "--lib",
+                "--bin",
+                "wenlan-server",
             ],
         )
 
@@ -874,6 +888,8 @@ class CommandGenerationTests(unittest.TestCase):
                 "-p",
                 "wenlan-server",
                 "--lib",
+                "--bin",
+                "wenlan-server",
             ],
         )
 

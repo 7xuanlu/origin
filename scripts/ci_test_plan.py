@@ -635,9 +635,16 @@ def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[s
     workspace_mode = workspace.get("mode")
     if workspace_mode == "full":
         commands.append(["cargo", "test", "--workspace", "--lib"])
+        commands.append(
+            ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
+        )
     elif workspace_mode in {"packages", "filterset"}:
         names = _validated_package_names(workspace.get("packages"), packages)
         commands.append(["cargo", "test", *_package_args(names), "--lib"])
+        if "wenlan-server" in names:
+            commands.append(
+                ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
+            )
     elif workspace_mode != "skip":
         raise PlanError(f"unknown workspace-lib mode: {workspace_mode!r}")
 
@@ -664,7 +671,7 @@ def archive_command_for(
     *,
     archive_file: str,
 ) -> list[str]:
-    """Build one workspace-lib archive without applying test predicates."""
+    """Build one affected unit-test archive without applying test predicates."""
 
     if not isinstance(plan, dict) or plan.get("version") != 1:
         raise PlanError("unsupported or malformed test plan")
@@ -684,7 +691,7 @@ def archive_command_for(
         _validated_path_argument(archive_file, name="archive-file"),
     ]
     if mode == "full":
-        return [*cargo, "--workspace", "--lib"]
+        return [*cargo, "--workspace", "--lib", "--bin", "wenlan-server"]
     if mode in {"packages", "filterset"}:
         if mode == "filterset":
             filterset = suite.get("filterset")
@@ -693,7 +700,10 @@ def archive_command_for(
         names = _validated_package_names(suite.get("packages"), packages)
         # Filterset plans archive each selected package's complete lib test
         # binary. Test-name predicates are valid only when the archive runs.
-        return [*cargo, *_package_args(names), "--lib"]
+        command = [*cargo, *_package_args(names), "--lib"]
+        if "wenlan-server" in names:
+            command.extend(["--bin", "wenlan-server"])
+        return command
     raise PlanError(f"unknown workspace-lib mode: {mode!r}")
 
 
@@ -774,10 +784,17 @@ def command_groups_for(
                 ]
             raise PlanError(f"unknown workspace-lib mode: {mode!r}")
         if mode == "full":
-            return [workspace_command([*cargo, "--workspace", "--lib"])]
+            return [
+                workspace_command(
+                    [*cargo, "--workspace", "--lib", "--bin", "wenlan-server"]
+                )
+            ]
         if mode == "packages":
             names = _validated_package_names(suite.get("packages"), packages)
-            return [workspace_command([*cargo, *_package_args(names), "--lib"])]
+            command = [*cargo, *_package_args(names), "--lib"]
+            if "wenlan-server" in names:
+                command.extend(["--bin", "wenlan-server"])
+            return [workspace_command(command)]
         if mode == "filterset":
             filterset = suite.get("filterset")
             if not isinstance(filterset, str) or not filterset:
