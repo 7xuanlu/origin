@@ -8300,13 +8300,35 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 ///
 /// Control flow is the other half and lives in `page_kind_match_sites`, which
 /// this calls: an arm is a pattern, not an operator, so a `match` decides on
-/// the column without ever writing one.
+/// the column without ever writing one, guard or no guard.
 ///
-/// What still gets past this: a comparison spelled as a method call
-/// (`kind.eq("overview")`), a literal reached through a `const`, and a
-/// predicate assembled from pieces none of which contains both the column and
-/// the value. Each is a deliberate ceiling, not an oversight — the tooth
-/// guards against a reader drifting in, not against one written to evade it.
+/// What still gets past this, each verified to escape rather than assumed to:
+///
+/// - a comparison spelled as a method call — `kind.eq("overview")`,
+///   `kind.starts_with("over")`. The accessor walk steps onto the call and
+///   finds no operator behind it.
+/// - a literal reached indirectly: `const OVERVIEW: &str = "overview"` then
+///   `kind == OVERVIEW`. The operand is an identifier, so there is nothing to
+///   compare against the forbidden set.
+/// - a value that is not a literal at all — `" AND kind = ?1"` with the kind
+///   bound at runtime, or `format!(" AND kind = '{wanted}'")`. A bound value is
+///   not knowable from the source, so this one is a limit of static reading
+///   rather than of this tooth.
+/// - a SQL fragment that opens on something other than `AND`, `OR`, `WHERE`,
+///   `HAVING`, or `ON`: a bare `" kind = 'overview'"` relying on the base
+///   ending in `WHERE`, a leading `"("`, or a `" WHEN kind = 'overview' THEN"`
+///   inside a CASE. This is the price of the connective gate, and the gate is
+///   what keeps migration 104's log line out; widening the lead set trades
+///   reach for false findings on prose.
+/// - a Rust pattern route not spelled `match` or `matches!` — `if let "source"
+///   = page.kind.as_str()`. Neither scan looks for a pattern that precedes its
+///   scrutinee.
+///
+/// None of these is characterised as evasion; they are ordinary ways to write
+/// the same decision that this tooth does not reach. It is a drift guard over
+/// the shapes this repository actually writes — the SQL fence in its two live
+/// spellings, the Rust comparison, the `match` — and a reader in one of the
+/// shapes above lands unnoticed.
 fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
     let production = strip_cfg_test_items(source);
     // Literals kept, comments blanked: the SQL this looks for lives inside
@@ -8420,14 +8442,18 @@ fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
             // somewhere else. Demanding the proof sit in the same literal is
             // what let that shape through, so a fragment is read as one and
             // counted, rather than excused for failing to prove itself — but
-            // only when it opens like a predicate, or every log line mentioning
-            // `kind='concept'` becomes a finding.
+            // only when it OPENS on a predicate keyword, or every log line
+            // mentioning `kind='concept'` becomes a finding. The opening token
+            // is the test because everything between it and the column is
+            // punctuation a reader is free to write: `AND p.kind`,
+            // `AND COALESCE(kind, 'concept')` — the live fence's own spelling —
+            // and `AND (kind` are all the same predicate.
             let fragment_predicate = !SQL_TABLE_CLAUSES
                 .iter()
                 .any(|clause| statement.contains(clause))
                 && statement
                     .split_whitespace()
-                    .next_back()
+                    .next()
                     .is_some_and(|word| SQL_PREDICATE_LEADS.contains(&word));
             if !fragment_predicate
                 && !statement.contains("FROM PAGES")
@@ -8460,6 +8486,63 @@ fn balanced_span(text: &str, open: char, close: char) -> Option<usize> {
     None
 }
 
+/// Byte offset of `needle` in `text` at bracket depth zero. Callers enter at
+/// depth zero and pass string-masked text, so a bracket inside a literal or a
+/// comment cannot move the count, and a `=>` inside a nested `match` block or a
+/// `,` inside a call's argument list is skipped rather than read as this
+/// level's punctuation.
+fn top_level_find(text: &str, needle: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (offset, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && text[offset..].starts_with(needle) {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+/// Byte offset of the `if` opening a match arm's guard: a whole word at bracket
+/// depth zero, so an `if` inside a pattern's parentheses or one spelled
+/// `identifier` is not mistaken for the keyword.
+fn guard_start(head: &str) -> Option<usize> {
+    let mut cursor = 0usize;
+    while let Some(found) = top_level_find(&head[cursor..], "if") {
+        let at = cursor + found;
+        cursor = at + "if".len();
+        let joined_left = head[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let joined_right = head[cursor..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
+        if !joined_left && !joined_right {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// Byte offset just past a match arm's body, given the offset just after its
+/// `=>`. A braced body ends at its closing brace, an expression body at the
+/// comma separating it from the next arm.
+fn arm_body_end(arms: &str, from: usize) -> usize {
+    let start = from + (arms[from..].len() - arms[from..].trim_start().len());
+    if arms[start..].starts_with('{') {
+        return match balanced_span(&arms[start + 1..], '{', '}') {
+            Some(close) => start + 1 + close + 1,
+            None => arms.len(),
+        };
+    }
+    match top_level_find(&arms[start..], ",") {
+        Some(at) => start + at + 1,
+        None => arms.len(),
+    }
+}
+
 /// True when `text` names `kind` as a whole word — `page.kind`,
 /// `kind.as_str()`, a bare binding — and not `creation_kind` or
 /// `assigned_kind`, which carry no fence.
@@ -8490,10 +8573,14 @@ fn names_kind_binding(text: &str) -> bool {
 /// scan: SQL is written across source lines with `\` continuations and has to
 /// be flattened first, while Rust tokens are already adjacent.
 ///
-/// A literal counts only in *pattern* position (`"source" =>`, `"source" |`).
-/// A `"source"` sitting in an arm's body is prose — an error message, a log
-/// line — and flagging it would make the tooth cry wolf on the arms that are
-/// actually fine.
+/// An arm is `pattern if guard => body`, and only the pattern decides. The
+/// three regions are cut apart by walking `=>` to `=>` at bracket depth zero
+/// and splitting each arm's head at its guard keyword. A `"source"` in the body
+/// is prose — an error message, a log line — and one in a guard is an
+/// expression; flagging either would make the tooth cry wolf on arms that are
+/// actually fine, while reading a literal by the punctuation that follows it
+/// would miss `"source" if active =>`, a pattern whose literal is followed by
+/// `if`.
 fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
     let structural = mask_lexical(production, false);
     let visible = mask_lexical(production, true);
@@ -8512,7 +8599,7 @@ fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
         // `match x { arms }` and `matches!(x, patterns)` are one decision
         // written two ways. In the macro every literal after the comma is a
         // pattern already, so it needs no `=>` to prove it is one.
-        let (scrutinee, arms, all_patterns) = if structural[cursor..].starts_with("es!") {
+        let (scrutinee, arms, masked, all_patterns) = if structural[cursor..].starts_with("es!") {
             let Some(open) = structural[cursor..].find('(') else {
                 continue;
             };
@@ -8526,6 +8613,7 @@ fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
             (
                 &visible[from..from + comma],
                 &visible[from + comma..from + len],
+                &structural[from + comma..from + len],
                 true,
             )
         } else {
@@ -8542,19 +8630,20 @@ fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
             (
                 &visible[cursor..cursor + open],
                 &visible[from..from + len],
+                &structural[from..from + len],
                 false,
             )
         };
         if !names_kind_binding(scrutinee) {
             continue;
         }
+        // In the macro every literal before the guard is already a pattern, so
+        // it needs no `=>` to prove it is one — but the guard is an expression
+        // there too, and its literals decide nothing.
         let routed = if all_patterns {
-            arms.split('"')
-                .skip(1)
-                .step_by(2)
-                .find(|literal| UNROUTABLE_PAGE_KINDS.contains(literal))
+            unroutable_literal(guard_start(masked).map_or(arms, |at| &arms[..at]))
         } else {
-            pattern_literal(arms)
+            pattern_literal(arms, masked)
         };
         if let Some(routed) = routed {
             sites.push(format!("{path}: match on kind, arm \"{routed}\""));
@@ -8564,21 +8653,33 @@ fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
 }
 
 /// The first arm pattern in `arms` naming a page kind no reader may route on.
-fn pattern_literal(arms: &str) -> Option<&str> {
-    let mut rest = arms;
-    while let Some(open) = rest.find('"') {
-        let body = &rest[open + 1..];
-        let close = body.find('"')?;
-        let literal = &body[..close];
-        rest = &body[close + 1..];
-        let follows = rest.trim_start();
-        if (follows.starts_with("=>") || follows.starts_with('|'))
-            && UNROUTABLE_PAGE_KINDS.contains(&literal)
-        {
+///
+/// An arm is three regions — `pattern if guard => body` — and only the first
+/// decides on the column. Walking `=>` to `=>` and cutting each arm at its
+/// guard is what separates them; reading a literal by what punctuation follows
+/// it cannot, because `"source" if active =>` is a pattern whose literal is
+/// followed by `if`, while `"entity" if tag == "source" =>` routes on `entity`
+/// alone and its `"source"` is an expression.
+fn pattern_literal<'a>(arms: &'a str, masked: &str) -> Option<&'a str> {
+    let mut cursor = 0usize;
+    while cursor < masked.len() {
+        let arrow = cursor + top_level_find(&masked[cursor..], "=>")?;
+        let head_end = guard_start(&masked[cursor..arrow]).map_or(arrow, |at| cursor + at);
+        if let Some(literal) = unroutable_literal(&arms[cursor..head_end]) {
             return Some(literal);
         }
+        cursor = arm_body_end(masked, arrow + 2);
     }
     None
+}
+
+/// The first double-quoted literal in `text` naming a page kind no reader may
+/// route on. Callers pass one arm's pattern region, never a whole arm.
+fn unroutable_literal(text: &str) -> Option<&str> {
+    text.split('"')
+        .skip(1)
+        .step_by(2)
+        .find(|literal| UNROUTABLE_PAGE_KINDS.contains(literal))
 }
 
 #[test]
@@ -8675,6 +8776,30 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
     );
 
     assert_eq!(
+        page_kind_routing_sites(path, "sql.push_str(\" AND p.kind = 'overview'\");"),
+        [format!("{path}: kind = 'overview'")],
+        "a fragment is recognised by the connective it opens with, so qualifying \
+         the column with its table alias cannot hide it"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "sql.push_str(\" AND COALESCE(kind, 'concept') = 'source'\");",
+        ),
+        [format!("{path}: kind = 'source'")],
+        "the live entity fence is spelled `AND COALESCE(kind, 'concept') != 'entity'` \
+         (db.rs:41949, db.rs:42055), so the appended form of it with the literal \
+         swapped is the likeliest reader to grow here"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(path, "sql.push_str(\" AND (kind = 'overview')\");"),
+        [format!("{path}: kind = 'overview'")],
+        "parenthesising a predicate changes its punctuation, not what it decides"
+    );
+
+    assert_eq!(
         page_kind_routing_sites(
             path,
             "let label = match page.kind.as_str() { \"source\" => \"doc\", _ => \"note\" };",
@@ -8700,6 +8825,25 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
         ),
         [format!("{path}: match on kind, arm \"overview\"")],
         "matches! is the same decision spelled as a macro"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "let l = match page.kind.as_str() { \"source\" if active => 1, _ => 0 };",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a guard narrows when the arm fires, so a guarded pattern routes on the \
+         column at least as much as a bare one"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "if matches!(page.kind.as_str(), \"source\" if active) { return Ok(()); }",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "the macro takes a guard too"
     );
 
     for (label, source) in [
@@ -8767,6 +8911,15 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
             "prose in an arm body, which decides nothing",
             "let l = match page.kind.as_str() { \"entity\" => bail!(\"source missing\"), \
              _ => 0 };",
+        ),
+        (
+            "a literal in a guard expression, which is not the arm's pattern",
+            "let l = match page.kind.as_str() { \"entity\" if tag == \"source\" => 1, \
+             _ => 0 };",
+        ),
+        (
+            "the same guard literal inside the macro",
+            "if matches!(page.kind.as_str(), \"entity\" if tag == \"source\") { return Ok(()); }",
         ),
     ] {
         assert!(
