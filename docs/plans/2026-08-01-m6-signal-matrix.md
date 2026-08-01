@@ -185,6 +185,8 @@ Reported, not resolved, per the STOP-13 instruction. Both are cases where a D1/D
 
 ### 7.1 `page_truth_state.support_status` has no live writer; every page is `provisional`
 
+> **Status: escalated 2026-08-01, pending ruling.** Contract-level; not resolved inside Stage 0. Artifact 12 marks the G2 clauses that depend on this predicate as blocked-pending-ruling rather than treating them as live gates.
+
 **Confirmed.** The only production write to `page_truth_state` anywhere in the workspace is `backfill_page_truth_state` (`crates/wenlan-core/src/db/claim_identity.rs:502`), called exactly once, from migration 99 (`crates/wenlan-core/src/db.rs:11752`). The migration's own doc comment states the outcome:
 
 > Migration 99 (M5 PR-A): fail-closed page truth-state backfill. **Every page becomes `provisional` and unreviewed.** Nothing is read from a legacy field and turned into a truth claim — see `backfill_page_truth_state` for why that is the whole point rather than a conservative default.
@@ -197,6 +199,8 @@ There is no derivation worker. `claim_derivation_jobs` — the table whose lease
 **Why this is a report and not a blocker I should resolve.** G1 already requires "M5 readiness/cutover at 100%" before M6 code begins, so the intended sequencing may well be that the derivation worker lands in a remaining M5 PR. What I cannot verify from this branch is whether that worker is planned or overlooked. The decision belongs to whoever owns the M5 scope, and it changes M6 sequencing either way: **PR-B's orphan-wikilink shadow is unmeasurable until a support-derivation writer exists**, and G1's prerequisite check should assert a live writer, not merely the presence of the table.
 
 ### 7.2 `pages.kind` is never set on insert, so `kind = 'overview'` cannot identify overview pages
+
+> **Status: escalated 2026-08-01, pending ruling.** Contract-level; not resolved inside Stage 0. Artifact 12 marks the G2 clauses that depend on this predicate as blocked-pending-ruling rather than treating them as live gates.
 
 **Confirmed.** The `kind` column was added by migration 89 with `DEFAULT 'concept'` and a CHECK over `('entity','concept','source','overview','authored')` (`crates/wenlan-core/src/db.rs:9173`). The only writer of `'overview'` is that migration's own backfill, `CASE WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview'` (`crates/wenlan-core/src/db.rs:9250`).
 
