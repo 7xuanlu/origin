@@ -822,16 +822,19 @@ The generator therefore expands the SQL layer through a **transitive caller
 closure**, and reports the depth so the layers stay distinguishable rather than
 being flattened into one number:
 
-| Depth | What it is | Count |
-|---|---|---|
-| 0 | SQL-bearing definitions — where prose is materialized | 55 |
-| 1 | wrapper layer — `get_page` over `get_page_inner` | 50 |
-| 2 | consumers — what the spec asks for | 86 |
-| | **total** | **191** |
+| Depth | What it is |
+|---|---|
+| 0 | SQL-bearing definitions — where prose is materialized |
+| 1 | wrapper layer — `get_page` over `get_page_inner` |
+| 2 | consumers — what the spec asks for |
+| 3 | outer consumers — route handlers and orchestration |
 
-Of these, **22** are exposure paths (`pub` and called from outside
-`wenlan-core`) and **9** are name-ambiguous, excluded from the exposure set
-rather than given caller edges a name scan cannot attribute.
+Counts are deliberately absent here. They lived in this table until the M5
+endpoints landed, went stale the same day, and sat wrong beside a generated
+block that was right. `--check` prints the live figures — rows per depth, plus
+how many are exposure paths (`pub` and called from outside `wenlan-core`).
+Name-ambiguous rows are excluded from the exposure set rather than given caller
+edges a name scan cannot attribute.
 
 ### What this enumeration is not
 
@@ -839,9 +842,13 @@ rather than given caller edges a name scan cannot attribute.
   generic names and under-matches through trait dispatch and re-exports. PR-B
   re-resolves with the language server and re-runs this generator, asserting set
   equality on the rows and the partition.
-- **Not depth-unbounded.** The closure stops at depth 2. A consumer three hops
-  from the SQL is not listed. Depth is a stated parameter of the generator, not
-  a claim that nothing lies past it.
+- **Not depth-unbounded.** The closure stops at depth 3. A consumer four hops
+  from the SQL is not listed. Depth is a stated parameter of the generator
+  (`DEPTH_TITLES`), not a claim that nothing lies past it. It was 2 until a
+  four-name chain — `handle_review_page` over `review_page_with_presence` over
+  `review_in_txn` over the `pages` SELECT — left the endpoint itself off the
+  list. Raising it added 75 rows, 28 of them route handlers, so the gap was a
+  class rather than one route.
 - **Not a safety property.** Internal-only means no *current* caller crosses the
   crate boundary, which one `pub` re-export changes.
 
@@ -893,7 +900,7 @@ carrying the authority of agreement.
 | `core/db/maintenance_duplicate_reads.rs:35` | `embedding_near_duplicate_pairs` | `pub(crate)` | internal-only |
 | `core/db/maintenance_duplicate_reads.rs:108` | `scan_near_duplicate_slice` | `pub(crate)` | internal-only |
 | `core/db/maintenance_retro_scan.rs:17` | `scan_automatic_retro_stub_slice` | `pub(crate)` | internal-only |
-| `core/db/presence_review.rs:220` | `page_binding` | `private` | internal-only |
+| `core/db/presence_review.rs:240` | `page_binding` | `private` | internal-only |
 | `core/db/repair_deterministic.rs:7` | `apply_deterministic_repair_cas` | `pub` | internal-only |
 | `core/db/repair_page_rename.rs:117` | `rename_page_title_cas_inner` | `pub(crate)` | internal-only |
 | `core/db/repair_page_rename.rs:729` | `page_on_connection` | `private` | internal-only |
@@ -1076,6 +1083,86 @@ carrying the authority of agreement.
 | `server/routes.rs:1029` | `handle_recent_pages` | `pub` | `list_recent_pages_with_badges_scoped` |
 | `server/scheduler.rs:1711` | `fire_maintenance_stage_safe` | `private` | `run_maintenance_stage_slice` |
 | `server/scheduler/ambient.rs:269` | `run_ambient_job_safe` | `pub(super)` | `run_ambient_job` |
+
+### Depth 3 — outer consumers — route handlers and orchestration
+
+| Address | Function | Visibility | Reaches prose via |
+|---|---|---|---|
+| `core/citations.rs:398` | `run_citation_backfill_tick` | `pub` | `run_citation_backfill_with_page_limit` |
+| `core/citations.rs:411` | `run_citation_backfill_slice` | `pub` | `run_citation_backfill_with_page_limit` |
+| `core/db.rs:21809` | `search_memory` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:22622` | `search_memory_temporal` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:23133` | `search_memory_cross_rerank_cued` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:23602` | `search_memory_expanded` | `pub` | `search_memory_with_cue` |
+| `core/db.rs:24717` | `augment_with_graph_seeded` | `pub` | `augment_with_graph_seeded_scoped` |
+| `core/db/repair_verification.rs:162` | `record_repair_verification_atomic` | `pub(crate)` | `projection_page_row_on_connection` |
+| `core/db/scoped_pages.rs:445` | `list_pages_scoped` | `pub` | `list_pages_scoped_inner` |
+| `core/db/scoped_pages.rs:461` | `list_pages_scoped_browse` | `pub` | `list_pages_scoped_inner` |
+| `core/db/scoped_pages.rs:673` | `get_page_scoped` | `pub` | `get_page_scoped_inner` |
+| `core/db/scoped_pages.rs:685` | `get_page_scoped_browse` | `pub` | `get_page_scoped_inner` |
+| `core/document_enrichment.rs:138` | `run_document_enrichment_with_request_budget` | `private` | `write_document_source_page` |
+| `core/eval/answer_quality.rs:1810` | `run_fullpipeline_locomo_batch` | `pub` | `open_or_seed_scenario_db` |
+| `core/eval/answer_quality.rs:2291` | `run_fullpipeline_lme_batch` | `pub` | `open_or_seed_scenario_db` |
+| `core/eval/lifecycle.rs:512` | `run_lifecycle_phases` | `private` | `run_post_ingest_enrichment` |
+| `core/eval/retrieval.rs:978` | `run_native_memory_comparison` | `pub` | `run_native_memory_augmentation` |
+| `core/eval/shared.rs:1954` | `enrich_db_for_eval_local` | `pub` | `run_post_ingest_enrichment` |
+| `core/eval/shared.rs:2094` | `enrich_post_ingest_batched` | `pub(crate)` | `run_post_ingest_enrichment` |
+| `core/eval/shared.rs:2264` | `run_concept_distillation_batch_api` | `pub` | `max_page_overlap` |
+| `core/export/knowledge.rs:1124` | `write_page_gated` | `pub` | `page_write_permit` |
+| `core/export/knowledge.rs:4052` | `write_page_gated` | `pub` | `page_write_permit` |
+| `core/ingest.rs:515` | `run_canonical_enrichment` | `pub` | `run_post_ingest_enrichment` |
+| `core/lint/semantic.rs:77` | `run` | `pub(super)` | `run_agent_submit` |
+| `core/maintenance.rs:635` | `collect_retro_candidates` | `private` | `detect_all_near_duplicate_pages` |
+| `core/maintenance/duplicates.rs:204` | `source_overlap_pairs` | `private` | `list_page_source_sets` |
+| `core/maintenance/page_merge_order.rs:21` | `order_survivor` | `pub(super)` | `load_candidate` |
+| `core/post_ingest.rs:992` | `write_grown_page` | `private` | `find_page_by_source_memory` |
+| `core/post_write/page_dispatch.rs:238` | `create_page_with_tuning` | `pub` | `page_write` |
+| `core/post_write/page_dispatch.rs:285` | `update_page` | `pub` | `page_write` |
+| `core/post_write/page_dispatch.rs:313` | `update_page_preserving_sources` | `pub` | `page_write` |
+| `core/post_write/page_dispatch.rs:333` | `update_page_at_source_revision` | `pub(crate)` | `page_write` |
+| `core/post_write/page_dispatch.rs:363` | `update_page_growth_at_versions` | `pub(crate)` | `update_page_impl` |
+| `core/post_write/page_revision.rs:179` | `accept_pending_revision_with_knowledge_path` | `pub` | `accept_page_revision_card` |
+| `core/refinery/mod.rs:594` | `run_periodic_steep_with_api` | `pub` | `run_periodic_steep_with_api_scope` |
+| `core/refinery/mod.rs:1727` | `maybe_refresh_overview_page` | `private` | `refresh_overview_page` |
+| `core/repair.rs:2051` | `apply_repair` | `pub` | `apply_repair_with_pages` |
+| `core/repair.rs:3039` | `validate_deterministic_target_resolved` | `pub(crate)` | `deterministic_target_still_actionable` |
+| `core/repair.rs:5539` | `capture_page_projection_on_connection` | `pub(crate)` | `projection_page_row_on_connection` |
+| `core/repair_plan/deterministic.rs:582` | `resolve_page_projections` | `private` | `capture_page_projection_rollback` |
+| `core/sources/page_watcher.rs:56` | `sync_filesystem_edits` | `pub` | `sync_one_file` |
+| `core/synthesis/distill.rs:975` | `distill_pages_scoped` | `pub` | `distill_pages_scoped_gated` |
+| `core/synthesis/distill.rs:1208` | `refresh_page` | `pub` | `refresh_page_with_prompt` |
+| `core/synthesis/refinement_queue.rs:117` | `apply_refinement` | `pub` | `apply_refinement_with_decision` |
+| `core/synthesis/refinement_queue.rs:274` | `apply_cross_space_discovery` | `private` | `page_write` |
+| `core/truth_adapter.rs:209` | `filter_page` | `pub` | `filter_pages` |
+| `server/brief_routes.rs:76` | `handle_read_brief` | `pub` | `filter_page_refs` |
+| `server/main.rs:631` | `run_daemon` | `private` | `prepare_startup_state` |
+| `server/memory_routes.rs:849` | `handle_search_memory` | `pub` | `filter_page_refs` |
+| `server/page_map_routes.rs:82` | `ensure_page_exists` | `private` | `visible_page` |
+| `server/page_map_routes.rs:119` | `compute_ref_state` | `private` | `visible_page` |
+| `server/page_map_routes.rs:257` | `handle_put_page_map_layout` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:314` | `handle_create_map_node` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:374` | `handle_patch_map_node` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:403` | `handle_delete_map_node` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:429` | `handle_create_map_edge` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:468` | `handle_patch_map_edge` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:494` | `handle_delete_map_edge` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:515` | `handle_reset_page_map` | `pub` | `ensure_page_is_active` |
+| `server/page_map_routes.rs:541` | `handle_improve_page_map` | `pub` | `ensure_page_is_active` |
+| `server/page_routes.rs:52` | `handle_list_pages` | `pub` | `filter_pages` |
+| `server/page_routes.rs:125` | `handle_get_page_sources` | `pub` | `filter_page_refs` |
+| `server/page_routes.rs:229` | `handle_search_pages` | `pub` | `filter_pages` |
+| `server/page_routes.rs:353` | `handle_export_pages` | `pub` | `page_write_permit` |
+| `server/page_routes.rs:414` | `handle_export_page` | `pub` | `page_write_permit` |
+| `server/page_routes.rs:477` | `handle_get_page_links` | `pub` | `filter_page_refs` |
+| `server/page_routes.rs:569` | `handle_list_orphan_links` | `pub` | `filter_page_refs` |
+| `server/page_routes.rs:910` | `handle_get_page_revisions` | `pub` | `filter_page_refs` |
+| `server/page_routes.rs:972` | `handle_review_page` | `pub` | `review_page_with_presence` |
+| `server/refinery_routes.rs:124` | `handle_accept_refinement` | `pub` | `apply_refinement_with_decision` |
+| `server/repair_routes.rs:210` | `handle_apply` | `private` | `apply_repair_with_pages` |
+| `server/routes.rs:185` | `handle_search` | `pub` | `filter_page_refs` |
+| `server/scheduler.rs:1090` | `spawn_scheduler` | `pub` | `fire_maintenance_stage_safe` |
+| `server/scheduler.rs:1863` | `fire_steep_phase` | `private` | `run_periodic_steep_phase_with_api` |
+| `server/source_routes.rs:321` | `sync_directory_source` | `pub(crate)` | `rebind_source_id_with_source_page` |
 
 <!-- m5-reader-sweep:end -->
 
