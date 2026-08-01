@@ -36,6 +36,7 @@ mod eval_paired_guard;
 mod eval_pipeline_reads;
 mod eval_substrate_guard;
 mod eval_temporal_seed;
+mod genesis_schema;
 mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;
 mod kg_quality_embedding_refresh;
@@ -100,6 +101,8 @@ mod eval_pipeline_reads_test;
 mod eval_substrate_guard_test;
 #[cfg(test)]
 mod eval_temporal_seed_test;
+#[cfg(test)]
+mod genesis_schema_test;
 #[cfg(test)]
 mod kg_quality_diagnostics_test;
 #[cfg(test)]
@@ -689,7 +692,9 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 107;
+/// Migration 108 is M6 PR-A's genesis substrate. It follows the M5 Truth
+/// migrations 105/106 and the page-kind repair at 107.
+pub const SCHEMA_VERSION: u32 = 108;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8414,6 +8419,15 @@ impl MemoryDB {
             if version < 107 {
                 self.migrate_107_page_kind_repair(version).await?;
             }
+
+            // Migration 108 (M6 PR-A): the genesis substrate — five empty
+            // tables and the two partial unique indexes that are D4's whole
+            // exclusion mechanism. Nothing in this build writes to any of
+            // them; the writers are later rungs. PARTIAL BY DESIGN, see
+            // migrate_108_genesis_substrate. See ensure_genesis_tables.
+            if version < 108 {
+                self.migrate_108_genesis_substrate(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12121,6 +12135,49 @@ impl MemoryDB {
             "[migration] Migration 107 applied: {repaired} page(s) moved off the silent \
              kind='concept' default"
         );
+        Ok(())
+    }
+
+    /// Migration 108 (M6 PR-A): the genesis substrate.
+    ///
+    /// Additive `IF NOT EXISTS` DDL, same shape as 101 and for the same
+    /// reason: the tables have to exist before the first writer can, and a
+    /// control that appears at the same moment as the thing it controls has a
+    /// window where it does not. Every table starts empty, and an empty
+    /// `genesis_coverage_state` means genesis is disabled for every space
+    /// (state-machines §7, D1) — so this migration changes no behavior.
+    ///
+    /// **This is PARTIAL BY DESIGN and is not the complete genesis
+    /// substrate.** It creates exactly five objects' worth of tables —
+    /// `genesis_candidates`, `genesis_candidate_roots`,
+    /// `genesis_coverage_state`, `genesis_group_coverage`, `genesis_frontier`
+    /// — plus the two partial unique indexes of §5. Those are the objects
+    /// whose shape the Stage-0 artifacts actually fix. Everything else the M6
+    /// contracts name is deliberately absent, including the durable homes for
+    /// machine F's `suppressed` and `quarantined` states and every `m6_*`
+    /// table of the relevance, overview, and refresh contracts: their column
+    /// types, keys, or liveness rules are unresolved or mutually contradictory
+    /// across artifacts. They land in a later additive migration once those
+    /// questions are adjudicated — see the PR-A schema-questions triage in the
+    /// drive record. Do not read this migration as the finished substrate.
+    ///
+    /// Number 108 follows the merged M5 Truth migrations 105/106 and the
+    /// page-kind repair at 107.
+    async fn migrate_108_genesis_substrate(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m108 begin: {error}")))?;
+        Self::ensure_genesis_tables(&tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m108 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 108", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m108 bump: {error}")))?;
+        log::info!("[migration] Migration 108 applied: M6 genesis substrate (partial by design)");
         Ok(())
     }
 
