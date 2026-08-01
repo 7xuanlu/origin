@@ -96,7 +96,7 @@ insert_entity_shadow_page|crates/wenlan-core/src/db.rs:9709|INSERT INTO pages @ 
 update_entity_shadow_page|crates/wenlan-core/src/db.rs:9752|UPDATE pages @ db.rs:9758|entity|store_entity @ db.rs:29293, add_entity_alias @ :29613, refresh_entity_embedding @ :29849, merge_entities @ :30358, confirm_entity @ :32645|pass_through|m6_fence::entity_shadow_sync
 ```
 
-Twenty-one rows: eighteen `route`, three `pass_through`.
+Twenty-one rows: **seventeen `route`** (`detect_page_candidates` through `record_annotate_failure`) and **four `pass_through`** (`write_document_source_page`, `sync_one_file`, and the two entity-shadow mutators).
 
 ### Notes on individual rows
 
@@ -171,15 +171,19 @@ D12 named five targets. Against this tree:
 10. `ensure_overview_page` — creates the reserved overview row; the only automatic `create_page` caller in the tree.
 11. `run_citation_backfill_with_page_limit` and 12. `record_annotate_failure` — **the citation-backfill lane, entirely absent from the frozen contract.** It runs as a scheduler ambient job (`wenlan-server/src/scheduler/ambient.rs:507`) and writes the `citations` column and a changelog entry through `set_page_citations_with_changelog_at_version`. It does not touch prose, which is presumably why it was overlooked, but it is an automatic page-row update and D10's dependency-invalidation reasoning has to account for it.
 
-Plus the three `pass_through` rows (`write_document_source_page`, `sync_one_file`, the entity-shadow pair), which the frozen contract's exclusion sentence covers in principle but names nowhere.
+Plus the four `pass_through` rows (`write_document_source_page`, `sync_one_file`, and the two entity-shadow mutators), which the frozen contract's exclusion sentence covers in principle but names nowhere. Twelve new `route` rows plus four `pass_through` rows against five frozen targets is how the twenty-one-row total is reached.
 
 ### Corrections to the post-M5 revalidation hints
 
-The 2026-07-31 revalidation note gave a starting remap for four symbols. Verified against this branch:
+The 2026-07-31 revalidation note gave a starting remap for four symbols. Three verify clean; **one caller attribution in it is wrong and should not be carried forward.**
+
+> **Correction of record.** The note lists `reconcile.rs:866` as a production caller of `run_page_growth_slice`. It is **test code.** `crates/wenlan-core/src/reconcile.rs` opens `#[cfg(test)]` at line 590, and the call at `:866` sits inside that module. `run_page_growth_slice` has exactly one production caller on this branch: `crates/wenlan-server/src/scheduler/ambient.rs:449`, the `AmbientJob::PageGrowth` arm.
+
+Symbol by symbol:
 
 - `detect_page_candidates → synthesis/detect.rs:18` — **correct**; production caller `refinery/mod.rs:982` correct.
 - `distill_pages_scoped_gated → synthesis/distill.rs:993` — **correct**; caller `refinery/mod.rs:1014` correct. The second listed caller `distill.rs:983` is inside `distill_pages_scoped` (`:975`), whose only production entry is the explicit `handle_distill` route.
-- `run_page_growth_slice → post_ingest.rs:128` — **correct**; caller `wenlan-server/src/scheduler/ambient.rs:449` correct. The other listed caller, `reconcile.rs:866`, is **test code** — `crates/wenlan-core/src/reconcile.rs` opens `#[cfg(test)]` at line 590.
+- `run_page_growth_slice → post_ingest.rs:128` — **correct**; caller `wenlan-server/src/scheduler/ambient.rs:449` correct. Its second listed caller is the wrong attribution called out above.
 - `refresh_overview_page → synthesis/overview.rs:104` — **correct**; wrapper `maybe_refresh_overview_page` at `refinery/mod.rs:1727` (the note's `:1737` is the call inside it, not the definition); `maintenance.rs:203,526` correct.
 
 ## 8. Completeness argument
