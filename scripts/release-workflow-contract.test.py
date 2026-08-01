@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
 RELEASE_PLEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release-please.yml"
 
@@ -113,6 +114,44 @@ def contract_violations(release: str, release_please: str) -> list[str]:
     return violations
 
 
+def release_cache_contract_violations(ci: str, release: str) -> list[str]:
+    """Keep the main-owned release cache usable by the tag consumer."""
+
+    violations: list[str] = []
+    producer = job_body(ci, "release-preflight")
+    consumer = job_body(release, "release")
+    shared_markers = [
+        "uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32",
+        "shared-key: release-v2-${{ matrix.target }}",
+        "workspaces: . -> target/${{ matrix.target }}",
+        'cache-workspace-crates: "false"',
+    ]
+    for owner, body in (("CI producer", producer), ("tag consumer", consumer)):
+        missing = [marker for marker in shared_markers if marker not in body]
+        if missing:
+            violations.append(
+                f"{owner} Windows release cache contract is incomplete: {', '.join(missing)}"
+            )
+
+    producer_markers = [
+        'cache-all-crates: "true"',
+        "cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}",
+        "save-if: ${{ github.ref == 'refs/heads/main' }}",
+    ]
+    if any(marker not in producer for marker in producer_markers):
+        violations.append("CI no longer owns the bounded Windows release target cache")
+
+    consumer_markers = [
+        "cache-all-crates: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}",
+        "cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}",
+        'save-if: "false"',
+    ]
+    if any(marker not in consumer for marker in consumer_markers):
+        violations.append("tag release no longer restores the Windows cache read-only")
+
+    return violations
+
+
 def assert_mutation_detected(
     release: str,
     release_please: str,
@@ -136,9 +175,11 @@ def assert_mutation_detected(
 
 
 def main() -> None:
+    ci = CI_PATH.read_text(encoding="utf-8")
     release = RELEASE_PATH.read_text(encoding="utf-8")
     release_please = RELEASE_PLEASE_PATH.read_text(encoding="utf-8")
     violations = contract_violations(release, release_please)
+    violations.extend(release_cache_contract_violations(ci, release))
     if violations:
         raise AssertionError("release workflow contract drift:\n" + "\n".join(violations))
 
@@ -178,6 +219,17 @@ def main() -> None:
         "mutable or unexpected",
         mutate_release_please=True,
     )
+    mutated_ci = ci.replace(
+        "workspaces: . -> target/${{ matrix.target }}",
+        "workspaces: . -> target",
+        1,
+    )
+    cache_violations = release_cache_contract_violations(mutated_ci, release)
+    if not any("CI producer" in violation for violation in cache_violations):
+        raise AssertionError(
+            "mutation did not exercise explicit-target cache mapping: "
+            f"{cache_violations!r}"
+        )
     print("PASS: release promotion, Homebrew, and Node 24 action contracts")
 
 

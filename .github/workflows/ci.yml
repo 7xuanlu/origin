@@ -1290,8 +1290,14 @@ jobs:
       - name: Cache release artifacts (main-owned)
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-${{ matrix.target }}
+          # `cargo --target` writes below target/<triple>/release. Point the
+          # cache cleaner at that triple root explicitly; otherwise it treats
+          # the triple as a Cargo profile and removes the release directory.
+          # v2 rotates the immutable cache that was saved after that cleanup.
+          shared-key: release-v2-${{ matrix.target }}
+          workspaces: . -> target/${{ matrix.target }}
           cache-all-crates: "true"
+          cache-workspace-crates: "false"
           # The repository cache is already at its 10 GB ceiling. Preserve the
           # expensive Windows release target only; other legs cache dependency
           # inputs without adding three more large target archives.
