@@ -518,8 +518,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Pull requests keep a hard wall-clock budget. Windows needs the full
     # backstop because its Vulkan/native bootstrap plus integration suite can
-    # exceed 30 minutes on a cold hosted runner; other PR platforms stay at 30.
-    timeout-minutes: ${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 30 }}
+    # exceed 30 minutes on a cold hosted runner. Other PR platforms get 45:
+    # a release-please version bump invalidates the whole sccache, and the
+    # resulting cold compile plus full test suite exceeds 30 minutes on
+    # macos-14 (run 30684460494 was canceled at 30m17s twice, zero failures).
+    timeout-minutes: ${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 45 }}
     strategy:
       # Cancel the rest of the matrix when one OS fails. Saves ~20-30min
       # per PR when a real bug breaks all platforms — Linux/macOS catch
