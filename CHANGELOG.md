@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.3](https://github.com/7xuanlu/wenlan/compare/v0.15.2...v0.15.3) (2026-08-01)
+
+
+### Features
+
+* close the M5 daemon gaps — cutover readiness, page review endpoint, named-page truth axes ([#418](https://github.com/7xuanlu/wenlan/issues/418)) ([1c903be](https://github.com/7xuanlu/wenlan/commit/1c903becb99eb19653acc0c0974a546d0b0bfcbd))
+
 ## [0.15.2](https://github.com/7xuanlu/wenlan/compare/v0.15.1...v0.15.2) (2026-07-31)
 
 
