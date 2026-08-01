@@ -474,11 +474,13 @@ D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
 > *Reachability.* There is no path from the production connection to a statement
 > handle. `libsql::Statement` keeps its `inner` field `pub(crate)`
 > (`libsql-0.9.30/src/statement.rs:31`-`:33`), and the `local` module that owns
-> the concrete statement is private — `lib.rs:121`-`:125` re-exports only
+> the concrete statement is private — `libsql-0.9.30/src/lib.rs:121`-`:125`
+> re-exports only
 > `version`, `version_number` and `RowsFuture` from it. Adding `libsql-sys` as a
 > direct dependency does not help: `libsql_sys::Statement` does expose
 > `raw_stmt` as a public field and `get_status` as a public method
-> (`libsql-sys-0.9.30/src/statement.rs:10`, `:183`-`:185`), but nothing hands you
+> (`libsql-sys-0.9.30/src/statement.rs:10`,
+> `libsql-sys-0.9.30/src/statement.rs:183`-`:185`), but nothing hands you
 > the instance the production connection prepared. A bench may open its **own**
 > `libsql_sys` or `rusqlite` connection on the same file and instrument the same
 > SQL; that measures a faithful replica, not the production statement, and the
@@ -490,11 +492,25 @@ D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
 > for work, not a count of index entries, and the number of steps per visited
 > entry varies with the plan. Comparing it against an arithmetic entry budget —
 > which is what rev 2's `R-BUDGET-VISITS = 2,176` did — is a category error, and
-> a bound built on it would be neither sound nor tight. The one API that counts
-> visited rows directly, `sqlite3_stmt_scanstatus` with `SQLITE_SCANSTAT_NVISIT`,
-> does not appear anywhere in the `libsql-sys` bindings; it requires
-> `SQLITE_ENABLE_STMT_SCANSTATUS` at compile time and this build does not carry
-> it.
+> a bound built on it would be neither sound nor tight.
+>
+> **Correction *(rev 5, round-4 item 6)*: rev 4 said the counting API "does not
+> appear anywhere in the bindings." That is wrong, and the difference changes
+> what the ruling can choose from.** `sqlite3_stmt_scanstatus` *is* declared in
+> the checked-in bindings
+> (`libsql-ffi-0.9.30/bundled/bindings/bindgen.rs:2838`), together with
+> `SQLITE_SCANSTAT_NVISIT = 1` and its siblings (`:483`-`:491`). What is missing
+> is the **compile-time flag**, not the binding: libsql-ffi builds its single
+> bundled SQLite from an explicit `cc::Build` flag list
+> (`libsql-ffi-0.9.30/build.rs:198`-`:219`) in which
+> `SQLITE_ENABLE_STMT_SCANSTATUS` does not appear anywhere, and the amalgamation
+> guards the implementation behind `#ifdef SQLITE_ENABLE_STMT_SCANSTATUS`
+> (`libsql-ffi-0.9.30/bundled/SQLite3MultipleCiphers/src/sqlite3.c:17643`,
+> `libsql-ffi-0.9.30/bundled/SQLite3MultipleCiphers/src/sqlite3.c:22353`). So the
+> symbol
+> is declared and simply not compiled: calling it today is a link failure, not a
+> runtime error — and enabling it is **appending one flag to an existing list**,
+> not adding a SQLite.
 >
 > The dependency hazard rev 2 flagged is still real and still governs any bench
 > that takes `libsql-sys`: rusqlite is deliberately on `buildtime_bindgen` rather
@@ -551,7 +567,7 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > is why the traversal matters. It is a derived quantity, not a measured one, and
 > rev 2's error was treating it as something a counter could be compared against.
 
-> **Decision S0-157 *(rev 3, round-2 finding 10; amended rev 4, round-3 N4)* — the absolute visit bound is
+> **Decision S0-157 *(rev 3, round-2 finding 10; amended rev 4, round-3 N4; option set corrected rev 5, round-4 item 6)* — the absolute visit bound is
 > NOT gated, and that is raised rather than papered over.** What the pinned stack
 > can honestly prove, and what it cannot:
 >
@@ -576,36 +592,61 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > is therefore not gated by anything, and no substitute proxy will be invented to
 > cover that. This is a contract question and it needs a ruling.**
 
-> **Ruling request R-1 — how is G6's visit clause discharged?** Four options,
-> with what each costs and what it gives up:
+> **Ruling request R-1 — how is G6's visit clause discharged?** *(amended rev 5,
+> round-4 item 6: rev 4 offered four options and mis-costed one of them, which hid
+> the option that is actually best. Five now, re-costed.)*
 >
 > | | Option | Satisfies the clause as frozen? | Cost |
 > |---|---|---|---|
 > | (a) | Accept `FULLSCAN_STEP == 0` + EQP index assertions as the discharge | No — proves *no full scan*, not a bound | None; already gated |
-> | (b) | Build the daemon's SQLite with `SQLITE_ENABLE_STMT_SCANSTATUS` and assert `SQLITE_SCANSTAT_NVISIT` | Yes, on the production statement | Custom libSQL build; collides with the documented two-bundled-SQLite hazard (`crates/wenlan-core/Cargo.toml:63`-`:67`) |
+> | (b) | **Ship** the flag: add `SQLITE_ENABLE_STMT_SCANSTATUS` to libsql-ffi's flag list in the daemon's own build and assert `NVISIT` on the production statement | Yes, on the production statement | The instrumentation ships to users; needs a maintained patch of `libsql-ffi/build.rs`; still needs `libsql-sys` to reach the handle |
+> | (b′) | **Bench-only, same build**: the identical one-flag patch, applied in a build graph that produces no shipped artifact; bench runs the identical SQL on the same file through `libsql-sys` and asserts `NVISIT ≤ 2,176` | Yes, on the real libSQL/SQLite code path | The patch is graph-wide, so the bench must live outside the shipping workspace; statement is prepared through `libsql-sys`, not the `libsql::Connection` wrapper |
 > | (c) | Restate the clause as a materialization bound | No — changes what the contract asks | None; already gated |
-> | (d) | **Bench-only**: a standalone benchmark binary opens the same file with a `SCANSTATUS`-enabled SQLite, runs the identical SQL, asserts `NVISIT ≤ 2,176` | Yes, on a faithful replica | One bench-only dependency; does not measure the production statement |
+> | (d) | Bench-only with a **different** SQLite build (rev 4's proposal): a standalone binary opens the same file with its own `SCANSTATUS`-enabled SQLite | Yes, on a replica | One bench-only dependency; a *different* query planner from the daemon's |
 >
-> **Recommendation: (d).** It is the only option that both keeps the frozen number
-> and measures the quantity the number is about. (a) and (c) discharge the clause
-> by reinterpreting it, which is the move S0-99 forbids for the 50 ms constant and
-> should be no more available here. (b) is the theoretically cleanest — it
-> instruments the real statement — but it puts a second SQLite build inside the
-> daemon, which is the precise failure this workspace already documents and
-> deliberately avoids; paying that risk for a benchmark is a bad trade.
+> **Rev 4's costing of (b) was wrong and it is worth naming the error, because it
+> is what made (d) look best.** Rev 4 wrote (b) off as colliding with the
+> two-bundled-SQLite hazard. That hazard is specific: *"Having two bundled SQLite
+> builds in the same binary causes libsql's thread-mode assertion to fail at
+> runtime"* (`crates/wenlan-core/Cargo.toml:63`-`:67`). Adding a compile flag to
+> the one bundled build creates no second copy and does not touch that hazard at
+> all. Rev 4 conflated *recompiling* SQLite with *adding* one.
 >
-> **What (d) gives up, stated plainly so the ruling is informed:** the bench
-> measures a replica, not the production statement. Same file, same schema, same
-> indexes, same SQL — but a different connection and a different SQLite build, so
-> it proves the *query and its indexes* stay inside the bound, not that the
-> daemon's own execution did. That is a real gap. It is also the same gap every
-> benchmark in this contract already has, since none of them run inside the
-> daemon process.
+> **Recommendation: (b′).** It keeps the frozen number, measures the quantity the
+> number is about, and — unlike (d) — runs against the same SQLite source and the
+> same flag list the daemon ships, so the query planner, the index choices and the
+> pager are the daemon's, not a look-alike's. (d)'s single advantage over (b′) was
+> avoiding a patched build; now that the patch is known to be one appended flag,
+> (d) is strictly dominated: it carries every limitation (b′) has, plus a different
+> planner. (a) and (c) discharge the clause by reinterpreting it, which is the move
+> S0-99 forbids for the 50 ms constant and should be no more available here. (b) is
+> the only option that instruments the shipped statement, and it is available if
+> the ruling wants it — the cost is that every user pays for instrumentation that
+> exists for one benchmark.
+>
+> **What (b′) gives up, stated plainly so the ruling is informed.** Three things,
+> none of which (d) fixes:
+>
+> 1. The instrumented build is not byte-identical to the shipped one — the flag
+>    adds counters to VDBE structures
+>    (`libsql-ffi-0.9.30/bundled/SQLite3MultipleCiphers/src/sqlite3.c:17078`). It
+>    is the same planner with instrumentation, not the same binary.
+> 2. The statement is prepared through `libsql-sys` — `raw_stmt` is a public field
+>    (`libsql-sys-0.9.30/src/statement.rs:10`) and `get_status` a public method
+>    (`libsql-sys-0.9.30/src/statement.rs:183`) — rather
+>    than through the `libsql::Connection` the daemon uses, because
+>    `libsql::Statement.inner` is private
+>    (`libsql-0.9.30/src/statement.rs:31`-`:33`). Same C library, different Rust
+>    wrapper.
+> 3. `build.rs` flags are not cargo features, so the patch applies to every
+>    consumer in its build graph. Keeping the instrumented build out of releases is
+>    a build-layout obligation the ruling should state explicitly, not a default.
 >
 > Rev 2 reserved this escape — *"the honest consequence is that G6's visit clause
-> is not gated and must be raised as such"* — rev 3 took it, and rev 4 sharpens it
-> into a decision the ruling can make in one move. Artifact 12 carries the
-> matching `RULING` row (G10.16, S0-160) so the unmapped clause stays countable.
+> is not gated and must be raised as such"* — rev 3 took it, rev 4 sharpened it
+> into a decision the ruling can make in one move, and rev 5 corrects the option
+> set it offered. Artifact 12 carries the matching `RULING` row (G6.14, S0-160) so
+> the unmapped clause stays countable.
 
 ---
 
@@ -823,7 +864,7 @@ does, and worth one line in the PR-A notes.
 | incremental pair state equals full recomputation | §5, S0-91 and S0-92 |
 | generated/inactive/retracted/legacy-ungrounded contribute zero | §1.2 table, all four **LIVE** |
 | `EXPLAIN QUERY PLAN` uses fixed indexes | §7 instrument (4), §8 index list |
-| instrumented row visits, not a textual `LIMIT` | **partly unsatisfiable on the pinned stack — S0-157 raises it.** Gated: `FULLSCAN_STEP == 0`, the decoded-row and query counters, EQP. Not gated: the absolute entry count |
+| instrumented row visits, not a textual `LIMIT` | **not gated today; ruling R-1 (S0-157) decides how.** Gated: `FULLSCAN_STEP == 0`, the decoded-row and query counters, EQP. Not gated: the absolute entry count — reachable on the pinned stack via a one-flag build (R-1 option b′), which is what the ruling chooses |
 | no group forms more than 2016 pairs | §3, `R-HUB-MAXPAIRS` |
 | candidate retrieval never exceeds 32 | §4, `R-CAND-CAP` |
 | a provisional candidate is never retrieved or attached | §1.2 — **BLOCKED**; the clause is currently vacuously true, which is worse than failing, so the test must assert the predicate is *evaluated*, not merely that no provisional page appeared |
@@ -878,5 +919,6 @@ materializes ~160 rows while traversing up to 2,048 index entries.
 **Added in rev 3:** `S0-157` *(sharpened rev 4)* the absolute visit bound is NOT
 gated — `VM_STEP` counts opcode steps, not entries, no reachable counter counts
 entries, and rev 3's linear-scaling proxy is withdrawn because a `32 × d`
-traversal is itself linear. Ruling request R-1 carries four options and
-recommends (d), a bench-only `SCANSTATUS` measurement.
+traversal is itself linear. Ruling request R-1 *(amended rev 5)* carries five
+options and recommends (b′): a bench-only build of the daemon's own libSQL with
+one flag appended, measuring `NVISIT` on the real code path.

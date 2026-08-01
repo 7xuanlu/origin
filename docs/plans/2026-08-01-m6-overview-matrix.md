@@ -223,7 +223,7 @@ rebinding pass.
 > proposal ID is derived so a re-run coalesces.** MG4 stages two proposals, not
 > one batched card, because each names a different page a human must decide
 > about. But a re-published generation must not stage them again: the ID is
-> `m6_digest("m6-overview-proposal-v1", [action, space, source_generation,
+> `m6_digest("m6-overview-proposal-v1", [action, space_id, source_generation,
 > losing_scope_id])`, inserted with `INSERT OR IGNORE`, mirroring what M4 already
 > does for its own proposals (`crates/wenlan-core/src/db.rs:14075`-`:14078` for
 > the ID shape, `:14090` for the insert mode).
@@ -390,7 +390,8 @@ that enum would change the accepted wire for every existing client, so:
 > #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 > pub enum OverviewProposalPayload {
 >     OverviewTransfer {
->         space: String,             // spaces.id, never spaces.name (artifact 10, S0-158)
+>         space_id: String,          // spaces.id — see artifact 10, S0-158, for the
+                                   // name→ID seam PR-A builds at the read boundary
 >         cutover_generation: i64,   // the enforcement clock S0-109 gates on
 >         source_generation: i64,    // the content clock this proposal was computed under
 >         losing_scope_kind: String,
@@ -399,7 +400,7 @@ that enum would change the accepted wire for every existing client, so:
 >         surviving_scope_id: String,
 >     },
 >     OverviewRetire {
->         space: String,
+>         space_id: String,
 >         cutover_generation: i64,
 >         source_generation: i64,
 >         losing_scope_kind: String,

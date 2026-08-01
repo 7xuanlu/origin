@@ -43,6 +43,7 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 | **LIVE** | the substrate exists on this branch; the mutation is writable today |
 | **PR-A** | needs schema or code that PR-A creates; writable the moment it lands |
 | **lane 1** | prerequisite in flight — the claim-derivation promoter being built on `m5-truth-derivation`. Not vapor, not a follow-up: the RED test is specified here against the frozen predicate so it becomes executable the day that branch lands |
+| **RULING** | the clause is frozen but its mapping waits on a ruling; the row is an index entry, **not** coverage (S0-160) |
 | **BLOCKED** | blocked pending the merge-no-survivor ruling. Not weakened, not dropped, not narrowed — carried at full strength with its dependency named |
 
 > **Decision S0-160 *(rev 4, round-3 N5)* — a frozen clause whose mapping waits
@@ -57,7 +58,16 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 > precisely so the hole is legible in the coverage table instead of hiding in the
 > difference between two numbers. When the ruling lands, the row becomes a normal
 > mutation row with a real control, or the clause is restated and the row is
-> retired with a note. G10.16 is the only one today.
+> retired with a note. G6.14 is the only one today.
+>
+> *(rev 5, round-4 item 4: rev 4 filed this row as `G10.16`, inside the G10 app
+> gate. The clause is G6's (`gp@wenlan-app:600`) and extends G6.11's limits, and
+> S0-144's completeness test resolves a clause to a row by the row ID's gate
+> prefix — so a `G10.` row could never satisfy a G6 clause, and the row would
+> have read as covered in one gate while leaving a hole in another. Refiled as
+> `G6.14`, which makes the mapping machine-resolvable by construction and needs
+> no separate mapping table. G10's numbering is unaffected: 16 was its last
+> row.)*
 
 > **Decision S0-134 — a gate clause with no mutation row in this catalog is not
 > gated.** The gate definitions in the frozen contract are prose; prose passes by
@@ -158,6 +168,16 @@ state×locale cell and there are exactly **39** of them. The letters a…m index
 S0-117's thirteen states in its order, so `G10.14f` is unambiguously
 `zh-Hans` × "overview transfer proposal". The three row-families materialize all
 39 and are counted as 39 by the mechanical rule below.)*
+
+*(rev 5, round-4 item 2: S0-117's row 1 reads "candidate card, one per variant"
+and does not itself order the four variants, so a…d were not yet unique. **The
+order is `M6CandidateCard`'s declaration order** (artifact 10 §5,
+`docs/plans/2026-08-01-m6-app-wire.md:200`-`:209`): `a` = EvidenceCluster,
+`b` = OrphanWikilink, `c` = CommunityOverview, `d` = SpaceOverview. Declaration
+order rather than an invented one, because the enum is the thing the renderer
+switches on — any other order would make the catalog and the code disagree about
+which cell a failing row names. `e`…`m` then follow S0-117's rows 5…13 as
+already stated.)*
 
 *(rev 2, finding 12: rev 1's P3 and P4 each bundled three states behind a single
 row, and P4's RED column asserted only the deferred one — timed-out and malformed
@@ -403,6 +423,7 @@ Catalogued in full in artifact 6; the mutation view:
 | G6.11d | exceed `50 ms` on a 5k-degree hub | `R-BENCH-MAX` (S0-98) | PR-A |
 | G6.12a–e | let a CAS-losing event commit — one row per event: provisionalization, root retraction, community rebinding, relevance-stat update, candidate-set change | that event writes attachment/dependency/history/receipt state instead of requeueing | PR-A |
 | G6.13 | let an embedding cross a threshold | the embedding tie-break test | PR-A |
+| G6.14 | the instrumented-visit clause (`gp@wenlan-app:613`-`:614`) — **deliberately unmapped pending ruling R-1**; see S0-160 here and S0-157 in artifact 6 | — | `RULING` |
 
 **G6.11's instrumentation is the row that fails quietly.** The contract requires
 *"instrumented row visits proving the bound rather than a textual SQL `LIMIT`"*
@@ -543,7 +564,6 @@ Catalogued in artifact 10; the mutation view:
 | G10.13a–m | **`en`** has no own string for state a…m — one row per state | that cell renders the raw key | PR-A |
 | G10.14a–m | **`zh-Hans`** has no own string for state a…m — one row per state | that cell silently renders the English fallback | PR-A |
 | G10.15a–m | **`zh-Hant`** has no own string for state a…m — one row per state | that cell silently renders the English fallback | PR-A |
-| G10.16 | the visit clause of G6 — **deliberately unmapped pending ruling R-1**; see S0-160 here and S0-157 in artifact 6 | — | `RULING` |
 
 **G10.9 is the row with a wrong-looking natural implementation.** Filtering
 unknown variants out of the list is the default behavior of every renderer, and
@@ -585,8 +605,13 @@ space and every signal disabled on every other space.
 > mutation row and nobody notices — which is exactly the failure mode S0-134
 > describes, arriving through drift instead of oversight.
 
-Current coverage: **11 gates, 189 gate mutation cases, 11 predicate cases, 200
-total.**
+Current coverage: **11 gates, 188 gate mutation cases, 11 predicate cases, and
+1 `RULING` placeholder that is NOT coverage — 200 rows counted mechanically.**
+
+*(rev 5, round-4 item 5: rev 4 labelled the same 200 as "189 gate mutation
+cases", which counted the `RULING` row as a mutation and contradicted S0-160's
+own sentence that it must never be totalled as coverage. The mechanical total is
+unchanged — the row is still a row — but the semantic split is 188 + 1 + 11.)*
 
 | Status | Cases |
 |---|---|
@@ -606,13 +631,17 @@ map, because the mapping depends on a decision that has not been made. S0-134
 says an unmapped clause is not gated; a clause that is silently absent is
 indistinguishable from one nobody noticed, which is the exact failure S0-134
 exists to catch. Carrying the row with an explicit `RULING` status keeps the
-index complete and makes the hole countable — one row today, G10.16.
+index complete and makes the hole countable — one row today, G6.14. It is
+filed under the gate that owns the clause, not the gate that happened to be
+under revision when the hole was found; S0-144 resolves a clause to a row by
+the row's gate prefix, so filing it elsewhere would leave the clause unmapped
+while looking mapped.
 
 *(rev 4: rev 3 reported 163. Round 3's group 7 held G10.13a–c non-concrete —
 it named a locale but never the state×locale **cell** S0-135 requires — so the
 locale condition is now one row per locale per state: G10.13a–m (`en`),
 G10.14a–m (`zh-Hans`), G10.15a–m (`zh-Hant`), the 39 cells S0-117 demands.
-G10.16 adds the `RULING` row for G6's visit clause. Total **200**. Again no new
+G6.14 adds the `RULING` row for G6's visit clause. Total **200**. Again no new
 claim: the same coverage, spelled at the grain the contract asks for.)*
 
 *(rev 3: rev 2 reported 145. Round 2's finding 7 found two rows still bundled —
@@ -696,4 +725,6 @@ the derivation is the contract.
 
 **Added in rev 4:** `S0-160` a frozen clause whose mapping is waiting on a ruling
 carries a `RULING` catalog row naming the ruling it waits on — an unmapped clause is
-visibly ungated per S0-134, never silently absent.
+visibly ungated per S0-134, never silently absent. *(rev 5: the row is filed under
+the gate that owns the clause — G6.14, not G10.16 — so S0-144's prefix-based
+completeness test resolves it, and it is never totalled as coverage.)*

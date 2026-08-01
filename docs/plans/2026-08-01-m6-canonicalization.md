@@ -147,7 +147,10 @@ version axis.
 
 `space` is the raw space string as stored in `communities.space` /
 `community_members.space` (`db.rs:10448`, `:10460`). It is **not** normalized —
-see S0-31.
+see S0-31 — and it is **not** the ID-valued `space_id` M6 payloads carry. Those
+columns are name-valued and are not touched by the rename cascade, so the two
+values can diverge; artifact 10's S0-161 settles which one wins where, and keeps
+this digest input exactly as specified here.
 
 ### 3.2 Per-signal part vectors
 
