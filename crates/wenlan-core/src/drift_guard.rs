@@ -5436,6 +5436,7 @@ fn ci_observer_contract_violations(
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>();
     let expected_script_lines = [
+        "python3 scripts/ci-cache-maintenance.test.py",
         "python3 scripts/ci-observer.test.py",
         "python3 scripts/ci-timed-command.test.py",
         "python3 scripts/verify-ort-source-pin.test.py",
@@ -5748,8 +5749,8 @@ fn ci_observer_contract_rejects_short_circuited_or_optional_measurement_tests() 
     let script = std::fs::read_to_string(root.join("scripts/ci-observer.py")).unwrap_or_default();
     let ci = ci
         .replace(
-            "      - name: Verify CI observer and ORT contracts\n        run: |\n          python3 scripts/ci-observer.test.py",
-            "      - name: Verify CI observer and ORT contracts\n        if: \"false\"\n        run: |\n          exit 0\n          python3 scripts/ci-observer.test.py",
+            "      - name: Verify CI observer and ORT contracts\n        run: |",
+            "      - name: Verify CI observer and ORT contracts\n        if: \"false\"\n        run: |\n          exit 0",
         );
     let violations = ci_observer_contract_violations(&ci, &observer, &script);
     assert!(
@@ -5768,8 +5769,8 @@ fn ci_observer_contract_rejects_non_blocking_measurement_tests() {
         std::fs::read_to_string(root.join(".github/workflows/ci-observer.yml")).unwrap_or_default();
     let script = std::fs::read_to_string(root.join("scripts/ci-observer.py")).unwrap_or_default();
     let ci = ci.replace(
-        "      - name: Verify CI observer and ORT contracts\n        run: |\n          python3 scripts/ci-observer.test.py",
-        "      - name: Verify CI observer and ORT contracts\n        continue-on-error: true\n        run: |\n          python3 scripts/ci-observer.test.py",
+        "      - name: Verify CI observer and ORT contracts\n        run: |",
+        "      - name: Verify CI observer and ORT contracts\n        continue-on-error: true\n        run: |",
     );
     let violations = ci_observer_contract_violations(&ci, &observer, &script);
     assert!(
