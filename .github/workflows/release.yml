@@ -295,11 +295,16 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-${{ matrix.target }}
+          # Keep this contract identical to ci.yml's main-owned producer.
+          # Explicit-target builds live below target/<triple>/release; v2
+          # bypasses the immutable cache created before that mapping existed.
+          shared-key: release-v2-${{ matrix.target }}
+          workspaces: . -> target/${{ matrix.target }}
           # Only Windows carries the costly coherent native Cargo target tree.
           # Tag releases consume the main-owned preflight cache but never write
           # a competing entry or evict ordinary CI caches.
           cache-all-crates: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+          cache-workspace-crates: "false"
           cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
           save-if: "false"
 
