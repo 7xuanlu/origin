@@ -78,7 +78,7 @@ is the enumeration of those weakenings. Each row names **one** thing to break an
 > section — three controls for thirteen G6 rows — which is not what S0-135 says
 > and does not discriminate: a section-level control passing tells you the
 > section's happy path works, not that row 7's tooth bites on row 7's condition.
-> A stated derivation rule is better than 145 hand-written cells, which would
+> A stated derivation rule is better than 163 hand-written cells, which would
 > drift; it works precisely *because* S0-154 makes every row single-conditioned.
 > Where the derivation does not apply, the row carries an explicit control in its
 > RED column and says so.
@@ -374,7 +374,10 @@ Catalogued in full in artifact 6; the mutation view:
 | G6.8 | let candidate retrieval exceed `32` | the retrieval cap | PR-A |
 | G6.9 | retrieve or attach a current M5-provisional candidate page | a provisional page is attached | lane 1 |
 | G6.10 | drop the `64/d` hub weighting | a hub dominates | PR-A |
-| G6.11 | exceed `64` adjacency rows / `4` queries / `512` rows / `50 ms` on a 5k-degree hub | the instrumented row-visit counters | PR-A |
+| G6.11a | exceed `64` adjacency rows for one endpoint on a 5k-degree hub | the adjacency-row cap assertion | PR-A |
+| G6.11b | issue a fifth query in one evaluation | the query counter (S0-95 instrument 2) | PR-A |
+| G6.11c | materialize more than `512` rows in one evaluation | the decoded-row counter (S0-95 instrument 1) | PR-A |
+| G6.11d | exceed `50 ms` on a 5k-degree hub | `R-BENCH-MAX` (S0-98) | PR-A |
 | G6.12a–e | let a CAS-losing event commit — one row per event: provisionalization, root retraction, community rebinding, relevance-stat update, candidate-set change | that event writes attachment/dependency/history/receipt state instead of requeueing | PR-A |
 | G6.13 | let an embedding cross a threshold | the embedding tie-break test | PR-A |
 
@@ -513,7 +516,8 @@ Catalogued in artifact 10; the mutation view:
 | G10.9 | silently skip an unknown proposal variant | **the card must still render** (artifact 10, S0-115) | PR-A |
 | G10.10 | let a stale action apply instead of conflicting | the typed conflict | PR-A |
 | G10.11a–e | accept one M6 action without presence — one row per action: candidate create, merge, dismiss, overview transfer, overview retire | that action commits unauthenticated | PR-A |
-| G10.12 | leave any of the thirteen rendered states missing in any of three locales | the enumeration assertion | PR-A |
+| G10.12a–m | drop one rendered state from the M6 enumeration — one row per state, the thirteen artifact 10's S0-117 enumerates | that state's present-and-non-empty assertion | PR-A |
+| G10.13a–c | ship a locale whose catalog has no own string for an M6 state — one row per locale; `zh-Hans`/`zh-Hant` silently render the English fallback, `en` renders the raw key | that locale's own-string assertion | PR-A |
 
 **G10.9 is the row with a wrong-looking natural implementation.** Filtering
 unknown variants out of the list is the default behavior of every renderer, and
@@ -555,19 +559,24 @@ space and every signal disabled on every other space.
 > mutation row and nobody notices — which is exactly the failure mode S0-134
 > describes, arriving through drift instead of oversight.
 
-Current coverage: **11 gates, 134 gate mutation cases, 11 predicate cases, 145
+Current coverage: **11 gates, 152 gate mutation cases, 11 predicate cases, 163
 total.**
 
 | Status | Cases |
 |---|---|
 | LIVE | 32 |
-| PR-A | 95 |
+| PR-A | 113 |
 | lane 1 | 16 |
 | BLOCKED | 2 |
 
 (Counts are mechanical — every catalog row is a table line whose ID matches
 `G<n>.<n>[a-z]` or `P<n>[a-z]`, and the status is its last cell. A row written
 `G4.5a–d` is one line standing for four cases and counts as four.)
+
+*(rev 3: rev 2 reported 145. Round 2's finding 7 found two rows still bundled —
+G6.11 carried four independent limits and G10.12 carried thirteen rendered states
+crossed with three locales — so they are now G6.11a–d, G10.12a–m and G10.13a–c,
+and the total is **163**. Same rule, two rows rev 2's own split missed.)*
 
 *(rev 2: rev 1 reported 93 rows. The number rose to 145 without a single new
 claim being added — S0-154's split turned fifteen bundled rows into their
@@ -595,7 +604,7 @@ resolves both; a ruling that addressed only the G2 exclusion would leave the
 detach rule undecided. Worth knowing when the ruling is drafted, so it is not
 scoped to the narrower question.
 
-**F2 — sixteen of the 145 cases cannot go red until lane 1 lands, and they are
+**F2 — sixteen of the 163 cases cannot go red until lane 1 lands, and they are
 concentrated in the gates that protect truth.** G1.2, G2.5, G6.9, G7.1–G7.3, and
 the ten remaining predicate cases all rest on a page being `supported`, and no
 production code writes that value today
@@ -628,7 +637,7 @@ must check.
 
 `S0-134` a gate clause with no mutation row is not gated; the catalog is the gate's index ·
 `S0-135` every RED row is paired with a discriminating positive control differing in exactly the mutated condition ·
-`S0-136` `lane 1` rows are specified against the frozen four-condition predicate, not against the eventual implementation ·
+`S0-136` `lane 1` rows are specified against committed frozen text — the four-condition predicate for §1's nine rows, the axis-independence rule for P6b — never against the eventual implementation ·
 `S0-137` the empty-inventory vacuous-truth mutation is required, and a genuinely empty page stays permanently provisional ·
 `S0-138` G2.7 is carried at full strength; the interim treatment is labelled as interim and does not become the contract ·
 `S0-139` the reservation exit matrix is asserted as a total function over 8 exits × 6 resting states ·

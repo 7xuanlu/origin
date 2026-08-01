@@ -434,7 +434,7 @@ them, stale/refresh enqueue state, the operation receipt
 |---|---|---|
 | indexed queries per route evaluation | ≤ 4 | `R-BUDGET-QUERIES` |
 | rows materialized per route evaluation | ≤ 512 | `R-BUDGET-ROWS` |
-| **index entries visited per route evaluation** | **≤ 2,176** | **`R-BUDGET-VISITS`** |
+| index entries visited per route evaluation | ≤ 2,176 — **derived, NOT gated** (S0-157) | `R-BUDGET-VISITS` |
 | wall time per route evaluation | ≤ 50 ms, **hard** | `R-BUDGET-MS` |
 
 D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
@@ -448,9 +448,10 @@ D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
 >    *materialization* budget — D9's word is "materializes".
 > 2. **A query counter**, one per `query`/`execute` call in the evaluation, for
 >    `R-BUDGET-QUERIES`.
-> 3. **`SQLITE_STMTSTATUS_VM_STEP`** read per statement, summed across the four,
->    normative for the new `R-BUDGET-VISITS`; and **`SQLITE_STMTSTATUS_FULLSCAN_STEP`
->    asserted equal to zero** on every one of them.
+> 3. **`SQLITE_STMTSTATUS_FULLSCAN_STEP` asserted equal to zero** on every
+>    statement — normative for *no full scan occurred*. `SQLITE_STMTSTATUS_VM_STEP`
+>    is read alongside it but is **not** normative for any absolute count; see
+>    S0-157 for what it may and may not be asserted against.
 > 4. **`EXPLAIN QUERY PLAN` assertions** that each query uses the named index
 >    from §8 and contains no `SCAN` over `edges`, `pages`, or `provenance_roots`.
 >
@@ -465,23 +466,42 @@ D9 is explicit that *"`LIMIT` in SQL text alone is not proof of visited work."*
 > row visits"* (`gp@wenlan-app:613`-`:614`), which is a runtime counter or it is
 > nothing.
 >
-> **What suffices, concretely, and what it costs.** SQLite exposes real visit
-> counters through `sqlite3_stmt_status`: `SQLITE_STMTSTATUS_VM_STEP` (4) scales
-> with work actually performed, and `SQLITE_STMTSTATUS_FULLSCAN_STEP` (1) is
-> non-zero exactly when a full scan happened. They are reachable from this
-> workspace, but not from the API it currently uses: `libsql::Statement`
-> (`libsql` 0.9.30, the workspace pin) exposes no status accessor, while
-> `libsql_sys::Statement::get_status(status: i32) -> i32` wraps
-> `sqlite3_stmt_status` directly. `libsql-sys` is **not** a direct dependency
-> today, so PR-A must add it — pinned to the identical `0.9.30`, because this
-> crate already carries a warning about exactly this hazard: rusqlite is
-> deliberately on `buildtime_bindgen` rather than `bundled` since *"having two
-> bundled SQLite builds in the same binary causes libsql's thread-mode assertion
-> to fail at runtime"* (`crates/wenlan-core/Cargo.toml:63`-`:67`). A second
-> SQLite arriving through a version-skewed `libsql-sys` would reproduce that
-> failure. If PR-A finds it cannot take the dependency, the honest consequence is
-> that G6's visit clause is not gated and must be raised as such — not that
-> decoded rows quietly become the proof again.
+> **Rev 3 correction (round-2 finding 10): rev 2 was wrong twice here, and both
+> errors were mine.** Rev 2 claimed these counters are "reachable from this
+> workspace" and made `VM_STEP` normative for an entry-count budget. Neither
+> holds.
+>
+> *Reachability.* There is no path from the production connection to a statement
+> handle. `libsql::Statement` keeps its `inner` field `pub(crate)`
+> (`libsql-0.9.30/src/statement.rs:31`-`:33`), and the `local` module that owns
+> the concrete statement is private — `lib.rs:121`-`:125` re-exports only
+> `version`, `version_number` and `RowsFuture` from it. Adding `libsql-sys` as a
+> direct dependency does not help: `libsql_sys::Statement` does expose
+> `raw_stmt` as a public field and `get_status` as a public method
+> (`libsql-sys-0.9.30/src/statement.rs:10`, `:183`-`:185`), but nothing hands you
+> the instance the production connection prepared. A bench may open its **own**
+> `libsql_sys` or `rusqlite` connection on the same file and instrument the same
+> SQL; that measures a faithful replica, not the production statement, and the
+> artifact must say so rather than blur it. (The `SQLITE_STMTSTATUS_*` constants
+> are also absent from the generated bindings, so their stable ABI values — `1`
+> for `FULLSCAN_STEP`, `4` for `VM_STEP` — would be written as literals.)
+>
+> *Units.* `VM_STEP` counts virtual-machine opcode steps. It is a monotone proxy
+> for work, not a count of index entries, and the number of steps per visited
+> entry varies with the plan. Comparing it against an arithmetic entry budget —
+> which is what rev 2's `R-BUDGET-VISITS = 2,176` did — is a category error, and
+> a bound built on it would be neither sound nor tight. The one API that counts
+> visited rows directly, `sqlite3_stmt_scanstatus` with `SQLITE_SCANSTAT_NVISIT`,
+> does not appear anywhere in the `libsql-sys` bindings; it requires
+> `SQLITE_ENABLE_STMT_SCANSTATUS` at compile time and this build does not carry
+> it.
+>
+> The dependency hazard rev 2 flagged is still real and still governs any bench
+> that takes `libsql-sys`: rusqlite is deliberately on `buildtime_bindgen` rather
+> than `bundled` because *"having two bundled SQLite builds in the same binary
+> causes libsql's thread-mode assertion to fail at runtime"*
+> (`crates/wenlan-core/Cargo.toml:63`-`:67`), so any added SQLite must be
+> version-matched.
 
 The four queries are exactly: (a) candidate retrieval, (b) adjacency for the
 source endpoint, (c) adjacency for the candidate endpoints, (d) pair statistics
@@ -496,10 +516,13 @@ arithmetic. Candidate retrieval returns **at most 32** pages
 `32 × 64 = 2,048` rows in the worst case — **four times** `R-BUDGET-ROWS`, which
 is 512. Two frozen numbers and one derived number that cannot all hold.
 
-> **Decision S0-156 *(rev 2, finding 10)* — query (c) aggregates in SQLite and
-> returns one row per candidate, so the evaluation materializes ~160 rows while
-> visiting up to 2,048 index entries. `R-BUDGET-VISITS` is set at 2,176 and is
-> the bound that actually constrains the hub.** Common-neighbour needs
+> **Decision S0-156 *(rev 2, finding 10; amended rev 3 — number kept)* — query
+> (c) aggregates in SQLite and returns one row per candidate, so the evaluation
+> materializes ~160 rows while visiting up to 2,048 index entries.** The
+> aggregation is the fix for the materialization blowup and stands. What does
+> **not** stand is rev 2's `R-BUDGET-VISITS = 2,176` asserted against `VM_STEP`:
+> per S0-95's rev-3 correction those are different units, so that budget is
+> withdrawn and replaced by S0-157. Common-neighbour needs
 > `|N(source) ∩ N(candidate)|` — a *count*, not the rows. Query (c) is
 >
 > ```sql
@@ -523,12 +546,40 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > braces, and it is why D9 wrote *"`LIMIT` in SQL text alone is not proof of
 > visited work"* rather than trusting a row count.
 >
-> The 2,176 figure is `2,048` for query (c) plus `32 + 64 + 32` for the other
-> three, i.e. the arithmetic worst case with no slack — deliberately, so that a
-> regression that adds one unindexed lookup fails rather than fitting in a
-> margin. `R-BENCH-HUB` asserts it on the 5,000-degree hub, where every candidate
-> genuinely has a full 64-row adjacency and the worst case is real rather than
-> theoretical.
+> The `2,048`-entry figure for query (c), plus `32 + 64 + 32` for the other
+> three, remains the correct **arithmetic** worst case and is worth stating — it
+> is why the traversal matters. It is a derived quantity, not a measured one, and
+> rev 2's error was treating it as something a counter could be compared against.
+
+> **Decision S0-157 *(rev 3, round-2 finding 10)* — the absolute visit bound is
+> NOT gated, and that is raised rather than papered over.** What the pinned stack
+> can honestly prove, and what it cannot:
+>
+> | Clause | Instrument | Gated? |
+> |---|---|---|
+> | `R-BUDGET-ROWS` — materialization ≤ 512 | decoded-row counter (instrument 1) | **yes** |
+> | `R-BUDGET-QUERIES` — ≤ 4 queries | query counter (instrument 2) | **yes** |
+> | no full scan | `FULLSCAN_STEP == 0`, bench connection | **yes** |
+> | each query uses its named index | `EXPLAIN QUERY PLAN` (instrument 4) | **yes** |
+> | `50 ms` route budget | `R-BENCH-MAX` (S0-98) | **yes** |
+> | **absolute entries visited ≤ 2,176** | none available | **no** |
+>
+> `VM_STEP` is retained for one honest use: a **scaling** assertion. Across the
+> bench's degree ladder, `VM_STEP` for query (c) must grow no faster than linearly
+> in hub degree. That catches the 32 × 64 blowup as a *shape* regression — the
+> failure mode D9 actually fears — without claiming a number of entries. It is
+> weaker than a bound and is labelled as such wherever it appears.
+>
+> **This leaves G6's "instrumented row visits proving the bound"
+> (`gp@wenlan-app:613`-`:614`) partly unsatisfiable on the current stack, which is
+> a contract question, not a Stage-0 drafting choice.** It goes to the ruling
+> queue with three options: (a) accept no-full-scan plus the scaling assertion as
+> the discharge of the visit clause; (b) require `SQLITE_ENABLE_STMT_SCANSTATUS`
+> in the SQLite build so `SQLITE_SCANSTAT_NVISIT` becomes available and the bound
+> becomes literally measurable; (c) restate the clause as a materialization bound,
+> which is already gated. Rev 2 reserved exactly this escape — *"the honest
+> consequence is that G6's visit clause is not gated and must be raised as
+> such"* — and rev 3 takes it.
 
 ---
 
@@ -746,7 +797,7 @@ does, and worth one line in the PR-A notes.
 | incremental pair state equals full recomputation | §5, S0-91 and S0-92 |
 | generated/inactive/retracted/legacy-ungrounded contribute zero | §1.2 table, all four **LIVE** |
 | `EXPLAIN QUERY PLAN` uses fixed indexes | §7 instrument (4), §8 index list |
-| instrumented row visits, not a textual `LIMIT` | §7 instrument (3) and §7.1 — `R-BUDGET-VISITS` via `SQLITE_STMTSTATUS_VM_STEP` |
+| instrumented row visits, not a textual `LIMIT` | **partly unsatisfiable on the pinned stack — S0-157 raises it.** Gated: `FULLSCAN_STEP == 0`, the decoded-row and query counters, EQP. Not gated: the absolute entry count |
 | no group forms more than 2016 pairs | §3, `R-HUB-MAXPAIRS` |
 | candidate retrieval never exceeds 32 | §4, `R-CAND-CAP` |
 | a provisional candidate is never retrieved or attached | §1.2 — **BLOCKED**; the clause is currently vacuously true, which is worse than failing, so the test must assert the predicate is *evaluated*, not merely that no provisional page appeared |
@@ -787,7 +838,7 @@ Every constant has an ID so an amendment has an address.
 `S0-92` decayed sums accumulate in fixed order and round to 9 dp ·
 `S0-93` snapshot field 1 is the `(version, source_revision)` pair ·
 `S0-94` CAS failure requeues; never retry inside the transaction ·
-`S0-95` three required instruments for the budget proof ·
+`S0-95` *(amended rev 2 and rev 3)* four instruments; `FULLSCAN_STEP` is normative, `VM_STEP` is not ·
 `S0-96` the route evaluation never touches `edges` directly ·
 `S0-97` the corpus is a seeded deterministic recipe identified by digest ·
 `S0-98` *(amended rev 2)* 50 ms is a hard maximum; p50/p99 are reporting only ·
@@ -795,6 +846,10 @@ Every constant has an ID so an amendment has an address.
 `S0-100` "qualified co-citation" means the 3-group floor was cleared ·
 `S0-101` an exact tie is bit-equality after 9-dp rounding.
 
-**Added in rev 2:** `S0-156` query (c) aggregates in SQLite; `R-BUDGET-VISITS` at
-2,176 is the bound that constrains the hub, and it is the only instrument that
-sees the 32 × 64 traversal.
+**Added in rev 2:** `S0-156` query (c) aggregates in SQLite, so the evaluation
+materializes ~160 rows while traversing up to 2,048 index entries.
+
+**Added in rev 3:** `S0-157` the absolute visit bound is NOT gated — `VM_STEP`
+counts opcode steps, not entries, and no reachable counter counts entries; what
+is gated is listed explicitly, and the shortfall goes to the ruling queue rather
+than being absorbed.

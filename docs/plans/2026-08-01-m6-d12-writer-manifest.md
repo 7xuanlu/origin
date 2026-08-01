@@ -81,7 +81,7 @@ This block is the artifact a G9 structural CI test consumes. Fields are pipe-del
 
 ```manifest
 # m6-writer-manifest-v1
-# branch: kg-m6-stage0 @ e39048c7
+# branch: kg-m6-stage0 @ 1c903bec
 # fields: symbol|defined_at|write_seam|writer_identity|trigger|policy|fence_adapter
 detect_page_candidates|crates/wenlan-core/src/synthesis/detect.rs:18|page_write PageWrite::Attach @ detect.rs:73|detect|refinery Phase::Detect @ refinery/mod.rs:982|route|m6_fence::detect_attach
 distill_one_cluster_with_tuning|crates/wenlan-core/src/synthesis/distill.rs:464|page_write PageWrite::Attach @ distill.rs:501,540; PageWrite::Create @ distill.rs:735|distill,system|refinery Phase::Emergence via distill_pages_scoped_gated|route|m6_fence::emergence_cluster_write
@@ -114,7 +114,7 @@ Twenty-one rows: **seventeen `route`** (`detect_page_candidates` through `record
 
 **`refresh_page` and `refresh_page_with_prompt` are the chokepoint** for four of the fenced lanes (redistill batch, redistill slice, maintenance slice/tick, overview). They earn their own rows so a per-caller mutation test can prove that fencing the lane entry is not sufficient on its own.
 
-**`insert_entity_shadow_page` / `update_entity_shadow_page` write `pages` rows but not pages.** They mirror an `entities` row into a `kind='entity'`, empty-`content` shadow. The function's own doc comment states the contract: these rows "stay excluded from retrieval/context, export, and every page mutation" (`db.rs:9711-9708`). They are `pass_through` for exactly that reason — the fence must observe them so G9 cannot be blindsided by the KG lane, and must never let them contribute a genesis root, a relevance candidate, or a coverage claim.
+**`insert_entity_shadow_page` / `update_entity_shadow_page` write `pages` rows but not pages.** They mirror an `entities` row into a `kind='entity'`, empty-`content` shadow. The function's own doc comment states the contract: these rows "stay excluded from retrieval/context, export, and every page mutation" (`db.rs:9711`-`:9712`). They are `pass_through` for exactly that reason — the fence must observe them so G9 cannot be blindsided by the KG lane, and must never let them contribute a genesis root, a relevance candidate, or a coverage claim.
 
 **`sync_one_file` carries human prose.** Its writer identity is `fs_edit`, which `Writer::classify` (`page_update.rs:50`) puts in `Writer::Human`. The scheduler poll is automatic; the content is a person editing markdown in the vault. `pass_through`, and D10's "human-owned page prose stays byte-identical" applies to whatever it writes.
 

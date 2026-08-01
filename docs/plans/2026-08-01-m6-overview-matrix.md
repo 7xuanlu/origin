@@ -83,7 +83,7 @@ So M4 *already implements D11's max-overlap-survivor rule at the ID level*:
 > community in the space and then un-retires the survivors:
 >
 > ```sql
-> -- crates/wenlan-core/src/db.rs:13979-13976
+> -- crates/wenlan-core/src/db.rs:13979-13980
 > UPDATE communities SET retired_at = ?2, updated_at = ?2
 >  WHERE space = ?1 AND retired_at IS NULL
 > -- then, per surviving community, crates/wenlan-core/src/db.rs:13997-14001
@@ -326,7 +326,7 @@ statement matter here, and both are already true in the tree:
 The lookup that keeps the global overview single is not scoped:
 
 ```sql
--- crates/wenlan-core/src/db.rs:43809-43808
+-- crates/wenlan-core/src/db.rs:43809-43812
 SELECT id FROM pages
  WHERE LOWER(title) = LOWER(?1) AND status = 'active'
    AND COALESCE(kind, 'concept') != 'entity'

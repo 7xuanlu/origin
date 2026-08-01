@@ -407,7 +407,7 @@ own. Stage-0 resolution: the triple's page-version component is
 (`crates/wenlan-core/src/db.rs:45178`) issues:
 
 ```sql
--- crates/wenlan-core/src/db.rs:45188-45186
+-- crates/wenlan-core/src/db.rs:45188-45190
 UPDATE pages SET citations = ?1, changelog = ?2
  WHERE id = ?3 AND version = ?4 AND status = 'active'
    AND citations IS NULL
