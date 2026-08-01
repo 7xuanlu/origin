@@ -80,7 +80,7 @@ cargo test -p wenlan-core --test eval_harness save_longmemeval_baseline -- --ign
 # Baselines saved to <EVAL_BASELINES_DIR>/*.json (gitignored, default ~/.cache/origin-eval).
 ```
 
-Pre-commit auto-formats Rust and runs Clippy on changed crates. Pre-push runs workspace clippy + library tests.
+Pre-commit auto-formats Rust and runs Clippy on changed crates. Pre-push uses the CI planner to run Clippy and tests over the affected reverse-dependency closure.
 
 ## Cross-platform
 
@@ -136,10 +136,12 @@ Wenlan runs across several layers. The split is driven by three questions: **(1)
 | **L2 pre-commit** | `cargo fmt --all`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
 | **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; a directly edited integration target runs alone | Local | `git push` | change-dependent | Yes |
 | **L4 CI on PR** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` retain the full workspace/platform/release backstop. | GitHub (`ci.yml`) | Every PR | target ≤20min | Yes (required) |
-| **L5 coverage on PR** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Every PR | ~10min | **No (informational)** |
+| **L5 coverage** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Push to `main` or manual dispatch | ~10min | **No (informational)** |
 | **L6 main canary** | Embedding-only eval (`cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval`) | GitHub (`main-canary.yml`) | Push to `main` | ~10min | No (post-merge) |
 | **L7 manual local** | `bash scripts/coverage.sh` (HTML coverage), GPU eval suite (`cargo test -- --ignored`), Anthropic batch judge (`ANTHROPIC_API_KEY=... cargo test ...`), live smokes with a real on-device judge (`bash scripts/live-smoke-doc-reconcile.sh`, `bash scripts/live-smoke-page-citations.sh`) — run the matching live smoke before merging a feature whose e2e stubs the LLM or never boots the daemon | Your laptop | On demand | minutes-hours | No |
 | **L8 pre-release** | Full eval suite vs saved baseline. Commit a **curated, env-stamped snapshot** of headline numbers to a results doc/README (single-run tagged "scaffold"; headline claims need N≥3 + stddev). Raw per-run baselines + history series stay gitignored. See "Commit policy" under Eval Citation Discipline. | Your laptop | Per release | hours | Soft gate |
+
+A required CI check failed intermittently? Follow [`docs/ci-flake-policy.md`](docs/ci-flake-policy.md) before rerunning, quarantining, rerouting, or reverting.
 
 ### What does NOT run in CI and why
 
@@ -154,7 +156,7 @@ Tried 90% `cargo llvm-cov` gate in pre-push, removed because:
 - **Not mirrored in CI:** `ci.yml` has no coverage gate, so local-only friction.
 - **Percentage gates rot:** new untestable surface forces busywork.
 
-Pre-push now runs clippy + non-instrumented tests only. Coverage = L5 (PR, informational) or L7 (manual).
+Pre-push now runs planner-selected Clippy + non-instrumented tests only. Coverage = L5 (main/manual, informational) or L7 (manual HTML).
 
 ### Eval cache, baselines & faithfulness benches → `app/eval/AGENTS.md`
 
