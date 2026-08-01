@@ -202,7 +202,7 @@ async fn a_zero_claim_page_can_carry_a_derivation_marker() {
 async fn derivation_jobs_dedupe_per_page_version() {
     let (db, _temp) = db_with_substrate().await;
     let conn = db.conn.lock().await;
-    // Since migration 104 the enqueue trigger has already queued p1 at its
+    // Since migration 105 the enqueue trigger has already queued p1 at its
     // current version, so clear the queue first: this test is about the shape
     // of the unique index, not about who filled the table.
     conn.execute("DELETE FROM claim_derivation_jobs", ())

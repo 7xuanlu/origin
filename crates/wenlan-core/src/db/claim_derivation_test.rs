@@ -7,7 +7,7 @@ use super::tests::test_db;
 use super::MemoryDB;
 
 /// A fully migrated database with NO pages. `test_db` runs the real migration
-/// chain, so migration 104 has already installed the triggers here — re-running
+/// chain, so migration 105 has already installed the triggers here — re-running
 /// the installer is itself the idempotence check a resumed migration needs.
 async fn db_with_queue() -> (MemoryDB, tempfile::TempDir) {
     let (db, temp) = test_db().await;
@@ -23,7 +23,7 @@ async fn db_with_queue() -> (MemoryDB, tempfile::TempDir) {
     (db, temp)
 }
 
-/// The state of a real vault the moment before migration 104: the substrate
+/// The state of a real vault the moment before migration 105: the substrate
 /// tables exist (they shipped in 98) but nothing enqueues. Reached by dropping
 /// the triggers back off a migrated database, which is the only way to write a
 /// page that the triggers never saw.
@@ -454,11 +454,15 @@ async fn derive_page(db: &MemoryDB, page_id: &str, claim_count: usize) -> Vec<St
                  (claim_revision_id, claim_id, predecessor_revision_id, canonical_text,
                   canonical_text_digest, claim_kind, extractor_version, created_at)
              VALUES (?1, ?2, '', ?3, ?4, 'fact', ?5, 0)",
+            // Page-specific text and digest. `entailment_cache` is keyed by
+            // claim TEXT digest, so two pages sharing a digest would share
+            // judgements — true of the real cache, and a fixture that leaks
+            // that way silently tests the wrong page.
             libsql::params![
                 rev_id.clone(),
                 claim_id,
-                format!("claim {i}"),
-                format!("d{i}"),
+                format!("claim {i} of {page_id}"),
+                format!("d_{page_id}_{i}"),
                 EXTRACTOR_VERSION
             ],
         )
@@ -485,9 +489,39 @@ async fn derive_page(db: &MemoryDB, page_id: &str, claim_count: usize) -> Vec<St
     revisions
 }
 
+/// Record that some judge scored this claim's text, without producing a
+/// qualifying support edge. This is the on-disk signature of "candidates were
+/// judged and fell short", as distinct from "nobody ever looked".
+async fn judged_but_short(db: &MemoryDB, revision_id: &str) {
+    let conn = db.conn.lock().await;
+    let digest: String = {
+        let mut rows = conn
+            .query(
+                "SELECT canonical_text_digest FROM claim_revisions WHERE claim_revision_id = ?1",
+                libsql::params![revision_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO entailment_cache
+             (claim_text_digest, source_span_digest, model_id, model_version,
+              prompt_version, score, threshold_at_write, backend, scored_at)
+         VALUES (?1, 'span', 'judge', 'v1', 'p1', 0.1, 0.75, 'test', 0)",
+        libsql::params![digest],
+    )
+    .await
+    .unwrap();
+}
+
 /// A `supports` edge at `score`, written straight to `edges` — these tests are
 /// about what the predicate READS, not about the write path's own refusals.
+/// The matching `entailment_cache` row goes in too, because a support edge that
+/// cannot name the verdict behind it is a state `write_support_edge` refuses to
+/// create, and a fixture that produced one would be testing an impossible DB.
 async fn support_claim(db: &MemoryDB, page_id: &str, revision_id: &str, score: f64) {
+    judged_but_short(db, revision_id).await;
     let conn = db.conn.lock().await;
     let space: String = {
         let mut rows = conn
@@ -588,19 +622,123 @@ async fn a_fully_supported_page_is_supported() {
     assert_eq!(reviewed, 0, "machine support never manufactures review");
 }
 
-/// Condition 3, and the only failure that is a verdict: the claims are real,
-/// the evidence was looked for, and it was not there.
+/// Weakening: let "unfiled" be spelled two ways.
+///
+/// Every other test here reads an edge the fixture seeded, and a fixture that
+/// copies `pages.space` onto its own edge agrees with itself by construction —
+/// it cannot see a disagreement between the two sides. This one drives the
+/// PRODUCTION writer end to end on a page with no space at all, which is the
+/// only place the question can actually be asked: `write_support_edge` stamps
+/// the edge with `COALESCE(memories.space, UNFILED_SPACE_ID)` while the fence
+/// resolves the claim side through to `pages.space`. If unfiled were NULL on
+/// one side and the sentinel on the other, every unfiled page in the vault
+/// would be permanently un-supportable, and the worker would read the resulting
+/// zero as "no evidence found" rather than "the write was refused" — the
+/// dead-substrate misread one layer down, and invisible for exactly the reason
+/// the cross-space case is.
+///
+/// It doubles as the shape check the seeded fixtures cannot give: the predicate
+/// reads an edge this crate's writer actually wrote.
 #[tokio::test]
-async fn a_claim_with_no_support_refutes_the_page() {
+async fn an_unfiled_page_can_be_supported_by_unfiled_evidence() {
+    const ADDED: &str = "They nest in old crow nests.";
+    let (db, _temp) = db_with_queue().await;
+    // `add_page` passes no space, so the page is unfiled — the case at issue.
+    add_page(&db, "uf1").await;
+    let base = crate::provenance::revision_content_digest("prose");
+    let minted = db
+        .mint_human_edit_delta("uf1", 1, &base, &format!("prose\n{ADDED}"))
+        .await
+        .unwrap()
+        .expect("the scenario needs a real delta to cite");
+    let revisions = derive_page(&db, "uf1", 1).await;
+
+    let span_digest = crate::provenance::revision_content_digest(ADDED);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entailment_cache
+                 (claim_text_digest, source_span_digest, model_id, model_version,
+                  prompt_version, score, threshold_at_write, backend, scored_at)
+             SELECT canonical_text_digest, ?2, 'judge', 'v1', 'p1', 0.91, 0.75, 'test', 0
+               FROM claim_revisions WHERE claim_revision_id = ?1",
+            libsql::params![revisions[0].clone(), span_digest.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    let verdict = super::claim_identity::SupportVerdict {
+        source_version: 1,
+        span_start: 0,
+        span_end: ADDED.len() as i64,
+        span_digest,
+        model_id: "judge".to_string(),
+        model_version: "v1".to_string(),
+        prompt_version: "p1".to_string(),
+        score: 0.91,
+        threshold_at_write: 0.75,
+    };
+    db.write_support_edge(
+        &revisions[0],
+        &minted.memory_source_id,
+        &minted.root_id,
+        &verdict,
+    )
+    .await
+    .expect("an unfiled page and its own unfiled evidence are the same space");
+
+    // Both sides agree, and they agree on the sentinel rather than on NULL —
+    // asserted rather than inferred from the write succeeding, because a fence
+    // written with `IS NOT` would also pass NULL against NULL, and that DB
+    // would break the moment one side started defaulting.
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT (SELECT space FROM pages WHERE id = 'uf1'),
+                        (SELECT space FROM memories WHERE source_id = ?1)",
+                libsql::params![minted.memory_source_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let page_space: Option<String> = row.get(0).unwrap();
+        let memory_space: Option<String> = row.get(1).unwrap();
+        assert_eq!(
+            page_space.as_deref(),
+            Some(super::UNFILED_SPACE_ID),
+            "an unfiled page stores the sentinel, not NULL"
+        );
+        assert_eq!(
+            memory_space, page_space,
+            "the evidence must land in the same spelling of unfiled as its page"
+        );
+    }
+
+    assert_eq!(
+        db.evaluate_page_support("uf1", 1).await.unwrap(),
+        SupportOutcome::Supported,
+        "the predicate must count an edge the production writer wrote"
+    );
+}
+
+/// Condition 3, and the only failure that is a verdict: the claims are real, a
+/// judge scored them, and nothing cleared the bar.
+#[tokio::test]
+async fn a_claim_judged_and_found_wanting_refutes_the_page() {
     let (db, _temp) = db_with_queue().await;
     add_page(&db, "p1").await;
     let revisions = derive_page(&db, "p1", 2).await;
     support_claim(&db, "p1", &revisions[0], 0.9).await;
+    judged_but_short(&db, &revisions[1]).await;
 
     let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::Refuted { ref reason } = outcome else {
+        panic!("got {outcome:?}");
+    };
     assert!(
-        matches!(outcome, SupportOutcome::Refuted { .. }),
-        "got {outcome:?}"
+        reason.contains("judged and fell short"),
+        "the stored reason must say the evidence was weighed: {reason}"
     );
     db.finalize_page_support("p1", 1, &outcome).await.unwrap();
     let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
@@ -609,6 +747,79 @@ async fn a_claim_with_no_support_refutes_the_page() {
         evaluated.is_some(),
         "a real verdict stamps evaluated_at — this is the one case that may cost a file"
     );
+}
+
+/// The widened reason set, and the safety call inside it. A claim no judge has
+/// ever scored means OUR pipeline did not run, not that the page is unsupported
+/// — so it must not stamp `evaluated_at`, and the stored reason must say which
+/// of the two situations it was. Collapsing these back into one `provisional`
+/// makes a gathering gap indistinguishable from a real refutation at exactly
+/// the moment a human is deciding whether to trust the page.
+#[tokio::test]
+async fn a_claim_nobody_judged_leaves_the_page_unevaluated() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 2).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    // revisions[1] is never judged at all — no edge, no cache row.
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::Unevaluated { ref reason } = outcome else {
+        panic!("a claim nobody judged is not a verdict; got {outcome:?}");
+    };
+    assert!(
+        reason.contains("no candidate evidence"),
+        "the stored reason must name the gathering gap: {reason}"
+    );
+
+    db.finalize_page_support("p1", 1, &outcome).await.unwrap();
+    let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
+    assert_eq!(status, "provisional");
+    assert!(
+        evaluated.is_none(),
+        "an ungathered claim must never cost the page its file"
+    );
+}
+
+/// The two reasons must be distinguishable in the stored text, not merely in
+/// the enum a caller has already thrown away.
+#[tokio::test]
+async fn the_two_provisional_reasons_are_distinguishable_on_disk() {
+    let (db, _temp) = db_with_queue().await;
+    for id in ["ungathered", "refuted"] {
+        add_page(&db, id).await;
+    }
+    let a = derive_page(&db, "ungathered", 1).await;
+    let b = derive_page(&db, "refuted", 1).await;
+    let _ = a;
+    judged_but_short(&db, &b[0]).await;
+
+    for id in ["ungathered", "refuted"] {
+        let outcome = db.evaluate_page_support(id, 1).await.unwrap();
+        db.finalize_page_support(id, 1, &outcome).await.unwrap();
+    }
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT page_id, provisional_reason FROM page_truth_state ORDER BY page_id",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        seen.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<Option<String>>(1).unwrap().unwrap_or_default(),
+        ));
+    }
+    assert_eq!(seen.len(), 2);
+    let refuted = &seen.iter().find(|r| r.0 == "refuted").unwrap().1;
+    let ungathered = &seen.iter().find(|r| r.0 == "ungathered").unwrap().1;
+    assert!(refuted.contains("judged and fell short"), "{refuted}");
+    assert!(ungathered.contains("no candidate evidence"), "{ungathered}");
+    assert_ne!(refuted, ungathered);
 }
 
 /// Row 15. Comparing each edge against its own `threshold_at_write` instead of

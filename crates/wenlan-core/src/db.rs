@@ -689,7 +689,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 104;
+pub const SCHEMA_VERSION: u32 = 105;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8386,12 +8386,12 @@ impl MemoryDB {
                 self.migrate_103_page_evaluated_at(version).await?;
             }
 
-            // Migration 104 (M5 derivation worker): the enqueue triggers, plus
+            // Migration 105 (M5 derivation worker): the enqueue triggers, plus
             // the first backlog sweep. `claim_derivation_jobs` has existed since
             // 98 with neither a writer nor a reader, so the queue was empty on
             // every install and `support_status = 'supported'` matched nothing.
-            if version < 104 {
-                self.migrate_104_claim_derivation_queue(version).await?;
+            if version < 105 {
+                self.migrate_105_claim_derivation_queue(version).await?;
             }
         }
 
@@ -11877,27 +11877,27 @@ impl MemoryDB {
     /// thousands of pages would hold every foreground request behind a full
     /// scan; the ambient lane re-runs the sweep each turn, so a large backlog
     /// fills in over the following ticks instead of at boot.
-    async fn migrate_104_claim_derivation_queue(&self, _prior: i64) -> Result<(), WenlanError> {
+    async fn migrate_105_claim_derivation_queue(&self, _prior: i64) -> Result<(), WenlanError> {
         {
             let conn = self.conn.lock().await;
             let tx = conn
                 .transaction()
                 .await
-                .map_err(|error| WenlanError::VectorDb(format!("m104 begin: {error}")))?;
+                .map_err(|error| WenlanError::VectorDb(format!("m105 begin: {error}")))?;
             Self::ensure_claim_derivation_triggers(&tx).await?;
             tx.commit()
                 .await
-                .map_err(|error| WenlanError::VectorDb(format!("m104 commit: {error}")))?;
+                .map_err(|error| WenlanError::VectorDb(format!("m105 commit: {error}")))?;
         }
 
         let enqueued = self.enqueue_stale_derivation_jobs(500).await?;
 
         let conn = self.conn.lock().await;
-        conn.execute("PRAGMA user_version = 104", ())
+        conn.execute("PRAGMA user_version = 105", ())
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m104 bump: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m105 bump: {error}")))?;
         log::info!(
-            "[migration] Migration 104 applied: claim-derivation queue live ({enqueued} \
+            "[migration] Migration 105 applied: claim-derivation queue live ({enqueued} \
              page(s) enqueued from the existing backlog)"
         );
         Ok(())

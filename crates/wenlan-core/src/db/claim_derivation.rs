@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! M5 claim-derivation work queue (schema 104).
+//! M5 claim-derivation work queue (schema 105).
 //!
 //! `claim_derivation_jobs` shipped with PR-A's substrate but with no writer and
 //! no reader, so on every real install the derivation backlog was permanently
@@ -102,7 +102,7 @@ pub enum SupportOutcome {
     NoPublish { reason: String },
 }
 
-/// The enqueue triggers, installed by migration 104.
+/// The enqueue triggers, installed by migration 105.
 ///
 /// `kind = 'entity'` pages are excluded: those are the M3 entity shadow pages,
 /// projections of an `entities` row rather than distilled prose, so there is no
@@ -163,7 +163,7 @@ impl MemoryDB {
         tx: &libsql::Transaction,
     ) -> Result<(), WenlanError> {
         tx.execute_batch(ENQUEUE_TRIGGERS).await.map_err(|error| {
-            WenlanError::VectorDb(format!("m104 claim-derivation triggers: {error}"))
+            WenlanError::VectorDb(format!("m105 claim-derivation triggers: {error}"))
         })?;
         Ok(())
     }
@@ -516,11 +516,34 @@ impl MemoryDB {
             });
         }
 
-        // Condition 3.
-        let unsupported: i64 = {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM page_version_claims pvc
+        // Condition 3, split by WHY a claim is unsupported. `provisional`
+        // conflates two situations that call for opposite responses, and the
+        // split has to reach the STORED reason or the distinction dies at the
+        // point a human would use it:
+        //
+        //   never judged -- no judge has ever scored this claim's text. The
+        //                   gathering or judging step did not happen, so we have
+        //                   not weighed this page at all.
+        //   judged short -- a judge scored this text and nothing cleared the
+        //                   bar. That IS a verdict about the evidence.
+        //
+        // The discriminator is a row in `entailment_cache` for the claim's
+        // canonical text digest, which exists if and only if some judge scored
+        // that exact text under some model and prompt.
+        let (never_judged, judged_short): (i64, i64) =
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT
+                         SUM(CASE WHEN ec.hit IS NULL THEN 1 ELSE 0 END),
+                         SUM(CASE WHEN ec.hit IS NULL THEN 0 ELSE 1 END)
+                       FROM page_version_claims pvc
+                       JOIN claim_revisions cr
+                         ON cr.claim_revision_id = pvc.claim_revision_id
+                       LEFT JOIN (
+                           SELECT DISTINCT claim_text_digest AS digest, 1 AS hit
+                             FROM entailment_cache
+                       ) ec ON ec.digest = cr.canonical_text_digest
                       WHERE pvc.page_id = ?1 AND pvc.page_version = ?2
                         AND NOT EXISTS (
                             SELECT 1 FROM edges e
@@ -531,23 +554,54 @@ impl MemoryDB {
                                AND e.superseded_by IS NULL
                                AND json_extract(e.payload, '$.score') >= ?3
                         )",
-                    libsql::params![page_id, page_version, SUPPORT_THRESHOLD],
-                )
-                .await
-                .map_err(|error| WenlanError::VectorDb(format!("support scan: {error}")))?;
-            rows.next()
-                .await
-                .map_err(|error| WenlanError::VectorDb(format!("support scan decode: {error}")))?
-                .map(|row| row.get::<i64>(0))
-                .transpose()
-                .map_err(|error| WenlanError::VectorDb(format!("support scan decode: {error}")))?
-                .unwrap_or(0)
-        };
-        if unsupported > 0 {
+                        libsql::params![page_id, page_version, SUPPORT_THRESHOLD],
+                    )
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("support scan: {error}")))?;
+                match rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("support scan decode: {error}"))
+                })? {
+                    Some(row) => (
+                        row.get::<Option<i64>>(0)
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!("support scan decode: {error}"))
+                            })?
+                            .unwrap_or(0),
+                        row.get::<Option<i64>>(1)
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!("support scan decode: {error}"))
+                            })?
+                            .unwrap_or(0),
+                    ),
+                    None => (0, 0),
+                }
+            };
+
+        // A claim nobody has judged means the derivation has not run to
+        // completion over this inventory, whatever the marker says about
+        // extraction. Calling that `Refuted` would stamp `evaluated_at` and cost
+        // the page its file for a gap in OUR pipeline rather than a fact about
+        // the page -- the mass-flip failure wearing a different hat. Fail closed
+        // to `Unevaluated`, and name how many and why.
+        if never_judged > 0 {
+            return Ok(SupportOutcome::Unevaluated {
+                reason: format!(
+                    "no candidate evidence: {never_judged} of {inventory_count} claim(s) have \
+                     never been scored by any judge{}",
+                    if judged_short > 0 {
+                        format!(" ({judged_short} more were judged and fell short)")
+                    } else {
+                        String::new()
+                    }
+                ),
+            });
+        }
+        if judged_short > 0 {
             return Ok(SupportOutcome::Refuted {
                 reason: format!(
-                    "{unsupported} of {inventory_count} claim(s) have no active support edge \
-                     above threshold {SUPPORT_THRESHOLD}"
+                    "candidates judged and fell short: {judged_short} of {inventory_count} \
+                     claim(s) have no active support edge at or above threshold \
+                     {SUPPORT_THRESHOLD}"
                 ),
             });
         }
