@@ -10,8 +10,14 @@ permissions:
   contents: read
 
 concurrency:
+  # A fixed group can retain only one pending run, silently dropping receipts
+  # during bursts. Keep every completed CI run/attempt independently observable.
   group: ci-observer-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
   cancel-in-progress: false
+
+env:
+  CI_CACHE_BUDGET_GB: "10"
+  CI_REQUIRED_GATE_TARGET_MINUTES: "20"
 
 jobs:
   collect:
@@ -32,27 +38,37 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
-          set -euo pipefail
-          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
-          [[ "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          set -uo pipefail
           out="$RUNNER_TEMP/ci-observer"
           mkdir -p "$out"
-          gh api --method GET \
+
+          if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
+            echo "::warning title=CI observer metadata::Invalid run identity; the receipt will record unavailable metadata."
+            exit 0
+          fi
+
+          fetch_metadata() {
+            local label="$1"
+            local destination="$2"
+            shift 2
+            local temporary="${destination}.tmp"
+            if "$@" > "$temporary"; then
+              mv "$temporary" "$destination"
+            else
+              rm -f "$temporary"
+              echo "::warning title=CI observer metadata::${label} metadata is unavailable; the receipt will record the failure."
+            fi
+          }
+
+          fetch_metadata "Jobs" "$out/jobs-pages.json" gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
             --paginate --slurp \
-            "/repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
-            > "$out/jobs-pages.json"
-          gh api --method GET \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100"
+          fetch_metadata "Cache usage" "$out/cache-usage.json" gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "/repos/$GITHUB_REPOSITORY/actions/cache/usage" \
-            > "$out/cache-usage.json"
-          gh api --method GET \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "/repos/$GITHUB_REPOSITORY/actions/cache/storage-limit" \
-            > "$out/cache-limit.json"
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/actions/cache/usage"
       - name: Build timing and cache receipt
         if: always()
         run: |
@@ -60,7 +76,8 @@ jobs:
             --event "$GITHUB_EVENT_PATH" \
             --jobs-pages "$RUNNER_TEMP/ci-observer/jobs-pages.json" \
             --cache-usage "$RUNNER_TEMP/ci-observer/cache-usage.json" \
-            --cache-limit "$RUNNER_TEMP/ci-observer/cache-limit.json" \
+            --cache-budget-gb "$CI_CACHE_BUDGET_GB" \
+            --required-gate-target-minutes "$CI_REQUIRED_GATE_TARGET_MINUTES" \
             --output "$RUNNER_TEMP/ci-observer/receipt.json"
       - name: Upload CI observer receipt
         if: always()

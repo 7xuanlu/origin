@@ -58,9 +58,10 @@ Get-Item $gitBash
 # generator after setup-msvc-ninja-windows.ps1 selects Ninja.
 $env:CARGO_TARGET_DIR = "C:\wl-target"
 
-# MSVC's nested Vulkan shader probes can concurrently write the same PDB.
-# Serialize release builds so cl.exe does not fail with C1041.
-$env:CARGO_BUILD_JOBS = "1"
+# Cargo can overlap two independent package builds. Keep nested CMake at one
+# worker so MSVC Vulkan shader probes cannot race while writing the same PDB.
+$env:CARGO_BUILD_JOBS = "2"
+$env:CMAKE_BUILD_PARALLEL_LEVEL = "1"
 ```
 
 If libclang is not on its standard path, set `LIBCLANG_PATH` to the directory
@@ -98,7 +99,7 @@ cargo test -p wenlan-server status_reports_selected_vulkan_device
 & scripts\stage-vulkan-loader-windows.ps1 `
   -DestinationDirectory $releaseDir
 & $gitBash scripts\build-release-binaries.sh $target
-cargo build --release --target $target --jobs 1 `
+cargo build --release --target $target --jobs 2 `
   -p wenlan-core --bin model_probe
 
 & scripts\setup-vulkan-sdk-windows.test.ps1
@@ -321,9 +322,9 @@ link alone is not the release gate.
   `CARGO_TARGET_DIR=C:\wl-target`, then rebuild; enabling Windows long paths
   does not make every older MSVC/CMake child tool long-path aware.
 - `C1041: cannot open program database`: concurrent nested MSVC probes wrote
-  the same PDB. Set `CARGO_BUILD_JOBS=1` and pass `--jobs 1` to the release
-  build. The Windows CI and release jobs intentionally use this slower,
-  deterministic path.
+  the same PDB. Run `scripts\setup-msvc-ninja-windows.ps1` and keep
+  `CMAKE_BUILD_PARALLEL_LEVEL=1`. Windows CI and release allow two outer Cargo
+  jobs, but they deliberately do not lift this nested CMake/PDB protection.
 - Vulkan builds but the daemon reports CPU: inspect `fallback_reason`, update
   the GPU driver, run `vulkaninfo.exe --summary`, then retry the live smoke.
 - A hybrid laptop picks the integrated GPU: inspect the device indexes printed

@@ -1,8 +1,15 @@
 name: Release Please
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-please-main
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -10,6 +17,11 @@ permissions:
 
 jobs:
   release-please:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
@@ -18,6 +30,7 @@ jobs:
           # No release-type input — setting it makes the action ignore config-file.
           manifest-file: .release-please-manifest.json
           config-file: release-please-config.json
+          target-branch: main
           # GITHUB_TOKEN events don't trigger other workflows (GitHub security policy).
           # A fine-grained PAT with contents:write lets the tag push trigger release.yml.
           token: ${{ secrets.RELEASE_TOKEN }}

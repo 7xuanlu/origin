@@ -170,6 +170,10 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare-release.outputs.release-targets) }}
     runs-on: ${{ matrix.os }}
+    # Windows native release builds are deliberately bounded more generously;
+    # all other targets should fail closed instead of occupying a runner after
+    # an unexpected toolchain or linker hang.
+    timeout-minutes: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || 60 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -216,6 +220,67 @@ jobs:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
+      - name: Stabilize Windows Rust cache toolchain inputs
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: bash scripts/stabilize-rust-cache-toolchains.sh
+
+      # rust-lld shipped with the Rust toolchain (~3-5min faster link
+      # than MSVC link.exe on our binary sizes). rustup does NOT proxy
+      # rust-lld, so its path must be discovered via `rustc --print
+      # sysroot`. Export the Cargo target linker for host build scripts plus
+      # RUSTFLAGS for target artifacts via $GITHUB_ENV so the Bash build step
+      # cannot resolve Git for Windows' unrelated usr/bin/link.exe.
+      - name: Configure rust-lld linker (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $sysroot = (rustc --print sysroot).Trim()
+          $lld = Join-Path $sysroot "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          if (-not (Test-Path $lld)) {
+            Write-Host "rust-lld.exe not found at $lld, listing sysroot:"
+            Get-ChildItem -Recurse -Filter rust-lld.exe -Path $sysroot
+            throw "rust-lld.exe missing"
+          }
+          $rustflags = "-C linker=$lld -C linker-flavor=lld-link"
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          "RUSTFLAGS=$rustflags" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "RUSTFLAGS=$rustflags"
+
+      - name: Select native Perl for vendored OpenSSL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $nativePerl = $null
+          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
+            if ($candidate.Source -match '[\\/]Git[\\/]') {
+              continue
+            }
+            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
+            if ($LASTEXITCODE -eq 0) {
+              $nativePerl = $candidate.Source
+              break
+            }
+          }
+          if (-not $nativePerl) {
+            throw "No native Perl can load Locale::Maketext::Simple"
+          }
+          "OPENSSL_SRC_PERL=$nativePerl" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "OPENSSL_SRC_PERL=$nativePerl"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          # Only Windows carries the costly coherent native Cargo target tree.
+          # Tag releases consume the main-owned preflight cache but never write
+          # a competing entry or evict ordinary CI caches.
+          cache-all-crates: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+          cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+          save-if: "false"
+
       # vcpkg sqlite3 for Windows — libsql 0.9 needs `sqlite3.lib` at link
       # time and does not bundle SQLite on Windows. Mirrors ci.yml's test
       # step. GitHub `windows-2022` runner ships vcpkg preinstalled.
@@ -245,64 +310,13 @@ jobs:
         run: |
           & scripts/setup-msvc-ninja-windows.ps1
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.target }}
-          cache-all-crates: "true"
-          # Keep the rare tag build from evicting ordinary CI caches. Every
-          # target still builds; only the costly Windows target is persisted.
-          cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
-
-      # rust-lld shipped with the Rust toolchain (~3-5min faster link
-      # than MSVC link.exe on our binary sizes). rustup does NOT proxy
-      # rust-lld, so its path must be discovered via `rustc --print
-      # sysroot`. Export the Cargo target linker for host build scripts plus
-      # RUSTFLAGS for target artifacts via $GITHUB_ENV so the Bash build step
-      # cannot resolve Git for Windows' unrelated usr/bin/link.exe.
-      - name: Configure rust-lld linker (Windows)
+      # Cargo may overlap two independent package builds. The setup step keeps
+      # nested CMake at one worker so concurrent MSVC shader probes cannot race
+      # while writing the same PDB.
+      - name: Cap Windows Cargo parallelism
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: |
-          $sysroot = (rustc --print sysroot).Trim()
-          $lld = Join-Path $sysroot "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
-          if (-not (Test-Path $lld)) {
-            Write-Host "rust-lld.exe not found at $lld, listing sysroot:"
-            Get-ChildItem -Recurse -Filter rust-lld.exe -Path $sysroot
-            throw "rust-lld.exe missing"
-          }
-          $rustflags = "-C linker=$lld -C linker-flavor=lld-link"
-          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-          "RUSTFLAGS=$rustflags" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "RUSTFLAGS=$rustflags"
-
-      - name: Serialize native build (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: '"CARGO_BUILD_JOBS=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
-
-      - name: Select native Perl for vendored OpenSSL
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $nativePerl = $null
-          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
-            if ($candidate.Source -match '[\\/]Git[\\/]') {
-              continue
-            }
-            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
-            if ($LASTEXITCODE -eq 0) {
-              $nativePerl = $candidate.Source
-              break
-            }
-          }
-          if (-not $nativePerl) {
-            throw "No native Perl can load Locale::Maketext::Simple"
-          }
-          "OPENSSL_SRC_PERL=$nativePerl" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "OPENSSL_SRC_PERL=$nativePerl"
+        run: '"CARGO_BUILD_JOBS=2" | Out-File -FilePath $env:GITHUB_ENV -Append'
 
       # CI release-preflight and the authoritative tag build share this exact
       # shipped-binary build/smoke contract. Packaging and publishing remain
@@ -462,7 +476,10 @@ jobs:
 
   docker:
     name: Build & Push Docker Image (${{ matrix.platform }})
-    needs: release
+    # Build architecture images alongside the binary matrix. If a binary leg
+    # fails, orphaned version-suffixed staging tags are accepted; the manifest
+    # job below still withholds the public version and latest tags.
+    needs: prepare-release
     runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
@@ -511,7 +528,7 @@ jobs:
 
   docker-manifest:
     name: Combine Docker Manifest (multi-arch)
-    needs: docker
+    needs: [docker, release]
     runs-on: ubuntu-24.04
     permissions:
       packages: write

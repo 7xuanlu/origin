@@ -59,6 +59,37 @@ NATIVE_SUFFIXES = {
 CLI_SERVER_PACKAGES = {"wenlan", "wenlan-server"}
 MANUAL_CORE_INTEGRATION = {"cached_scenario_db_check", "eval_harness"}
 
+PLUGIN_JOB_PREFIXES = (
+    "plugin",
+    "plugin-codex",
+    ".agents/plugins",
+    ".claude-plugin",
+)
+PLUGIN_JOB_FILES = {
+    "plugin-contract.json",
+    "scripts/validate-codex-plugin-slice.py",
+    "scripts/validate-plugin-contract.py",
+    "scripts/validate-plugin-contract.test.sh",
+}
+
+DOCS_JOB_PREFIXES = ("docs",)
+DOCS_JOB_FILES = {
+    "LICENSE",
+    "scripts/check-readme-translations.py",
+    "scripts/check-readme-translations.test.sh",
+    "scripts/update-readme-eval.py",
+    "scripts/update-readme-eval.test.py",
+    "scripts/validate-versions.sh",
+    "scripts/validate-versions.test.sh",
+}
+
+SUITE_OUTPUT_KEYS = {
+    "workspace-lib-required": "workspace_lib",
+    "cli-server-integration-required": "cli_server_integration",
+    "core-integration-required": "core_integration",
+    "canonical-smokes-required": "canonical_smokes",
+}
+
 
 def _cargo_executable() -> str:
     """Return Cargo's executable without parsing a shell command string."""
@@ -83,6 +114,7 @@ def _full_plan(reason: str) -> dict:
         "workspace_lib": {"mode": "full"},
         "cli_server_integration": {"mode": "full"},
         "core_integration": {"mode": "full"},
+        "canonical_smokes": {"mode": "full"},
     }
 
 
@@ -184,6 +216,38 @@ def _owner(path: str, directories: dict[str, str]) -> tuple[str, str] | None:
     return package, path[len(directory) + 1 :]
 
 
+def _plugin_job_owns(path: str) -> bool:
+    if path in PLUGIN_JOB_FILES:
+        return True
+    return any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in PLUGIN_JOB_PREFIXES
+    )
+
+
+def _npm_job_owns(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return len(parts) >= 4 and parts[0] == "crates" and parts[2] == "npm"
+
+
+def _rust_fixture_owns(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    if len(parts) < 4 or parts[0] != "crates":
+        return False
+    return "tests" in parts[2:-1] or parts[2] == "resources"
+
+
+def _docs_job_owns(path: str) -> bool:
+    if path in DOCS_JOB_FILES:
+        return True
+    if any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in DOCS_JOB_PREFIXES
+    ):
+        return True
+    return path.endswith(".md") and not _rust_fixture_owns(path)
+
+
 def _integration_targets(package: dict) -> set[str]:
     targets = set()
     for target in package["targets"]:
@@ -246,9 +310,25 @@ def build_plan(
     cli_server_targets: dict[str, set[str]] = defaultdict(set)
     core_full = False
     core_targets: set[str] = set()
+    canonical_smokes = False
     reasons: list[str] = []
 
     for path in paths:
+        # Plugin distribution files have an explicit required CI owner. Check
+        # that ownership before Cargo/build classification so a mixed
+        # Rust-plus-plugin diff keeps the Rust portion's narrow plan.
+        if _plugin_job_owns(path):
+            reasons.append(f"plugin contract job owns changed path: {path}")
+            continue
+
+        if _npm_job_owns(path):
+            reasons.append(f"npm contract job owns changed path: {path}")
+            continue
+
+        if _docs_job_owns(path):
+            reasons.append(f"docs contract job owns changed path: {path}")
+            continue
+
         if (
             path in FULL_INPUTS
             or path.endswith("/Cargo.toml")
@@ -316,6 +396,7 @@ def build_plan(
             broad_packages.update(closure)
             cli_server_packages.update(closure & CLI_SERVER_PACKAGES)
             core_full = core_full or "wenlan-core" in closure
+            canonical_smokes = True
             reasons.append(f"source change selects reverse dependency closure: {path}")
             continue
 
@@ -354,7 +435,37 @@ def build_plan(
         "workspace_lib": _workspace_lib_plan(broad_packages, isolated_filters),
         "cli_server_integration": cli_server_plan,
         "core_integration": core_plan,
+        "canonical_smokes": {"mode": "full" if canonical_smokes else "skip"},
     }
+
+
+def required_suite_outputs(plan: object) -> dict[str, bool]:
+    """Return validated booleans used by workflow job and step gates."""
+
+    if not isinstance(plan, dict) or plan.get("version") != 1:
+        raise PlanError("unsupported or malformed test plan")
+    required: dict[str, bool] = {}
+    for output_name, suite_name in SUITE_OUTPUT_KEYS.items():
+        suite = plan.get(suite_name)
+        if not isinstance(suite, dict):
+            raise PlanError(f"test plan has no suite {suite_name!r}")
+        mode = suite.get("mode")
+        if not isinstance(mode, str) or not mode:
+            raise PlanError(f"test plan suite {suite_name!r} has no mode")
+        required[output_name] = mode != "skip"
+    required["canonical-acceptance-required"] = any(
+        required[name]
+        for name in (
+            "cli-server-integration-required",
+            "core-integration-required",
+            "canonical-smokes-required",
+        )
+    )
+    required["rust-ci-required"] = (
+        required["workspace-lib-required"]
+        or required["canonical-acceptance-required"]
+    )
+    return required
 
 
 def _validated_package_names(
@@ -385,12 +496,65 @@ def _package_args(package_names: Iterable[str]) -> list[str]:
     return arguments
 
 
+def _validated_path_argument(raw_path: object, *, name: str) -> str:
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path
+        or "\n" in raw_path
+        or "\r" in raw_path
+        or raw_path.startswith("-")
+    ):
+        raise PlanError(f"{name} must be a non-empty path argument")
+    return raw_path
+
+
+def archive_command_for(
+    plan: object,
+    cargo_metadata: object,
+    *,
+    archive_file: str,
+) -> list[str]:
+    """Build one workspace-lib archive without applying test predicates."""
+
+    if not isinstance(plan, dict) or plan.get("version") != 1:
+        raise PlanError("unsupported or malformed test plan")
+    packages, _directories = _workspace(cargo_metadata)
+    suite = plan.get("workspace_lib")
+    if not isinstance(suite, dict):
+        raise PlanError("test plan has no suite 'workspace-lib'")
+    mode = suite.get("mode")
+    if mode == "skip":
+        return []
+
+    cargo = [
+        "cargo",
+        "nextest",
+        "archive",
+        "--archive-file",
+        _validated_path_argument(archive_file, name="archive-file"),
+    ]
+    if mode == "full":
+        return [*cargo, "--workspace", "--lib"]
+    if mode in {"packages", "filterset"}:
+        if mode == "filterset":
+            filterset = suite.get("filterset")
+            if not isinstance(filterset, str) or not filterset:
+                raise PlanError("workspace filterset is empty")
+        names = _validated_package_names(suite.get("packages"), packages)
+        # Filterset plans archive each selected package's complete lib test
+        # binary. Test-name predicates are valid only when the archive runs.
+        return [*cargo, *_package_args(names), "--lib"]
+    raise PlanError(f"unknown workspace-lib mode: {mode!r}")
+
+
 def command_groups_for(
     suite_name: str,
     plan: object,
     cargo_metadata: object,
     *,
     partition: str | None = None,
+    archive_file: str | None = None,
+    workspace_remap: str | None = None,
 ) -> list[list[str]]:
     """Translate a plan suite into validated argv vectors."""
 
@@ -413,12 +577,52 @@ def command_groups_for(
         if suite_name != "workspace-lib":
             raise PlanError("nextest partition is only supported for workspace-lib")
 
+    if archive_file is None and workspace_remap is not None:
+        raise PlanError("workspace-remap requires an archive-file")
+    if archive_file is not None:
+        if suite_name != "workspace-lib":
+            raise PlanError("nextest archives are only supported for workspace-lib")
+        if workspace_remap is None:
+            raise PlanError("archive-file requires workspace-remap")
+        archive_file = _validated_path_argument(
+            archive_file,
+            name="archive-file",
+        )
+        workspace_remap = _validated_path_argument(
+            workspace_remap,
+            name="workspace-remap",
+        )
+
     def workspace_command(arguments: list[str]) -> list[str]:
         if partition is None:
             return arguments
         return [*arguments, "--partition", partition]
 
     if suite_name == "workspace-lib":
+        if archive_file is not None:
+            archived = [
+                *cargo,
+                "--archive-file",
+                archive_file,
+                "--workspace-remap",
+                workspace_remap,
+            ]
+            if mode == "full":
+                return [workspace_command(archived)]
+            if mode == "packages":
+                _validated_package_names(suite.get("packages"), packages)
+                return [workspace_command(archived)]
+            if mode == "filterset":
+                filterset = suite.get("filterset")
+                if not isinstance(filterset, str) or not filterset:
+                    raise PlanError("workspace filterset is empty")
+                _validated_package_names(suite.get("packages"), packages)
+                return [
+                    workspace_command(
+                        [*archived, "-E", filterset, "--no-tests=pass"]
+                    )
+                ]
+            raise PlanError(f"unknown workspace-lib mode: {mode!r}")
         if mode == "full":
             return [workspace_command([*cargo, "--workspace", "--lib"])]
         if mode == "packages":
@@ -571,6 +775,11 @@ def _require_filterset_match(command: list[str]) -> None:
         if index + 1 >= len(command):
             raise PlanError("nextest partition has no value")
         unpartitioned = [*command[:index], *command[index + 2 :]]
+    # The run may legitimately have an empty shard after the unpartitioned
+    # selector was proven non-empty. `nextest list` does not accept this flag.
+    unpartitioned = [
+        argument for argument in unpartitioned if argument != "--no-tests=pass"
+    ]
     list_command = [
         _cargo_executable(),
         "nextest",
@@ -612,11 +821,14 @@ def _require_filterset_match(command: list[str]) -> None:
     print(f"workspace-lib filterset matched {matched} tests")
 
 
-def _write_github_output(path: str, plan_json: str) -> None:
+def _write_github_output(path: str, plan: object, plan_json: str) -> None:
     if "\n" in plan_json or "\r" in plan_json:
         raise PlanError("compact plan JSON unexpectedly contains a newline")
+    required = required_suite_outputs(plan)
     with Path(path).open("a", encoding="utf-8") as output:
         output.write(f"test-plan={plan_json}\n")
+        for name, value in required.items():
+            output.write(f"{name}={'true' if value else 'false'}\n")
 
 
 def _main(argv: list[str]) -> int:
@@ -628,6 +840,10 @@ def _main(argv: list[str]) -> int:
     plan_parser.add_argument("--metadata-file", required=True)
     plan_parser.add_argument("--event-name", required=True)
     plan_parser.add_argument("--github-output")
+
+    archive_parser = subparsers.add_parser("archive")
+    archive_parser.add_argument("--plan-json", required=True)
+    archive_parser.add_argument("--archive-file", required=True)
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument(
@@ -641,6 +857,8 @@ def _main(argv: list[str]) -> int:
     )
     run_parser.add_argument("--plan-json", required=True)
     run_parser.add_argument("--partition")
+    run_parser.add_argument("--archive-file")
+    run_parser.add_argument("--workspace-remap")
 
     arguments = parser.parse_args(argv)
     if arguments.command == "plan":
@@ -658,18 +876,35 @@ def _main(argv: list[str]) -> int:
         plan_json = json.dumps(plan, separators=(",", ":"), sort_keys=True)
         print(plan_json)
         if arguments.github_output:
-            _write_github_output(arguments.github_output, plan_json)
+            _write_github_output(arguments.github_output, plan, plan_json)
         return 0
 
     try:
         plan = json.loads(arguments.plan_json)
     except json.JSONDecodeError as error:
         raise PlanError("plan-json is invalid") from error
+    metadata = _cargo_metadata()
+    if arguments.command == "archive":
+        command = archive_command_for(
+            plan,
+            metadata,
+            archive_file=arguments.archive_file,
+        )
+        if not command:
+            print("workspace-lib: no affected tests to archive")
+            return 0
+        executable_command = _executable_command(command)
+        print("+", " ".join(executable_command), flush=True)
+        subprocess.run(executable_command, check=True)
+        return 0
+
     commands = command_groups_for(
         arguments.suite,
         plan,
-        _cargo_metadata(),
+        metadata,
         partition=arguments.partition,
+        archive_file=arguments.archive_file,
+        workspace_remap=arguments.workspace_remap,
     )
     if not commands:
         print(f"{arguments.suite}: no affected tests")
