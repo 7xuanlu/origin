@@ -349,6 +349,7 @@ class PackageClosureTests(unittest.TestCase):
 
 class PlatformPlanTests(unittest.TestCase):
     INFRASTRUCTURE_PATHS = (
+        ".config/nextest.toml",
         ".github/workflows/ci.yml",
         ".githooks/pre-push",
         "scripts/ci_test_plan.py",
@@ -357,6 +358,7 @@ class PlatformPlanTests(unittest.TestCase):
         "scripts/release_targets.test.py",
         "scripts/build-release-binaries.sh",
         "scripts/release-workflow-contract.test.py",
+        "crates/wenlan-cli/tests/distribution.rs",
         "crates/wenlan-core/src/drift_guard.rs",
     )
 
@@ -429,13 +431,18 @@ class PlatformPlanTests(unittest.TestCase):
             "Cargo.toml",
             "Cargo.lock",
             "rust-toolchain.toml",
-            ".config/nextest.toml",
             "crates/wenlan-core/Cargo.toml",
             "crates/wenlan-core/build.rs",
             "crates/wenlan-core/native/bridge.cpp",
         ):
             with self.subTest(path=path):
                 self.assertEqual(self.platform_plan_for(path)["mode"], "full")
+
+    def test_nextest_config_uses_platform_smokes_not_full_behavior_suites(self) -> None:
+        plan = self.platform_plan_for(".config/nextest.toml")
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertFalse(any(required_suite_outputs(plan).values()))
 
     def test_non_pr_platform_plan_keeps_full_backstop(self) -> None:
         plan = build_platform_plan(

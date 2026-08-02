@@ -43,6 +43,14 @@ FULL_INPUTS = {
     "scripts/ci_test_plan.test.py",
 }
 
+# Repository contracts are executable Rust tests, but they do not exercise
+# platform behavior. Linux owns their canonical execution; routing them into
+# macOS and Windows would duplicate product suites without adding OS evidence.
+PLATFORM_CONTRACT_ONLY_PATHS = {
+    "crates/wenlan-cli/tests/distribution.rs",
+    "crates/wenlan-core/src/drift_guard.rs",
+}
+
 NATIVE_SUFFIXES = {
     ".c",
     ".cc",
@@ -509,13 +517,15 @@ def build_platform_plan(
 
     # Linux owns repository/workflow/planner contracts. Platform behavior is
     # widened only by product crate inputs or the shared Cargo/toolchain graph.
-    # drift_guard.rs is test-contract source: its Rust tests run canonically on
-    # Linux and must not turn a workflow-only PR into two full native suites.
+    # Repository-contract tests run canonically on Linux and must not turn an
+    # infrastructure-only PR into two full native suites. nextest repository
+    # config can contain host/target overrides, so CI executes a small real
+    # nextest test on each platform; Linux remains the owner of the complete
+    # suite. See https://nexte.st/docs/configuration/specifying-platforms/.
     shared_platform_inputs = {
         "Cargo.toml",
         "Cargo.lock",
         "rust-toolchain.toml",
-        ".config/nextest.toml",
     }
     relevant = [
         path
@@ -523,7 +533,7 @@ def build_platform_plan(
         if path in shared_platform_inputs
         or (
             path.startswith("crates/")
-            and path != "crates/wenlan-core/src/drift_guard.rs"
+            and path not in PLATFORM_CONTRACT_ONLY_PATHS
         )
     ]
     if not relevant:

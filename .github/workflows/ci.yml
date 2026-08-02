@@ -46,6 +46,7 @@ jobs:
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
       macos-m4: ${{ steps.filter.outputs.macos-m4 }}
       windows-llm-probe: ${{ steps.filter.outputs.windows-llm-probe }}
+      nextest-config: ${{ steps.filter.outputs.nextest-config }}
       release-preflight: ${{ steps.filter.outputs.release-preflight }}
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
       workspace-platform: ${{ steps.filter.outputs.workspace-platform }}
@@ -324,6 +325,10 @@ jobs:
               - 'crates/wenlan-core/src/provenance.rs'
               - 'crates/wenlan-core/src/refinery/mod.rs'
               - 'crates/wenlan-core/tests/m4_community_gates.rs'
+            nextest-config:
+              # Repository config supports host/target-specific overrides.
+              # Exercise the real parser and scheduler once on each platform
+              # without repeating the complete cross-platform library suite.
               - '.config/nextest.toml'
             windows-llm-probe:
               - 'crates/wenlan-core/src/engine.rs'
@@ -468,6 +473,7 @@ jobs:
           python3 scripts/ci-cache-maintenance.test.py
           python3 scripts/ci-observer.test.py
           python3 scripts/ci-timed-command.test.py
+          bash scripts/download-run-artifact.test.sh
           python3 scripts/verify-ort-source-pin.test.py
           python3 scripts/verify-ort-source-pin.py
       - name: Set up Rust for affected-test planning
@@ -707,10 +713,18 @@ jobs:
           name: wenlan-workspace-lib-nextest-${{ github.run_id }}
           path: ${{ runner.temp }}/wenlan-nextest-archive
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Run workspace-lib archive partition
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
@@ -829,14 +843,25 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
+      - name: Validate nextest config on platform
+        if: needs.detect-changes.outputs.nextest-config == 'true'
+        run: cargo nextest run -p wenlan-types --lib -E 'test(/^brand::tests::brand_is_wenlan$/)' --no-tests=fail
       # detect-changes prepares one revision- and SHA-pinned snapshot before
       # the matrix starts. Each platform downloads that run-scoped artifact without
       # contending on the repository cache API.
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       # Workspace lib tests skipped on Windows — Linux + macOS catch the
       # same cross-platform unit logic in ~5-15min vs 25min on Windows.
       # Windows-specific behavior (paths, mcp_add, schtasks) is covered
@@ -936,9 +961,10 @@ jobs:
         run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-env CI_TEST_PLAN
       # When this OS already owns behavioral tests, keep platform compile proof
       # in the same target directory instead of rebuilding the native graph in
-      # mcp-platform. That job remains the owner for OSes absent from this matrix.
+      # mcp-platform. When the Apple release preflight is already scheduled, its
+      # shipped-binary build and launch smoke own the stronger macOS proof.
       - name: Build CLI/server contract binaries (test owner)
-        if: needs.detect-changes.outputs.workspace-platform == 'true'
+        if: needs.detect-changes.outputs.workspace-platform == 'true' && !(matrix.os == 'macos-14' && needs.detect-changes.outputs.release-preflight == 'true')
         run: cargo build -p wenlan -p wenlan-server --bins
       # Ordinary Windows PR proof uses debug artifacts already warmed by the
       # integration suite. Stage both pinned runtime DLLs next to the daemon
@@ -1159,15 +1185,24 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Page lint scale gate (Linux time + RSS)
+        id: page-lint-scale
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true'
         run: bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
       - name: Upload Page lint scale receipt (Linux)
-        if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'
+        if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true' && steps.page-lint-scale.outcome != 'skipped'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: task-19-lint-scale-ubuntu-24.04-${{ github.sha }}
@@ -1492,10 +1527,18 @@ jobs:
       # detect-changes so health does not depend on a cold Hugging Face fetch.
       - name: Download portable FastEmbed model
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Build and smoke shipped release binaries
         shell: bash
         run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
@@ -1610,10 +1653,18 @@ jobs:
       # real_router.rs boots a real MemoryDB. detect-changes owns the only cold
       # fetch; this lane must fail closed if the prepared snapshot is absent.
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Affected wenlan-mcp + wenlan-types integrations
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}

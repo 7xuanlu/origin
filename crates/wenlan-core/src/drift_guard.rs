@@ -209,6 +209,41 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 "job {job_name} uses FastEmbed artifact name {actual_name:?}, expected {ARTIFACT_NAME:?}"
             ));
         }
+        if download["id"].as_str() != Some("fastembed-download")
+            || download["continue-on-error"].as_bool() != Some(true)
+        {
+            violations.push(format!(
+                "job {job_name} does not expose the official artifact action outcome for bounded retry"
+            ));
+        }
+        let retry_indexes = steps
+            .iter()
+            .enumerate()
+            .filter_map(|(index, step)| {
+                (step["name"].as_str() == Some("Retry portable FastEmbed model download"))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let expected_retry_if = if *job_name == "release-preflight" {
+            "matrix.target == 'x86_64-pc-windows-msvc' && steps.fastembed-download.outcome == 'failure'"
+        } else {
+            "steps.fastembed-download.outcome == 'failure'"
+        };
+        let retry_valid = retry_indexes.as_slice() == [download_index + 1]
+            && retry_indexes.first().is_some_and(|index| {
+                let retry = &steps[*index];
+                retry["if"].as_str() == Some(expected_retry_if)
+                    && retry["env"]["GH_TOKEN"].as_str() == Some("${{ github.token }}")
+                    && retry["run"].as_str()
+                        == Some(
+                            "bash scripts/download-run-artifact.sh \"$GITHUB_RUN_ID\" \"fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}\" .fastembed_cache",
+                        )
+            });
+        if !retry_valid {
+            violations.push(format!(
+                "job {job_name} lacks the exact fail-closed FastEmbed artifact retry fallback"
+            ));
+        }
         if steps.iter().any(|step| {
             step["uses"]
                 .as_str()
@@ -2105,11 +2140,31 @@ fn ci_routing_contract_violations(
             ));
         }
     }
+    if ci["jobs"]["detect-changes"]["outputs"]["nextest-config"].as_str()
+        != Some("${{ steps.filter.outputs.nextest-config }}")
+    {
+        violations.push("detect-changes does not expose the nextest platform-smoke route".into());
+    }
+    let nextest_platform = job_step(&ci, "test", "Validate nextest config on platform");
+    if nextest_platform.and_then(|step| step["if"].as_str())
+        != Some("needs.detect-changes.outputs.nextest-config == 'true'")
+        || nextest_platform.and_then(|step| step["run"].as_str())
+            != Some(
+                "cargo nextest run -p wenlan-types --lib -E 'test(/^brand::tests::brand_is_wenlan$/)' --no-tests=fail",
+            )
+        || !detect_change_filter_paths(&ci, "nextest-config").contains(".config/nextest.toml")
+    {
+        violations.push(
+            "nextest config changes do not execute one bounded real test on each routed platform"
+                .into(),
+        );
+    }
     for contract in [
         "def build_platform_plan(",
         "if not relevant:",
         "no platform behavioral inputs changed",
-        "path != \"crates/wenlan-core/src/drift_guard.rs\"",
+        "PLATFORM_CONTRACT_ONLY_PATHS = {",
+        "path not in PLATFORM_CONTRACT_ONLY_PATHS",
         "behavioral_packages = {\"wenlan-core\", \"wenlan-server\", \"wenlan\"}",
         "choices=(\"canonical\", \"platform\")",
     ] {
@@ -2373,7 +2428,6 @@ fn ci_routing_contract_violations(
         "crates/wenlan-core/src/db/community_grouping_state.rs",
         "crates/wenlan-core/src/refinery/mod.rs",
         "crates/wenlan-core/tests/m4_community_gates.rs",
-        ".config/nextest.toml",
     ] {
         if !macos_m4.contains(path) {
             violations.push(format!("macos-m4 routing omits M4 contract input {path}"));
@@ -2823,7 +2877,7 @@ fn ci_routing_contract_violations(
     )
     .is_some()
         || transferred_workspace.and_then(|step| step["if"].as_str())
-            != Some("needs.detect-changes.outputs.workspace-platform == 'true'")
+            != Some("needs.detect-changes.outputs.workspace-platform == 'true' && !(matrix.os == 'macos-14' && needs.detect-changes.outputs.release-preflight == 'true')")
         || transferred_workspace
             .and_then(|step| step["run"].as_str())
             .is_none_or(|run| {
