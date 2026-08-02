@@ -1974,6 +1974,7 @@ fn ci_routing_contract_violations(
         "release-preflight",
         "mcp-platform",
         "workspace-platform",
+        "trusted-release-candidate",
         "test-plan",
         "workspace-lib-required",
         "cli-server-integration-required",
@@ -2008,6 +2009,44 @@ fn ci_routing_contract_violations(
     }
     let universal_planner_condition =
         "steps.release-proof.outputs.verified-release-merge != 'true'";
+    let trusted_checkout = job_step(
+        &ci,
+        "detect-changes",
+        "Checkout trusted release candidate classifier",
+    );
+    let trusted_candidate = job_step(&ci, "detect-changes", "Classify trusted release candidate");
+    let trusted_candidate_run = trusted_candidate
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if ci["jobs"]["detect-changes"]["outputs"]["trusted-release-candidate"].as_str()
+        != Some("${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}")
+        || trusted_candidate.and_then(|step| step["id"].as_str()) != Some("release-candidate-trust")
+        || trusted_candidate.and_then(|step| step["env"]["GITHUB_TOKEN"].as_str())
+            != Some("${{ github.token }}")
+        || trusted_checkout.and_then(|step| step["uses"].as_str())
+            != Some("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803")
+        || trusted_checkout.and_then(|step| step["with"]["ref"].as_str())
+            != Some("${{ github.event.pull_request.base.sha || github.sha }}")
+        || trusted_checkout.and_then(|step| step["with"]["path"].as_str())
+            != Some("trusted-release-gate")
+        || trusted_checkout.and_then(|step| step["with"]["fetch-depth"].as_u64()) != Some(1)
+        || trusted_checkout.and_then(|step| step["with"]["persist-credentials"].as_bool())
+            != Some(false)
+        || !trusted_candidate_run
+            .contains("classifier=trusted-release-gate/scripts/classify-release-candidate.py")
+        || !trusted_candidate_run.contains("python3 \"$classifier\"")
+        || !trusted_candidate_run
+            .contains("echo \"trusted-release-candidate=false\" >> \"$GITHUB_OUTPUT\"")
+        || !trusted_candidate_run.contains("--event \"$GITHUB_EVENT_PATH\"")
+        || !trusted_candidate_run.contains("--event-name \"$GITHUB_EVENT_NAME\"")
+        || !trusted_candidate_run.contains("--repository \"$GITHUB_REPOSITORY\"")
+        || !trusted_candidate_run.contains("--github-output \"$GITHUB_OUTPUT\"")
+    {
+        violations.push(
+            "release candidate test skip is not bound to the fail-closed semantic classifier"
+                .into(),
+        );
+    }
     let planner_setup = job_step(
         &ci,
         "detect-changes",
@@ -2646,7 +2685,7 @@ fn ci_routing_contract_violations(
         );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
-    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')";
+    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')";
     if platform_condition != expected_platform_condition {
         violations.push(
             "platform test job does not derive from rust-ci-required plus its platform owner"
@@ -2655,6 +2694,7 @@ fn ci_routing_contract_violations(
     }
     for required in [
         "needs.detect-changes.outputs.rust-ci-required",
+        "needs.detect-changes.outputs.trusted-release-candidate != 'true'",
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
         "startsWith(github.head_ref, 'release-please--branches--')",
@@ -2680,6 +2720,7 @@ fn ci_routing_contract_violations(
     for required in [
         "github.event_name",
         "pull_request",
+        "steps.release-candidate-trust.outputs.trusted-release-candidate",
         "startsWith(github.head_ref, 'release-please--branches--')",
         "steps.filter.outputs.macos",
         "steps.filter.outputs.windows",
@@ -2704,6 +2745,7 @@ fn ci_routing_contract_violations(
     }
     for required in [
         "needs.detect-changes.outputs.rust-ci-required",
+        "needs.detect-changes.outputs.trusted-release-candidate != 'true'",
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
         "startsWith(github.head_ref, 'release-please--branches--')",
@@ -2716,7 +2758,7 @@ fn ci_routing_contract_violations(
         }
     }
     let run_rust = "run_rust='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' }}'";
-    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'";
+    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'";
     for (name, expected) in [("run_rust", run_rust), ("run_platform", run_platform)] {
         if !conclusion_run
             .lines()
@@ -5555,28 +5597,60 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     }
 }
 
-fn windows_native_parallelism_violations(
-    ci_workflow: &str,
-    _release_workflow: &str,
-    msvc_setup: &str,
-) -> Vec<String> {
+fn windows_cache_parallelism_violations(ci_workflow: &str, msvc_setup: &str) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let mut violations = Vec::new();
-    let step = job_step(
+    let final_state = job_step(
         &ci,
         "release-preflight",
-        "Bound native build concurrency (Windows)",
+        "Finalize Windows release cache state",
     );
-    let run = step
+    let run = final_state
         .and_then(|candidate| candidate["run"].as_str())
         .unwrap_or_default();
-    if step.and_then(|candidate| candidate["if"].as_str())
-        != Some("matrix.target == 'x86_64-pc-windows-msvc'")
-        || !run.contains("CARGO_BUILD_JOBS=2")
-        || run.contains("CARGO_BUILD_JOBS=1")
+    if final_state.and_then(|candidate| candidate["id"].as_str()) != Some("windows-cache-final")
+        || final_state.and_then(|candidate| candidate["if"].as_str())
+            != Some("matrix.target == 'x86_64-pc-windows-msvc'")
     {
         violations
-            .push("release preflight does not cap outer Windows Cargo at exactly two jobs".into());
+            .push("final Windows cache-state step is not target-scoped and identified".into());
+    }
+    let state_selects_jobs = |state: &str, jobs: usize| {
+        let state_marker = format!("$state = \"{state}\"");
+        let job_marker = format!("$jobs = {jobs}");
+        run.find(&state_marker).is_some_and(|index| {
+            run[index + state_marker.len()..]
+                .lines()
+                .take(3)
+                .any(|line| line.trim() == job_marker)
+        })
+    };
+    for (state, jobs, label) in [
+        ("exact-restore", 4, "exact restore"),
+        ("fallback-restore", 3, "fallback restore"),
+        ("cold-miss", 2, "coherent cold build"),
+    ] {
+        if !state_selects_jobs(state, jobs) || run.matches(&format!("$jobs = {jobs}")).count() != 1
+        {
+            violations.push(format!(
+                "final Windows cache state does not map {label} to exactly {jobs} Cargo jobs"
+            ));
+        }
+    }
+    if run
+        .lines()
+        .filter(|line| line.trim_start().starts_with("$jobs = "))
+        .count()
+        != 3
+        || !run.contains("\"state=$state\" | Out-File -FilePath $env:GITHUB_OUTPUT -Append")
+        || !run.contains("\"jobs=$jobs\" | Out-File -FilePath $env:GITHUB_OUTPUT -Append")
+        || !run.contains("\"CARGO_BUILD_JOBS=$jobs\" | Out-File -FilePath $env:GITHUB_ENV -Append")
+        || !run.contains("cargo_jobs=$jobs")
+    {
+        violations.push(
+            "final Windows cache receipt does not exclusively drive the selected Cargo job bound"
+                .into(),
+        );
     }
     if !msvc_setup.contains("$env:CMAKE_BUILD_PARALLEL_LEVEL = \"1\"")
         || msvc_setup.contains("$env:CMAKE_BUILD_PARALLEL_LEVEL = \"2\"")
@@ -5588,48 +5662,70 @@ fn windows_native_parallelism_violations(
 }
 
 #[test]
-fn windows_cargo_uses_two_jobs_while_nested_cmake_stays_serial() {
+fn windows_cache_state_selects_bounded_cargo_jobs_while_nested_cmake_stays_serial() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
-    let release =
-        std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release");
     let setup = std::fs::read_to_string(root.join("scripts/setup-msvc-ninja-windows.ps1"))
         .expect("read Windows MSVC Ninja setup");
-    let violations = windows_native_parallelism_violations(&ci, &release, &setup);
+    let violations = windows_cache_parallelism_violations(&ci, &setup);
     assert!(
         violations.is_empty(),
-        "Windows native parallelism drift — Cargo may run exactly two outer jobs while nested \
-         CMake remains serialized at one worker. Fix the CI/release caps or the MSVC Ninja setup; \
-         an intentional change also updates this guard and its positive control:\n{}",
+        "Windows native parallelism drift — an exact/fallback/cold cache state must select \
+         four/three/two outer Cargo jobs while nested CMake remains serialized at one worker. \
+         Fix the final cache receipt or the MSVC Ninja setup; an intentional change also \
+         updates this guard and its positive control:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn windows_native_parallelism_rejects_reversed_limits() {
+fn windows_cache_parallelism_rejects_incoherent_state_bounds() {
     let ci = r#"
 jobs:
   release-preflight:
     steps:
-      - name: Bound native build concurrency (Windows)
+      - name: Finalize Windows release cache state
+        id: windows-cache-final
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: CARGO_BUILD_JOBS=1
+        shell: pwsh
+        run: |
+          if ($cold) {
+            $state = "cold-miss"
+            $jobs = 2
+          } elseif ($exact) {
+            $state = "exact-restore"
+            $jobs = 4
+          } else {
+            $state = "fallback-restore"
+            $jobs = 3
+          }
+          "state=$state" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "jobs=$jobs" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "CARGO_BUILD_JOBS=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Final Windows cache receipt: cargo_jobs=$jobs"
       - name: Build and smoke shipped release binaries
         run: build
 "#;
-    let release = r#"
-jobs:
-  release:
-    steps:
-      - name: Build and smoke shipped release binaries
-        run: build
-      - name: Cap Windows Cargo parallelism
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: CARGO_BUILD_JOBS=1
-"#;
-    let setup = "$env:CMAKE_BUILD_PARALLEL_LEVEL = \"2\"\nCARGO_BUILD_JOBS=2";
-    let violations = windows_native_parallelism_violations(ci, release, setup);
-    for expected in ["exactly two jobs", "nested CMake"] {
+    let setup = "$env:CMAKE_BUILD_PARALLEL_LEVEL = \"1\"";
+    assert!(
+        windows_cache_parallelism_violations(ci, setup).is_empty(),
+        "positive control must accept the coherent cache-state bounds"
+    );
+
+    let unsafe_ci = ci
+        .replace("$jobs = 4", "$jobs = 2")
+        .replace("$jobs = 3", "$jobs = 4")
+        .replace("$jobs = 2", "$jobs = 1")
+        .replace("$env:GITHUB_ENV", "$env:GITHUB_OUTPUT");
+    let unsafe_setup = "$env:CMAKE_BUILD_PARALLEL_LEVEL = \"2\"\nCARGO_BUILD_JOBS=4";
+    let violations = windows_cache_parallelism_violations(&unsafe_ci, unsafe_setup);
+    for expected in [
+        "exact restore",
+        "fallback restore",
+        "coherent cold build",
+        "selected Cargo job bound",
+        "nested CMake",
+    ] {
         assert!(
             violations.iter().any(|item| item.contains(expected)),
             "fixture must exercise {expected:?}: {violations:?}"

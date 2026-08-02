@@ -18,6 +18,7 @@ FAST_MAINTENANCE_PATH = (
 )
 OBSERVER_PATH = REPO_ROOT / ".github" / "workflows" / "release-candidate-observer.yml"
 VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate-release-candidate.py"
+CLASSIFIER_PATH = REPO_ROOT / "scripts" / "classify-release-candidate.py"
 ARCHIVE_PATH = REPO_ROOT / "scripts" / "release_archive.py"
 PROMOTION_PATH = REPO_ROOT / "scripts" / "release-promotion.py"
 SYNC_RELEASE_PR_PATH = REPO_ROOT / "scripts" / "sync-release-pr.py"
@@ -476,139 +477,117 @@ def contract_violations(
             violations.append(
                 f"Node 24 action {action} uses mutable or unexpected reference {reference}"
             )
+    violations.extend(release_cache_retry_contract_violations(ci))
     return violations
 
 
-def release_cache_contract_violations(ci: str, release: str) -> list[str]:
-    """Keep the main-owned release cache usable by the tag consumer."""
+def release_cache_retry_contract_violations(ci: str) -> list[str]:
+    """Keep the Windows release-cache retry bounded, coherent, and pre-build."""
 
     violations: list[str] = []
-    producer = job_body(ci, "release-preflight")
-    consumer = job_body(release, "release")
-    shared_markers = [
-        "id: windows-release-cache",
-        "uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32",
+    job = job_body(ci, "release-preflight")
+    primary = named_step_body(job, "Cache release artifacts (main-owned)")
+    initial_probe = named_step_body(job, "Probe initial Windows release cache restore")
+    backoff = named_step_body(job, "Back off before one Windows cache retry")
+    retry = named_step_body(job, "Retry Windows release cache restore once")
+    final_probe = named_step_body(job, "Finalize Windows release cache state")
+    pin = "Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32"
+    cold_gate = (
+        "if: matrix.target == 'x86_64-pc-windows-msvc' && "
+        "steps.windows-cache-probe.outputs.state == 'cold-miss'"
+    )
+
+    primary_inputs = [
         "shared-key: release-v3-${{ matrix.target }}",
-        'cache-workspace-crates: "false"',
-    ]
-    for owner, body in (("CI producer", producer), ("tag consumer", consumer)):
-        missing = [marker for marker in shared_markers if marker not in body]
-        if missing:
-            violations.append(
-                f"{owner} Windows release cache contract is incomplete: {', '.join(missing)}"
-            )
-
-    marker_name = "Mark Windows explicit target as nested Cargo cache"
-    producer_marker = named_step_body(producer, marker_name)
-    consumer_marker = named_step_body(consumer, marker_name)
-    marker_contract = [
-        "if: matrix.target == 'x86_64-pc-windows-msvc'",
-        "shell: pwsh",
-        '$targetRoot = "target\\${{ matrix.target }}"',
-        'Join-Path $targetRoot "CACHEDIR.TAG"',
-        '$contents = @"\n          Signature: 8a477f597d28d172789f06886806bc55',
-        "[IO.File]::WriteAllText($marker, $contents, [Text.UTF8Encoding]::new($false))",
-    ]
-    for owner, body, marker in (
-        ("CI producer", producer, producer_marker),
-        ("tag consumer", consumer, consumer_marker),
-    ):
-        if any(item not in marker for item in marker_contract):
-            violations.append(
-                f"{owner} does not create a valid nested Cargo target marker"
-            )
-        marker_index = body.find(f"- name: {marker_name}")
-        cache_index = body.find("uses: Swatinem/rust-cache@")
-        if marker_index < 0 or cache_index < 0 or marker_index >= cache_index:
-            violations.append(f"{owner} creates the nested target marker after cache restore")
-
-    if producer_marker != consumer_marker:
-        violations.append("producer/consumer nested target marker parity has drifted")
-
-    probe_name = "Probe Windows host and target cache restore"
-    producer_probe = named_step_body(producer, probe_name)
-    consumer_probe = named_step_body(consumer, probe_name)
-    probe_contract = [
-        "if: matrix.target == 'x86_64-pc-windows-msvc'",
-        "shell: pwsh",
-        '$marker = "target\\${{ matrix.target }}\\CACHEDIR.TAG"',
-        '$hostDeps = "target\\release\\deps"',
-        '$targetDeps = "target\\${{ matrix.target }}\\release\\deps"',
-        "$exactHit = '${{ steps.windows-release-cache.outputs.cache-hit }}'",
-        "if ($hostCount -eq 0 -and $targetCount -eq 0)",
-        "elseif ($hostCount -gt 0 -and $targetCount -gt 0)",
-        "partial Windows cache restore:",
-        'if ($exactHit -eq "true" -and $state -ne "warm-or-fallback-restore")',
-        "Windows cache restore receipt: action_exact=$exactHit state=$state host_deps=$hostCount target_deps=$targetCount marker=present",
-    ]
-    for owner, body, probe in (
-        ("CI producer", producer, producer_probe),
-        ("tag consumer", consumer, consumer_probe),
-    ):
-        if any(item not in probe for item in probe_contract):
-            violations.append(f"{owner} omits the fail-loud Windows cache restore probe")
-        cache_index = body.find("uses: Swatinem/rust-cache@")
-        tail = body[cache_index:] if cache_index >= 0 else ""
-        next_step = re.search(r"^      - name: (.+)$", tail, re.MULTILINE)
-        if next_step is None or next_step.group(1) != probe_name:
-            violations.append(f"{owner} does not probe the Windows cache immediately after restore")
-    if producer_probe != consumer_probe:
-        violations.append("producer/consumer Windows cache restore probe parity has drifted")
-
-    receipt_name = "Verify Windows host and target cache layout"
-    producer_receipt = named_step_body(producer, receipt_name)
-    consumer_receipt = named_step_body(consumer, receipt_name)
-    receipt_contract = [
-        "if: matrix.target == 'x86_64-pc-windows-msvc'",
-        "shell: pwsh",
-        '$marker = "target\\${{ matrix.target }}\\CACHEDIR.TAG"',
-        '$hostDeps = "target\\release\\deps"',
-        '$targetDeps = "target\\${{ matrix.target }}\\release\\deps"',
-        "Get-ChildItem -LiteralPath $hostDeps",
-        "Get-ChildItem -LiteralPath $targetDeps",
-        "if ($hostCount -eq 0 -or $targetCount -eq 0)",
-        "Windows cache layout receipt:",
-    ]
-    for owner, body, receipt, proof_name in (
-        ("CI producer", producer, producer_receipt, "Native ORT smoke (Windows release preflight)"),
-        ("tag consumer", consumer, consumer_receipt, "Build and smoke shipped release binaries"),
-    ):
-        if any(item not in receipt for item in receipt_contract):
-            violations.append(f"{owner} omits the fail-loud Windows cache layout receipt")
-        proof_index = body.find(f"- name: {proof_name}")
-        receipt_index = body.find(f"- name: {receipt_name}")
-        if proof_index < 0 or receipt_index <= proof_index:
-            violations.append(f"{owner} records its cache layout receipt before build/smoke proof")
-    if producer_receipt != consumer_receipt:
-        violations.append("producer/consumer Windows cache layout receipt parity has drifted")
-
-    cache_configs: list[tuple[list[str], list[str]]] = []
-    for owner, body in (("CI producer", producer), ("tag consumer", consumer)):
-        keys = re.findall(r"^\s+shared-key:\s*(.+)$", body, re.MULTILINE)
-        workspaces = re.findall(r"^\s+workspaces:\s*(.*)$", body, re.MULTILINE)
-        cache_configs.append((keys, workspaces))
-        if workspaces != [". -> target"]:
-            violations.append(
-                f"{owner} must use one top-level target root; overlapping cache roots are forbidden"
-            )
-    if cache_configs[0] != cache_configs[1]:
-        violations.append("release cache producer/consumer parity has drifted")
-
-    producer_markers = [
+        "workspaces: . -> target",
         'cache-all-crates: "true"',
+        'cache-workspace-crates: "false"',
         "cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}",
-        "save-if: ${{ github.ref == 'refs/heads/main' }}",
     ]
-    if any(marker not in producer for marker in producer_markers):
-        violations.append("CI no longer owns the bounded Windows release target cache")
+    input_pattern = re.compile(r"^ {10}([a-z][a-z-]+):\s*(.+)$", re.MULTILINE)
+    primary_input_map = dict(input_pattern.findall(primary))
+    retry_input_map = dict(input_pattern.findall(retry))
+    expected_primary_inputs = {
+        "shared-key": "release-v3-${{ matrix.target }}",
+        "workspaces": ". -> target",
+        "cache-all-crates": '"true"',
+        "cache-workspace-crates": '"false"',
+        "cache-targets": "${{ matrix.target == 'x86_64-pc-windows-msvc' }}",
+        "save-if": "${{ github.ref == 'refs/heads/main' }}",
+    }
+    expected_retry_inputs = expected_primary_inputs | {"save-if": '"false"'}
+    if (
+        "id: windows-release-cache" not in primary
+        or f"uses: {pin}" not in primary
+        or "save-if: ${{ github.ref == 'refs/heads/main' }}" not in primary
+        or any(marker not in primary for marker in primary_inputs)
+        or primary_input_map != expected_primary_inputs
+    ):
+        violations.append("primary Windows release cache restore contract has drifted")
+    if (
+        "id: windows-release-cache-retry" not in retry
+        or f"uses: {pin}" not in retry
+        or 'save-if: "false"' not in retry
+        or any(marker not in retry for marker in primary_inputs)
+        or retry_input_map != expected_retry_inputs
+        or "continue-on-error" in retry
+        or job.count(f"uses: {pin}") != 2
+    ):
+        violations.append(
+            "Windows release cache retry is not a single pinned restore-only attempt"
+        )
+    if cold_gate not in backoff or cold_gate not in retry:
+        violations.append("Windows release cache retry is not gated by the measured cold miss")
+    if "Start-Sleep -Seconds 25" not in backoff:
+        violations.append("Windows release cache retry backoff is not exactly 25 seconds")
 
-    consumer_markers = [
-        "cache-all-crates: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}",
-        "cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}",
-        'save-if: "false"',
+    initial_contract = [
+        "id: windows-cache-probe",
+        "$exactHit = '${{ steps.windows-release-cache.outputs.cache-hit }}'",
+        '"exact=$exactHit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"state=$state" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"host-count=$hostCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"target-count=$targetCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        "partial Windows cache restore:",
+        'if ($exactHit -eq "true" -and $state -ne "exact-restore")',
+        "Initial Windows cache receipt:",
     ]
-    if any(marker not in consumer for marker in consumer_markers):
-        violations.append("tag release no longer restores the Windows cache read-only")
+    if any(marker not in initial_probe for marker in initial_contract):
+        violations.append("initial Windows cache probe omits observable coherent outputs")
+
+    final_contract = [
+        "id: windows-cache-final",
+        "$initialState = '${{ steps.windows-cache-probe.outputs.state }}'",
+        "$retryOutcome = '${{ steps.windows-release-cache-retry.outcome }}'",
+        "$retryExact = '${{ steps.windows-release-cache-retry.outputs.cache-hit }}'",
+        'throw "partial Windows cache restore after retry:',
+        'if ($exactHit -eq "true" -and $state -ne "exact-restore")',
+        '$state = "cold-miss"\n            $jobs = 2',
+        '$state = "exact-restore"\n              $jobs = 4',
+        '$state = "fallback-restore"\n              $jobs = 3',
+        '"state=$state" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"jobs=$jobs" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"source=$source" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"exact=$exactHit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"host-count=$hostCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"target-count=$targetCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+        '"CARGO_BUILD_JOBS=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Append',
+        "Final Windows cache receipt:",
+    ]
+    if any(marker not in final_probe for marker in final_contract):
+        violations.append("final Windows cache receipt omits fail-closed state or bounded jobs")
+
+    ordered_steps = [
+        "Cache release artifacts (main-owned)",
+        "Probe initial Windows release cache restore",
+        "Back off before one Windows cache retry",
+        "Retry Windows release cache restore once",
+        "Finalize Windows release cache state",
+        "Build and smoke shipped release binaries",
+    ]
+    positions = [job.find(f"- name: {name}") for name in ordered_steps]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        violations.append("Windows release cache retry ordering can overlay live Cargo artifacts")
 
     return violations
 
@@ -868,6 +847,104 @@ def candidate_observer_contract_violations(
     return violations
 
 
+def trusted_candidate_gate_violations(
+    ci: str, classifier: str, validator: str
+) -> list[str]:
+    """Only a semantically closed Release PR may omit duplicate platform tests."""
+
+    violations: list[str] = []
+    detect = job_body(ci, "detect-changes")
+    trust_step = named_step_body(detect, "Classify trusted release candidate")
+    trusted_checkout = named_step_body(
+        detect, "Checkout trusted release candidate classifier"
+    )
+    for marker in [
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "ref: ${{ github.event.pull_request.base.sha || github.sha }}",
+        "path: trusted-release-gate",
+        "fetch-depth: 1",
+        "persist-credentials: false",
+    ]:
+        if marker not in trusted_checkout:
+            violations.append(f"trusted candidate base checkout omits {marker!r}")
+    for marker in [
+        "trusted-release-candidate: ${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}",
+        "id: release-candidate-trust",
+        "classifier=trusted-release-gate/scripts/classify-release-candidate.py",
+        'python3 "$classifier"',
+        'echo "trusted-release-candidate=false" >> "$GITHUB_OUTPUT"',
+        '--event "$GITHUB_EVENT_PATH"',
+        '--event-name "$GITHUB_EVENT_NAME"',
+        '--repository "$GITHUB_REPOSITORY"',
+        '--github-output "$GITHUB_OUTPUT"',
+    ]:
+        owner = ci if marker.startswith("trusted-release-candidate:") else trust_step
+        if marker not in owner:
+            violations.append(f"trusted candidate detect gate omits {marker!r}")
+
+    matrix = re.search(
+        r"^      - id: matrix\n(?P<body>.*?)(?=^      - )",
+        detect,
+        re.MULTILINE | re.DOTALL,
+    )
+    matrix_body = matrix.group("body") if matrix else ""
+    trusted_branch = (
+        'elif [ "${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}" = "true" ]; then'
+    )
+    lookalike_branch = (
+        'elif [ "${{ startsWith(github.head_ref, \'release-please--branches--\') }}" = "true" ]; then'
+    )
+    if (
+        trusted_branch not in matrix_body
+        or lookalike_branch not in matrix_body
+        or matrix_body.find(trusted_branch) >= matrix_body.find(lookalike_branch)
+        or "include=\"\""
+        not in matrix_body[
+            matrix_body.find(trusted_branch) : matrix_body.find(lookalike_branch)
+        ]
+        or "include=\"${macos},${windows}\""
+        not in matrix_body[matrix_body.find(lookalike_branch) :]
+    ):
+        violations.append("trusted candidate matrix is not fail-closed against lookalike branches")
+
+    test_if = re.search(
+        r"^  test:\n.*?^    if: (?P<value>.+)$", ci, re.MULTILINE | re.DOTALL
+    )
+    test_condition = test_if.group("value") if test_if else ""
+    if (
+        ci.count("needs.detect-changes.outputs.trusted-release-candidate != 'true'")
+        != 2
+        or "needs.detect-changes.outputs.trusted-release-candidate != 'true'"
+        not in test_condition
+        or "startsWith(github.head_ref, 'release-please--branches--')" not in test_condition
+    ):
+        violations.append("platform test skip is not bound to semantic candidate trust")
+    conclusion = job_body(ci, "conclusion")
+    if (
+        "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true'"
+        not in conclusion
+    ):
+        violations.append("conclusion does not mirror the semantic candidate test skip")
+
+    for marker in [
+        "VALIDATOR.validate_trusted_release_candidate(",
+        "trusted-release-candidate={'true' if trusted else 'false'}",
+        "except Exception as error:",
+    ]:
+        if marker not in classifier:
+            violations.append(f"trusted candidate classifier omits fail-closed marker {marker!r}")
+    for marker in [
+        "def validate_trusted_release_candidate(",
+        "validate_release_pr_content(api, repository, pr)",
+        'api.get_json(f"/repos/{repository}/git/ref/heads/main")',
+        'event_head_repo.get("fork") is not False',
+        'event_user.get("login") != RELEASE_AUTHOR',
+    ]:
+        if marker not in validator:
+            violations.append(f"shared semantic release validator omits {marker!r}")
+    return violations
+
+
 def assert_mutation_detected(
     ci: str,
     release: str,
@@ -918,6 +995,7 @@ def main() -> None:
     fast_maintenance = FAST_MAINTENANCE_PATH.read_text(encoding="utf-8")
     observer = OBSERVER_PATH.read_text(encoding="utf-8")
     validator = VALIDATOR_PATH.read_text(encoding="utf-8")
+    classifier = CLASSIFIER_PATH.read_text(encoding="utf-8")
     archive = ARCHIVE_PATH.read_text(encoding="utf-8")
     promotion = PROMOTION_PATH.read_text(encoding="utf-8")
     sync_release_pr = SYNC_RELEASE_PR_PATH.read_text(encoding="utf-8")
@@ -931,10 +1009,47 @@ def main() -> None:
         sync_release_pr,
     )
     violations.extend(candidate_observer_contract_violations(ci, observer, validator, archive))
+    violations.extend(trusted_candidate_gate_violations(ci, classifier, validator))
     if violations:
         raise AssertionError("release workflow contract drift:\n" + "\n".join(violations))
 
     release_mutations = [
+        (
+            "Start-Sleep -Seconds 25",
+            "Start-Sleep -Seconds 5",
+            "backoff is not exactly 25 seconds",
+            "ci",
+        ),
+        (
+            "      - name: Retry Windows release cache restore once\n"
+            "        id: windows-release-cache-retry\n"
+            "        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.windows-cache-probe.outputs.state == 'cold-miss'\n"
+            "        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2",
+            "      - name: Retry Windows release cache restore once\n"
+            "        id: windows-release-cache-retry\n"
+            "        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.windows-cache-probe.outputs.state == 'cold-miss'\n"
+            "        uses: Swatinem/rust-cache@v2",
+            "single pinned restore-only attempt",
+            "ci",
+        ),
+        (
+            "if: matrix.target == 'x86_64-pc-windows-msvc' && steps.windows-cache-probe.outputs.state == 'cold-miss'",
+            "if: matrix.target == 'x86_64-pc-windows-msvc' && true",
+            "gated by the measured cold miss",
+            "ci",
+        ),
+        (
+            '$state = "cold-miss"\n            $jobs = 2',
+            '$state = "cold-miss"\n            $jobs = 1',
+            "final Windows cache receipt",
+            "ci",
+        ),
+        (
+            '"host-count=$hostCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+            '"host-total=$hostCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append',
+            "initial Windows cache probe",
+            "ci",
+        ),
         (
             "--wait-seconds 720",
             "--wait-seconds 0",
@@ -1141,6 +1256,12 @@ def main() -> None:
         )
     candidate_mutations = [
         (
+            "needs.detect-changes.outputs.trusted-release-candidate != 'true'",
+            "true",
+            "platform test skip is not bound",
+            "ci",
+        ),
+        (
             "github.event.pull_request.head.repo.full_name == github.repository",
             "true",
             "exact head SHA",
@@ -1283,6 +1404,13 @@ def main() -> None:
             mutated if owner == "observer" else observer,
             mutated if owner == "validator" else validator,
             mutated if owner == "archive" else archive,
+        )
+        candidate_violations.extend(
+            trusted_candidate_gate_violations(
+                mutated if owner == "ci" else ci,
+                classifier,
+                mutated if owner == "validator" else validator,
+            )
         )
         if not any(expected in violation for violation in candidate_violations):
             raise AssertionError(

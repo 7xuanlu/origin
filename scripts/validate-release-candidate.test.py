@@ -31,6 +31,7 @@ def load_script(name: str, module_name: str):
 
 
 VALIDATOR = load_script("validate-release-candidate.py", "validate_release_candidate")
+CLASSIFIER = load_script("classify-release-candidate.py", "classify_release_candidate")
 PACKAGE = load_script("package-release-artifacts.py", "package_release_for_validator")
 MANIFEST = load_script("release-candidate-manifest.py", "manifest_for_validator")
 
@@ -228,6 +229,34 @@ def candidate_pr_detail(*, state: str, merged: bool) -> dict:
     }
 
 
+def candidate_event() -> dict:
+    pr = candidate_pr_detail(state="open", merged=False)
+    pr["base"]["sha"] = BASE_SHA
+    return {"pull_request": pr}
+
+
+class TrustedCandidateApi(FakeContentApi):
+    def __init__(self, old: dict[str, str], new: dict[str, str]) -> None:
+        super().__init__(old, new)
+        self.pr = candidate_pr_detail(state="open", merged=False)
+        self.pr["changed_files"] = len(VALIDATOR.REQUIRED_RELEASE_PATHS)
+        self.pr["base"]["sha"] = BASE_SHA
+
+    def get_json(self, path: str, *, params=None):
+        prefix = "/repos/7xuanlu/wenlan"
+        if path == prefix:
+            return {
+                "id": 2,
+                "full_name": "7xuanlu/wenlan",
+                "owner": {"login": "7xuanlu"},
+            }
+        if path == f"{prefix}/pulls/42":
+            return self.pr
+        if path == f"{prefix}/git/ref/heads/main":
+            return {"object": {"type": "commit", "sha": BASE_SHA}}
+        return super().get_json(path, params=params)
+
+
 class PrStateApi:
     def __init__(self, merge_tree_sha: str = TREE_SHA) -> None:
         self.merge_tree_sha = merge_tree_sha
@@ -370,6 +399,143 @@ class AttemptJobsApi:
 
 
 class ValidateReleaseCandidateTests(unittest.TestCase):
+    def test_trusted_classifier_accepts_only_canonical_metadata_candidate(self) -> None:
+        old, new = release_contents()
+        trusted, reason = CLASSIFIER.classify(
+            event_name="pull_request",
+            event=candidate_event(),
+            api=TrustedCandidateApi(old, new),
+            repository="7xuanlu/wenlan",
+        )
+        self.assertTrue(trusted, reason)
+
+    def test_trusted_classifier_rejects_same_name_fork_without_api_reads(self) -> None:
+        event = candidate_event()
+        event["pull_request"]["head"]["repo"]["fork"] = True
+
+        class NoReadApi:
+            def get_json(self, path: str, *, params=None):
+                raise AssertionError(f"untrusted identity queried API: {path}")
+
+        trusted, reason = CLASSIFIER.classify(
+            event_name="pull_request",
+            event=event,
+            api=NoReadApi(),
+            repository="7xuanlu/wenlan",
+        )
+        self.assertFalse(trusted)
+        self.assertIn("exact trusted release identity", reason)
+
+    def test_trusted_classifier_rejects_code_or_noncanonical_managed_delta(self) -> None:
+        old, new = release_contents()
+        api = TrustedCandidateApi(old, new)
+        api.pr["changed_files"] += 1
+
+        original_get_json = api.get_json
+
+        def with_code_path(path: str, *, params=None):
+            if path.endswith("/files"):
+                files = original_get_json(path, params=params)
+                if params["page"] == 1:
+                    return [
+                        *files,
+                        {
+                            "filename": "crates/wenlan-core/src/db.rs",
+                            "status": "modified",
+                        },
+                    ]
+                return files
+            return original_get_json(path, params=params)
+
+        api.get_json = with_code_path  # type: ignore[method-assign]
+        trusted, reason = CLASSIFIER.classify(
+            event_name="pull_request",
+            event=candidate_event(),
+            api=api,
+            repository="7xuanlu/wenlan",
+        )
+        self.assertFalse(trusted)
+        self.assertIn("paths mismatch", reason)
+
+        old, new = release_contents()
+        new["Cargo.toml"] += 'panic = "abort" # 0.15.4\n'
+        trusted, reason = CLASSIFIER.classify(
+            event_name="pull_request",
+            event=candidate_event(),
+            api=TrustedCandidateApi(old, new),
+            repository="7xuanlu/wenlan",
+        )
+        self.assertFalse(trusted)
+        self.assertIn("exact version-only", reason)
+
+    def test_trusted_classifier_rejects_stale_main_base_and_parse_errors(self) -> None:
+        old, new = release_contents()
+        api = TrustedCandidateApi(old, new)
+        original_get_json = api.get_json
+
+        def stale_main(path: str, *, params=None):
+            if path.endswith("/git/ref/heads/main"):
+                return {"object": {"type": "commit", "sha": "f" * 40}}
+            return original_get_json(path, params=params)
+
+        api.get_json = stale_main  # type: ignore[method-assign]
+        trusted, reason = CLASSIFIER.classify(
+            event_name="pull_request",
+            event=candidate_event(),
+            api=api,
+            repository="7xuanlu/wenlan",
+        )
+        self.assertFalse(trusted)
+        self.assertIn("not the current main", reason)
+
+        trusted, reason = CLASSIFIER.classify(
+            event_name="pull_request",
+            event=[],
+            api=api,
+            repository="7xuanlu/wenlan",
+        )
+        self.assertFalse(trusted)
+        self.assertIn("not an object", reason)
+
+        class ApiFailure:
+            def get_json(self, path: str, *, params=None):
+                raise OSError("injected API failure")
+
+        trusted, reason = CLASSIFIER.classify(
+            event_name="pull_request",
+            event=candidate_event(),
+            api=ApiFailure(),
+            repository="7xuanlu/wenlan",
+        )
+        self.assertFalse(trusted)
+        self.assertIn("injected API failure", reason)
+
+    def test_classifier_cli_turns_invalid_event_json_into_false_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            event = root / "event.json"
+            output = root / "output.txt"
+            event.write_text("{not-json", encoding="utf-8")
+            self.assertEqual(
+                CLASSIFIER.main(
+                    [
+                        "--event",
+                        str(event),
+                        "--event-name",
+                        "pull_request",
+                        "--repository",
+                        "7xuanlu/wenlan",
+                        "--github-output",
+                        str(output),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "trusted-release-candidate=false\n",
+            )
+
     def test_full_validate_candidate_happy_path_reconciles_manifests_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

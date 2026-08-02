@@ -434,6 +434,77 @@ def validate_release_pr_content(
     return new_version, base_sha, paths
 
 
+def validate_trusted_release_candidate(
+    event: dict, api: JsonApi, repository: str
+) -> tuple[str, str]:
+    """Prove that a PR is the exact metadata-only release candidate.
+
+    This is the shared semantic gate used by PR CI before it omits the
+    redundant macOS/Windows debug matrix. Any uncertainty raises
+    ``CandidateError`` so the caller can fail closed to the complete matrix.
+    """
+
+    event_pr = _mapping(event.get("pull_request"), "event pull request")
+    event_base = _mapping(event_pr.get("base"), "event pull request base")
+    event_head = _mapping(event_pr.get("head"), "event pull request head")
+    event_user = _mapping(event_pr.get("user"), "event pull request author")
+    event_base_repo = _mapping(event_base.get("repo"), "event base repository")
+    event_head_repo = _mapping(event_head.get("repo"), "event head repository")
+    pr_number = _positive_int(event_pr.get("number"), "event pull request number")
+    head_sha = _sha(event_head.get("sha"), "event pull request head SHA")
+    event_base_sha = _sha(event_base.get("sha"), "event pull request base SHA")
+    if (
+        event_pr.get("draft") is not False
+        or event_base.get("ref") != "main"
+        or event_base_repo.get("full_name") != repository
+        or event_head.get("ref") != RELEASE_BRANCH
+        or event_head_repo.get("full_name") != repository
+        or event_head_repo.get("fork") is not False
+        or event_user.get("login") != RELEASE_AUTHOR
+    ):
+        raise CandidateError("event pull request is not the exact trusted release identity")
+
+    repository_record = _mapping(
+        api.get_json(f"/repos/{repository}"), "candidate repository"
+    )
+    repository_id = _positive_int(repository_record.get("id"), "repository id")
+    if (
+        repository_record.get("full_name") != repository
+        or _mapping(repository_record.get("owner"), "repository owner").get("login")
+        != RELEASE_AUTHOR
+    ):
+        raise CandidateError("candidate repository identity mismatch")
+
+    pr = _mapping(
+        api.get_json(f"/repos/{repository}/pulls/{pr_number}"),
+        "candidate pull request",
+    )
+    state, _ = _candidate_pr_state(
+        api,
+        repository,
+        pr,
+        pr_number=pr_number,
+        repository_id=repository_id,
+        head_sha=head_sha,
+    )
+    if state != "open":
+        raise CandidateError("trusted release candidate is not open")
+
+    main_ref = _mapping(
+        api.get_json(f"/repos/{repository}/git/ref/heads/main"), "main Git ref"
+    )
+    main_object = _mapping(main_ref.get("object"), "main Git ref object")
+    if main_object.get("type") != "commit" or _sha(
+        main_object.get("sha"), "main Git ref SHA"
+    ) != event_base_sha:
+        raise CandidateError("release candidate base is not the current main commit")
+
+    version, base_sha, _ = validate_release_pr_content(api, repository, pr)
+    if base_sha != event_base_sha:
+        raise CandidateError("event and current pull request base SHAs differ")
+    return version, head_sha
+
+
 def _tree_sha(api: JsonApi, repository: str, commit_sha: str) -> str:
     commit = _mapping(
         api.get_json(f"/repos/{repository}/git/commits/{commit_sha}"), "Git commit"
