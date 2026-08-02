@@ -4686,6 +4686,7 @@ fn release_candidate_observer_contract_rejects_privilege_and_identity_drift() {
 fn release_promotion_contract_violations(
     ci_workflow: &str,
     release_please_workflow: &str,
+    release_please_config: &str,
     fast_maintenance_workflow: &str,
     release_workflow: &str,
     promotion_script: &str,
@@ -4693,11 +4694,16 @@ fn release_promotion_contract_violations(
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let release_please: serde_yaml::Value =
         serde_yaml::from_str(release_please_workflow).expect("parse release-please.yml");
+    let release_please_config: serde_json::Value =
+        serde_json::from_str(release_please_config).unwrap_or(serde_json::Value::Null);
     let fast_maintenance: serde_yaml::Value =
         serde_yaml::from_str(fast_maintenance_workflow).expect("parse release-pr-maintenance.yml");
     let release: serde_yaml::Value =
         serde_yaml::from_str(release_workflow).expect("parse release.yml");
     let mut violations = Vec::new();
+    if release_please_config["packages"]["."]["always-update"].as_bool() != Some(true) {
+        violations.push("release-please package always-update is not exact true".into());
+    }
     let main_gate = job_step(&ci, "detect-changes", "Verify reusable release merge")
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
@@ -5046,6 +5052,8 @@ fn release_promotion_reuses_exact_archives_and_fails_closed() {
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci");
     let release_please = std::fs::read_to_string(root.join(".github/workflows/release-please.yml"))
         .expect("read release-please");
+    let release_please_config = std::fs::read_to_string(root.join("release-please-config.json"))
+        .expect("read release-please config");
     let fast_maintenance =
         std::fs::read_to_string(root.join(".github/workflows/release-pr-maintenance.yml"))
             .expect("read fast release maintenance");
@@ -5056,6 +5064,7 @@ fn release_promotion_reuses_exact_archives_and_fails_closed() {
     let violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &release_please_config,
         &fast_maintenance,
         &release,
         &promotion,
@@ -5073,6 +5082,8 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci");
     let release_please = std::fs::read_to_string(root.join(".github/workflows/release-please.yml"))
         .expect("read release-please");
+    let release_please_config = std::fs::read_to_string(root.join("release-please-config.json"))
+        .expect("read release-please config");
     let fast_maintenance =
         std::fs::read_to_string(root.join(".github/workflows/release-pr-maintenance.yml"))
             .expect("read fast release maintenance");
@@ -5091,6 +5102,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &release_please_config,
         &fast_maintenance,
         &release,
         &promotion,
@@ -5099,6 +5111,31 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         assert!(
             violations.iter().any(|item| item.contains(expected)),
             "mutation must exercise {expected:?}: {violations:?}"
+        );
+    }
+    for (label, mutated_config) in [
+        (
+            "false",
+            release_please_config.replace("\"always-update\": true", "\"always-update\": false"),
+        ),
+        (
+            "missing",
+            release_please_config.replace("\"always-update\"", "\"always-update-missing\""),
+        ),
+    ] {
+        let config_violations = release_promotion_contract_violations(
+            &ci,
+            &release_please,
+            &mutated_config,
+            &fast_maintenance,
+            &release,
+            &promotion,
+        );
+        assert!(
+            config_violations
+                .iter()
+                .any(|item| item.contains("always-update is not exact true")),
+            "{label} always-update mutation must fail closed: {config_violations:?}"
         );
     }
     let duplicate_publish_verification =
@@ -5111,6 +5148,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let duplicate_publish_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &release_please_config,
         &fast_maintenance,
         &duplicate_publish_verification,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
@@ -5131,6 +5169,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let retry_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &release_please_config,
         &fast_maintenance,
         &retry_unsafe_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
@@ -5149,6 +5188,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let mutable_tag_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &release_please_config,
         &fast_maintenance,
         &mutable_tag_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
@@ -5167,6 +5207,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let stable_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &release_please_config,
         &fast_maintenance,
         &stable_incremental_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
@@ -5200,6 +5241,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let routing_violations = release_promotion_contract_violations(
         &ci,
         &unsafe_release_please,
+        &release_please_config,
         &unsafe_fast_maintenance,
         &std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release"),
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))

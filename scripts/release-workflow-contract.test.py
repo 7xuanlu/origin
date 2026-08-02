@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -11,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
 RELEASE_PLEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release-please.yml"
+RELEASE_PLEASE_CONFIG_PATH = REPO_ROOT / "release-please-config.json"
 FAST_MAINTENANCE_PATH = (
     REPO_ROOT / ".github" / "workflows" / "release-pr-maintenance.yml"
 )
@@ -55,12 +57,19 @@ def contract_violations(
     ci: str,
     release: str,
     release_please: str,
+    release_please_config: str,
     fast_maintenance: str,
     promotion: str,
 ) -> list[str]:
     """Keep release publication bound to the PR-built immutable archives."""
 
     violations: list[str] = []
+    try:
+        config = json.loads(release_please_config)
+    except json.JSONDecodeError:
+        config = {}
+    if config.get("packages", {}).get(".", {}).get("always-update") is not True:
+        violations.append("release-please package always-update is not exact true")
     if "- '.github/workflows/release-pr-maintenance.yml'" not in ci:
         violations.append("fast release maintenance cannot bootstrap its Rust contract")
     ci_gate = named_step_body(job_body(ci, "detect-changes"), "Verify reusable release merge")
@@ -787,6 +796,7 @@ def assert_mutation_detected(
     ci: str,
     release: str,
     release_please: str,
+    release_please_config: str,
     fast_maintenance: str,
     promotion: str,
     old: str,
@@ -799,6 +809,7 @@ def assert_mutation_detected(
         "ci": ci,
         "release": release,
         "release_please": release_please,
+        "release_please_config": release_please_config,
         "fast_maintenance": fast_maintenance,
         "promotion": promotion,
     }
@@ -810,6 +821,7 @@ def assert_mutation_detected(
         documents["ci"],
         documents["release"],
         documents["release_please"],
+        documents["release_please_config"],
         documents["fast_maintenance"],
         documents["promotion"],
     )
@@ -823,13 +835,14 @@ def main() -> None:
     ci = CI_PATH.read_text(encoding="utf-8")
     release = RELEASE_PATH.read_text(encoding="utf-8")
     release_please = RELEASE_PLEASE_PATH.read_text(encoding="utf-8")
+    release_please_config = RELEASE_PLEASE_CONFIG_PATH.read_text(encoding="utf-8")
     fast_maintenance = FAST_MAINTENANCE_PATH.read_text(encoding="utf-8")
     observer = OBSERVER_PATH.read_text(encoding="utf-8")
     validator = VALIDATOR_PATH.read_text(encoding="utf-8")
     archive = ARCHIVE_PATH.read_text(encoding="utf-8")
     promotion = PROMOTION_PATH.read_text(encoding="utf-8")
     violations = contract_violations(
-        ci, release, release_please, fast_maintenance, promotion
+        ci, release, release_please, release_please_config, fast_maintenance, promotion
     )
     violations.extend(candidate_observer_contract_violations(ci, observer, validator, archive))
     if violations:
@@ -853,6 +866,18 @@ def main() -> None:
             "skip-github-release: false",
             "PR-only contract",
             "release_please",
+        ),
+        (
+            '"always-update": true',
+            '"always-update": false',
+            "always-update is not exact true",
+            "release_please_config",
+        ),
+        (
+            '      "always-update": true,\n',
+            "",
+            "always-update is not exact true",
+            "release_please_config",
         ),
         (
             "  push:\n    branches: [main]",
@@ -962,6 +987,7 @@ def main() -> None:
             ci,
             release,
             release_please,
+            release_please_config,
             fast_maintenance,
             promotion,
             old,
