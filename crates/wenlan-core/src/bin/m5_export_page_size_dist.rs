@@ -10,7 +10,6 @@ use wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot;
 struct Args {
     db: PathBuf,
     output: PathBuf,
-    overwrite: bool,
 }
 
 #[tokio::main]
@@ -27,7 +26,7 @@ async fn run() -> Result<()> {
         bail!("--db must name an existing database file");
     }
     let database = M5PageSizeSnapshotDb::open(&args.db).await?;
-    let snapshot = prepare_m5_snapshot(&args.output, args.overwrite)?;
+    let snapshot = prepare_m5_snapshot(&args.output)?;
     let counts = database.fixed_counts().await?;
 
     let distribution = distribution_from_fixed_counts(counts)?;
@@ -44,7 +43,6 @@ async fn run() -> Result<()> {
 fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args> {
     let mut db = None;
     let mut output = None;
-    let mut overwrite = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -62,13 +60,11 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
                     args.next().context("--output requires a path")?,
                 ));
             }
-            Some("--overwrite") => overwrite = true,
-            _ => bail!("usage: m5_export_page_size_dist --db PATH --output PATH [--overwrite]"),
+            _ => bail!("usage: m5_export_page_size_dist --db PATH --output PATH"),
         }
     }
     Ok(Args {
         db: db.context("--db is required")?,
         output: output.context("--output is required")?,
-        overwrite,
     })
 }

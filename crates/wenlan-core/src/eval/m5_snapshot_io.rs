@@ -13,24 +13,22 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use same_file::Handle;
 use std::ffi::{OsStr, OsString};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 pub struct PreparedM5Snapshot {
     parent: Dir,
     parent_identity: Handle,
     lexical_parent: PathBuf,
     target_name: OsString,
-    overwrite: bool,
 }
 
 /// Prepare one snapshot publication against a stable output-parent identity.
 /// No output file or temporary file is created by this step.
-pub fn prepare_m5_snapshot(output: &Path, overwrite: bool) -> Result<PreparedM5Snapshot> {
+pub fn prepare_m5_snapshot(output: &Path) -> Result<PreparedM5Snapshot> {
     let target_name = output
         .file_name()
         .filter(|name| !name.is_empty())
@@ -54,10 +52,9 @@ pub fn prepare_m5_snapshot(output: &Path, overwrite: bool) -> Result<PreparedM5S
         parent_identity,
         lexical_parent,
         target_name,
-        overwrite,
     };
     prepared.ensure_lexical_parent_unchanged()?;
-    prepared.validate_existing_target()?;
+    prepared.ensure_target_absent()?;
     Ok(prepared)
 }
 
@@ -66,7 +63,7 @@ impl PreparedM5Snapshot {
     /// capability. A retargeted lexical parent is refused before temp creation.
     pub fn write(self, bytes: &[u8]) -> Result<()> {
         self.ensure_lexical_parent_unchanged()?;
-        self.validate_existing_target()?;
+        self.ensure_target_absent()?;
 
         let (temp_name, mut temp_file) = self.create_temp()?;
         let publication = (|| -> Result<()> {
@@ -78,21 +75,13 @@ impl PreparedM5Snapshot {
                 .context("sync capability-relative snapshot temp")?;
             drop(temp_file);
 
-            if self.overwrite {
-                // This is the last target lookup before the capability-relative
-                // rename. Symlinks, non-files, and SQLite targets fail closed.
-                self.validate_existing_target()?;
-                self.parent
-                    .rename(&temp_name, &self.parent, &self.target_name)
-                    .context("capability-relative snapshot overwrite")?;
-            } else {
-                self.parent
-                    .hard_link(&temp_name, &self.parent, &self.target_name)
-                    .context("output exists; pass --overwrite to replace it")?;
-                self.parent
-                    .remove_file(&temp_name)
-                    .context("remove published snapshot temp link")?;
-            }
+            self.ensure_target_absent()?;
+            self.parent
+                .hard_link(&temp_name, &self.parent, &self.target_name)
+                .context("output exists; choose a new --output path")?;
+            self.parent
+                .remove_file(&temp_name)
+                .context("remove published snapshot temp link")?;
             Ok(())
         })();
 
@@ -120,35 +109,12 @@ impl PreparedM5Snapshot {
         Ok(())
     }
 
-    fn validate_existing_target(&self) -> Result<()> {
-        let metadata = match self.parent.symlink_metadata(&self.target_name) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error).context("inspect capability-relative output target"),
-        };
-        if metadata.file_type().is_symlink() {
-            bail!("existing --output must not be a symlink");
+    fn ensure_target_absent(&self) -> Result<()> {
+        match self.parent.symlink_metadata(&self.target_name) {
+            Ok(_) => bail!("output exists; choose a new --output path"),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("inspect capability-relative output target"),
         }
-        if !metadata.is_file() {
-            bail!("existing --output must be a regular file");
-        }
-
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let mut target = self
-            .parent
-            .open_with(&self.target_name, &options)
-            .context("open existing output target no-follow")?;
-        let mut header = [0_u8; SQLITE_HEADER.len()];
-        match target.read_exact(&mut header) {
-            Ok(()) if &header == SQLITE_HEADER => {
-                bail!("existing --output must not be a SQLite database")
-            }
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {}
-            Err(error) => return Err(error).context("read existing output header"),
-        }
-        Ok(())
     }
 
     fn create_temp(&self) -> Result<(OsString, cap_std::fs::File)> {
