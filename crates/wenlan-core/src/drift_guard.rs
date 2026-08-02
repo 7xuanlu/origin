@@ -7268,12 +7268,15 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     {
         violations.push("CI benchmark is not workflow_dispatch-only".into());
     }
-    if benchmark["permissions"]["contents"].as_str() != Some("read")
+    if benchmark["permissions"]["actions"].as_str() != Some("read")
+        || benchmark["permissions"]["contents"].as_str() != Some("read")
         || benchmark["permissions"]
             .as_mapping()
-            .is_none_or(|permissions| permissions.len() != 1)
+            .is_none_or(|permissions| permissions.len() != 2)
     {
-        violations.push("CI benchmark does not have exact read-only contents permission".into());
+        violations.push(
+            "CI benchmark does not have exact read-only actions and contents permissions".into(),
+        );
     }
     if benchmark_workflow.contains("${{ secrets.") {
         violations.push("CI benchmark reads repository secrets".into());
@@ -7500,28 +7503,140 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
         violations.push("P6 toolchain does not install its explicit production target".into());
     }
     let p6_job = &benchmark["jobs"]["p6-release"];
-    let fastembed_restore = job_step(
-        &benchmark,
-        "p6-release",
-        "Restore portable FastEmbed model for Windows smoke",
+    let p6_fastembed_job = &benchmark["jobs"]["p6-fastembed"];
+    let p6_fastembed_steps = p6_fastembed_job["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let producer_step_position = |name: &str| {
+        p6_fastembed_steps
+            .iter()
+            .position(|step| step["name"].as_str() == Some(name))
+    };
+    let main_fastembed_restore =
+        job_step(&ci, "detect-changes", "Restore portable FastEmbed model");
+    let main_fastembed_publish = job_step(
+        &ci,
+        "detect-changes",
+        "Publish portable FastEmbed model for this run",
     );
-    if p6_job["env"]["FASTEMBED_CACHE_DIR"].as_str()
-        != Some("${{ github.workspace }}/.fastembed_cache")
-        || fastembed_restore
+    let p6_fastembed_restore = job_step(
+        &benchmark,
+        "p6-fastembed",
+        "Restore P6 portable FastEmbed model",
+    );
+    let p6_fastembed_prepare = job_step(
+        &benchmark,
+        "p6-fastembed",
+        "Prepare P6 portable FastEmbed model",
+    );
+    let p6_fastembed_publish = job_step(
+        &benchmark,
+        "p6-fastembed",
+        "Publish P6 portable FastEmbed model for this run",
+    );
+    if p6_fastembed_job["if"].as_str()
+        != Some("inputs.experiment == 'p6-release' || inputs.experiment == 'all'")
+        || p6_fastembed_job["runs-on"].as_str() != Some("ubuntu-24.04")
+        || p6_fastembed_job["timeout-minutes"].as_i64() != Some(15)
+        || job_needs(&benchmark, "p6-release") != ["p6-fastembed"]
+        || p6_fastembed_restore
             .and_then(|step| step["uses"].as_str())
             .is_none_or(|uses| !uses.starts_with("actions/cache/restore@"))
-        || fastembed_restore.and_then(|step| step["if"].as_str()) != Some("runner.os == 'Windows'")
-        || fastembed_restore.and_then(|step| step["with"]["path"].as_str())
-            != Some("${{ env.FASTEMBED_CACHE_DIR }}")
-        || fastembed_restore.and_then(|step| step["with"]["key"].as_str())
+        || p6_fastembed_restore.and_then(|step| step["continue-on-error"].as_bool()) != Some(true)
+        || p6_fastembed_restore.and_then(|step| step["with"]["path"].as_str())
+            != Some(".fastembed_cache")
+        || p6_fastembed_restore.and_then(|step| step["with"]["path"].as_str())
+            != main_fastembed_restore.and_then(|step| step["with"]["path"].as_str())
+        || p6_fastembed_restore.and_then(|step| step["with"]["key"].as_str())
             != Some("fastembed-bge-base-en-v1.5-q-v3-portable")
-        || fastembed_restore.and_then(|step| step["with"]["enableCrossOsArchive"].as_str())
+        || p6_fastembed_restore.and_then(|step| step["with"]["enableCrossOsArchive"].as_str())
             != Some("true")
-        || fastembed_restore.and_then(|step| step["with"]["fail-on-cache-miss"].as_str())
-            != Some("true")
+        || p6_fastembed_restore.is_some_and(|step| step["with"].get("fail-on-cache-miss").is_some())
+        || p6_fastembed_prepare.and_then(|step| step["run"].as_str())
+            != Some("python3 scripts/prepare-fastembed-cache.py --cache-dir .fastembed_cache")
+        || p6_fastembed_publish
+            .and_then(|step| step["uses"].as_str())
+            .is_none_or(|uses| !uses.starts_with("actions/upload-artifact@"))
+        || p6_fastembed_publish.and_then(|step| step["with"]["name"].as_str())
+            != Some("p6-fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}")
+        || p6_fastembed_publish.and_then(|step| step["with"]["path"].as_str())
+            != Some(".fastembed_cache")
+        || p6_fastembed_publish.and_then(|step| step["with"]["path"].as_str())
+            != main_fastembed_publish.and_then(|step| step["with"]["path"].as_str())
+        || p6_fastembed_publish.and_then(|step| step["with"]["include-hidden-files"].as_bool())
+            != Some(true)
+        || p6_fastembed_publish.and_then(|step| step["with"]["compression-level"].as_i64())
+            != Some(0)
+        || p6_fastembed_publish.and_then(|step| step["with"]["retention-days"].as_i64()) != Some(1)
+        || p6_fastembed_publish.and_then(|step| step["with"]["if-no-files-found"].as_str())
+            != Some("error")
+        || p6_fastembed_publish.and_then(|step| step["with"]["overwrite"].as_bool()) != Some(true)
+        || producer_step_position("Restore P6 portable FastEmbed model")
+            .zip(producer_step_position(
+                "Prepare P6 portable FastEmbed model",
+            ))
+            .zip(producer_step_position(
+                "Publish P6 portable FastEmbed model for this run",
+            ))
+            .is_none_or(|((restore, prepare), publish)| restore >= prepare || prepare >= publish)
     {
         violations.push(
-            "P6 Windows smoke does not fail closed on the portable FastEmbed prerequisite".into(),
+            "P6 FastEmbed producer does not preserve cache path identity and publish one verified run-scoped artifact"
+                .into(),
+        );
+    }
+    let p6_fastembed_download = job_step(
+        &benchmark,
+        "p6-release",
+        "Download P6 portable FastEmbed model",
+    );
+    let p6_fastembed_retry = job_step(
+        &benchmark,
+        "p6-release",
+        "Retry P6 portable FastEmbed model download",
+    );
+    let retry_run = p6_fastembed_retry
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let p6_job_text = serde_yaml::to_string(p6_job).unwrap_or_default();
+    if p6_job["env"]["FASTEMBED_CACHE_DIR"].as_str()
+        != Some("${{ github.workspace }}/.fastembed_cache")
+        || p6_fastembed_download
+            .and_then(|step| step["uses"].as_str())
+            .is_none_or(|uses| !uses.starts_with("actions/download-artifact@"))
+        || p6_fastembed_download.and_then(|step| step["if"].as_str())
+            != Some("runner.os == 'Windows'")
+        || p6_fastembed_download.and_then(|step| step["id"].as_str())
+            != Some("p6-fastembed-download")
+        || p6_fastembed_download.and_then(|step| step["continue-on-error"].as_bool()) != Some(true)
+        || p6_fastembed_download.and_then(|step| step["with"]["name"].as_str())
+            != Some("p6-fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}")
+        || p6_fastembed_download.and_then(|step| step["with"]["path"].as_str())
+            != Some(".fastembed_cache")
+        || p6_fastembed_retry.and_then(|step| step["if"].as_str())
+            != Some("runner.os == 'Windows' && steps.p6-fastembed-download.outcome == 'failure'")
+        || p6_fastembed_retry.and_then(|step| step["env"]["GH_TOKEN"].as_str())
+            != Some("${{ github.token }}")
+        || !retry_run.contains("scripts/download-run-artifact.sh")
+        || !retry_run.contains("p6-fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}")
+        || !retry_run.trim_end().ends_with(".fastembed_cache")
+        || p6_job_text.contains("actions/cache/restore@")
+        || step_position("Retry P6 portable FastEmbed model download")
+            .zip(step_position(
+                "Fetch locked dependencies outside timed region",
+            ))
+            .is_none_or(|(download, fetch)| download >= fetch)
+        || step_position("Retry P6 portable FastEmbed model download")
+            .zip(step_position(
+                "Measure release profile (Windows required-proof layout)",
+            ))
+            .is_none_or(|(download, build)| download >= build)
+    {
+        violations.push(
+            "P6 Windows FastEmbed consumer does not use the exact artifact path, bounded retry, or pre-timing order"
+                .into(),
         );
     }
     for prerequisite in [
@@ -7621,10 +7736,14 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
         "p4-runners",
         "p5-test-engine",
         "p5-windows-drive",
+        "p6-fastembed",
         "p6-release",
     ]);
     if benchmark_jobs != expected_jobs {
-        violations.push("CI benchmark contains jobs beyond the four orthogonal suites".into());
+        violations.push(
+            "CI benchmark does not contain exactly four orthogonal suites plus the P6 prerequisite"
+                .into(),
+        );
     }
 
     let jobs = benchmark["jobs"].as_mapping().into_iter().flatten();
@@ -7642,7 +7761,7 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
                 "benchmark job {job_name} enables sccache writes in env"
             ));
         }
-        if job["strategy"]["fail-fast"].as_bool() != Some(false) {
+        if job_name != "p6-fastembed" && job["strategy"]["fail-fast"].as_bool() != Some(false) {
             violations.push(format!("benchmark job {job_name} is not fail-fast false"));
         }
         if job["timeout-minutes"]
@@ -7651,20 +7770,22 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
         {
             violations.push(format!("benchmark job {job_name} lacks a bounded timeout"));
         }
-        let steps = job["steps"].as_sequence().into_iter().flatten();
-        let upload = steps.clone().find(|step| {
-            step["uses"]
-                .as_str()
-                .is_some_and(|uses| uses.contains("actions/upload-artifact@"))
-        });
-        if upload.and_then(|step| step["if"].as_str()) != Some("always()")
-            || upload
-                .and_then(|step| step["with"]["path"].as_str())
-                .is_none_or(|path| path.contains("target"))
-        {
-            violations.push(format!(
-                "benchmark job {job_name} does not always upload receipt-only evidence"
-            ));
+        if job_name != "p6-fastembed" {
+            let steps = job["steps"].as_sequence().into_iter().flatten();
+            let upload = steps.clone().find(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.contains("actions/upload-artifact@"))
+            });
+            if upload.and_then(|step| step["if"].as_str()) != Some("always()")
+                || upload
+                    .and_then(|step| step["with"]["path"].as_str())
+                    .is_none_or(|path| path.contains("target"))
+            {
+                violations.push(format!(
+                    "benchmark job {job_name} does not always upload receipt-only evidence"
+                ));
+            }
         }
     }
 
@@ -7744,13 +7865,13 @@ jobs:
     let violations = ci_benchmark_contract_violations(ci, benchmark);
     for expected in [
         "workflow_dispatch-only",
-        "read-only contents permission",
+        "read-only actions and contents permissions",
         "reads repository secrets",
         "required CI closure",
         "Rust routing",
         "omits experiment control",
         "measured cache state",
-        "four orthogonal suites",
+        "four orthogonal suites plus the P6 prerequisite",
         "environment or job-level permissions",
         "sccache writes in env",
         "fail-fast false",
@@ -7901,8 +8022,17 @@ fn ci_benchmark_contract_rejects_stale_release_execution() {
             "      - name: Removed nested Cargo cache marker",
         )
         .replace(
-            "      - name: Restore portable FastEmbed model for Windows smoke",
-            "      - name: Removed portable FastEmbed model for Windows smoke",
+            "      - name: Restore P6 portable FastEmbed model",
+            "      - name: Removed P6 portable FastEmbed model",
+        )
+        .replace(
+            "      - name: Download P6 portable FastEmbed model",
+            "      - name: Removed P6 portable FastEmbed model download",
+        )
+        .replacen(
+            "          path: .fastembed_cache",
+            "          path: ${{ github.workspace }}/.fastembed_cache",
+            1,
         )
         .replace(
             "profile: cgu-256, cache_mode: cold, cgu: \"256\"",
@@ -7919,7 +8049,8 @@ fn ci_benchmark_contract_rejects_stale_release_execution() {
         "shipped no-LTO profiles with one cold-only alternative",
         "release-preflight cache input",
         "nested Windows target before cache restore",
-        "portable FastEmbed prerequisite",
+        "P6 FastEmbed producer",
+        "P6 Windows FastEmbed consumer",
         "omits production marker",
         "three shipped target binaries",
     ] {
