@@ -7584,7 +7584,7 @@ jobs:
         "required CI closure",
         "Rust routing",
         "omits experiment control",
-        "profile-invalidated restores",
+        "measured cache state",
         "four orthogonal suites",
         "environment or job-level permissions",
         "sccache writes in env",
@@ -7613,14 +7613,9 @@ fn ci_benchmark_contract_requires_read_only_sccache_and_truthful_restore_modes()
         .expect("read benchmark workflow");
     let benchmark = benchmark
         .replace("      SCCACHE_GHA_RW_MODE: READ_ONLY\n", "")
-        .replace("cache_mode: production-restore", "cache_mode: warm")
-        .replace("profile-invalidated-cold", "production-restore");
+        .replace("cache_mode: production-restore", "cache_mode: warm");
     let violations = ci_benchmark_contract_violations(&ci, &benchmark);
-    for expected in [
-        "read-only sccache",
-        "production-restore",
-        "profile-invalidated restores",
-    ] {
+    for expected in ["read-only sccache", "production-restore"] {
         assert!(
             violations
                 .iter()
@@ -7650,21 +7645,21 @@ fn ci_benchmark_contract_requires_target_and_host_linkers_on_windows() {
 }
 
 #[test]
-fn ci_benchmark_contract_rejects_dead_profile_cache_logic() {
+fn ci_benchmark_contract_rejects_unmeasured_cache_state() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
         .expect("read benchmark workflow");
     let benchmark = benchmark.replace(
-        "if requested_mode == \"production-restore\" and profile != \"current\"",
-        "if False",
+        r#"effective_cache = os.environ.get("WINDOWS_CACHE_STATE") or requested_mode"#,
+        "effective_cache = requested_mode",
     );
     let violations = ci_benchmark_contract_violations(&ci, &benchmark);
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("profile-invalidated restores")),
-        "dead truthfulness logic must fail the benchmark contract: {violations:?}"
+            .any(|violation| violation.contains("measured cache state")),
+        "unmeasured cache state must fail the benchmark contract: {violations:?}"
     );
 }
 
@@ -7682,7 +7677,7 @@ fn ci_benchmark_contract_rejects_unused_effective_cache_value() {
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("profile-invalidated restores")),
+            .any(|violation| violation.contains("measured cache state")),
         "unused effective cache logic must fail the benchmark contract: {violations:?}"
     );
 }
