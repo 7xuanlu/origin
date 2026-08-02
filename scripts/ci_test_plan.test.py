@@ -777,6 +777,15 @@ class NonRustOwnerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assert_non_rust_owner(path)
 
+    def test_git_hook_contract_paths_have_no_rust_suites(self) -> None:
+        for path in (
+            ".githooks/pre-commit",
+            ".githooks/pre-push",
+            "scripts/git-hooks.test.sh",
+        ):
+            with self.subTest(path=path):
+                self.assert_non_rust_owner(path)
+
     def test_docs_npm_and_plugin_only_diff_stays_on_fast_lanes(self) -> None:
         self.assert_non_rust_owner(
             "docs/windows-vulkan.md",
@@ -883,6 +892,9 @@ class SuiteOutputTests(unittest.TestCase):
             ".config/nextest.toml": (False, False),
             ".github/workflows/ci.yml": (False, False),
             "scripts/ci_test_plan.py": (False, False),
+            ".githooks/pre-commit": (False, False),
+            ".githooks/pre-push": (False, False),
+            "scripts/git-hooks.test.sh": (False, False),
             "docs/windows-vulkan.md": (False, False),
             "plugin-codex/skills/setup/SKILL.md": (False, False),
             "crates/wenlan-mcp/npm/install.js": (False, False),

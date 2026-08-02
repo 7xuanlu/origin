@@ -73,6 +73,12 @@ NON_CLIPPY_CONTRACT_INPUTS = {
     "scripts/ci_test_plan.test.py",
 }
 
+DETECT_CONTRACT_INPUTS = {
+    ".githooks/pre-commit",
+    ".githooks/pre-push",
+    "scripts/git-hooks.test.sh",
+}
+
 # Repository contracts are executable Rust tests, but they do not exercise
 # platform behavior. Linux owns their canonical execution; routing them into
 # macOS and Windows would duplicate product suites without adding OS evidence.
@@ -322,7 +328,11 @@ def _is_clippy_input(path: str) -> bool:
 def _is_non_clippy_contract_input(path: str, existing: set[str]) -> bool:
     if _plugin_job_owns(path) or _npm_job_owns(path) or _docs_job_owns(path):
         return True
-    if path.startswith(".github/workflows/") or path in NON_CLIPPY_CONTRACT_INPUTS:
+    if (
+        path.startswith(".github/workflows/")
+        or path in NON_CLIPPY_CONTRACT_INPUTS
+        or path in DETECT_CONTRACT_INPUTS
+    ):
         return True
     return path in existing and (
         path in ISOLATED_UNIT_TESTS or path in ISOLATED_UNIT_MODULES
@@ -442,6 +452,10 @@ def _build_test_plan(
 
         if _docs_job_owns(path):
             reasons.append(f"docs contract job owns changed path: {path}")
+            continue
+
+        if path in DETECT_CONTRACT_INPUTS:
+            reasons.append(f"detect contract job owns changed path: {path}")
             continue
 
         if (

@@ -516,6 +516,7 @@ jobs:
           echo "json={\"include\":[${include}]}" >> "$GITHUB_OUTPUT"
       - name: Verify CI observer and ORT contracts
         run: |
+          bash scripts/git-hooks.test.sh
           python3 scripts/ci-cache-maintenance.test.py
           python3 scripts/ci-observer.test.py
           python3 scripts/ci-timed-command.test.py
