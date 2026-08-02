@@ -1147,6 +1147,9 @@ fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
         ),
         "MemoryDB::new reaches migration 105, whose pre-serve queue seed must use the named bound"
     );
+    let enqueue_start = claim_derivation
+        .find("pub async fn enqueue_stale_derivation_jobs(")
+        .expect("the bounded sweep entry point must exist");
     let sweep_start = claim_derivation
         .find("async fn sweep_stale_derivation_jobs(")
         .expect("the bounded sweep implementation must exist");
@@ -1154,29 +1157,58 @@ fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
         .find("pub async fn drain_stale_derivation_jobs(")
         .map(|offset| sweep_start + offset)
         .expect("the drain must follow the bounded sweep");
+    let enqueue = &claim_derivation[enqueue_start..sweep_start];
+    let validation = enqueue
+        .find("if limit <= 0")
+        .expect("the signed sweep bound must be validated");
+    let transaction = enqueue
+        .find("transaction_with_behavior")
+        .expect("the bounded sweep must remain transactional");
+    assert!(
+        validation < transaction,
+        "a non-positive limit must fail before any transactional or temp-table mutation"
+    );
+
     let sweep = &claim_derivation[sweep_start..sweep_end];
-    let stale_capture = sweep
-        .find("INSERT INTO claim_derivation_backlog_batch")
-        .expect("stale-marker cleanup must first capture a bounded batch");
-    let drift_capture = sweep
-        .find("INSERT INTO claim_derivation_drift_batch")
-        .expect("drift cleanup must first capture a bounded batch");
+    assert_eq!(
+        sweep.matches("CREATE TEMP TABLE").count(),
+        1,
+        "stale-marker and drift work must share one overall batch table"
+    );
+    assert!(
+        !sweep.contains("claim_derivation_backlog_batch")
+            && !sweep.contains("claim_derivation_drift_batch"),
+        "the former independently bounded batches must not return"
+    );
+    let capture = sweep
+        .find("INSERT INTO claim_derivation_sweep_batch")
+        .expect("all sweep candidates must first enter the unified batch");
     let first_cleanup = sweep
         .find("DELETE FROM claim_derivation_jobs")
-        .expect("the captured batches must replace stale done jobs");
+        .expect("the captured batch must replace stale done jobs");
     assert!(
-        stale_capture < first_cleanup && drift_capture < first_cleanup,
-        "both bounded sets must be captured before any cleanup write can touch jobs"
+        capture < first_cleanup,
+        "the unified bounded set must be captured before any cleanup write can touch jobs"
     );
-    for (batch, minimum_uses) in [
-        ("FROM claim_derivation_backlog_batch", 2),
-        ("FROM claim_derivation_drift_batch", 3),
-    ] {
-        assert!(
-            sweep.matches(batch).count() >= minimum_uses,
-            "{batch} must bind capture, done-job cleanup, and pending insertion/demotion"
-        );
-    }
+    assert!(
+        sweep.contains("UNION")
+            && sweep.contains("ORDER BY c.page_id, c.page_version")
+            && sweep.contains("LIMIT ?3"),
+        "the distinct stale/drift union needs one deterministic overall bound"
+    );
+    assert_eq!(
+        sweep.matches("FROM claim_derivation_sweep_batch").count(),
+        4,
+        "one batch reset plus done-job cleanup, pending insertion, and demotion must be the only unified-batch consumers"
+    );
+    assert!(
+        sweep.contains("WHERE needs_demotion = 1"),
+        "the unified batch must retain which captured rows need synchronous demotion"
+    );
+    assert!(
+        sweep.contains("Ok(captured as usize)"),
+        "the returned progress must count distinct rows in the unified batch"
+    );
     let fence = runtime
         .find("if optional_runtime_workers_allowed(repair_recovery_pending)")
         .expect("repair recovery must fence optional runtime workers");
