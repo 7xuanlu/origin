@@ -3203,16 +3203,19 @@ fn release_version_sync_never_runs_package_lifecycle_scripts() {
     let root = repo_root();
     let bump = std::fs::read_to_string(root.join("scripts/bump-version.sh"))
         .expect("read bump-version.sh");
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("read release.yml");
     let validation = std::fs::read_to_string(root.join("scripts/validate-versions.test.sh"))
         .expect("read validate-versions.test.sh");
 
     let npm_version_lines = bump
         .lines()
+        .chain(release.lines())
         .filter(|line| line.contains("npm version"))
         .collect::<Vec<_>>();
     assert_eq!(
         npm_version_lines.len(),
-        2,
+        4,
         "unexpected npm version command inventory"
     );
     assert!(

@@ -679,12 +679,12 @@ jobs:
         working-directory: crates/wenlan-mcp/npm
         run: |
           VERSION="${RELEASE_TAG#v}"
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version --ignore-scripts
       - name: Sync setup package version from tag
         working-directory: crates/wenlan-cli/npm
         run: |
           VERSION="${RELEASE_TAG#v}"
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version --ignore-scripts
       - name: Copy root README and LICENSE into npm packages
         # npm renders README.md on the package page and surfaces LICENSE on
         # the package metadata. Copying root files ensures both packages
