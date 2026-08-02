@@ -21,6 +21,7 @@ pub mod layer;
 pub mod lifecycle;
 pub mod locomo;
 pub mod longmemeval;
+pub mod m5_bench_corpus;
 pub mod metrics;
 pub mod page_faithfulness;
 pub mod paired;
