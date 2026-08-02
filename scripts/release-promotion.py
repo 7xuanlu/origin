@@ -42,6 +42,10 @@ CI_WORKFLOW_FILE = "ci.yml"
 OBSERVER_WORKFLOW_FILE = "release-candidate-observer.yml"
 RELEASE_BRANCH = "release-please--branches--main"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_MERGE_TITLE_RE = re.compile(
+    r"^chore\(main\): release [0-9]+\.[0-9]+\.[0-9]+"
+    r"(?:[-.][0-9A-Za-z.-]+)? \(#([1-9][0-9]*)\)$"
+)
 DIGEST_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
 MAX_RECEIPT_WRAPPER_BYTES = 2 * 1024 * 1024
 MAX_MAIN_PLAN_WRAPPER_BYTES = 2 * 1024 * 1024
@@ -149,7 +153,39 @@ def _release_context(
     if not release_like:
         if malformed_release_like:
             raise PromotionError("release-please association has the wrong base branch")
-        return None, None
+        # The commit-to-PR association index can briefly return an empty list
+        # immediately after a squash merge. The immutable squash title carries
+        # the PR number, so resolve that already-existing PR directly and then
+        # subject it to the same complete proof below. The title never grants
+        # trust by itself; any identity or tree mismatch still fails closed.
+        commit = _mapping(
+            api.get_json(f"/repos/{repository}/git/commits/{main_sha}"),
+            f"Git commit {main_sha}",
+        )
+        message = commit.get("message")
+        if not isinstance(message, str):
+            raise PromotionError(f"Git commit {main_sha} has no message")
+        title = message.splitlines()[0] if message.splitlines() else ""
+        match = RELEASE_MERGE_TITLE_RE.fullmatch(title)
+        if match is None:
+            return None, None
+        pr_number = int(match.group(1))
+        fallback = _mapping(
+            api.get_json(f"/repos/{repository}/pulls/{pr_number}"),
+            f"pull request {pr_number}",
+        )
+        fallback_head = _mapping(fallback.get("head"), "release title pull request head")
+        fallback_base = _mapping(fallback.get("base"), "release title pull request base")
+        if (
+            fallback.get("number") != pr_number
+            or fallback_head.get("ref") != RELEASE_BRANCH
+            or fallback_base.get("ref") != "main"
+        ):
+            raise PromotionError(
+                "release-like commit title does not resolve to the release-please PR"
+            )
+        associated = [fallback]
+        release_like = [fallback]
     if len(release_like) != 1:
         raise PromotionError(
             f"expected one associated release-please PR, found {len(release_like)}"
@@ -161,6 +197,11 @@ def _release_context(
         event_name="push",
         ref="refs/heads/main",
         sha=main_sha,
+        # GitHub's commit-to-PR association can be briefly inconsistent just
+        # after a squash merge. Reuse the snapshot that already identified the
+        # release branch instead of issuing an immediate second lookup that can
+        # transiently return an empty list.
+        associated_pulls=associated,
     )
     if not proof.verified:
         raise PromotionError(f"release merge proof failed: {proof.reason}")

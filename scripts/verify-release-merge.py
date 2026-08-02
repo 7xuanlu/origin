@@ -250,6 +250,7 @@ def verify_release_merge(
     event_name: str,
     ref: str,
     sha: str,
+    associated_pulls: object | None = None,
 ) -> ReleaseProof:
     if event_name != "push" or ref != MAIN_REF:
         return ReleaseProof(False, "event is not a push to refs/heads/main")
@@ -259,10 +260,12 @@ def verify_release_merge(
         return ReleaseProof(False, "repository must be OWNER/REPO")
 
     try:
-        pulls = api.get_json(
-            f"/repos/{repository}/commits/{sha}/pulls",
-            params={"per_page": 100},
-        )
+        pulls = associated_pulls
+        if pulls is None:
+            pulls = api.get_json(
+                f"/repos/{repository}/commits/{sha}/pulls",
+                params={"per_page": 100},
+            )
         candidates = _release_pr_candidates(pulls, sha)
         if len(candidates) != 1:
             return ReleaseProof(

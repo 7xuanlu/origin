@@ -136,6 +136,27 @@ class VerifyReleaseMergeTests(unittest.TestCase):
         self.assertEqual(proof.pr_head_sha, HEAD_SHA)
         self.assertEqual(proof.tree_sha, TREE_SHA)
 
+    def test_reuses_caller_provided_association_snapshot(self) -> None:
+        api = FakeApi(
+            {
+                path: response
+                for path, response in self.responses.items()
+                if path != self.paths["pulls"]
+            }
+        )
+
+        proof = self.module.verify_release_merge(
+            api,
+            REPOSITORY,
+            event_name="push",
+            ref="refs/heads/main",
+            sha=CURRENT_SHA,
+            associated_pulls=self.responses[self.paths["pulls"]],
+        )
+
+        self.assertTrue(proof.verified, proof.reason)
+        self.assertNotIn(self.paths["pulls"], [path for path, _query in api.calls])
+
     def test_direct_main_push_falls_back_without_an_associated_pr(self) -> None:
         self.responses[self.paths["pulls"]] = []
 
@@ -167,6 +188,9 @@ class VerifyReleaseMergeTests(unittest.TestCase):
             "wrong branch": lambda: self.responses[self.paths["pulls"]][0][
                 "head"
             ].update(ref="topic"),
+            "wrong merge SHA": lambda: self.responses[self.paths["pulls"]][0].update(
+                merge_commit_sha="0" * 40
+            ),
             "failed check": lambda: self.responses[self.paths["checks"]][
                 "check_runs"
             ][0].update(conclusion="failure"),
