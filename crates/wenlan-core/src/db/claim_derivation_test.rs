@@ -2019,6 +2019,90 @@ async fn support_that_no_longer_clears_the_bar_is_re_enqueued() {
     assert_eq!(job_for(&db, "p1").await.unwrap().1, "pending");
 }
 
+/// Row 15's runtime bound must constrain the SAME set for enqueue and
+/// demotion. If the enqueue takes 25 rows but the demotion takes all 26, the
+/// last page is no longer `supported`, so the next drift scan cannot find it;
+/// it has no job either, and the continuation incorrectly reports completion.
+#[tokio::test]
+async fn drifted_support_converges_past_the_runtime_batch_without_losing_the_tail() {
+    const RUNTIME_BATCH: i64 = 25;
+    const PAGE_COUNT: usize = RUNTIME_BATCH as usize + 1;
+
+    let (db, _temp) = db_with_queue().await;
+    for i in 0..PAGE_COUNT {
+        let page_id = format!("drift_tail_{i:02}");
+        add_page(&db, &page_id).await;
+        let revisions = derive_page(&db, &page_id, 1).await;
+        support_claim(&db, &page_id, &revisions[0], SUPPORT_THRESHOLD + 0.02).await;
+        publish_supported(&db, &page_id).await;
+    }
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET payload = json_set(payload, '$.score', ?1)
+              WHERE edge_type = 'supports'",
+            libsql::params![SUPPORT_THRESHOLD - 0.05],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.enqueue_stale_derivation_jobs(RUNTIME_BATCH)
+            .await
+            .unwrap(),
+        RUNTIME_BATCH as usize,
+        "the first bounded turn may queue only its batch"
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*)
+                   FROM page_truth_state t
+                  WHERE t.page_id LIKE 'drift_tail_%'
+                    AND t.support_status = 'provisional'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM claim_derivation_jobs j
+                         WHERE j.page_id = t.page_id
+                           AND j.page_version = t.page_version
+                           AND j.status = 'pending'
+                    )",
+                (),
+            )
+            .await
+            .unwrap();
+        let demoted_without_pending: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            demoted_without_pending, 0,
+            "a bounded sweep must never demote a page it did not durably queue"
+        );
+    }
+
+    assert_eq!(
+        db.enqueue_stale_derivation_jobs(RUNTIME_BATCH)
+            .await
+            .unwrap(),
+        1,
+        "the tail must remain discoverable for the next runtime turn"
+    );
+    assert_eq!(
+        db.enqueue_stale_derivation_jobs(RUNTIME_BATCH)
+            .await
+            .unwrap(),
+        0,
+        "only after the tail is queued may the continuation report completion"
+    );
+
+    for i in 0..PAGE_COUNT {
+        let page_id = format!("drift_tail_{i:02}");
+        assert_eq!(truth_row(&db, &page_id).await.unwrap().0, "provisional");
+        assert_eq!(job_for(&db, &page_id).await.unwrap().1, "pending");
+    }
+}
+
 /// F6. One bounded sweep is a truncation unless something continues it. The
 /// migration queues a batch and stops; every page past it was reachable only by
 /// being edited, so on a vault larger than the batch the "backlog scan"

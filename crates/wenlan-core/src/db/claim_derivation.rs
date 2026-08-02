@@ -107,6 +107,11 @@ pub struct DerivationJob {
 /// permanently self-certifying.
 pub const SUPPORT_THRESHOLD: f64 = 0.75;
 
+/// The one bounded claim-derivation write migration 105 may perform while
+/// `MemoryDB::new` is still on the pre-serve startup path. Runtime continuation
+/// drains everything beyond this seed after the listener can accept requests.
+pub(super) const MIGRATION_105_BACKLOG_SEED_LIMIT: i64 = 500;
+
 /// The result of evaluating §1 of the truth-state matrix for one page version.
 ///
 /// Three of the four variants all mean `support_status = 'provisional'`. They
@@ -526,10 +531,10 @@ impl MemoryDB {
 
     /// Enqueue up to `limit` already-existing pages that carry no valid marker.
     ///
-    /// Returns how many jobs were created. A zero from this function means the
-    /// vault is fully derived at the current extractor version — it is a real
-    /// measurement, which is exactly what the empty queue before this worker
-    /// was not.
+    /// Returns how many pages advanced into the durable queue/demotion batch. A
+    /// zero from this function means there is no stale extraction or drift work
+    /// left to advance — it is a real measurement, which is exactly what the
+    /// empty queue before this worker was not.
     /// **The enqueue and the demotion are one transaction, not two statements
     /// that usually both run.** The order below is load-bearing — being
     /// `supported` is part of what makes a page drifted, so demoting first
@@ -634,26 +639,52 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("derivation backlog enqueue: {error}"))
             })?;
 
-        let re_derive = conn
+        // Freeze the drift batch before either half mutates what the drift
+        // predicate can see. `support_status = 'supported'` is part of that
+        // predicate, so a second live SELECT after demotion cannot be trusted to
+        // name the same pages. The temp table is connection-local, is cleared
+        // on every pass, and participates in this transaction: rollback loses
+        // the captured batch together with its queue and truth-state changes.
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS claim_derivation_drift_batch (
+                 page_id TEXT NOT NULL,
+                 page_version INTEGER NOT NULL,
+                 PRIMARY KEY (page_id, page_version)
+             ) WITHOUT ROWID;
+             DELETE FROM claim_derivation_drift_batch;",
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("derivation drift batch: {error}")))?;
+
+        let drifted = conn
             .execute(
                 &format!(
-                    "INSERT INTO claim_derivation_jobs
-                         (job_id, page_id, page_version, status, attempts, created_at, updated_at)
-                     SELECT d.drifted_page_id || ':' || d.drifted_page_version,
-                            d.drifted_page_id, d.drifted_page_version, 'pending', 0, ?2, ?2
+                    "INSERT INTO claim_derivation_drift_batch (page_id, page_version)
+                     SELECT d.drifted_page_id, d.drifted_page_version
                        FROM ({DRIFTED_SUPPORTED_PAGES}) d
-                      WHERE NOT EXISTS (
-                          SELECT 1 FROM claim_derivation_jobs j
-                           WHERE j.page_id = d.drifted_page_id
-                             AND j.page_version = d.drifted_page_version
-                      )
                       ORDER BY d.drifted_page_id
-                      LIMIT ?3"
+                      LIMIT ?2"
                 ),
-                libsql::params![SUPPORT_THRESHOLD, now, limit],
+                libsql::params![SUPPORT_THRESHOLD, limit],
             )
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("derivation drift enqueue: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("derivation drift batch: {error}")))?;
+
+        conn.execute(
+            "INSERT INTO claim_derivation_jobs
+                         (job_id, page_id, page_version, status, attempts, created_at, updated_at)
+             SELECT d.page_id || ':' || d.page_version,
+                    d.page_id, d.page_version, 'pending', 0, ?1, ?1
+               FROM claim_derivation_drift_batch d
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM claim_derivation_jobs j
+                   WHERE j.page_id = d.page_id
+                     AND j.page_version = d.page_version
+              )",
+            libsql::params![now],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("derivation drift enqueue: {error}")))?;
 
         // Demote NOW, not when a worker eventually reaches the job just queued.
         // Queueing answers "when will we know again"; it does not answer "what
@@ -663,10 +694,11 @@ impl MemoryDB {
         // the same argument [`support_demotion_body`] makes for row 13, reached
         // here from the scan rather than from a trigger.
         //
-        // Strictly after the enqueue above, because being `supported` is part of
-        // what makes a page drifted: demoting first empties
-        // [`DRIFTED_SUPPORTED_PAGES`] and the re-derivation is never queued at
-        // all. The two statements are ordered, not merely adjacent.
+        // Strictly after the enqueue above, and against the exact batch captured
+        // before it. Being `supported` is part of what makes a page drifted:
+        // demoting a fresh SELECT empties that predicate, while demoting more
+        // rows than the bounded enqueue makes the tail disappear forever. The
+        // temp batch binds both halves to one durable set.
         //
         // `evaluated_at = NULL` for the same reason it is NULL there: the page
         // lands on `Unevaluated`, so it keeps its projected file. We have stopped
@@ -674,29 +706,27 @@ impl MemoryDB {
         // not, which is the honest state when the bar moved under a stored
         // verdict.
         conn.execute(
-            &format!(
-                "UPDATE page_truth_state
+            "UPDATE page_truth_state
                     SET support_status = 'provisional',
                         provisional_reason = 'supporting evidence no longer clears the \
                                               threshold; this page needs re-derivation',
                         evaluated_at = NULL,
-                        updated_at = ?2
+                        updated_at = ?1
                   WHERE support_status = 'supported'
                     AND (page_id, page_version) IN (
-                        SELECT drifted_page_id, drifted_page_version
-                          FROM ({DRIFTED_SUPPORTED_PAGES})
-                    )"
-            ),
-            libsql::params![SUPPORT_THRESHOLD, now],
+                        SELECT page_id, page_version
+                          FROM claim_derivation_drift_batch
+                    )",
+            libsql::params![now],
         )
         .await
         .map_err(|error| WenlanError::VectorDb(format!("derivation drift demotion: {error}")))?;
 
-        Ok((created + re_derive) as usize)
+        Ok((created + drifted) as usize)
     }
 
     /// Run [`Self::enqueue_stale_derivation_jobs`] until the backlog is drained,
-    /// in batches of `batch`. Returns the total enqueued.
+    /// in batches of `batch`. Returns the total pages advanced.
     ///
     /// The bound on a single scan is a boot-latency bound, not a policy: the
     /// migration runs while the daemon is still coming up, and a full scan of a

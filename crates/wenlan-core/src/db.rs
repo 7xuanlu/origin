@@ -11891,10 +11891,9 @@ impl MemoryDB {
     /// full scan.
     ///
     /// The bound needs a continuation or it is a silent truncation: on a vault
-    /// of 1,200 pages this queues 500 and the other 700 are reachable only by
-    /// being edited. [`MemoryDB::drain_stale_derivation_jobs`] is that
-    /// continuation, and the daemon calls it once per boot (see
-    /// `wenlan-server`'s startup), after the port work that must not wait on it.
+    /// of 1,200 pages this queues 500 and leaves 700 for the daemon's
+    /// shutdown-aware runtime worker, which advances one bounded batch per turn
+    /// after the listener can serve requests.
     async fn migrate_105_claim_derivation_queue(&self, _prior: i64) -> Result<(), WenlanError> {
         {
             let conn = self.conn.lock().await;
@@ -11915,7 +11914,9 @@ impl MemoryDB {
                 .map_err(|error| WenlanError::VectorDb(format!("m105 commit: {error}")))?;
         }
 
-        let enqueued = self.enqueue_stale_derivation_jobs(500).await?;
+        let enqueued = self
+            .enqueue_stale_derivation_jobs(claim_derivation::MIGRATION_105_BACKLOG_SEED_LIMIT)
+            .await?;
 
         let conn = self.conn.lock().await;
         conn.execute("PRAGMA user_version = 105", ())

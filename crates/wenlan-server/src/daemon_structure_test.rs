@@ -6,6 +6,8 @@ const MAIN_ROOT: &str = "crates/wenlan-server/src/main.rs";
 const SCHEDULER_ROOT: &str = "crates/wenlan-server/src/scheduler.rs";
 const MAIN_STARTUP_CHILD: &str = "crates/wenlan-server/src/main/startup.rs";
 const MAIN_RUNTIME_CHILD: &str = "crates/wenlan-server/src/main/runtime.rs";
+const CORE_DB_ROOT: &str = "crates/wenlan-core/src/db.rs";
+const CORE_CLAIM_DERIVATION: &str = "crates/wenlan-core/src/db/claim_derivation.rs";
 const SCHEDULER_AMBIENT_CHILD: &str = "crates/wenlan-server/src/scheduler/ambient.rs";
 const BIND_TESTS: &str = "crates/wenlan-server/src/bind_addr_tests.rs";
 const SCHEDULER_TESTS: &str = "crates/wenlan-server/src/scheduler/scheduler_tests.rs";
@@ -1986,6 +1988,8 @@ fn truth_reconciliation_work_runs_only_in_the_runtime_worker() {
     let root = repo_root();
     let startup = read_source(&root, MAIN_STARTUP_CHILD);
     let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let core_db = read_source(&root, CORE_DB_ROOT);
+    let claim_derivation = read_source(&root, CORE_CLAIM_DERIVATION);
 
     assert!(
         startup.contains("begin_support_reconcile_pass("),
@@ -2007,6 +2011,20 @@ fn truth_reconciliation_work_runs_only_in_the_runtime_worker() {
             "the shutdown-aware runtime continuation is missing {required}"
         );
     }
+    assert!(
+        startup.contains("wenlan_core::db::MemoryDB::new("),
+        "normal startup must keep the constructor alias visible to the placement tooth"
+    );
+    assert!(
+        claim_derivation.contains("pub(super) const MIGRATION_105_BACKLOG_SEED_LIMIT: i64 = 500;"),
+        "migration 105's constructor-time queue seed must stay explicitly bounded"
+    );
+    assert!(
+        core_db.contains(
+            "enqueue_stale_derivation_jobs(claim_derivation::MIGRATION_105_BACKLOG_SEED_LIMIT)"
+        ),
+        "the one bounded constructor-time exception must remain named and reviewable"
+    );
 }
 
 #[test]

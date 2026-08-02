@@ -1099,9 +1099,11 @@ async fn a_verdict_from_a_superseded_extractor_stops_being_readable() {
 /// worker would put queue mutations into the one mode that promised none.
 ///
 /// Startup must not call `drain_stale_derivation_jobs`: looping to exhaustion
-/// before `serve` has no wall-clock bound. The optional runtime worker instead
-/// calls one enqueue sweep per turn and yields, under the existing repair-mode
-/// fence. The durable queue makes that continuation restart-safe.
+/// before `serve` has no wall-clock bound. `MemoryDB::new` does run migration
+/// 105's one-time, named 500-row seed before serving; the optional runtime
+/// worker continues that bounded exception one sweep per turn and yields under
+/// the existing repair-mode fence. The durable queue makes the continuation
+/// restart-safe.
 #[test]
 fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
     let sources = workspace_sources();
@@ -1115,11 +1117,35 @@ fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
         .find(|(path, _)| path.ends_with("crates/wenlan-server/src/main/runtime.rs"))
         .map(|(_, body)| body.as_str())
         .expect("runtime.rs must be in the production source inventory");
+    let db = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-core/src/db.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("db.rs must be in the production source inventory");
+    let claim_derivation = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-core/src/db/claim_derivation.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("claim_derivation.rs must be in the production source inventory");
 
     assert!(
         !startup.contains("drain_stale_derivation_jobs(")
             && !startup.contains("enqueue_stale_derivation_jobs("),
-        "pre-serve startup must open only the read gate, never run data-sized backlog work"
+        "startup.rs must not directly run data-sized backlog work"
+    );
+    assert!(
+        startup.contains("wenlan_core::db::MemoryDB::new("),
+        "the placement tooth must trace the normal constructor alias, not only direct calls"
+    );
+    assert!(
+        claim_derivation.contains("pub(super) const MIGRATION_105_BACKLOG_SEED_LIMIT: i64 = 500;"),
+        "migration 105's one permitted pre-serve queue write needs an explicit bounded contract"
+    );
+    assert!(
+        db.contains(
+            "enqueue_stale_derivation_jobs(claim_derivation::MIGRATION_105_BACKLOG_SEED_LIMIT)"
+        ),
+        "MemoryDB::new reaches migration 105, whose pre-serve queue seed must use the named bound"
     );
     let fence = runtime
         .find("if optional_runtime_workers_allowed(repair_recovery_pending)")
