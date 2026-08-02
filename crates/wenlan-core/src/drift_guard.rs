@@ -3556,8 +3556,18 @@ fn ci_fans_out_one_prepared_fastembed_artifact_per_run() {
     let ci: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse ci.yml");
     let artifact_name = "fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}";
 
-    let producer = job_step_using(&ci, "detect-changes", "actions/upload-artifact")
-        .expect("detect-changes must publish the prepared FastEmbed snapshot");
+    let producer = job_step(
+        &ci,
+        "detect-changes",
+        "Publish portable FastEmbed model for this run",
+    )
+    .expect("detect-changes must publish the prepared FastEmbed snapshot");
+    assert!(
+        producer["uses"]
+            .as_str()
+            .is_some_and(|action| action.starts_with("actions/upload-artifact@")),
+        "FastEmbed producer must use upload-artifact"
+    );
     assert_eq!(
         producer["with"]["name"].as_str(),
         Some(artifact_name),
