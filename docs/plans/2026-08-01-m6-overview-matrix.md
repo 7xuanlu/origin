@@ -145,26 +145,34 @@ it single is a title lookup.
 
 D11: *"At most one active subscription per `(scope_kind, scope_id)`."*
 
-> **Decision S0-74 — the constraint is a primary key on the active-subscription
-> table, not a uniqueness check in code.**
+> **Decision S0-74 — retained subscription history has its own collision-safe
+> identity; live exclusivity is enforced by partial unique indexes, not a
+> uniqueness check in code.**
 >
 > ```sql
 > CREATE TABLE m6_overview_subscriptions (
+>     subscription_id TEXT PRIMARY KEY,
 >     scope_kind   TEXT NOT NULL CHECK(scope_kind IN ('install','space','community')),
 >     scope_id     TEXT NOT NULL,
 >     page_id      TEXT NOT NULL,
->     space        TEXT NOT NULL,
+>     space        TEXT,
 >     state        TEXT NOT NULL CHECK(state IN ('active','detached')),
 >     created_at   INTEGER NOT NULL,
 >     detached_at  INTEGER,
->     PRIMARY KEY (scope_kind, scope_id)
+>     CHECK ((scope_kind = 'install' AND space IS NULL) OR
+>            (scope_kind <> 'install' AND space IS NOT NULL))
 > );
+> CREATE UNIQUE INDEX idx_m6_overview_sub_scope_active
+>     ON m6_overview_subscriptions(scope_kind, scope_id)
+>     WHERE state = 'active';
 > CREATE UNIQUE INDEX idx_m6_overview_sub_page
 >     ON m6_overview_subscriptions(page_id) WHERE state = 'active';
 > ```
 >
-> The primary key gives D11's at-most-one directly. The second index gives the
-> converse — one active subscription per page — which D11 does not state but G8's
+> `subscription_id` makes `created_at` ordinary retained data and allows a scope
+> to subscribe again after an earlier row is detached. The first index gives
+> D11's at-most-one-live rule directly. The second gives the converse — one
+> active subscription per page — which D11 does not state but G8's
 > "duplicate subscription" case needs, because without it two scopes could both
 > point at one page and a detach of either would half-orphan it.
 >
@@ -517,7 +525,7 @@ here:
 | partitioner swap | S0-72 | changing the partitioner changes membership but the subscription is keyed on the community ID, so no subscription row is written |
 | label proposal | §5, S0-80 | accepting a display name updates `communities.display_name` and **not** `pages.title` |
 | stale-generation acceptance | §7 | a proposal carrying a `source_generation` older than the current one is rejected, and the loser stays detached rather than being retro-transferred |
-| duplicate subscription | S0-74 | the primary key and the partial unique index each reject their direction; assert both, since one index catches only one shape |
+| duplicate subscription | S0-74 | the scope and page partial unique indexes each reject their direction; assert both, since one index catches only one shape |
 | human-edited overview | S0-79 | the four prohibitions, asserted on a detached human-edited page |
 | detached loser | S0-78 | readable, not refreshed, **and not marked stale** |
 | space overview | S0-83 | no `scope_kind='space'` row written during a community event |
@@ -533,7 +541,7 @@ with no adversarial effort beyond choosing an ordinary word as a community name.
 `S0-71` no rebind subscription; an explicit merge-loser detach rule instead ·
 `S0-72` "maximum overlap" means M4's weighted metric, never recomputed ·
 `S0-73` the existing global Overview is its own `install` scope kind ·
-`S0-74` at-most-one is a primary key, plus a partial unique index for the converse ·
+`S0-74` retained rows use `subscription_id`; two partial unique indexes enforce the live scope and page directions ·
 `S0-75` split stages no M6 proposal ·
 `S0-76` detach is automatic; transfer and retire are not ·
 `S0-77` one proposal per (merge event, losing scope), with a derived coalescing ID ·

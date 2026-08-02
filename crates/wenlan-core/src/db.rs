@@ -115,6 +115,8 @@ mod kg_quality_vocabulary_test;
 #[cfg(test)]
 mod lint_snapshot_test;
 #[cfg(test)]
+mod m6_followup_schema_test;
+#[cfg(test)]
 mod maintenance_duplicate_reads_test;
 #[cfg(test)]
 mod maintenance_queue_test;
@@ -695,9 +697,9 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-/// Migration 108 is M6 PR-A's genesis substrate. It follows the M5 Truth
-/// migrations 105/106 and the page-kind repair at 107.
-pub const SCHEMA_VERSION: u32 = 108;
+/// Migration 109 completes M6 PR-A's additive substrate after the user-ratified
+/// D1-D8 contract amendment. It follows the partial genesis substrate at 108.
+pub const SCHEMA_VERSION: u32 = 109;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8431,6 +8433,15 @@ impl MemoryDB {
             if version < 108 {
                 self.migrate_108_genesis_substrate(version).await?;
             }
+
+            // Migration 109 (M6 PR-A follow-up): the fourteen remaining
+            // durable tables plus the per-space mutation counter whose shapes
+            // were blocked on the D1-D8 contract-defect rulings. The tables
+            // start empty and the counter backfills to zero, so no M6 writer or
+            // reader is enabled by this migration.
+            if version < 109 {
+                self.migrate_109_m6_substrate_followup(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12181,6 +12192,42 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("m108 bump: {error}")))?;
         log::info!("[migration] Migration 108 applied: M6 genesis substrate (partial by design)");
+        Ok(())
+    }
+
+    /// Migration 109 (M6 PR-A follow-up): complete the inert M6 substrate.
+    ///
+    /// The preceding migration deliberately stopped at the five objects whose
+    /// Stage-0 contracts were internally coherent. The user has since ratified
+    /// the D1-D8 amendment that fixes the remaining liveness, identity, and
+    /// readiness contradictions. All fourteen new tables and the one added
+    /// `genesis_coverage_state.m6_mutation_count` column land in one additive
+    /// transaction. Nothing here schedules work or changes a reader/writer
+    /// fence; later M6 rungs remain responsible for every behavior switch.
+    async fn migrate_109_m6_substrate_followup(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m109 begin: {error}")))?;
+
+        crate::m6::frontier_policy::ensure_frontier_policy_tables(&tx)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m109 frontier: {error}")))?;
+        crate::m6::overview_subscriptions::ensure_overview_subscription_tables(&tx).await?;
+        crate::m6::refresh_readiness::ensure_refresh_readiness_tables(&tx)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m109 refresh: {error}")))?;
+        crate::m6::relevance::ensure_relevance_tables(&tx).await?;
+        crate::m6::remaining_substrate::ensure_remaining_substrate(&tx).await?;
+
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m109 commit: {error}")))?;
+        conn.execute("PRAGMA user_version = 109", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m109 bump: {error}")))?;
+        log::info!("[migration] Migration 109 applied: M6 substrate follow-up (inert)");
         Ok(())
     }
 

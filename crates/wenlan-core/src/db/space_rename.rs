@@ -85,6 +85,21 @@ const CLOSURE: &[(&str, bool)] = &[
     ("genesis_coverage_state", true),
     ("genesis_group_coverage", true),
     ("genesis_frontier", true),
+    // Migration 109 completes the M6 substrate. Relevance rows and refresh
+    // jobs are re-derivable; human decisions, readiness evidence, exact
+    // dependency snapshots, retained subscriptions, and monotone counters are
+    // permanent and are fenced below before any destination cleanup occurs.
+    ("m6_pair_stats", true),
+    ("m6_adjacency", true),
+    ("genesis_refresh_jobs", false),
+    ("m6_refresh_dependencies", true),
+    ("m6_readiness", true),
+    ("m6_readiness_soak_receipts", true),
+    ("genesis_suppression", true),
+    ("genesis_card_binding", true),
+    ("genesis_quarantine", true),
+    ("m6_overview_subscriptions", false),
+    ("m6_counters", false),
 ];
 
 const PERMANENT_GENESIS_TABLES: &[&str] = &[
@@ -92,7 +107,21 @@ const PERMANENT_GENESIS_TABLES: &[&str] = &[
     "genesis_coverage_state",
     "genesis_group_coverage",
     "genesis_frontier",
+    "m6_refresh_dependencies",
+    "m6_readiness",
+    "m6_readiness_soak_receipts",
+    "genesis_suppression",
+    "genesis_card_binding",
+    "genesis_quarantine",
+    "m6_overview_subscriptions",
+    "m6_counters",
 ];
+
+/// Re-derivable rows whose `space` is not part of their primary key. They do
+/// not collide mechanically with the renamed source row, but leaving an orphan
+/// under the destination name would make unrelated stale work live when the
+/// space rename creates that name.
+const DESTINATION_ORPHANS_TO_RETIRE: &[&str] = &["genesis_refresh_jobs"];
 
 /// Rewrite every space-keyed row from `old_name` to `new_name` inside the
 /// caller's transaction. The caller must already have renamed the `spaces` row
@@ -133,6 +162,17 @@ pub(super) async fn cascade_space_rename(
         }
     }
 
+    for table in DESTINATION_ORPHANS_TO_RETIRE {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE space = ?1"),
+            libsql::params![new_name],
+        )
+        .await
+        .map_err(|e| {
+            WenlanError::VectorDb(format!("update_space retire orphan {table} rows: {e}"))
+        })?;
+    }
+
     for (table, space_in_primary_key) in CLOSURE {
         if !space_in_primary_key {
             continue;
@@ -161,4 +201,11 @@ pub(super) async fn cascade_space_rename(
 #[cfg(test)]
 pub(super) fn closed_tables() -> Vec<&'static str> {
     CLOSURE.iter().map(|(table, _)| *table).collect()
+}
+
+/// Permanent M6 rows for which a destination-name orphan refuses the rename
+/// instead of being silently discarded.
+#[cfg(test)]
+pub(super) fn permanent_tables() -> Vec<&'static str> {
+    PERMANENT_GENESIS_TABLES.to_vec()
 }

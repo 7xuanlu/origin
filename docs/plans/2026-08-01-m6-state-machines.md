@@ -19,7 +19,18 @@ checkout is the user's; nothing in this work modifies it. Verify a citation with
 rather than terminal-final, adding transition A19 and decision S0-151. Rev 1's
 S0-numbers are unchanged; nothing was renumbered.
 
-**Status.** Contract only. No schema, no code. Per Stage 0, no M6 schema or production code begins until the prerequisite gate is current and green against post-M5 `main`.
+The approved 2026-08-02 D2=A/D3=A amendment makes suppression and card-binding
+rows retained history with stored liveness. In this artifact, "exactly one
+durable reason" therefore means exactly one **live** reason:
+`genesis_suppression.lapsed_at IS NULL` or
+`genesis_card_binding.closed_at IS NULL`. The authorized J1 judgment applies
+the same retained-history rule to quarantine (`lifted_at IS NULL`). Historical
+rows do not count.
+
+**Status.** Contract plus disabled additive substrate. Migrations 108 and 109
+install the state-machine tables and storage invariants, but no M6 writer,
+reader cutover, or automatic job is enabled. Runtime wiring remains owned by
+the later PR-B/PR-C rungs.
 
 ---
 
@@ -38,7 +49,7 @@ That sentence cannot be expressed in any of the other five machines — a candid
 | C | Lease | one (phase, space, input generation) operation | `grouping_leases` (**exists**) | G3 |
 | D | Coverage epoch | one space's identity-contract era | `genesis_coverage_state` (new) | G10 |
 | E | Finalization | one publish attempt's atomicity | the outer transaction + `page_projection_outbox` | G4 |
-| F | Group / frontier | one independence group in one epoch | `genesis_frontier` + `genesis_group_coverage` (new) | G5 |
+| F | Group / frontier | one independence group in one epoch | `genesis_frontier` + `genesis_group_coverage` + retained card/suppression histories (new) | G5 |
 
 Only machine C has an existing physical substrate. The other five are contract-first; PR-A introduces their tables disabled.
 
@@ -285,7 +296,13 @@ stateDiagram-v2
 
 ## 7. Machine D — coverage epoch
 
-**Object.** One space's identity-contract era. **Durable home.** `genesis_coverage_state(space PRIMARY KEY, coverage_epoch, epoch_state, opened_at, migration_cursor, genesis_enabled)`.
+**Object.** One space's identity-contract era. **Durable home.**
+`genesis_coverage_state(space PRIMARY KEY, space_id UNIQUE, coverage_epoch,
+epoch_state, opened_at, migration_cursor, genesis_enabled,
+m6_mutation_count)`. `space_id` is the immutable `spaces.id`; `space` is its
+renameable display-name projection. Migration 109 and storage triggers require
+the pair to resolve to the same live space on insert/name change, while a
+retained proof may remain deliberately orphaned after `delete_space("keep")`.
 
 Two orthogonal facts live here, and conflating them is the error this section exists to prevent:
 
@@ -395,7 +412,15 @@ This is a structural consequence of the machine as specified: the model call hap
 
 ## 9. Machine F — group / frontier reconciliation
 
-**Object.** One independence group in one coverage epoch, per space. **Durable home.** `genesis_frontier` (keyed by space, independence group, coverage epoch — D7) plus `genesis_group_coverage` for the permanent-coverage state. Frontier ordering is D7's `next_scan_at, first_seen_at, group_id`.
+**Object.** One independence group in one coverage epoch, per space. **Durable
+home.** `genesis_frontier` (keyed by space, independence group, coverage epoch
+— D7), `genesis_group_coverage` for permanent coverage,
+`genesis_card_binding` for retained per-group card history, and
+`genesis_suppression` for repeatable append-only suppression history, and
+`genesis_quarantine` for repeatable retained quarantine history. Frontier
+ordering is D7's `next_scan_at, first_seen_at, group_id`. Only open card
+bindings (`closed_at IS NULL`), unlapsed suppressions (`lapsed_at IS NULL`),
+and unlifted quarantines (`lifted_at IS NULL`) are live reasons.
 
 This is the machine that carries D4's closing rule.
 
@@ -424,16 +449,16 @@ stateDiagram-v2
 |---|---|---|---|---|---|
 | F1 | ∅ → `waiting_frontier` | differential query finds an eligible uncovered group | group passes D1's relaxed independence floor | frontier row, `first_seen_at = unixepoch()`, `next_scan_at` set | The differential query is the source of truth (G5). A crash simply means the group is found again on the next scan; frontier rows are re-derivable, which is why F1 needs no atomicity with anything. |
 | F2 | `waiting_frontier` → `exclusively_claimed` | concept prepare (B1) | partial unique indexes accept | frontier row retires; reservation row is the durable reason | Same transaction as A2/B1. |
-| F3 | `waiting_frontier` → `surfaced_card` | evidence below the admission floor for more than 7 days (D7) | — | **one coalesced unformed-topic card** for all such groups in the space | D7 says *one* card, not one per group: the card is coalesced. Crash-safe because card creation is idempotent on (space, epoch, card kind). |
+| F3 | `waiting_frontier` → `surfaced_card` | evidence below the admission floor for more than 7 days (D7) | — | **one coalesced unformed-topic card** for all such groups in the space, plus one retained open binding per group | D7 says *one* card, not one per group: the card is coalesced while its bindings remain per-group. Crash-safe because card creation is idempotent on (space, epoch, card kind), and a partial unique index permits at most one open binding per group/epoch. |
 | F4 | `exclusively_claimed` → `covered` | genesis finalize commits (B5, E2) | inside the one outer transaction | permanent `genesis_group_coverage` row | All-or-nothing with the page. |
 | F5 | `exclusively_claimed` → `waiting_frontier` | reservation released without publishing (B4 via A14/A15/A16, or B6) | — | frontier row re-inserted, `next_scan_at` per S0-2 backoff where applicable | **Same transaction as the release** (D4). This is the edge that keeps I-1 true across every terminal exit. |
-| F6 | `exclusively_claimed` → `surfaced_card` | candidate → `review_required` (A12) | — | group bound to the durable surfaced review card | Same transaction as the reservation release (A12). |
-| F7 | `exclusively_claimed` \| `surfaced_card` → `suppressed` | candidate suppressed, or card dismissed by a human (A17) | — | suppression row, `expires_at = unixepoch() + 180 days` (D7); suppression identity is durable (D14) | The suppression identity survives compaction (S0-10) and rollback (D14). |
-| F8 | `surfaced_card` → `waiting_frontier` | card expires (A18) | — | frontier row re-inserted | D4: expiry moves it through the normal frontier transition. |
-| F9 | any → `quarantined` | explicit quarantine | an operator or a policy rule records a reason | quarantine row with an explicit, durable reason string | D7 requires the reason to be explicit; a group may never arrive here by default or by omission. |
+| F6 | `exclusively_claimed` → `surfaced_card` | candidate → `review_required` (A12) | — | group bound to the durable surfaced review card with `created_at` and `closed_at=NULL` | Same transaction as the reservation release (A12). |
+| F7 | `exclusively_claimed` \| `surfaced_card` → `suppressed` | candidate suppressed, or card dismissed by a human (A17) | — | append suppression keyed by `(space, independence_group_id, coverage_epoch, suppressed_at)`, with `page_id` as identity and `lapsed_at=NULL` | For a shared card, one transaction closes **every** live binding for `card_id` before writing each replacement suppression. Failure after closure or after any per-group insert rolls everything back. Both card and suppression histories survive compaction and rollback. |
+| F8 | `surfaced_card` → `waiting_frontier` | card expires (A18) | — | close the binding and re-insert the frontier row in one transaction | D4: expiry moves it through the normal frontier transition; the closed binding remains history and no longer counts. |
+| F9 | any → `quarantined` | explicit quarantine | an operator or a policy rule records a reason | append a row keyed by `(space, independence_group_id, coverage_epoch, quarantined_at)` with non-empty reason and `lifted_at=NULL` | D7 requires the reason to be explicit; a partial unique index permits at most one live row per group/epoch, and the transition from the prior reason is atomic. |
 | F10 | `waiting_frontier` → `covered` | the group is a mirror of an already-covered group | a permanent coverage row exists for the group at this epoch | coverage recorded immediately, no candidate | D4: *"a durable group-coverage row makes future mirrors of an already-covered group covered immediately."* No LLM, no lease, no candidate. |
-| F11 | `suppressed` → `waiting_frontier` | 180 days elapse | — | frontier row re-inserted; **suppression identity is retained** | The row moves out of suppression; the identity of what was suppressed is not deleted (D7, D14). |
-| F12 | `quarantined` → `waiting_frontier` | quarantine explicitly lifted | — | frontier row re-inserted | Requires the same explicitness as F9. |
+| F11 | `suppressed` → `waiting_frontier` | reconciler observes `expires_at <= unixepoch()` | — | stamp `lapsed_at` **before** re-inserting frontier, in one transaction; suppression identity is retained | Wall-clock expiry alone does not change the live reason. The stored marker and frontier replacement commit together; a later same-epoch suppression appends a new row. |
+| F12 | `quarantined` → `waiting_frontier` | quarantine explicitly lifted | — | stamp `lifted_at` before restoring frontier, in one transaction | The retained row no longer counts; a later explicit quarantine appends a new row rather than overwriting history. |
 
 **Cursor wrap, restart, quota exhaustion, and a permanently small space may delay work but may never lose or silently park evidence** (D7). Structurally: F1 is driven by a differential query rather than an incremental queue, so a lost cursor costs a rescan and never a lost group; F3's 7-day rule guarantees that even a space that never reaches the admission floor surfaces once (G5's positive control); and S0-5's recovery scan guarantees F5 fires for every reservation orphaned by a crash.
 
@@ -445,7 +470,7 @@ These are the properties no single machine can state. Each names the gate that p
 
 | # | Invariant | Where it could break | Gate |
 |---|---|---|---|
-| **I-1** | **Every group outside `waiting_frontier` has exactly one durable reason** — an active bounded reservation, permanent coverage, surfaced review, time-bounded suppression, or explicit quarantine. Never zero, never two. | Any non-atomic pairing of a reservation release (B4/B6) with the group's next state (F5–F9). Every such pair is specified as one transaction for this reason. | G5, and G3's terminal-exit crash matrix |
+| **I-1** | **Every group outside `waiting_frontier` has exactly one live durable reason** — an active bounded reservation, permanent coverage, open surfaced review, unlapsed suppression, or unlifted quarantine. Never zero, never two. Closed/lapsed rows remain history and do not count. | Any non-atomic pairing of a reservation release or card closure with the group's next state (F5–F9/F11). Every such pair is specified as one transaction for this reason. | G5, and G3's terminal-exit crash matrix |
 | **I-2** | **One slot publishes at most one page.** Overlapping concept candidates cannot both mint. | The partial unique indexes of §5 are the only enforcement; a code-level check would be a second, weaker one. | G3 |
 | **I-3** | **A witness row is never readable as coverage.** Overview candidates never consume concept coverage. | Any query that reads `genesis_candidate_roots` without filtering `claim_role`. | G2, G3 |
 | **I-4** | **A published page and its coverage, claims, truth state, receipt, and lease consumption are one atomic fact.** | Any use of a self-committing M5 finalizer inside the genesis path, or any nested transaction. | G4 |
@@ -506,6 +531,6 @@ G3, G4, and G5 are the executable form of this artifact. The mapping is one-way 
 
 - **G3 `m6_overlapping_candidates_publish_once`** consumes machines A, B, and C. Its *"crash-test every reservation exit: published, bounded retry, review-required, stale, suppressed, superseded, exhausted retry, and compaction"* maps onto B5, B3, A12, A7/A14/A15, A17, A16, A14 with `reason='retry_exhausted'`, and §4's compaction paragraph. Each `stale` exit it crash-tests must also be driven through A19 to prove the slot is re-preparable — a terminal-looking exit that silently strands its group is exactly the rev-1 defect finding 3 caught. Its assertion that each transition *"must atomically leave every group in permanent coverage, an active bounded reservation, frontier, surfaced review, suppression, or quarantine"* is invariant I-1 over machine F.
 - **G4 `m6_finalize_is_all_or_nothing`** consumes machine E. Its injection points — *"failure and concurrent root retraction, dependency change, human edit, community generation change, lease expiry, and claim loss at every finalize boundary"* — map onto gates E-6, E-8, E-8, E-7, E-1, and E-5.
-- **G5 `m6_frontier_has_no_missing_root`** consumes machine F and invariant I-1, and its *"cover cursor wrap, restart, quota exhaustion, liveness transitions, compaction, and seven-day surfacing"* maps onto §11, S0-9's no-attempt-charge rule, F3, and S0-10.
+- **G5 `m6_frontier_has_no_missing_root`** consumes machine F and invariant I-1, and its *"cover cursor wrap, restart, quota exhaustion, liveness transitions, compaction, and seven-day surfacing"* maps onto §11, S0-9's no-attempt-charge rule, F3, and S0-10. The amendment adds suppress → lapse → frontier → suppress again with both suppression histories retained, plus one shared-card dismissal injected after closing all bindings and after each replacement suppression; every committed or rolled-back observation must leave exactly one live reason per group.
 
 Where a gate and this artifact disagree, the gate is right and this document is the thing to fix — the executable test is the contract's real teeth, and this is its seed.
