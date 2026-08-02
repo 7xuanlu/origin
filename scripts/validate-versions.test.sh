@@ -195,3 +195,6 @@ echo "PASS test 10: release jobs pin the event SHA and verify the receipt-derive
 
 python3 "$REPO_ROOT/scripts/release-workflow-contract.test.py"
 echo "PASS test 11: release promotion and public install contracts"
+
+bash "$REPO_ROOT/scripts/bump-version.test.sh"
+echo "PASS test 12: release version sync disables npm lifecycle scripts"

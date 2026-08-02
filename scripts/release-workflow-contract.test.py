@@ -20,6 +20,7 @@ OBSERVER_PATH = REPO_ROOT / ".github" / "workflows" / "release-candidate-observe
 VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate-release-candidate.py"
 ARCHIVE_PATH = REPO_ROOT / "scripts" / "release_archive.py"
 PROMOTION_PATH = REPO_ROOT / "scripts" / "release-promotion.py"
+SYNC_RELEASE_PR_PATH = REPO_ROOT / "scripts" / "sync-release-pr.py"
 RUNTIME_IMAGE_PATH = REPO_ROOT / "scripts" / "verify-release-runtime-image.py"
 
 EXPECTED_NODE24_ACTIONS = {
@@ -60,6 +61,7 @@ def contract_violations(
     release_please_config: str,
     fast_maintenance: str,
     promotion: str,
+    sync_release_pr: str,
 ) -> list[str]:
     """Keep release publication bound to the PR-built immutable archives."""
 
@@ -132,6 +134,59 @@ def contract_violations(
     ]:
         if marker not in maintain:
             violations.append(f"ordinary release-please path omits PR-only contract {marker!r}")
+    for workflow, label, trusted_ref in [
+        (fast_maintenance, "fast", "${{ github.sha }}"),
+        (release_please, "fallback", "${{ github.event.workflow_run.head_sha }}"),
+    ]:
+        maintenance_job = job_body(workflow, "maintain-release-pr")
+        trusted_checkout = named_step_body(
+            maintenance_job, "Checkout trusted release PR synchronizer"
+        )
+        resolver = named_step_body(maintenance_job, "Resolve exact pending Release PR")
+        exact_checkout = named_step_body(
+            maintenance_job, "Checkout exact release PR head"
+        )
+        synchronizer = named_step_body(
+            maintenance_job, "Merge main and sync release PR branch"
+        )
+        for marker in [
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+            f"ref: {trusted_ref}",
+            "persist-credentials: false",
+        ]:
+            if marker not in trusted_checkout:
+                violations.append(f"{label} maintenance trusted checkout omits {marker!r}")
+        for marker in [
+            "id: release_pr",
+            "GITHUB_TOKEN: ${{ github.token }}",
+            'cp scripts/sync-release-pr.py "$RUNNER_TEMP/sync-release-pr.py"',
+            'cp scripts/bump-version.sh "$RUNNER_TEMP/bump-version.sh"',
+            'python3 "$RUNNER_TEMP/sync-release-pr.py" resolve',
+            '--repository "$GITHUB_REPOSITORY"',
+            '--github-output "$GITHUB_OUTPUT"',
+        ]:
+            if marker not in resolver:
+                violations.append(f"{label} maintenance resolver omits {marker!r}")
+        for marker in [
+            "if: steps.release_pr.outputs.release_pr_state == 'present'",
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+            "ref: ${{ steps.release_pr.outputs.release_pr_head_sha }}",
+            "token: ${{ secrets.RELEASE_TOKEN }}",
+            "fetch-depth: 0",
+            "persist-credentials: true",
+        ]:
+            if marker not in exact_checkout:
+                violations.append(f"{label} maintenance exact checkout omits {marker!r}")
+        for marker in [
+            "if: steps.release_pr.outputs.release_pr_state == 'present'",
+            'python3 "$RUNNER_TEMP/sync-release-pr.py" sync',
+            '--expected-head-sha "${{ steps.release_pr.outputs.release_pr_head_sha }}"',
+            '--bump-script "$RUNNER_TEMP/bump-version.sh"',
+        ]:
+            if marker not in synchronizer:
+                violations.append(f"{label} maintenance synchronizer omits {marker!r}")
+        if "steps.release.outputs.pr" in maintenance_job:
+            violations.append(f"{label} maintenance still trusts optional action PR output")
     create_tag = job_body(release_please, "create-validated-tag")
     for marker in [
         "needs.route-main.outputs.state == 'validated'",
@@ -181,9 +236,7 @@ def contract_violations(
         "manifest-file: .release-please-manifest.json",
         "config-file: release-please-config.json",
         "target-branch: main",
-        "ref: release-please--branches--main",
-        "bash scripts/bump-version.sh",
-        "git push origin HEAD",
+        "scripts/sync-release-pr.py",
     ]:
         if marker not in fast_maintenance:
             violations.append(f"fast release maintenance omits {marker!r}")
@@ -207,18 +260,41 @@ def contract_violations(
             violations.append(
                 f"fast release maintenance contains publishing or unsafe path {forbidden!r}"
             )
-    push_commands = [
-        line.strip()
-        for line in fast_job.splitlines()
-        if line.strip().startswith("git push")
-    ]
-    if push_commands != ["git push origin HEAD"]:
-        violations.append(
-            f"fast release maintenance push is not exact non-force sync: {push_commands!r}"
-        )
     for uses in re.findall(r"\buses:\s+([^\s#]+)", fast_maintenance):
         if re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", uses) is None:
             violations.append(f"fast release maintenance action is not SHA-pinned: {uses!r}")
+
+    for marker in [
+        '"X-GitHub-Api-Version": "2026-03-10"',
+        '"state": "open"',
+        '"base": BASE_BRANCH',
+        '"head": f"{RELEASE_AUTHOR}:{RELEASE_BRANCH}"',
+        "if owner != RELEASE_AUTHOR:",
+        "if not payload:",
+        "if len(payload) != 1:",
+        'user.get("login") != RELEASE_AUTHOR',
+        'head["repo"].get("full_name") != repository',
+        "current != expected_head_sha",
+        '["git", "fetch", "--no-tags", "origin", BASE_BRANCH]',
+        '["git", "merge", "--no-edit", "origin/main"]',
+        '["bash", str(bump_script)]',
+        '["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{RELEASE_BRANCH}"]',
+        "remote_shas != [expected_head_sha]",
+        '"HEAD:refs/heads/release-please--branches--main"',
+        "except subprocess.CalledProcessError as error:",
+    ]:
+        if marker not in sync_release_pr:
+            violations.append(f"release PR synchronizer omits {marker!r}")
+    for forbidden in [
+        "git rebase",
+        "--force",
+        '"-f"',
+        "git tag",
+        "gh release",
+        "refs/tags/",
+    ]:
+        if forbidden in sync_release_pr:
+            violations.append(f"release PR synchronizer contains unsafe mutation {forbidden!r}")
 
     if re.search(r"\n\s+workflow_dispatch:", release):
         violations.append("tag release retains an unbound manual dispatch path")
@@ -799,6 +875,7 @@ def assert_mutation_detected(
     release_please_config: str,
     fast_maintenance: str,
     promotion: str,
+    sync_release_pr: str,
     old: str,
     new: str,
     expected: str,
@@ -812,6 +889,7 @@ def assert_mutation_detected(
         "release_please_config": release_please_config,
         "fast_maintenance": fast_maintenance,
         "promotion": promotion,
+        "sync_release_pr": sync_release_pr,
     }
     source = documents[owner]
     if old not in source:
@@ -824,6 +902,7 @@ def assert_mutation_detected(
         documents["release_please_config"],
         documents["fast_maintenance"],
         documents["promotion"],
+        documents["sync_release_pr"],
     )
     if not any(expected in violation for violation in violations):
         raise AssertionError(
@@ -841,8 +920,15 @@ def main() -> None:
     validator = VALIDATOR_PATH.read_text(encoding="utf-8")
     archive = ARCHIVE_PATH.read_text(encoding="utf-8")
     promotion = PROMOTION_PATH.read_text(encoding="utf-8")
+    sync_release_pr = SYNC_RELEASE_PR_PATH.read_text(encoding="utf-8")
     violations = contract_violations(
-        ci, release, release_please, release_please_config, fast_maintenance, promotion
+        ci,
+        release,
+        release_please,
+        release_please_config,
+        fast_maintenance,
+        promotion,
+        sync_release_pr,
     )
     violations.extend(candidate_observer_contract_violations(ci, observer, validator, archive))
     if violations:
@@ -892,16 +978,58 @@ def main() -> None:
             "fast_maintenance",
         ),
         (
-            "run: bash scripts/bump-version.sh",
-            "run: gh api /git/refs",
-            "publishing or unsafe path",
+            "ref: ${{ steps.release_pr.outputs.release_pr_head_sha }}",
+            "ref: release-please--branches--main",
+            "exact checkout omits",
             "fast_maintenance",
         ),
         (
-            "git push origin HEAD",
-            "git push --force origin HEAD",
-            "publishing or unsafe path",
-            "fast_maintenance",
+            "if not payload:",
+            "if False:",
+            "synchronizer omits",
+            "sync_release_pr",
+        ),
+        (
+            "if len(payload) != 1:",
+            "if False:",
+            "synchronizer omits",
+            "sync_release_pr",
+        ),
+        (
+            "if owner != RELEASE_AUTHOR:",
+            "if False:",
+            "synchronizer omits",
+            "sync_release_pr",
+        ),
+        (
+            'user.get("login") != RELEASE_AUTHOR',
+            'user.get("login") == RELEASE_AUTHOR',
+            "synchronizer omits",
+            "sync_release_pr",
+        ),
+        (
+            "current != expected_head_sha",
+            "False",
+            "synchronizer omits",
+            "sync_release_pr",
+        ),
+        (
+            "remote_shas != [expected_head_sha]",
+            "False",
+            "synchronizer omits",
+            "sync_release_pr",
+        ),
+        (
+            '["git", "merge", "--no-edit", "origin/main"]',
+            '["git", "rebase", "origin/main"]',
+            "synchronizer omits",
+            "sync_release_pr",
+        ),
+        (
+            '"HEAD:refs/heads/release-please--branches--main"',
+            '"+HEAD:refs/heads/release-please--branches--main"',
+            "synchronizer omits",
+            "sync_release_pr",
         ),
         (
             "group: release-pr-maintenance-main",
@@ -990,6 +1118,7 @@ def main() -> None:
             release_please_config,
             fast_maintenance,
             promotion,
+            sync_release_pr,
             old,
             new,
             expected,

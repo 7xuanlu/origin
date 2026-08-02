@@ -333,13 +333,14 @@ def _release_version_policy(config_text: str, old_version: str, new_version: str
     if not isinstance(packages, dict) or set(packages) != {"."}:
         raise CandidateError("release-please config package scope is not exactly root")
     package = packages["."]
-    allowed = {"release-type", "versioning", "release-as"}
+    allowed = {"release-type", "versioning", "always-update", "release-as"}
     if (
         not isinstance(package, dict)
-        or not {"release-type", "versioning"}.issubset(package)
+        or not {"release-type", "versioning", "always-update"}.issubset(package)
         or not set(package).issubset(allowed)
         or package.get("release-type") != "simple"
         or package.get("versioning") != "always-bump-patch"
+        or package.get("always-update") is not True
     ):
         raise CandidateError("release-please root package policy is not closed always-bump-patch")
     old_parts = _version(old_version, "base version")
