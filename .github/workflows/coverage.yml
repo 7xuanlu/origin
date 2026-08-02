@@ -5,40 +5,54 @@ name: Coverage (informational)
 # slowing the merge gate. See AGENTS.md "Local vs CI test responsibilities".
 
 on:
-  # Coverage was running on every PR (~7 min). Coverage is informational
-  # and rarely changes the merge decision; restrict to main pushes and
-  # manual dispatch so PRs aren't gated on it.
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/pull_request_template.md'
-      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Cancel a superseded manual/main run for the same ref.
-concurrency:
-  group: coverage-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  measure-plan:
+    name: route main measurements
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      coverage-required: ${{ steps.plan.outputs.coverage-required }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Plan main measurements
+        id: plan
+        env:
+          MEASURE_EVENT_NAME: ${{ github.event_name }}
+          MEASURE_BEFORE: ${{ github.event.before }}
+          MEASURE_HEAD: ${{ github.sha }}
+        run: |
+          python3 scripts/ci_measure_plan.py \
+            --event-name "$MEASURE_EVENT_NAME" \
+            --before "$MEASURE_BEFORE" \
+            --head "$MEASURE_HEAD" \
+            --github-output "$GITHUB_OUTPUT"
+
   coverage:
     name: Coverage report
+    needs: measure-plan
     runs-on: ubuntu-24.04
     if: >-
-      github.event_name != 'pull_request' ||
-      !startsWith(github.head_ref, 'release-please--branches--')
-    # Informational: never blocks merges. Failing this job is a warning, not a
-    # gate. Required-status-checks should NOT include this job.
-    continue-on-error: true
+      always() &&
+      (needs.measure-plan.result != 'success' ||
+       needs.measure-plan.outputs.coverage-required == 'true')
+    timeout-minutes: 60
+    # Keep concurrency on the expensive job: a non-owner push must not cancel
+    # a valid measurement that is already running.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     env:
       # Match ci.yml exactly so actions/cache computes the same cache version;
       # a cache miss may download the model but never changes correctness.
@@ -91,3 +105,4 @@ jobs:
           name: coverage-reports
           path: rust-coverage.json
           retention-days: 7
+          if-no-files-found: error

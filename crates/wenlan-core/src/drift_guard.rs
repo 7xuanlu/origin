@@ -478,6 +478,9 @@ fn coverage_single_test_execution_violations(workflow: &str) -> Vec<String> {
     let main_owned_cache = "${{ github.ref == 'refs/heads/main' }}";
     let rust_cache = job_step_using(&parsed, "coverage", "Swatinem/rust-cache");
     let mut violations = Vec::new();
+    if parsed["jobs"]["coverage"]["timeout-minutes"].as_u64() != Some(60) {
+        violations.push("coverage has no explicit 60-minute informational budget".into());
+    }
     if rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some(main_owned_cache) {
         violations.push("coverage cache writes are not restricted to main".into());
     }
@@ -547,6 +550,16 @@ fn coverage_single_test_execution_violations(workflow: &str) -> Vec<String> {
         violations.push(
             "coverage must render JSON and text summaries with two report-only commands".into(),
         );
+    }
+
+    let upload = job_step(&parsed, "coverage", "Upload coverage artifacts");
+    if upload
+        .and_then(|step| step["uses"].as_str())
+        .is_none_or(|uses| !uses.contains("actions/upload-artifact@"))
+        || upload.and_then(|step| step["with"]["path"].as_str()) != Some("rust-coverage.json")
+        || upload.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("error")
+    {
+        violations.push("coverage artifact is not a fail-loud JSON receipt".into());
     }
 
     violations
@@ -2120,8 +2133,10 @@ fn ci_routing_contract_violations(
     let planner_test = planner_test_step
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
-    if planner_test != "python3 scripts/ci_test_plan.test.py" {
-        violations.push("detect-changes does not test the impact planner before use".into());
+    if planner_test
+        != "python3 scripts/ci_test_plan.test.py\npython3 scripts/ci_measure_plan.test.py\n"
+    {
+        violations.push("detect-changes does not test both impact planners before use".into());
     }
     let planner = job_step(&ci, "detect-changes", "Plan affected Rust tests");
     let planner_run = planner
@@ -3727,8 +3742,12 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
         .into_iter()
         .flatten()
         .filter_map(serde_yaml::Value::as_str)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(partitions, BTreeSet::from(["slice:1/2", "slice:2/2"]));
+        .collect::<Vec<_>>();
+    assert_eq!(
+        partitions,
+        ["slice:1/3", "slice:2/3", "slice:3/3"],
+        "the shared Linux archive must fan out far enough to keep the PR tail below 20 minutes"
+    );
     assert_eq!(
         planner.matches("--no-tests=pass").count(),
         2,
@@ -6454,11 +6473,171 @@ jobs:
 
 // ── Teeth #12: the main eval canary stays off the required CI path ──
 
+fn main_measurement_route_contract_violations(
+    workflow: &serde_yaml::Value,
+    heavy_job: &str,
+    required_output: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let push_branches = workflow["on"]["push"]["branches"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    if push_branches != ["main"] {
+        violations.push(format!(
+            "{heavy_job} measurement push trigger is not limited to main: {push_branches:?}"
+        ));
+    }
+    if workflow["on"]["push"].get("paths").is_some()
+        || workflow["on"]["push"].get("paths-ignore").is_some()
+    {
+        violations.push(format!(
+            "{heavy_job} uses trigger-level path filters instead of the fail-closed internal route"
+        ));
+    }
+    if workflow["on"].get("workflow_dispatch").is_none() {
+        violations.push(format!(
+            "{heavy_job} measurement has no manual workflow_dispatch backstop"
+        ));
+    }
+    if workflow["on"].get("pull_request").is_some() {
+        violations.push(format!("{heavy_job} measurement runs on pull requests"));
+    }
+    if !workflow["concurrency"].is_null() {
+        violations.push(format!(
+            "{heavy_job} uses workflow-level concurrency that a non-owner push can cancel"
+        ));
+    }
+
+    let route = &workflow["jobs"]["measure-plan"];
+    if route["runs-on"].as_str() != Some("ubuntu-24.04")
+        || route["timeout-minutes"].as_u64() != Some(5)
+        || !job_needs(workflow, "measure-plan").is_empty()
+    {
+        violations.push(format!(
+            "{heavy_job} does not use the bounded independent measure-plan job"
+        ));
+    }
+    let expected_output = format!("${{{{ steps.plan.outputs.{required_output} }}}}");
+    if route["outputs"][required_output].as_str() != Some(expected_output.as_str()) {
+        violations.push(format!(
+            "{heavy_job} measure-plan does not export {required_output}"
+        ));
+    }
+    let checkout = job_step_using(workflow, "measure-plan", "actions/checkout");
+    if checkout.and_then(|step| step["with"]["fetch-depth"].as_u64()) != Some(0) {
+        violations.push(format!(
+            "{heavy_job} measure-plan does not fetch the complete two-dot push diff"
+        ));
+    }
+    let plan = job_step(workflow, "measure-plan", "Plan main measurements");
+    let plan_run = plan
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    for required in [
+        "python3 scripts/ci_measure_plan.py",
+        "--event-name \"$MEASURE_EVENT_NAME\"",
+        "--before \"$MEASURE_BEFORE\"",
+        "--head \"$MEASURE_HEAD\"",
+        "--github-output \"$GITHUB_OUTPUT\"",
+    ] {
+        if !plan_run.contains(required) {
+            violations.push(format!(
+                "{heavy_job} measure-plan invocation omits {required:?}"
+            ));
+        }
+    }
+    if plan.and_then(|step| step["id"].as_str()) != Some("plan")
+        || plan.and_then(|step| step["env"]["MEASURE_EVENT_NAME"].as_str())
+            != Some("${{ github.event_name }}")
+        || plan.and_then(|step| step["env"]["MEASURE_BEFORE"].as_str())
+            != Some("${{ github.event.before }}")
+        || plan.and_then(|step| step["env"]["MEASURE_HEAD"].as_str()) != Some("${{ github.sha }}")
+        || plan.is_some_and(|step| step.get("continue-on-error").is_some())
+    {
+        violations.push(format!(
+            "{heavy_job} measure-plan inputs are not fail-closed and event-bound"
+        ));
+    }
+
+    let heavy = &workflow["jobs"][heavy_job];
+    if job_needs(workflow, heavy_job) != ["measure-plan"] {
+        violations.push(format!(
+            "{heavy_job} does not depend only on the measure-plan job"
+        ));
+    }
+    let condition = heavy["if"]
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expected_condition = format!(
+        "always() && (needs.measure-plan.result != 'success' || needs.measure-plan.outputs.{required_output} == 'true')"
+    );
+    if condition != expected_condition {
+        violations.push(format!(
+            "{heavy_job} does not run on planner failure or an affirmative owner route"
+        ));
+    }
+    if heavy["concurrency"]["group"].as_str() != Some("${{ github.workflow }}-${{ github.ref }}")
+        || heavy["concurrency"]["cancel-in-progress"].as_bool() != Some(true)
+    {
+        violations.push(format!(
+            "{heavy_job} does not cancel only superseded expensive measurements"
+        ));
+    }
+    if heavy.get("continue-on-error").is_some() {
+        violations.push(format!(
+            "{heavy_job} hides a broken informational measurement as success"
+        ));
+    }
+
+    violations
+}
+
+#[test]
+fn coverage_measurement_route_is_fail_closed_and_job_scoped() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/coverage.yml"))
+        .expect("read coverage.yml");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse coverage.yml");
+    let violations =
+        main_measurement_route_contract_violations(&parsed, "coverage", "coverage-required");
+    assert!(
+        violations.is_empty(),
+        "coverage route drift — every main push reaches a fail-closed semantic planner, manual \
+         dispatch is a full backstop, and only superseded expensive jobs cancel:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn coverage_measurement_route_rejects_fail_open_fallback() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/coverage.yml"))
+        .expect("read coverage.yml")
+        .replace(
+            "always() &&\n      (needs.measure-plan.result != 'success' ||\n       needs.measure-plan.outputs.coverage-required == 'true')",
+            "needs.measure-plan.outputs.coverage-required == 'true'",
+        );
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("parse coverage.yml");
+    let violations =
+        main_measurement_route_contract_violations(&parsed, "coverage", "coverage-required");
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("run on planner failure")),
+        "coverage must run rather than skip when its route planner fails: {violations:?}"
+    );
+}
+
 fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let canary: serde_yaml::Value =
         serde_yaml::from_str(canary_workflow).unwrap_or(serde_yaml::Value::Null);
-    let mut violations = Vec::new();
+    let mut violations =
+        main_measurement_route_contract_violations(&canary, "main-canary", "main-canary-required");
 
     let mut required_jobs = BTreeSet::new();
     let mut pending_jobs = vec!["conclusion".to_string()];
@@ -6501,47 +6680,12 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
         violations.push("Rust routing omits the main canary workflow contract".into());
     }
 
-    let push_branches = canary["on"]["push"]["branches"]
-        .as_sequence()
-        .into_iter()
-        .flatten()
-        .filter_map(serde_yaml::Value::as_str)
-        .collect::<Vec<_>>();
-    if push_branches != ["main"] {
-        violations.push(format!(
-            "main canary push trigger is not limited to main: {push_branches:?}"
-        ));
-    }
-    if canary["on"]["push"].get("paths").is_some()
-        || canary["on"]["push"].get("paths-ignore").is_some()
-    {
-        violations.push(
-            "main canary filters main pushes by path instead of proving every accepted push".into(),
-        );
-    }
-    if !canary["on"]["workflow_dispatch"].is_null() {
-        // A null mapping value is how `workflow_dispatch:` is represented.
-    } else if canary["on"].get("workflow_dispatch").is_none() {
-        violations.push("main canary has no manual workflow_dispatch trigger".into());
-    }
-    if canary["on"].get("pull_request").is_some() {
-        violations.push("main canary runs on pull requests".into());
-    }
-    if !canary["concurrency"].is_null() {
-        violations.push(
-            "main canary uses concurrency that can discard an accepted main push proof".into(),
-        );
-    }
-
     let job = &canary["jobs"]["main-canary"];
     if job["runs-on"].as_str() != Some("ubuntu-24.04") {
         violations.push("main canary does not run on the canonical Linux platform".into());
     }
-    if job["timeout-minutes"].as_u64() != Some(60) {
-        violations.push("main canary does not retain a 60-minute cold-cache budget".into());
-    }
-    if !job_needs(&canary, "main-canary").is_empty() {
-        violations.push("main canary is not an independent job".into());
+    if job["timeout-minutes"].as_u64() != Some(20) {
+        violations.push("main canary does not enforce the 20-minute wall-clock budget".into());
     }
     if job["env"]["SCCACHE_GHA_RW_MODE"].as_str() != Some("READ_ONLY") {
         violations.push("main canary sccache is not read-only".into());
@@ -6609,25 +6753,50 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
         violations.push("main canary contains a FastEmbed cache writer".into());
     }
 
-    let eval = job_step(&canary, "main-canary", "Run embedding-only eval");
-    if eval.and_then(|step| step["run"].as_str())
-        != Some("cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval")
-        || eval.and_then(|step| step["env"]["EVAL_BASELINES_DIR"].as_str())
-            != Some("${{ runner.temp }}/origin-eval-canary")
+    let expected_filter = "test(=eval::retrieval::tests::test_run_quality_cost_eval_basic) | test(=eval::retrieval_drift::tests::ranking_drift_vs_golden)";
+    let inventory = job_step(&canary, "main-canary", "Verify exact canary inventory");
+    let inventory_run = inventory
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if inventory.and_then(|step| step["env"]["CANARY_FILTER"].as_str()) != Some(expected_filter)
+        || !inventory_run.contains("cargo nextest list -p wenlan-core --lib")
+        || !inventory_run.contains("--run-ignored=only")
+        || !inventory_run.contains("--ignore-default-filter")
+        || !inventory_run.contains("-E \"$CANARY_FILTER\"")
+        || !inventory_run.contains("--message-format json")
+        || !inventory_run.contains("payload.get(\"test-count\") != 2")
+        || !inventory_run.contains("case.get(\"ignored\") is True")
+        || !inventory_run.contains("eval::retrieval::tests::test_run_quality_cost_eval_basic")
+        || !inventory_run.contains("eval::retrieval_drift::tests::ranking_drift_vs_golden")
     {
-        violations.push("main canary does not run the exact embedding-only eval contract".into());
+        violations.push("main canary does not prove its exact two-test ignored inventory".into());
     }
-    let upload = job_step(&canary, "main-canary", "Upload eval canary baseline");
-    if upload
-        .and_then(|step| step["uses"].as_str())
-        .is_none_or(|uses| !uses.contains("actions/upload-artifact@"))
-        || upload.and_then(|step| step["if"].as_str()) != Some("always()")
-        || upload.and_then(|step| step["with"]["path"].as_str())
-            != Some("${{ runner.temp }}/origin-eval-canary/*.json")
-        || upload.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("warn")
+
+    let eval = job_step(&canary, "main-canary", "Run embedding-only eval");
+    let eval_run = eval
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if eval.and_then(|step| step["env"]["CANARY_FILTER"].as_str()) != Some(expected_filter)
+        || eval_run
+            != "cargo nextest run -p wenlan-core --lib --run-ignored=only --ignore-default-filter --no-tests=fail -E \"$CANARY_FILTER\""
     {
-        violations
-            .push("main canary does not preserve its always-uploaded baseline receipt".into());
+        violations.push("main canary does not run the exact two-test eval contract".into());
+    }
+    if !job["env"]["EVAL_BASELINES_DIR"].is_null()
+        || canary_steps.clone().any(|step| {
+            !step["env"]["EVAL_BASELINES_DIR"].is_null()
+                || step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.contains("actions/upload-artifact"))
+                || step["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("eval canary baseline"))
+        })
+    {
+        violations.push("main canary preserves a fake baseline artifact with no producer".into());
     }
 
     violations
@@ -6699,6 +6868,8 @@ jobs:
           key: mutable
       - name: Run embedding-only eval
         run: cargo test
+      - name: Upload eval canary baseline
+        uses: actions/upload-artifact@v4
 "#;
     let violations = main_canary_contract_violations(ci, canary);
     for expected in [
@@ -6706,20 +6877,23 @@ jobs:
         "conclusion.needs",
         "Rust routing",
         "limited to main",
-        "filters main pushes by path",
-        "manual workflow_dispatch",
+        "trigger-level path filters",
+        "manual workflow_dispatch backstop",
         "pull requests",
-        "concurrency",
+        "workflow-level concurrency",
+        "bounded independent measure-plan",
+        "does not export main-canary-required",
+        "run on planner failure",
         "canonical Linux",
-        "60-minute cold-cache budget",
-        "independent job",
+        "20-minute wall-clock budget",
         "sccache is not read-only",
         "FastEmbed cache directory",
         "rust-cache is not restore-only",
         "portable v3 cache",
         "FastEmbed cache writer",
-        "exact embedding-only eval",
-        "always-uploaded baseline receipt",
+        "exact two-test ignored inventory",
+        "exact two-test eval contract",
+        "fake baseline artifact",
     ] {
         assert!(
             violations
@@ -8103,6 +8277,7 @@ fn ci_evidence_workflows_pin_every_action_by_sha() {
     for path in [
         ".github/workflows/ci.yml",
         ".github/workflows/main-canary.yml",
+        ".github/workflows/coverage.yml",
         ".github/workflows/ci-observer.yml",
         ".github/workflows/ci-benchmark.yml",
     ] {

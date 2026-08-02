@@ -309,10 +309,10 @@ mod tests {
 
     /// The differential drift gate (L6, push to `main`). Captures live rankings and
     /// asserts top-weighted RBO vs both the current and the old-anchor goldens.
-    /// `#[ignore]`d (needs the FastEmbed model); the dedicated main-canary workflow's
-    /// `--run-ignored=only eval::retrieval` picks it up by substring.
+    /// `#[ignore]`d (needs the FastEmbed model); the dedicated main-canary workflow
+    /// selects this exact full test name alongside the labeled quality/cost eval.
     #[tokio::test]
-    #[ignore] // L6 — needs FastEmbed model; runs on push to main via --run-ignored=only eval::retrieval
+    #[ignore] // L6 — needs FastEmbed model; exact-selected on relevant main pushes
     async fn ranking_drift_vs_golden() {
         let dir = fixture_dir();
         if !dir.exists() {
