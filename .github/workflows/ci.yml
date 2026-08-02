@@ -473,7 +473,6 @@ jobs:
           python3 scripts/ci-cache-maintenance.test.py
           python3 scripts/ci-observer.test.py
           python3 scripts/ci-timed-command.test.py
-          bash scripts/download-run-artifact.test.sh
           python3 scripts/verify-ort-source-pin.test.py
           python3 scripts/verify-ort-source-pin.py
       - name: Set up Rust for affected-test planning
@@ -537,6 +536,8 @@ jobs:
             args+=(--exclude-target x86_64-pc-windows-msvc)
           fi
           python3 scripts/release_targets.py "${args[@]}"
+      - name: Test artifact download retry
+        run: bash scripts/download-run-artifact.test.sh
       - name: Test FastEmbed cache preparation
         run: python3 scripts/prepare-fastembed-cache.test.py
       - name: Restore portable FastEmbed model

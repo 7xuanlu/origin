@@ -317,6 +317,13 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
                 .into(),
         );
     }
+    let retry_test = detect_index("Test artifact download retry")
+        .and_then(|index| detect_steps.get(index).copied());
+    if retry_test.and_then(|step| step["run"].as_str())
+        != Some("bash scripts/download-run-artifact.test.sh")
+    {
+        violations.push("detect-changes does not test the bounded artifact retry helper".into());
+    }
     let prepare = detect_index("Prepare portable FastEmbed model")
         .and_then(|index| detect_steps.get(index).copied());
     if prepare.and_then(|step| step["run"].as_str())
