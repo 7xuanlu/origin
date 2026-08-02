@@ -107,6 +107,28 @@ def release_matrix(*, exclude_targets: Iterable[str] = ()) -> dict:
     }
 
 
+def release_preflight_matrix(*, event_name: str, ref: str, head_ref: str) -> dict:
+    """Return the event-scoped preflight matrix without weakening release proof."""
+
+    if event_name == "pull_request":
+        if head_ref.startswith("release-please--branches--"):
+            return release_matrix()
+        return release_matrix(exclude_targets=["x86_64-pc-windows-msvc"])
+    if event_name == "push":
+        if ref != "refs/heads/main":
+            raise TargetError(f"release preflight does not accept push ref {ref!r}")
+        return release_matrix(
+            exclude_targets=[
+                "aarch64-apple-darwin",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu",
+            ]
+        )
+    if event_name == "workflow_dispatch":
+        return release_matrix()
+    raise TargetError(f"release preflight does not accept event {event_name!r}")
+
+
 def require_target(target: str) -> dict:
     """Return a caller-owned target entry or fail closed."""
 
@@ -143,6 +165,13 @@ def _main(argv: list[str]) -> int:
     matrix_parser.add_argument("--output-name", default="release-targets")
     matrix_parser.add_argument("--exclude-target", action="append", default=[])
 
+    preflight_parser = subparsers.add_parser("preflight-matrix")
+    preflight_parser.add_argument("--event-name", required=True)
+    preflight_parser.add_argument("--ref", required=True)
+    preflight_parser.add_argument("--head-ref", default="")
+    preflight_parser.add_argument("--github-output")
+    preflight_parser.add_argument("--output-name", default="release-preflight-targets")
+
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--target", required=True)
 
@@ -164,11 +193,15 @@ def _main(argv: list[str]) -> int:
         )
         return 0
 
-    matrix_json = json.dumps(
-        release_matrix(exclude_targets=arguments.exclude_target),
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    if arguments.command == "preflight-matrix":
+        matrix = release_preflight_matrix(
+            event_name=arguments.event_name,
+            ref=arguments.ref,
+            head_ref=arguments.head_ref,
+        )
+    else:
+        matrix = release_matrix(exclude_targets=arguments.exclude_target)
+    matrix_json = json.dumps(matrix, separators=(",", ":"), sort_keys=True)
     print(matrix_json)
     if arguments.github_output:
         _write_github_output(arguments.github_output, arguments.output_name, matrix_json)
