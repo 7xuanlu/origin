@@ -256,12 +256,26 @@ class HappyPathApi(FakeContentApi):
         artifacts: list[dict],
         pr: dict,
         event_run: dict,
+        jobs_by_attempt: dict[int, list[dict]] | None = None,
     ) -> None:
         super().__init__(old, new)
         self.wrappers = wrappers
         self.artifacts = artifacts
         self.pr = pr
         self.event_run = event_run
+        self.jobs_by_attempt = jobs_by_attempt or {
+            event_run["run_attempt"]: [
+                {
+                    "id": 100 + index,
+                    "run_id": event_run["id"],
+                    "head_sha": event_run["head_sha"],
+                    "name": f"release-preflight ({entry['target']})",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+                for index, entry in enumerate(VALIDATOR.release_matrix()["include"])
+            ]
+        }
 
     def get_json(self, path: str, *, params=None):
         prefix = "/repos/7xuanlu/wenlan"
@@ -296,6 +310,16 @@ class HappyPathApi(FakeContentApi):
             return self.pr
         if path == f"{prefix}/actions/runs/1/artifacts":
             return {"total_count": 4, "artifacts": self.artifacts}
+        attempt_prefix = f"{prefix}/actions/runs/1/attempts/"
+        if path.startswith(attempt_prefix) and path.endswith("/jobs"):
+            attempt = int(path.removeprefix(attempt_prefix).removesuffix("/jobs"))
+            jobs = [
+                {**job, "run_attempt": job.get("run_attempt", attempt)}
+                for job in self.jobs_by_attempt.get(attempt, [])
+            ]
+            page = params["page"]
+            start = (page - 1) * 100
+            return {"total_count": len(jobs), "jobs": jobs[start : start + 100]}
         return super().get_json(path, params=params)
 
     def download(self, path: str, destination: Path, maximum: int):
@@ -308,6 +332,39 @@ class HappyPathApi(FakeContentApi):
         return len(raw), hashlib.sha256(raw).hexdigest()
 
 
+def release_job(
+    target: str,
+    *,
+    job_id: int,
+    conclusion: str = "success",
+    run_id: int = 1,
+    head_sha: str = HEAD_SHA,
+) -> dict:
+    return {
+        "id": job_id,
+        "run_id": run_id,
+        "head_sha": head_sha,
+        "name": f"release-preflight ({target})",
+        "status": "completed",
+        "conclusion": conclusion,
+    }
+
+
+class AttemptJobsApi:
+    def __init__(self, jobs_by_attempt: dict[int, list[dict]]) -> None:
+        self.jobs_by_attempt = jobs_by_attempt
+
+    def get_json(self, path: str, *, params=None):
+        attempt = int(path.split("/attempts/", 1)[1].split("/", 1)[0])
+        jobs = [
+            {**job, "run_attempt": job.get("run_attempt", attempt)}
+            for job in self.jobs_by_attempt.get(attempt, [])
+        ]
+        page = params["page"]
+        start = (page - 1) * 100
+        return {"total_count": len(jobs), "jobs": jobs[start : start + 100]}
+
+
 class ValidateReleaseCandidateTests(unittest.TestCase):
     def test_full_validate_candidate_happy_path_reconciles_manifests_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -318,7 +375,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
             pr["base"]["sha"] = BASE_SHA
             event_run = {
                 "id": 1,
-                "run_attempt": 1,
+                "run_attempt": 2,
                 "workflow_id": 3,
                 "check_suite_id": 4,
                 "name": VALIDATOR.CI_WORKFLOW_NAME,
@@ -339,10 +396,14 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
             }
             wrappers: dict[int, Path] = {}
             artifacts: list[dict] = []
-            for artifact_id, matrix_entry in enumerate(
-                VALIDATOR.release_matrix()["include"], start=10
-            ):
+            matrix_entries = VALIDATOR.release_matrix()["include"]
+            target_attempts = {
+                entry["target"]: 1 if index < 2 else 2
+                for index, entry in enumerate(matrix_entries)
+            }
+            for artifact_id, matrix_entry in enumerate(matrix_entries, start=10):
                 target = matrix_entry["target"]
+                artifact_attempt = target_attempts[target]
                 target_root = root / target
                 binary_dir = target_root / "bin"
                 binary_dir.mkdir(parents=True)
@@ -359,7 +420,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                     repository="7xuanlu/wenlan",
                     repository_id=2,
                     run_id=1,
-                    run_attempt=1,
+                    run_attempt=artifact_attempt,
                     pr_number=42,
                     pr_author="7xuanlu",
                     head_sha=HEAD_SHA,
@@ -382,7 +443,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                 artifacts.append(
                     {
                         "id": artifact_id,
-                        "name": f"release-candidate-1-1-{target}",
+                        "name": f"release-candidate-1-{artifact_attempt}-{target}",
                         "size_in_bytes": len(wrapper_raw),
                         "expired": False,
                         "digest": "sha256:"
@@ -396,7 +457,40 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                         },
                     }
                 )
-            api = HappyPathApi(old, new, wrappers, artifacts, pr, event_run)
+            jobs_by_attempt = {
+                1: [
+                    {
+                        "id": 100 + index,
+                        "run_id": 1,
+                        "head_sha": HEAD_SHA,
+                        "name": f"release-preflight ({entry['target']})",
+                        "status": "completed",
+                        "conclusion": "success" if index < 2 else "failure",
+                    }
+                    for index, entry in enumerate(matrix_entries)
+                ],
+                2: [
+                    {
+                        "id": 200 + index,
+                        "run_id": 1,
+                        "head_sha": HEAD_SHA,
+                        "name": f"release-preflight ({entry['target']})",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                    for index, entry in enumerate(matrix_entries)
+                    if index >= 2
+                ],
+            }
+            api = HappyPathApi(
+                old,
+                new,
+                wrappers,
+                artifacts,
+                pr,
+                event_run,
+                jobs_by_attempt,
+            )
             event = {"action": "completed", "workflow_run": event_run}
             validated_assets = root / "validated-assets"
             receipt = VALIDATOR.validate_candidate(
@@ -409,6 +503,14 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
             self.assertEqual(receipt["status"], "passed")
             self.assertEqual(receipt["pr_state"], "open")
             self.assertIsNone(receipt["merge_commit_sha"])
+            self.assertEqual(receipt["run_attempt"], 2)
+            self.assertEqual(
+                {artifact["name"] for artifact in receipt["artifacts"]},
+                {
+                    f"release-candidate-1-{target_attempts[target]}-{target}"
+                    for target in target_attempts
+                },
+            )
             self.assertEqual(len(receipt["artifacts"]), 4)
             self.assertEqual(len(receipt["assets"]), 6)
             self.assertEqual(
@@ -419,7 +521,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
             VALIDATOR.write_validated_receipt(receipt_path, receipt)
             closed = VALIDATOR.close_receipt(
                 receipt_path,
-                artifact_name="validated-release-assets-1-1-100-2",
+                artifact_name="validated-release-assets-1-2-100-2",
                 artifact_id=99,
                 artifact_digest="9" * 64,
                 observer_run_id=100,
@@ -442,7 +544,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
             ):
                 VALIDATOR.close_receipt(
                     receipt_path,
-                    artifact_name="validated-release-assets-1-1-100-2",
+                    artifact_name="validated-release-assets-1-2-100-2",
                     artifact_id=99,
                     artifact_digest="9" * 64,
                     observer_run_id=100,
@@ -522,6 +624,130 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "total_count"):
             VALIDATOR._api_pages(CountApi(), "/artifacts", "artifacts")
+
+    def test_target_attempts_follow_only_jobs_reexecuted_by_partial_rerun(self) -> None:
+        targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
+        api = AttemptJobsApi(
+            {
+                1: [
+                    release_job(
+                        target,
+                        job_id=100 + index,
+                        conclusion="success" if index < 2 else "failure",
+                    )
+                    for index, target in enumerate(targets)
+                ],
+                2: [
+                    release_job(target, job_id=200 + index)
+                    for index, target in enumerate(targets)
+                    if index >= 2
+                ],
+            }
+        )
+        selected = VALIDATOR._latest_release_target_attempts(
+            api,
+            "7xuanlu/wenlan",
+            run_id=1,
+            current_attempt=2,
+            head_sha=HEAD_SHA,
+        )
+        self.assertEqual(
+            selected,
+            {
+                target: 1 if index < 2 else 2
+                for index, target in enumerate(targets)
+            },
+        )
+
+    def test_latest_reexecuted_target_failure_cannot_fallback(self) -> None:
+        targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
+        api = AttemptJobsApi(
+            {
+                1: [
+                    release_job(target, job_id=100 + index)
+                    for index, target in enumerate(targets)
+                ],
+                2: [release_job(targets[0], job_id=200, conclusion="failure")],
+            }
+        )
+        with self.assertRaisesRegex(
+            VALIDATOR.CandidateError, "latest release-preflight job.*failure"
+        ):
+            VALIDATOR._latest_release_target_attempts(
+                api,
+                "7xuanlu/wenlan",
+                run_id=1,
+                current_attempt=2,
+                head_sha=HEAD_SHA,
+            )
+
+    def test_duplicate_release_target_job_in_one_attempt_is_rejected(self) -> None:
+        targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
+        jobs = [
+            release_job(target, job_id=100 + index)
+            for index, target in enumerate(targets)
+        ]
+        jobs.append(release_job(targets[0], job_id=999))
+        with self.assertRaisesRegex(VALIDATOR.CandidateError, "more than once"):
+            VALIDATOR._latest_release_target_attempts(
+                AttemptJobsApi({1: jobs}),
+                "7xuanlu/wenlan",
+                run_id=1,
+                current_attempt=1,
+                head_sha=HEAD_SHA,
+            )
+
+    def test_release_target_job_attempt_must_match_attempt_endpoint(self) -> None:
+        target = VALIDATOR.release_matrix()["include"][0]["target"]
+        mismatched = release_job(target, job_id=100)
+        mismatched["run_attempt"] = 2
+        with self.assertRaisesRegex(VALIDATOR.CandidateError, "control-plane identity"):
+            VALIDATOR._latest_release_target_attempts(
+                AttemptJobsApi({1: [mismatched]}),
+                "7xuanlu/wenlan",
+                run_id=1,
+                current_attempt=1,
+                head_sha=HEAD_SHA,
+            )
+
+    def test_candidate_artifact_attempt_index_is_closed_and_conflict_safe(self) -> None:
+        targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
+        attempts = {target: 1 if index < 2 else 2 for index, target in enumerate(targets)}
+        artifacts = [
+            {
+                "id": 100 + index,
+                "name": f"release-candidate-1-{attempts[target]}-{target}",
+            }
+            for index, target in enumerate(targets)
+        ]
+        selected = VALIDATOR._candidate_artifacts_for_attempts(
+            artifacts,
+            run_id=1,
+            current_attempt=2,
+            target_attempts=attempts,
+        )
+        self.assertEqual(set(selected), set(targets))
+
+        duplicate = artifacts + [dict(artifacts[0], id=999)]
+        with self.assertRaisesRegex(VALIDATOR.CandidateError, "duplicated"):
+            VALIDATOR._candidate_artifacts_for_attempts(
+                duplicate,
+                run_id=1,
+                current_attempt=2,
+                target_attempts=attempts,
+            )
+
+        future = list(artifacts)
+        future[0] = dict(
+            future[0], name=f"release-candidate-1-3-{targets[0]}"
+        )
+        with self.assertRaisesRegex(VALIDATOR.CandidateError, "attempt or target"):
+            VALIDATOR._candidate_artifacts_for_attempts(
+                future,
+                run_id=1,
+                current_attempt=2,
+                target_attempts=attempts,
+            )
 
     def test_cross_host_artifact_redirect_strips_bearer_token(self) -> None:
         request = urllib.request.Request(

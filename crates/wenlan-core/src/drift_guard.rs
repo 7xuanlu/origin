@@ -4356,6 +4356,7 @@ fn release_candidate_observer_contract_violations(
         "/actions/workflows/{workflow_id}",
         "/commits/{head_sha}/pulls",
         "/actions/runs/{run_id}/artifacts",
+        "/actions/runs/{run_id}/attempts/{run_attempt}/jobs",
         "/actions/artifacts/{artifact_id}/zip",
         "payload.get(\"total_count\")",
         "safe_extract_zip(wrapper, extracted, outer_names)",
@@ -4372,6 +4373,10 @@ fn release_candidate_observer_contract_violations(
         "document[\"receipt_state\"] = \"closed\"",
         "validated_assets_artifact",
         "This receipt is observe-only",
+        "def _latest_release_target_attempts(",
+        "job.get(\"run_attempt\") != attempt",
+        "latest release-preflight job",
+        "def _candidate_artifacts_for_attempts(",
     ] {
         if !validator_script.contains(required) {
             violations.push(format!(
@@ -4620,6 +4625,45 @@ fn release_promotion_contract_violations(
         violations
             .push("tag release does not resolve the main receipt before asset promotion".into());
     }
+    let plan_upload = job_step(&release, "resolve-promotion", "Upload small promotion plan");
+    let plan_download = job_step_using(&release, "promote-assets", "actions/download-artifact");
+    if plan_upload.and_then(|step| step["with"]["name"].as_str())
+        != Some("release-promotion-plan-${{ github.run_id }}")
+        || plan_upload.and_then(|step| step["with"]["overwrite"].as_bool()) != Some(true)
+        || plan_download.and_then(|step| step["with"]["name"].as_str())
+            != Some("release-promotion-plan-${{ github.run_id }}")
+    {
+        violations.push(
+            "tag promotion plan is not a retry-safe same-run locator with fresh receipt validation"
+                .into(),
+        );
+    }
+    for (job, step_name, artifact_name) in [
+        (
+            "promote-assets",
+            "Publish exact Homebrew inputs for this run",
+            "homebrew-artifacts",
+        ),
+        (
+            "promote-assets",
+            "Publish exact Docker runtime inputs for this run",
+            "docker-runtime-inputs",
+        ),
+        (
+            "docker",
+            "Publish immutable image digest receipt",
+            "docker-image-digest-${{ matrix.tag-suffix }}",
+        ),
+    ] {
+        let upload = job_step(&release, job, step_name);
+        if upload.and_then(|step| step["with"]["name"].as_str()) != Some(artifact_name)
+            || upload.and_then(|step| step["with"]["overwrite"].as_bool()) != Some(true)
+        {
+            violations.push(format!(
+                "retryable internal artifact {artifact_name:?} is not run-scoped and overwrite-safe"
+            ));
+        }
+    }
     let docker = &release["jobs"]["docker"];
     let docker_text = serde_yaml::to_string(docker).unwrap_or_default();
     if job_needs(&release, "docker") != ["promote-assets"]
@@ -4635,6 +4679,10 @@ fn release_promotion_contract_violations(
         "MAX_RECEIPT_CANDIDATES = 20",
         "latest trusted observer attempt",
         "observer reruns produced conflicting release semantics",
+        "main-release-promotion-receipt-{run_id}-",
+        "/actions/runs/{run_id}/attempts/{run_attempt}/jobs",
+        "main promotion receipt claims a future run attempt",
+        "main promotion receipt reruns produced conflicting semantics",
         "subparsers.add_parser(\"consume-main-receipt\")",
         "subparsers.add_parser(\"download-assets\")",
         "safe_extract_zip(wrapper, output_dir, expected)",
@@ -4691,6 +4739,25 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "mutation must exercise {expected:?}: {violations:?}"
         );
     }
+    let retry_unsafe_release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("read release")
+        .replace(
+            "name: release-promotion-plan-${{ github.run_id }}",
+            "name: release-promotion-plan-${{ github.run_id }}-${{ github.run_attempt }}",
+        );
+    let retry_violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &retry_unsafe_release,
+        &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+            .expect("read promotion resolver"),
+    );
+    assert!(
+        retry_violations
+            .iter()
+            .any(|item| item.contains("retry-safe")),
+        "mutation must exercise retry-safe tag promotion: {retry_violations:?}"
+    );
 }
 
 fn windows_native_parallelism_violations(

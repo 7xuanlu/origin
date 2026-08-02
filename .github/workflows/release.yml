@@ -192,12 +192,16 @@ jobs:
       - name: Upload small promotion plan
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-promotion-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          # This is a same-workflow locator, not a trust anchor. A full rerun
+          # replaces it with a new immutable artifact ID; a failed-jobs-only
+          # rerun reuses the last successful resolver output. The consumer
+          # strictly parses the plan and revalidates every closed receipt/hash.
+          name: release-promotion-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/release-promotion-plan.json
           compression-level: 0
           retention-days: 30
           if-no-files-found: error
-          overwrite: false
+          overwrite: true
 
   promote-assets:
     name: Promote exact validated release assets
@@ -215,7 +219,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: release-promotion-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: release-promotion-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/promotion-plan
       - name: Download exact validated wrapper once
         env:
@@ -256,7 +260,9 @@ jobs:
             ${{ runner.temp }}/promoted-assets/wenlan-mcp-darwin-arm64.tar.gz
           retention-days: 1
           if-no-files-found: error
-          overwrite: false
+          # Internal retry locator. The uploaded archives are still the exact
+          # receipt-validated bytes, and every rerun creates a fresh artifact ID.
+          overwrite: true
       - name: Publish exact Docker runtime inputs for this run
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -268,7 +274,9 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
-          overwrite: false
+          # Internal retry locator; Docker revalidates the receipt and archive
+          # hashes before it executes the copied server binary.
+          overwrite: true
 
   docker:
     name: Verify & Push Runtime Image (${{ matrix.platform }})
@@ -351,7 +359,10 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
-          overwrite: false
+          # One stable locator per architecture lets a failed matrix leg be
+          # retried without discarding the successful leg. Registry digests are
+          # re-inspected before any public manifest is created.
+          overwrite: true
 
   docker-manifest:
     name: Combine Docker Manifest (multi-arch)

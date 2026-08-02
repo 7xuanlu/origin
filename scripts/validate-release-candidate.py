@@ -50,6 +50,7 @@ MAX_API_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_PR_FILES = 32
 MAX_TREE_ENTRIES = 50_000
+MAX_JOB_PAGES = 10
 RELEASE_MANAGED_PATHS = frozenset(
     {
         ".release-please-manifest.json",
@@ -526,6 +527,129 @@ def _expected_artifact_names(run_id: int, run_attempt: int) -> dict[str, str]:
     }
 
 
+def _attempt_jobs(
+    api: JsonApi,
+    repository: str,
+    run_id: int,
+    run_attempt: int,
+) -> list[dict]:
+    jobs: list[dict] = []
+    expected_total: int | None = None
+    path = f"/repos/{repository}/actions/runs/{run_id}/attempts/{run_attempt}/jobs"
+    for page in range(1, MAX_JOB_PAGES + 1):
+        payload = _mapping(
+            api.get_json(path, params={"per_page": 100, "page": page}),
+            f"workflow attempt {run_attempt} jobs page {page}",
+        )
+        total = payload.get("total_count")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            raise CandidateError("workflow attempt job total_count is invalid")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise CandidateError("workflow attempt job total_count changed during pagination")
+        values = _array(payload.get("jobs"), f"workflow attempt {run_attempt} jobs")
+        jobs.extend(_mapping(value, "workflow attempt job") for value in values)
+        if len(values) < 100:
+            if len(jobs) != expected_total:
+                raise CandidateError("workflow attempt job total_count does not match pages")
+            return jobs
+    raise CandidateError("workflow attempt jobs exceeded the bounded page limit")
+
+
+def _latest_release_target_attempts(
+    api: JsonApi,
+    repository: str,
+    *,
+    run_id: int,
+    current_attempt: int,
+    head_sha: str,
+) -> dict[str, int]:
+    """Bind every release target to the last attempt that actually ran its job."""
+
+    targets = [entry["target"] for entry in release_matrix()["include"]]
+    target_by_job = {f"release-preflight ({target})": target for target in targets}
+    latest: dict[str, tuple[int, dict]] = {}
+    for attempt in range(1, current_attempt + 1):
+        seen: dict[str, dict] = {}
+        for job in _attempt_jobs(api, repository, run_id, attempt):
+            target = target_by_job.get(job.get("name"))
+            if target is None:
+                continue
+            if target in seen:
+                raise CandidateError(
+                    f"release target {target!r} appears more than once in attempt {attempt}"
+                )
+            _positive_int(job.get("id"), "release-preflight job id")
+            if (
+                job.get("run_id") != run_id
+                or job.get("run_attempt") != attempt
+                or job.get("head_sha") != head_sha
+            ):
+                raise CandidateError("release-preflight job control-plane identity mismatch")
+            seen[target] = job
+        for target, job in seen.items():
+            latest[target] = (attempt, job)
+
+    missing = set(targets) - set(latest)
+    if missing:
+        raise CandidateError(
+            f"release-preflight jobs never ran for targets: {sorted(missing)}"
+        )
+    selected: dict[str, int] = {}
+    for target in targets:
+        attempt, job = latest[target]
+        if job.get("status") != "completed" or job.get("conclusion") != "success":
+            raise CandidateError(
+                f"latest release-preflight job for {target!r} in attempt {attempt} "
+                f"concluded {job.get('conclusion')!r}"
+            )
+        selected[target] = attempt
+    return selected
+
+
+def _candidate_artifacts_for_attempts(
+    artifacts: list,
+    *,
+    run_id: int,
+    current_attempt: int,
+    target_attempts: dict[str, int],
+) -> dict[str, dict]:
+    prefix = f"release-candidate-{run_id}-"
+    targets = {entry["target"] for entry in release_matrix()["include"]}
+    indexed: dict[tuple[int, str], dict] = {}
+    pattern = re.compile(rf"^{re.escape(prefix)}([1-9][0-9]*)-(.+)$")
+    for raw in artifacts:
+        artifact = _mapping(raw, "run artifact")
+        name = artifact.get("name")
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        match = pattern.fullmatch(name)
+        if match is None:
+            raise CandidateError("release candidate artifact name is malformed")
+        attempt = int(match.group(1))
+        target = match.group(2)
+        if attempt > current_attempt or target not in targets:
+            raise CandidateError("release candidate artifact attempt or target is invalid")
+        key = (attempt, target)
+        if key in indexed:
+            raise CandidateError("release candidate artifact attempt/target is duplicated")
+        indexed[key] = artifact
+
+    selected: dict[str, dict] = {}
+    for target, attempt in target_attempts.items():
+        artifact = indexed.get((attempt, target))
+        if artifact is None:
+            raise CandidateError(
+                f"release candidate artifact is missing for {target!r} attempt {attempt}"
+            )
+        selected[target] = artifact
+    ids = [artifact.get("id") for artifact in selected.values()]
+    if len(set(ids)) != len(selected):
+        raise CandidateError("candidate artifact IDs are duplicated")
+    return selected
+
+
 def _validate_artifact_record(
     raw: object,
     *,
@@ -800,23 +924,19 @@ def validate_candidate(
     all_artifacts = _api_pages(
         api, f"/repos/{repository}/actions/runs/{run_id}/artifacts", "run artifacts"
     )
-    expected_names = _expected_artifact_names(run_id, run_attempt)
-    current_prefix = f"release-candidate-{run_id}-{run_attempt}-"
-    candidate_artifacts = [
-        artifact
-        for artifact in all_artifacts
-        if isinstance(artifact, dict)
-        and isinstance(artifact.get("name"), str)
-        and artifact["name"].startswith(current_prefix)
-    ]
-    by_name = {
-        artifact.get("name"): artifact for artifact in candidate_artifacts
-    }
-    if len(candidate_artifacts) != 4 or set(by_name) != set(expected_names.values()):
-        raise CandidateError("current run-attempt artifact set is not the exact four targets")
-    ids = [artifact.get("id") for artifact in candidate_artifacts]
-    if len(set(ids)) != 4:
-        raise CandidateError("candidate artifact IDs are duplicated")
+    target_attempts = _latest_release_target_attempts(
+        api,
+        repository,
+        run_id=run_id,
+        current_attempt=run_attempt,
+        head_sha=head_sha,
+    )
+    selected_artifacts = _candidate_artifacts_for_attempts(
+        all_artifacts,
+        run_id=run_id,
+        current_attempt=run_attempt,
+        target_attempts=target_attempts,
+    )
 
     work_dir = Path(tempfile.mkdtemp(prefix="release-candidate-", dir=temp_root))
     if validated_assets_dir is not None:
@@ -834,9 +954,10 @@ def validate_candidate(
     }
     assets: list[dict] = []
     artifact_receipts: list[dict] = []
-    for target, expected_name in expected_names.items():
+    for target, artifact_attempt in target_attempts.items():
+        expected_name = f"release-candidate-{run_id}-{artifact_attempt}-{target}"
         artifact = _validate_artifact_record(
-            by_name[expected_name],
+            selected_artifacts[target],
             expected_name=expected_name,
             run_id=run_id,
             repository_id=repository_id,
@@ -847,7 +968,11 @@ def validate_candidate(
             artifact,
             target=target,
             work_dir=work_dir,
-            trusted={**trusted_common, "expected_artifact_name": expected_name},
+            trusted={
+                **trusted_common,
+                "run_attempt": artifact_attempt,
+                "expected_artifact_name": expected_name,
+            },
             validated_assets_dir=validated_assets_dir,
         )
         assets.extend(target_assets)
@@ -977,9 +1102,12 @@ def close_receipt(
         _sha(document.get("merge_commit_sha"), "receipt merge commit SHA")
     else:
         raise CandidateError("receipt PR state is invalid")
-    expected_artifacts = _expected_artifact_names(run_id, run_attempt)
-    artifact_names: set[str] = set()
+    expected_targets = {entry["target"] for entry in release_matrix()["include"]}
+    artifact_targets: set[str] = set()
     artifact_ids: set[int] = set()
+    artifact_name_pattern = re.compile(
+        rf"^release-candidate-{run_id}-([1-9][0-9]*)-(.+)$"
+    )
     for raw_artifact in artifacts:
         artifact = _mapping(raw_artifact, "receipt source artifact")
         if set(artifact) != {"digest", "id", "name", "size"}:
@@ -990,9 +1118,21 @@ def close_receipt(
             raise CandidateError("receipt source artifact exceeds the size bound")
         if WRAPPER_DIGEST_RE.fullmatch(str(artifact.get("digest"))) is None:
             raise CandidateError("receipt source artifact digest is invalid")
-        artifact_names.add(str(artifact.get("name")))
+        source_artifact_name = artifact.get("name")
+        match = (
+            artifact_name_pattern.fullmatch(source_artifact_name)
+            if isinstance(source_artifact_name, str)
+            else None
+        )
+        if match is None:
+            raise CandidateError("receipt source artifact name is invalid")
+        artifact_attempt = int(match.group(1))
+        artifact_target = match.group(2)
+        if artifact_attempt > run_attempt or artifact_target not in expected_targets:
+            raise CandidateError("receipt source artifact attempt or target is invalid")
+        artifact_targets.add(artifact_target)
         artifact_ids.add(artifact_id_value)
-    if artifact_names != set(expected_artifacts.values()) or len(artifact_ids) != 4:
+    if artifact_targets != expected_targets or len(artifact_ids) != 4:
         raise CandidateError("receipt source artifact inventory is not exact")
     expected_assets = {asset["name"]: asset for asset in release_assets()}
     asset_names: set[str] = set()
@@ -1018,7 +1158,10 @@ def close_receipt(
         f"{observer_run_id}-{observer_run_attempt}"
     )
     if artifact_name != expected_name:
-        raise CandidateError("validated assets artifact name is not source-run scoped")
+        raise CandidateError(
+            "validated assets artifact name is not source-run scoped: "
+            f"expected {expected_name!r}, got {artifact_name!r}"
+        )
     _positive_int(artifact_id, "validated assets artifact id")
     if ACTION_DIGEST_RE.fullmatch(artifact_digest) is None:
         raise CandidateError("validated assets artifact digest is not canonical SHA-256")

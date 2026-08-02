@@ -142,9 +142,9 @@ def contract_violations(
     resolve = job_body(release, "resolve-promotion")
     for marker in [
         "scripts/release-promotion.py consume-main-receipt",
-        "name: release-promotion-plan-${{ github.run_id }}-${{ github.run_attempt }}",
+        "name: release-promotion-plan-${{ github.run_id }}",
         "retention-days: 30",
-        "overwrite: false",
+        "overwrite: true",
     ]:
         if marker not in resolve:
             violations.append(f"tag promotion resolver omits {marker!r}")
@@ -153,6 +153,9 @@ def contract_violations(
         "scripts/release-promotion.py download-assets",
         "Download exact validated wrapper once",
         "Existing release asset $name differs; refusing to clobber.",
+        "name: release-promotion-plan-${{ github.run_id }}",
+        "name: homebrew-artifacts",
+        "name: docker-runtime-inputs",
     ]:
         if marker not in promote:
             violations.append(f"validated asset promotion omits {marker!r}")
@@ -168,6 +171,20 @@ def contract_violations(
             violations.append(f"runtime image lane omits binary-reuse proof {marker!r}")
     if "docker/Dockerfile.daemon" in docker or "cargo build" in docker:
         violations.append("runtime image lane can compile a different server binary")
+    for job_name, artifact_name in [
+        ("promote-assets", "homebrew-artifacts"),
+        ("promote-assets", "docker-runtime-inputs"),
+        ("docker", "docker-image-digest-${{ matrix.tag-suffix }}"),
+    ]:
+        job = job_body(release, job_name)
+        match = re.search(
+            rf"name: {re.escape(artifact_name)}[\s\S]{{0,700}}?overwrite: true",
+            job,
+        )
+        if match is None:
+            violations.append(
+                f"retryable internal artifact {artifact_name!r} is not overwrite-safe"
+            )
     runtime_image = RUNTIME_IMAGE_PATH.read_text(encoding="utf-8")
     for marker in [
         '"--load"',
@@ -209,6 +226,10 @@ def contract_violations(
         "MAX_RECEIPT_CANDIDATES = 20",
         "observer reruns produced conflicting release semantics",
         "latest trusted observer attempt",
+        "main-release-promotion-receipt-{run_id}-",
+        "/actions/runs/{run_id}/attempts/{run_attempt}/jobs",
+        "main promotion receipt claims a future run attempt",
+        "main promotion receipt reruns produced conflicting semantics",
         'subparsers.add_parser("consume-main-receipt")',
         'subparsers.add_parser("download-assets")',
         "validated assets wrapper size or digest mismatch",
@@ -558,6 +579,7 @@ def candidate_observer_contract_violations(
         "/actions/workflows/{workflow_id}",
         "/commits/{head_sha}/pulls",
         "/actions/runs/{run_id}/artifacts",
+        "/actions/runs/{run_id}/attempts/{run_attempt}/jobs",
         "/actions/artifacts/{artifact_id}/zip",
         'payload.get("total_count")',
         "safe_extract_zip(wrapper, extracted, outer_names)",
@@ -578,6 +600,10 @@ def candidate_observer_contract_violations(
         "def close_receipt(",
         'document["receipt_state"] = "closed"',
         '"validated_assets_artifact"',
+        "def _latest_release_target_attempts(",
+        'job.get("run_attempt") != attempt',
+        "latest release-preflight job",
+        "def _candidate_artifacts_for_attempts(",
     ]
     for marker in required_validator_markers:
         if marker not in validator:

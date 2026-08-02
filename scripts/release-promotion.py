@@ -706,30 +706,117 @@ def _main_ci_run(
     return run
 
 
-def _download_main_plan(
+def _main_receipt_artifacts(
+    api: PromotionApi,
+    repository: str,
+    run_id: int,
+) -> list[dict]:
+    prefix = f"main-release-promotion-receipt-{run_id}-"
+    candidates: list[dict] = []
+    seen_records = 0
+    expected_total: int | None = None
+    for page in range(1, MAX_ARTIFACT_PAGES + 1):
+        payload = _mapping(
+            api.get_json(
+                f"/repos/{repository}/actions/runs/{run_id}/artifacts",
+                params={"per_page": 100, "page": page},
+            ),
+            f"main CI artifacts page {page}",
+        )
+        values = _array(payload.get("artifacts"), f"main CI artifacts page {page}")
+        total = payload.get("total_count")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            raise PromotionError("main CI artifact total_count is invalid")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise PromotionError("main CI artifact total_count changed during pagination")
+        seen_records += len(values)
+        for raw in values:
+            artifact = _mapping(raw, "main CI artifact")
+            name = artifact.get("name")
+            if isinstance(name, str) and name.startswith(prefix):
+                if re.fullmatch(re.escape(prefix) + r"[1-9][0-9]*", name) is None:
+                    raise PromotionError("main promotion receipt name is malformed")
+                candidates.append(artifact)
+                if len(candidates) > MAX_RECEIPT_CANDIDATES:
+                    raise PromotionError(
+                        "main promotion receipt count exceeds the fail-closed bound"
+                    )
+        if len(values) < 100:
+            if seen_records != expected_total:
+                raise PromotionError("main CI artifact total_count does not match pages")
+            return candidates
+    raise PromotionError("main CI artifact search exceeded the bounded page limit")
+
+
+def _detect_changes_job(
+    api: PromotionApi,
+    repository: str,
+    run_id: int,
+    run_attempt: int,
+    main_sha: str,
+) -> dict:
+    matches: list[dict] = []
+    seen_records = 0
+    expected_total: int | None = None
+    for page in range(1, MAX_ARTIFACT_PAGES + 1):
+        payload = _mapping(
+            api.get_json(
+                f"/repos/{repository}/actions/runs/{run_id}/attempts/{run_attempt}/jobs",
+                params={"per_page": 100, "page": page},
+            ),
+            f"main CI attempt {run_attempt} jobs page {page}",
+        )
+        values = _array(
+            payload.get("jobs"), f"main CI attempt {run_attempt} jobs page {page}"
+        )
+        total = payload.get("total_count")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            raise PromotionError("main CI job total_count is invalid")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise PromotionError("main CI job total_count changed during pagination")
+        seen_records += len(values)
+        matches.extend(
+            _mapping(raw, "main CI job")
+            for raw in values
+            if isinstance(raw, dict) and raw.get("name") == "detect-changes"
+        )
+        if len(values) < 100:
+            if seen_records != expected_total:
+                raise PromotionError("main CI job total_count does not match pages")
+            break
+    else:
+        raise PromotionError("main CI job search exceeded the bounded page limit")
+    if len(matches) != 1:
+        raise PromotionError(
+            f"expected one detect-changes job in main attempt {run_attempt}, "
+            f"found {len(matches)}"
+        )
+    job = matches[0]
+    if (
+        job.get("run_id") != run_id
+        or job.get("run_attempt") != run_attempt
+        or job.get("head_sha") != main_sha
+        or job.get("status") != "completed"
+        or job.get("conclusion") != "success"
+    ):
+        raise PromotionError(
+            f"detect-changes job in main attempt {run_attempt} is not an exact success"
+        )
+    _positive_int(job.get("id"), "detect-changes job id")
+    return job
+
+
+def _download_main_plan_artifact(
     api: PromotionApi,
     repository: str,
     repository_id: int,
-    main_run: dict,
+    artifact: dict,
     temp_root: Path,
 ) -> dict:
-    run_id = _positive_int(main_run.get("id"), "main CI run id")
-    run_attempt = _positive_int(main_run.get("run_attempt"), "main CI run attempt")
-    name = f"main-release-promotion-receipt-{run_id}-{run_attempt}"
-    candidates = [
-        artifact
-        for artifact in _artifact_pages(api, repository, name)
-        if artifact.get("name") == name
-        and _mapping(
-            artifact.get("workflow_run"), "main receipt workflow run"
-        ).get("id")
-        == run_id
-    ]
-    if len(candidates) != 1:
-        raise PromotionError(
-            f"expected one exact main promotion receipt, found {len(candidates)}"
-        )
-    artifact = candidates[0]
     artifact_run = _mapping(
         artifact.get("workflow_run"), "main receipt workflow run"
     )
@@ -755,6 +842,85 @@ def _download_main_plan(
     extracted = work / "plan"
     safe_extract_zip(wrapper, extracted, ["main-release-promotion-receipt.json"])
     return read_plan(extracted / "main-release-promotion-receipt.json")
+
+
+def _main_plan_semantics(plan: dict) -> str:
+    main_run = _mapping(plan.get("main_run"), "plan main run")
+    receipt = _mapping(plan.get("receipt"), "plan receipt")
+    semantic = {
+        "schema_version": plan.get("schema_version"),
+        "main_sha": plan.get("main_sha"),
+        "main_tree_sha": plan.get("main_tree_sha"),
+        "main_run": {
+            "run_id": main_run.get("run_id"),
+            "workflow_path": main_run.get("workflow_path"),
+        },
+        # Rerunning the trusted observer creates a new immutable wrapper ID even
+        # when the source run and all six archive hashes are unchanged. Wrapper
+        # identity is revalidated after selecting the newest plan; it is not a
+        # release-semantic difference by itself.
+        "receipt": json.loads(_receipt_semantics(receipt)),
+    }
+    return json.dumps(semantic, separators=(",", ":"), sort_keys=True)
+
+
+def _download_main_plan(
+    api: PromotionApi,
+    repository: str,
+    repository_id: int,
+    main_run: dict,
+    temp_root: Path,
+) -> dict:
+    run_id = _positive_int(main_run.get("id"), "main CI run id")
+    terminal_attempt = _positive_int(
+        main_run.get("run_attempt"), "main CI run attempt"
+    )
+    main_sha = _sha(main_run.get("head_sha"), "main CI head SHA")
+    candidates = _main_receipt_artifacts(api, repository, run_id)
+    if not candidates:
+        raise PromotionError("main promotion receipt is not available")
+
+    validated: list[tuple[int, int, dict]] = []
+    validated_attempts: set[int] = set()
+    for artifact in sorted(candidates, key=lambda item: int(item.get("id", 0))):
+        artifact_run = _mapping(
+            artifact.get("workflow_run"), "main receipt workflow run"
+        )
+        if artifact_run.get("id") != run_id:
+            raise PromotionError("main promotion receipt belongs to a different run")
+        plan = _download_main_plan_artifact(
+            api, repository, repository_id, artifact, temp_root
+        )
+        plan_run = _mapping(plan.get("main_run"), "plan main run")
+        origin_attempt = _positive_int(
+            plan_run.get("run_attempt"), "plan main run attempt"
+        )
+        if origin_attempt > terminal_attempt:
+            raise PromotionError("main promotion receipt claims a future run attempt")
+        if (
+            plan_run.get("run_id") != run_id
+            or plan_run.get("workflow_path") != CI_WORKFLOW_PATH
+            or artifact.get("name")
+            != f"main-release-promotion-receipt-{run_id}-{origin_attempt}"
+        ):
+            raise PromotionError("main promotion receipt origin is inconsistent")
+        if origin_attempt not in validated_attempts:
+            _detect_changes_job(
+                api, repository, run_id, origin_attempt, main_sha
+            )
+            validated_attempts.add(origin_attempt)
+        validated.append(
+            (
+                origin_attempt,
+                _positive_int(artifact.get("id"), "main receipt artifact id"),
+                plan,
+            )
+        )
+
+    semantics = {_main_plan_semantics(plan) for _attempt, _id, plan in validated}
+    if len(semantics) != 1:
+        raise PromotionError("main promotion receipt reruns produced conflicting semantics")
+    return max(validated, key=lambda value: (value[0], value[1]))[2]
 
 
 def consume_main_receipt(
@@ -794,7 +960,6 @@ def consume_main_receipt(
             plan.get("main_sha") != main_sha
             or plan.get("main_tree_sha") != result.main_tree_sha
             or plan_run.get("run_id") != main_run.get("id")
-            or plan_run.get("run_attempt") != main_run.get("run_attempt")
             or plan.get("receipt_artifact") != expected_artifact
             or _receipt_semantics(_mapping(plan.get("receipt"), "plan receipt"))
             != _receipt_semantics(_mapping(result.receipt, "validated receipt"))

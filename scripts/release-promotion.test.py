@@ -375,6 +375,392 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertEqual(consumed.state, "blocked")
         self.assertIsNone(closed_plan)
 
+    def test_partial_rerun_accepts_attempt_one_receipt_after_attempt_two_success(self) -> None:
+        main_sha = "3" * 40
+        receipt = {
+            "assets": [{"name": "a", "sha256": "1" * 64}],
+            "check_suite_id": 11,
+            "head_sha": HEAD_SHA,
+            "paths": ["version.txt"],
+            "pr_number": 4,
+            "repository": REPOSITORY,
+            "repository_id": 2,
+            "run_attempt": 2,
+            "run_id": 7,
+            "tree_sha": "2" * 40,
+            "version": "0.15.4",
+            "workflow_id": 9,
+        }
+        receipt_artifact = {
+            "digest": "sha256:" + "a" * 64,
+            "id": 40,
+            "name": "validated-release-receipt-7-2",
+            "size_in_bytes": 123,
+        }
+        result = PROMOTION.GateResult(
+            "validated",
+            "ok",
+            receipt=receipt,
+            receipt_artifact=receipt_artifact,
+            main_sha=main_sha,
+            main_tree_sha="4" * 40,
+        )
+        plan = {
+            "schema_version": 1,
+            "main_sha": main_sha,
+            "main_tree_sha": "4" * 40,
+            "main_run": {
+                "run_id": 100,
+                "run_attempt": 1,
+                "workflow_path": PROMOTION.CI_WORKFLOW_PATH,
+            },
+            "receipt": receipt,
+            "receipt_artifact": receipt_artifact,
+        }
+        main_receipt = {
+            "id": 60,
+            "name": "main-release-promotion-receipt-100-1",
+            "workflow_run": {"id": 100},
+        }
+        artifacts_path = f"/repos/{REPOSITORY}/actions/runs/100/artifacts"
+        artifacts_params = {"per_page": 100, "page": 1}
+        jobs_path = f"/repos/{REPOSITORY}/actions/runs/100/attempts/1/jobs"
+        jobs_params = {"per_page": 100, "page": 1}
+        api = FakeApi(
+            {
+                (f"/repos/{REPOSITORY}", ()): {
+                    "id": 2,
+                    "full_name": REPOSITORY,
+                },
+                (artifacts_path, tuple(sorted(artifacts_params.items()))): {
+                    "total_count": 1,
+                    "artifacts": [main_receipt],
+                },
+                (jobs_path, tuple(sorted(jobs_params.items()))): {
+                    "total_count": 1,
+                    "jobs": [
+                        {
+                            "id": 70,
+                            "name": "detect-changes",
+                            "run_id": 100,
+                            "run_attempt": 1,
+                            "head_sha": main_sha,
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                    ],
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            PROMOTION, "verify_main", return_value=result
+        ), mock.patch.object(
+            PROMOTION,
+            "_main_ci_run",
+            return_value={"id": 100, "run_attempt": 2, "head_sha": main_sha},
+        ), mock.patch.object(
+            PROMOTION, "_download_main_plan_artifact", return_value=plan
+        ):
+            consumed, closed_plan = PROMOTION.consume_main_receipt(
+                api, REPOSITORY, main_sha, Path(raw)
+            )
+        self.assertEqual(consumed.state, "validated")
+        self.assertEqual(consumed.main_run_attempt, 2)
+        self.assertEqual(closed_plan, plan)
+
+    def test_main_receipt_rejects_failed_detect_changes_origin(self) -> None:
+        main_sha = "3" * 40
+        artifact = {
+            "id": 60,
+            "name": "main-release-promotion-receipt-100-1",
+            "workflow_run": {"id": 100},
+        }
+        plan = {
+            "schema_version": 1,
+            "main_sha": main_sha,
+            "main_tree_sha": "4" * 40,
+            "main_run": {
+                "run_id": 100,
+                "run_attempt": 1,
+                "workflow_path": PROMOTION.CI_WORKFLOW_PATH,
+            },
+            "receipt": {},
+            "receipt_artifact": {},
+        }
+        api = FakeApi(
+            {
+                (
+                    f"/repos/{REPOSITORY}/actions/runs/100/attempts/1/jobs",
+                    (("page", 1), ("per_page", 100)),
+                ): {
+                    "total_count": 1,
+                    "jobs": [
+                        {
+                            "id": 70,
+                            "name": "detect-changes",
+                            "run_id": 100,
+                            "run_attempt": 1,
+                            "head_sha": main_sha,
+                            "status": "completed",
+                            "conclusion": "failure",
+                        }
+                    ],
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            PROMOTION, "_main_receipt_artifacts", return_value=[artifact]
+        ), mock.patch.object(
+            PROMOTION, "_download_main_plan_artifact", return_value=plan
+        ):
+            with self.assertRaisesRegex(PROMOTION.PromotionError, "not an exact success"):
+                PROMOTION._download_main_plan(
+                    api,
+                    REPOSITORY,
+                    2,
+                    {"id": 100, "run_attempt": 2, "head_sha": main_sha},
+                    Path(raw),
+                )
+
+    def test_main_receipt_reruns_must_have_consistent_semantics(self) -> None:
+        main_sha = "3" * 40
+        receipt = {
+            "assets": [{"name": "a", "sha256": "1" * 64}],
+            "check_suite_id": 11,
+            "head_sha": HEAD_SHA,
+            "paths": ["version.txt"],
+            "pr_number": 4,
+            "repository": REPOSITORY,
+            "repository_id": 2,
+            "run_attempt": 1,
+            "run_id": 7,
+            "tree_sha": "2" * 40,
+            "version": "0.15.4",
+            "workflow_id": 9,
+        }
+        artifacts = [
+            {
+                "id": attempt,
+                "name": f"main-release-promotion-receipt-100-{attempt}",
+                "workflow_run": {"id": 100},
+            }
+            for attempt in (1, 2)
+        ]
+        plans = [
+            {
+                "schema_version": 1,
+                "main_sha": main_sha,
+                "main_tree_sha": digit * 40,
+                "main_run": {
+                    "run_id": 100,
+                    "run_attempt": attempt,
+                    "workflow_path": PROMOTION.CI_WORKFLOW_PATH,
+                },
+                "receipt": {**receipt, "observer": {"run_id": attempt}},
+                "receipt_artifact": {"id": attempt},
+            }
+            for attempt, digit in ((1, "4"), (2, "5"))
+        ]
+        responses: dict[tuple[str, tuple], object] = {}
+        for attempt in (1, 2):
+            responses[
+                (
+                    f"/repos/{REPOSITORY}/actions/runs/100/attempts/{attempt}/jobs",
+                    (("page", 1), ("per_page", 100)),
+                )
+            ] = {
+                "total_count": 1,
+                "jobs": [
+                    {
+                        "id": 70 + attempt,
+                        "name": "detect-changes",
+                        "run_id": 100,
+                        "run_attempt": attempt,
+                        "head_sha": main_sha,
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ],
+            }
+        api = FakeApi(responses)
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            PROMOTION, "_main_receipt_artifacts", return_value=artifacts
+        ), mock.patch.object(
+            PROMOTION, "_download_main_plan_artifact", side_effect=plans
+        ):
+            with self.assertRaisesRegex(PROMOTION.PromotionError, "conflicting semantics"):
+                PROMOTION._download_main_plan(
+                    api,
+                    REPOSITORY,
+                    2,
+                    {"id": 100, "run_attempt": 2, "head_sha": main_sha},
+                    Path(raw),
+                )
+
+    def test_main_receipt_selects_newest_consistent_origin(self) -> None:
+        main_sha = "3" * 40
+        receipt = {
+            "assets": [{"name": "a", "sha256": "1" * 64}],
+            "check_suite_id": 11,
+            "head_sha": HEAD_SHA,
+            "paths": ["version.txt"],
+            "pr_number": 4,
+            "repository": REPOSITORY,
+            "repository_id": 2,
+            "run_attempt": 1,
+            "run_id": 7,
+            "tree_sha": "2" * 40,
+            "version": "0.15.4",
+            "workflow_id": 9,
+        }
+        artifacts = [
+            {
+                "id": attempt,
+                "name": f"main-release-promotion-receipt-100-{attempt}",
+                "workflow_run": {"id": 100},
+            }
+            for attempt in (1, 2)
+        ]
+        plans = [
+            {
+                "schema_version": 1,
+                "main_sha": main_sha,
+                "main_tree_sha": "4" * 40,
+                "main_run": {
+                    "run_id": 100,
+                    "run_attempt": attempt,
+                    "workflow_path": PROMOTION.CI_WORKFLOW_PATH,
+                },
+                "receipt": {**receipt, "observer": {"run_id": attempt}},
+                "receipt_artifact": {"id": attempt},
+            }
+            for attempt in (1, 2)
+        ]
+        responses: dict[tuple[str, tuple], object] = {}
+        for attempt in (1, 2):
+            responses[
+                (
+                    f"/repos/{REPOSITORY}/actions/runs/100/attempts/{attempt}/jobs",
+                    (("page", 1), ("per_page", 100)),
+                )
+            ] = {
+                "total_count": 1,
+                "jobs": [
+                    {
+                        "id": 70 + attempt,
+                        "name": "detect-changes",
+                        "run_id": 100,
+                        "run_attempt": attempt,
+                        "head_sha": main_sha,
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ],
+            }
+        api = FakeApi(responses)
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            PROMOTION, "_main_receipt_artifacts", return_value=artifacts
+        ), mock.patch.object(
+            PROMOTION, "_download_main_plan_artifact", side_effect=plans
+        ):
+            selected = PROMOTION._download_main_plan(
+                api,
+                REPOSITORY,
+                2,
+                {"id": 100, "run_attempt": 2, "head_sha": main_sha},
+                Path(raw),
+            )
+        self.assertEqual(selected["main_run"]["run_attempt"], 2)
+
+    def test_main_receipt_future_attempt_and_malformed_name_fail_closed(self) -> None:
+        main_sha = "3" * 40
+        future_artifact = {
+            "id": 60,
+            "name": "main-release-promotion-receipt-100-3",
+            "workflow_run": {"id": 100},
+        }
+        future_plan = {
+            "schema_version": 1,
+            "main_sha": main_sha,
+            "main_tree_sha": "4" * 40,
+            "main_run": {
+                "run_id": 100,
+                "run_attempt": 3,
+                "workflow_path": PROMOTION.CI_WORKFLOW_PATH,
+            },
+            "receipt": {},
+            "receipt_artifact": {},
+        }
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            PROMOTION, "_main_receipt_artifacts", return_value=[future_artifact]
+        ), mock.patch.object(
+            PROMOTION, "_download_main_plan_artifact", return_value=future_plan
+        ):
+            with self.assertRaisesRegex(PROMOTION.PromotionError, "future run attempt"):
+                PROMOTION._download_main_plan(
+                    mock.Mock(),
+                    REPOSITORY,
+                    2,
+                    {"id": 100, "run_attempt": 2, "head_sha": main_sha},
+                    Path(raw),
+                )
+
+        artifacts_path = f"/repos/{REPOSITORY}/actions/runs/100/artifacts"
+        malformed_api = FakeApi(
+            {
+                (
+                    artifacts_path,
+                    (("page", 1), ("per_page", 100)),
+                ): {
+                    "total_count": 1,
+                    "artifacts": [
+                        {
+                            "id": 61,
+                            "name": "main-release-promotion-receipt-100-bogus",
+                        }
+                    ],
+                }
+            }
+        )
+        with self.assertRaisesRegex(PROMOTION.PromotionError, "name is malformed"):
+            PROMOTION._main_receipt_artifacts(malformed_api, REPOSITORY, 100)
+
+    def test_main_receipt_and_job_pagination_fail_closed_on_short_pages(self) -> None:
+        artifacts_path = f"/repos/{REPOSITORY}/actions/runs/100/artifacts"
+        jobs_path = f"/repos/{REPOSITORY}/actions/runs/100/attempts/1/jobs"
+        params = (("page", 1), ("per_page", 100))
+        api = FakeApi(
+            {
+                (artifacts_path, params): {
+                    "total_count": 2,
+                    "artifacts": [
+                        {
+                            "id": 1,
+                            "name": "main-release-promotion-receipt-100-1",
+                        }
+                    ],
+                },
+                (jobs_path, params): {
+                    "total_count": 2,
+                    "jobs": [
+                        {
+                            "id": 2,
+                            "name": "detect-changes",
+                            "run_id": 100,
+                            "run_attempt": 1,
+                            "head_sha": "3" * 40,
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                    ],
+                },
+            }
+        )
+        with self.assertRaisesRegex(PROMOTION.PromotionError, "does not match pages"):
+            PROMOTION._main_receipt_artifacts(api, REPOSITORY, 100)
+        with self.assertRaisesRegex(PROMOTION.PromotionError, "does not match pages"):
+            PROMOTION._detect_changes_job(api, REPOSITORY, 100, 1, "3" * 40)
+
     def test_main_ci_run_requires_exact_attempt_and_control_plane(self) -> None:
         run = {
             "id": 100,
