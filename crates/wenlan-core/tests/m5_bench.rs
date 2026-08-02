@@ -343,6 +343,123 @@ async fn exporter_rejects_database_output_aliases_before_data_loss() {
     }
 }
 
+#[cfg(feature = "eval-harness")]
+#[tokio::test]
+async fn exporter_refuses_live_wal_sidecar_and_preserves_uncheckpointed_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("live.db");
+    let database = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let connection = database.connect().unwrap();
+
+    let mut journal_mode = connection
+        .query("PRAGMA journal_mode=WAL", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        journal_mode
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap()
+            .to_ascii_lowercase(),
+        "wal"
+    );
+    drop(journal_mode);
+    let mut autocheckpoint = connection
+        .query("PRAGMA wal_autocheckpoint=0", ())
+        .await
+        .unwrap();
+    autocheckpoint.next().await.unwrap().unwrap();
+    drop(autocheckpoint);
+    connection
+        .execute(
+            "CREATE TABLE pages (id TEXT PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut checkpoint = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    checkpoint.next().await.unwrap().unwrap();
+    drop(checkpoint);
+    let main_before_commit = std::fs::read(&db_path).unwrap();
+
+    connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    for index in 0..5 {
+        connection
+            .execute(
+                "INSERT INTO pages (id, content, status) VALUES (?1, ?2, 'active')",
+                libsql::params![format!("p{index}"), "x".repeat(100)],
+            )
+            .await
+            .unwrap();
+    }
+    connection.execute("COMMIT", ()).await.unwrap();
+
+    let wal_path = directory.path().join("live.db-wal");
+    let wal_before = std::fs::read(&wal_path).unwrap();
+    assert!(!wal_before.is_empty());
+    assert_eq!(std::fs::read(&db_path).unwrap(), main_before_commit);
+
+    let nested = directory.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let wal_alias = nested.join("..").join("live.db-wal");
+    let result = run_exporter(&db_path, &wal_alias, true);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("SQLite transaction-control"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+
+    let observer = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        observer.fixed_counts().await.unwrap(),
+        [5, 0, 0, 0, 0, 0, 0, 0]
+    );
+
+    drop(connection);
+    drop(database);
+}
+
+#[cfg(feature = "eval-harness")]
+#[tokio::test]
+async fn snapshot_fences_exact_database_file_family_but_allows_unrelated_same_dir_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("family.db");
+    create_pages_db(&db_path, &five_ascii_pages()).await;
+
+    for family_name in [
+        "family.db-wal",
+        "family.db-shm",
+        "family.db-journal",
+        "family.db-mj123456789",
+    ] {
+        let output = directory.path().join(family_name);
+        let error = wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&db_path, &output, true)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("SQLite transaction-control"),
+            "{family_name}: {error:#}"
+        );
+        assert!(!output.exists());
+    }
+
+    let unrelated = directory.path().join("distribution.json");
+    let prepared =
+        wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&db_path, &unrelated, true).unwrap();
+    prepared.write(b"safe\n").unwrap();
+    assert_eq!(std::fs::read(&unrelated).unwrap(), b"safe\n");
+}
+
 #[cfg(all(feature = "eval-harness", unix))]
 #[tokio::test]
 async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {

@@ -12,7 +12,7 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use same_file::Handle;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +23,8 @@ pub struct PreparedM5Snapshot {
     parent: Dir,
     parent_identity: Handle,
     db_identity: Handle,
+    db_name: OsString,
+    shares_db_parent: bool,
     lexical_parent: PathBuf,
     target_name: OsString,
     overwrite: bool,
@@ -44,6 +46,23 @@ pub fn prepare_m5_snapshot(
         bail!("--db must name a regular file");
     }
     let db_identity = Handle::from_file(db_file).context("hold snapshot database identity")?;
+    let db_name = db
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("--db must include a file name")?
+        .to_os_string();
+    let db_parent = Dir::open_ambient_dir(nonempty_parent(db), ambient_authority())
+        .context("open database-parent capability")?;
+    let db_parent_identity = handle_for_dir(&db_parent).context("hold database-parent identity")?;
+
+    let db_via_parent = db_parent
+        .open(&db_name)
+        .context("open database through held parent capability")?;
+    let db_via_parent_identity =
+        Handle::from_file(db_via_parent.into_std()).context("verify database-parent identity")?;
+    if db_via_parent_identity != db_identity {
+        bail!("database parent changed during snapshot preparation");
+    }
 
     let target_name = output
         .file_name()
@@ -54,11 +73,14 @@ pub fn prepare_m5_snapshot(
     let parent = Dir::open_ambient_dir(&lexical_parent, ambient_authority())
         .context("open output-parent capability")?;
     let parent_identity = handle_for_dir(&parent).context("hold output-parent identity")?;
+    let shares_db_parent = parent_identity == db_parent_identity;
 
     let prepared = PreparedM5Snapshot {
         parent,
         parent_identity,
         db_identity,
+        db_name,
+        shares_db_parent,
         lexical_parent,
         target_name,
         overwrite,
@@ -128,6 +150,12 @@ impl PreparedM5Snapshot {
     }
 
     fn validate_existing_target(&self) -> Result<()> {
+        if self.shares_db_parent
+            && is_sqlite_transaction_control_name(&self.db_name, &self.target_name)
+        {
+            bail!("--output must not name a SQLite transaction-control file for --db");
+        }
+
         let metadata = match self.parent.symlink_metadata(&self.target_name) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -187,4 +215,20 @@ fn nonempty_parent(path: &Path) -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+fn is_sqlite_transaction_control_name(db_name: &OsStr, target_name: &OsStr) -> bool {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut family_name = db_name.to_os_string();
+        family_name.push(suffix);
+        if target_name == family_name {
+            return true;
+        }
+    }
+
+    let mut super_journal_prefix = db_name.to_os_string();
+    super_journal_prefix.push("-mj");
+    target_name
+        .as_encoded_bytes()
+        .starts_with(super_journal_prefix.as_encoded_bytes())
 }
