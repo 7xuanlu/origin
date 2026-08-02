@@ -455,17 +455,84 @@ class PlatformPlanTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "full")
         self.assertTrue(all(required_suite_outputs(plan).values()))
 
-    def test_empty_pr_inventory_still_fails_closed(self) -> None:
-        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
-            build_platform_plan(
-                [],
-                cargo_metadata(),
-                event_name="pull_request",
-                existing_paths=set(),
-            )
+    def test_filtered_m4_only_pr_inventory_skips_generic_platform_suites(
+        self,
+    ) -> None:
+        plan = build_platform_plan(
+            [],
+            cargo_metadata(),
+            event_name="pull_request",
+            existing_paths=set(),
+        )
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertEqual(
+            plan["reasons"], ["no generic platform behavioral inputs changed"]
+        )
+        self.assertFalse(any(required_suite_outputs(plan).values()))
+
+    def test_empty_non_pr_and_release_platform_inventory_keeps_full_backstop(
+        self,
+    ) -> None:
+        for event_name in ("push", "release-please"):
+            with self.subTest(event_name=event_name):
+                plan = build_platform_plan(
+                    [],
+                    cargo_metadata(),
+                    event_name=event_name,
+                    existing_paths=set(),
+                )
+
+                self.assertEqual(plan["mode"], "full")
+                self.assertTrue(all(required_suite_outputs(plan).values()))
 
 
 class NarrowOwnerTests(unittest.TestCase):
+    R4_MANIFESTS = (
+        "crates/wenlan-core/src/drift_guard/r4_test_support_api_manifest.txt",
+        "crates/wenlan-core/src/drift_guard/r4_test_support_raw_manifest.txt",
+    )
+
+    def test_r4_manifests_select_only_their_canonical_contract_module(self) -> None:
+        for path in self.R4_MANIFESTS:
+            with self.subTest(path=path):
+                plan = plan_for(path)
+
+                self.assertEqual(plan["mode"], "differential")
+                self.assertEqual(
+                    plan["workspace_lib"],
+                    {
+                        "mode": "filterset",
+                        "packages": ["wenlan-core"],
+                        "filterset": (
+                            "package(wenlan-core) & "
+                            "test(/^drift_guard::r4_test_support_test::/)"
+                        ),
+                    },
+                )
+                self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
+                self.assertEqual(plan["core_integration"], {"mode": "skip"})
+                self.assertEqual(plan["contract_integration"], {"mode": "skip"})
+                self.assertEqual(plan["canonical_smokes"], {"mode": "skip"})
+                outputs = required_suite_outputs(plan)
+                self.assertTrue(outputs["rust-ci-required"])
+                self.assertFalse(outputs["canonical-acceptance-required"])
+
+    def test_removed_r4_manifest_fails_closed_to_every_suite(self) -> None:
+        for path in self.R4_MANIFESTS:
+            with self.subTest(path=path):
+                plan = plan_for(path, existing_paths=set())
+
+                self.assertEqual(plan["mode"], "full")
+                self.assertTrue(all(required_suite_outputs(plan).values()))
+
+    def test_unknown_r4_manifest_sibling_stays_fail_closed(self) -> None:
+        path = "crates/wenlan-core/src/drift_guard/new_manifest.txt"
+        plan = plan_for(path)
+
+        self.assertEqual(plan["mode"], "full")
+        self.assertTrue(all(required_suite_outputs(plan).values()))
+
     def test_explicit_isolated_test_module_selects_its_real_prefix(self) -> None:
         path = "crates/wenlan-core/src/lint/pages/security_test.rs"
         plan = plan_for(path)
@@ -905,6 +972,56 @@ class CommandGenerationTests(unittest.TestCase):
             local_test_commands_for(target_plan, cargo_metadata()),
             [["cargo", "test", "-p", "wenlan-mcp", "--test", "real_router"]],
         )
+
+    def test_local_push_runs_isolated_modules_by_exact_cargo_prefix(self) -> None:
+        plan = plan_for(
+            "crates/wenlan-core/src/drift_guard/r4_test_support_raw_manifest.txt"
+        )
+
+        self.assertEqual(
+            local_test_commands_for(plan, cargo_metadata()),
+            [
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-core",
+                    "--lib",
+                    "drift_guard::r4_test_support_test::",
+                ]
+            ],
+        )
+
+    def test_local_push_preserves_mixed_broad_and_isolated_owners(self) -> None:
+        plan = plan_for(
+            "crates/wenlan-mcp/src/tools.rs",
+            "crates/wenlan-core/src/drift_guard/r4_test_support_api_manifest.txt",
+        )
+
+        self.assertEqual(plan["workspace_lib"]["mode"], "filterset")
+        self.assertEqual(
+            local_test_commands_for(plan, cargo_metadata()),
+            [
+                ["cargo", "test", "-p", "wenlan-mcp", "--lib"],
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-core",
+                    "--lib",
+                    "drift_guard::r4_test_support_test::",
+                ],
+            ],
+        )
+
+    def test_local_push_rejects_unrecognized_filterset_text(self) -> None:
+        plan = plan_for(
+            "crates/wenlan-core/src/drift_guard/r4_test_support_raw_manifest.txt"
+        )
+        plan["workspace_lib"]["filterset"] = "all()"
+
+        with self.assertRaisesRegex(PlanError, "not locally executable"):
+            local_test_commands_for(plan, cargo_metadata())
 
     def test_contract_target_generates_required_target_only_command(self) -> None:
         plan = plan_for("crates/wenlan-types/tests/page_draft_wire.rs")

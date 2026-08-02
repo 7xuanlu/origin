@@ -505,11 +505,24 @@ jobs:
         id: platform-test-plan
         if: steps.release-proof.outputs.verified-release-merge != 'true'
         env:
-          CHANGED_FILES_JSON: ${{ steps.filter.outputs.impact_files }}
+          MACOS_FILES_JSON: ${{ steps.filter.outputs.macos_files }}
+          MACOS_M4_FILES_JSON: ${{ steps.filter.outputs['macos-m4_files'] }}
+          WINDOWS_FILES_JSON: ${{ steps.filter.outputs.windows_files }}
           # Release-please is the pre-release backstop, so it keeps the full
           # platform plan even though it arrives as a pull_request event.
           CI_EVENT_NAME: ${{ startsWith(github.head_ref, 'release-please--branches--') && 'release-please' || github.event_name }}
         run: |
+          # Canonical Linux receives the complete PR inventory above. Native
+          # lanes receive only files owned by their filters; M4-only macOS
+          # paths already have the focused M4 gate in the macOS job. Keep all
+          # Windows ownership even if a future path is shared with that gate.
+          CHANGED_FILES_JSON="$(
+            jq -cn \
+              --argjson macos "$MACOS_FILES_JSON" \
+              --argjson macos_m4 "$MACOS_M4_FILES_JSON" \
+              --argjson windows "$WINDOWS_FILES_JSON" \
+              '(($macos - $macos_m4) + $windows) | unique'
+          )"
           python3 scripts/ci_test_plan.py plan \
             --scope platform \
             --changed-files-json "$CHANGED_FILES_JSON" \
