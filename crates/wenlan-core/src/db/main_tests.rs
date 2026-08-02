@@ -38667,6 +38667,376 @@ async fn migration_89_kind_fold_ledger_records_assignment_rule() {
     );
 }
 
+async fn page_kind_of(db: &MemoryDB, id: &str) -> String {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query("SELECT kind FROM pages WHERE id = ?1", libsql::params![id])
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+/// Every page-insert path must stamp `kind` explicitly. Migration 89 gave the
+/// column an honest backfill but the write path never carried the rule, so
+/// every page created after it silently took the `'concept'` DEFAULT --
+/// including the reserved Overview singleton, whose whole identity is that it
+/// is not a concept page.
+#[tokio::test]
+async fn insert_page_stamps_kind_from_title_and_creation_kind() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    db.insert_page(
+        "page_kind_distilled",
+        "Rust ownership",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    for (id, title, creation_kind) in [
+        ("page_kind_overview", "Overview", "research"),
+        ("page_kind_overview_case", "oVeRvIeW", "research"),
+        ("page_kind_research", "Some research", "research"),
+        ("page_kind_authored", "Hand written", "authored"),
+        ("page_kind_source", "Ingested file", "source"),
+        ("page_kind_imported", "Legacy import", "imported"),
+    ] {
+        db.insert_page_with_kind(
+            id,
+            title,
+            None,
+            "body",
+            None,
+            None,
+            &[],
+            &now,
+            creation_kind,
+            "unconfirmed",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    for (id, expected) in [
+        ("page_kind_distilled", "concept"),
+        ("page_kind_overview", "overview"),
+        ("page_kind_overview_case", "overview"),
+        ("page_kind_research", "concept"),
+        ("page_kind_authored", "authored"),
+        ("page_kind_source", "source"),
+        ("page_kind_imported", "source"),
+    ] {
+        assert_eq!(
+            page_kind_of(&db, id).await,
+            expected,
+            "{id} must be stamped kind={expected} at insert, not left on the DEFAULT"
+        );
+    }
+}
+
+/// A Page draft is authored by a human by construction (`creation_kind`
+/// 'authored'), so its `kind` must say so from birth rather than claiming to
+/// be a distilled concept page.
+#[tokio::test]
+async fn page_draft_insert_stamps_authored_kind() {
+    let (db, _dir) = test_db().await;
+    let page = db
+        .create_page_draft("Draft title", "draft body", None, None)
+        .await
+        .unwrap();
+    assert_eq!(page_kind_of(&db, &page.id).await, "authored");
+}
+
+async fn rerun_migration_107(db: &MemoryDB) {
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 106", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 107 re-fires");
+}
+
+/// Seed a page directly, leaving `kind` on the column DEFAULT — exactly the
+/// shape the pre-repair write path produced.
+async fn seed_defaulted_page(
+    conn: &libsql::Connection,
+    id: &str,
+    title: &str,
+    creation_kind: &str,
+    status: &str,
+) {
+    conn.execute(
+        "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified, \
+         creation_kind, status) \
+         VALUES (?1, ?2, 'content', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
+                 '2026-01-01T00:00:00Z', ?3, ?4)",
+        libsql::params![id, title, creation_kind, status],
+    )
+    .await
+    .unwrap();
+}
+
+/// Freeze a page into migration 89's fold ledger, marking it as a row that
+/// migration already classified.
+async fn seed_kind_fold_ledger(conn: &libsql::Connection, id: &str, creation_kind: &str) {
+    conn.execute(
+        "INSERT INTO page_kind_fold_ledger \
+         (page_id, prior_creation_kind, assigned_kind, rule, migrated_at) \
+         VALUES (?1, ?2, 'concept', 'concept', '2026-01-01T00:00:00Z')",
+        libsql::params![id, creation_kind],
+    )
+    .await
+    .unwrap();
+}
+
+/// Migration 89 classified the corpus it could see; every page written after it
+/// took the `'concept'` DEFAULT because no insert named the column. The repair
+/// applies the same rule to exactly that population — rows the 89 fold never
+/// recorded — and leaves migration 89's own decisions, and any deliberately
+/// stamped kind, alone.
+#[tokio::test]
+async fn migration_107_repairs_kind_for_pages_the_89_fold_never_saw() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        for (id, title, creation_kind, status) in [
+            ("page_107_overview", "Overview", "research", "active"),
+            ("page_107_overview_case", "oVeRvIeW", "research", "active"),
+            ("page_107_source", "Ingested file", "source", "active"),
+            ("page_107_imported", "Legacy import", "imported", "active"),
+            ("page_107_authored", "Hand written", "authored", "draft"),
+            (
+                "page_107_distilled",
+                "Rust ownership",
+                "distilled",
+                "active",
+            ),
+            // An archived page titled "Overview" is not the reserved
+            // singleton -- the title is only reserved among live pages.
+            (
+                "page_107_archived_overview",
+                "Overview",
+                "research",
+                "archived",
+            ),
+        ] {
+            seed_defaulted_page(&conn, id, title, creation_kind, status).await;
+        }
+        // Classified by migration 89 as 'concept' and recorded as such; the
+        // repair must not overrule that, even though the rule reads
+        // creation_kind='source' as a source page today.
+        seed_defaulted_page(
+            &conn,
+            "page_107_pre89_source",
+            "Old ingest",
+            "source",
+            "active",
+        )
+        .await;
+        seed_kind_fold_ledger(&conn, "page_107_pre89_source", "source").await;
+        // A deliberately stamped kind is never demoted or re-derived.
+        conn.execute(
+            "UPDATE pages SET kind = 'entity' WHERE id = 'page_107_distilled'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    rerun_migration_107(&db).await;
+
+    for (id, expected) in [
+        ("page_107_overview", "overview"),
+        ("page_107_overview_case", "overview"),
+        ("page_107_source", "source"),
+        ("page_107_imported", "source"),
+        ("page_107_authored", "authored"),
+        ("page_107_archived_overview", "concept"),
+        ("page_107_pre89_source", "concept"),
+        ("page_107_distilled", "entity"),
+    ] {
+        assert_eq!(
+            page_kind_of(&db, id).await,
+            expected,
+            "{id} must read kind={expected} after the repair"
+        );
+    }
+}
+
+/// Migration 107's CASE is the frozen SQL twin of `pages::page_kind_for`. They
+/// have to agree at the moment the migration ships, or the repair writes one
+/// answer and every later insert writes another. Driven through the real
+/// migration rather than a re-typed copy of the expression, so the thing under
+/// test is the SQL that actually runs.
+#[tokio::test]
+async fn page_kind_rule_matches_the_migration_107_case() {
+    let (db, _dir) = test_db().await;
+    let mut matrix = Vec::new();
+    for (index, creation_kind) in [
+        "distilled",
+        "authored",
+        "research",
+        "imported",
+        "source",
+        "entity",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (title_index, title) in ["Overview", "oVeRvIeW", "Rust ownership"]
+            .into_iter()
+            .enumerate()
+        {
+            for status in ["active", "draft", "archived"] {
+                let id = format!("page_parity_{index}_{title_index}_{status}");
+                matrix.push((id, title, creation_kind, status));
+            }
+        }
+    }
+    {
+        let conn = db.conn.lock().await;
+        for (id, title, creation_kind, status) in &matrix {
+            seed_defaulted_page(&conn, id, title, creation_kind, status).await;
+        }
+    }
+
+    rerun_migration_107(&db).await;
+
+    for (id, title, creation_kind, status) in &matrix {
+        assert_eq!(
+            page_kind_of(&db, id).await,
+            crate::pages::page_kind_for(title, creation_kind, status),
+            "migration 107's CASE disagrees with page_kind_for for \
+             title={title:?} creation_kind={creation_kind:?} status={status:?}"
+        );
+    }
+}
+
+/// Re-running the repair is a no-op: it only ever moves a row off the silent
+/// default, so a second pass finds nothing left to move.
+#[tokio::test]
+async fn migration_107_kind_repair_is_idempotent() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        seed_defaulted_page(&conn, "page_107_idem", "Overview", "research", "active").await;
+    }
+    rerun_migration_107(&db).await;
+    assert_eq!(page_kind_of(&db, "page_107_idem").await, "overview");
+    rerun_migration_107(&db).await;
+    assert_eq!(page_kind_of(&db, "page_107_idem").await, "overview");
+}
+
+/// The SOURCE-page clone re-derives `kind` instead of copying it. Migration 89
+/// mapped only `creation_kind='imported'` onto 'source', so a pre-89 SOURCE
+/// page still sits at 'concept'; the clone is a NEW row with a new id and no
+/// fold-ledger entry, so migration 107 will never revisit it. Copying would
+/// mint a fresh row that lies -- the exact bug this change exists to end.
+#[tokio::test]
+async fn rebind_source_page_clone_derives_kind_rather_than_copying_a_stale_one() {
+    let (db, _dir) = test_db().await;
+    db.upsert_documents(vec![make_memory_doc(
+        "kind-rebind-old",
+        "Source page kind survives rename",
+        "fact",
+        "work",
+        "folder",
+    )])
+    .await
+    .unwrap();
+    let chunk_id = db
+        .get_memories_by_source_id("memory", "kind-rebind-old")
+        .await
+        .unwrap()[0]
+        .id
+        .clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page_with_kind(
+        "page_rebind_old",
+        "Ingested file",
+        None,
+        "body",
+        None,
+        None,
+        &[chunk_id.as_str()],
+        &now,
+        "source",
+        "unconfirmed",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    // Recreate the pre-89 state: migration 89 mapped only 'imported' onto
+    // 'source', so a SOURCE page of that era still sits on the silent default.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET kind = 'concept' WHERE id = 'page_rebind_old'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(page_kind_of(&db, "page_rebind_old").await, "concept");
+
+    db.rebind_source_id_with_source_page(
+        "memory",
+        "kind-rebind-old",
+        "kind-rebind-new",
+        "page_rebind_old",
+        "page_rebind_new",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        page_kind_of(&db, "page_rebind_new").await,
+        "source",
+        "the clone is a new row written today, so it must carry the kind today's \
+         rule assigns, not the stale one migration 89 left on its source"
+    );
+    // The clone's CASE is a third copy of the rule's logic; pin it to the rule
+    // itself so the two cannot drift apart unnoticed.
+    assert_eq!(
+        page_kind_of(&db, "page_rebind_new").await,
+        crate::pages::page_kind_for("Ingested file", "source", "active"),
+        "the clone's inline CASE must keep agreeing with crate::pages::page_kind_for"
+    );
+}
+
+/// A draft stores `kind='authored'`, so the `Page` handed back must say so.
+/// `PAGE_COLUMNS` used to stop before `kind`, and `row_to_page` defaults a
+/// missing column 20 to 'concept' -- which matched reality only while every
+/// row was 'concept'. Stamping the column at insert is what made that silent
+/// fallback start returning a value the row does not hold.
+#[tokio::test]
+async fn page_draft_read_returns_the_kind_it_stored() {
+    let (db, _dir) = test_db().await;
+    let id = format!("page_{}", uuid::Uuid::new_v4());
+    let created = db
+        .create_page_draft_with_id(&id, "Hand written", "body", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        page_kind_of(&db, &id).await,
+        "authored",
+        "the stored row is authored"
+    );
+    assert_eq!(
+        created.kind, "authored",
+        "and the returned Page must agree with the row it just wrote"
+    );
+}
+
 async fn insert_test_page(conn: &libsql::Connection, id: &str) {
     conn.execute(
         "INSERT INTO pages (id, title, content, created_at, last_compiled, last_modified) \

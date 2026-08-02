@@ -8,7 +8,8 @@ const PAGE_COLUMNS: &str = "id, title, summary, content, entity_id, space,
     source_memory_ids, version, status, created_at, last_compiled, last_modified,
     COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0),
     COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'),
-    COALESCE(review_status, 'confirmed'), workspace, citations";
+    COALESCE(review_status, 'confirmed'), workspace, citations,
+    COALESCE(kind, 'concept')";
 
 fn ensure_meaningful_snapshot(title: &str, content: &str) -> Result<(), WenlanError> {
     if title.trim().is_empty() && content.trim().is_empty() {
@@ -291,14 +292,21 @@ impl MemoryDB {
                     id, title, summary, content, entity_id, space, source_memory_ids,
                     version, status, embedding, created_at, last_compiled,
                     last_modified, sources_updated_count, stale_reason, user_edited,
-                    changelog, creation_kind, review_status, workspace, citations
+                    changelog, creation_kind, review_status, workspace, citations, kind
                  ) VALUES (
                     ?1, ?2, NULL, ?3, NULL, ?4, '[]',
                     1, 'draft', NULL, ?5, ?5,
                     ?5, 0, NULL, 1,
-                    '[]', 'authored', 'unconfirmed', ?4, '[]'
+                    '[]', 'authored', 'unconfirmed', ?4, '[]', ?6
                  )",
-            libsql::params![id, title, content, page_scope, now],
+            libsql::params![
+                id,
+                title,
+                content,
+                page_scope,
+                now,
+                crate::pages::page_kind_for(title, "authored", "draft")
+            ],
         )
         .await
         .map_err(|error| WenlanError::VectorDb(format!("create Page draft: {error}")))?;

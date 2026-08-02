@@ -9,6 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
+use syn::{Expr, Lit, Pat, Token};
 
 #[cfg(test)]
 #[path = "drift_guard/r4_test_support_test.rs"]
@@ -7803,6 +7808,2094 @@ fn db_domain_guard_rejects_missing_duplicate_inline_and_visible_scope_drift() {
         assert!(
             visible_drift.contains(unexpected),
             "positive control did not detect visible method {unexpected}: {visible_drift}"
+        );
+    }
+}
+
+// ── Teeth #15: every production `INSERT INTO pages` names `kind` ──
+
+/// Overwrite `[from, to)` with spaces, leaving newlines alone so reported
+/// offsets still line up with the file.
+fn blank_span(out: &mut [u8], from: usize, to: usize) {
+    for byte in &mut out[from..to] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+/// Blank comments — and, when `keep_strings` is false, string and char literals
+/// too — to spaces, preserving byte length and every newline.
+///
+/// Two callers want opposite halves of the same walk. Reading Rust block
+/// structure needs literals blanked, so a brace inside a string cannot move a
+/// depth counter. Reading the SQL a file executes needs literals *kept* but
+/// still recognised, so a `//` or a brace inside a query is not mistaken for
+/// Rust, while prose in a comment stops being scannable text.
+///
+/// Handles the three shapes that actually bite: Rust block comments nest, raw
+/// strings (`r#"…"#`) do not honour backslash escapes, and a `'` opens a char
+/// literal only when it closes like one — otherwise it is a lifetime, which
+/// never carries braces and must be left alone.
+fn mask_lexical(source: &str, keep_strings: bool) -> String {
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let blank = |byte: u8| if byte == b'\n' { b'\n' } else { b' ' };
+    let lit = |byte: u8| if keep_strings { byte } else { blank(byte) };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(b' ');
+                i += 1;
+            }
+            continue;
+        }
+
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth = depth.saturating_sub(1);
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                out.push(blank(bytes[i]));
+                i += 1;
+            }
+            continue;
+        }
+
+        if byte == b'r' {
+            let mut hashes = 0usize;
+            let mut open = i + 1;
+            while bytes.get(open) == Some(&b'#') {
+                hashes += 1;
+                open += 1;
+            }
+            if bytes.get(open) == Some(&b'"') {
+                while i <= open {
+                    out.push(lit(bytes[i]));
+                    i += 1;
+                }
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        let mut close = i + 1;
+                        let mut seen = 0usize;
+                        while seen < hashes && bytes.get(close) == Some(&b'#') {
+                            seen += 1;
+                            close += 1;
+                        }
+                        if seen == hashes {
+                            while i < close {
+                                out.push(lit(bytes[i]));
+                                i += 1;
+                            }
+                            break;
+                        }
+                    }
+                    out.push(lit(bytes[i]));
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        if byte == b'"' {
+            out.push(lit(byte));
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    out.push(lit(bytes[i]));
+                    i += 1;
+                    if i < bytes.len() {
+                        out.push(lit(bytes[i]));
+                        i += 1;
+                    }
+                    continue;
+                }
+                let closing = bytes[i] == b'"';
+                out.push(lit(bytes[i]));
+                i += 1;
+                if closing {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if byte == b'\'' {
+            // `'x'` and `'\n'` close within a few bytes; `'static` never does.
+            let closes = if bytes.get(i + 1) == Some(&b'\\') {
+                (2..8).find(|&n| bytes.get(i + n) == Some(&b'\''))
+            } else if bytes.get(i + 2) == Some(&b'\'') {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(n) = closes {
+                for offset in 0..=n {
+                    out.push(lit(bytes[i + offset]));
+                }
+                i += n + 1;
+                continue;
+            }
+        }
+
+        out.push(byte);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+/// Collapse a SQL column list lifted out of Rust source: line continuations,
+/// string-literal punctuation, and indentation all become single spaces, so
+/// the reported site is stable under reformatting.
+fn normalized_column_list(columns: &str) -> String {
+    columns
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c| c == '\\' || c == '"'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// True when the text immediately preceding an `INTO pages` is the INSERT
+/// keyword, allowing for a conflict clause: `INSERT INTO`, `INSERT OR IGNORE
+/// INTO`, `INSERT OR REPLACE INTO`. Anything else that merely mentions the
+/// table (`DELETE FROM pages`, a doc comment) is not a writer.
+fn insert_keyword_precedes(head: &str) -> bool {
+    // `ends_with` rather than word equality: the keyword is embedded in a Rust
+    // string literal, so the token carrying it is `conn.execute("INSERT`.
+    let head = head.trim_end();
+    if head.ends_with("INSERT") {
+        return true;
+    }
+    let mut words = head.split_whitespace().rev();
+    let _conflict_action = words.next();
+    words.next() == Some("OR") && words.next().is_some_and(|word| word.ends_with("INSERT"))
+}
+
+/// Production inserts into `pages` whose column list does not name `kind`,
+/// reported as `path: <column list>`.
+///
+/// `pages.kind` (migration 89) is `NOT NULL DEFAULT 'concept'`, so omitting it
+/// does not fail the insert — it silently asserts the row is a concept page.
+/// That default is exactly how every page written after migration 89 came to
+/// lie about what it is, the reserved Overview singleton included. The column
+/// list is the only place the omission is visible, so that is what is read.
+///
+/// Matching is deliberately loose on shape and strict on meaning: whitespace is
+/// collapsed first (so a statement split across source lines reads like a
+/// compact one) and keywords are compared case-insensitively against an
+/// ASCII-uppercase twin, because a guard that only recognises the one spelling
+/// the current code happens to use is a guard that passes the day someone
+/// writes `INSERT OR IGNORE` — a form this very file's migration 89 already
+/// uses on another table.
+fn page_insert_sites_without_kind(path: &str, source: &str) -> Vec<String> {
+    let production = strip_cfg_test_items(source);
+    let collapsed = production.split_whitespace().collect::<Vec<_>>().join(" ");
+    // `to_ascii_uppercase` is length-preserving, so one offset indexes both.
+    let upper = collapsed.to_ascii_uppercase();
+    let mut sites = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = upper[cursor..].find("INTO PAGES") {
+        let start = cursor + found;
+        cursor = start + "INTO PAGES".len();
+        let after = &collapsed[cursor..];
+        // `pages_fts`, `pages_pre49`, … are other tables entirely.
+        if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        if !insert_keyword_precedes(&upper[..start]) {
+            continue;
+        }
+        let Some(open) = after.find('(') else {
+            continue;
+        };
+        let Some(close) = after[open..].find(')') else {
+            continue;
+        };
+        let columns = normalized_column_list(&after[open + 1..open + close]);
+        if columns.split(',').any(|column| column.trim() == "kind") {
+            continue;
+        }
+        sites.push(format!("{path}: {columns}"));
+    }
+    sites
+}
+
+/// Migration 46 rebuilds `pages` from the legacy `concepts` table at
+/// `user_version = 46`, forty-three migrations before `kind` exists. Naming the
+/// column there would be a syntax error against the schema of its own era, so
+/// it is the one production insert that legitimately omits it — pinned by its
+/// exact column list rather than a line number so the exemption cannot quietly
+/// widen to cover a new writer.
+const PRE_KIND_SCHEMA_REBUILD: &str = concat!(
+    "crates/wenlan-core/src/db.rs: ",
+    "id, title, summary, content, entity_id, domain, source_memory_ids, version, status, ",
+    "embedding, created_at, last_compiled, last_modified, sources_updated_count, ",
+    "stale_reason, user_edited"
+);
+
+/// Test modules in this crate live in their own files, gated by a
+/// `#[cfg(test)] mod …;` declaration in the parent — a convention
+/// `db_main_tests_live_outside_db_rs` already enforces. The gate is therefore
+/// in the parent file, not in the module, so the `#[cfg(test)]` strip cannot
+/// see it and the scan has to recognise these by name.
+fn is_test_only_module(path: &str) -> bool {
+    let stem = path.strip_suffix(".rs").unwrap_or(path);
+    stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.contains("_test/")
+        || stem.contains("_tests/")
+        || stem.contains("_test_support")
+}
+
+#[test]
+fn every_production_page_insert_names_kind() {
+    let root = repo_root();
+    let mut sites = Vec::new();
+    for path in git_ls_files(&root, "*.rs").into_iter().filter(|path| {
+        path.starts_with("crates/")
+            && path.contains("/src/")
+            && path != "crates/wenlan-core/src/drift_guard.rs"
+            && !is_test_only_module(path)
+    }) {
+        let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
+        sites.extend(page_insert_sites_without_kind(&path, &source));
+    }
+    assert_eq!(
+        sites,
+        [PRE_KIND_SCHEMA_REBUILD],
+        "a production INSERT INTO pages omits `kind`, so the row it writes takes the \
+         NOT NULL DEFAULT 'concept' and claims to be a concept page whatever it really is. \
+         Name the column and stamp it from crate::pages::page_kind_for"
+    );
+}
+
+#[test]
+fn page_insert_kind_guard_detects_omission_and_ignores_lookalikes() {
+    let omitted = page_insert_sites_without_kind(
+        "crates/wenlan-core/src/somewhere.rs",
+        "conn.execute(\"INSERT INTO pages (id, title, creation_kind) VALUES (?1, ?2, ?3)\", ())",
+    );
+    assert_eq!(
+        omitted,
+        ["crates/wenlan-core/src/somewhere.rs: id, title, creation_kind"],
+        "positive control must catch an omission and must not read `creation_kind` as `kind`"
+    );
+
+    assert!(
+        page_insert_sites_without_kind(
+            "crates/wenlan-core/src/somewhere.rs",
+            "conn.execute(\"INSERT INTO pages (id, title, kind, creation_kind) \
+             VALUES (?1, ?2, ?3, ?4)\", ())",
+        )
+        .is_empty(),
+        "a column list naming kind is not a violation"
+    );
+
+    assert!(
+        page_insert_sites_without_kind(
+            "crates/wenlan-core/src/somewhere.rs",
+            "conn.execute(\"INSERT INTO pages_fts(rowid, title) VALUES (?1, ?2)\", ())",
+        )
+        .is_empty(),
+        "pages_fts is a different table"
+    );
+
+    // Spellings the first cut of this guard was blind to. Each one is a real
+    // way to write the same insert, so each one must still be caught.
+    for (label, source) in [
+        (
+            "conflict clause",
+            "conn.execute(\"INSERT OR IGNORE INTO pages (id, title, creation_kind) \
+             VALUES (?1, ?2, ?3)\", ())",
+        ),
+        (
+            "replace clause",
+            "conn.execute(\"INSERT OR REPLACE INTO pages (id, title, creation_kind) \
+             VALUES (?1, ?2, ?3)\", ())",
+        ),
+        (
+            "lowercase keywords",
+            "conn.execute(\"insert into pages (id, title, creation_kind) \
+             values (?1, ?2, ?3)\", ())",
+        ),
+        (
+            "split across lines",
+            "conn.execute(\"INSERT INTO\n    pages\n    (id, title, creation_kind)\n \
+             VALUES (?1, ?2, ?3)\", ())",
+        ),
+    ] {
+        assert_eq!(
+            page_insert_sites_without_kind("crates/wenlan-core/src/somewhere.rs", source),
+            ["crates/wenlan-core/src/somewhere.rs: id, title, creation_kind"],
+            "a production insert written as `{label}` must still be caught"
+        );
+    }
+
+    assert!(
+        page_insert_sites_without_kind(
+            "crates/wenlan-core/src/somewhere.rs",
+            "conn.execute(\"DELETE FROM pages WHERE id = ?1\", ())",
+        )
+        .is_empty(),
+        "a statement that merely names the table is not an insert"
+    );
+}
+
+#[test]
+fn page_insert_kind_guard_is_fail_closed_after_test_items() {
+    let source = concat!(
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn fixture() {\n",
+        "        conn.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n",
+        "    }\n",
+        "}\n",
+        "async fn create(&self) {\n",
+        "    #[cfg(test)]\n",
+        "    if validate {\n",
+        "        hooks::after_validation(id).await;\n",
+        "    }\n",
+        "    tx.execute(\"INSERT INTO pages (id, summary) VALUES (?1, ?2)\", ());\n",
+        "}\n",
+    );
+    assert_eq!(
+        page_insert_sites_without_kind("crates/wenlan-core/src/somewhere.rs", source),
+        ["crates/wenlan-core/src/somewhere.rs: id, summary"],
+        "the gated fixture must be ignored, and a production insert after an inline \
+         #[cfg(test)] item must still be caught"
+    );
+}
+
+/// A cfg attribute gates the syntactic node that OWNS it, not the next braced
+/// item or semicolon-terminated statement. The old lexical delimiter applied
+/// one item-shaped heuristic everywhere, so an attribute on a parameter, arm,
+/// or field could consume later production code and make both teeth pass on
+/// code they never scanned.
+#[test]
+fn cfg_stripping_preserves_production_after_nested_attribute_positions() {
+    let path = "crates/wenlan-core/src/somewhere.rs";
+    let fixtures = [
+        (
+            "function parameter",
+            "fn create(#[cfg(test)] _: (), page: &Page) {\n\
+                 if page.kind.as_str() == \"source\" {}\n\
+                 tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+             }",
+        ),
+        (
+            "closure parameter",
+            "fn create(page: &Page) {\n\
+                 let _probe = |#[cfg(test)] _: (), value: u8| value;\n\
+                 if page.kind.as_str() == \"source\" {}\n\
+                 tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+             }",
+        ),
+        (
+            "match arm",
+            "fn create(page: &Page, tag: &str) {\n\
+                 let _ = match tag {\n\
+                     #[cfg(test)] \"probe\" => 0,\n\
+                     _ => {\n\
+                         if page.kind.as_str() == \"source\" {}\n\
+                         tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+                         1\n\
+                     }\n\
+                 };\n\
+             }",
+        ),
+        (
+            "struct field",
+            "struct Probe { #[cfg(test)] only: (), value: u8 }\n\
+             fn create(page: &Page) {\n\
+                 if page.kind.as_str() == \"source\" {}\n\
+                 tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+             }",
+        ),
+    ];
+
+    for (label, source) in fixtures {
+        assert_eq!(
+            page_kind_routing_sites(path, source),
+            [format!("{path}: kind == \"source\"")],
+            "a cfg-gated {label} must not blank the production comparison after it"
+        );
+        assert_eq!(
+            page_insert_sites_without_kind(path, source),
+            [format!("{path}: id, title")],
+            "a cfg-gated {label} must not blank the production INSERT after it"
+        );
+    }
+
+    let token_whitespace = "# [cfg(test)]\n\
+         fn probe(page: &Page) {\n\
+             if page.kind.as_str() == \"source\" {}\n\
+             tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+         }\n\
+         fn create(page: &Page) {\n\
+             if page.kind.as_str() == \"source\" {}\n\
+             tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+         }";
+    assert_eq!(
+        page_kind_routing_sites(path, token_whitespace),
+        [format!("{path}: kind == \"source\"")],
+        "whitespace between `#` and `[` must not expose a test-only comparison"
+    );
+    assert_eq!(
+        page_insert_sites_without_kind(path, token_whitespace),
+        [format!("{path}: id, title")],
+        "whitespace between `#` and `[` must not expose a test-only INSERT"
+    );
+
+    let utf8_before_routing = "fn create(page: &Page) { let 測試測試測試測試測試測試 = 0; \
+         if page.kind.as_str() == \"source\" {} #[cfg(test)] let _probe = [0; 64]; }";
+    syn::parse_file(utf8_before_routing).expect("the UTF-8 routing control must be valid Rust");
+    assert_eq!(
+        page_kind_routing_sites(path, utf8_before_routing),
+        [format!("{path}: kind == \"source\"")],
+        "UTF-8 before a cfg span must not move blanking onto an earlier production comparison"
+    );
+
+    let utf8_before_insert =
+        "fn create() { let 測試測試測試測試測試測試測試測試測試測試測試測試 = 0; \
+         tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ()); \
+         #[cfg(test)] let _probe = [0; 64]; }";
+    syn::parse_file(utf8_before_insert).expect("the UTF-8 INSERT control must be valid Rust");
+    assert_eq!(
+        page_insert_sites_without_kind(path, utf8_before_insert),
+        [format!("{path}: id, title")],
+        "UTF-8 before a cfg span must not move blanking onto an earlier production INSERT"
+    );
+}
+
+/// A brace that is only *text* must not move the depth counter. Both fixtures
+/// below put an unmatched `{` inside the `#[cfg(test)]` region — once in a
+/// string, once in a comment — so a counter reading raw bytes never sees the
+/// region balance, blanks the rest of the file, and reports nothing. Silence
+/// is the worst possible answer from a fail-closed guard, so each fixture is
+/// followed by a production insert the scan is required to still catch.
+#[test]
+fn page_insert_kind_guard_counts_only_structural_braces() {
+    for (label, text) in [
+        ("string", "        let brace = \"{\";\n"),
+        ("comment", "        // an unmatched { , written in prose\n"),
+    ] {
+        let source = format!(
+            concat!(
+                "#[cfg(test)]\n",
+                "mod tests {{\n",
+                "    fn fixture() {{\n",
+                "{}",
+                "        conn.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n",
+                "    }}\n",
+                "}}\n",
+                "async fn create() {{\n",
+                "    tx.execute(\"INSERT INTO pages (id, summary) VALUES (?1, ?2)\", ());\n",
+                "}}\n",
+            ),
+            text
+        );
+        syn::parse_file(&source)
+            .unwrap_or_else(|error| panic!("the {label} control must be valid Rust: {error}"));
+        assert_eq!(
+            page_insert_sites_without_kind("crates/wenlan-core/src/somewhere.rs", &source),
+            ["crates/wenlan-core/src/somewhere.rs: id, summary"],
+            "an unmatched brace in a {label} must not swallow the production insert after it"
+        );
+    }
+}
+
+// ── Teeth #16: no production read routes on a non-`entity` page kind ──
+
+/// `pages.kind` values a production read may not discriminate on.
+///
+/// `'entity'` is absent on purpose. The `kind='entity'` shadow fence predates
+/// this repair and is the one value every writer has always stamped
+/// deliberately, so it is the one value a reader can trust today.
+const UNROUTABLE_PAGE_KINDS: [&str; 4] = ["authored", "concept", "overview", "source"];
+
+/// SQL clauses that bind a statement to a table. A literal carrying none of
+/// them names no table, which makes it a fragment rather than a statement.
+const SQL_TABLE_CLAUSES: [&str; 5] = ["FROM ", "JOIN ", "UPDATE ", "INTO ", "TABLE "];
+
+/// Keywords a SQL predicate opens with. A fragment names no table, so this is
+/// the only thing separating `" AND kind = 'overview'"` from a log line that
+/// happens to mention `kind='concept'` — migration 107 ships exactly such a
+/// line, and without this the tooth cries wolf on its own repair.
+const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
+
+/// Production reads that filter or route on a `pages.kind` value other than
+/// `'entity'`, reported as `path: kind <op> <literal>`.
+///
+/// Writing the column truthfully is not the same as making it trustworthy to
+/// read. Two gaps survive this change on purpose. Rename, archive, and replace
+/// paths never re-derive `kind`, so a page renamed to `Overview` — or away from
+/// it — keeps whatever it was stamped with. And migration 89 folded only
+/// `creation_kind='imported'` onto `'source'`, never `'source'` itself, so a
+/// page imported before 89 still sits at `'concept'`; migration 107's ledger
+/// guard skips exactly those rows, because 89 already wrote them an entry. A
+/// reader routing on those values today is routing on stale data, which is why
+/// the fence stays up until M6 re-derives `kind` on every mutation path.
+///
+/// A write is not a read. A SQL predicate whose own literal names a table is
+/// excused unless that literal *selects* from `pages` (`FROM pages` / `JOIN
+/// pages`), which is what keeps migration 89's `CHECK` constraint, migration
+/// 107's `UPDATE pages … WHERE kind = 'concept'` repair guard, and every other
+/// table's `kind` column out of the scan without an exemption list that would
+/// have to be maintained — and widened — by hand. A literal
+/// naming *no* table proves nothing either way, and is counted rather than
+/// excused when it opens on a SQL connective: that is the only reading under
+/// which `sql.push_str(" AND kind = 'overview'")` is visible at all, since the
+/// `FROM pages` it belongs to sits in a different literal. The connective is
+/// what keeps prose out — migration 107 logs the phrase `kind='concept'`, and
+/// counting every literal that merely contains the column would make the
+/// repair's own success message a finding. The residual cost is that a
+/// fragment appended to some *other* table's query trips the tooth; naming
+/// that table in the fragment clears it.
+///
+/// The operator and the quote style are matched as a pair: SQL spells equality
+/// `=` around single quotes, Rust spells it `==` around double quotes. Nothing
+/// else is a comparison. That pairing is what keeps a Rust assignment and the
+/// `kind = "concept"` line inside an eval TOML fixture from reading as reads.
+/// Accessors between the column and the operator are stepped over, so
+/// `page.kind.as_str() == "overview"` and `page.kind() != "concept"` are the
+/// same site as `page.kind == "overview"`.
+///
+/// Control flow is the other half and lives in `page_kind_match_sites`, which
+/// this calls. That half is parsed rather than scanned. What being parsed buys
+/// is narrower than it first looks, and worth stating exactly. Punctuation
+/// stopped being load-bearing: comma-optional bodies, turbofish commas and
+/// closure commas are structure now.
+///
+/// Nesting is reached in four positions, which is the honest enumeration this
+/// paragraph owed and did not give: a `match` written inside an ARM BODY, inside
+/// an ARM GUARD, inside a `matches!` SCRUTINEE, and inside a `matches!` GUARD.
+/// The last of those was parsed and thrown away until round 7, so
+/// `matches!(flag, true if match page.kind.as_str() { … })` was invisible while
+/// this very paragraph claimed guards could not hide shape. Reaching a position
+/// is not the same as recording in it: the routed literal is taken from
+/// `arm.pat` only, because a `"source"` in a body or a guard is a value the code
+/// computes rather than a pattern the column is matched against, and recording
+/// either would make the tooth cry wolf. A guard that compares directly —
+/// `if page.kind.as_str() == "source"` — is still caught, but by the lexical
+/// comparison scan above, not by either visitor.
+///
+/// What a reader NAMES can still hide, and that is where the list below lives.
+///
+/// What still gets past this, each verified to escape rather than assumed to:
+///
+/// - a comparison spelled as a method call — `kind.eq("overview")`,
+///   `kind.starts_with("over")`. The accessor walk steps onto the call and
+///   finds no operator behind it.
+/// - a literal reached indirectly, on either half: `const OVERVIEW: &str =
+///   "overview"` then `kind == OVERVIEW`, and equally `match page.kind.as_str()
+///   { OVERVIEW => … }`, where the arm is a path pattern and not a literal one.
+///   Both compare an identifier against nothing.
+/// - a value that is not a literal at all — `" AND kind = ?1"` with the kind
+///   bound at runtime, or `format!(" AND kind = '{wanted}'")`. A bound value is
+///   not knowable from the source, so this one is a limit of static reading
+///   rather than of this tooth.
+/// - the column reached through an intermediate binding: `let k =
+///   normalise(page.kind.as_str()); match k { "source" => … }`. The scrutinee
+///   names `k`, and this scan does not follow assignments. Direct reads and
+///   one-expression compounds — `(page.kind.as_str(), active)`,
+///   `normalise(page.kind.as_str())`, `{ page.kind.as_str() }` — are covered;
+///   a named hop is not.
+/// - a SQL fragment that opens on something other than `AND`, `OR`, `WHERE`,
+///   `HAVING`, or `ON`: a bare `" kind = 'overview'"` relying on the base
+///   ending in `WHERE`, a leading `"("`, or a `" WHEN kind = 'overview' THEN"`
+///   inside a CASE. This is the price of the connective gate, and the gate is
+///   what keeps migration 107's log line out; widening the lead set trades
+///   reach for false findings on prose.
+/// - a `match` inside a macro body that is not a sequence of statements, and a
+///   routing decision hidden behind a macro of this repository's own —
+///   `is_source!(page)`. Macro tokens are not parsed on the way in, so the scan
+///   re-parses what it can (`my_wrapper!(let l = match page.kind … ;)` is
+///   reached) and skips bodies with their own grammar. Narrower than the old
+///   text scan, which saw every macro body: the one place going structural
+///   costs reach.
+/// - a kind that is not a string. If `kind` ever becomes an enum,
+///   `match page.kind { PageKind::Source => … }` is a variant pattern, not a
+///   string literal, and this scan goes quiet. Nothing in the tree is written
+///   that way today; it is named because migrating the column would silently
+///   retire the tooth rather than redden it.
+///
+/// The shape defects three review rounds found — the guard, the comma boundary,
+/// the turbofish, the enumerated scrutinee list — are gone by construction
+/// rather than patched, and `if let`/`while let` moved from disclosed hole to
+/// coverage.
+///
+/// Two things err the other way, toward a visible false finding rather than a
+/// silent miss, which is the direction a fail-closed guard should lean: `cfg`
+/// predicates are skipped only when they genuinely REQUIRE `test`, so an item
+/// excluded from production builds by some other means is still scanned; and a
+/// scrutinee is searched as a whole tree, so a `match` over an unrelated value
+/// computed near anything named `kind` can report. A file that does not parse,
+/// and a `matches!` whose pattern cannot be recovered, are likewise reported
+/// rather than passed.
+///
+/// WHERE a `cfg` is read is its own ledger, and it is a cry-wolf ledger rather
+/// than a hole ledger: an unread `cfg` position can only ADD a finding for code
+/// that never ships, never hide a reader. Both halves of the tooth now ask the
+/// same question through `compiles_outside_test` — the lexical scan judged the
+/// literal text `#[cfg(test)]` until round 7, so `#[cfg(all(test, feature =
+/// "slow"))]` produced a production finding the visitor gates had no power to
+/// retract, since a text-scan finding is recorded before the parser runs.
+///
+/// The positions are no longer a list anyone curates. EVERY node in the pinned
+/// syn 2.0.117 that owns a `Vec<Attribute>` is gated — 19 of them, enumerated on
+/// `skip_cfg_test_nodes!`. That is a derived claim, and this is the derivation:
+///
+/// ```text
+/// grep -rn 'pub attrs: Vec<Attribute>' "$(cargo metadata --format-version 1 \
+///   | jq -r '.packages[]|select(.name=="syn" and .version=="2.0.117")|.manifest_path' \
+///   | xargs dirname)/src"
+/// ```
+///
+/// 94 hits, 93 distinct nodes (`ItemStatic` appears twice — once for real, once
+/// inside a token.rs doc comment). One is excluded: `DeriveInput`, which a file
+/// walk never reaches, because items parse as `Item`. The other 92 are each
+/// reached by at least one of the 19 gates.
+///
+/// It reads as over-coverage — nothing in this tree writes a `cfg` on a bare-fn
+/// argument — and that is deliberate. Rounds 6, 7 and 8 each shipped a
+/// hand-picked subset, each with an argument for why the omissions were
+/// harmless, and each argument was wrong for a different reason: `Item::Type`
+/// because a const position can hold a MACRO and `visit_macro` re-parses macro
+/// input as statements; closure parameters and struct-pattern fields because
+/// `Pat::Macro` reaches the same re-parse. Three rounds of that is enough
+/// evidence that the subset is not knowable in advance. Closing the list costs
+/// nine lines and ends the class.
+///
+/// Two things this does NOT claim. It is exhaustive over syn's ATTRIBUTE
+/// positions, not over ways to hide a routing decision — a match assembled by a
+/// build script, or behind a proc macro, is not in this file at all. And it is
+/// pinned to 2.0.117: a syn bump that adds an attribute-bearing node reopens the
+/// gap silently, which is why the derivation is written down here rather than
+/// left as something the next reader has to reconstruct.
+///
+/// None of the above is characterised as evasion; they are ordinary ways to
+/// write the same decision. It is a drift guard over the shapes this repository
+/// actually writes.
+fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
+    let production = strip_cfg_test_items(source);
+    // Literals kept, comments blanked: the SQL this looks for lives inside
+    // string literals, while prose *about* `kind='concept'` is not a reader.
+    let visible = mask_lexical(&production, true);
+    let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut sites = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = collapsed[cursor..].find("kind") {
+        let start = cursor + found;
+        cursor = start + "kind".len();
+        // `creation_kind`, `assigned_kind`, `prior_creation_kind` are other
+        // columns and carry no fence.
+        if collapsed[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let mut rest = collapsed[cursor..].trim_start();
+        // `COALESCE(kind, 'concept') != 'entity'` is how this codebase already
+        // spells the entity fence, at every one of its two dozen live sites, so
+        // a reader that grows here will be a copy of one of them with the
+        // literal changed. Step over the default and read the operator that
+        // follows, or the guard is blind to its single most likely spelling.
+        let head = &collapsed[..start];
+        if head
+            .len()
+            .checked_sub("COALESCE(".len())
+            .and_then(|from| head.get(from..))
+            .is_some_and(|word| word.eq_ignore_ascii_case("COALESCE("))
+        {
+            let Some(close) = rest.find(')') else {
+                continue;
+            };
+            rest = rest[close + 1..].trim_start();
+        }
+        // An accessor is transparent. `page.kind.as_str() == "overview"` and
+        // `page.kind() != "concept"` route on the value `page.kind ==
+        // "overview"` routes on; only the spelling differs, and `Page.kind` is
+        // a public `String`, so the accessor forms are the ones a reader would
+        // actually reach for. Step the chain until the operator is reachable.
+        // Nothing is decided here — the literal check below still gates every
+        // hit — so stepping past a `.len()` or a `.clone()` costs only reach.
+        loop {
+            let stepped = if let Some(after) = rest.strip_prefix("()") {
+                after
+            } else if let Some(name) = rest.strip_prefix('.') {
+                let len = name
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(name.len());
+                if len == 0 {
+                    break;
+                }
+                &name[len..]
+            } else {
+                break;
+            };
+            rest = stepped.trim_start();
+        }
+        // Which quote styles each operator may legally carry. SQLite spells
+        // inequality both `<>` and `!=`, but only Rust spells equality `==`,
+        // and a bare `=` beside a double-quoted string is a Rust *assignment*,
+        // which is what keeps the `kind = "concept"` line inside an eval TOML
+        // fixture from reading as a comparison.
+        let (op, single, double, tail) = if let Some(tail) = rest.strip_prefix("==") {
+            ("==", false, true, tail)
+        } else if let Some(tail) = rest.strip_prefix("!=") {
+            ("!=", true, true, tail)
+        } else if let Some(tail) = rest.strip_prefix("<>") {
+            ("<>", true, false, tail)
+        } else if let Some(tail) = rest.strip_prefix('=') {
+            ("=", true, false, tail)
+        } else if rest
+            .get(..2)
+            .is_some_and(|word| word.eq_ignore_ascii_case("in"))
+            && !rest[2..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        {
+            ("IN", true, false, &rest[2..])
+        } else {
+            continue;
+        };
+        let operand = tail.trim_start();
+        let (scope, list) = match operand.strip_prefix('(') {
+            Some(items) => (items.split(')').next().unwrap_or_default(), true),
+            None => (operand, false),
+        };
+        let quote = match scope.trim_start().chars().next() {
+            Some('\'') if single => '\'',
+            Some('"') if double => '"',
+            // A column, a CASE, a bind parameter, an enum path: not a literal.
+            _ => continue,
+        };
+        let literals: Vec<&str> = if list {
+            scope.split(quote).skip(1).step_by(2).collect()
+        } else {
+            scope.split(quote).nth(1).into_iter().collect()
+        };
+        let Some(routed) = literals
+            .iter()
+            .find(|literal| UNROUTABLE_PAGE_KINDS.contains(literal))
+        else {
+            continue;
+        };
+        if quote == '\'' {
+            let literal_start = collapsed[..start].rfind('"').map_or(0, |open| open + 1);
+            let statement = collapsed[literal_start..start].to_ascii_uppercase();
+            // A literal naming no table at all is a fragment, not a statement:
+            // `sql.push_str(" AND kind = 'overview'")` appended to a base built
+            // somewhere else. Demanding the proof sit in the same literal is
+            // what let that shape through, so a fragment is read as one and
+            // counted, rather than excused for failing to prove itself — but
+            // only when it OPENS on a predicate keyword, or every log line
+            // mentioning `kind='concept'` becomes a finding. The opening token
+            // is the test because everything between it and the column is
+            // punctuation a reader is free to write: `AND p.kind`,
+            // `AND COALESCE(kind, 'concept')` — the live fence's own spelling —
+            // and `AND (kind` are all the same predicate.
+            let fragment_predicate = !SQL_TABLE_CLAUSES
+                .iter()
+                .any(|clause| statement.contains(clause))
+                && statement
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|word| SQL_PREDICATE_LEADS.contains(&word));
+            if !fragment_predicate
+                && !statement.contains("FROM PAGES")
+                && !statement.contains("JOIN PAGES")
+            {
+                continue;
+            }
+        }
+        sites.push(format!("{path}: kind {op} {quote}{routed}{quote}"));
+    }
+    // The match scan gets the ORIGINAL source, not the stripped twin. Exact
+    // span blanking need not leave delimiters parseable, and the parser already
+    // skips test-only syntax structurally with the same gate list.
+    sites.extend(page_kind_match_sites(path, source));
+    sites
+}
+
+/// The same scan over a statement fragment rather than a whole file, so the
+/// controls below can stay the one-liners they are.
+///
+/// This is the ONLY place a snippet is wrapped and re-parsed. Keeping it out of
+/// [`page_kind_routing_sites`] is what makes the production path strictly
+/// fail-closed: a real file that no longer parses becomes a finding instead of
+/// being silently retried as a function body until something sticks.
+#[cfg(test)]
+fn page_kind_routing_sites_in_snippet(path: &str, snippet: &str) -> Vec<String> {
+    page_kind_routing_sites(path, &format!("fn drift_guard_probe() {{\n{snippet}\n}}"))
+}
+
+/// Rust `match` / `matches!` routing on a page kind — the shape the comparison
+/// scan structurally cannot see, because an arm is a pattern and never writes
+/// an operator.
+///
+/// Parsed with `syn` rather than walked as text. Three review rounds found
+/// three separate defects in a hand-rolled arm walker (a literal read by the
+/// punctuation that followed it, an arm boundary read off commas, an
+/// enumerated list of scrutinee wrappers), and the second had no textual fix:
+/// `make::<u8, u16>("source")` and `a < b, c > d` are the same character
+/// sequence at the depth a bracket counter can see, so only a parser can say
+/// whether that comma separates arms. `drift_guard` is `#[cfg(test)]`
+/// (lib.rs:29) and `syn` is already a dev-dependency of this crate with `full`
+/// + `visit`, so this costs nothing at production-compile time.
+///
+/// With an AST the three regions of `pattern if guard => body` arrive already
+/// separated, so guards, comma-optional block bodies, turbofish commas, closure
+/// commas, and nested matches all stop being special cases. The routed literal
+/// is taken from `arm.pat` ALONE — a `"source"` in a body is prose and one in a
+/// guard is an expression, and recording either would make the tooth cry wolf.
+/// That is a rule about where a literal is RECORDED, not about where this walks:
+/// arm bodies, arm guards, `matches!` scrutinees and `matches!` guards are all
+/// traversed, because a `match` written inside any of them is its own site.
+///
+/// A production file parses as a FILE or it is a finding. There is deliberately
+/// no retry as a function body here: substituting something the parser *can*
+/// read for the thing it cannot is how a checker reports OK on what it never
+/// checked. Snippet parsing exists, but only behind the test-only entry point
+/// `page_kind_routing_sites_in_snippet`.
+fn page_kind_match_sites(path: &str, production: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(production) else {
+        return vec![format!(
+            "{path}: could not be parsed as Rust, so the page-kind match scan could not run"
+        )];
+    };
+    let mut visitor = MatchVisitor {
+        path,
+        sites: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.sites
+}
+
+/// Whether code carrying this `cfg` can still be compiled into a NON-test
+/// build — the question that decides whether the scan may skip it.
+///
+/// Unknown predicates (`feature = "..."`, `target_os = "..."`) count as "yes,
+/// it can", so a subtree is skipped only when `test` is genuinely REQUIRED.
+/// That direction is the whole point: `#[cfg(not(test))]` and
+/// `#[cfg(any(target_os = "macos", test))]` are production code — the second is
+/// live style in this repository (crates/wenlan-server/src/main.rs:156) — and
+/// an over-eager skip is a silent hole, while an over-eager scan is at worst a
+/// visible false finding. Reading any nested `test` ident as "test-only" got
+/// exactly this backwards.
+fn compiles_outside_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => !path.is_ident("test"),
+        syn::Meta::NameValue(_) => true,
+        syn::Meta::List(list) => {
+            let Ok(nested) =
+                list.parse_args_with(Punctuated::<syn::Meta, Token![,]>::parse_terminated)
+            else {
+                return true;
+            };
+            if list.path.is_ident("all") {
+                nested.iter().all(compiles_outside_test)
+            } else if list.path.is_ident("any") {
+                nested.iter().any(compiles_outside_test)
+            } else {
+                // `not(..)`, and anything unrecognised: assume it compiles, so
+                // the subtree is scanned rather than skipped.
+                true
+            }
+        }
+    }
+}
+
+/// True only for attributes that make the code they carry test-only.
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|meta| !compiles_outside_test(&meta))
+    })
+}
+
+/// Every `Item` variant that carries attributes. Enumerated in full rather than
+/// sampled, for the third time in this scan's history: a partial list of
+/// scrutinee wrappers, then a partial list of `Expr` variants, then this.
+///
+/// The 7-of-15 list this replaces was defended as consequence-free on the
+/// grounds that the omitted containers hold expressions only in const position,
+/// where no runtime `page` exists. That reasoning was wrong, and the
+/// counter-example is short: a const position can hold a MACRO, and
+/// `visit_macro` re-parses macro input as statements, so
+/// `#[cfg(test)] type T = [u8; ignored!(match page.kind.as_str() { … })];`
+/// reported a test-only match as production. Const position bounds what
+/// COMPILES, not what this scan reads.
+///
+/// Checked against the pinned syn (=2.0.117): of its 16 `Item` variants, 15
+/// carry `attrs` and all 15 are listed. `Item::Verbatim` is the one exclusion —
+/// it wraps a raw `TokenStream` and has no attributes to read.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+/// All 16 attribute-bearing `Pat` variants of the pinned syn; `Verbatim` is the
+/// exclusion. Five of them (`Const`, `Lit`, `Macro`, `Path`, `Range`) are
+/// `Expr` structs reused in pattern position, and carry the expression's own
+/// attribute list.
+///
+/// Round 8 found this whole family unread. A closure parameter and a
+/// struct-pattern field both accept a `cfg` — checked with rustc, not assumed —
+/// and both descend through `Pat::Macro` into `visit_macro`, where macro input
+/// is re-parsed as statements. That is the same route the `Item::Type` omission
+/// took, which is why it is closed here as a family rather than one variant at
+/// a time.
+fn pat_attrs(pattern: &Pat) -> &[syn::Attribute] {
+    match pattern {
+        Pat::Const(pattern) => &pattern.attrs,
+        Pat::Ident(pattern) => &pattern.attrs,
+        Pat::Lit(pattern) => &pattern.attrs,
+        Pat::Macro(pattern) => &pattern.attrs,
+        Pat::Or(pattern) => &pattern.attrs,
+        Pat::Paren(pattern) => &pattern.attrs,
+        Pat::Path(pattern) => &pattern.attrs,
+        Pat::Range(pattern) => &pattern.attrs,
+        Pat::Reference(pattern) => &pattern.attrs,
+        Pat::Rest(pattern) => &pattern.attrs,
+        Pat::Slice(pattern) => &pattern.attrs,
+        Pat::Struct(pattern) => &pattern.attrs,
+        Pat::Tuple(pattern) => &pattern.attrs,
+        Pat::TupleStruct(pattern) => &pattern.attrs,
+        Pat::Type(pattern) => &pattern.attrs,
+        Pat::Wild(pattern) => &pattern.attrs,
+        _ => &[],
+    }
+}
+
+/// All 3 `GenericParam` variants of the pinned syn — every one carries an
+/// attribute list, so there is no exclusion here.
+///
+/// A gated type or const parameter reaches code through its DEFAULT, which is a
+/// const position, and a const position can hold a macro.
+fn generic_param_attrs(param: &syn::GenericParam) -> &[syn::Attribute] {
+    match param {
+        syn::GenericParam::Lifetime(param) => &param.attrs,
+        syn::GenericParam::Type(param) => &param.attrs,
+        syn::GenericParam::Const(param) => &param.attrs,
+    }
+}
+
+/// All 4 attribute-bearing `ImplItem` variants of the pinned syn; `Verbatim` is
+/// the exclusion. `Type` was the omission — an associated type's array length is
+/// a const position, and a const position can hold a macro.
+fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+/// All 4 attribute-bearing `TraitItem` variants of the pinned syn; `Verbatim` is
+/// the exclusion.
+fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+/// All 4 attribute-bearing `ForeignItem` variants of the pinned syn; `Verbatim`
+/// is the exclusion. An `extern` block is reached through `Item::ForeignMod`,
+/// and `ForeignItem::Macro` is another macro this scan re-parses.
+fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+/// `Stmt::Item` and `Stmt::Expr` keep their attributes on the item or the
+/// expression, where the item and expression gates already read them.
+fn stmt_attrs(statement: &syn::Stmt) -> &[syn::Attribute] {
+    match statement {
+        syn::Stmt::Local(local) => &local.attrs,
+        syn::Stmt::Macro(statement) => &statement.attrs,
+        _ => &[],
+    }
+}
+
+/// Every `Expr` variant that carries attributes, so a `#[cfg(test)]` in
+/// expression position is read wherever it is written. Enumerated rather than
+/// sampled: a partial list here is the same defect shape as the partial
+/// scrutinee list this scan already had to fix once.
+///
+/// Checked against the pinned syn (=2.0.117): of its 40 `Expr` variants, 39
+/// carry `attrs` and all 39 are listed. `Expr::Verbatim` is the one exclusion —
+/// it wraps a raw `TokenStream` and has no attributes to read — so the `_` arm
+/// is unreachable for any attribute-bearing node rather than a silent catch-all.
+fn expr_attrs(expr: &Expr) -> &[syn::Attribute] {
+    macro_rules! attrs_of {
+        ($($variant:ident),+ $(,)?) => {
+            match expr {
+                $(Expr::$variant(node) => &node.attrs,)+
+                _ => &[],
+            }
+        };
+    }
+    attrs_of!(
+        Array, Assign, Async, Await, Binary, Block, Break, Call, Cast, Closure, Const, Continue,
+        Field, ForLoop, Group, If, Index, Infer, Let, Lit, Loop, Macro, Match, MethodCall, Paren,
+        Path, Range, RawAddr, Reference, Repeat, Return, Struct, Try, TryBlock, Tuple, Unary,
+        Unsafe, While, Yield,
+    )
+}
+
+/// The `cfg` gates on non-expression nodes, written once and mixed into both
+/// visitors in this scan.
+///
+/// Eighteen positions here, plus each visitor's own `visit_expr` for the
+/// nineteenth: items, impl items, trait items, foreign items, statements, match
+/// arms, struct-literal fields, field declarations, enum variants, the file
+/// itself, patterns, struct-pattern fields, typed patterns (which is where a
+/// function parameter's attributes live), receivers, generic parameters,
+/// variadics, bare-fn arguments, and bare variadics.
+///
+/// That list is not taste. It is every node in the pinned syn 2.0.117 that owns
+/// a `Vec<Attribute>`, derived from the vendored source rather than recalled —
+/// the derivation is recorded in the ceiling below. Rounds 6, 7 and 8 each
+/// shipped a hand-picked subset and each was found short by a shape nobody had
+/// thought of; a closed list is the only version of this that stops being wrong.
+///
+/// [`MatchVisitor`] walks a file looking for routing sites; `KindReader` walks a
+/// single scrutinee asking whether it names the column. They have to agree on
+/// which nodes are production code, because the second one runs on a subtree the
+/// first has already entered: a scrutinee whose only `kind` read sits behind
+/// `#[cfg(test)]` is not a production reader, and reporting it is the same
+/// cry-wolf the item and statement gates fixed one level up. Sharing the gates
+/// is what stops the two from drifting apart again.
+///
+/// Each visitor still writes its own `visit_expr`: `KindReader` stops walking
+/// the moment it has found the column, and `MatchVisitor` does not. The callback
+/// is a no-op for those readers and records an exact source span for the text
+/// stripper below, so all three consumers share one closed gate list.
+macro_rules! return_if_cfg_test_node {
+    ($visitor:expr, $node:expr, $attrs:expr) => {{
+        let attrs = $attrs;
+        if is_cfg_test(attrs) {
+            $visitor.record_cfg_test_node($node, attrs);
+            return;
+        }
+    }};
+}
+
+macro_rules! skip_cfg_test_nodes {
+    () => {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            return_if_cfg_test_node!(self, node, item_attrs(node));
+            visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            return_if_cfg_test_node!(self, node, impl_item_attrs(node));
+            visit::visit_impl_item(self, node);
+        }
+
+        fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+            return_if_cfg_test_node!(self, node, trait_item_attrs(node));
+            visit::visit_trait_item(self, node);
+        }
+
+        fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+            return_if_cfg_test_node!(self, node, stmt_attrs(node));
+            visit::visit_stmt(self, node);
+        }
+
+        fn visit_arm(&mut self, node: &'ast syn::Arm) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_arm(self, node);
+        }
+
+        fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+            return_if_cfg_test_node!(self, node, foreign_item_attrs(node));
+            visit::visit_foreign_item(self, node);
+        }
+
+        // A struct-literal field keeps its attributes on the `FieldValue` and
+        // not on the expression underneath, so an expression gate alone reads
+        // an empty attribute list and descends. This is live style here
+        // (crates/wenlan-core/src/lint/runner.rs:132).
+        fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_field_value(self, node);
+        }
+
+        // A field DECLARATION and an enum variant reach code through their
+        // type's array length and their discriminant. Both are const positions,
+        // and a const position can hold a macro this scan re-parses.
+        fn visit_field(&mut self, node: &'ast syn::Field) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_field(self, node);
+        }
+
+        fn visit_variant(&mut self, node: &'ast syn::Variant) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_variant(self, node);
+        }
+
+        // A file's own inner `#![cfg(test)]` gates every item in it.
+        fn visit_file(&mut self, node: &'ast syn::File) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_file(self, node);
+        }
+
+        // Patterns. `visit_pat` covers closure parameters and every nested
+        // pattern; `visit_field_pat` covers a struct pattern's fields, which
+        // syn reaches directly without passing through `visit_pat`.
+        fn visit_pat(&mut self, node: &'ast Pat) {
+            return_if_cfg_test_node!(self, node, pat_attrs(node));
+            visit::visit_pat(self, node);
+        }
+
+        fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_field_pat(self, node);
+        }
+
+        // A function parameter is a `PatType`, which `visit_fn_arg` reaches
+        // WITHOUT going through `visit_pat` — so this is not redundant.
+        fn visit_pat_type(&mut self, node: &'ast syn::PatType) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_pat_type(self, node);
+        }
+
+        fn visit_receiver(&mut self, node: &'ast syn::Receiver) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_receiver(self, node);
+        }
+
+        fn visit_generic_param(&mut self, node: &'ast syn::GenericParam) {
+            return_if_cfg_test_node!(self, node, generic_param_attrs(node));
+            visit::visit_generic_param(self, node);
+        }
+
+        fn visit_variadic(&mut self, node: &'ast syn::Variadic) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_variadic(self, node);
+        }
+
+        fn visit_bare_fn_arg(&mut self, node: &'ast syn::BareFnArg) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_bare_fn_arg(self, node);
+        }
+
+        fn visit_bare_variadic(&mut self, node: &'ast syn::BareVariadic) {
+            return_if_cfg_test_node!(self, node, &node.attrs);
+            visit::visit_bare_variadic(self, node);
+        }
+    };
+}
+
+struct CfgTestSpanCollector {
+    spans: Vec<(usize, usize)>,
+}
+
+impl CfgTestSpanCollector {
+    fn record_cfg_test_node<T: Spanned>(&mut self, node: &T, attrs: &[syn::Attribute]) {
+        let start = attrs.first().map_or_else(
+            || node.span().byte_range().start,
+            |attr| attr.span().byte_range().start,
+        );
+        self.spans.push((start, node.span().byte_range().end));
+    }
+}
+
+impl<'ast> Visit<'ast> for CfgTestSpanCollector {
+    skip_cfg_test_nodes!();
+
+    fn visit_expr(&mut self, node: &'ast Expr) {
+        return_if_cfg_test_node!(self, node, expr_attrs(node));
+        visit::visit_expr(self, node);
+    }
+}
+
+/// Blank exactly the parsed syntax nodes that a test-only cfg attribute owns.
+/// On a parse failure the original text remains visible, which can cry wolf
+/// but cannot make a production writer or routing comparison disappear.
+fn strip_cfg_test_items(source: &str) -> String {
+    let Ok(file) = syn::parse_file(source) else {
+        return source.to_string();
+    };
+
+    let mut out = source.as_bytes().to_vec();
+    if is_cfg_test(&file.attrs) {
+        blank_span(&mut out, 0, source.len());
+        return String::from_utf8(out).expect("blanking writes only ASCII spaces");
+    }
+
+    let mut collector = CfgTestSpanCollector { spans: Vec::new() };
+    collector.visit_file(&file);
+    for (from, to) in collector.spans {
+        if from <= to
+            && to <= source.len()
+            && source.is_char_boundary(from)
+            && source.is_char_boundary(to)
+        {
+            blank_span(&mut out, from, to);
+        }
+    }
+
+    String::from_utf8(out).expect("blanking writes only ASCII spaces")
+}
+
+struct MatchVisitor<'a> {
+    path: &'a str,
+    sites: Vec<String>,
+}
+
+impl MatchVisitor<'_> {
+    fn record_cfg_test_node<T: Spanned>(&mut self, _node: &T, _attrs: &[syn::Attribute]) {}
+
+    /// Records the pattern if it routes on a forbidden kind, and says whether
+    /// it did, so a `match` can stop at its first offending arm.
+    fn record(&mut self, pattern: &Pat) -> bool {
+        let Some(kind) = pattern_kind(pattern) else {
+            return false;
+        };
+        self.sites
+            .push(format!("{}: match on kind, arm \"{kind}\"", self.path));
+        true
+    }
+}
+
+impl<'ast> Visit<'ast> for MatchVisitor<'_> {
+    // The shared gates. Items and impl items alone left cfg-gated statements,
+    // trait items, match arms, expressions, struct-literal fields, field
+    // declarations and enum variants unread.
+    skip_cfg_test_nodes!();
+
+    fn visit_expr(&mut self, node: &'ast Expr) {
+        return_if_cfg_test_node!(self, node, expr_attrs(node));
+        visit::visit_expr(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        if expr_names_kind(&node.expr) {
+            for arm in &node.arms {
+                if is_cfg_test(&arm.attrs) {
+                    continue;
+                }
+                if self.record(&arm.pat) {
+                    break;
+                }
+            }
+        }
+        visit::visit_expr_match(self, node);
+    }
+
+    /// `if let "source" = page.kind.as_str()` and `while let` route on the
+    /// column exactly as a `match` arm does; the pattern simply precedes its
+    /// scrutinee. Free to cover once the shape is an AST node rather than text.
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        if expr_names_kind(&node.expr) {
+            self.record(&node.pat);
+        }
+        visit::visit_expr_let(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "matches")
+        {
+            match node.parse_body::<MatchesInvocation>() {
+                Ok(invocation) => {
+                    if expr_names_kind(&invocation.scrutinee) {
+                        self.record(&invocation.pattern);
+                    }
+                    // The scrutinee and the guard are both ordinary
+                    // expressions, and either can contain a `match` of its own.
+                    self.visit_expr(&invocation.scrutinee);
+                    if let Some(guard) = &invocation.guard {
+                        self.visit_expr(guard);
+                    }
+                }
+                // Unreadable is not clean. A `matches!` whose pattern cannot be
+                // recovered is a decision on unknown terms, and swallowing the
+                // parse error is what let a trailing comma erase the call.
+                Err(_) => self.sites.push(format!(
+                    "{}: a matches! invocation could not be parsed, so its pattern is unknown",
+                    self.path
+                )),
+            }
+            return;
+        }
+        // A `match` written inside some other macro's body is still a reader.
+        // Token streams are not parsed by `syn` on the way in, so recover the
+        // ones that happen to be statements; the rest (`vec![1, 2]`, a format
+        // string) simply do not parse and are skipped.
+        if let Ok(statements) = node.parse_body_with(syn::Block::parse_within) {
+            for statement in &statements {
+                self.visit_stmt(statement);
+            }
+        }
+    }
+}
+
+/// `matches!(scrutinee, pattern | pattern if guard $(,)?)`.
+///
+/// The guard is KEPT rather than discarded. Its own literals are still not
+/// routing — they are an expression's, not a pattern's, which is why the guard
+/// is never passed to `record` — but it is a whole expression, so a `match` on
+/// the column can be written inside it. Parsing it and throwing it away made
+/// `matches!(flag, true if match page.kind.as_str() { … })` invisible.
+struct MatchesInvocation {
+    scrutinee: Expr,
+    pattern: Pat,
+    guard: Option<Expr>,
+}
+
+impl Parse for MatchesInvocation {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let scrutinee = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let pattern = Pat::parse_multi_with_leading_vert(input)?;
+        let guard = if input.peek(Token![if]) {
+            input.parse::<Token![if]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        // core's `matches!` ends in `$(,)?`, and `parse_body` refuses leftover
+        // tokens — so an ordinary trailing comma used to fail the parse.
+        if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+        }
+        Ok(MatchesInvocation {
+            scrutinee,
+            pattern,
+            guard,
+        })
+    }
+}
+
+/// True when a scrutinee READS the page-kind column anywhere inside it:
+/// `page.kind`, `page.kind.as_str()`, `page.kind()`, a bare `kind` binding, and
+/// equally the compound forms a reader actually writes —
+/// `(page.kind.as_str(), active)`, `normalize(page.kind.as_str())`,
+/// `{ page.kind.as_str() }`.
+///
+/// Searched as a tree, not as an enumerated list of wrapper nodes. The list was
+/// the defect: it named `Reference`/`Paren`/`Unary`/`Try`/`Cast`/`Group` and so
+/// missed `Tuple`, `Call` and `Block`, and any such list is one syntax away
+/// from the next miss. Identifiers are still compared whole, so `creation_kind`
+/// — a different column, carrying no fence — never matches at any depth.
+///
+/// The tree is walked under the SAME `cfg` gates as the file above it. A
+/// scrutinee is ordinary code and can carry its own test-only branch, so
+/// without them a `match` whose production scrutinee reads some other column
+/// reported purely because a `#[cfg(test)]` sibling named `kind`.
+fn expr_names_kind(expr: &Expr) -> bool {
+    struct KindReader {
+        found: bool,
+    }
+
+    impl KindReader {
+        fn record_cfg_test_node<T: Spanned>(&mut self, _node: &T, _attrs: &[syn::Attribute]) {}
+    }
+
+    impl<'ast> Visit<'ast> for KindReader {
+        skip_cfg_test_nodes!();
+
+        fn visit_expr(&mut self, node: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            return_if_cfg_test_node!(self, node, expr_attrs(node));
+            self.found = names_kind_here(node);
+            if !self.found {
+                visit::visit_expr(self, node);
+            }
+        }
+    }
+
+    let mut reader = KindReader { found: false };
+    reader.visit_expr(expr);
+    reader.found
+}
+
+/// Does THIS node name `kind`, ignoring its children?
+fn names_kind_here(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(field) => {
+            matches!(&field.member, syn::Member::Named(name) if name == "kind")
+        }
+        Expr::MethodCall(call) => call.method == "kind",
+        Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "kind"),
+        _ => false,
+    }
+}
+
+/// The page kind a pattern routes on, at any depth of an or-pattern, a
+/// reference, or a tuple — every position where the literal is still matched
+/// against rather than evaluated.
+fn pattern_kind(pattern: &Pat) -> Option<String> {
+    match pattern {
+        Pat::Lit(literal) => match &literal.lit {
+            Lit::Str(text) => {
+                let value = text.value();
+                UNROUTABLE_PAGE_KINDS
+                    .contains(&value.as_str())
+                    .then_some(value)
+            }
+            _ => None,
+        },
+        Pat::Or(cases) => cases.cases.iter().find_map(pattern_kind),
+        Pat::Paren(paren) => pattern_kind(&paren.pat),
+        Pat::Reference(reference) => pattern_kind(&reference.pat),
+        Pat::Ident(ident) => ident
+            .subpat
+            .as_ref()
+            .and_then(|(_, subpattern)| pattern_kind(subpattern)),
+        Pat::TupleStruct(tuple) => tuple.elems.iter().find_map(pattern_kind),
+        Pat::Tuple(tuple) => tuple.elems.iter().find_map(pattern_kind),
+        Pat::Slice(slice) => slice.elems.iter().find_map(pattern_kind),
+        _ => None,
+    }
+}
+
+#[test]
+fn no_production_read_routes_on_a_non_entity_page_kind() {
+    let root = repo_root();
+    let mut sites = Vec::new();
+    for path in git_ls_files(&root, "*.rs").into_iter().filter(|path| {
+        path.starts_with("crates/")
+            && path.contains("/src/")
+            && path != "crates/wenlan-core/src/drift_guard.rs"
+            && !is_test_only_module(path)
+    }) {
+        let source = std::fs::read_to_string(root.join(&path)).expect("read Rust source");
+        sites.extend(page_kind_routing_sites(&path, &source));
+    }
+    assert!(
+        sites.is_empty(),
+        "production code now reads `pages.kind` to decide something, on a value other than \
+         'entity': {sites:?}. The column is written truthfully as of migration 107, but it is \
+         not yet trustworthy to read: rename, archive, and replace paths never re-derive it, \
+         and migration 89 folded only creation_kind='imported' onto 'source', so a page \
+         imported before 89 still carries 'concept'. Resolve by title or creation_kind the way \
+         synthesis::overview does, and retire this tooth in the PR that re-derives kind on \
+         every mutation path"
+    );
+}
+
+#[test]
+fn page_kind_routing_guard_separates_reads_from_writes() {
+    let path = "crates/wenlan-core/src/somewhere.rs";
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "conn.query(\"SELECT id FROM pages WHERE kind = 'source' AND status = 'active'\", ())",
+        ),
+        [format!("{path}: kind = 'source'")],
+        "a SELECT that filters pages on a non-entity kind is exactly what the fence forbids"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "conn.query(\"SELECT id FROM pages p JOIN page_map m ON m.page_id = p.id \
+             WHERE p.kind IN ('source','overview')\", ())",
+        ),
+        [format!("{path}: kind IN 'source'")],
+        "an IN list is a filter too, and a qualified `p.kind` is still the column"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(path, "if page.kind == \"overview\" { return Ok(()); }"),
+        [format!("{path}: kind == \"overview\"")],
+        "routing in Rust on a deserialized Page is the same fence"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "conn.query(\"SELECT id FROM pages WHERE status = 'active' \
+             AND COALESCE(kind, 'concept') = 'source'\", ())",
+        ),
+        [format!("{path}: kind = 'source'")],
+        "the fence's own COALESCE spelling with the literal swapped is the likeliest \
+         way a reader lands here, so it must not be the one shape that slips through"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "if page.kind.as_str() == \"overview\" { return Ok(()); }"
+        ),
+        [format!("{path}: kind == \"overview\"")],
+        "`Page.kind` is a public String, so `.as_str()` is the form a reader would \
+         actually write; an accessor between the column and the operator changes \
+         the spelling and nothing else"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "if page.kind() != \"concept\" { return Ok(()); }"
+        ),
+        [format!("{path}: kind != \"concept\"")],
+        "a getter is the same read as the field"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "let mut sql = String::from(\"SELECT id FROM pages WHERE space = ?1\"); \
+             sql.push_str(\" AND kind = 'overview'\");",
+        ),
+        [format!("{path}: kind = 'overview'")],
+        "a predicate appended to a base built elsewhere is still a predicate, and \
+         requiring the `FROM pages` proof in the same literal is exactly what hid it"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(path, "sql.push_str(\" AND p.kind = 'overview'\");"),
+        [format!("{path}: kind = 'overview'")],
+        "a fragment is recognised by the connective it opens with, so qualifying \
+         the column with its table alias cannot hide it"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "sql.push_str(\" AND COALESCE(kind, 'concept') = 'source'\");",
+        ),
+        [format!("{path}: kind = 'source'")],
+        "the live entity fence is spelled `AND COALESCE(kind, 'concept') != 'entity'` \
+         (db.rs:41949, db.rs:42055), so the appended form of it with the literal \
+         swapped is the likeliest reader to grow here"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(path, "sql.push_str(\" AND (kind = 'overview')\");"),
+        [format!("{path}: kind = 'overview'")],
+        "parenthesising a predicate changes its punctuation, not what it decides"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "let label = match page.kind.as_str() { \"source\" => \"doc\", _ => \"note\" };",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a match arm decides on the column without ever writing an operator"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "let label = match page.kind() { \"overview\" => \"home\", _ => \"note\" };",
+        ),
+        [format!("{path}: match on kind, arm \"overview\"")],
+        "the scrutinee is matched as a whole word, so an accessor call reads the \
+         same as a bare binding"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "if matches!(page.kind.as_str(), \"overview\" | \"authored\") { return Ok(()); }",
+        ),
+        [format!("{path}: match on kind, arm \"overview\"")],
+        "matches! is the same decision spelled as a macro"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "let l = match page.kind.as_str() { \"source\" if active => 1, _ => 0 };",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a guard narrows when the arm fires, so a guarded pattern routes on the \
+         column at least as much as a bare one"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "if matches!(page.kind.as_str(), \"source\" if active) { return Ok(()); }",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "the macro takes a guard too"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "let l = match page.kind.as_str() {\n    \
+             \"entity\" => if active { 0 } else { 1 }\n    \
+             \"source\" => 2,\n    _ => 0,\n};",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "Rust lets an arm whose body is an expression-with-block drop its \
+         trailing comma, and this repository writes that style, so an arm \
+         boundary read off commas loses every arm after the first such body"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "if let \"source\" = page.kind.as_str() { skip(); }"
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "an `if let` is a match arm with the pattern written first, and reading \
+         the AST makes it the same site rather than a disclosed hole"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "match (page.kind.as_str(), active) { (\"source\", true) => route(), _ => {} }",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "pairing the column with a second value is ordinary Rust and this \
+         repository's own style, so a scrutinee list that stopped at single-\
+         value wrappers let the commonest compound form straight through"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "let l = match normalize(page.kind.as_str()) { \"overview\" => 1, _ => 0 };",
+        ),
+        [format!("{path}: match on kind, arm \"overview\"")],
+        "passing the column through a helper does not stop the arm deciding on it"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "if matches!(page.kind.as_str(), \"source\",) { return Ok(()); }",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "`matches!` ends in `$(,)?`, so a trailing comma is valid Rust — and a \
+         parser that refused it while the caller swallowed the error erased \
+         the whole invocation"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "if matches!(flag, true if match page.kind.as_str() { \"source\" => true, \
+             _ => false }) { return Ok(()); }",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a `matches!` guard is a whole expression and can hold a `match` of its \
+         own. The guard was parsed only to be discarded, so the invocation's own \
+         scrutinee — `flag`, naming nothing — was the only thing ever looked at"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "#[cfg(not(test))]\nfn f(page: &Page) -> u8 {\n    \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n}",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "`cfg(not(test))` is production-ONLY code; reading any nested `test` \
+         ident as test-only skipped exactly the code this tooth exists to read"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "#[cfg(any(target_os = \"macos\", test))]\nfn f(page: &Page) -> u8 {\n    \
+             match page.kind.as_str() { \"overview\" => 1, _ => 0 }\n}",
+        ),
+        [format!("{path}: match on kind, arm \"overview\"")],
+        "this is live style in this repository (crates/wenlan-server/src/main.rs:156): \
+         the function ships on macOS, and `test` only widens when it also compiles"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "#[cfg(feature = \"test-utils\")]\nfn f(page: &Page) -> u8 {\n    \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n}",
+        ),
+        [format!("{path}: match on kind, arm \"source\"")],
+        "a feature merely NAMED after tests is compiled into production builds. \
+         This control used to read `creation_kind`, so it passed whether the \
+         item was scanned or skipped — it asserted nothing at all"
+    );
+
+    // The exhaustiveness claim on `skip_cfg_test_nodes!` is derived from ONE
+    // pinned syn version. A bump can add an attribute-bearing node and reopen
+    // the gap in silence, so the pin itself is a tooth: this fails on the bump,
+    // pointing at the derivation to re-run rather than letting the claim rot.
+    let lock = std::fs::read_to_string(repo_root().join("Cargo.lock"))
+        .expect("Cargo.lock must be readable to check the syn pin");
+    let pinned = lock
+        .split("[[package]]")
+        .find(|block| block.contains("\nname = \"syn\"\n"))
+        .and_then(|block| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix("version = ").map(|v| v.trim_matches('"')))
+        });
+    assert_eq!(
+        pinned,
+        Some("2.0.117"),
+        "syn moved. The gate list on `skip_cfg_test_nodes!` claims to cover every \
+         attribute-bearing node in syn 2.0.117, derived by grepping the vendored \
+         source for `pub attrs: Vec<Attribute>` (94 hits, 93 distinct nodes, \
+         `DeriveInput` excluded as unreachable from a file walk). Re-run that \
+         derivation against the new version, add any new node to the macro, and \
+         update this pin — three rounds of review found this list short by a \
+         shape nobody predicted, so it is not safe to assume a bump added none"
+    );
+
+    // The positions round 7 DISCLOSED as unread, now READ. Round 7 pinned them
+    // as known false findings; two of those pins turned out not to compile, or
+    // not to be caused by the position they named — a disclosure resting on a
+    // fixture nobody built is worth no more than the argument it replaced.
+    // Every fixture below was compiled with `rustc --edition 2021` in BOTH
+    // configurations (with and without `--cfg test`, exit 0 each), so each is
+    // real Rust whose test-only half genuinely leaves a production build.
+    //
+    // Each is CAUSAL: the macro sits inside the node the attribute gates, so
+    // removing that gate is what brings the finding back.
+    for (label, source) in [
+        (
+            "a function parameter, reached through `PatType` rather than `Pat`",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             fn f(#[cfg(test)] p: [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })]) {}",
+        ),
+        (
+            "a generic TYPE parameter, gated together with the field that uses it \
+             so the struct compiles either way",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             struct S<#[cfg(test)] T = [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })]> {\n    \
+             #[cfg(test)]\n    marker: std::marker::PhantomData<T>,\n}",
+        ),
+        (
+            "a CONST generic parameter, with the macro inside the parameter's own \
+             default — round 7 put it in the return type, where no parameter gate \
+             could ever have silenced it",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             struct C<#[cfg(test)] const N: usize = { ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }) }> {\n    \
+             #[cfg(test)]\n    bytes: [u8; N],\n}",
+        ),
+        (
+            "a CLOSURE parameter",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             let _c = |#[cfg(test)] p: [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })]| ();",
+        ),
+        (
+            "a STRUCT-PATTERN field",
+            "macro_rules! ignored_pat { ($($tt:tt)*) => { _ }; }\n\
+             let S { #[cfg(test)] a: ignored_pat!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }), .. } = s;",
+        ),
+    ] {
+        assert_eq!(
+            page_kind_routing_sites_in_snippet(path, source),
+            Vec::<String>::new(),
+            "{label} is a cfg-gated position holding a macro, and macro input is \
+             re-parsed as statements — so leaving the position ungated reported \
+             this test-only match as production. Every fixture here compiled \
+             under `rustc --edition 2021` both with and without `--cfg test`; \
+             two of round 7's did not, which is why they proved nothing"
+        );
+    }
+
+    assert_eq!(
+        page_kind_routing_sites(
+            path,
+            "#![cfg(test)]\nfn f(page: &Page) -> u8 {\n    \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n}",
+        ),
+        Vec::<String>::new(),
+        "a file's own inner attribute gates every item in it, and it is the one \
+         position reached through the production entry rather than a snippet. No \
+         file in this tree carries one, which is why round 7 disclosed it; \
+         reading it costs four lines, which is less than the disclosure did"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites_in_snippet(
+            path,
+            "macro_rules! ignored_pat { ($($tt:tt)*) => { _ }; }\n\
+             let (#[cfg(test)] ignored_pat!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }), y) = t;",
+        ),
+        [format!(
+            "{path}: could not be parsed as Rust, so the page-kind match scan could not run"
+        )],
+        "an attribute on a TUPLE-pattern element is not a shape any gate could \
+         reach, because it is not Rust: rustc rejects it with `expected pattern, \
+         found #` in both configurations. syn refusing it mirrors the compiler, \
+         and this scan reports the file as unreadable rather than passing it \
+         clean. Round 7 read this single fixture as proof that PATTERN position \
+         at large was unparseable; the closure-parameter and struct-pattern-field \
+         controls above are the counterexamples it was missing"
+    );
+
+    // The production entry point, not the snippet one: these prove that a file
+    // this scan cannot read reports itself rather than passing clean.
+    assert_eq!(
+        page_kind_routing_sites(path, "let x = 5;"),
+        [format!(
+            "{path}: could not be parsed as Rust, so the page-kind match scan could not run"
+        )],
+        "a fragment is not a file. This is the exact false clean the fallback \
+         bought: statements parse once they are wrapped in a function, so a \
+         tracked file that stopped being a file returned an empty finding list \
+         — indistinguishable from a file that was read and found innocent"
+    );
+
+    assert_eq!(
+        page_kind_routing_sites(path, "fn truncated(page: &Page) -> u8 { match page.kind"),
+        [format!(
+            "{path}: could not be parsed as Rust, so the page-kind match scan could not run"
+        )],
+        "a file whose readers cannot be enumerated must never read as having none"
+    );
+
+    for (label, source) in [
+        (
+            "the entity fence itself",
+            "conn.query(\"SELECT id FROM pages WHERE kind = 'entity' AND status = 'active'\", ())",
+        ),
+        (
+            "the entity fence in its live COALESCE spelling",
+            "conn.query(\"SELECT id FROM pages WHERE status = 'active' \
+             AND COALESCE(kind, 'concept') != 'entity'\", ())",
+        ),
+        (
+            "a COALESCE projection, which decides nothing",
+            "conn.query(\"SELECT COALESCE(kind, 'concept') FROM pages WHERE id = ?1\", ())",
+        ),
+        (
+            "migration 89's CHECK constraint",
+            "conn.execute(\"ALTER TABLE pages ADD COLUMN kind TEXT NOT NULL DEFAULT 'concept' \
+             CHECK(kind IN ('entity','concept','source','overview','authored'))\", ())",
+        ),
+        (
+            "migration 107's repair guard",
+            "tx.execute(\"UPDATE pages SET kind = CASE WHEN creation_kind = 'authored' \
+             THEN 'authored' ELSE 'concept' END WHERE kind = 'concept'\", ())",
+        ),
+        (
+            "a different column",
+            "conn.query(\"SELECT id FROM pages WHERE creation_kind = 'source'\", ())",
+        ),
+        (
+            "a different table's kind",
+            "conn.query(\"SELECT id FROM entity_links WHERE kind = 'source'\", ())",
+        ),
+        (
+            "a fragment that names its own table",
+            "sql.push_str(\" JOIN entity_links e ON e.page_id = p.id AND e.kind = 'source'\");",
+        ),
+        (
+            "migration 107's own log line, which is prose and not a predicate",
+            "log::info!(\"[migration] Migration 107 applied: {repaired} page(s) moved off the \
+             silent kind='concept' default\");",
+        ),
+        (
+            "a Rust assignment, not a comparison",
+            "let mut expected = Fixture::default(); expected.kind = \"concept\";",
+        ),
+        (
+            "prose in a comment",
+            "// pre-89 imports still carry kind='concept' until M6 re-derives them",
+        ),
+        (
+            "a bind parameter",
+            "conn.query(\"SELECT id FROM pages WHERE kind = ?1\", params![kind])",
+        ),
+        (
+            "a match on the entity fence",
+            "let shadow = match page.kind.as_str() { \"entity\" => true, _ => false };",
+        ),
+        (
+            "a match on a different column",
+            "let l = match page.creation_kind.as_str() { \"source\" => 1, _ => 0 };",
+        ),
+        (
+            "prose in an arm body, which decides nothing",
+            "let l = match page.kind.as_str() { \"entity\" => bail!(\"source missing\"), \
+             _ => 0 };",
+        ),
+        (
+            "a literal in a guard expression, which is not the arm's pattern",
+            "let l = match page.kind.as_str() { \"entity\" if tag == \"source\" => 1, \
+             _ => 0 };",
+        ),
+        (
+            "the same guard literal inside the macro",
+            "if matches!(page.kind.as_str(), \"entity\" if tag == \"source\") { return Ok(()); }",
+        ),
+        (
+            "a forbidden literal in an arm body, reached past a turbofish comma",
+            "let l = match page.kind.as_str() { \"entity\" => make::<u8, u16>(\"source\"), \
+             _ => 0 };",
+        ),
+        (
+            "the same shape with a two-argument closure",
+            "let l = match page.kind.as_str() { \"entity\" => fold(|a, b| pick(a, b, \"source\")), \
+             _ => 0 };",
+        ),
+        (
+            "a test fixture, which the scan now skips by attribute rather than by \
+             blanking its lines",
+            "#[cfg(test)]\nmod tests {\n    fn f(page: &Page) -> u8 {\n        \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n    }\n}",
+        ),
+        (
+            "a cfg that REQUIRES test, whatever else it also requires",
+            "#[cfg(all(test, feature = \"slow\"))]\nfn f(page: &Page) -> u8 {\n    \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n}",
+        ),
+        (
+            "the same cfg over a COMPARISON. The lexical half judged the literal \
+             text `#[cfg(test)]` while the AST half was already evaluating the \
+             predicate, so one tooth gave two answers — and a text-scan finding \
+             is recorded before the parser runs, so the visitor gates could not \
+             retract it",
+            "#[cfg(all(test, feature = \"slow\"))]\nfn f(page: &Page) {\n    \
+             if page.kind.as_str() == \"source\" {}\n}",
+        ),
+        (
+            "a cfg-gated type alias whose array length holds a macro. A const \
+             position bounds what COMPILES, not what this scan reads: macro input \
+             is re-parsed as statements, so the omitted `Item::Type` reported a \
+             test-only match as production",
+            "macro_rules! ignored_const { ($($tt:tt)*) => { 1 }; }\n\
+             #[cfg(test)]\ntype T = [u8; ignored_const!(\
+             match page.kind.as_str() { \"source\" => 1, _ => 0 })];",
+        ),
+        (
+            "the same route through a cfg-gated extern block, so the fix reads as \
+             a class rather than one patched variant",
+            "#[cfg(test)]\nextern \"C\" {\n    \
+             ignored_items!(match page.kind.as_str() { \"source\" => 1, _ => 0 });\n}",
+        ),
+        (
+            "a cfg-gated statement, an attribute position items alone never reached",
+            "#[cfg(test)]\nlet l = match page.kind.as_str() { \"source\" => 1, _ => 0 };",
+        ),
+        (
+            "a cfg-gated trait item, likewise",
+            "trait Router {\n    #[cfg(test)]\n    fn route(page: &Page) -> u8 {\n        \
+             match page.kind.as_str() { \"source\" => 1, _ => 0 }\n    }\n}",
+        ),
+        (
+            "a cfg-gated match arm, likewise",
+            "let l = match tag {\n    #[cfg(test)]\n    \
+             \"probe\" => match page.kind.as_str() { \"source\" => 1, _ => 0 },\n    \
+             _ => 0,\n};",
+        ),
+        (
+            "a compound scrutinee over a different column",
+            "let l = match (page.creation_kind.as_str(), active) { \
+             (\"source\", true) => 1, _ => 0 };",
+        ),
+        (
+            "a cfg-gated struct-literal field, whose attribute syn keeps on the \
+             field and not on the expression under it",
+            "let built = Built {\n    #[cfg(test)]\n    \
+             route: match page.kind.as_str() { \"source\" => 1, _ => 0 },\n    \
+             name,\n};",
+        ),
+        (
+            "a scrutinee whose only `kind` read is cfg-gated, so the value the \
+             production build matches on is a different column entirely",
+            "let l = match ({\n    #[cfg(test)]\n    let k = page.kind.as_str();\n    \
+             #[cfg(not(test))]\n    let k = page.slug.as_str();\n    k\n}) { \
+             \"source\" => 1, _ => 0 };",
+        ),
+        (
+            "a cfg attribute written across SEVERAL LINES. The lexical stripper \
+             asked whether ONE line both opened and closed an attribute until \
+             round 9, so rustfmt's own wrapping of a long predicate turned a \
+             test-only comparison into a production finding — and a text-scan \
+             finding is recorded before the parser runs, so no visitor gate \
+             could retract it",
+            "#[cfg(\n    all(test, feature = \"slow\")\n)]\nfn f(page: &Page) {\n    \
+             if page.kind.as_str() == \"source\" {}\n}",
+        ),
+        (
+            "a cfg attribute SHARING ITS LINE with the item it gates, which the \
+             line-shaped stripper also missed: the line started with `#[cfg(` \
+             but ended with the item's brace",
+            "#[cfg(all(test, feature = \"slow\"))] fn f(page: &Page) { \
+             if page.kind.as_str() == \"source\" {} }",
+        ),
+        (
+            "the same gate spelled with the whitespace Rust permits. Formatting \
+             is not a semantic signal, and a stripper that reads it as one is \
+             deciding what ships by how it was typed",
+            "#[ cfg ( all ( test , feature = \"slow\" ) ) ]\nfn f(page: &Page) {\n    \
+             if page.kind.as_str() == \"source\" {}\n}",
+        ),
+    ] {
+        assert!(
+            page_kind_routing_sites_in_snippet(path, source).is_empty(),
+            "{label} is not a read routing on kind: {:?}",
+            page_kind_routing_sites_in_snippet(path, source)
         );
     }
 }

@@ -689,7 +689,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 106;
+pub const SCHEMA_VERSION: u32 = 107;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8406,6 +8406,14 @@ impl MemoryDB {
             if version < 106 {
                 self.migrate_106_derivation_run_identity(version).await?;
             }
+
+            // Migration 107: repair the pages migration 89 never got to see.
+            // 89 classified the corpus of its day, but no insert named `kind`,
+            // so every page written since took the DEFAULT. See
+            // migrate_107_page_kind_repair.
+            if version < 107 {
+                self.migrate_107_page_kind_repair(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12024,6 +12032,95 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("m106 bump: {error}")))?;
         log::info!("[migration] Migration 106 applied: derivation runs carry a run identity");
+        Ok(())
+    }
+
+    /// Migration 107: make `pages.kind` truthful for the rows migration 89
+    /// never saw.
+    ///
+    /// 89 added the column and backfilled the corpus of its day honestly, but
+    /// no insert path ever named the column, so `NOT NULL DEFAULT 'concept'`
+    /// answered for every page written since — including the reserved Overview
+    /// singleton, which `ensure_overview_page` creates through the ordinary
+    /// page-create path. The write path now stamps `kind` from
+    /// `crate::pages::page_kind_for`; this applies that same rule, once, to the
+    /// rows that missed it.
+    ///
+    /// Scoped by two guards rather than run over the whole table:
+    ///
+    /// * `page_kind_fold_ledger` froze the pre-fold corpus, so its absence
+    ///   marks a row as "created after 89". Leaving ledgered rows alone keeps
+    ///   89's ledger a faithful mirror of the kinds it assigned — including the
+    ///   one place today's rule would disagree with it (89 read
+    ///   `creation_kind='source'` as a concept page). Re-deciding that is a
+    ///   separate call with its own audit trail, not this repair's business.
+    ///   The marker is sound but not exact, and the gap can be a wrong answer
+    ///   rather than only lost coverage. `delete_page` removes the row and its
+    ///   history but no ledger entry, and SOURCE ids are deterministic
+    ///   (`document_enrichment::source_page_id` hashes source id + file path),
+    ///   so a file deleted and re-ingested before this upgrade lands back on
+    ///   the same id. The recreated row took `concept` from the silent default,
+    ///   the inherited ledger entry describes the page that used to hold that
+    ///   id, and this repair skips it — leaving a SOURCE page stamped
+    ///   `concept`, a value that was never true of it. It is inert today only
+    ///   because every reader is still fenced to `kind='entity'`
+    ///   (`drift_guard::no_production_read_routes_on_a_non_entity_page_kind`).
+    ///   Tightening it (comparing the ledger's `migrated_at` against
+    ///   `pages.created_at`) needs one timestamp format to hold across every
+    ///   historical row, which is a bigger claim than this repair needs to
+    ///   make; M6 re-deriving `kind` on every mutation path is what closes it.
+    /// * `kind = 'concept'` means the repair only ever moves a row off the
+    ///   silent default. It cannot demote a deliberately stamped kind (the
+    ///   `kind='entity'` dual-write shadows above all), and re-running it is a
+    ///   no-op.
+    ///
+    /// The CASE is the frozen historical twin of `page_kind_for`, pinned equal
+    /// by `page_kind_rule_matches_the_migration_107_case`. Deliberately no
+    /// reader moves onto the column here: the Overview is still resolved by
+    /// title (`synthesis::overview`), and routing reads through `kind` is M6's
+    /// business. This migration only stops the column from lying.
+    async fn migrate_107_page_kind_repair(&self, prior_version: i64) -> Result<(), WenlanError> {
+        // §6.9: a data pass over `pages` gets a restore point, same as 89 and 99.
+        self.backup_before_migration(107, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m107 begin: {error}")))?;
+        let repaired = tx
+            .execute(
+                "UPDATE pages SET kind = CASE \
+                    WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview' \
+                    WHEN creation_kind = 'authored' THEN 'authored' \
+                    WHEN creation_kind IN ('imported', 'source') THEN 'source' \
+                    WHEN creation_kind = 'entity' THEN 'entity' \
+                    ELSE 'concept' END \
+                 WHERE kind = 'concept' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM page_kind_fold_ledger l WHERE l.page_id = pages.id \
+                   ) \
+                   AND CASE \
+                    WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview' \
+                    WHEN creation_kind = 'authored' THEN 'authored' \
+                    WHEN creation_kind IN ('imported', 'source') THEN 'source' \
+                    WHEN creation_kind = 'entity' THEN 'entity' \
+                    ELSE 'concept' END <> 'concept'",
+                (),
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m107 repair kind: {error}")))?;
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m107 commit: {error}")))?;
+
+        conn.execute("PRAGMA user_version = 107", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m107 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 107 applied: {repaired} page(s) moved off the silent \
+             kind='concept' default"
+        );
         Ok(())
     }
 
@@ -26954,17 +27051,28 @@ impl MemoryDB {
         if old_page_id == new_page_id {
             return Ok(());
         }
+        // `kind` is re-derived rather than copied: migration 89 mapped only
+        // `creation_kind='imported'` onto 'source', so a pre-89 SOURCE page still
+        // carries kind='concept'. This clone is a NEW row with a new id and no
+        // fold-ledger entry, so migration 107 will never revisit it -- copying the
+        // old value would mint a fresh row that lies, which is the bug this whole
+        // change exists to end. Frozen twin of `crate::pages::page_kind_for`.
         let inserted = conn
             .execute(
                 "INSERT INTO pages
                      (id,title,summary,content,entity_id,space,source_memory_ids,
                       version,status,embedding,created_at,last_compiled,last_modified,
                       sources_updated_count,stale_reason,user_edited,changelog,
-                      creation_kind,review_status,workspace,citations)
+                      creation_kind,review_status,workspace,citations,kind)
                  SELECT ?1,title,summary,content,entity_id,space,source_memory_ids,
                         version,status,embedding,created_at,last_compiled,last_modified,
                         sources_updated_count,stale_reason,user_edited,changelog,
-                        creation_kind,review_status,workspace,citations
+                        creation_kind,review_status,workspace,citations,
+                        CASE WHEN LOWER(title) = 'overview' AND status = 'active' THEN 'overview'
+                             WHEN creation_kind = 'authored' THEN 'authored'
+                             WHEN creation_kind IN ('imported', 'source') THEN 'source'
+                             WHEN creation_kind = 'entity' THEN 'entity'
+                             ELSE 'concept' END
                  FROM pages
                  WHERE id = ?2 AND creation_kind = 'source'",
                 libsql::params![new_page_id, old_page_id],
@@ -41604,19 +41712,25 @@ impl MemoryDB {
             }
         }
 
+        // Migration 89's discriminator, stamped from the ONE rule rather than
+        // left to the column DEFAULT -- this is the single funnel every
+        // page-insert path reaches, so stamping here is what makes `kind`
+        // truthful corpus-wide. Both arms below write `status='active'`.
+        let kind = crate::pages::page_kind_for(title, creation_kind, "active");
+
         let concept_result = match &embedding_sql {
             Some(emb) => {
                 conn.execute(
-                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9, ?10, ?11, ?12, ?13)",
-                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, emb.as_str(), now, creation_kind, review_status, workspace, citations_json],
+                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, emb.as_str(), now, creation_kind, review_status, workspace, citations_json, kind],
                 ).await
             }
             None => {
                 conn.execute(
-                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8, ?9, ?10, ?11, ?12)",
-                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, now, creation_kind, review_status, workspace, citations_json],
+                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    libsql::params![id, title, summary, content, entity_id, space, source_ids_json, now, creation_kind, review_status, workspace, citations_json, kind],
                 ).await
             }
         };
@@ -46575,7 +46689,7 @@ impl MemoryDB {
     ) -> Result<Option<crate::pages::Page>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut sql = String::from(
-            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations
+            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
              FROM pages
              WHERE stale_reason = ? AND status = 'active'
                AND COALESCE(kind, 'concept') != 'entity'",
