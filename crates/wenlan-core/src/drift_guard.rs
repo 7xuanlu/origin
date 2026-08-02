@@ -538,6 +538,7 @@ fn release_rust_cache_violations(workflow: &str) -> Vec<String> {
     if rust_cache.is_none() {
         violations.push("release job removed its target-level rust-cache fallback".into());
     }
+    let windows_condition = "matrix.target == 'x86_64-pc-windows-msvc'";
     let windows_only = "${{ matrix.target == 'x86_64-pc-windows-msvc' }}";
     if rust_cache.and_then(|step| step["with"]["shared-key"].as_str())
         != Some("release-v3-${{ matrix.target }}")
@@ -561,7 +562,7 @@ fn release_rust_cache_violations(workflow: &str) -> Vec<String> {
     let marker_run = marker
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
-    if marker.and_then(|step| step["if"].as_str()) != Some(windows_only)
+    if marker.and_then(|step| step["if"].as_str()) != Some(windows_condition)
         || !marker_run.contains("CACHEDIR.TAG")
         || !marker_run.contains("Signature: 8a477f597d28d172789f06886806bc55")
     {
