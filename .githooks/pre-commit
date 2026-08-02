@@ -11,10 +11,11 @@ HAS_RUST=$(echo "$STAGED_FILES" | grep -q '\.rs$' && echo "yes" || echo "no")
 HAS_RUST_INPUT=$(echo "$STAGED_FILES" | grep -Eq '(\.rs$|(^|/)Cargo\.toml$|^Cargo\.lock$|^rust-toolchain\.toml$|^clippy\.toml$)' && echo "yes" || echo "no")
 
 if [ "$HAS_RUST" = "yes" ]; then
-    echo "  Auto-formatting Rust..."
-    cargo fmt --all 2>&1
-    # Re-stage any files that cargo fmt modified
-    git diff --name-only | grep '\.rs$' | xargs git add 2>/dev/null || true
+    echo "  Checking Rust formatting..."
+    cargo fmt --all -- --check 2>&1 || {
+        echo "FAIL: Rust formatting differs. Run cargo fmt --all, review the changes, and stage them explicitly."
+        exit 1
+    }
 
 fi
 

@@ -28,17 +28,6 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash -c 'IN=$(cat); H=.claude/hooks/cargo-check-crate.sh; R=\"${CLAUDE_PROJECT_DIR:-}\"; [ -f \"$R/$H\" ] || R=$(git -C \"$(printf %s \"$IN\" | jq -r .cwd)\" rev-parse --show-toplevel 2>/dev/null); [ -f \"$R/$H\" ] || { echo \"cargo-check-crate: hook script unresolvable — skipping (advisory)\" >&2; exit 1; }; printf %s \"$IN\" | CLAUDE_PROJECT_DIR=\"$R\" bash \"$R/$H\"'"
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [
