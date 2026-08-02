@@ -757,12 +757,46 @@ def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[s
         commands.append(
             ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
         )
-    elif workspace_mode in {"packages", "filterset"}:
+    elif workspace_mode == "packages":
         names = _validated_package_names(workspace.get("packages"), packages)
         commands.append(["cargo", "test", *_package_args(names), "--lib"])
         if "wenlan-server" in names:
             commands.append(
                 ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
+            )
+    elif workspace_mode == "filterset":
+        names = set(_validated_package_names(workspace.get("packages"), packages))
+        filterset = workspace.get("filterset")
+        if not isinstance(filterset, str) or not filterset:
+            raise PlanError("workspace filterset is empty")
+        broad: set[str] = set()
+        isolated: list[tuple[str, str]] = []
+        for expression in filterset.split(" | "):
+            broad_match = re.fullmatch(r"package\(([A-Za-z0-9_-]+)\)", expression)
+            isolated_match = re.fullmatch(
+                r"package\(([A-Za-z0-9_-]+)\) & test\(/\^([A-Za-z0-9_:]+)::/\)",
+                expression,
+            )
+            if broad_match is not None:
+                broad.add(broad_match.group(1))
+            elif isolated_match is not None:
+                isolated.append((isolated_match.group(1), isolated_match.group(2)))
+            else:
+                raise PlanError("workspace filterset is not locally executable")
+        selected = broad | {package for package, _prefix in isolated}
+        if selected != names:
+            raise PlanError("workspace filterset package inventory is inconsistent")
+        if broad:
+            commands.append(
+                ["cargo", "test", *_package_args(sorted(broad)), "--lib"]
+            )
+            if "wenlan-server" in broad:
+                commands.append(
+                    ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
+                )
+        for package, prefix in isolated:
+            commands.append(
+                ["cargo", "test", "-p", package, "--lib", f"{prefix}::"]
             )
     elif workspace_mode != "skip":
         raise PlanError(f"unknown workspace-lib mode: {workspace_mode!r}")

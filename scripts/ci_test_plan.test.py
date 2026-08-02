@@ -973,6 +973,56 @@ class CommandGenerationTests(unittest.TestCase):
             [["cargo", "test", "-p", "wenlan-mcp", "--test", "real_router"]],
         )
 
+    def test_local_push_runs_isolated_modules_by_exact_cargo_prefix(self) -> None:
+        plan = plan_for(
+            "crates/wenlan-core/src/drift_guard/r4_test_support_raw_manifest.txt"
+        )
+
+        self.assertEqual(
+            local_test_commands_for(plan, cargo_metadata()),
+            [
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-core",
+                    "--lib",
+                    "drift_guard::r4_test_support_test::",
+                ]
+            ],
+        )
+
+    def test_local_push_preserves_mixed_broad_and_isolated_owners(self) -> None:
+        plan = plan_for(
+            "crates/wenlan-mcp/src/tools.rs",
+            "crates/wenlan-core/src/drift_guard/r4_test_support_api_manifest.txt",
+        )
+
+        self.assertEqual(plan["workspace_lib"]["mode"], "filterset")
+        self.assertEqual(
+            local_test_commands_for(plan, cargo_metadata()),
+            [
+                ["cargo", "test", "-p", "wenlan-mcp", "--lib"],
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-core",
+                    "--lib",
+                    "drift_guard::r4_test_support_test::",
+                ],
+            ],
+        )
+
+    def test_local_push_rejects_unrecognized_filterset_text(self) -> None:
+        plan = plan_for(
+            "crates/wenlan-core/src/drift_guard/r4_test_support_raw_manifest.txt"
+        )
+        plan["workspace_lib"]["filterset"] = "all()"
+
+        with self.assertRaisesRegex(PlanError, "not locally executable"):
+            local_test_commands_for(plan, cargo_metadata())
+
     def test_contract_target_generates_required_target_only_command(self) -> None:
         plan = plan_for("crates/wenlan-types/tests/page_draft_wire.rs")
 

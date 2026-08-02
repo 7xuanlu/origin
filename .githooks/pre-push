@@ -3,9 +3,10 @@ set -euo pipefail
 
 # Push-time checks reuse CI's fail-closed package planner. Ordinary source
 # changes run Clippy + lib tests for the owning crate's reverse dependency
-# closure; direct integration-test edits run that target. Shared build inputs
-# intentionally fall back to the full workspace. CI remains the owner of broad
-# integration, HTTP smoke, platform, and release-profile proofs.
+# closure; direct integration-test edits and isolated unit-test owners run only
+# their exact target/module. Shared build inputs intentionally fall back to the
+# full workspace. CI remains the owner of broad integration, HTTP smoke,
+# platform, and release-profile proofs.
 
 ZERO_SHA="0000000000000000000000000000000000000000"
 all_changed=""
