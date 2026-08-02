@@ -4940,11 +4940,7 @@ fn release_promotion_contract_violations(
     }
     for (workflow, label, trusted_ref) in [
         (&fast_maintenance, "fast", "${{ github.sha }}"),
-        (
-            &release_please,
-            "fallback",
-            "${{ github.event.workflow_run.head_sha }}",
-        ),
+        (&release_please, "fallback", "${{ github.sha }}"),
     ] {
         let trusted_checkout = job_step(
             workflow,
@@ -5525,6 +5521,10 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "github.event.workflow_run.conclusion != 'success'",
         )
         .replace(
+            "      - name: Checkout trusted release PR synchronizer\n        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6\n        with:\n          # workflow_run's github.sha is the immutable default-branch commit\n          # that owns this privileged workflow. The observed CI head may be an\n          # older main commit that predates the synchronizer itself.\n          ref: ${{ github.sha }}",
+            "      - name: Checkout trusted release PR synchronizer\n        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6\n        with:\n          ref: ${{ github.event.workflow_run.head_sha }}",
+        )
+        .replace(
             "MAIN_SHA: ${{ github.event.workflow_run.head_sha }}",
             "MAIN_SHA: ${{ github.sha }}",
         );
@@ -5543,6 +5543,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         "pinned, least-privilege, PR-only, and non-force",
         "publishing or lifecycle mutation",
         "immutable resolved head",
+        "stage the trusted synchronizer",
         "observed successful main receipt",
     ] {
         assert!(

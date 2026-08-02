@@ -111,7 +111,10 @@ jobs:
       - name: Checkout trusted release PR synchronizer
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # workflow_run's github.sha is the immutable default-branch commit
+          # that owns this privileged workflow. The observed CI head may be an
+          # older main commit that predates the synchronizer itself.
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Resolve exact pending Release PR
         id: release_pr

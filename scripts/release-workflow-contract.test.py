@@ -136,7 +136,7 @@ def contract_violations(
             violations.append(f"ordinary release-please path omits PR-only contract {marker!r}")
     for workflow, label, trusted_ref in [
         (fast_maintenance, "fast", "${{ github.sha }}"),
-        (release_please, "fallback", "${{ github.event.workflow_run.head_sha }}"),
+        (release_please, "fallback", "${{ github.sha }}"),
     ]:
         maintenance_job = job_body(workflow, "maintain-release-pr")
         trusted_checkout = named_step_body(
@@ -1047,6 +1047,21 @@ def main() -> None:
             "github.event.workflow_run.conclusion == 'success'",
             "github.event.workflow_run.conclusion != 'success'",
             "release-please main route omits",
+            "release_please",
+        ),
+        (
+            "      - name: Checkout trusted release PR synchronizer\n"
+            "        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6\n"
+            "        with:\n"
+            "          # workflow_run's github.sha is the immutable default-branch commit\n"
+            "          # that owns this privileged workflow. The observed CI head may be an\n"
+            "          # older main commit that predates the synchronizer itself.\n"
+            "          ref: ${{ github.sha }}",
+            "      - name: Checkout trusted release PR synchronizer\n"
+            "        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6\n"
+            "        with:\n"
+            "          ref: ${{ github.event.workflow_run.head_sha }}",
+            "fallback maintenance trusted checkout omits",
             "release_please",
         ),
         (
