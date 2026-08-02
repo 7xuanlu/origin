@@ -1201,8 +1201,17 @@ jobs:
         id: page-lint-scale
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true'
         run: bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
+      - name: Preserve Page lint diagnostic on prerequisite failure
+        if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'
+        shell: bash
+        run: |
+          receipt="$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
+          if [[ ! -f "$receipt" ]]; then
+            printf 'task=19 diagnostic scale gate\nstatus=not-run\nstep_outcome=%s\n' \
+              '${{ steps.page-lint-scale.outcome }}' > "$receipt"
+          fi
       - name: Upload Page lint scale receipt (Linux)
-        if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true' && steps.page-lint-scale.outcome != 'skipped'
+        if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: task-19-lint-scale-ubuntu-24.04-${{ github.sha }}

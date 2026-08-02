@@ -5251,7 +5251,19 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         "canonical-acceptance",
         "Upload Page lint scale receipt (Linux)",
     );
-    if lint_upload.and_then(|step| step["if"].as_str())
+    let lint_preserve = job_step(
+        &ci,
+        "canonical-acceptance",
+        "Preserve Page lint diagnostic on prerequisite failure",
+    );
+    let preserve_run = lint_preserve
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if lint_preserve.and_then(|step| step["if"].as_str())
+        != Some("always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'")
+        || !preserve_run.contains("if [[ ! -f \"$receipt\" ]]")
+        || !preserve_run.contains("${{ steps.page-lint-scale.outcome }}")
+        || lint_upload.and_then(|step| step["if"].as_str())
         != Some("always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'")
         || lint_upload
             .and_then(|step| step["uses"].as_str())
