@@ -4307,7 +4307,7 @@ jobs:
         "release-profile-sensitive",
         "native/build-sensitive",
         "45-minute non-Windows PR budget",
-        "release-sensitive PRs and release backstops",
+        "release-sensitive changes and explicit release backstops",
         "rust-lld",
         "debug runtime artifacts",
         "differentially compile every wenlan-mcp target",
