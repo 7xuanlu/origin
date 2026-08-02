@@ -414,7 +414,7 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
 fn coverage_fastembed_cache_violations(workflow: &str) -> Vec<String> {
     const CACHE_STEP: &str = "Restore portable FastEmbed model";
     const CACHE_DIR: &str = "${{ github.workspace }}/.fastembed_cache";
-    const CACHE_PATH: &str = "${{ env.FASTEMBED_CACHE_DIR }}";
+    const CACHE_PATH: &str = ".fastembed_cache";
     const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v3-portable";
 
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse coverage.yml");
@@ -461,6 +461,10 @@ fn coverage_fastembed_cache_violations(workflow: &str) -> Vec<String> {
     {
         violations
             .push("coverage does not restore the cross-OS portable FastEmbed v3 cache".into());
+    }
+    if cache_step["with"]["fail-on-cache-miss"].as_str() != Some("true") {
+        violations
+            .push("coverage FastEmbed cache restore is not fail-closed on a cache miss".into());
     }
     if steps.iter().any(|step| {
         step["uses"].as_str().is_some_and(|uses| {
@@ -698,6 +702,7 @@ jobs:
         "coverage caches",
         "cache key",
         "cross-OS portable FastEmbed v3",
+        "fail-closed",
         "FastEmbed cache writer",
     ] {
         assert!(
@@ -707,6 +712,31 @@ jobs:
             "fixture must exercise {expected:?}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn coverage_fastembed_cache_contract_rejects_absolute_action_path() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/coverage.yml"))
+        .expect("read coverage.yml");
+    let mutated = workflow.replacen(
+        "          path: .fastembed_cache",
+        "          path: ${{ env.FASTEMBED_CACHE_DIR }}",
+        1,
+    );
+    assert_ne!(
+        mutated, workflow,
+        "fixture must mutate the cache action path"
+    );
+    let violations = coverage_fastembed_cache_violations(&mutated);
+    assert_eq!(
+        violations.len(),
+        1,
+        "absolute cache action path must be the only mutation: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("coverage caches"),
+        "absolute cache action path must fail the shared-version contract: {violations:?}"
+    );
 }
 
 #[test]
@@ -6780,7 +6810,7 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
         .and_then(|step| step["uses"].as_str())
         .is_none_or(|uses| !uses.contains("actions/cache/restore@"))
         || fastembed_restore.and_then(|step| step["with"]["path"].as_str())
-            != Some("${{ env.FASTEMBED_CACHE_DIR }}")
+            != Some(".fastembed_cache")
         || fastembed_restore.and_then(|step| step["with"]["key"].as_str())
             != Some("fastembed-bge-base-en-v1.5-q-v3-portable")
         || fastembed_restore.and_then(|step| step["with"]["enableCrossOsArchive"].as_str())
@@ -6789,6 +6819,12 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
         violations.push(
             "main canary FastEmbed cache is not the restore-only cross-OS portable v3 cache".into(),
         );
+    }
+    if fastembed_restore.and_then(|step| step["with"]["fail-on-cache-miss"].as_str())
+        != Some("true")
+    {
+        violations
+            .push("main canary FastEmbed cache restore is not fail-closed on a cache miss".into());
     }
     if canary_steps
         .clone()
@@ -6940,6 +6976,7 @@ jobs:
         "FastEmbed cache directory",
         "rust-cache is not restore-only",
         "portable v3 cache",
+        "fail-closed",
         "FastEmbed cache writer",
         "exact two-test ignored inventory",
         "exact two-test eval contract",
@@ -6952,6 +6989,30 @@ jobs:
             "fixture must exercise {expected:?}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn main_canary_contract_rejects_absolute_cache_action_path() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml");
+    let mutated = canary.replacen(
+        "          path: .fastembed_cache",
+        "          path: ${{ env.FASTEMBED_CACHE_DIR }}",
+        1,
+    );
+    assert_ne!(mutated, canary, "fixture must mutate the cache action path");
+    let violations = main_canary_contract_violations(&ci, &mutated);
+    assert_eq!(
+        violations.len(),
+        1,
+        "absolute cache action path must be the only mutation: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("portable v3 cache"),
+        "absolute cache action path must fail the shared-version contract: {violations:?}"
+    );
 }
 
 #[test]
