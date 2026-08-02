@@ -19,6 +19,14 @@ class PlanError(ValueError):
 
 
 ISOLATED_UNIT_MODULES = {
+    "crates/wenlan-core/src/drift_guard/r4_test_support_api_manifest.txt": (
+        "wenlan-core",
+        "drift_guard::r4_test_support_test",
+    ),
+    "crates/wenlan-core/src/drift_guard/r4_test_support_raw_manifest.txt": (
+        "wenlan-core",
+        "drift_guard::r4_test_support_test",
+    ),
     "crates/wenlan-core/src/lint/pages/security_test.rs": (
         "wenlan-core",
         "lint::pages::fs::tests::security_cases",
@@ -513,7 +521,7 @@ def build_platform_plan(
             existing_paths=existing_paths,
         )
     if not paths:
-        raise PlanError("changed path inventory is empty")
+        return _skip_plan("no generic platform behavioral inputs changed")
 
     # Linux owns repository/workflow/planner contracts. Platform behavior is
     # widened only by product crate inputs or the shared Cargo/toolchain graph.

@@ -2109,6 +2109,15 @@ fn ci_routing_contract_violations(
     let platform_event = platform_planner
         .and_then(|step| step["env"]["CI_EVENT_NAME"].as_str())
         .unwrap_or_default();
+    let platform_macos_files = platform_planner
+        .and_then(|step| step["env"]["MACOS_FILES_JSON"].as_str())
+        .unwrap_or_default();
+    let platform_macos_m4_files = platform_planner
+        .and_then(|step| step["env"]["MACOS_M4_FILES_JSON"].as_str())
+        .unwrap_or_default();
+    let platform_windows_files = platform_planner
+        .and_then(|step| step["env"]["WINDOWS_FILES_JSON"].as_str())
+        .unwrap_or_default();
     let platform_order = (
         detect_step_index("Plan affected Rust tests"),
         detect_step_index("Plan affected platform behavior tests"),
@@ -2124,11 +2133,22 @@ fn ci_routing_contract_violations(
         || !platform_planner_run.contains("--metadata-file \"$RUNNER_TEMP/cargo-metadata.json\"")
         || !platform_planner_run.contains("--event-name \"$CI_EVENT_NAME\"")
         || !platform_planner_run.contains("--github-output \"$GITHUB_OUTPUT\"")
+        || !platform_planner_run.contains("--argjson macos \"$MACOS_FILES_JSON\"")
+        || !platform_planner_run.contains("--argjson macos_m4 \"$MACOS_M4_FILES_JSON\"")
+        || !platform_planner_run.contains("--argjson windows \"$WINDOWS_FILES_JSON\"")
+        || !platform_planner_run
+            .contains("(($macos - $macos_m4) + $windows) | unique")
+        || platform_macos_files != "${{ steps.filter.outputs.macos_files }}"
+        || platform_macos_m4_files
+            != "${{ steps.filter.outputs['macos-m4_files'] }}"
+        || platform_windows_files != "${{ steps.filter.outputs.windows_files }}"
+        || platform_planner_run.contains("impact_files")
         || platform_event
             != "${{ startsWith(github.head_ref, 'release-please--branches--') && 'release-please' || github.event_name }}"
     {
         violations.push(
-            "detect-changes does not emit a separate fail-closed platform behavior plan"
+            "detect-changes does not derive its platform behavior plan from the exact generic \
+             macOS plus Windows filter inventories"
                 .into(),
         );
     }
@@ -2432,7 +2452,7 @@ fn ci_routing_contract_violations(
         }
     }
     let macos_m4 = detect_change_filter_paths(&ci, "macos-m4");
-    for path in [
+    let expected_macos_m4: BTreeSet<String> = [
         "crates/wenlan-core/src/community_grouping.rs",
         "crates/wenlan-core/src/community_partition.rs",
         "crates/wenlan-core/src/edge_grounding.rs",
@@ -2441,15 +2461,37 @@ fn ci_routing_contract_violations(
         "crates/wenlan-core/src/db/community_grouping_state.rs",
         "crates/wenlan-core/src/refinery/mod.rs",
         "crates/wenlan-core/tests/m4_community_gates.rs",
-    ] {
-        if !macos_m4.contains(path) {
-            violations.push(format!("macos-m4 routing omits M4 contract input {path}"));
-        }
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for path in expected_macos_m4.difference(&macos_m4) {
+        violations.push(format!("macos-m4 routing omits M4 contract input {path}"));
+    }
+    for path in macos_m4.difference(&expected_macos_m4) {
+        violations.push(format!(
+            "macos-m4 focused-owner allowlist has unreviewed path {path}"
+        ));
     }
     for path in &macos_m4 {
         if !filter_routes_path(&macos_paths, path) {
             violations.push(format!(
                 "M4-sensitive path does not also schedule the macOS job: {path}"
+            ));
+        }
+    }
+    let m4_platform_target = "crates/wenlan-core/tests/m4_community_gates.rs";
+    if !platform_sensitive_paths
+        .iter()
+        .any(|(path, platform, _)| path == m4_platform_target && *platform == "macos")
+    {
+        violations.push("the focused M4 target lost its real macOS cfg branch".into());
+    }
+    for (path, platform, _) in platform_sensitive_paths {
+        if macos_m4.contains(path) && path != m4_platform_target {
+            violations.push(format!(
+                "macos-m4 focused source {path} acquired {platform}-specific cfg; retain it in \
+                 the generic platform plan or move that proof into the focused target"
             ));
         }
     }
@@ -3074,6 +3116,16 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             "steps.test-plan.outputs.rust-ci-required == 'true'",
             "steps.filter.outputs.rust == 'true'",
             1,
+        )
+        .replacen(
+            "(($macos - $macos_m4) + $windows) | unique",
+            "($macos + $windows) | unique",
+            1,
+        )
+        .replacen(
+            "            macos-m4:\n              - 'crates/wenlan-core/src/community_grouping.rs'",
+            "            macos-m4:\n              - 'crates/wenlan-core/src/community_grouping.rs'\n              - 'crates/wenlan-core/src/unreviewed_m4.rs'",
+            1,
         );
     let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
         .expect("read CI test planner")
@@ -3094,7 +3146,8 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             1,
         )
         .replacen("    if not relevant:", "    if False:", 1);
-    let platform_sensitive_paths = platform_sensitive_paths(&root);
+    let mut platform_sensitive_paths = platform_sensitive_paths(&root);
+    platform_sensitive_paths.push(("crates/wenlan-core/src/db.rs".into(), "macos", "macos"));
     let release_profile_sensitive_paths = release_profile_sensitive_paths(&root);
     let mut violations = ci_routing_contract_violations(
         &workflow,
@@ -3111,6 +3164,9 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "non-Rust fast-owner",
         "unknown paths",
         "platform test planner lost required contract",
+        "exact generic macOS plus Windows filter inventories",
+        "macos-m4 focused-owner allowlist has unreviewed path",
+        "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",
     ] {
         assert!(
             violations
