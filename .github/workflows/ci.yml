@@ -179,6 +179,8 @@ jobs:
               - 'scripts/update-readme-eval.test.py'
               - 'scripts/validate-versions.sh'
               - 'scripts/validate-versions.test.sh'
+              - 'scripts/bump-version.sh'
+              - 'scripts/bump-version.test.sh'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
             npm:

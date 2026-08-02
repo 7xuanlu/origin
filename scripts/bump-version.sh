@@ -40,8 +40,8 @@ done
 echo "  Updated Cargo.toml (workspace.dependencies wenlan-types/wenlan-core)"
 
 # 2. npm wrapper package.json files
-(cd crates/wenlan-mcp/npm && npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version >/dev/null)
-(cd crates/wenlan-cli/npm && npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version >/dev/null)
+(cd crates/wenlan-mcp/npm && npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version --ignore-scripts >/dev/null)
+(cd crates/wenlan-cli/npm && npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version --ignore-scripts >/dev/null)
 echo "  Updated crates/wenlan-mcp/npm/package.json"
 echo "  Updated crates/wenlan-cli/npm/package.json"
 

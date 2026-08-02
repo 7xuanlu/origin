@@ -3173,6 +3173,8 @@ fn documentation_only_changes_take_the_docs_lane_without_runtime_backstops() {
         "scripts/update-readme-eval.test.py",
         "scripts/validate-versions.sh",
         "scripts/validate-versions.test.sh",
+        "scripts/bump-version.sh",
+        "scripts/bump-version.test.sh",
     ] {
         assert!(
             filter_routes_path(&docs, path),
@@ -3193,6 +3195,35 @@ fn documentation_only_changes_take_the_docs_lane_without_runtime_backstops() {
     assert!(
         filter_routes_path(rust, markdown_test_fixture),
         "Markdown under crates/**/tests/** must retain Rust test coverage"
+    );
+}
+
+#[test]
+fn release_version_sync_never_runs_package_lifecycle_scripts() {
+    let root = repo_root();
+    let bump = std::fs::read_to_string(root.join("scripts/bump-version.sh"))
+        .expect("read bump-version.sh");
+    let validation = std::fs::read_to_string(root.join("scripts/validate-versions.test.sh"))
+        .expect("read validate-versions.test.sh");
+
+    let npm_version_lines = bump
+        .lines()
+        .filter(|line| line.contains("npm version"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        npm_version_lines.len(),
+        2,
+        "unexpected npm version command inventory"
+    );
+    assert!(
+        npm_version_lines
+            .iter()
+            .all(|line| line.contains("--ignore-scripts")),
+        "release version sync must not execute candidate-controlled npm lifecycle scripts"
+    );
+    assert!(
+        validation.contains("bash \"$REPO_ROOT/scripts/bump-version.test.sh\""),
+        "release validation must exercise the hostile lifecycle-script fixture"
     );
 }
 
