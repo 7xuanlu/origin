@@ -8336,7 +8336,7 @@ const SQL_TABLE_CLAUSES: [&str; 5] = ["FROM ", "JOIN ", "UPDATE ", "INTO ", "TAB
 
 /// Keywords a SQL predicate opens with. A fragment names no table, so this is
 /// the only thing separating `" AND kind = 'overview'"` from a log line that
-/// happens to mention `kind='concept'` — migration 104 ships exactly such a
+/// happens to mention `kind='concept'` — migration 107 ships exactly such a
 /// line, and without this the tooth cries wolf on its own repair.
 const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 
@@ -8348,7 +8348,7 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 /// paths never re-derive `kind`, so a page renamed to `Overview` — or away from
 /// it — keeps whatever it was stamped with. And migration 89 folded only
 /// `creation_kind='imported'` onto `'source'`, never `'source'` itself, so a
-/// page imported before 89 still sits at `'concept'`; migration 104's ledger
+/// page imported before 89 still sits at `'concept'`; migration 107's ledger
 /// guard skips exactly those rows, because 89 already wrote them an entry. A
 /// reader routing on those values today is routing on stale data, which is why
 /// the fence stays up until M6 re-derives `kind` on every mutation path.
@@ -8356,14 +8356,14 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 /// A write is not a read. A SQL predicate whose own literal names a table is
 /// excused unless that literal *selects* from `pages` (`FROM pages` / `JOIN
 /// pages`), which is what keeps migration 89's `CHECK` constraint, migration
-/// 104's `UPDATE pages … WHERE kind = 'concept'` repair guard, and every other
+/// 107's `UPDATE pages … WHERE kind = 'concept'` repair guard, and every other
 /// table's `kind` column out of the scan without an exemption list that would
 /// have to be maintained — and widened — by hand. A literal
 /// naming *no* table proves nothing either way, and is counted rather than
 /// excused when it opens on a SQL connective: that is the only reading under
 /// which `sql.push_str(" AND kind = 'overview'")` is visible at all, since the
 /// `FROM pages` it belongs to sits in a different literal. The connective is
-/// what keeps prose out — migration 104 logs the phrase `kind='concept'`, and
+/// what keeps prose out — migration 107 logs the phrase `kind='concept'`, and
 /// counting every literal that merely contains the column would make the
 /// repair's own success message a finding. The residual cost is that a
 /// fragment appended to some *other* table's query trips the tooth; naming
@@ -8421,7 +8421,7 @@ const SQL_PREDICATE_LEADS: [&str; 5] = ["AND", "OR", "WHERE", "HAVING", "ON"];
 ///   `HAVING`, or `ON`: a bare `" kind = 'overview'"` relying on the base
 ///   ending in `WHERE`, a leading `"("`, or a `" WHEN kind = 'overview' THEN"`
 ///   inside a CASE. This is the price of the connective gate, and the gate is
-///   what keeps migration 104's log line out; widening the lead set trades
+///   what keeps migration 107's log line out; widening the lead set trades
 ///   reach for false findings on prose.
 /// - a `match` inside a macro body that is not a sequence of statements, and a
 ///   routing decision hidden behind a macro of this repository's own —
@@ -9325,7 +9325,7 @@ fn no_production_read_routes_on_a_non_entity_page_kind() {
     assert!(
         sites.is_empty(),
         "production code now reads `pages.kind` to decide something, on a value other than \
-         'entity': {sites:?}. The column is written truthfully as of migration 104, but it is \
+         'entity': {sites:?}. The column is written truthfully as of migration 107, but it is \
          not yet trustworthy to read: rename, archive, and replace paths never re-derive it, \
          and migration 89 folded only creation_kind='imported' onto 'source', so a page \
          imported before 89 still carries 'concept'. Resolve by title or creation_kind the way \
@@ -9733,7 +9733,7 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
              CHECK(kind IN ('entity','concept','source','overview','authored'))\", ())",
         ),
         (
-            "migration 104's repair guard",
+            "migration 107's repair guard",
             "tx.execute(\"UPDATE pages SET kind = CASE WHEN creation_kind = 'authored' \
              THEN 'authored' ELSE 'concept' END WHERE kind = 'concept'\", ())",
         ),
@@ -9750,8 +9750,8 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
             "sql.push_str(\" JOIN entity_links e ON e.page_id = p.id AND e.kind = 'source'\");",
         ),
         (
-            "migration 104's own log line, which is prose and not a predicate",
-            "log::info!(\"[migration] Migration 104 applied: {repaired} page(s) moved off the \
+            "migration 107's own log line, which is prose and not a predicate",
+            "log::info!(\"[migration] Migration 107 applied: {repaired} page(s) moved off the \
              silent kind='concept' default\");",
         ),
         (

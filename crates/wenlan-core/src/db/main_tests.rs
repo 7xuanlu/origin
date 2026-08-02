@@ -38754,14 +38754,14 @@ async fn page_draft_insert_stamps_authored_kind() {
     assert_eq!(page_kind_of(&db, &page.id).await, "authored");
 }
 
-async fn rerun_migration_104(db: &MemoryDB) {
+async fn rerun_migration_107(db: &MemoryDB) {
     {
         let conn = db.conn.lock().await;
-        conn.execute("PRAGMA user_version = 103", ()).await.unwrap();
+        conn.execute("PRAGMA user_version = 106", ()).await.unwrap();
     }
     db.run_migrations(&crate::events::NoopEmitter)
         .await
-        .expect("migration 104 re-fires");
+        .expect("migration 107 re-fires");
 }
 
 /// Seed a page directly, leaving `kind` on the column DEFAULT — exactly the
@@ -38803,18 +38803,18 @@ async fn seed_kind_fold_ledger(conn: &libsql::Connection, id: &str, creation_kin
 /// recorded — and leaves migration 89's own decisions, and any deliberately
 /// stamped kind, alone.
 #[tokio::test]
-async fn migration_104_repairs_kind_for_pages_the_89_fold_never_saw() {
+async fn migration_107_repairs_kind_for_pages_the_89_fold_never_saw() {
     let (db, _dir) = test_db().await;
     {
         let conn = db.conn.lock().await;
         for (id, title, creation_kind, status) in [
-            ("page_104_overview", "Overview", "research", "active"),
-            ("page_104_overview_case", "oVeRvIeW", "research", "active"),
-            ("page_104_source", "Ingested file", "source", "active"),
-            ("page_104_imported", "Legacy import", "imported", "active"),
-            ("page_104_authored", "Hand written", "authored", "draft"),
+            ("page_107_overview", "Overview", "research", "active"),
+            ("page_107_overview_case", "oVeRvIeW", "research", "active"),
+            ("page_107_source", "Ingested file", "source", "active"),
+            ("page_107_imported", "Legacy import", "imported", "active"),
+            ("page_107_authored", "Hand written", "authored", "draft"),
             (
-                "page_104_distilled",
+                "page_107_distilled",
                 "Rust ownership",
                 "distilled",
                 "active",
@@ -38822,7 +38822,7 @@ async fn migration_104_repairs_kind_for_pages_the_89_fold_never_saw() {
             // An archived page titled "Overview" is not the reserved
             // singleton -- the title is only reserved among live pages.
             (
-                "page_104_archived_overview",
+                "page_107_archived_overview",
                 "Overview",
                 "research",
                 "archived",
@@ -38835,33 +38835,33 @@ async fn migration_104_repairs_kind_for_pages_the_89_fold_never_saw() {
         // creation_kind='source' as a source page today.
         seed_defaulted_page(
             &conn,
-            "page_104_pre89_source",
+            "page_107_pre89_source",
             "Old ingest",
             "source",
             "active",
         )
         .await;
-        seed_kind_fold_ledger(&conn, "page_104_pre89_source", "source").await;
+        seed_kind_fold_ledger(&conn, "page_107_pre89_source", "source").await;
         // A deliberately stamped kind is never demoted or re-derived.
         conn.execute(
-            "UPDATE pages SET kind = 'entity' WHERE id = 'page_104_distilled'",
+            "UPDATE pages SET kind = 'entity' WHERE id = 'page_107_distilled'",
             (),
         )
         .await
         .unwrap();
     }
 
-    rerun_migration_104(&db).await;
+    rerun_migration_107(&db).await;
 
     for (id, expected) in [
-        ("page_104_overview", "overview"),
-        ("page_104_overview_case", "overview"),
-        ("page_104_source", "source"),
-        ("page_104_imported", "source"),
-        ("page_104_authored", "authored"),
-        ("page_104_archived_overview", "concept"),
-        ("page_104_pre89_source", "concept"),
-        ("page_104_distilled", "entity"),
+        ("page_107_overview", "overview"),
+        ("page_107_overview_case", "overview"),
+        ("page_107_source", "source"),
+        ("page_107_imported", "source"),
+        ("page_107_authored", "authored"),
+        ("page_107_archived_overview", "concept"),
+        ("page_107_pre89_source", "concept"),
+        ("page_107_distilled", "entity"),
     ] {
         assert_eq!(
             page_kind_of(&db, id).await,
@@ -38871,13 +38871,13 @@ async fn migration_104_repairs_kind_for_pages_the_89_fold_never_saw() {
     }
 }
 
-/// Migration 104's CASE is the frozen SQL twin of `pages::page_kind_for`. They
+/// Migration 107's CASE is the frozen SQL twin of `pages::page_kind_for`. They
 /// have to agree at the moment the migration ships, or the repair writes one
 /// answer and every later insert writes another. Driven through the real
 /// migration rather than a re-typed copy of the expression, so the thing under
 /// test is the SQL that actually runs.
 #[tokio::test]
-async fn page_kind_rule_matches_the_migration_104_case() {
+async fn page_kind_rule_matches_the_migration_107_case() {
     let (db, _dir) = test_db().await;
     let mut matrix = Vec::new();
     for (index, creation_kind) in [
@@ -38908,13 +38908,13 @@ async fn page_kind_rule_matches_the_migration_104_case() {
         }
     }
 
-    rerun_migration_104(&db).await;
+    rerun_migration_107(&db).await;
 
     for (id, title, creation_kind, status) in &matrix {
         assert_eq!(
             page_kind_of(&db, id).await,
             crate::pages::page_kind_for(title, creation_kind, status),
-            "migration 104's CASE disagrees with page_kind_for for \
+            "migration 107's CASE disagrees with page_kind_for for \
              title={title:?} creation_kind={creation_kind:?} status={status:?}"
         );
     }
@@ -38923,22 +38923,22 @@ async fn page_kind_rule_matches_the_migration_104_case() {
 /// Re-running the repair is a no-op: it only ever moves a row off the silent
 /// default, so a second pass finds nothing left to move.
 #[tokio::test]
-async fn migration_104_kind_repair_is_idempotent() {
+async fn migration_107_kind_repair_is_idempotent() {
     let (db, _dir) = test_db().await;
     {
         let conn = db.conn.lock().await;
-        seed_defaulted_page(&conn, "page_104_idem", "Overview", "research", "active").await;
+        seed_defaulted_page(&conn, "page_107_idem", "Overview", "research", "active").await;
     }
-    rerun_migration_104(&db).await;
-    assert_eq!(page_kind_of(&db, "page_104_idem").await, "overview");
-    rerun_migration_104(&db).await;
-    assert_eq!(page_kind_of(&db, "page_104_idem").await, "overview");
+    rerun_migration_107(&db).await;
+    assert_eq!(page_kind_of(&db, "page_107_idem").await, "overview");
+    rerun_migration_107(&db).await;
+    assert_eq!(page_kind_of(&db, "page_107_idem").await, "overview");
 }
 
 /// The SOURCE-page clone re-derives `kind` instead of copying it. Migration 89
 /// mapped only `creation_kind='imported'` onto 'source', so a pre-89 SOURCE
 /// page still sits at 'concept'; the clone is a NEW row with a new id and no
-/// fold-ledger entry, so migration 104 will never revisit it. Copying would
+/// fold-ledger entry, so migration 107 will never revisit it. Copying would
 /// mint a fresh row that lies -- the exact bug this change exists to end.
 #[tokio::test]
 async fn rebind_source_page_clone_derives_kind_rather_than_copying_a_stale_one() {

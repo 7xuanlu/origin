@@ -689,7 +689,7 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-pub const SCHEMA_VERSION: u32 = 106;
+pub const SCHEMA_VERSION: u32 = 107;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8386,14 +8386,6 @@ impl MemoryDB {
                 self.migrate_103_page_evaluated_at(version).await?;
             }
 
-            // Migration 104: repair the pages migration 89 never got to see.
-            // 89 classified the corpus of its day, but no insert named `kind`,
-            // so every page written since took the DEFAULT. See
-            // migrate_104_page_kind_repair.
-            if version < 104 {
-                self.migrate_104_page_kind_repair(version).await?;
-            }
-
             // Migration 105 (M5 derivation worker): the enqueue triggers, plus
             // the first backlog sweep. `claim_derivation_jobs` has existed since
             // 98 with neither a writer nor a reader, so the queue was empty on
@@ -8413,6 +8405,14 @@ impl MemoryDB {
             // trigger body.
             if version < 106 {
                 self.migrate_106_derivation_run_identity(version).await?;
+            }
+
+            // Migration 107: repair the pages migration 89 never got to see.
+            // 89 classified the corpus of its day, but no insert named `kind`,
+            // so every page written since took the DEFAULT. See
+            // migrate_107_page_kind_repair.
+            if version < 107 {
+                self.migrate_107_page_kind_repair(version).await?;
             }
         }
 
@@ -12035,7 +12035,7 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Migration 104: make `pages.kind` truthful for the rows migration 89
+    /// Migration 107: make `pages.kind` truthful for the rows migration 89
     /// never saw.
     ///
     /// 89 added the column and backfilled the corpus of its day honestly, but
@@ -12075,19 +12075,19 @@ impl MemoryDB {
     ///   no-op.
     ///
     /// The CASE is the frozen historical twin of `page_kind_for`, pinned equal
-    /// by `page_kind_rule_matches_the_migration_104_case`. Deliberately no
+    /// by `page_kind_rule_matches_the_migration_107_case`. Deliberately no
     /// reader moves onto the column here: the Overview is still resolved by
     /// title (`synthesis::overview`), and routing reads through `kind` is M6's
     /// business. This migration only stops the column from lying.
-    async fn migrate_104_page_kind_repair(&self, prior_version: i64) -> Result<(), WenlanError> {
+    async fn migrate_107_page_kind_repair(&self, prior_version: i64) -> Result<(), WenlanError> {
         // §6.9: a data pass over `pages` gets a restore point, same as 89 and 99.
-        self.backup_before_migration(104, prior_version).await?;
+        self.backup_before_migration(107, prior_version).await?;
 
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m104 begin: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m107 begin: {error}")))?;
         let repaired = tx
             .execute(
                 "UPDATE pages SET kind = CASE \
@@ -12109,16 +12109,16 @@ impl MemoryDB {
                 (),
             )
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m104 repair kind: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m107 repair kind: {error}")))?;
         tx.commit()
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m104 commit: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m107 commit: {error}")))?;
 
-        conn.execute("PRAGMA user_version = 104", ())
+        conn.execute("PRAGMA user_version = 107", ())
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("m104 bump: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("m107 bump: {error}")))?;
         log::info!(
-            "[migration] Migration 104 applied: {repaired} page(s) moved off the silent \
+            "[migration] Migration 107 applied: {repaired} page(s) moved off the silent \
              kind='concept' default"
         );
         Ok(())
@@ -27054,7 +27054,7 @@ impl MemoryDB {
         // `kind` is re-derived rather than copied: migration 89 mapped only
         // `creation_kind='imported'` onto 'source', so a pre-89 SOURCE page still
         // carries kind='concept'. This clone is a NEW row with a new id and no
-        // fold-ledger entry, so migration 104 will never revisit it -- copying the
+        // fold-ledger entry, so migration 107 will never revisit it -- copying the
         // old value would mint a fresh row that lies, which is the bug this whole
         // change exists to end. Frozen twin of `crate::pages::page_kind_for`.
         let inserted = conn

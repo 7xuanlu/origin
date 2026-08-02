@@ -59,7 +59,7 @@ pub(crate) fn page_embedding_text(title: &str, summary: Option<&str>, content: &
 /// One disagreement with the stored column survives on purpose, and it is the
 /// reason no reader may route on `kind` yet. Migration 89 folded
 /// `creation_kind='imported'` onto 'source' but never `'source'` itself, and it
-/// wrote a fold-ledger row for every page it saw — so migration 104, which
+/// wrote a fold-ledger row for every page it saw — so migration 107, which
 /// skips any page the ledger already ruled on, leaves those rows where 89 put
 /// them. A page imported before 89 therefore still stores 'concept' while this
 /// rule says 'source'. Size the gap on a real vault with `SELECT COUNT(*) FROM
