@@ -295,10 +295,11 @@ The last row is a finding, not an illustration — see F1 in §12.
 >   rules bite: chunks and mirrors of one document collapse to one group
 >   (`provenance_roots.independence_group_id`, `db.rs:8792`), so a single source
 >   split into ten chunks cannot manufacture a floor-clearing pair.
-> - **Undecayed.** The floor is a statement about how much independent evidence
->   ever existed, not about how fresh it is. Applying decay first would let a
->   pair with ample old evidence silently drop below the floor and re-enter it
->   on any new touch, flapping the score.
+> - **Undecayed, currently eligible.** The floor is a statement about how many
+>   independent groups currently survive the eligibility spine, not about how
+>   fresh their surviving evidence is. Root retraction removes a group when its
+>   last eligible root disappears; reactivation restores it. Applying decay to
+>   the floor would still let ample old evidence silently fall below three.
 > - **Unsmoothed.** Smoothing exists to make the estimator well-defined, not to
 >   satisfy the floor. `0 + 0.5` must never read as support.
 
@@ -364,8 +365,11 @@ recomputation."*
 > single point.**
 >
 > - **What state.** The full pair table, normalized to
->   `sorted_set((page_a, page_b, n11, n10, n01, n00))` with `page_a < page_b`
->   lexicographically, at a fixed relevance generation.
+>   `sorted_set((page_a, page_b, n11, n10, n01, n00,
+>   distinct_group_count))` with `page_a < page_b` lexicographically, at a
+>   fixed relevance generation. `distinct_group_count` is the undecayed count
+>   of currently eligible distinct groups co-supporting the pair; the
+>   `floor_cleared` bit is derived at read time and is not stored.
 > - **Compared how.** Byte equality of `m6_digest("m6-pairstats-v1", …)` over
 >   that normalized set (artifact 4 §2), not a per-row float tolerance. The
 >   cells are sums of `f64` decay factors, so a tolerance-based comparison would
@@ -550,10 +554,11 @@ is 512. Two frozen numbers and one derived number that cannot all hold.
 > `|N(source) ∩ N(candidate)|` — a *count*, not the rows. Query (c) is
 >
 > ```sql
-> SELECT endpoint_id, count(*) FROM m6_adjacency
->  WHERE space = ?1 AND endpoint_id IN (<the ≤32 candidates>)
+> SELECT endpoint_kind, endpoint_id, count(*) FROM m6_adjacency
+>  WHERE space = ?1 AND endpoint_kind = ?2
+>    AND endpoint_id IN (<the ≤32 candidates>)
 >    AND neighbor_id IN (<the ≤64 source neighbours>)
->  GROUP BY endpoint_id
+>  GROUP BY endpoint_kind, endpoint_id
 > ```
 >
 > which materializes at most 32 rows. Whole-evaluation materialization is then
@@ -785,7 +790,7 @@ Against the two PR-A-new tables plus the existing `edges`:
 |---|---|---|
 | I1 | `m6_pair_stats(space, page_a, page_b)` PRIMARY KEY | query (d) |
 | I2 | `m6_pair_stats(space, page_a, updated_generation)` | incremental invalidation |
-| I3 | `m6_adjacency(space, endpoint_kind, endpoint_id, rank)` PRIMARY KEY | queries (b), (c); `rank` is the deterministic 1..64 slot from S0-89 |
+| I3 | `m6_adjacency(space, endpoint_kind, endpoint_id, rank)` PRIMARY KEY, plus `UNIQUE(space, endpoint_kind, endpoint_id, neighbor_id)` | queries (b), (c); `rank` is the deterministic 1..64 slot from S0-89, while neighbor uniqueness prevents Jaccard inflation |
 | I4 | `m6_adjacency(space, neighbor_id)` | reverse invalidation on root retraction |
 | I5 | `page_truth_state(support_status, page_id)` | candidate retrieval; extends the existing status-only index (`claim_identity.rs:301`-`:302`) |
 

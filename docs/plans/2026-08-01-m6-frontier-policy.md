@@ -7,6 +7,13 @@ which fixed the six states and twelve transitions; this artifact fixes the
 queries, the clocks, the scopes, and the exhaustion behaviour that machine F left
 open.
 
+**Approved amendment (2026-08-02, D2=A and D3=A).** Suppression history is
+append-only and repeatable, with stored liveness (`lapsed_at IS NULL`), and
+card bindings are retained per group with stored liveness
+(`closed_at IS NULL`). Every reference below to "exactly one reason" means
+exactly one **live** reason; closed/lapsed history remains queryable and does
+not count.
+
 **Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
 on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
 the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
@@ -37,25 +44,27 @@ could park evidence, with the guard that stops it.
 
 ### 1.1 Six states, six durable homes
 
-Machine F's six states are not a `state` column. Each is the presence of a row in
-a different table, and "exactly one durable reason" is literally "exactly one of
-these six has a row for this group."
+Machine F's six states are not a `state` column. Each is the presence of a
+**live** row in a different table, and "exactly one durable reason" is literally
+"exactly one of these six has a live row for this group." Retained closed card
+bindings and lapsed suppressions are history, not current reasons.
 
 | State | Durable home | New? |
 |---|---|---|
 | `covered` | `genesis_group_coverage` | PR-A-new |
 | `exclusively_claimed` | `genesis_candidate_roots` with a live reservation | PR-A-new (D4) |
 | `waiting_frontier` | `genesis_frontier` | PR-A-new |
-| `surfaced_card` | `genesis_card_binding` → `refinement_queue` (`crates/wenlan-core/src/db/migrations_v004_v009.rs:49`) | binding new; queue **exists** |
-| `suppressed` | `genesis_suppression` | PR-A-new |
+| `surfaced_card` | `genesis_card_binding WHERE closed_at IS NULL` → `refinement_queue` (`crates/wenlan-core/src/db/migrations_v004_v009.rs:49`) | binding new; queue **exists** |
+| `suppressed` | `genesis_suppression WHERE lapsed_at IS NULL` | PR-A-new |
 | `quarantined` | `genesis_quarantine` | PR-A-new |
 
 > **Decision S0-42 — the six states are six tables, not one enum column.** A
 > single `state` column would make the invariant true by construction and
 > therefore untestable: the row would always have exactly one value, including
 > when the *reason* behind it had been rolled back. Six tables make "exactly one"
-> a real count over real rows, which is what G5 has to assert. It also matches
-> what the transitions already are — F4 writes a coverage row, F7 writes a
+> a real count over live rows, which is what G5 has to assert. Historical rows
+> remain in those same tables but are excluded by their stable liveness marker.
+> It also matches what the transitions already are — F4 writes a coverage row, F7 writes a
 > suppression row — so no transition gains a second write.
 
 ### 1.2 The eligible set
@@ -93,20 +102,21 @@ the space, not with groups.
 
 ```sql
 SELECT e.gid,
-       (cov.gid  IS NOT NULL)
-     + (clm.gid  IS NOT NULL)
-     + (fro.gid  IS NOT NULL)
-     + (crd.gid  IS NOT NULL)
-     + (sup.gid  IS NOT NULL)
-     + (qua.gid  IS NOT NULL) AS reason_count
+       (cov.independence_group_id IS NOT NULL)
+     + (clm.independence_group_id IS NOT NULL)
+     + (fro.independence_group_id IS NOT NULL)
+     + (crd.independence_group_id IS NOT NULL)
+     + (sup.independence_group_id IS NOT NULL)
+     + (qua.independence_group_id IS NOT NULL) AS reason_count
   FROM eligible e
-  LEFT JOIN genesis_group_coverage  cov ON cov.gid = e.gid AND cov.space = :space AND cov.coverage_epoch = :epoch
-  LEFT JOIN live_reservations      clm ON clm.gid = e.gid AND clm.space = :space AND clm.coverage_epoch = :epoch
-  LEFT JOIN genesis_frontier       fro ON fro.gid = e.gid AND fro.space = :space AND fro.coverage_epoch = :epoch
-  LEFT JOIN genesis_card_binding   crd ON crd.gid = e.gid AND crd.space = :space AND crd.coverage_epoch = :epoch
-  LEFT JOIN genesis_suppression    sup ON sup.gid = e.gid AND sup.space = :space AND sup.coverage_epoch = :epoch
-                                      AND sup.expires_at > unixepoch()
-  LEFT JOIN genesis_quarantine     qua ON qua.gid = e.gid AND qua.space = :space AND qua.coverage_epoch = :epoch
+  LEFT JOIN genesis_group_coverage  cov ON cov.independence_group_id = e.gid AND cov.space = :space AND cov.coverage_epoch = :epoch
+  LEFT JOIN live_reservations      clm ON clm.independence_group_id = e.gid AND clm.space = :space AND clm.coverage_epoch = :epoch
+  LEFT JOIN genesis_frontier       fro ON fro.independence_group_id = e.gid AND fro.space = :space AND fro.coverage_epoch = :epoch
+  LEFT JOIN genesis_card_binding   crd ON crd.independence_group_id = e.gid AND crd.space = :space AND crd.coverage_epoch = :epoch
+                                      AND crd.closed_at IS NULL
+  LEFT JOIN genesis_suppression    sup ON sup.independence_group_id = e.gid AND sup.space = :space AND sup.coverage_epoch = :epoch
+                                      AND sup.lapsed_at IS NULL
+  LEFT JOIN genesis_quarantine     qua ON qua.independence_group_id = e.gid AND qua.space = :space AND qua.coverage_epoch = :epoch
                                       AND qua.lifted_at IS NULL
  WHERE reason_count <> 1;
 ```
@@ -115,6 +125,14 @@ SELECT e.gid,
 and filtered to candidates in a non-terminal state — the reservation is only a
 *reason* while the candidate is alive, which is exactly what makes F5 (reservation
 released → back to frontier) mandatory rather than housekeeping.
+
+The card and suppression predicates are stored markers on purpose. A wall-clock
+predicate such as `expires_at > unixepoch()` cannot be a safe partial-index
+predicate, and it would let the same committed database change from one reason
+to zero without a transaction. The reconciler first stamps `lapsed_at`, then
+restores `genesis_frontier`, in one transaction. The partial unique indexes on
+each table permit at most one open/unlapsed row per `(space,
+independence_group_id, coverage_epoch)`.
 
 **Two failure shapes, two different meanings.**
 
@@ -210,6 +228,12 @@ unformed-topic card. The dispatch asks: one per what?
 The card lists the below-floor groups by count and by their nearest-miss floor,
 never by content. See §3.4.
 
+The durable binding is one retained row per group and card:
+`genesis_card_binding(space, independence_group_id, coverage_epoch, card_id,
+page_id, first_seen_at, created_at, closed_at)`. One shared card therefore has
+many rows. Only `closed_at IS NULL` rows count in §1.3, and a partial unique
+index permits at most one open binding per group/epoch.
+
 ### 3.2 Card identity and the write that must not be used
 
 Card ID: `m6_unformed_topic_<space-digest>_<epoch>`, where the space digest is an
@@ -273,6 +297,16 @@ The 7-day timer starts at `genesis_frontier.first_seen_at`. Transitions F5
 > violate D7 while every individual transition looks correct. A new coverage epoch
 > does reset it, because the epoch is a new accounting era by construction.
 
+### 3.6 Shared-card closure
+
+Dismissal reads every live binding for the shared `card_id`, closes **all** of
+them, and only then writes each group's post-card transition. Closure and all
+replacement reasons share one transaction. A crash after all bindings close or
+after any individual suppression insert rolls the whole transaction back, so
+every group still has its open card reason; a commit leaves every binding
+closed and every group with its suppression reason. Binding rows are retained
+after closure.
+
 ---
 
 ## 4. Suppression (180 days)
@@ -281,21 +315,25 @@ Written by F7 when a candidate is suppressed or a human dismisses a card.
 
 | Property | Value |
 |---|---|
-| Row | `genesis_suppression(space, gid, coverage_epoch, reason, suppressed_at, expires_at, identity)` |
+| Row | `genesis_suppression(space, independence_group_id, coverage_epoch, page_id, reason, first_seen_at, suppressed_at, expires_at, lapsed_at)` |
 | Clock | `expires_at = unixepoch() + 180*86400`, set in-statement (S0-11) |
-| Lapse | F11: `expires_at <= unixepoch()` → the row stops counting as a reason, and the differential query's `0` result re-inserts the frontier row |
-| Identity | durable **forever**, past both lapse and compaction (D7, D14) |
+| Lapse | F11: the reconciler observes `expires_at <= unixepoch()`, stamps `lapsed_at`, then re-inserts the frontier row in the same transaction |
+| Identity | `page_id`, durable **forever**, past both lapse and compaction (D7, D14) |
 
-> **Decision S0-51 — lapse is expiry, not deletion.** The join in §1.3 carries
-> `AND sup.expires_at > unixepoch()`, so a lapsed suppression stops being a reason
-> without the row going away. Deleting it would erase the record that a human
+> **Decision S0-51 — lapse is a stored marker, not deletion.** The join in §1.3
+> carries `AND sup.lapsed_at IS NULL`; `expires_at <= unixepoch()` makes a row
+> eligible for reconciliation but does not itself change liveness. The
+> reconciler stamps `lapsed_at` before restoring frontier, in the same
+> transaction. Deleting the suppression would erase the record that a human
 > already said no once, which D7 ("suppression identities remain durable") and D14
 > (forward-safe rollback) both require to survive.
 
-A consequence worth stating: because lapse is expiry and F11 is driven by the
-differential query rather than a timer job, **there is no scheduled work at the
-180-day mark.** The group simply starts reading as `reason_count = 0` on the next
-scan and gets its frontier row back. Nothing to crash, nothing to miss.
+A consequence worth stating: there is no zero-reason wall-clock edge at the
+180-day mark. Until the next differential reconciliation, the unlapsed row is
+still the one live reason. That reconciliation commits the marker and frontier
+replacement together. A later suppression in the same epoch appends a new row
+with a new `suppressed_at`; the lapsed identity remains queryable, and the
+partial unique index still allows at most one unlapsed row.
 
 ---
 
@@ -310,7 +348,14 @@ The only one of the six states that is never entered automatically.
 > handler happened to pass", and a group can then arrive in quarantine by
 > omission — which is parking with extra steps.
 
-Lifting (F12) sets `lifted_at`; the row is retained, same argument as §4.
+The retained row is
+`genesis_quarantine(space, independence_group_id, coverage_epoch, reason,
+first_seen_at, quarantined_at, lifted_at)`, keyed by `(space,
+independence_group_id, coverage_epoch, quarantined_at)`. Only
+`lifted_at IS NULL` counts in §1.3, and a partial unique index permits at most
+one live quarantine per group/epoch. Lifting (F12) stamps `lifted_at` before
+restoring frontier in the same transaction; the row is retained and a later
+quarantine appends a new history row, mirroring §4.
 
 ---
 
@@ -382,10 +427,10 @@ D7's closing rule, enumerated. "Parked" means the group is eligible and
 | P5 | Lease held by a dead process | no worker can claim the group | `grouping_leases.expires_at` + the reap arm (`crates/wenlan-core/src/db.rs:13432`-`:13434`) | existing M4 substrate |
 | P6 | Retry exhaustion | candidate stops retrying | S0-12: `attempt > 5` → `stale` with `reason='retry_exhausted'`, which releases the reservation (F5) and returns the group to the frontier | artifact 2 |
 | P7 | Quota exhaustion (any of 5 caps) | work not started | no cap may terminalize or retire | S0-54 |
-| P8 | Suppression never lapsing | group suppressed forever | `expires_at` is set in-statement at write time and the join filters on it; there is no path that writes an unbounded expiry | §4, S0-51 |
-| P9 | Quarantine never lifted | group quarantined forever | quarantine requires an explicit human/policy reason and is visible as a distinct state in the differential query; it is a *deliberate* park, which D7 permits as one of its six states | S0-52 |
+| P8 | Suppression never lapsing | group suppressed forever | `expires_at` is set in-statement; reconciliation stamps `lapsed_at` before restoring frontier, and the live join uses that stable marker | §4, S0-51 |
+| P9 | Quarantine never lifted | group quarantined forever | quarantine requires an explicit human/policy reason and is visible as a distinct state in the differential query; lift stamps the stable marker before restoring frontier, and reactivation appends history | S0-52 |
 | P10 | Below-floor forever in a small space | group never reaches the admission floor | the 7-day card fires regardless of floor (F3); this is G5's positive control | §3 |
-| P11 | Card dismissed, never re-emitted | user dismissed once, silence forever | dismissal writes a **suppression** row with a 180-day expiry, not a permanent card state; §4's lapse returns the group | S0-49 + §4 |
+| P11 | Card dismissed, never re-emitted | user dismissed once, silence forever | dismissal atomically closes every live binding for the shared card and writes one suppression per group; §4's marked lapse returns each group | §3.6 + §4 |
 | P12 | Compaction deletes the reason | terminal candidate row removed → `reason_count = 0` → rediscovery loop | compaction nulls the payload only | S0-53 |
 | P13 | Timer reset by re-entry churn | claim/release cycling keeps resetting the 7-day clock | `first_seen_at` preserved across re-entry | S0-50 |
 | P14 | Epoch change disables genesis | new-epoch genesis blocked pending migration (D5) | the block is on *new genesis*, not on the frontier; groups keep their frontier rows and the differential query keeps running under the old epoch until the migration completes | machine D, artifact 2 |
@@ -441,7 +486,7 @@ how a full-pass scan degrades foreground latency on this daemon's one connection
 
 | Gate | What this artifact hands it |
 |---|---|
-| G5 (`m6_frontier_has_no_missing_root`) | §1.3's query verbatim as the assertion body; the `0` vs `> 1` split (S0-43) as two distinct failure modes; S0-46's `next_scan_at` ceiling as a second assertion |
+| G5 (`m6_frontier_has_no_missing_root`) | §1.3's live-row query verbatim as the assertion body; the `0` vs `> 1` split (S0-43) as two distinct failure modes; suppress → lapse → frontier → suppress again while both histories remain queryable; shared-card failure injection after closure and after every replacement reason; S0-46's `next_scan_at` ceiling as a second assertion |
 | G6 (abuse bounds) | §7's table — one case per cap, each asserting the excess is still in `waiting_frontier` |
 | G-catalog | P1–P16 (§8) as one crash/adversarial case each; P10 as the positive control for a permanently small space; P12 as the retention-policy regression test |
 | G10 (epoch) | P14: the frontier keeps running under the old epoch while new-epoch genesis is blocked |
@@ -450,7 +495,7 @@ how a full-pass scan degrades foreground latency on this daemon's one connection
 
 ## 11. Decisions introduced here
 
-`S0-42` six states are six tables, not an enum column ·
+`S0-42` six states are six tables, and G5 counts exactly one live row rather than all retained history ·
 `S0-43` reconciler repairs `reason_count = 0`, refuses `> 1` ·
 `S0-44` the cursor is a pure optimization ·
 `S0-45` one `app_metadata` cursor key, cleared to `""` on wrap ·
@@ -459,7 +504,7 @@ how a full-pass scan degrades foreground latency on this daemon's one connection
 `S0-48` card written with `INSERT OR IGNORE`, never `INSERT OR REPLACE` ·
 `S0-49` every M6 clock is an INTEGER `unixepoch()` on an M6 table ·
 `S0-50` `first_seen_at` survives re-entry within an epoch ·
-`S0-51` suppression lapses by expiry, never by deletion ·
-`S0-52` quarantine reason is non-empty and never defaulted ·
+`S0-51` suppression is repeatable append-only history; the reconciler marks expiry with `lapsed_at` before restoring frontier ·
+`S0-52` quarantine reason is non-empty and never defaulted; retained rows use `lifted_at` as stable liveness and may repeat ·
 `S0-53` compaction nulls the payload, never deletes the row ·
 `S0-54` no cap may terminalize a candidate or retire a frontier row.

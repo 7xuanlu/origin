@@ -23,6 +23,14 @@ window (finding 14); S0-129 gains its third condition (finding 6); S0-131's
 ledger-class count is reconciled (finding 16). No S0 number was reused or
 renumbered.
 
+**Approved amendment (2026-08-02; D8=A).** The stored `stage` domain is exactly
+`A|B|C|D|E`. Stages A-D use signal `'-'`; stage E uses one of the four signal
+names. The monotone `(epoch, phase)` fence remains an independent axis.
+Composite diagram labels such as `D_preparing` and `E1_committed` are
+presentation labels for `stage × signal × phase`, never `stage` values. Soak
+evidence and the `disabled`/`forward_fix` operational disposition remain in
+their separately named receipt/state fields.
+
 ### Citation conventions
 
 In-repo citations are read on branch `kg-m6-stage0`. Three files carry almost
@@ -84,6 +92,12 @@ zero-dimensional.
 > `signal` is **`NOT NULL DEFAULT '-'`**: the literal `'-'` for stages A–D, and
 > one of the four genesis signal names for stage E. G11's independence is then a
 > key property rather than a checked invariant.
+
+The table enforces `stage IN ('A','B','C','D','E')` and the bidirectional
+stage/signal rule: A-D iff signal is `'-'`; E iff signal is one of
+`evidence-cluster`, `orphan-wikilink`, `community-overview`, or
+`space-overview`. Four E rows can coexist, while a second D/`-` row conflicts on
+the primary key.
 
 > **Decision S0-152 *(rev 2, finding 5)* — the stage-A–D `signal` is a non-null
 > sentinel, never `NULL`.** Rev 1 wrote `NULL`, which silently made the key not a
@@ -183,6 +197,13 @@ stateDiagram-v2
 
 Two properties of this diagram are contract, not drawing:
 
+The node labels are presentation-only composites. For example,
+`D_preparing` is stored as `(stage='D', signal='-', phase='preparing')`, and
+`E1_committed` is stored as `(stage='E', signal='evidence-cluster',
+phase='committed')`. `soaked`, `disabled`, and `forward_fix` are not phase or
+stage values: soak is a separate durable receipt, while disable/forward-fix is
+the separate operational state.
+
 **Abort returns to the previous *soaked* state, never to `off`-as-if-nothing-
 happened.** The epoch still bumps on abort (S0-120), so a writer holding a
 pre-abort capture cannot win a later CAS.
@@ -219,7 +240,7 @@ inspection.
 | 2 | M6 reader manifest | the D12 manifest's structural CI test is green on the deployed commit |
 | 3 | M6 writer manifest | same test, writer half; every listed caller has its fence adapter |
 | 4 | relevance parity | incremental pair state equals full recomputation for this space (artifact 6 §5 oracle) |
-| 5 | dependency state | zero rows in the refresh dependency table for this space referencing a retracted or absent root |
+| 5 | dependency state | zero rows from `m6_refresh_dependencies d LEFT JOIN provenance_roots r ON r.root_id=d.root_id` for this space where `r.root_id IS NULL OR r.status <> 'active'` |
 | 6 | app availability | the app's compatibility manifest advertises a contract version this daemon supports (G1) |
 | 7 | zero pending incompatible jobs | zero rows in the genesis/refresh job tables for this space at a schema older than the current readiness epoch |
 
