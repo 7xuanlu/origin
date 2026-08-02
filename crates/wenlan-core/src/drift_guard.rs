@@ -2253,6 +2253,12 @@ fn ci_routing_contract_violations(
                 .into(),
         );
     }
+    if !rust_paths.contains(".github/workflows/release-pr-maintenance.yml") {
+        violations.push(
+            "release PR maintenance workflow cannot bootstrap its push-only contract through rust"
+                .into(),
+        );
+    }
     if !rust_paths.contains("clippy.toml") {
         violations.push(
             "clippy configuration cannot bootstrap its syntax-aware FastEmbed guard through rust"
@@ -4680,12 +4686,15 @@ fn release_candidate_observer_contract_rejects_privilege_and_identity_drift() {
 fn release_promotion_contract_violations(
     ci_workflow: &str,
     release_please_workflow: &str,
+    fast_maintenance_workflow: &str,
     release_workflow: &str,
     promotion_script: &str,
 ) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let release_please: serde_yaml::Value =
         serde_yaml::from_str(release_please_workflow).expect("parse release-please.yml");
+    let fast_maintenance: serde_yaml::Value =
+        serde_yaml::from_str(fast_maintenance_workflow).expect("parse release-pr-maintenance.yml");
     let release: serde_yaml::Value =
         serde_yaml::from_str(release_workflow).expect("parse release.yml");
     let mut violations = Vec::new();
@@ -4733,6 +4742,103 @@ fn release_promotion_contract_violations(
     {
         violations.push("release-please hybrid trigger or job inventory drifted".into());
     }
+    if release_please["concurrency"]["group"].as_str() != Some("release-please-main")
+        || release_please["concurrency"]["cancel-in-progress"].as_bool() != Some(false)
+    {
+        violations.push("release-please does not serialize receipt and tag operations".into());
+    }
+    if fast_maintenance["concurrency"]["group"].as_str() != Some("release-pr-maintenance-main")
+        || fast_maintenance["concurrency"]["cancel-in-progress"].as_bool() != Some(false)
+        || fast_maintenance["concurrency"]["queue"].as_str() != Some("max")
+        || release_please["jobs"]["maintain-release-pr"]["concurrency"]["group"].as_str()
+            != Some("release-pr-maintenance-main")
+        || release_please["jobs"]["maintain-release-pr"]["concurrency"]["cancel-in-progress"]
+            .as_bool()
+            != Some(false)
+        || release_please["jobs"]["maintain-release-pr"]["concurrency"]["queue"].as_str()
+            != Some("max")
+    {
+        violations.push("release PR branch writers do not share the fixed maintenance lock".into());
+    }
+    let fast_trigger_names = fast_maintenance["on"]
+        .as_mapping()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    let fast_branches = fast_maintenance["on"]["push"]["branches"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    let fast_jobs = fast_maintenance["jobs"]
+        .as_mapping()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    if fast_trigger_names != BTreeSet::from(["push"])
+        || fast_branches != ["main"]
+        || fast_jobs != BTreeSet::from(["maintain-release-pr"])
+    {
+        violations.push("fast release maintenance is not exact main-push PR-only routing".into());
+    }
+    let fast_job = &fast_maintenance["jobs"]["maintain-release-pr"];
+    let fast_action = job_step_using(
+        &fast_maintenance,
+        "maintain-release-pr",
+        "googleapis/release-please-action",
+    );
+    let fast_push = job_step(
+        &fast_maintenance,
+        "maintain-release-pr",
+        "Commit synced versions to release PR branch",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    let push_commands = fast_push
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("git push"))
+        .collect::<Vec<_>>();
+    if fast_job["if"].as_str()
+        != Some("github.event_name == 'push' && github.ref == 'refs/heads/main'")
+        || fast_job["timeout-minutes"].as_u64() != Some(5)
+        || fast_maintenance["permissions"]["contents"].as_str() != Some("read")
+        || fast_maintenance["permissions"]["pull-requests"].as_str() != Some("read")
+        || fast_job["permissions"]["contents"].as_str() != Some("write")
+        || fast_job["permissions"]["pull-requests"].as_str() != Some("write")
+        || fast_action.and_then(|step| step["uses"].as_str())
+            != Some("googleapis/release-please-action@0dfd8538845b8e92600d271a895a5372865d4062")
+        || fast_action.and_then(|step| step["with"]["skip-github-release"].as_bool()) != Some(true)
+        || push_commands != ["git push origin HEAD"]
+    {
+        violations.push(
+            "fast release maintenance is not pinned, least-privilege, PR-only, and non-force"
+                .into(),
+        );
+    }
+    for forbidden in [
+        "workflow_run:",
+        "workflow_dispatch:",
+        "pull_request:",
+        "create-validated-tag",
+        "release-promotion.py",
+        "refs/tags/",
+        "/git/refs",
+        "git tag",
+        "gh release",
+        "autorelease:",
+        "/issues/",
+        "--method POST",
+    ] {
+        if fast_maintenance_workflow.contains(forbidden) {
+            violations.push(format!(
+                "fast release maintenance contains publishing or lifecycle mutation {forbidden:?}"
+            ));
+        }
+    }
     let route = job_step(
         &release_please,
         "route-main",
@@ -4742,6 +4848,27 @@ fn release_promotion_contract_violations(
     .unwrap_or_default();
     if !route.contains("scripts/release-promotion.py consume-main-receipt") {
         violations.push("release-please does not consume the exact main receipt".into());
+    }
+    let route_condition = release_please["jobs"]["route-main"]["if"]
+        .as_str()
+        .unwrap_or_default();
+    let tag_job = &release_please["jobs"]["create-validated-tag"];
+    let tag_step = job_step(
+        &release_please,
+        "create-validated-tag",
+        "Require pending release lifecycle and create exact tag",
+    );
+    if !route_condition.contains("github.event.workflow_run.event == 'push'")
+        || !route_condition.contains("github.event.workflow_run.head_branch == 'main'")
+        || !route_condition.contains("github.event.workflow_run.conclusion == 'success'")
+        || job_needs(&release_please, "create-validated-tag") != ["route-main"]
+        || tag_job["if"].as_str() != Some("needs.route-main.outputs.state == 'validated'")
+        || tag_step.and_then(|step| step["env"]["MAIN_SHA"].as_str())
+            != Some("${{ github.event.workflow_run.head_sha }}")
+    {
+        violations.push(
+            "validated tag is not exclusively bound to the observed successful main receipt".into(),
+        );
     }
     if job_step_using(
         &release_please,
@@ -4919,12 +5046,20 @@ fn release_promotion_reuses_exact_archives_and_fails_closed() {
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci");
     let release_please = std::fs::read_to_string(root.join(".github/workflows/release-please.yml"))
         .expect("read release-please");
+    let fast_maintenance =
+        std::fs::read_to_string(root.join(".github/workflows/release-pr-maintenance.yml"))
+            .expect("read fast release maintenance");
     let release =
         std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release");
     let promotion = std::fs::read_to_string(root.join("scripts/release-promotion.py"))
         .expect("read promotion resolver");
-    let violations =
-        release_promotion_contract_violations(&ci, &release_please, &release, &promotion);
+    let violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &fast_maintenance,
+        &release,
+        &promotion,
+    );
     assert!(
         violations.is_empty(),
         "hybrid release promotion contract drift:\n{}",
@@ -4938,6 +5073,9 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci");
     let release_please = std::fs::read_to_string(root.join(".github/workflows/release-please.yml"))
         .expect("read release-please");
+    let fast_maintenance =
+        std::fs::read_to_string(root.join(".github/workflows/release-pr-maintenance.yml"))
+            .expect("read fast release maintenance");
     let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
         .expect("read release")
         .replace(
@@ -4950,8 +5088,13 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "MAX_RECEIPT_CANDIDATES = 20",
             "MAX_RECEIPT_CANDIDATES = 1000",
         );
-    let violations =
-        release_promotion_contract_violations(&ci, &release_please, &release, &promotion);
+    let violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &fast_maintenance,
+        &release,
+        &promotion,
+    );
     for expected in ["duplicate compilation", "MAX_RECEIPT_CANDIDATES"] {
         assert!(
             violations.iter().any(|item| item.contains(expected)),
@@ -4968,6 +5111,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let duplicate_publish_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &fast_maintenance,
         &duplicate_publish_verification,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
@@ -4987,6 +5131,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let retry_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &fast_maintenance,
         &retry_unsafe_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
@@ -5004,6 +5149,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let mutable_tag_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &fast_maintenance,
         &mutable_tag_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
@@ -5021,6 +5167,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
     let stable_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
+        &fast_maintenance,
         &stable_incremental_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
@@ -5031,6 +5178,46 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             .any(|item| item.contains("stable release")),
         "mutation must reject incremental stable release: {stable_violations:?}"
     );
+
+    let unsafe_fast_maintenance = fast_maintenance
+        .replace("skip-github-release: true", "skip-github-release: false")
+        .replace(
+            "group: release-pr-maintenance-main",
+            "group: release-please-main",
+        )
+        .replace("queue: max", "queue: single")
+        .replace("run: bash scripts/bump-version.sh", "run: gh api /git/refs")
+        .replace("git push origin HEAD", "git push --force origin HEAD");
+    let unsafe_release_please = release_please
+        .replace(
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.conclusion != 'success'",
+        )
+        .replace(
+            "MAIN_SHA: ${{ github.event.workflow_run.head_sha }}",
+            "MAIN_SHA: ${{ github.sha }}",
+        );
+    let routing_violations = release_promotion_contract_violations(
+        &ci,
+        &unsafe_release_please,
+        &unsafe_fast_maintenance,
+        &std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release"),
+        &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+            .expect("read promotion resolver"),
+    );
+    for expected in [
+        "fixed maintenance lock",
+        "pinned, least-privilege, PR-only, and non-force",
+        "publishing or lifecycle mutation",
+        "observed successful main receipt",
+    ] {
+        assert!(
+            routing_violations
+                .iter()
+                .any(|item| item.contains(expected)),
+            "mutation must exercise {expected:?}: {routing_violations:?}"
+        );
+    }
 }
 
 fn windows_native_parallelism_violations(

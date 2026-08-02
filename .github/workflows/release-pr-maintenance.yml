@@ -1,0 +1,59 @@
+name: Release PR Maintenance
+
+on:
+  push:
+    branches: [main]
+
+# Serialize every release-branch writer without sharing a pending slot with the
+# receipt-gated tag workflow. The successful-CI fallback uses this same group.
+concurrency:
+  group: release-pr-maintenance-main
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  maintain-release-pr:
+    name: Maintain release PR only
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@0dfd8538845b8e92600d271a895a5372865d4062 # v5
+        id: release
+        with:
+          # This push-triggered path may propose a Release PR, but only the
+          # successful-main receipt gate in release-please.yml may create a tag.
+          skip-github-release: true
+          manifest-file: .release-please-manifest.json
+          config-file: release-please-config.json
+          target-branch: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+      - name: Checkout release PR for Cargo version sync
+        if: steps.release.outputs.pr != ''
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: release-please--branches--main
+          token: ${{ secrets.RELEASE_TOKEN }}
+      - name: Sync versions to all manifests
+        if: steps.release.outputs.pr != ''
+        run: bash scripts/bump-version.sh
+      - name: Commit synced versions to release PR branch
+        if: steps.release.outputs.pr != ''
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync versions to $(tr -d '[:space:]' < version.txt)"
+            git push origin HEAD
+          else
+            echo "No version drift; nothing to commit."
+          fi

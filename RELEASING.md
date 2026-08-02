@@ -4,7 +4,7 @@ This document covers releases of the local runtime: `wenlan` CLI, `wenlan-server
 
 ## How release-please works
 
-Merge conventional commits to `main` (for example, `feat:`, `fix:`, or `chore:`). The `release-please` workflow opens a Release PR automatically, bumps the version, and updates `CHANGELOG.md`. Its ordinary-main path sets `skip-github-release: true`: it maintains the PR but cannot create a tag or GitHub Release. Merging the Release PR cuts a release only after the trusted promotion gate binds that exact merge tree to the archives already built and tested by the PR. The gate then creates the exact `v*` tag, which triggers artifact-only publication in `release.yml`.
+Merge conventional commits to `main` (for example, `feat:`, `fix:`, or `chore:`). The push-only `release-pr-maintenance` workflow immediately opens or updates the Release PR, bumps the version, and updates `CHANGELOG.md` while main CI runs in parallel. It sets `skip-github-release: true`: this path may maintain the PR but cannot create a tag or GitHub Release. The later successful-main `workflow_run` keeps the same PR-only operation as a no-op fallback for transient push-workflow failures. Merging the Release PR cuts a release only after the trusted promotion gate binds that exact merge tree to the archives already built and tested by the PR. The gate then creates the exact `v*` tag, which triggers artifact-only publication in `release.yml`.
 
 > The coding-time rules—why every release bumps patch (`"versioning": "always-bump-patch"`), how to force a deliberate minor via `release-as`, the version-file-sync rule, and how to undo a release—live in the root [`AGENTS.md`](AGENTS.md) "Releasing (release-please)" section. This document is the human operator procedure.
 
@@ -14,7 +14,8 @@ Config files:
 
 - `release-please-config.json` — release type and version-bump behavior
 - `.release-please-manifest.json` — current version
-- `.github/workflows/release-please.yml` — maintains the Release PR and creates a tag only for a receipt-validated Release PR merge
+- `.github/workflows/release-pr-maintenance.yml` — immediately maintains the Release PR on `main` pushes; it has no tag, release, or lifecycle-label API path
+- `.github/workflows/release-please.yml` — revalidates successful main CI, provides the delayed ordinary-maintenance fallback, and creates a tag only for a receipt-validated Release PR merge
 - `.github/workflows/release.yml` — consumes exact validated archives and publishes them on the receipt-derived `v*` tag; it does not recompile Rust
 
 ## Manual version override
@@ -39,6 +40,8 @@ A passing observer uploads the exact six inspected files as `validated-release-a
 
 On the Release PR merge, main CI waits up to 12 minutes for this small closed receipt. Ordinary commits without a Release PR stay on the normal CI path. A release-like merge with missing, invalid, expired, or conflicting evidence fails closed; it cannot silently fall back to a full rebuild or ordinary release-please behavior. For valid evidence, the successful `detect-changes` execution emits `main-release-promotion-receipt-{main-run}-{producer-attempt}`, bound to the exact main SHA/tree, source CI run/attempt, observer run/attempt, validated-assets artifact ID/digest, PR, version, and tag. A failed-jobs-only rerun may leave that producer in an earlier attempt; the later `release-please` workflow therefore validates the terminal successful main run, locates the receipt's claimed producer attempt, proves that exact `detect-changes` job succeeded in that attempt, and freshly revalidates the receipt before it creates the exact tag. Future, failed-producer, or semantically conflicting receipts fail closed.
 
+Fast maintenance uses the fixed `release-pr-maintenance-main` concurrency group, and the successful-CI fallback joins the same group at job scope, so release-branch writers are serialized. Both set `queue: max`, preserving a bounded FIFO queue instead of letting a newer pending writer replace an older one during a merge burst. Receipt routing and validated tagging retain the separate fixed `release-please-main` group, so ordinary maintenance cannot displace a pending tag operation. The maintenance workflow uses the `RELEASE_TOKEN` so its update to `release-please--branches--main` automatically triggers candidate PR CI, but it performs only a normal non-force `git push origin HEAD`. A Release PR merge also produces a `main` push; running the action in its official PR-only `skip-github-release` mode does not create the tag or move the pending lifecycle to tagged. Those mutations remain exclusively in the successful-main receipt path and the final publication job.
+
 The closed receipt is an internal chain-of-custody record, not a Sigstore attestation or third-party provenance statement. Its trust comes from the default-branch workflow code, exact GitHub workflow/run identities, immutable artifact IDs, and verified SHA-256 digests. This design follows GitHub's warning that `workflow_run` can receive secrets and write tokens even when its source run cannot, so the observer is kept read-only and never executes candidate bytes.
 
 Official behavior relied on by this design:
@@ -48,6 +51,8 @@ Official behavior relied on by this design:
 - [GitHub REST API for the jobs in one workflow-run attempt](https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2026-03-10#get-jobs-for-a-workflow-run-attempt)
 - [GitHub Actions artifact REST metadata and exact-name query](https://docs.github.com/en/rest/actions/artifacts?apiVersion=2026-03-10)
 - [GitHub `push` event commit SHA semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#push)
+- [GitHub workflow-trigger behavior for `GITHUB_TOKEN`, GitHub Apps, and PATs](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow)
+- [GitHub concurrency groups and queued-run behavior](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
 - [GitHub REST API for reading an exact tag ref](https://docs.github.com/en/rest/git/refs?apiVersion=2026-03-10#get-a-reference)
 - [`upload-artifact` immutability, replacement semantics, artifact ID/digest outputs, and retention](https://github.com/actions/upload-artifact)
 - [`upload-artifact` same-run artifact-name uniqueness](https://github.com/actions/upload-artifact#not-uploading-to-the-same-artifact)
